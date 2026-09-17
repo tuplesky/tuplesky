@@ -1,0 +1,58 @@
+{
+  "scope": "Documentation and extension-graph validation only",
+  "not_tested": [
+    "Official Mermaid rendering",
+    "Rust/Go builds and interoperability",
+    "Distributed protocol models and service tests",
+    "Real storage crash qualification",
+    "Original full dependency graph, which is not reproduced in this package"
+  ],
+  "documents": [
+    {
+      "file": "tuplesky-design-v0.6-update.md",
+      "bytes": 64913,
+      "sha256": "520a2dd0f24daef5576e61139c578745317f7a38ecb4aff619b46e9bdcc3edac",
+      "headings": 58,
+      "fences": 6,
+      "mermaid_blocks_structurally_checked": 4
+    },
+    {
+      "file": "tuplesky-pr-plan-v1.3-update.md",
+      "bytes": 26706,
+      "sha256": "2f9f903d1286cb4839cbf60b929d652fbfec4710857535f1c3182c68b8035f8c",
+      "headings": 28,
+      "fences": 0,
+      "mermaid_blocks_structurally_checked": 0
+    },
+    {
+      "file": "README.md",
+      "bytes": 2943,
+      "sha256": "19e4c3a4b32f56fd525db483b28f9bc1b836208190e6cde6be8910fef7545a6a",
+      "headings": 5,
+      "fences": 1,
+      "mermaid_blocks_structurally_checked": 0
+    },
+    {
+      "file": "swiftpaxos-upstream-review.md",
+      "bytes": 9051,
+      "sha256": "437947985ebc55116bf90767bded394f0f2f76b72f0e0f8719fc43463bc83257",
+      "headings": 8,
+      "fences": 1,
+      "mermaid_blocks_structurally_checked": 0
+    }
+  ],
+  "extension_task_count": 19,
+  "combined_task_count": 89,
+  "status": "passed",
+  "checks": [
+    "Markdown parsed",
+    "Fence balance",
+    "Explicit anchors unique",
+    "Local document links resolve",
+    "Source labels defined",
+    "Task table matches specifications",
+    "Task references resolve",
+    "New-task graph is acyclic",
+    "Mermaid declaration/quote structure only"
+  ]
+}

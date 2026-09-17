@@ -1,0 +1,132 @@
+{
+  "base_plan": "global-coordination-rust-pr-plan-v1.2.md",
+  "base_task_count": 70,
+  "new_task_count": 19,
+  "combined_task_count": 89,
+  "new_tasks": {
+    "PR-J01": [
+      "PR-01",
+      "PR-02",
+      "PR-S01",
+      "PR-S02"
+    ],
+    "PR-J02": [
+      "PR-J01"
+    ],
+    "PR-J03": [
+      "PR-J02",
+      "PR-08",
+      "PR-11"
+    ],
+    "PR-J04": [
+      "PR-J03",
+      "PR-09"
+    ],
+    "PR-J05": [
+      "PR-J02",
+      "PR-J03",
+      "PR-J04",
+      "PR-09"
+    ],
+    "PR-J06": [
+      "PR-J04",
+      "PR-J05"
+    ],
+    "PR-J07": [
+      "PR-J03",
+      "PR-J05",
+      "PR-31"
+    ],
+    "PR-O01": [
+      "PR-02",
+      "PR-03",
+      "PR-28",
+      "PR-49"
+    ],
+    "PR-O02": [
+      "PR-O01",
+      "PR-J03",
+      "PR-50"
+    ],
+    "PR-O03": [
+      "PR-O02",
+      "PR-31"
+    ],
+    "PR-O04": [
+      "PR-O02",
+      "PR-48"
+    ],
+    "PR-O05": [
+      "PR-O04",
+      "PR-18"
+    ],
+    "PR-O06": [
+      "PR-O03",
+      "PR-O04",
+      "PR-O05",
+      "PR-J05"
+    ],
+    "PR-M01": [
+      "PR-02",
+      "PR-19"
+    ],
+    "PR-M02": [
+      "PR-M01",
+      "PR-33",
+      "PR-48"
+    ],
+    "PR-M03": [
+      "PR-M01",
+      "PR-O02",
+      "PR-57",
+      "PR-J04"
+    ],
+    "PR-M04": [
+      "PR-M03",
+      "PR-M02"
+    ],
+    "PR-M05": [
+      "PR-M02",
+      "PR-M03",
+      "PR-M04",
+      "PR-58"
+    ],
+    "PR-Q01": [
+      "PR-J07",
+      "PR-O06",
+      "PR-M05",
+      "PR-63",
+      "PR-64"
+    ]
+  },
+  "optional_tasks": [
+    "PR-J06"
+  ],
+  "original_gate_extensions": {
+    "PR-66": [
+      "PR-Q01"
+    ]
+  },
+  "extension_only_topological_order": [
+    "PR-J01",
+    "PR-J02",
+    "PR-J03",
+    "PR-J04",
+    "PR-J05",
+    "PR-J06",
+    "PR-J07",
+    "PR-O01",
+    "PR-O02",
+    "PR-O03",
+    "PR-O04",
+    "PR-O05",
+    "PR-O06",
+    "PR-M01",
+    "PR-M02",
+    "PR-M03",
+    "PR-M04",
+    "PR-M05",
+    "PR-Q01"
+  ],
+  "qualification": "Base-plan graph not loaded; only the extension graph was cycle-checked."
+}
