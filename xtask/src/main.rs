@@ -60,6 +60,8 @@ enum Cmd {
     CheckCi,
     /// `cargo check` the workspace with the declared minimum supported Rust version.
     Msrv,
+    /// Run the loom model checks (`--cfg loom`) for local concurrency boundaries.
+    Loom,
     /// Everything a pull request runs: fmt --check, lint, check-deps, test, check-docs, check-ci.
     Ci,
 }
@@ -83,6 +85,7 @@ fn run_cli() -> Result<()> {
         Cmd::CheckDocs { render } => check_docs(&root, render),
         Cmd::CheckCi => check_ci(&root),
         Cmd::Msrv => msrv(&root),
+        Cmd::Loom => loom(&root),
         Cmd::Ci => {
             fmt(&root, true)?;
             lint(&root)?;
@@ -253,6 +256,28 @@ fn check_ci(root: &Path) -> Result<()> {
         "python3",
         &["-m", "unittest", "discover", "-s", ".", "-p", "test_*.py"],
     )
+}
+
+fn loom(root: &Path) -> Result<()> {
+    eprintln!(
+        "$ RUSTFLAGS=--cfg loom cargo test -p coord-storage --test loom_watch --release --locked"
+    );
+    let status = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "coord-storage",
+            "--test",
+            "loom_watch",
+            "--release",
+            "--locked",
+        ])
+        .env("RUSTFLAGS", "--cfg loom")
+        .env("LOOM_MAX_PREEMPTIONS", "3")
+        .current_dir(root)
+        .status()
+        .context("failed to start cargo")?;
+    ensure_success("cargo", status)
 }
 
 fn msrv(root: &Path) -> Result<()> {
