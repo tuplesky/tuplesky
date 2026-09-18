@@ -17,8 +17,9 @@
 //!   space afterward. The cursor records the floor it was computed under; a
 //!   higher floor restarts the pass.
 //!
-//! Protocol state is untouched (semantic forgetting is task-51+), engines
-//! own no TTL or filter logic, and no exclusive live-file rewrite happens.
+//! Protocol state is untouched: semantic forgetting is a different floor
+//! with different rules (`coord_checkpoint::trim`, task-51). Engines own no
+//! TTL or filter logic, and no exclusive live-file rewrite happens.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
