@@ -138,16 +138,39 @@ pub struct ReplayOutcome {
     pub commits: u32,
 }
 
+/// Upper bound on scan pages per collection during replay; a conforming
+/// engine holding at most a few thousand rows never approaches it.
+const MAX_REPLAY_PAGES: u32 = 1 << 16;
+
 fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
     let view = engine.reader().snapshot().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for c in Collection::ALL {
         let mut request = ScanRequest::all(64, 1 << 20);
+        let mut pages = 0u32;
+        let mut last_key: Option<Vec<u8>> = None;
         loop {
+            pages += 1;
+            if pages > MAX_REPLAY_PAGES {
+                return Err(format!(
+                    "collection {} did not exhaust within {MAX_REPLAY_PAGES} pages",
+                    c.name()
+                ));
+            }
             let page = view
                 .scan_page(c.id(), &request)
                 .map_err(|e| e.to_string())?;
+            // Every page must advance strictly past the previous cursor; an
+            // adapter that ignores `resume_after` is nonconformant, not a
+            // reason to loop forever.
             for r in &page.rows {
+                if last_key.as_ref().is_some_and(|k| r.key <= *k) {
+                    return Err(format!(
+                        "collection {} scan did not advance past the resume key",
+                        c.name()
+                    ));
+                }
+                last_key = Some(r.key.clone());
                 out.push((c.id().0, r.key.clone(), r.value.clone()));
             }
             if page.exhausted {
@@ -224,6 +247,11 @@ pub fn replay<E: LocalEngine>(
                 i += 1;
             }
             Step::CrashReopen => {
+                // A crash discards the uncommitted transaction: the pending
+                // steps are neither applied to the engine afterwards nor to
+                // the oracle. (The pinned generator only crashes after a
+                // commit, so frozen fixtures are unaffected.)
+                pending.clear();
                 crash(engine);
                 i += 1;
             }

@@ -51,6 +51,8 @@ fn each_misbehavior_is_detected_by_the_named_check() {
         (Misbehavior::SwallowedIteratorErrors, "iterator_errors"),
         (Misbehavior::FalseDurability, "durability"),
         (Misbehavior::EarlyVisibility, "transactions"),
+        (Misbehavior::UnpinnedScans, "transactions"),
+        (Misbehavior::NoncommitVisibleUntilReopen, "commit_outcomes"),
     ];
     for (misbehavior, expected_check) in cases {
         let mut h = ModelHarness(ModelEngine::misbehaving(&[misbehavior]));
@@ -182,4 +184,73 @@ fn scenario_fixture_replays_to_frozen_digest() {
     let outcome = replay(&mut torn, &stored, ModelEngine::crash_and_reopen).unwrap();
     assert!(!outcome.matches_oracle);
     assert_eq!(outcome.matches_expected, Some(false));
+}
+
+#[test]
+fn crash_discards_the_pending_transaction_in_replay() {
+    use coord_store_testkit::scenario::Step;
+    let kv = Collection::KvCurrentV1.id().0;
+    let scenario = StoreScenarioV1 {
+        schema: "store_scenario_v1".to_owned(),
+        seed: [0; 32],
+        generator: "hand-written".to_owned(),
+        steps: vec![
+            Step::Put {
+                collection: kv,
+                key: b"kept".to_vec(),
+                value: b"1".to_vec(),
+            },
+            Step::Commit,
+            Step::Put {
+                collection: kv,
+                key: b"lost".to_vec(),
+                value: b"2".to_vec(),
+            },
+            Step::CrashReopen,
+            Step::Commit,
+        ],
+        expected_digest: None,
+    };
+    let mut engine = ModelEngine::new();
+    let outcome = replay(&mut engine, &scenario, ModelEngine::crash_and_reopen).unwrap();
+    assert!(outcome.matches_oracle);
+    assert_eq!(outcome.commits, 2);
+    let rows = engine.durable_rows();
+    assert!(rows.iter().any(|(_, k, _)| k == b"kept"));
+    assert!(
+        !rows.iter().any(|(_, k, _)| k == b"lost"),
+        "a put pending at the crash must not be committed afterwards: {rows:?}"
+    );
+}
+
+#[test]
+fn replay_rejects_an_engine_whose_scans_never_advance() {
+    use coord_store_testkit::scenario::Step;
+    let kv = Collection::KvCurrentV1.id().0;
+    // More rows than one replay page, so a resume key is needed.
+    let mut steps = Vec::new();
+    for i in 0..100u32 {
+        steps.push(Step::Put {
+            collection: kv,
+            key: format!("k{i:03}").into_bytes(),
+            value: vec![1],
+        });
+    }
+    steps.push(Step::Commit);
+    let scenario = StoreScenarioV1 {
+        schema: "store_scenario_v1".to_owned(),
+        seed: [0; 32],
+        generator: "hand-written".to_owned(),
+        steps,
+        expected_digest: None,
+    };
+    let mut stuck = ModelEngine::misbehaving(&[Misbehavior::IgnoredResumeKey]);
+    let err = replay(&mut stuck, &scenario, ModelEngine::crash_and_reopen).unwrap_err();
+    assert!(err.contains("did not advance"), "{err}");
+    let mut honest = ModelEngine::new();
+    assert!(
+        replay(&mut honest, &scenario, ModelEngine::crash_and_reopen)
+            .unwrap()
+            .matches_oracle
+    );
 }

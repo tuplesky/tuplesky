@@ -379,9 +379,44 @@ fn check_transactions<H: ConformanceHarness>(h: &mut H) -> Check {
         }
         tx.commit_durable().map_err(|e| e.to_string())?;
     }
-    // Pinned snapshot stays pinned; a new one sees both collections atomically.
+    // Pinned snapshot stays pinned for point reads and for scan pages: an
+    // adapter whose scans open a fresh transaction per page would show the
+    // new history row here even though `before` predates the commit.
     if before.get(KV, b"t1").map_err(|e| e.to_string())? != Some(b"old".to_vec()) {
         return Err("snapshot not pinned".to_owned());
+    }
+    let pinned_scan = before
+        .scan_page(
+            HIST,
+            &req(
+                Bound::Included(b"t1"),
+                Bound::Excluded(b"t2"),
+                Direction::Forward,
+                10,
+                1 << 20,
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+    if !pinned_scan.rows.is_empty() {
+        return Err(format!(
+            "scan through a pinned snapshot saw {} row(s) committed after it",
+            pinned_scan.rows.len()
+        ));
+    }
+    let pinned_kv = before
+        .scan_page(
+            KV,
+            &req(
+                Bound::Included(b"t1"),
+                Bound::Excluded(b"t2"),
+                Direction::Forward,
+                10,
+                1 << 20,
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+    if pinned_kv.rows.len() != 1 || pinned_kv.rows[0].value != b"old" {
+        return Err("scan through a pinned snapshot does not see the pinned value".to_owned());
     }
     let after = reader.snapshot().map_err(|e| e.to_string())?;
     let kv = after.get(KV, b"t1").map_err(|e| e.to_string())?;
@@ -465,6 +500,16 @@ fn check_commit_outcomes<H: ConformanceHarness>(h: &mut H) -> Result<CheckResult
             }
         }
     }
+    // A definite noncommit must be absent from live snapshots at once, not
+    // only after volatile state is discarded by a reopen: publishing it and
+    // dropping it later would expose data the caller is free to replan.
+    let live = h.engine().reader().snapshot().map_err(|e| e.to_string())?;
+    if live.get(KV, b"c1").map_err(|e| e.to_string())?.is_some() {
+        return Ok(CheckResult::Failed(
+            "definitely-not-committed batch is visible before reopen".to_owned(),
+        ));
+    }
+    drop(live);
     h.crash_and_reopen();
     let view = h.engine().reader().snapshot().map_err(|e| e.to_string())?;
     if view.get(KV, b"c1").map_err(|e| e.to_string())?.is_some() {
