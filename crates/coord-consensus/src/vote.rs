@@ -226,6 +226,22 @@ impl VoteSet {
         Ok(())
     }
 
+    /// The conservative slow predicate only (task-24 learner): the leader
+    /// proposal adopted by a majority including the leader.
+    pub fn learned_slow(&self) -> Option<Learned> {
+        let leader = self.leader.as_ref()?;
+        let mut adopting: BTreeSet<ReplicaId> = self.slow.clone();
+        adopting.extend(
+            self.fast
+                .values()
+                .filter(|a| same_set(&a.deps, &leader.deps))
+                .map(|a| a.replica),
+        );
+        (adopting.len() + 1 >= self.config.slow_size()).then(|| Learned::Slow {
+            deps: leader.deps.clone(),
+        })
+    }
+
     /// The learning predicate over the counted votes. Fast learning is
     /// preferred when both hold; both need the leader proposal.
     pub fn learned(&self) -> Option<Learned> {

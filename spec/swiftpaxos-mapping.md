@@ -113,6 +113,16 @@ must be re-checked against the paper text at the task-19 review.
 | (volatile descriptors) | `[EXT]` after a crash the table is rebuilt from durable dependency rows; a durable vote is a fact, an undurable one was never sent (Section 4.7) | `CommandTable::restore`, `Follower::recover` | `tests/follower.rs::a_crash_between_state_and_vote_preserves_the_learning_obligation` |
 | `acceptFastAndSlowAck` dep equality | Equal direct dependencies are collected as evidence, never acted on; learning is task-24 | `Follower::collect` -> `VoteSet` | equal-direct-deps test |
 
+## Slow learning and ordered application (task-24)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| `getFastAndSlowAcksHandler` on the slow set (`slowPathH`, `SQ`): `desc.phase = COMMIT` | Conservative learning: the leader's order adopted by a majority including the leader, and every dependency committed (guard) | `VoteSet::learned_slow`, `learner::Learner::commit_learned` | `crates/coord-storage/tests/cluster.rs` (3/5 voters) |
+| `deliver`: execute once every `desc.dep` is delivered; leader `Seqnum` | Execution in leader sequence order once every dependency executed, at the next execution position | `Learner::next_executable` | same |
+| `desc.cmd.Execute(r.State)` then `repchan.reply` | `[EXT]` application goes through the common materializer with the retry binding; the outcome is sealed into `EstablishedResult` and only then published; no single reply establishes anything (Sections 4.5, 17.4) | `Learner::established`, `coord_storage::apply::Applier`, `Effect::Established` | `cluster.rs::one_leader_response_cannot_establish_success` |
+| (no watches in the prototype) | `[EXT]` a revision's complete event set reaches watches only after the durable commit | `Applier::apply` -> `WatchHub::publish` | `cluster.rs::watch_events_follow_irrevocable_application` |
+| `optExec` / speculative delivery on the leader | Out of scope here (task-29); the learner never executes on a proposal alone | review boundary | one-leader-response test |
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |
