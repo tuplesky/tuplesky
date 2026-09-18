@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use coord_transport::{BoundIdentity, CloseReason, Lane, Limits, TransportError, evidence_frame};
+use coord_transport::{
+    BoundIdentity, CloseReason, Lane, Limits, SendError, TransportError, evidence_frame,
+};
 use coord_transport_sim::{LinkFaults, NodeConfig, PacketWorld, SimEvent};
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
@@ -101,6 +103,7 @@ fn exchange(seed: u8, faults: LinkFaults, frames: usize) -> PacketWorld {
             r(1),
             inc(),
             Lane::Control,
+            DOMAIN,
             evidence_frame(&[0xa0, i as u8]).unwrap(),
         )
         .unwrap();
@@ -109,6 +112,7 @@ fn exchange(seed: u8, faults: LinkFaults, frames: usize) -> PacketWorld {
             r(0),
             inc(),
             Lane::Control,
+            DOMAIN,
             evidence_frame(&[0xb0, i as u8]).unwrap(),
         )
         .unwrap();
@@ -215,6 +219,9 @@ fn a_stalled_bulk_lane_leaves_control_flowing_through_flow_control_alone() {
     limits.lanes[Lane::Bulk.index()].max_uni_streams = 2;
     limits.lanes[Lane::Bulk.index()].stream_receive_window = 64 * 1024;
     limits.lanes[Lane::Bulk.index()].receive_window = 128 * 1024;
+    // The queue admits the whole offered burst here: this test is about
+    // what a stalled lane does to control latency, not about refusal.
+    limits.lanes[Lane::Bulk.index()].queue_depth = 64;
     let (mut w, expected) = registered_world(&f, 5, limits);
     for lane in [Lane::Control, Lane::Bulk] {
         w.connect(
@@ -238,6 +245,7 @@ fn a_stalled_bulk_lane_leaves_control_flowing_through_flow_control_alone() {
             r(1),
             inc(),
             Lane::Bulk,
+            DOMAIN,
             evidence_frame(&vec![i; 30 * 1024]).unwrap(),
         )
         .unwrap();
@@ -255,6 +263,7 @@ fn a_stalled_bulk_lane_leaves_control_flowing_through_flow_control_alone() {
         r(1),
         inc(),
         Lane::Control,
+        DOMAIN,
         evidence_frame(b"vote").unwrap(),
     )
     .unwrap();
@@ -383,4 +392,115 @@ fn a_sparse_observer_and_collector_topology_opens_only_what_roles_need() {
     let per_node: BTreeMap<usize, usize> = (0..5).map(|n| (n, w.connections(n))).collect();
     assert_eq!(per_node[&2], 3, "the rejected connection never counted");
     let _ = connected(&events);
+}
+
+#[test]
+fn the_simulator_refuses_exactly_what_the_real_adapter_refuses() {
+    // An overload scenario is only worth running if the simulator admits
+    // what production admits. Appending to an unbounded queue would let a
+    // burst through here that the real adapter answers with QueueFull,
+    // TooManyGroups or TooLarge, so the visible outcome would differ and
+    // memory would grow past the configured bounds.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut limits = Limits::default();
+    limits.lanes[Lane::Bulk.index()].queue_depth = 4;
+    limits.lanes[Lane::Bulk.index()].max_groups = 2;
+    let (mut w, expected) = registered_world(&f, 11, limits);
+    w.connect(
+        0,
+        1,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Bulk,
+        "node-1",
+        expected[1].clone(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1 && w.connections(1) == 1));
+    // Node 1 never reads, so nothing leaves the queue.
+    w.stall(1, Lane::Bulk);
+    let frame = || evidence_frame(&vec![9u8; 4096]).unwrap();
+    let mut refused = None;
+    for _ in 0..64 {
+        if let Err(e) = w.send(0, r(1), inc(), Lane::Bulk, DOMAIN, frame()) {
+            refused = Some(e);
+            break;
+        }
+    }
+    assert!(
+        matches!(refused, Some(SendError::QueueFull { lane: Lane::Bulk })),
+        "the group's depth is enforced: {refused:?}"
+    );
+    // A third group is refused rather than admitted beside the two.
+    for group in [DomainId([7; 16]), DomainId([8; 16])] {
+        let mut seen = None;
+        for _ in 0..64 {
+            if let Err(e) = w.send(0, r(1), inc(), Lane::Bulk, group, frame()) {
+                seen = Some(e);
+                break;
+            }
+        }
+        assert!(
+            matches!(
+                seen,
+                Some(SendError::QueueFull { .. }) | Some(SendError::TooManyGroups { .. })
+            ),
+            "{group:?}: {seen:?}"
+        );
+    }
+    // A frame larger than the destination budget could never be admitted.
+    let huge = vec![0u8; Limits::default().budget.destination_bytes + 1];
+    assert!(
+        matches!(
+            w.send(0, r(1), inc(), Lane::Bulk, DOMAIN, huge),
+            Err(SendError::TooLarge { .. })
+        ),
+        "an unsendable frame is refused up front"
+    );
+}
+
+#[test]
+fn the_dialer_binds_the_server_certificate_before_it_accepts_the_ack() {
+    // Every certificate here is issued by one trusted authority, so TLS
+    // succeeding says nothing about which node answered. Without the
+    // binding the real dialer performs, the simulator would negotiate
+    // with one node, register it under another replica and misattribute
+    // everything it later received.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter, PeerRole::Voter]);
+    let (mut w, expected) = registered_world(&f, 13, Limits::default());
+    // Reach node 1 but claim to expect node 2.
+    w.connect(
+        0,
+        1,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-1",
+        expected[2].clone(),
+    )
+    .unwrap();
+    w.run_until(20_000, |w| w.nodes_closed(0) > 0);
+    assert_eq!(w.connections(0), 0, "the wrong node is not a peer");
+    let rejected = w.take_events(0).into_iter().any(|e| {
+        matches!(
+            e,
+            SimEvent::Closed {
+                reason: CloseReason::Rejected(ref m),
+                ..
+            } if m.contains("identity")
+        )
+    });
+    assert!(rejected, "the mismatch is a rejection, not a connection");
+    // The matching expectation still negotiates.
+    w.connect(
+        0,
+        1,
+        PeerRole::Voter,
+        Some(inc()),
+        Lane::Control,
+        "node-1",
+        expected[1].clone(),
+    )
+    .unwrap();
+    assert!(w.run_until(20_000, |w| w.connections(0) == 1));
 }

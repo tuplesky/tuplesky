@@ -27,7 +27,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,8 +36,9 @@ use bytes::{Bytes, BytesMut};
 use coord_core::event::PeerProvenance;
 use coord_sim::rng::NamedStreams;
 use coord_transport::{
-    ALPN_API, ALPN_PEER, BoundIdentity, Class, CloseCode, CloseReason, IdentityBinder, Lane,
-    LaneLimits, Limits, lane_of_hello, role_class, role_lanes,
+    ALPN_API, ALPN_PEER, BoundIdentity, Budget, BudgetError, Class, CloseCode, CloseReason,
+    FairQueue, IdentityBinder, Lane, LaneLimits, Limits, QueueError, Queued, lane_of_hello,
+    role_class, role_lanes,
 };
 use coord_transport_testkit::TestIdentity;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
@@ -231,11 +232,16 @@ struct Conn {
     control_recv: Option<StreamId>,
     /// Per stream: the frame reader and whether its one frame was
     /// delivered (anything after it is a protocol violation).
-    readers: HashMap<StreamId, (FrameReader, bool)>,
+    readers: BTreeMap<StreamId, (FrameReader, bool)>,
     /// Unwritten remainders of stream writes blocked by flow control.
     pending_writes: VecDeque<(StreamId, Vec<u8>, bool)>,
     /// Frames waiting for stream credit.
-    pending_opens: VecDeque<Vec<u8>>,
+    /// Frames waiting for stream credit, in the production round-robin
+    /// queue with the lane's depth and group bounds.
+    pending_opens: FairQueue,
+    /// Bytes this destination may hold in flight (checked, as production
+    /// checks, before a frame is admitted).
+    budget: Budget,
     timeout: Option<Instant>,
     connection_id: u64,
     reported_closed: bool,
@@ -248,8 +254,8 @@ struct Node {
     endpoint: Endpoint,
     client_tls: [Arc<QuicClientConfig>; 2],
     lane_transport: [Arc<quinn_proto::TransportConfig>; 4],
-    connections: HashMap<ConnectionHandle, Conn>,
-    conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
+    connections: BTreeMap<ConnectionHandle, Conn>,
+    conn_events: BTreeMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     inbound: VecDeque<(u64, u64, SocketAddr, BytesMut)>,
     outbound: Vec<(Transmit, Bytes)>,
     binder: Arc<dyn IdentityBinder>,
@@ -259,7 +265,9 @@ struct Node {
     limits: Limits,
     next_connection: u64,
     events: Vec<SimEvent>,
-    by_link: HashMap<(ReplicaId, ReplicaIncarnation, Lane), ConnectionHandle>,
+    by_link: BTreeMap<(ReplicaId, ReplicaIncarnation, Lane), ConnectionHandle>,
+    /// Bytes this node may hold in flight across every destination.
+    node_budget: Budget,
     stalled: BTreeSet<Lane>,
     /// Frames this node handed to QUIC, per lane (message-level view).
     sent: Vec<(Lane, Vec<u8>)>,
@@ -348,8 +356,8 @@ impl Node {
             endpoint,
             client_tls,
             lane_transport,
-            connections: HashMap::new(),
-            conn_events: HashMap::new(),
+            connections: BTreeMap::new(),
+            conn_events: BTreeMap::new(),
             inbound: VecDeque::new(),
             outbound: Vec::new(),
             binder: config.binder,
@@ -359,7 +367,11 @@ impl Node {
             limits,
             next_connection: 1,
             events: Vec::new(),
-            by_link: HashMap::new(),
+            by_link: BTreeMap::new(),
+            node_budget: Budget::new(
+                config.limits.budget.node_bytes,
+                config.limits.budget.control_reserve,
+            ),
             stalled: BTreeSet::new(),
             sent: Vec::new(),
         }
@@ -406,9 +418,16 @@ impl Node {
                                     identity: None,
                                     control_send: None,
                                     control_recv: None,
-                                    readers: HashMap::new(),
+                                    readers: BTreeMap::new(),
                                     pending_writes: VecDeque::new(),
-                                    pending_opens: VecDeque::new(),
+                                    pending_opens: FairQueue::new(
+                                        self.limits.lanes[0].queue_depth,
+                                        self.limits.lanes[0].max_groups,
+                                    ),
+                                    budget: Budget::new(
+                                        self.limits.budget.destination_bytes,
+                                        self.limits.budget.control_reserve,
+                                    ),
                                     timeout: None,
                                     connection_id: id,
                                     reported_closed: false,
@@ -444,6 +463,11 @@ impl Node {
         let mut buf = Vec::with_capacity(1500);
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = Vec::new();
+            // Connection order decides routing order, which consumes
+            // link randomness and enters the trace digest. A hashed map
+            // would order it differently per process, so two runs of one
+            // seed would schedule differently: the order is the handle
+            // order, which is stable.
             let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
             for ch in handles {
                 if let Some(c) = self.connections.get_mut(&ch)
@@ -660,8 +684,18 @@ impl Node {
             }
             return;
         }
+        // More bytes than one frame of the largest class can need is a
+        // protocol violation, not something to buffer.
+        let mut overflow = None;
         for bytes in &chunks {
-            reader.push(bytes);
+            if let Err(e) = reader.push(bytes) {
+                overflow = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = overflow {
+            self.close(ch, CloseReason::Malformed(format!("{e:?}")), now);
+            return;
         }
         let frame = match frame_or_close(reader) {
             Ok(f) => f,
@@ -675,7 +709,7 @@ impl Node {
                 return;
             };
             match (phase, decode(&frame)) {
-                (Phase::HelloSent, Ok(MessageV1::HelloAck(ack))) => self.on_hello_ack(ch, ack),
+                (Phase::HelloSent, Ok(MessageV1::HelloAck(ack))) => self.on_hello_ack(ch, ack, now),
                 (Phase::Fresh, Ok(MessageV1::Hello(hello))) => self.on_hello(ch, hello, now),
                 (_, Ok(MessageV1::Close(close))) => {
                     self.close(ch, CloseReason::PeerClosed { code: close.code }, now)
@@ -814,6 +848,13 @@ impl Node {
             .set_max_concurrent_streams(Dir::Uni, VarInt::from_u32(limits.max_uni_streams));
         c.conn
             .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(limits.max_bidi_streams));
+        // The acceptor starts at the cross-lane floor and is raised to
+        // the lane once `Hello` names it, windows included. Raising only
+        // the stream counts would leave bulk and watch credit exhausting
+        // at a different point here than in the real adapter.
+        if let Ok(window) = VarInt::from_u64(limits.receive_window) {
+            c.conn.set_receive_window(window);
+        }
         let control = c.control_send.expect("control stream");
         c.pending_writes.push_back((control, ack, false));
         c.phase = Phase::Ready;
@@ -832,7 +873,7 @@ impl Node {
         self.flush(ch);
     }
 
-    fn on_hello_ack(&mut self, ch: ConnectionHandle, ack: HelloAckV1) {
+    fn on_hello_ack(&mut self, ch: ConnectionHandle, ack: HelloAckV1, now: Instant) {
         let c = self.connections.get_mut(&ch).expect("connection");
         let Side::Dialer {
             lane,
@@ -844,6 +885,31 @@ impl Node {
             return;
         };
         let (lane, local_role) = (*lane, *local_role);
+        let expected = expected.clone();
+        // Every certificate here is issued by one trusted authority, so
+        // TLS succeeding says nothing about *which* node answered. The
+        // production dialer binds the server's certificate to the
+        // identity it expected before it accepts anything; without the
+        // same binding the simulator would negotiate with one node,
+        // register it under another replica and misattribute its frames.
+        let certs = Self::peer_certs(&c.conn);
+        let claim = HelloV1 {
+            role: expected.role,
+            cluster_id: self.cluster,
+            domain_id: self.domain,
+            incarnation: expected.incarnation,
+            capabilities: BoundedVec::new(Vec::new()).expect("bounded"),
+        };
+        let bound = certs
+            .as_ref()
+            .and_then(|certs| self.binder.bind(certs, &claim).ok());
+        let accepted = bound.as_ref().is_some_and(|b| {
+            b.replica == expected.replica && b.incarnation == expected.incarnation
+        });
+        if !accepted {
+            self.close(ch, CloseReason::Rejected("identity".into()), now);
+            return;
+        }
         let identity = BoundIdentity {
             role: expected.role,
             replica: expected.replica,
@@ -893,14 +959,16 @@ impl Node {
     /// Write pending frames as credit and flow control allow.
     fn flush(&mut self, ch: ConnectionHandle) {
         let c = self.connections.get_mut(&ch).expect("connection");
-        while let Some(frame) = c.pending_opens.pop_front() {
-            match c.conn.streams().open(Dir::Uni) {
-                Some(id) => c.pending_writes.push_back((id, frame, true)),
-                None => {
-                    c.pending_opens.push_front(frame);
-                    break;
-                }
-            }
+        // A stream is opened only when there is a frame for it, so a
+        // frame is never taken out of the queue and then dropped for want
+        // of credit: without credit it simply stays queued, and the lane's
+        // depth keeps bounding what is held.
+        while !c.pending_opens.is_empty() {
+            let Some(id) = c.conn.streams().open(Dir::Uni) else {
+                break;
+            };
+            let queued = c.pending_opens.pop().expect("not empty");
+            c.pending_writes.push_back((id, queued.frame, true));
         }
         while let Some((id, data, finish)) = c.pending_writes.pop_front() {
             match c.conn.send_stream(id).write(&data) {
@@ -1071,9 +1139,16 @@ impl PacketWorld {
                 identity: None,
                 control_send: None,
                 control_recv: None,
-                readers: HashMap::new(),
+                readers: BTreeMap::new(),
                 pending_writes: VecDeque::new(),
-                pending_opens: VecDeque::new(),
+                pending_opens: FairQueue::new(
+                    node.limits.lanes[lane.index()].queue_depth,
+                    node.limits.lanes[lane.index()].max_groups,
+                ),
+                budget: Budget::new(
+                    node.limits.budget.destination_bytes,
+                    node.limits.budget.control_reserve,
+                ),
                 timeout: None,
                 connection_id: id,
                 reported_closed: false,
@@ -1091,18 +1166,43 @@ impl PacketWorld {
         replica: ReplicaId,
         incarnation: ReplicaIncarnation,
         lane: Lane,
+        group: DomainId,
         frame: Vec<u8>,
     ) -> Result<(), coord_transport::SendError> {
+        let now = self.clock.now();
         let node = &mut self.nodes[from];
         let ch = *node
             .by_link
             .get(&(replica, incarnation, lane))
             .ok_or(coord_transport::SendError::NotConnected)?;
+        let node_budget = &node.node_budget;
         let c = node
             .connections
             .get_mut(&ch)
             .ok_or(coord_transport::SendError::NotConnected)?;
-        c.pending_opens.push_back(frame.clone());
+        // Admission is what production does, or an overload scenario here
+        // would accept frames the real adapter refuses, report a
+        // different visible outcome and grow without the configured
+        // bounds.
+        let bytes = frame.len();
+        for budget in [&c.budget, node_budget] {
+            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
+                return Err(coord_transport::SendError::TooLarge { bytes, limit });
+            }
+        }
+        match c.pending_opens.push(Queued {
+            group,
+            frame: frame.clone(),
+            enqueued: now,
+        }) {
+            Ok(()) => {}
+            Err(QueueError::GroupFull) => {
+                return Err(coord_transport::SendError::QueueFull { lane });
+            }
+            Err(QueueError::TooManyGroups) => {
+                return Err(coord_transport::SendError::TooManyGroups { lane });
+            }
+        }
         node.sent.push((lane, frame));
         node.flush(ch);
         Ok(())
