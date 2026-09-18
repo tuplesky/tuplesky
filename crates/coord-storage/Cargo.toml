@@ -15,6 +15,7 @@ role = "production"
 coord-types.workspace = true
 coord-core.workspace = true
 coord-store-api.workspace = true
+coord-journal-api.workspace = true
 coord-state.workspace = true
 coord-consensus.workspace = true
 serde = { workspace = true, features = ["std"] }
@@ -23,6 +24,7 @@ blake3.workspace = true
 
 [dev-dependencies]
 coord-store-testkit.workspace = true
+coord-journal-raft-engine.workspace = true
 coord-storage-redb.workspace = true
 coord-redb-faultkit.workspace = true
 coord-oracle.workspace = true

@@ -66,6 +66,12 @@ pub struct GatedView<V> {
 }
 
 impl<V: OrderedRead> GatedView<V> {
+    /// Bind a snapshot to the metadata it proves. Only the gate (and the
+    /// crate's own tests) may claim that pairing.
+    pub(crate) const fn new(view: V, meta: DurableMeta) -> Self {
+        GatedView { view, meta }
+    }
+
     /// The snapshot.
     pub fn view(&self) -> &V {
         &self.view
@@ -110,6 +116,6 @@ impl<R: SnapshotSource> GatedReader<R> {
                 ),
             });
         }
-        Ok(GatedView { view, meta })
+        Ok(GatedView::new(view, meta))
     }
 }
