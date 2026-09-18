@@ -53,7 +53,16 @@ impl Default for SpeculationLimits {
 /// The tentative plans of unexecuted proposals, in the leader's order.
 #[derive(Debug, Default)]
 pub struct Overlay {
-    plans: BTreeMap<CommandId, ApplyPlan>,
+    plans: BTreeMap<CommandId, Speculated>,
+    bytes: usize,
+}
+
+/// A held tentative plan and what it was charged against the byte bound.
+/// The charge is stored, not recomputed, so retiring a plan returns
+/// exactly what admitting it took.
+#[derive(Debug)]
+struct Speculated {
+    plan: ApplyPlan,
     bytes: usize,
 }
 
@@ -82,7 +91,7 @@ impl Overlay {
     /// gone).
     pub fn retire(&mut self, command: &CommandId) {
         if let Some(p) = self.plans.remove(command) {
-            self.bytes = self.bytes.saturating_sub(plan_bytes(&p));
+            self.bytes = self.bytes.saturating_sub(p.bytes);
         }
     }
 
@@ -154,7 +163,12 @@ pub fn speculable(op: &CanonicalOperation) -> bool {
     }
 }
 
-fn plan_bytes(plan: &ApplyPlan) -> usize {
+/// What holding this plan and its response actually costs. The response
+/// is measured, not estimated from the event count: a range read mutates
+/// nothing and publishes no events, yet its response carries every value
+/// it returned, and an estimate that ignored it charged such a plan zero
+/// and let the overlay retain far more than its bound.
+fn plan_bytes(plan: &ApplyPlan, response: &[u8]) -> usize {
     plan.mutations
         .iter()
         .map(|m| match m {
@@ -163,17 +177,16 @@ fn plan_bytes(plan: &ApplyPlan) -> usize {
             _ => 0,
         })
         .sum::<usize>()
-        + plan.response_bytes_hint()
-}
-
-trait ResponseHint {
-    fn response_bytes_hint(&self) -> usize;
-}
-
-impl ResponseHint for ApplyPlan {
-    fn response_bytes_hint(&self) -> usize {
-        self.events.len() * 32
-    }
+        + plan
+            .events
+            .iter()
+            .map(|e| {
+                e.key.len()
+                    + e.entry.as_ref().map_or(0, |v| v.value.len())
+                    + e.prev.as_ref().map_or(0, |v| v.value.len())
+            })
+            .sum::<usize>()
+        + response.len()
 }
 
 /// Compute the tentative outcome of `request.command` over the overlay.
@@ -208,7 +221,12 @@ pub fn speculate<E: LocalEngine>(
         command_id: request.command,
     };
     let gated = worker.reader().snapshot()?;
-    match retry::admit(gated.view(), &binding)? {
+    // Only new work is speculated. A presented invocation the retry layer
+    // already holds a result for is refused here and served by the
+    // applier, which is where the retained result is reauthorized; the
+    // predicate is therefore `true` so the refusal names the retry rather
+    // than an authorization this path never performs.
+    match retry::admit(gated.view(), &binding, |_| true)? {
         Admission::New => {}
         other => return Err(SpeculationRefused::NotAdmitted(other)),
     }
@@ -225,7 +243,7 @@ pub fn speculate<E: LocalEngine>(
     // counter; the authorization context is untouched because no
     // speculable operation changes it.
     for p in &request.prefix {
-        let plan = &overlay.plans[p];
+        let plan = &overlay.plans[p].plan;
         apply_to_map(&mut view.current, plan);
         if let Some(r) = plan.revision {
             view.kv_revision = r;
@@ -244,6 +262,13 @@ pub fn speculate<E: LocalEngine>(
     }
     let response = postcard::to_allocvec(&planned.response)
         .map_err(|_| SpeculationRefused::MalformedPayload)?;
+    // The bound is on what the overlay holds after this plan, not on what
+    // it held before: one plan alone can exceed it, and such a command
+    // takes the ordinary finalized path.
+    let charge = plan_bytes(&planned, &response);
+    if overlay.bytes + charge > limits.max_bytes {
+        return Err(SpeculationRefused::OverBudget);
+    }
     let outcome = TentativeOutcome {
         command: request.command,
         position: planned.position,
@@ -252,7 +277,13 @@ pub fn speculate<E: LocalEngine>(
         response,
         prefix: request.prefix.clone(),
     };
-    overlay.bytes += plan_bytes(&planned);
-    overlay.plans.insert(request.command, planned);
+    overlay.bytes += charge;
+    overlay.plans.insert(
+        request.command,
+        Speculated {
+            plan: planned,
+            bytes: charge,
+        },
+    );
     Ok(outcome)
 }

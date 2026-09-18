@@ -1648,8 +1648,10 @@ fn tentative_results_of_a_lost_leader_never_surface() {
     let leader = &cluster.nodes[0];
     let t1 = leader.tentative_of(&c1).expect("speculated");
     let t2 = leader.tentative_of(&c2).expect("speculated");
-    assert_eq!(t1.position.get(), 1);
-    assert_eq!(t2.position.get(), 2);
+    // Positions are absolute: the ordered bootstrap batch occupies the
+    // first of them, and admitted commands follow it.
+    assert_eq!(t1.position.get(), 1 + BOOTSTRAP_POSITIONS);
+    assert_eq!(t2.position.get(), 2 + BOOTSTRAP_POSITIONS);
     assert!(
         leader.released.is_empty(),
         "nothing learned, nothing released"
@@ -1671,7 +1673,7 @@ fn tentative_results_of_a_lost_leader_never_surface() {
     // now overwrites a=2 at position two; neither ever surfaced.
     let final_c1 = acked.iter().find(|(_, c, _)| *c == c1).unwrap();
     assert_ne!(final_c1.2, t1.result_digest);
-    assert_eq!(final_c1.0, 2);
+    assert_eq!(final_c1.0, 2 + BOOTSTRAP_POSITIONS);
     cluster.observe(1);
     cluster.observe_retries(1, 100);
     assert!(check_history(&cluster.history).ok());
