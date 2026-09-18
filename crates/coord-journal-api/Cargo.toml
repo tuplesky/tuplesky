@@ -1,0 +1,22 @@
+[package]
+name = "coord-journal-api"
+description = "Shared journal contract: stream allocation, local sequence, immutable records, barriers, failures, frontiers and checkpoint pointers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "core"
+
+[dependencies]
+coord-types.workspace = true
+coord-core.workspace = true
+coord-store-api.workspace = true
+serde.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
