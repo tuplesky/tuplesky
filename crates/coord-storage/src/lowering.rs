@@ -1,12 +1,12 @@
 //! Lowering of immutable batches into engine rows, stamps and digests.
 
 use coord_core::effect::{ApplyBase, PersistBatch, StoreUpdate};
-use coord_store_api::engine::{EngineError, WriteTxn};
+use coord_store_api::engine::{EngineError, ErrorClass, WriteTxn};
 use coord_store_api::envelope::{AppliedStamp, StoreEnvelopeV1};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_store_api::seq::StoreSeq;
 use coord_types::identity::{Digest32, HashDomain};
-use coord_types::ids::{ConfigurationEpoch, ExecutionPosition, LocalJournalSeq};
+use coord_types::ids::{ConfigurationEpoch, ExecutionPosition};
 use serde::{Deserialize, Serialize};
 
 /// Digest of one batch bound to its guard context.
@@ -130,27 +130,35 @@ impl DurableMeta {
     /// The metadata of an empty projection.
     pub fn initial() -> Self {
         DurableMeta {
-            stamp: AppliedStamp {
-                store_seq: StoreSeq::INITIAL,
-                journal_seq: LocalJournalSeq::ZERO,
-                last_batch_digest: Digest32([0; 32]),
-            },
+            stamp: AppliedStamp::new(StoreSeq::INITIAL, Digest32([0; 32])),
             frontier: ExecutionFrontier::INITIAL,
         }
     }
 
     /// Read from any ordered view.
+    ///
+    /// The stamp and the frontier are written atomically, so after the first
+    /// flush exactly one missing row is corruption, never an empty
+    /// projection: only the both-missing case is the initial state.
     pub fn read<V: coord_store_api::engine::OrderedRead>(view: &V) -> Result<Self, EngineError> {
         let meta = Collection::MetaV1.id();
-        let stamp = match view.get(meta, meta_fields::APPLIED_STAMP)? {
-            Some(bytes) => AppliedStamp::from_envelope(&bytes)?,
-            None => DurableMeta::initial().stamp,
-        };
-        let frontier = match view.get(meta, meta_fields::EXECUTION_FRONTIER)? {
-            Some(bytes) => ExecutionFrontier::decode(&bytes)?,
-            None => ExecutionFrontier::INITIAL,
-        };
-        Ok(DurableMeta { stamp, frontier })
+        let stamp = view.get(meta, meta_fields::APPLIED_STAMP)?;
+        let frontier = view.get(meta, meta_fields::EXECUTION_FRONTIER)?;
+        match (stamp, frontier) {
+            (None, None) => Ok(DurableMeta::initial()),
+            (Some(stamp), Some(frontier)) => Ok(DurableMeta {
+                stamp: AppliedStamp::from_envelope(&stamp)?,
+                frontier: ExecutionFrontier::decode(&frontier)?,
+            }),
+            (Some(_), None) => Err(EngineError::new(
+                ErrorClass::Corrupt,
+                "applied stamp present but execution frontier missing",
+            )),
+            (None, Some(_)) => Err(EngineError::new(
+                ErrorClass::Corrupt,
+                "execution frontier present but applied stamp missing",
+            )),
+        }
     }
 
     /// Write both rows inside the transaction.
