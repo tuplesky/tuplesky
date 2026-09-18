@@ -49,6 +49,7 @@ claimed as qualification (Section 22.2).
 | serde_json | =1.0.151 | default | tooling, replay bundles |
 | rand_chacha / rand_core | =0.10.0 | no default | deterministic tests only; forbidden in `core` crates |
 | proptest | =1.11.0 | std | dev-dependency only |
+| loom | =0.7.2 | default | linked only under `cfg(loom)` (never set in production builds); the policy filters metadata by platform |
 | tempfile | =3.27.0 | default | dev-dependency only |
 
 Candidates not yet consumed by any crate (quinn, rustls, tokio, fjall, the

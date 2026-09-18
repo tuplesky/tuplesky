@@ -325,12 +325,32 @@ pub fn scan_current_page<V: OrderedRead>(
     Ok((rows, page.exhausted))
 }
 
+/// One stored event with the namespace it was written in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEvent {
+    /// Namespace of the key.
+    pub namespace: NamespaceId,
+    /// The event.
+    pub event: KvEvent,
+}
+
 /// The complete event set of one revision, in ordinal order. `None` when
 /// the revision produced no events (or was never applied).
 pub fn events_at<V: OrderedRead>(
     view: &V,
     revision: KvRevision,
 ) -> Result<Option<Vec<KvEvent>>, EngineError> {
+    Ok(stored_events_at(view, revision)?
+        .map(|events| events.into_iter().map(|e| e.event).collect()))
+}
+
+/// [`events_at`] keeping each event's namespace, for consumers that filter
+/// by namespace (watch replay must not relabel a batch with the watch's
+/// namespace: a revision may carry keys of several namespaces).
+pub fn stored_events_at<V: OrderedRead>(
+    view: &V,
+    revision: KvRevision,
+) -> Result<Option<Vec<StoredEvent>>, EngineError> {
     let request = ScanRequest {
         lower: Bound::Included(codecs::event_key(revision, 0)),
         upper: Bound::Included(codecs::event_key(revision, u32::MAX)),
@@ -353,11 +373,14 @@ pub fn events_at<V: OrderedRead>(
             ));
         }
         let record = codecs::decode_event(&row.value)?;
-        events.push(KvEvent {
-            kind: record.kind,
-            key: record.key,
-            entry: record.entry,
-            prev: record.prev,
+        events.push(StoredEvent {
+            namespace: record.namespace,
+            event: KvEvent {
+                kind: record.kind,
+                key: record.key,
+                entry: record.entry,
+                prev: record.prev,
+            },
         });
     }
     Ok(Some(events))
