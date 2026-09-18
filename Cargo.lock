@@ -768,8 +768,10 @@ dependencies = [
  "coord-core",
  "coord-oracle",
  "coord-types",
+ "postcard",
  "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

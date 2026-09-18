@@ -182,3 +182,17 @@ rejected by class within a bounded read). A schema change requires
 reviewed fixtures on both sides. No Serde reflection, cgo, protobuf or Go
 voting state machine is introduced; the collector and configuration
 evidence schemas are reserved for later client integration (task-m02).
+
+task-46 extends the mirror with the Kine subset of two schemas the
+adapter must produce and consume, and the raw binding kinds: the
+`logical_v1` operations `Range`, `KineCreate`, `KineUpdate` and
+`KineDelete` (encoder and decoder, verified against
+`crates/coord-types/fixtures/command_ids_v1.json`), the
+`coord_state::Response` outcomes a Kine request can receive (decoder,
+verified against `crates/coord-state/fixtures/kine_responses_v1.json`;
+every other `Outcome` variant is refused as unexpected), the command-id
+and Kine-binding derivations (BLAKE3 derive-key contexts of
+`HashDomain`, verified against `command_ids_v1.json` and
+`kine_bindings_v1.json`), and `Bind`/`BindAck` (raw kinds, not part of
+the typed registry). A schema change on either side requires reviewed
+fixtures on both.

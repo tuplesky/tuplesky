@@ -75,6 +75,30 @@ func (i *Instance) Allocate(logical []byte, commandID [32]byte, deadlineMs uint3
 	return inv, nil
 }
 
+// AllocateFor allocates the next sequence and lets `build` derive the
+// canonical payload and command identity from the resulting retry key
+// (a Kine write's hidden binding is a function of that key). The
+// sequence is consumed only when `build` succeeds.
+func (i *Instance) AllocateFor(
+	deadlineMs uint32,
+	build func(key wire.RetryKey) (logical []byte, commandID [32]byte, err error),
+) (Invocation, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	seq := i.next
+	logical, commandID, err := build(i.retryKey(seq))
+	if err != nil {
+		return Invocation{}, err
+	}
+	inv, err := i.build(seq, logical, commandID, deadlineMs)
+	if err != nil {
+		return Invocation{}, err
+	}
+	i.next = seq + 1
+	i.bound[seq] = commandID
+	return inv, nil
+}
+
 // Retry rebuilds an allocated sequence's invocation; the command id must
 // be the one bound at allocation (no implicit fresh identity).
 func (i *Instance) Retry(seq uint64, logical []byte, commandID [32]byte, deadlineMs uint32) (Invocation, error) {
