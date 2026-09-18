@@ -136,10 +136,10 @@ pub fn select(
         if !seen.insert(r.replica) {
             return Err(RecoveryError::DuplicateReport { replica: r.replica });
         }
-        if r.ballot != config.ballot {
+        if r.ballot != config.ballot() {
             return Err(RecoveryError::WrongBallot { replica: r.replica });
         }
-        if r.committed_ballot.epoch != config.epoch {
+        if r.committed_ballot.epoch != config.epoch() {
             return Err(RecoveryError::EpochMismatch { replica: r.replica });
         }
         for e in &r.entries {
@@ -213,7 +213,7 @@ pub fn select(
         reproposed.remove(c);
     }
     Ok(SyncDecision {
-        ballot: config.ballot,
+        ballot: config.ballot(),
         source_ballot,
         entries,
         reproposed,

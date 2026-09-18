@@ -38,21 +38,78 @@ pub enum ConfigurationError {
 }
 
 /// The quorum policy of one ballot in one configuration epoch.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Only [`BallotConfiguration::c2`] and [`BallotConfiguration::c1`]
+/// construct one, and decoding goes through the same validation, so every
+/// value in existence satisfies the quorum invariants (the leader is a
+/// voter in every fast set; a C2 fast set is exactly a majority).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BallotConfiguration {
     /// Configuration epoch (exact voter identities).
-    pub epoch: ConfigurationEpoch,
+    epoch: ConfigurationEpoch,
     /// Ballot; its leader leads every quorum.
-    pub ballot: Ballot,
+    ballot: Ballot,
     /// Exact voters of the epoch.
-    pub voters: BTreeSet<ReplicaId>,
+    voters: BTreeSet<ReplicaId>,
     /// C2: the fixed fast set. C1: every voter is eligible.
-    pub fast_set: BTreeSet<ReplicaId>,
+    fast_set: BTreeSet<ReplicaId>,
     /// Fast-quorum class.
-    pub class: FastQuorumClass,
+    class: FastQuorumClass,
+}
+
+/// The encoded shape of a configuration; validated before it becomes one.
+#[derive(Deserialize)]
+struct RawConfiguration {
+    epoch: ConfigurationEpoch,
+    ballot: Ballot,
+    voters: BTreeSet<ReplicaId>,
+    fast_set: BTreeSet<ReplicaId>,
+    class: FastQuorumClass,
+}
+
+impl<'de> Deserialize<'de> for BallotConfiguration {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawConfiguration::deserialize(deserializer)?;
+        let config = BallotConfiguration {
+            epoch: raw.epoch,
+            ballot: raw.ballot,
+            voters: raw.voters,
+            fast_set: raw.fast_set,
+            class: raw.class,
+        };
+        config
+            .validate()
+            .map_err(|e| serde::de::Error::custom(alloc::format!("{e:?}")))?;
+        Ok(config)
+    }
 }
 
 impl BallotConfiguration {
+    /// Configuration epoch.
+    pub const fn epoch(&self) -> ConfigurationEpoch {
+        self.epoch
+    }
+
+    /// The ballot.
+    pub const fn ballot(&self) -> Ballot {
+        self.ballot
+    }
+
+    /// Exact voters of the epoch.
+    pub const fn voters(&self) -> &BTreeSet<ReplicaId> {
+        &self.voters
+    }
+
+    /// The fast set (every voter for C1).
+    pub const fn fast_set(&self) -> &BTreeSet<ReplicaId> {
+        &self.fast_set
+    }
+
+    /// Fast-quorum class.
+    pub const fn class(&self) -> FastQuorumClass {
+        self.class
+    }
+
     /// A C2 configuration with a fixed fast set (majority-sized, including
     /// the leader).
     pub fn c2(

@@ -42,6 +42,88 @@
         ]
       }
     },
+    "first_learned": [
+      {
+        "Fast": {
+          "deps": [
+            [
+              250,
+              139,
+              144,
+              139,
+              127,
+              58,
+              74,
+              245,
+              183,
+              222,
+              225,
+              19,
+              166,
+              136,
+              125,
+              31,
+              180,
+              140,
+              149,
+              187,
+              247,
+              13,
+              181,
+              189,
+              188,
+              208,
+              191,
+              120,
+              81,
+              134,
+              98,
+              222
+            ]
+          ]
+        }
+      },
+      {
+        "Slow": {
+          "deps": [
+            [
+              250,
+              139,
+              144,
+              139,
+              127,
+              58,
+              74,
+              245,
+              183,
+              222,
+              225,
+              19,
+              166,
+              136,
+              125,
+              31,
+              180,
+              140,
+              149,
+              187,
+              247,
+              13,
+              181,
+              189,
+              188,
+              208,
+              191,
+              120,
+              81,
+              134,
+              98,
+              222
+            ]
+          ]
+        }
+      }
+    ],
     "rejected": {
       "duplicate-fast-from-ReplicaId(01010101010101010101010101010101)": "Duplicate",
       "observer-r9-fast": "NotAVoter",
@@ -51,7 +133,7 @@
   },
   {
     "name": "forged-proposal-and-redelivered-adoption",
-    "permutations": 120,
+    "permutations": 720,
     "learned": {
       "Slow": {
         "deps": [
@@ -92,9 +174,52 @@
         ]
       }
     },
+    "first_learned": [
+      {
+        "Slow": {
+          "deps": [
+            [
+              250,
+              139,
+              144,
+              139,
+              127,
+              58,
+              74,
+              245,
+              183,
+              222,
+              225,
+              19,
+              166,
+              136,
+              125,
+              31,
+              180,
+              140,
+              149,
+              187,
+              247,
+              13,
+              181,
+              189,
+              188,
+              208,
+              191,
+              120,
+              81,
+              134,
+              98,
+              222
+            ]
+          ]
+        }
+      }
+    ],
     "rejected": {
       "duplicate-fast-from-ReplicaId(00000000000000000000000000000000)": "Duplicate",
       "duplicate-slow-from-ReplicaId(02020202020202020202020202020202)": "Duplicate",
+      "leader-without-seqnum": "MissingSequence",
       "r1-forged-proposal": "ForgedProposal"
     }
   },
@@ -141,12 +266,55 @@
         ]
       }
     },
+    "first_learned": [
+      {
+        "Slow": {
+          "deps": [
+            [
+              250,
+              139,
+              144,
+              139,
+              127,
+              58,
+              74,
+              245,
+              183,
+              222,
+              225,
+              19,
+              166,
+              136,
+              125,
+              31,
+              180,
+              140,
+              149,
+              187,
+              247,
+              13,
+              181,
+              189,
+              188,
+              208,
+              191,
+              120,
+              81,
+              134,
+              98,
+              222
+            ]
+          ]
+        }
+      }
+    ],
     "rejected": {}
   },
   {
     "name": "arbitrary-fastest-majority-is-not-c2",
     "permutations": 2,
     "learned": null,
+    "first_learned": [],
     "rejected": {
       "r2-fast-outside-fast-set": "NotInFastSet"
     }
@@ -155,6 +323,7 @@
     "name": "no-leader-proposal",
     "permutations": 2,
     "learned": null,
+    "first_learned": [],
     "rejected": {}
   }
 ]
