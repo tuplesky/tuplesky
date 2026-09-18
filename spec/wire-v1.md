@@ -150,3 +150,21 @@ vote. Frozen error codes of `ResponseV1::Err` are `wire_v1::codes` in
 backpressure, `0x0003` malformed request, `0x0004` not admitted, `0x0005`
 result too large; append-only); pending and unknown outcomes use
 the `Pending` and `Unknown` outcomes, not error codes.
+
+## API session binding (task-37)
+
+An API-class connection carries no session until its first frame after
+`Hello` binds one. Two raw kinds in the API range:
+
+| Kind | Value | Direction | Payload |
+|---|---|---|---|
+| Bind | `0x0105` | client to frontend | `BindV1 { token }`: the STS service token (at most 8 KiB) |
+| BindAck | `0x0106` | frontend to client | `BindAckV1 { session, expires_at, scope, rule_generation }` |
+
+The frontend verifies the token locally against the STS's published keys
+under its clock health; a rejected binding closes the connection with
+code `2`. A later `Bind` on the same connection (rebind) must carry the
+same session: it refreshes validity, never identity or ceiling. Nothing
+is admitted before a binding, or after its validity ends; watches and
+results of already admitted work are released only through the fresh
+authorization barrier of `coord-session`.
