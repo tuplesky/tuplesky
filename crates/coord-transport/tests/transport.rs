@@ -468,7 +468,8 @@ async fn no_application_zero_rtt() {
     assert_eq!(Transport::tls_profile().max_early_data_size, 0);
     assert!(!Transport::tls_profile().client_early_data);
     assert!(Transport::tls_profile().tls13_only);
-    assert!(Transport::tls_profile().client_certificate_required);
+    assert!(Transport::tls_profile().peer_mutual_tls);
+    assert!(Transport::tls_profile().api_mutual_tls_for_trusted_roles);
     let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
     let mut acceptor = bind(&f, 0);
     // A raw client that would use early data if the server allowed it.
@@ -783,4 +784,149 @@ async fn fan_out_admits_each_destination_on_its_own_and_groups_share_fairly() {
     // Node-wide accounting covers both destinations.
     let (_, node_peak) = a.node_budget();
     assert!(node_peak > 0 && node_peak <= 96 * 1024);
+}
+
+/// Open a raw QUIC connection to `acceptor` offering `alpn`, with a
+/// client certificate only when `identity` is given, and send `first` as
+/// the first control frame. Returns how the acceptor ended it.
+async fn raw_first_frame(
+    f: &Fixture,
+    acceptor: &mut Transport,
+    server: &TestIdentity,
+    alpn: &[u8],
+    identity: Option<&TestIdentity>,
+    first: Vec<u8>,
+) -> (Option<CloseReason>, bool) {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(f.ca.roots());
+    let mut client = match identity {
+        Some(id) => builder
+            .with_client_auth_cert(id.chain.clone(), id.key.clone_key())
+            .unwrap(),
+        None => builder.with_no_client_auth(),
+    };
+    client.alpn_protocols = vec![alpn.to_vec()];
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(client).unwrap(),
+    )));
+    let addr = acceptor.local_addr().unwrap();
+    let Ok(conn) = endpoint.connect(addr, &server.name).unwrap().await else {
+        // The handshake itself failed: nothing reaches negotiation.
+        return (None, false);
+    };
+    // A rejected certificate surfaces as a connection error here rather
+    // than at `connect`, because QUIC carries the alert asynchronously.
+    let Ok((mut send, _recv)) = conn.open_bi().await else {
+        return (None, false);
+    };
+    if send.write_all(&first).await.is_err() {
+        return (None, false);
+    }
+    let mut connected = false;
+    let reason = loop {
+        match event(acceptor).await {
+            TransportEvent::Connected { .. } => connected = true,
+            TransportEvent::Closed { reason, .. } => break Some(reason),
+            _ => {}
+        }
+        if connected {
+            break None;
+        }
+    };
+    conn.close(0u32.into(), b"");
+    (reason, connected)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_reaches_the_api_plane_without_a_client_certificate() {
+    let f = fixture(&[PeerRole::Voter]);
+    let mut acceptor = bind(&f, 0);
+    let (reason, connected) = raw_first_frame(
+        &f,
+        &mut acceptor,
+        &f.ids[0],
+        ALPN_API,
+        None,
+        hello_with(
+            PeerRole::Client,
+            CLUSTER,
+            None,
+            vec![Lane::Unary.capability()],
+        ),
+    )
+    .await;
+    assert!(connected, "anonymous client refused: {reason:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_api_role_that_acts_for_others_is_refused_without_a_client_certificate() {
+    let f = fixture(&[PeerRole::Voter]);
+    let mut acceptor = bind(&f, 0);
+    for role in [PeerRole::Frontend, PeerRole::KineCollector] {
+        let (reason, connected) = raw_first_frame(
+            &f,
+            &mut acceptor,
+            &f.ids[0],
+            ALPN_API,
+            None,
+            hello_with(role, CLUSTER, None, vec![Lane::Unary.capability()]),
+        )
+        .await;
+        assert!(!connected, "{role:?} negotiated anonymously");
+        assert!(
+            matches!(reason, Some(CloseReason::Rejected(_))),
+            "{role:?}: {reason:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_peer_plane_still_requires_a_client_certificate() {
+    let f = fixture(&[PeerRole::Voter]);
+    let mut acceptor = bind(&f, 0);
+    let (reason, connected) = raw_first_frame(
+        &f,
+        &mut acceptor,
+        &f.ids[0],
+        ALPN_PEER,
+        None,
+        hello(PeerRole::Voter, CLUSTER, Some(inc(1))),
+    )
+    .await;
+    assert!(!connected, "a voter negotiated without a certificate");
+    assert!(
+        reason.is_none() || matches!(reason, Some(CloseReason::Rejected(_))),
+        "{reason:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_certificate_outside_the_trust_anchors_is_refused_on_both_planes() {
+    let f = fixture(&[PeerRole::Voter]);
+    let other = TestCa::new();
+    let stranger = other.issue("stranger", r(9), inc(1), PeerRole::Client);
+    let mut acceptor = bind(&f, 0);
+    for (alpn, first) in [
+        (
+            ALPN_API,
+            hello_with(
+                PeerRole::Client,
+                CLUSTER,
+                None,
+                vec![Lane::Unary.capability()],
+            ),
+        ),
+        (ALPN_PEER, hello(PeerRole::Voter, CLUSTER, Some(inc(1)))),
+    ] {
+        let (reason, connected) =
+            raw_first_frame(&f, &mut acceptor, &f.ids[0], alpn, Some(&stranger), first).await;
+        assert!(
+            !connected,
+            "an untrusted certificate negotiated: {reason:?}"
+        );
+    }
 }
