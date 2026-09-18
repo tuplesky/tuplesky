@@ -1,0 +1,29 @@
+[package]
+name = "coord-collector"
+description = "Trusted frontend collector: admission, parallel voter fan-out, source-exact evidence collection and native unary/watch dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+coord-core.workspace = true
+coord-consensus.workspace = true
+coord-state.workspace = true
+coord-storage.workspace = true
+serde = { workspace = true, features = ["std"] }
+postcard.workspace = true
+
+[dev-dependencies]
+coord-store-api.workspace = true
+coord-store-testkit.workspace = true
+coord-transport.workspace = true
+coord-transport-testkit.workspace = true
+coord-transport-sim.workspace = true
+serde_json.workspace = true
