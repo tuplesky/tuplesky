@@ -576,7 +576,7 @@ impl Leader {
         let fast = |c: &CommandId| learner.learned_fast(c);
         let gate = ReleaseGate {
             epoch: self.config.identity.epoch,
-            ballot: self.config.quorum.ballot,
+            ballot: self.config.quorum.ballot(),
             committed: &committed,
             fast: &fast,
         };
