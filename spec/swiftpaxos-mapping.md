@@ -75,6 +75,18 @@ must be re-checked against the paper text at the task-19 review.
 | `stopDescs` / `repchan.stop` during recovery | `[EXT]` vote-producing callbacks completing after a same-boot election update bookkeeping but never send (Section 4.8) | `coord_core::outbox::Outbox::release` with `BallotState::promised` | `tests/ballot.rs::a_same_boot_election_fences_obsolete_vote_callbacks` |
 | `getCmdDescSeq` / `getDepAndHashes` / `keyInfo` | Initialization binds payload, computes dependencies and publishes the index in one transition; a descriptor without payload is a placeholder invisible to lookups and guards (Section 4.7) | `CommandTable::{expect, initialize, conflicts, phase_of}` | `tests/ballot.rs::initialization_publishes_atomically_and_placeholders_are_invisible` |
 
+## Dependency graph and path evidence (task-21)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| `HashLog.Append` (`swift/dpath.go`) | Per-key hash chain over commands in local order; the head is the path evidence a fast acknowledgement carries | `graph::PathLog::append`, `chain`, `CommandRecord::{paths, path}` | `tests/graph.rs::direct_set_equality_differs_from_full_path_evidence` |
+| `HashLog.Update` / `recordLeaderHash` / `updateLogs` / `pendingUpd` | The leader's sequence number and digest synchronize the follower's prefix; early leader evidence is applied at the append; the head is recomputed over the pending suffix (no compression) | `PathLog::sync`, `CommandTable::record_leader_path` | `tests/graph.rs::leader_synchronization_aligns_follower_paths` |
+| `SHashesEq` (per-key set equality of checksums) | Combined evidence independent of key listing order | `graph::combined_path` | direct-set test |
+| client `accept`: checksum equality, not `Dep.Equals` | Direct-set equality is not path equality: equal `deps` with different prefixes yield different evidence and no fast path | `vote::VoteSet::learned` (path), test | direct-set test |
+| `deliver`: waits until every `desc.dep` is delivered (direct only) | `[EXT]` exact transitive closure, budgeted per turn (Section 18.2), stopping on a placeholder/unknown dependency | `graph::ClosureCursor::step`, `CommandTable::{closure_start, closure_step}` | `tests/graph.rs::closure_traversal_is_exact_and_incremental` |
+| `descPool` / `MaxDescRoutines` / `HISTORY_SIZE` | `[EXT]` bounded capacity refuses new work; unresolved acceptance is never evicted; only executed records retire | `CommandTable::{with_capacity, retire}`, `InitError::Backpressure`, `RetireError` | `tests/graph.rs::backpressure_refuses_new_work_without_deleting_unresolved_acceptance` |
+| `history[]` (volatile) | `[EXT]` required dependency state is a `protocol_v1` row per command (Section 5.2) | `rows::{dependency_key, dependency_update, decode_dependency}` | `tests/graph.rs::dependency_rows_round_trip` |
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |

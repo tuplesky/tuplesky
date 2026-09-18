@@ -8,13 +8,20 @@ use coord_core::effect::StoreUpdate;
 use coord_store_api::engine::{EngineError, ErrorClass};
 use coord_store_api::envelope::StoreEnvelopeV1;
 use coord_store_api::registry::Collection;
+use coord_types::CommandId;
 use coord_types::ids::{Ballot, ConfigurationEpoch};
+
+use crate::commands::CommandRecord;
 use serde::{Deserialize, Serialize};
 
 /// Record kind of the promise row.
 pub const PROMISE_KIND: u16 = 0x0001;
+/// Record kind of a command dependency row.
+pub const DEPENDENCY_KIND: u16 = 0x0002;
 /// Key tag of the promise row within an epoch.
 const PROMISE_TAG: u8 = 0x00;
+/// Key tag of command dependency rows within an epoch.
+const DEPENDENCY_TAG: u8 = 0x01;
 
 /// The durable promise of one replica in one epoch: the highest ballot it
 /// promised (no lower ballot is voted after it) and the ballot it last
@@ -70,5 +77,54 @@ pub fn promise_update(
         collection: Collection::ProtocolV1.id(),
         key: promise_key(epoch),
         value: Some(encode_promise(record)?),
+    })
+}
+
+/// `protocol_v1` key of a command's dependency row in an epoch.
+pub fn dependency_key(epoch: ConfigurationEpoch, command: &CommandId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(41);
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.push(DEPENDENCY_TAG);
+    out.extend_from_slice(command.as_bytes());
+    out
+}
+
+/// Encode a command's required dependency state (phase, dependencies,
+/// payload binding and path evidence).
+pub fn encode_dependency(record: &CommandRecord) -> Result<Vec<u8>, EngineError> {
+    let payload = postcard::to_allocvec(record)
+        .map_err(|_| EngineError::new(ErrorClass::Limit, "dependency encode"))?;
+    StoreEnvelopeV1 {
+        record_kind: DEPENDENCY_KIND,
+        schema_version: 1,
+        payload,
+    }
+    .encode()
+}
+
+/// Decode a dependency row.
+pub fn decode_dependency(bytes: &[u8]) -> Result<CommandRecord, EngineError> {
+    let env = StoreEnvelopeV1::decode(bytes)?;
+    if env.record_kind != DEPENDENCY_KIND || env.schema_version != 1 {
+        return Err(EngineError::new(ErrorClass::Corrupt, "dependency record"));
+    }
+    let (record, rest): (CommandRecord, &[u8]) = postcard::take_from_bytes(&env.payload)
+        .map_err(|_| EngineError::new(ErrorClass::Corrupt, "dependency record"))?;
+    if !rest.is_empty() {
+        return Err(EngineError::new(ErrorClass::Corrupt, "dependency record"));
+    }
+    Ok(record)
+}
+
+/// The update persisting a command's dependency row.
+pub fn dependency_update(
+    epoch: ConfigurationEpoch,
+    command: &CommandId,
+    record: &CommandRecord,
+) -> Result<StoreUpdate, EngineError> {
+    Ok(StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: dependency_key(epoch, command),
+        value: Some(encode_dependency(record)?),
     })
 }
