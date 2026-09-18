@@ -134,15 +134,30 @@ pub struct RootLock {
 }
 
 impl RootLock {
-    fn acquire(root: &Path) -> Result<RootLock, OpenError> {
-        std::fs::create_dir_all(root)?;
+    /// Acquire the root lock. `create` is only for [`Generation::create`]:
+    /// opening an existing root must not create the directory or the lock
+    /// file, so a misspelled or absent root reports `NotInitialized` and
+    /// leaves no artifacts behind.
+    fn acquire(root: &Path, create: bool) -> Result<RootLock, OpenError> {
+        if create {
+            std::fs::create_dir_all(root)?;
+        } else if !root.is_dir() {
+            return Err(OpenError::NotInitialized);
+        }
         let path = root.join("lock");
-        let file = File::options()
+        let file = match File::options()
             .read(true)
             .write(true)
-            .create(true)
+            .create(create)
             .truncate(false)
-            .open(&path)?;
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(OpenError::NotInitialized);
+            }
+            Err(e) => return Err(OpenError::Io(e)),
+        };
         match file.try_lock() {
             Ok(()) => Ok(RootLock { _file: file, path }),
             Err(std::fs::TryLockError::WouldBlock) => Err(OpenError::Busy),
@@ -190,7 +205,7 @@ impl Generation {
         identity: StoreIdentity,
         options: OpenOptions,
     ) -> Result<Generation, OpenError> {
-        let lock = RootLock::acquire(root)?;
+        let lock = RootLock::acquire(root, true)?;
         if root.join(CURRENT).exists() {
             return Err(OpenError::AlreadyInitialized);
         }
@@ -276,7 +291,7 @@ impl Generation {
         expected: StoreIdentity,
         options: OpenOptions,
     ) -> Result<Generation, OpenError> {
-        let lock = RootLock::acquire(root)?;
+        let lock = RootLock::acquire(root, false)?;
         let current = match std::fs::read(root.join(CURRENT)) {
             Ok(bytes) => String::from_utf8(bytes)
                 .map_err(|_| OpenError::Corrupt("CURRENT is not UTF-8".into()))?,
@@ -376,6 +391,7 @@ impl Generation {
                 &manifest.incarnation.to_be_bytes(),
             )?;
             check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
+            check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
         }
         Ok(Generation {
             engine: RedbEngine::from_database(db, db_path, options.cache_bytes),

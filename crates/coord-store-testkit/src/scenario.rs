@@ -163,7 +163,7 @@ fn is_engine_private(collection: u16, key: &[u8]) -> bool {
 fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
     let view = engine.reader().snapshot().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for c in referenced {
+    for c in Collection::ALL {
         let mut request = ScanRequest::all(64, 1 << 20);
         let mut pages = 0u32;
         let mut last_key: Option<Vec<u8>> = None;
@@ -176,7 +176,7 @@ fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
                 ));
             }
             let page = view
-                .scan_page(CollectionId(c), &request)
+                .scan_page(c.id(), &request)
                 .map_err(|e| e.to_string())?;
             // Every page must advance strictly past the previous cursor; an
             // adapter that ignores `resume_after` is nonconformant, not a

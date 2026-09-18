@@ -133,6 +133,10 @@ fn cross_collection_atomicity_with_read_your_writes_scans() {
     // Outstanding handles keep the file open: a crash reopen fails closed
     // until they are gone (a second opener is excluded, never tolerated).
     assert!(h.engine().reopen().is_err());
+    assert!(
+        !h.engine().is_quarantined(),
+        "refused before closing anything"
+    );
     drop(before);
     drop(reader);
     h.engine().reopen().unwrap();
@@ -161,6 +165,17 @@ fn open_never_creates_and_create_never_reinitializes() {
         !dir.path().join("CURRENT").exists(),
         "open must not create anything"
     );
+    assert!(
+        !dir.path().join("lock").exists(),
+        "open must not create the lock file"
+    );
+    // A root that does not exist at all stays absent after a failed open.
+    let absent = dir.path().join("missing");
+    assert!(matches!(
+        Generation::open_existing(&absent, identity(), options()),
+        Err(OpenError::NotInitialized)
+    ));
+    assert!(!absent.exists(), "open must not create the root directory");
     let g = Generation::create(dir.path(), identity(), options()).unwrap();
     assert_eq!(g.manifest().generation, 1);
     drop(g);
@@ -305,5 +320,59 @@ fn damaged_files_fail_closed() {
     assert!(matches!(
         Generation::open_existing(other.path(), identity(), options()),
         Err(OpenError::IdentityRecordMismatch("domain_id"))
+    ));
+}
+
+#[test]
+fn failed_reopen_quarantines_the_engine_until_a_reopen_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = RedbHarness::create(dir.path());
+    let db = dir.path().join("gen-000001").join("domain.redb");
+    // Hide the file: the reopen cannot verify it, and the placeholder must
+    // not become a usable database.
+    std::fs::rename(&db, dir.path().join("hidden")).unwrap();
+    assert!(h.engine().reopen().is_err());
+    assert!(h.engine().is_quarantined());
+    assert!(
+        h.engine().reader().snapshot().is_err(),
+        "no reads while quarantined"
+    );
+    assert!(
+        h.engine().begin_write().is_err(),
+        "no writes while quarantined"
+    );
+    // Restoring the file lets a later reopen succeed and serve again.
+    std::fs::rename(dir.path().join("hidden"), &db).unwrap();
+    h.engine().reopen().unwrap();
+    assert!(!h.engine().is_quarantined());
+    h.engine().reader().snapshot().unwrap();
+    let mut tx = h.engine().begin_write().unwrap();
+    tx.put(Collection::KvCurrentV1.id(), b"q", b"1").unwrap();
+    tx.commit_durable().unwrap();
+}
+
+#[test]
+fn profile_identity_record_is_verified_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Generation::create(dir.path(), identity(), options()).unwrap());
+    let db_path = dir.path().join("gen-000001").join("domain.redb");
+    {
+        let db = redb::Database::open(&db_path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn
+                .open_table(coord_storage_redb::engine::table_definition(
+                    Collection::MetaV1,
+                ))
+                .unwrap();
+            table
+                .insert(b"profile".as_slice(), b"other".as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    assert!(matches!(
+        Generation::open_existing(dir.path(), identity(), options()),
+        Err(OpenError::IdentityRecordMismatch("profile"))
     ));
 }
