@@ -553,6 +553,7 @@ async fn transport_completion_is_not_durability_or_establishment() {
             TransportEvent::Connected { .. } => "connected",
             TransportEvent::PeerFrame { .. } => "frame",
             TransportEvent::ApiRequest { .. } => "request",
+            TransportEvent::ApiDelivery { .. } => "delivery",
             TransportEvent::Closed { .. } => "closed",
         });
     }
@@ -561,7 +562,10 @@ async fn transport_completion_is_not_durability_or_establishment() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_is_bounded_and_stream_bounds_hold() {
-    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    // A third identity for the raw client: one connection per lane is a
+    // rule now, so a raw dial under r(1)'s identity would displace b's
+    // connection instead of standing beside it.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter, PeerRole::Voter]);
     let mut a = bind(&f, 0);
     let mut b = bind(&f, 1);
     connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
@@ -574,7 +578,7 @@ async fn shutdown_is_bounded_and_stream_bounds_hold() {
         TransportEvent::Connected { .. }
     ));
     // A one-frame stream with trailing bytes closes the connection.
-    let raw = raw_client(&f, &f.ids[1], ALPN_PEER);
+    let raw = raw_client(&f, &f.ids[2], ALPN_PEER);
     let conn = raw
         .connect(a.local_addr().unwrap(), &f.ids[0].name)
         .unwrap()
@@ -968,22 +972,182 @@ async fn the_frame_deadline_bounds_the_whole_peer_send() {
         TransportEvent::Connected { .. } => {}
         other => panic!("{other:?}"),
     }
-    // Far more than the peer's window, and it never reads a byte.
+    // Far more than the peer's window, and it never reads a byte. The
+    // queue accepts it; the lane's sender opens the stream and then
+    // waits on credit that never comes.
     let big = evidence_frame(&vec![7u8; 256 * 1024]).unwrap();
+    acceptor
+        .send(
+            coord_transport::Destination::Replica {
+                replica: r(1),
+                incarnation: inc(1),
+                lane: Lane::Control,
+            },
+            DOMAIN,
+            big,
+        )
+        .expect("queued");
+    // With one deadline over the whole frame the sender gives up and
+    // counts the loss; without it the write stays pending forever and
+    // this lane never sends again.
     let started = std::time::Instant::now();
-    let sent = timeout(
-        Duration::from_secs(20),
-        acceptor.send_peer(r(1), inc(1), big),
-    )
-    .await
-    .expect("the send returns rather than hanging");
-    assert!(
-        matches!(sent, Err(coord_transport::SendError::Timeout)),
-        "{sent:?}"
+    loop {
+        let stats = acceptor
+            .stats(r(1), inc(1), Lane::Control)
+            .expect("the lane exists");
+        if stats.refused > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the sender never gave up: {stats:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_connection_on_one_lane_replaces_and_closes_the_first() {
+    // One connection per lane. A second dial of the same lane by the same
+    // replica takes the slot; leaving the displaced connection open would
+    // keep its receive loop, streams and windows alive, so repeated dials
+    // would multiply exactly the capacity the lane bounds.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut a = bind(&f, 0);
+    let mut b = bind(&f, 1);
+    connect_lane(&b, &a, &f.ids[0], Lane::Control).await;
+    assert!(matches!(
+        event(&mut a).await,
+        TransportEvent::Connected { .. }
+    ));
+    assert!(matches!(
+        event(&mut b).await,
+        TransportEvent::Connected { .. }
+    ));
+    assert_eq!(a.connections(), 1);
+    connect_lane(&b, &a, &f.ids[0], Lane::Control).await;
+    // The acceptor sees the new connection and the old one ending; the
+    // order of the two is not fixed.
+    let mut seen = (false, false);
+    while !(seen.0 && seen.1) {
+        match event(&mut a).await {
+            TransportEvent::Connected { .. } => seen.0 = true,
+            TransportEvent::Closed { .. } => seen.1 = true,
+            other => panic!("{other:?}"),
+        }
+    }
+    // Settle: exactly one connection for the lane, not two.
+    for _ in 0..50 {
+        if a.connections() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(a.connections(), 1, "the displaced connection is closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_link_is_not_kept_for_the_process_lifetime() {
+    // Every API connection and every replica incarnation is its own link
+    // key. Keeping an emptied link would retain its queues, semaphores
+    // and counters for as long as the endpoint lives, so ordinary
+    // connect/disconnect churn would grow without bound.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut a = bind(&f, 0);
+    assert_eq!(a.links(), 0);
+    for _ in 0..4 {
+        let b = bind(&f, 1);
+        connect_lane(&b, &a, &f.ids[0], Lane::Control).await;
+        assert!(matches!(
+            event(&mut a).await,
+            TransportEvent::Connected { .. }
+        ));
+        assert_eq!(a.links(), 1);
+        b.shutdown(Duration::from_secs(2)).await;
+        match event(&mut a).await {
+            TransportEvent::Closed { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        for _ in 0..50 {
+            if a.links() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(a.links(), 0, "the emptied link is released");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_is_admitted_under_the_same_budgets_as_any_other_traffic() {
+    // A reply is traffic. Writing it straight to the stream would let
+    // concurrent unary requests, or many API connections, hand window
+    // after window to QUIC outside the node and destination caps the
+    // lanes exist to enforce.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    assert_eq!(acceptor.node_budget(), (0, 0));
+    let client = raw_client(&f, &f.ids[1], ALPN_API);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut control, _control_recv) = conn.open_bi().await.unwrap();
+    control
+        .write_all(&hello_with(
+            PeerRole::Frontend,
+            CLUSTER,
+            None,
+            vec![Lane::Unary.capability()],
+        ))
+        .await
+        .unwrap();
+    match event(&mut acceptor).await {
+        TransportEvent::Connected { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&request_frame()).await.unwrap();
+    send.finish().unwrap();
+    let responder = match event(&mut acceptor).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+    let reply = evidence_frame(&vec![3u8; 64 * 1024]).unwrap();
+    let size = reply.len();
+    responder.respond(reply).await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Some(n) = recv.read(&mut buf).await.unwrap() {
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got.len(), size, "the reply arrived whole");
+    // The reply passed through the node budget on its way out.
+    let (_, peak) = acceptor.node_budget();
+    assert!(peak >= size, "the reply was never charged: peak {peak}");
+}
+
+/// A minimal well-formed unary request frame.
+fn request_frame() -> Vec<u8> {
+    let mut request = coord_types::logical_v1::LogicalRequest::new(
+        coord_types::ids::NamespaceId([5; 16]),
+        coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+            key: vec![1],
+            value: vec![2],
+            lease: None,
+            prev_kv: false,
+        }),
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "it gave up at the frame deadline: {:?}",
-        started.elapsed()
-    );
+    request.canonicalize();
+    let retry_key = coord_types::RetryKey {
+        cluster_id: CLUSTER,
+        domain_id: DOMAIN,
+        session_id: coord_types::ids::SessionId([3; 16]),
+        client_instance_id: coord_types::ids::ClientInstanceId([4; 16]),
+        request_sequence: coord_types::ids::RequestSequence::new(1).unwrap(),
+    };
+    MessageV1::Request(coord_types::wire_v1::RequestV1::new(retry_key, &request, 0).unwrap())
+        .encode()
+        .unwrap()
 }
