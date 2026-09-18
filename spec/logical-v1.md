@@ -8,7 +8,7 @@ Normative companion to `crates/coord-types`. Design references: Sections 2.3,
 
 | Type | Encoding | Rule |
 |---|---|---|
-| `ClusterId`, `DomainId`, `NamespaceId`, `SessionId`, `ClientInstanceId`, `ReplicaId`, `LeaseId`, `ReadFenceId` | 16 opaque bytes | Allocated at a trusted boundary or derived; exact length on decode |
+| `ClusterId`, `DomainId`, `NamespaceId`, `SessionId`, `ClientInstanceId`, `ReplicaId`, `LeaseId`, `ReadFenceId`, `PrincipalId` | 16 opaque bytes | Allocated at a trusted boundary or derived; exact length on decode |
 | `KvRevision` | u64 big-endian, max `i64::MAX` | Advances once per KV-mutating command; overflow stops |
 | `ExecutionPosition`, `ConfigurationEpoch`, `EndpointGeneration`, `CatalogGeneration`, `LocalJournalSeq`, `FinalizedFrameSeq`, `RequestSequence`, `LeaseGeneration`, `ReplicaIncarnation` | u64 big-endian | Distinct types, no conversions, never wrap or recycle |
 | `Ballot` | `(epoch, number, leader)` | Comparable only within one epoch |

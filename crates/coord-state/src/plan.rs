@@ -3,9 +3,10 @@
 use alloc::vec::Vec;
 
 use coord_core::effect::ApplyBase;
-use coord_types::ids::{ExecutionPosition, KvRevision, LeaseId};
+use coord_types::ids::{ExecutionPosition, KvRevision, LeaseGeneration, LeaseId};
 use serde::{Deserialize, Serialize};
 
+use crate::lease::LeaseRecord;
 use crate::view::KvEntry;
 
 /// One item of a range result.
@@ -54,6 +55,44 @@ pub enum Outcome {
     ErrCompacted,
     /// Requested revision is above the current revision.
     ErrFutureRevision,
+    /// A native lease was granted.
+    LeaseGranted {
+        /// Lease identity (derived from the stable request).
+        lease_id: LeaseId,
+        /// Ownership generation.
+        generation: LeaseGeneration,
+        /// Granted TTL in seconds.
+        ttl_seconds: u32,
+    },
+    /// A lease was revoked and its attached keys deleted atomically.
+    LeaseRevoked {
+        /// Keys deleted.
+        deleted: u64,
+    },
+    /// Authoritative lease existence, generation and granted TTL. The
+    /// remaining time is a separately labelled scheduler estimate supplied
+    /// outside deterministic application (task-16), never part of the plan.
+    LeaseTimeToLive {
+        /// Lease identity.
+        lease_id: LeaseId,
+        /// Ownership generation.
+        generation: LeaseGeneration,
+        /// Granted TTL in seconds.
+        granted_ttl_seconds: u32,
+        /// Committed renewals.
+        renewal_sequence: u64,
+        /// Attached keys in order, when requested.
+        keys: Option<Vec<Vec<u8>>>,
+    },
+    /// The named lease does not exist, is not active or is not visible in
+    /// this namespace.
+    ErrLeaseNotFound,
+    /// A grant named an identity that already has a record (live or tombstone).
+    ErrLeaseExists,
+    /// The principal does not own the lease.
+    ErrLeasePermission,
+    /// Attachment count or deletion/event byte quota exceeded.
+    ErrLeaseQuota,
 }
 
 /// Response to the client: header revision plus outcome.
@@ -104,12 +143,17 @@ pub enum Mutation {
         /// Entry removed.
         prev: KvEntry,
     },
-    /// Attach the key to a lease (reverse index maintenance).
+    /// Attach the key to a lease, or refresh the binding of an already
+    /// attached key (reverse index maintenance).
     LeaseAttach {
         /// Lease.
         lease: LeaseId,
         /// Key.
         key: Vec<u8>,
+        /// Lease generation bound.
+        generation: LeaseGeneration,
+        /// Modification revision of the bound entry.
+        mod_revision: KvRevision,
     },
     /// Detach the key from a lease.
     LeaseDetach {
@@ -117,6 +161,13 @@ pub enum Mutation {
         lease: LeaseId,
         /// Key.
         key: Vec<u8>,
+    },
+    /// Write (create or replace) a lease record.
+    LeaseWrite {
+        /// Lease.
+        lease: LeaseId,
+        /// Complete new record.
+        record: LeaseRecord,
     },
     /// Advance the MVCC retention floor.
     CompactTo {

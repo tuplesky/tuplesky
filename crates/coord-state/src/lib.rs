@@ -15,16 +15,28 @@
 //!
 //! Semantic limits (Section 19.3) are checked before any plan is produced,
 //! so a rejected request leaves nothing to undo.
+//!
+//! Native leases (task-15; Section 7.1): [`lease::LeaseRecord`] carries the
+//! owner principal, generation, TTL and attachment accounting. Grant,
+//! attach, detach, revoke and time-to-live are planned here against the
+//! lease records and reverse index the view carries; ownership is checked
+//! against the view's principal, a revocation deletes exactly the current
+//! attachments in one revision, and count/byte quotas are rechecked on
+//! every write of an attached key. Lease errors are recorded outcomes
+//! (they advance execution and are retained for retries), not planner
+//! errors.
 #![forbid(unsafe_code)]
 #![no_std]
 #![warn(missing_docs)]
 extern crate alloc;
 
+pub mod lease;
 pub mod limits;
 pub mod plan;
 pub mod planner;
 pub mod view;
 
+pub use lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 pub use limits::PlanLimits;
 pub use plan::{ApplyPlan, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
 pub use planner::{PlanError, plan};

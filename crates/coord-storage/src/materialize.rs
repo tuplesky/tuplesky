@@ -15,7 +15,7 @@ use crate::worker::{StoreWorker, SubmitError};
 
 /// Lower a plan into the immutable batch materialization will apply:
 /// current rows, history versions, complete events of the revision, lease
-/// index rows, the KV revision frontier, the retention floor and, when the
+/// records and reverse-index rows, the KV revision frontier, the retention floor and, when the
 /// command has a stable invocation identity, its retry record and executed
 /// identity. The batch carries the plan's base so the worker rechecks it in
 /// the transaction.
@@ -73,11 +73,26 @@ pub fn plan_to_batch(
                     })?),
                 });
             }
-            Mutation::LeaseAttach { lease, key } => {
+            Mutation::LeaseAttach {
+                lease,
+                key,
+                generation,
+                mod_revision,
+            } => {
                 updates.push(StoreUpdate {
                     collection: Collection::LeaseKeysV1.id(),
                     key: codecs::lease_key(lease, &namespace, key),
-                    value: Some(codecs::encode_lease_key()?),
+                    value: Some(codecs::encode_lease_key(&codecs::LeaseKeyRecordV1 {
+                        generation: *generation,
+                        mod_revision: *mod_revision,
+                    })?),
+                });
+            }
+            Mutation::LeaseWrite { lease, record } => {
+                updates.push(StoreUpdate {
+                    collection: Collection::LeaseV1.id(),
+                    key: codecs::lease_row_key(lease),
+                    value: Some(codecs::encode_lease(record)?),
                 });
             }
             Mutation::LeaseDetach { lease, key } => {
