@@ -600,6 +600,7 @@ name = "coord-checkpoint"
 version = "0.1.0"
 dependencies = [
  "coord-core",
+ "coord-redb-faultkit",
  "coord-state",
  "coord-storage",
  "coord-storage-redb",

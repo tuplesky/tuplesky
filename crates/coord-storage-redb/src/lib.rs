@@ -13,8 +13,13 @@
 //! in-database identity record that must both match the expected origin,
 //! domain, replica, incarnation, generation and engine before a database is
 //! served. Missing, empty, corrupt or mismatched files are errors, never a
-//! cue to create or reinitialize. This is the strict single-store reference
-//! foundation; journal-first production arrives with task-j03.
+//! cue to create or reinitialize. It also implements the install target of a
+//! shared checkpoint (task-50): an [`lifecycle::InactiveGeneration`] is a new
+//! `gen-<n>` of this same engine, profile and schema, carrying the node's own
+//! identity, that is filled while the previous generation stays selected and
+//! becomes the selected one only after its data, directory and manifest are
+//! durable. This is the strict single-store reference foundation;
+//! journal-first production arrives with task-j03.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -23,7 +28,9 @@ pub mod lifecycle;
 pub mod manifest;
 
 pub use engine::{RedbEngine, RedbReader, RedbView, RedbWrite};
-pub use lifecycle::{Generation, OpenError, OpenOptions, RootLock, StoreIdentity};
+pub use lifecycle::{
+    ActivateStep, Generation, InactiveGeneration, OpenError, OpenOptions, RootLock, StoreIdentity,
+};
 pub use manifest::StoreManifestV1;
 
 /// Crate role marker used by the dependency-policy check.
