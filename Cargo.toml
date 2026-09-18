@@ -16,6 +16,8 @@ members = [
     "crates/coord-storage-redb",
     "crates/coord-redb-faultkit",
     "crates/coord-sim",
+    "crates/coord-transport",
+    "crates/coord-transport-testkit",
     "xtask",
     "tools/raft-engine-smoke",
 ]
@@ -43,12 +45,24 @@ coord-storage-redb = { path = "crates/coord-storage-redb" }
 coord-storage = { path = "crates/coord-storage" }
 coord-redb-faultkit = { path = "crates/coord-redb-faultkit" }
 coord-sim = { path = "crates/coord-sim" }
+coord-transport = { path = "crates/coord-transport" }
+coord-transport-testkit = { path = "crates/coord-transport-testkit" }
 
 # Encoding and identity (Section 16.2).
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "alloc"] }
 bytes = "=1.12.1"
 blake3 = "=1.8.7"
+
+# Transport (Section 16.2): QUIC over TLS 1.3 with the explicit AWS-LC
+# provider; Tokio stays outside the pure core (xtask check-deps).
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+quinn-proto = { version = "=0.11.17", default-features = false, features = ["rustls-aws-lc-rs"] }
+rustls = { version = "=0.23.44", default-features = false, features = ["std", "aws_lc_rs"] }
+rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+# Test certificates only (never a production dependency edge).
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs"] }
 
 # Storage (production state engine; not linked by common semantics).
 redb = { version = "=4.2.0", default-features = false, features = ["std"] }
