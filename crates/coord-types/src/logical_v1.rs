@@ -336,40 +336,56 @@ impl CanonicalOperation {
                         return Err(ValidationError::KeyTooLong);
                     }
                     cost += c.key.len();
-                    if let CompareOperand::Bytes(b) = &c.operand {
-                        if b.len() > limits::MAX_VALUE_BYTES {
-                            return Err(ValidationError::ValueTooLong);
+                    match (&c.target, &c.operand) {
+                        (
+                            CompareTarget::Version
+                            | CompareTarget::CreateRevision
+                            | CompareTarget::ModRevision,
+                            CompareOperand::Counter(_),
+                        )
+                        | (CompareTarget::Lease, CompareOperand::Lease(_)) => {}
+                        (CompareTarget::Value, CompareOperand::Bytes(b)) => {
+                            if b.len() > limits::MAX_VALUE_BYTES {
+                                return Err(ValidationError::ValueTooLong);
+                            }
+                            cost += b.len();
                         }
-                        cost += b.len();
+                        _ => return Err(ValidationError::OperandMismatch),
                     }
                 }
                 for branch in [&txn.success, &txn.failure] {
-                    let mut written: Vec<&[u8]> = Vec::new();
+                    // Every write selector of the branch so far. A branch may
+                    // write each key at most once (design Section 6.4), so an
+                    // exact key or an interval delete must not select a key
+                    // any earlier write of the branch already selects.
+                    let mut written: Vec<WriteSelector<'_>> = Vec::new();
                     for op in branch {
-                        let key: Option<&[u8]> = match op {
+                        let selector = match op {
                             BranchOp::Range(r) => {
                                 cost += validate_range(r)?;
                                 None
                             }
                             BranchOp::Put(p) => {
                                 cost += validate_put(p)?;
-                                Some(&p.key)
+                                Some(WriteSelector {
+                                    key: &p.key,
+                                    end: None,
+                                })
                             }
                             BranchOp::DeleteRange(d) => {
                                 d.range.validate()?;
                                 cost += d.range.byte_cost();
-                                if d.range.range_end.is_none() {
-                                    Some(&d.range.key)
-                                } else {
-                                    None
-                                }
+                                Some(WriteSelector {
+                                    key: &d.range.key,
+                                    end: d.range.range_end.as_deref(),
+                                })
                             }
                         };
-                        if let Some(k) = key {
-                            if written.contains(&k) {
+                        if let Some(sel) = selector {
+                            if written.iter().any(|w| w.overlaps(&sel)) {
                                 return Err(ValidationError::DuplicateKeyInBranch);
                             }
-                            written.push(k);
+                            written.push(sel);
                         }
                     }
                 }
@@ -395,6 +411,25 @@ impl CanonicalOperation {
             return Err(ValidationError::RequestTooLarge);
         }
         Ok(())
+    }
+}
+
+/// The keys one branch write selects: an exact key or a half-open interval.
+#[derive(Clone, Copy)]
+struct WriteSelector<'a> {
+    key: &'a [u8],
+    end: Option<&'a [u8]>,
+}
+
+impl WriteSelector<'_> {
+    /// Whether some key is selected by both writes.
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self.end, other.end) {
+            (None, None) => self.key == other.key,
+            (Some(end), None) => self.key <= other.key && other.key < end,
+            (None, Some(end)) => other.key <= self.key && self.key < end,
+            (Some(a_end), Some(b_end)) => self.key < b_end && other.key < a_end,
+        }
     }
 }
 
@@ -526,6 +561,121 @@ mod tests {
             failure: vec![],
         });
         assert_eq!(txn.validate(), Err(ValidationError::DuplicateKeyInBranch));
+    }
+
+    fn put(key: &[u8]) -> BranchOp {
+        BranchOp::Put(PutOp {
+            key: key.to_vec(),
+            value: vec![],
+            lease: None,
+            prev_kv: false,
+        })
+    }
+
+    fn delete(key: &[u8], end: Option<&[u8]>) -> BranchOp {
+        BranchOp::DeleteRange(DeleteRangeOp {
+            range: KeyRange {
+                key: key.to_vec(),
+                range_end: end.map(<[u8]>::to_vec),
+            },
+            prev_kv: false,
+        })
+    }
+
+    fn branch(ops: Vec<BranchOp>) -> CanonicalOperation {
+        CanonicalOperation::Txn(TxnOp {
+            compares: vec![],
+            success: ops,
+            failure: vec![],
+        })
+    }
+
+    #[test]
+    fn overlapping_interval_writes_in_branch_are_rejected() {
+        let dup = Err(ValidationError::DuplicateKeyInBranch);
+        // Interval delete followed by a put inside it, and the reverse order.
+        assert_eq!(
+            branch(vec![delete(b"a", Some(b"z")), put(b"m")]).validate(),
+            dup
+        );
+        assert_eq!(
+            branch(vec![put(b"m"), delete(b"a", Some(b"z"))]).validate(),
+            dup
+        );
+        // Two overlapping interval deletes, including containment.
+        assert_eq!(
+            branch(vec![delete(b"a", Some(b"m")), delete(b"c", Some(b"z"))]).validate(),
+            dup
+        );
+        assert_eq!(
+            branch(vec![delete(b"a", Some(b"z")), delete(b"c", Some(b"d"))]).validate(),
+            dup
+        );
+        // Disjoint selectors are fine: the exclusive end is not selected.
+        assert_eq!(
+            branch(vec![delete(b"a", Some(b"m")), put(b"m")]).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            branch(vec![delete(b"a", Some(b"m")), delete(b"m", Some(b"z"))]).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            branch(vec![put(b"a"), delete(b"b", None), put(b"c")]).validate(),
+            Ok(())
+        );
+        // The failure branch is checked independently of the success branch.
+        let both = CanonicalOperation::Txn(TxnOp {
+            compares: vec![],
+            success: vec![put(b"m")],
+            failure: vec![delete(b"a", Some(b"z"))],
+        });
+        assert_eq!(both.validate(), Ok(()));
+    }
+
+    #[test]
+    fn compare_operands_must_match_their_targets() {
+        let compare = |target, operand| {
+            CanonicalOperation::Txn(TxnOp {
+                compares: vec![Compare {
+                    key: b"k".to_vec(),
+                    target,
+                    result: CompareResult::Equal,
+                    operand,
+                }],
+                success: vec![],
+                failure: vec![],
+            })
+        };
+        let bad = Err(ValidationError::OperandMismatch);
+        assert_eq!(
+            compare(CompareTarget::Value, CompareOperand::Counter(1)).validate(),
+            bad
+        );
+        assert_eq!(
+            compare(CompareTarget::Lease, CompareOperand::Bytes(vec![1])).validate(),
+            bad
+        );
+        assert_eq!(
+            compare(CompareTarget::ModRevision, CompareOperand::Lease(None)).validate(),
+            bad
+        );
+        assert_eq!(
+            compare(CompareTarget::Version, CompareOperand::Bytes(vec![])).validate(),
+            bad
+        );
+        assert_eq!(
+            compare(CompareTarget::Value, CompareOperand::Bytes(vec![1])).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            compare(CompareTarget::Lease, CompareOperand::Lease(None)).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            compare(CompareTarget::CreateRevision, CompareOperand::Counter(0)).validate(),
+            Ok(())
+        );
     }
 
     #[test]

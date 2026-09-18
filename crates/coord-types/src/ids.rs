@@ -89,8 +89,22 @@ fixed_id!(
 macro_rules! checked_counter {
     ($(#[$doc:meta])* $name:ident, max = $max:expr) => {
         $(#[$doc])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         pub struct $name(u64);
+
+        /// Decoding goes through [`Self::new`], so a serialized value above
+        /// [`Self::MAX`] is rejected exactly like a public construction.
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let raw = u64::deserialize(deserializer)?;
+                Self::new(raw).map_err(|_| {
+                    serde::de::Error::custom(concat!(
+                        stringify!($name),
+                        " exceeds its maximum"
+                    ))
+                })
+            }
+        }
 
         impl $name {
             /// Largest representable value.
@@ -263,6 +277,31 @@ impl Ballot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserialization_enforces_the_counter_bound() {
+        use serde::de::IntoDeserializer;
+        type E = serde::de::value::Error;
+        let below: Result<KvRevision, E> =
+            KvRevision::deserialize(KV_REVISION_MAX.into_deserializer());
+        assert_eq!(below.unwrap(), KvRevision::MAX);
+        let above: Result<KvRevision, E> =
+            KvRevision::deserialize((KV_REVISION_MAX + 1).into_deserializer());
+        assert!(above.is_err());
+        let above: Result<KvRevision, E> = KvRevision::deserialize(u64::MAX.into_deserializer());
+        assert!(above.is_err());
+        let unbounded: Result<ExecutionPosition, E> =
+            ExecutionPosition::deserialize(u64::MAX.into_deserializer());
+        assert_eq!(unbounded.unwrap(), ExecutionPosition::MAX);
+        // Postcard round trip of an encoded out-of-range value fails as well.
+        let bytes = postcard::to_allocvec(&u64::MAX).unwrap();
+        assert!(postcard::from_bytes::<KvRevision>(&bytes).is_err());
+        let bytes = postcard::to_allocvec(&KvRevision::MAX).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<KvRevision>(&bytes).unwrap(),
+            KvRevision::MAX
+        );
+    }
 
     #[test]
     fn revision_caps_at_i64_max() {
