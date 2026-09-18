@@ -14,7 +14,9 @@ use coord_transport::{
 };
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
-use coord_types::wire_v1::{BoundedVec, HEADER_LEN, HelloV1, MessageV1, PeerRole, encode_frame};
+use coord_types::wire_v1::{
+    BoundedVec, CloseV1, HEADER_LEN, HelloV1, MessageV1, PeerRole, encode_frame,
+};
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::time::timeout;
 
@@ -167,6 +169,15 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
 /// A raw client endpoint presenting `id`'s certificate, for driving the
 /// acceptor with hand-built frames.
 fn raw_client(f: &Fixture, id: &TestIdentity, alpn: &[u8]) -> quinn::Endpoint {
+    raw_client_with(f, id, alpn, Arc::new(quinn::TransportConfig::default()))
+}
+
+fn raw_client_with(
+    f: &Fixture,
+    id: &TestIdentity,
+    alpn: &[u8],
+    transport: Arc<quinn::TransportConfig>,
+) -> quinn::Endpoint {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut client = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -176,9 +187,10 @@ fn raw_client(f: &Fixture, id: &TestIdentity, alpn: &[u8]) -> quinn::Endpoint {
         .unwrap();
     client.alpn_protocols = vec![alpn.to_vec()];
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(client).unwrap(),
-    )));
+    let mut config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client).unwrap()));
+    config.transport_config(transport);
+    endpoint.set_default_client_config(config);
     endpoint
 }
 
@@ -518,5 +530,196 @@ async fn shutdown_is_bounded_and_stream_bounds_hold() {
             incarnation: None,
             capabilities: vec![],
         },
+    );
+}
+
+/// Negotiate a raw client by hand and return the live connection. Bytes
+/// in `pipelined` follow the hello in the same write, so they arrive in
+/// the same read the hello does.
+async fn negotiated(
+    f: &Fixture,
+    id: &TestIdentity,
+    alpn: &[u8],
+    acceptor: &mut Transport,
+    role: PeerRole,
+    pipelined: &[u8],
+) -> (quinn::Endpoint, quinn::Connection, quinn::SendStream) {
+    let client = raw_client(f, id, alpn);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    let mut first = hello(role, CLUSTER, Some(inc(1)));
+    first.extend_from_slice(pipelined);
+    send.write_all(&first).await.unwrap();
+    match event(acceptor).await {
+        TransportEvent::Connected { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    (client, conn, send)
+}
+
+/// A peer-evidence frame with its kind or version overwritten.
+fn evidence_with(kind: u16, version: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frame = evidence_frame(payload).unwrap();
+    frame[4..6].copy_from_slice(&kind.to_be_bytes());
+    frame[6..8].copy_from_slice(&version.to_be_bytes());
+    frame
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_streams_carry_only_supported_peer_evidence() {
+    // The frame reader checks lengths and class limits, not what a frame
+    // is. A negotiated peer sending an unsupported evidence version, or
+    // another kind entirely, must not have it emitted as authenticated
+    // consensus input.
+    for (kind, version) in [
+        (coord_transport::KIND_PEER_EVIDENCE, 2u16),
+        (0x0100u16, 1u16),
+    ] {
+        let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+        let mut acceptor = bind(&f, 0);
+        let (_client, conn, _control) = negotiated(
+            &f,
+            &f.ids[1],
+            ALPN_PEER,
+            &mut acceptor,
+            PeerRole::Voter,
+            &[],
+        )
+        .await;
+        let mut uni = conn.open_uni().await.unwrap();
+        uni.write_all(&evidence_with(kind, version, b"not-evidence"))
+            .await
+            .unwrap();
+        uni.finish().unwrap();
+        loop {
+            match event(&mut acceptor).await {
+                TransportEvent::PeerFrame { .. } => {
+                    panic!("{kind:#06x} v{version} reached consensus")
+                }
+                TransportEvent::Closed { reason, .. } => {
+                    assert!(
+                        matches!(reason, CloseReason::Malformed(ref m) if m.contains("peer frame")),
+                        "{reason:?}"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_streams_carry_only_client_originated_requests() {
+    // A reply, a handshake message or an undecodable payload on an API
+    // request stream is a protocol violation at the boundary, not
+    // something every consumer downstream has to re-check.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    let (_client, conn, _control) = negotiated(
+        &f,
+        &f.ids[1],
+        ALPN_API,
+        &mut acceptor,
+        PeerRole::Frontend,
+        &[],
+    )
+    .await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(&hello(PeerRole::Frontend, CLUSTER, None))
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    loop {
+        match event(&mut acceptor).await {
+            TransportEvent::ApiRequest { .. } => panic!("a hello was dispatched as a request"),
+            TransportEvent::Closed { reason, .. } => {
+                assert!(
+                    matches!(reason, CloseReason::Malformed(ref m) if m.contains("not a request")),
+                    "{reason:?}"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_pipelined_behind_the_hello_is_not_lost() {
+    // One QUIC read can carry the hello and the close that follows it.
+    // The reader holding those extra bytes lives with the control stream,
+    // so the close is honored rather than discarded with a per-read
+    // reader.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut acceptor = bind(&f, 0);
+    let close = MessageV1::Close(CloseV1 {
+        code: 0x1234,
+        reason: coord_types::wire_v1::BoundedBytes::new(b"bye".to_vec()).unwrap(),
+    })
+    .encode()
+    .unwrap();
+    let (_client, _conn, _control) = negotiated(
+        &f,
+        &f.ids[1],
+        ALPN_PEER,
+        &mut acceptor,
+        PeerRole::Voter,
+        &close,
+    )
+    .await;
+    match event(&mut acceptor).await {
+        TransportEvent::Closed { reason, .. } => {
+            assert_eq!(reason, CloseReason::PeerClosed { code: 0x1234 })
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_frame_deadline_bounds_the_whole_peer_send() {
+    // A peer that grants no more flow-control credit lets the stream open
+    // complete and then leaves the write pending. The deadline covers the
+    // complete frame, so the sender gives up instead of hanging.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut acceptor = bind(&f, 0);
+    let mut transport = quinn::TransportConfig::default();
+    transport.receive_window(quinn::VarInt::from_u32(4096));
+    transport.stream_receive_window(quinn::VarInt::from_u32(4096));
+    let client = raw_client_with(&f, &f.ids[1], ALPN_PEER, Arc::new(transport));
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(&hello(PeerRole::Voter, CLUSTER, Some(inc(1))))
+        .await
+        .unwrap();
+    match event(&mut acceptor).await {
+        TransportEvent::Connected { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    // Far more than the peer's window, and it never reads a byte.
+    let big = evidence_frame(&vec![7u8; 256 * 1024]).unwrap();
+    let started = std::time::Instant::now();
+    let sent = timeout(
+        Duration::from_secs(20),
+        acceptor.send_peer(r(1), inc(1), big),
+    )
+    .await
+    .expect("the send returns rather than hanging");
+    assert!(
+        matches!(sent, Err(coord_transport::SendError::Timeout)),
+        "{sent:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "it gave up at the frame deadline: {:?}",
+        started.elapsed()
     );
 }
