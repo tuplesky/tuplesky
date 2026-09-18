@@ -226,6 +226,25 @@ impl Follower {
         self
     }
 
+    /// Restore the durable payloads of recovered commands (their
+    /// `payload_v1` rows, written in the same batch as the dependency row)
+    /// so the materializer and payload requests are served after a
+    /// restart. Called before boot; unknown commands are ignored.
+    pub fn restore_payloads(
+        mut self,
+        payloads: impl IntoIterator<Item = (CommandId, PayloadRecordV1)>,
+    ) -> Self {
+        for (c, p) in payloads {
+            if self.table.phase_of(&c).is_none() {
+                continue;
+            }
+            self.bindings.insert(p.retry_key, c);
+            self.payloads.insert(c, p);
+            self.served_payloads.insert(c);
+        }
+        self
+    }
+
     /// A follower from state carried across a role change, under `quorum`.
     pub fn from_recovered(state: RecoveredState, quorum: BallotConfiguration) -> Self {
         Follower {
@@ -447,6 +466,50 @@ impl Follower {
         }
         if campaign.binding().is_none() && !campaign.is_durable() {
             let decision = campaign.decision().expect("selected").clone();
+            // A selected command this replica never stored (it was down
+            // while the request was admitted) needs its payload before the
+            // result is bound: the new leader re-proposes from payloads,
+            // never from identities alone. The reporting voters hold them
+            // durably (they reported the command).
+            let missing: Vec<CommandId> = decision
+                .entries
+                .keys()
+                .chain(decision.reproposed.iter())
+                .filter(|c| self.table.phase_of(c).is_none())
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                if campaign.payloads_requested() {
+                    return Vec::new();
+                }
+                campaign.mark_payloads_requested();
+                let me = self.config.identity.replica;
+                let voters: Vec<ReplicaId> = campaign
+                    .promised()
+                    .iter()
+                    .filter(|v| **v != me)
+                    .copied()
+                    .collect();
+                let context = self
+                    .ballots
+                    .context(boot, decision.ballot, LocalJournalSeq::ZERO);
+                let outbox = self.outbox.as_mut().expect("booted");
+                for voter in voters {
+                    outbox.publish(PendingSend {
+                        context,
+                        requires: Vec::new(),
+                        to: PeerId {
+                            replica: voter,
+                            incarnation: ReplicaIncarnation::ZERO,
+                        },
+                        frame: ProtocolMessage::PayloadRequest {
+                            commands: missing.clone(),
+                        }
+                        .encode(),
+                    });
+                }
+                return self.release();
+            }
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             campaign.bound(barrier);
             let update = sync_update(self.config.identity.epoch, &SyncRecordV1 { decision })
@@ -665,9 +728,12 @@ impl Follower {
         if commands.is_empty() {
             return Vec::new();
         }
+        // Payload transfer is not a voting transition: it is published
+        // under the promised ballot so a promise for a higher ballot never
+        // fences it (the candidate needs payloads to recover).
         let context = self
             .ballots
-            .context(boot, self.config.quorum.ballot, LocalJournalSeq::ZERO);
+            .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.publish(PendingSend {
                 context,
@@ -1128,7 +1194,12 @@ impl Follower {
             ProtocolMessage::SlowAck(ack) => self.collect(from, Vote::Slow(ack)),
             ProtocolMessage::PayloadRequest { commands } => self.serve_payloads(from, &commands),
             ProtocolMessage::PayloadResponse { command, payload } => {
-                self.on_payload(command, payload)
+                let mut out = self.on_payload(command, payload);
+                if self.campaign.is_some() {
+                    // A campaign waiting for this payload can bind now.
+                    out.extend(self.advance_campaign());
+                }
+                out
             }
             ProtocolMessage::LeaderReply { .. } => Vec::new(),
         }
@@ -1140,9 +1211,10 @@ impl Follower {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
+        // Served under the promised ballot: see `request_payloads`.
         let context = self
             .ballots
-            .context(boot, self.config.quorum.ballot, LocalJournalSeq::ZERO);
+            .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
         let responses: Vec<ProtocolMessage> = commands
             .iter()
             .filter(|c| self.served_payloads.contains(c))

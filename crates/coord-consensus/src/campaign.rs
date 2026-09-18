@@ -29,6 +29,7 @@ pub struct Campaign {
     bound: Option<BarrierId>,
     durable: bool,
     published: bool,
+    payloads_requested: bool,
 }
 
 impl Campaign {
@@ -44,7 +45,25 @@ impl Campaign {
             bound: None,
             durable: false,
             published: false,
+            payloads_requested: false,
         }
+    }
+
+    /// Voters whose promise for this ballot arrived (the candidate
+    /// included once it promised itself).
+    pub const fn promised(&self) -> &BTreeSet<ReplicaId> {
+        &self.promised
+    }
+
+    /// Whether the payloads the selection needs were already requested.
+    pub const fn payloads_requested(&self) -> bool {
+        self.payloads_requested
+    }
+
+    /// Record that the missing payloads were requested from the reporting
+    /// voters (asked once; the selection waits for them).
+    pub const fn mark_payloads_requested(&mut self) {
+        self.payloads_requested = true;
     }
 
     /// A campaign resumed from a durably bound selection (after a crash):
