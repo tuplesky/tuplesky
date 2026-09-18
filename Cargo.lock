@@ -187,6 +187,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-store-testkit"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "coord-core",
+ "coord-store-api",
+ "coord-types",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "coord-types"
 version = "0.1.0"
 dependencies = [
