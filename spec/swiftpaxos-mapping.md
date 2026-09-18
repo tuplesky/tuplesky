@@ -62,6 +62,19 @@ must be re-checked against the paper text at the task-19 review.
 | `handleSync`: `r.FQ = r.qs.AQ(r.ballot)` | The fast set changes only with the ballot | `BallotConfiguration` is per ballot | quorum test |
 | `handleSync`: leader sends `MFastAck`/`MReply`, followers `MLightSlowAck` for adopted commands | Publication after Sync follows the durable table below | `Publication` | publication test |
 
+## Promises and configuration guards (task-20)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| `handleNewLeader`: `r.ballot >= msg.Ballot -> return` | Only a strictly higher ballot is promised; a promise in flight already bounds later requests | `BallotState::on_new_leader` -> `PromiseRejection::NotHigher` | `tests/ballot.rs::promise_reply_waits_for_the_row_and_every_batch_before_the_cut` |
+| `handleNewLeader`: `r.ballot = msg.Ballot` (volatile) | `[EXT]` the promise is a durable row (`protocol_v1`, `PromiseRecordV1`) written before the reply; recovered at boot | `rows::promise_update`, `BallotState::recover`, `coord_storage::protocol::read_promise` | `tests/ballot.rs::old_messages_cannot_lower_a_recovered_promise` |
+| `MNewLeaderAckN` sent right after state change | `[EXT]` the reply requires the promise row and every batch submitted before the cut (Section 4.8) | `PromiseEffects::reply.requires` through the logical outbox | same as first row |
+| `MNewLeaderAckN.Cballot` | The synchronized ballot travels with the promise | `ProtocolMessage::Promise::synced`, `BallotState::mark_synced` | same |
+| `MNewLeader.Replica` is the candidate, ballot leader derived from it | The ballot's leader must be the sender | `PromiseRejection::LeaderMismatch` | `tests/ballot.rs::wrong_configuration_identity_never_votes` |
+| (no epochs in the prototype) | `[EXT]` a ballot of another epoch, a non-voter sender or a non-voting role never votes (Section 10) | `PromiseRejection::{WrongEpoch, NotAVoter, NotVoting}` | same |
+| `stopDescs` / `repchan.stop` during recovery | `[EXT]` vote-producing callbacks completing after a same-boot election update bookkeeping but never send (Section 4.8) | `coord_core::outbox::Outbox::release` with `BallotState::promised` | `tests/ballot.rs::a_same_boot_election_fences_obsolete_vote_callbacks` |
+| `getCmdDescSeq` / `getDepAndHashes` / `keyInfo` | Initialization binds payload, computes dependencies and publishes the index in one transition; a descriptor without payload is a placeholder invisible to lookups and guards (Section 4.7) | `CommandTable::{expect, initialize, conflicts, phase_of}` | `tests/ballot.rs::initialization_publishes_atomically_and_placeholders_are_invisible` |
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |
