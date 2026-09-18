@@ -27,6 +27,16 @@
 //!   the root and checks order, uniqueness, counts, bounds (the manifest's
 //!   own encoded size among them) and descriptors, so an importer
 //!   (task-50) trusts bytes only after this.
+//! * [`install`] (task-50; Sections 10.3, 17.6, 17.13): the importing half.
+//!   A [`install::ChunkSet`] collects chunks against their descriptors so a
+//!   missing or corrupt one blocks the install, and
+//!   [`install::install_shared`] writes the verified rows into the engine of
+//!   an inactive generation after origin, configuration, schema, identity
+//!   and emptiness checks, closing with the boundary of `meta_v1` and the
+//!   [`install::InstalledCheckpointV1`] receipt. It writes no identity and
+//!   no `protocol_v1` row, so a learner inherits neither the donor's
+//!   identity nor any vote, and it never selects anything: the physical
+//!   generation lifecycle (`coord-storage-redb`) does that afterwards.
 //!
 //! This is not `LocalRecoveryCheckpointV1` (task-j04): it carries no
 //! promises, votes, stamps, journal sequences or physical files, gives a
@@ -35,10 +45,15 @@
 #![warn(missing_docs)]
 
 pub mod export;
+pub mod install;
 pub mod manifest;
 pub mod verify;
 
 pub use export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
+pub use install::{
+    ChunkSet, InstallError, InstallLimits, InstallRequirements, Installed, InstalledCheckpointV1,
+    install_shared, installed_baseline,
+};
 pub use manifest::{
     CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1, MAX_CHUNKS,
     MAX_MANIFEST_BYTES, RowV1, SHARED_CHECKPOINT_FORMAT_V1, SharedCheckpointV1, SharedManifestV1,

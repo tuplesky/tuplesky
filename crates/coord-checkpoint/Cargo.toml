@@ -20,6 +20,7 @@ serde = { workspace = true, features = ["std"] }
 postcard.workspace = true
 
 [dev-dependencies]
+coord-redb-faultkit.workspace = true
 coord-state.workspace = true
 coord-store-testkit.workspace = true
 coord-storage-redb.workspace = true

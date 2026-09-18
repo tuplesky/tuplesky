@@ -260,6 +260,7 @@ The receiver verifies root, digests, order, uniqueness, counts and bounds
 artifact carries no node identity, incarnation, boot, stamp or journal
 sequence and is not the local recovery checkpoint (task-j04).
 
+<<<<<<< HEAD
 The manifest is not paginated: one Manifest frame carries the whole
 descriptor list, so the encoded manifest is itself a supported-size bound
 of the artifact rather than a property of the transport. Export refuses a
@@ -269,6 +270,23 @@ always be framed. Chunk count alone does not decide it, since every
 descriptor also carries its chunk's first and last key; the derived count
 ceiling `MAX_CHUNKS` is only what the frame could describe if every
 boundary key were empty.
+=======
+The install (`coord_checkpoint::install_shared`, task-50) accepts chunks
+against their descriptors, so a missing, duplicated, truncated or altered
+chunk blocks it, and writes the verified rows into the engine of an
+inactive generation whose cluster and domain already match the artifact.
+It closes with the boundary rows of `meta_v1` (KV revision, retention
+floor, lease authority and the execution frontier at the artifact's
+configuration epoch), a local applied stamp that represents nothing yet,
+and one node-private receipt in `checkpoint_v1`
+(`installed_shared_v1`, record kind `0x0001`: format, cluster, domain,
+configuration, boundary, root, chunks, rows). The receipt is local
+evidence that an install completed; it is never transmitted, never enters
+a common digest and grants no authority. No identity or `protocol_v1` row
+is written, so a learner inherits neither the donor's identity nor any
+promise or vote, and post-boundary commands and unresolved closure are
+transferred separately (task-25).
+>>>>>>> d6e4c53 (task-50: install learner snapshots and reconcile catch-up state)
 
 ## Go mirror (task-44)
 
