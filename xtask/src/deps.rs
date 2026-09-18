@@ -34,6 +34,8 @@ const TEST_ONLY_EXTERNAL: &[&str] = &[
     "libfuzzer-sys",
     "criterion",
     "quickcheck",
+    // The experimental state engine (task-s03): production remains redb-only.
+    "fjall",
 ];
 
 /// Crates a `core` (pure, deterministic) crate may never reach through normal
@@ -59,8 +61,10 @@ const CORE_FORBIDDEN: &[&str] = &[
 
 /// Expected resolved feature sets for audited dependencies. The pinned
 /// raft-engine must build with no optional feature (no scripting, internals,
-/// nightly allocator, failpoints or optional codecs).
-const FEATURE_AUDIT: &[(&str, &[&str])] = &[("raft-engine", &[])];
+/// nightly allocator, failpoints or optional codecs); the experimental fjall
+/// pin resolves exactly the explicit `lz4` feature (no bytes, metrics or
+/// whitebox features).
+const FEATURE_AUDIT: &[(&str, &[&str])] = &[("raft-engine", &[]), ("fjall", &["lz4"])];
 
 /// Constructors that cast unverified data into a sealed capability, and the
 /// non-test crates allowed to contain them (design Sections 3, 9.3, 18.1).
