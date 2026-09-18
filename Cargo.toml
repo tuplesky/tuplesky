@@ -28,6 +28,8 @@ members = [
     "crates/coordctl",
     "crates/coord-node-issuer",
     "crates/coord-membership",
+    "crates/coord-daemon",
+    "bins/coordd",
     "xtask",
     "tools/raft-engine-smoke",
 ]
@@ -67,6 +69,7 @@ coord-login = { path = "crates/coord-login" }
 coordctl = { path = "crates/coordctl" }
 coord-node-issuer = { path = "crates/coord-node-issuer" }
 coord-membership = { path = "crates/coord-membership" }
+coord-daemon = { path = "crates/coord-daemon" }
 
 # Encoding and identity (Section 16.2).
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
