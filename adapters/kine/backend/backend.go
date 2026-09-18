@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/tuplesky/tuplesky/adapters/kine/client"
@@ -35,10 +36,8 @@ var (
 	ErrSessionMismatch = errors.New("bound session differs from the configured session")
 	// ErrNotStarted: an operation before Start.
 	ErrNotStarted = errors.New("backend not started")
-	// ErrWatchUnsupported: watches are task-47.
-	ErrWatchUnsupported = status.Error(codes.Unimplemented, "watch is not served by this backend revision (task-47)")
-	// ErrCompactUnsupported: compaction conventions are task-47.
-	ErrCompactUnsupported = status.Error(codes.Unimplemented, "compaction is not served by this backend revision (task-47)")
+	// ErrClosed: the backend was closed.
+	ErrClosed = errors.New("backend closed")
 )
 
 // Event is one native invocation the backend performed (the trace of an
@@ -84,6 +83,15 @@ type Config struct {
 	AccountingMaxPages int
 	// Observer receives one Event per native invocation.
 	Observer func(Event)
+	// SyncTimeout bounds WaitForSyncTo: a watch that has not processed
+	// the awaited revision by then is terminated with a resumption error
+	// rather than reported synced (default 30s).
+	SyncTimeout time.Duration
+	// WatchReconnectAttempts bounds consecutive failed reopen attempts of
+	// a lost watch before it fails (default 5).
+	WatchReconnectAttempts int
+	// WatchReconnectBackoff is the base delay between reopen attempts.
+	WatchReconnectBackoff time.Duration
 }
 
 // Backend is the coord:// backend of one domain.
@@ -96,6 +104,17 @@ type Backend struct {
 	// epoch means the frontend acknowledged a new session, so new work is
 	// allocated under a new instance.
 	epoch uint64
+
+	// root ends every watch and pending wait on Close.
+	root   context.Context
+	cancel context.CancelFunc
+
+	wmu       sync.Mutex
+	watches   map[uint64]*watchState
+	nextWatch uint64
+	// changed is replaced and closed whenever a watch frontier moves or a
+	// watch ends, waking WaitForSyncTo.
+	changed chan struct{}
 }
 
 // New validates the configuration.
@@ -121,7 +140,27 @@ func New(cfg Config) (*Backend, error) {
 	if cfg.AccountingMaxPages <= 0 {
 		cfg.AccountingMaxPages = 64
 	}
-	return &Backend{cfg: cfg}, nil
+	if cfg.SyncTimeout == 0 {
+		cfg.SyncTimeout = 30 * time.Second
+	}
+	if cfg.WatchReconnectAttempts <= 0 {
+		cfg.WatchReconnectAttempts = 5
+	}
+	if cfg.WatchReconnectBackoff == 0 {
+		cfg.WatchReconnectBackoff = 200 * time.Millisecond
+	}
+	root, cancel := context.WithCancel(context.Background())
+	return &Backend{cfg: cfg, root: root, cancel: cancel, watches: map[uint64]*watchState{}, changed: make(chan struct{})}, nil
+}
+
+// Close ends every watch, unblocks every pending synchronization wait
+// and closes the native lanes. The edge calls it at shutdown.
+func (b *Backend) Close() {
+	b.cancel()
+	b.wmu.Lock()
+	b.wake()
+	b.wmu.Unlock()
+	b.cfg.Client.Close()
 }
 
 var _ server.Backend = (*Backend)(nil)
@@ -200,6 +239,8 @@ func kindName(op wire.LogicalOp) string {
 		return "KineUpdate"
 	case wire.KineDeleteOp:
 		return "KineDelete"
+	case wire.CompactOp:
+		return "Compact"
 	default:
 		return "?"
 	}
@@ -253,19 +294,40 @@ func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryK
 	return res, err
 }
 
+// exchange sends the invocation and establishes its outcome under one
+// identity: a transport loss or a Pending answer is followed by a
+// resolution; a resolution the endpoint answers Unknown (it never saw the
+// identity) re-sends the identical invocation, which an endpoint that did
+// see it answers from its retained result. Attempts are bounded.
 func (b *Backend) exchange(ctx context.Context, inst *client.Instance, inv client.Invocation, event *Event) (wire.Result, error) {
+	resolveFrame, err := inst.ResolveFrame(inv)
+	if err != nil {
+		return wire.Result{}, status.Error(codes.Internal, err.Error())
+	}
 	out, err := b.cfg.Client.Do(ctx, inv.Frame)
 	if err != nil {
 		return wire.Result{}, mapClientError(err)
 	}
+	resolving := false
 	for out.Unknown && event.Resolves < b.cfg.ResolveAttempts {
 		if ctx.Err() != nil {
 			return wire.Result{}, status.FromContextError(ctx.Err()).Err()
 		}
 		event.Resolves++
-		frame, err := inst.ResolveFrame(inv)
-		if err != nil {
-			return wire.Result{}, status.Error(codes.Internal, err.Error())
+		frame := resolveFrame
+		if resolving && !out.Pending {
+			// The endpoint does not know the identity: re-send.
+			frame = inv.Frame
+			resolving = false
+		} else {
+			if out.Pending {
+				select {
+				case <-time.After(20 * time.Millisecond * time.Duration(event.Resolves)):
+				case <-ctx.Done():
+					return wire.Result{}, status.FromContextError(ctx.Err()).Err()
+				}
+			}
+			resolving = true
 		}
 		out, err = b.cfg.Client.Do(ctx, frame)
 		if err != nil {
@@ -307,6 +369,8 @@ func outcomeName(kind wire.OutcomeKind) string {
 		return "KineUpdated"
 	case wire.OutcomeKineDeleted:
 		return "KineDeleted"
+	case wire.OutcomeCompacted:
+		return "Compacted"
 	case wire.OutcomeErrCompacted:
 		return "ErrCompacted"
 	case wire.OutcomeErrFutureRevision:
@@ -637,22 +701,3 @@ func (b *Backend) DbSize(ctx context.Context) (int64, error) {
 	}
 	return 0, status.Errorf(codes.ResourceExhausted, "accounting scan exceeded %d pages", b.cfg.AccountingMaxPages)
 }
-
-// Watch is task-47: the watch is cancelled with an explicit error rather
-// than served from polling or silently.
-func (b *Backend) Watch(ctx context.Context, key, end string, revision int64) server.WatchResult {
-	events := make(chan []*server.Event)
-	close(events)
-	errc := make(chan error, 1)
-	errc <- ErrWatchUnsupported
-	return server.WatchResult{Events: events, Errorc: errc}
-}
-
-// Compact is task-47.
-func (b *Backend) Compact(ctx context.Context, revision int64) (int64, error) {
-	return 0, ErrCompactUnsupported
-}
-
-// WaitForSyncTo is part of the watch delivery pipeline (task-47); nothing
-// is served that could progress over missing events.
-func (b *Backend) WaitForSyncTo(revision int64) {}

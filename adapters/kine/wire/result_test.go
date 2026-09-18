@@ -63,6 +63,7 @@ func (k *jsonKineKv) kv(*testing.T) *KineKv {
 }
 
 var unitOutcomes = map[string]OutcomeKind{
+	"Compacted":           OutcomeCompacted,
 	"KineCreated":         OutcomeKineCreated,
 	"ErrKeyExists":        OutcomeErrKeyExists,
 	"ErrCompacted":        OutcomeErrCompacted,
@@ -181,7 +182,7 @@ func TestResultDecodingMatchesRustVectors(t *testing.T) {
 // An outcome outside the Kine subset (a lease grant, a plain put) is
 // refused, never mapped to a Kine result.
 func TestResultRefusesOutcomesOutsideTheSubset(t *testing.T) {
-	for _, disc := range []byte{0, 1, 3, 7, 34, 100} {
+	for _, disc := range []byte{0, 1, 3, 7, 8, 34, 100} {
 		if _, err := DecodeResult([]byte{5, disc}); !errors.Is(err, ErrUnexpectedOutcome) {
 			t.Fatalf("discriminant %d: %v", disc, err)
 		}

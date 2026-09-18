@@ -159,12 +159,11 @@ func TestACredentialRefreshRollsTheSessionOverWithoutStrandingOldInvocations(t *
 
 	// An invocation whose outcome the domain never establishes: the
 	// backend resolves it by identity and then refuses it explicitly.
-	domain.PendingOnce.Store(true)
-	domain.ForgetAll.Store(true)
+	domain.PendingAlways.Store(true)
 	if _, err := be.Create(ctx, "/registry/ambiguous", []byte("v"), 0); err == nil {
 		t.Fatal("an unestablished outcome was reported as success")
 	}
-	domain.ForgetAll.Store(false)
+	domain.PendingAlways.Store(false)
 	ambiguous := make(map[[32]byte]bool)
 	for _, entry := range domain.Log() {
 		if entry.Session == first && entry.Sequence == 2 {

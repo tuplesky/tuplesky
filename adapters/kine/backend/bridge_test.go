@@ -65,6 +65,8 @@ type bridgeOptions struct {
 	// accountingPages bounds DbSize.
 	accountingPages int
 	accountingPage  uint32
+	// syncTimeout bounds WaitForSyncTo.
+	syncTimeout time.Duration
 }
 
 func startDomain(t *testing.T) (*fakedomain.Server, *tls.Config) {
@@ -99,6 +101,7 @@ func startBridge(t *testing.T, opts bridgeOptions) *bridge {
 		ClientInstance:      [16]byte{4},
 		AccountingPageLimit: opts.accountingPage,
 		AccountingMaxPages:  opts.accountingPages,
+		SyncTimeout:         opts.syncTimeout,
 		Observer: func(e backend.Event) {
 			br.mu.Lock()
 			br.events = append(br.events, e)
@@ -109,6 +112,7 @@ func startBridge(t *testing.T, opts bridgeOptions) *bridge {
 		t.Fatal(err)
 	}
 	br.backend = be
+	t.Cleanup(be.Close)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	if !opts.noStart {
@@ -441,8 +445,10 @@ func TestUnknownOutcomeIsResolvedByIdentityOrFailsExplicitly(t *testing.T) {
 	if len(log) != 2 || log[0].Kind != "request" || !log[0].Executed || log[1].Kind != "resolve" || log[0].Sequence != log[1].Sequence {
 		t.Fatalf("domain log %+v", log)
 	}
-	// A single lost resolution is retried under the same identity: the
-	// second resolution finds the retained result.
+	// A resolution the endpoint answers Unknown (it does not know the
+	// identity) re-sends the identical invocation, which the endpoint
+	// that did execute it answers from its retained result: no second
+	// execution.
 	br.resetTrace()
 	br.domain.PendingOnce.Store(true)
 	br.domain.ForgetOnce.Store(true)
@@ -453,17 +459,20 @@ func TestUnknownOutcomeIsResolvedByIdentityOrFailsExplicitly(t *testing.T) {
 	if events := br.trace(); len(events) != 1 || events[0].Resolves != 2 {
 		t.Fatalf("trace %+v", events)
 	}
-	// The endpoint loses the identity for good: the bridge reports an
+	log = br.domain.Log()
+	if len(log) != 3 || !log[0].Executed || log[1].Kind != "resolve" || log[2].Op != "retained" {
+		t.Fatalf("domain log %+v", log)
+	}
+	// The endpoint never establishes the outcome: the bridge reports an
 	// explicit unavailable error, not a fabricated result, and the
 	// command was still executed exactly once.
 	br.resetTrace()
-	br.domain.PendingOnce.Store(true)
-	br.domain.ForgetAll.Store(true)
+	br.domain.PendingAlways.Store(true)
 	_, err := br.cli.Txn(ctxT(t)).If(clientv3.Compare(clientv3.ModRevision(key+"2"), "=", 0)).Then(clientv3.OpPut(key+"2", "v")).Commit()
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("unknown outcome: %v", err)
 	}
-	br.domain.ForgetAll.Store(false)
+	br.domain.PendingAlways.Store(false)
 	log = br.domain.Log()
 	executed := 0
 	for _, l := range log {
@@ -489,8 +498,8 @@ func TestUnknownOutcomeIsResolvedByIdentityOrFailsExplicitly(t *testing.T) {
 	}
 }
 
-// The unsupported subset is refused explicitly: from-key ranges, TTLs out
-// of range, watches and compaction (task-47).
+// The unsupported subset is refused explicitly: from-key ranges and TTLs
+// out of range never reach the domain.
 func TestUnsupportedRequestsAreExplicit(t *testing.T) {
 	br := startBridge(t, bridgeOptions{})
 	if _, err := br.cli.Get(ctxT(t), "/registry", clientv3.WithFromKey()); status.Code(err) != codes.InvalidArgument {
@@ -502,22 +511,8 @@ func TestUnsupportedRequestsAreExplicit(t *testing.T) {
 			t.Fatalf("ttl %d: %v", ttl, err)
 		}
 	}
-	if _, err := br.cli.Compact(ctxT(t), 1); status.Code(err) != codes.Unimplemented {
-		t.Fatalf("compact: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	wch := br.cli.Watch(ctx, "/registry/", clientv3.WithPrefix())
-	select {
-	case resp, ok := <-wch:
-		if ok && !resp.Canceled {
-			t.Fatalf("watch served: %+v", resp)
-		}
-		if ok && status.Code(resp.Err()) != codes.Unimplemented && resp.Err() != nil && !strings.Contains(resp.Err().Error(), "task-47") {
-			t.Fatalf("watch error %v", resp.Err())
-		}
-	case <-ctx.Done():
-		t.Fatal("watch neither cancelled nor closed")
+	if _, err := br.cli.Compact(ctxT(t), 0); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("compact 0: %v", err)
 	}
 	if len(br.domain.Model().Current()) != 1 {
 		t.Fatal("refused requests reached the domain")

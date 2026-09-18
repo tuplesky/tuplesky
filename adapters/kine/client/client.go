@@ -33,6 +33,9 @@ var (
 	// ErrBindRejected: the frontend refused the session binding (the
 	// token was not accepted, or the answer was not an acknowledgement).
 	ErrBindRejected = errors.New("bind rejected")
+	// ErrWatchLost: the watch stream or its connection ended without a
+	// close frame; resume from the last complete revision.
+	ErrWatchLost = errors.New("watch lost")
 	// ErrNegotiationRejected: the frontend did not acknowledge the Hello
 	// with the declared lane, so the connection is not usable.
 	ErrNegotiationRejected = errors.New("negotiation rejected")
@@ -42,9 +45,17 @@ var (
 	ErrSessionConflict = errors.New("session conflict")
 )
 
-// LaneUnary is the capability that declares the unary request lane in the
-// Hello (spec/wire-v1.md, task-31).
-const LaneUnary uint16 = 0x0011
+// Lane is one admitted connection lane (spec/wire-v1.md, task-31): each
+// lane is a separate connection declared by its capability in the Hello.
+type Lane uint16
+
+// The lanes a Kine collector uses.
+const (
+	// LaneUnary carries requests and responses.
+	LaneUnary Lane = 0x0011
+	// LaneWatch carries long-lived event streams.
+	LaneWatch Lane = 0x0012
+)
 
 // TokenSource supplies the service token presented at binding. A
 // *Provider is the production source.
@@ -66,6 +77,11 @@ type Outcome struct {
 	// Unknown is true when the outcome could not be established (timeout,
 	// reset, or an Unknown/Pending answer): resolve by identity.
 	Unknown bool
+	// Pending is true when the endpoint answered Pending: it knows the
+	// identity and the outcome is not established yet (resolve again
+	// later). Unknown without Pending after a resolution means the
+	// endpoint does not know the identity, so the invocation is re-sent.
+	Pending bool
 }
 
 // PoolLimits bounds the warm pool.
@@ -127,17 +143,17 @@ type Client struct {
 	cfg    Config
 	dialFn func(ctx context.Context) (*quic.Conn, error)
 
-	mu   sync.Mutex
-	conn *quic.Conn
-	// dialing is non-nil while one goroutine dials and binds the shared
-	// connection; it is closed when that attempt settles so the others
-	// wait for its result instead of each dialing a connection of their
-	// own.
-	dialing chan struct{}
-	// control is the negotiation stream of `conn`: it stays open for the
-	// connection's life because a Close frame travels on it.
-	control *quic.Stream
-	sem     chan struct{}
+	mu    sync.Mutex
+	conns map[Lane]*quic.Conn
+	// dialing holds, per lane, a channel that is non-nil while one
+	// goroutine dials and binds that lane's connection; it is closed when
+	// the attempt settles so the others wait for its result instead of
+	// each dialing a connection of their own.
+	dialing map[Lane]chan struct{}
+	// controls holds each lane's negotiation stream: it stays open for
+	// the connection's life because a Close frame travels on it.
+	controls map[Lane]*quic.Stream
+	sem      chan struct{}
 	// bound is what the last acknowledged Bind established.
 	bound *binding
 	// Reconnects performed (for tests).
@@ -154,8 +170,11 @@ func New(addr string, cfg Config) *Client {
 		tlsConf.NextProtos = []string{ALPNNativeAPI}
 	}
 	c := &Client{
-		cfg: cfg,
-		sem: make(chan struct{}, cfg.Limits.MaxStreams),
+		cfg:      cfg,
+		sem:      make(chan struct{}, cfg.Limits.MaxStreams),
+		conns:    map[Lane]*quic.Conn{},
+		controls: map[Lane]*quic.Stream{},
+		dialing:  map[Lane]chan struct{}{},
 	}
 	c.dialFn = func(ctx context.Context) (*quic.Conn, error) {
 		return quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
@@ -186,32 +205,44 @@ func withDefaults(cfg Config) Config {
 // newWithDialer is a test hook injecting a dialer (an in-process server).
 func newWithDialer(cfg Config, dial func(ctx context.Context) (*quic.Conn, error)) *Client {
 	cfg = withDefaults(cfg)
-	return &Client{cfg: cfg, dialFn: dial, sem: make(chan struct{}, cfg.Limits.MaxStreams)}
+	return &Client{
+		cfg:      cfg,
+		dialFn:   dial,
+		sem:      make(chan struct{}, cfg.Limits.MaxStreams),
+		conns:    map[Lane]*quic.Conn{},
+		controls: map[Lane]*quic.Stream{},
+		dialing:  map[Lane]chan struct{}{},
+	}
 }
 
-// connect returns a live connection, dialing and negotiating it if
-// needed. A connection whose acknowledged binding no longer admits work
-// is dropped first: the frontend refuses a rebind that names another
-// session on a live connection, so a rolled-over session needs a fresh
-// one. Only one goroutine dials at a time: the others wait for that
-// attempt to settle and then re-check, so a burst of requests on a fresh
-// or dropped client shares one connection rather than opening one per
-// request.
+// connect returns the live unary-lane connection, dialing and binding
+// (Hello) if needed. A binding presents the service token once.
 func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
+	return c.connectLane(ctx, LaneUnary)
+}
+
+// connectLane returns the live connection of `lane`, dialing and binding
+// it if needed. Every lane binds the same session, so a binding that no
+// longer admits work drops every lane first: the frontend refuses a
+// rebind that names another session on a live connection, and a rolled
+// over session needs fresh ones. Only one goroutine dials a lane at a
+// time: the others wait for that attempt to settle and then re-check, so
+// a burst of requests on a fresh or dropped client shares one connection
+// per lane rather than opening one per request.
+func (c *Client) connectLane(ctx context.Context, lane Lane) (*quic.Conn, error) {
 	for {
 		c.mu.Lock()
-		if c.bound != nil && !c.bound.active(c.cfg.Clock(), c.cfg.BindingMargin) && c.conn != nil {
-			expired := c.conn
-			c.mu.Unlock()
-			c.drop(expired)
-			c.mu.Lock()
+		stale := c.bound != nil && !c.bound.active(c.cfg.Clock(), c.cfg.BindingMargin) && len(c.conns) > 0
+		c.mu.Unlock()
+		if stale {
+			c.dropAll()
 		}
-		if c.conn != nil {
-			conn := c.conn
+		c.mu.Lock()
+		if conn := c.conns[lane]; conn != nil {
 			c.mu.Unlock()
 			return conn, nil
 		}
-		if wait := c.dialing; wait != nil {
+		if wait := c.dialing[lane]; wait != nil {
 			c.mu.Unlock()
 			select {
 			case <-wait:
@@ -223,30 +254,30 @@ func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
 			}
 		}
 		done := make(chan struct{})
-		c.dialing = done
+		c.dialing[lane] = done
 		c.mu.Unlock()
 
-		conn, control, err := c.dialAndBind(ctx)
+		conn, control, err := c.dialAndBind(ctx, lane)
 		c.mu.Lock()
 		if err == nil {
-			c.conn, c.control = conn, control
+			c.conns[lane], c.controls[lane] = conn, control
 		}
-		c.dialing = nil
+		delete(c.dialing, lane)
 		close(done)
 		c.mu.Unlock()
 		return conn, err
 	}
 }
 
-// dialAndBind dials one connection and binds it, closing it on a failed
-// bind so it never leaks. The negotiation stream comes back with the
-// connection: it stays open for the connection's life.
-func (c *Client) dialAndBind(ctx context.Context) (*quic.Conn, *quic.Stream, error) {
+// dialAndBind dials one connection and binds it on `lane`, closing it on
+// a failed bind so it never leaks. The negotiation stream comes back with
+// the connection: it stays open for the connection's life.
+func (c *Client) dialAndBind(ctx context.Context, lane Lane) (*quic.Conn, *quic.Stream, error) {
 	conn, err := c.dialFn(ctx)
 	if err != nil {
 		return nil, nil, ErrNotConnected
 	}
-	control, err := c.bind(ctx, conn)
+	control, err := c.bind(ctx, conn, lane)
 	if err != nil {
 		_ = conn.CloseWithError(2, "bind failed")
 		return nil, nil, err
@@ -293,13 +324,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	return err
 }
 
-// bind negotiates the connection: the Hello declaring the unary lane
-// travels on the control stream and the HelloAck is read back before
-// anything else is sent, so a refused negotiation is never mistaken for
-// a usable connection. The service token is then presented once in a
-// Bind frame. The control stream is returned and stays open, because a
-// Close frame travels on it.
-func (c *Client) bind(ctx context.Context, conn *quic.Conn) (*quic.Stream, error) {
+// bind negotiates the connection: the Hello declaring `lane` travels on
+// the control stream and the HelloAck is read back before anything else
+// is sent, so a refused negotiation is never mistaken for a usable
+// connection. The service token is then presented once in a Bind frame.
+// The control stream is returned and stays open, because a Close frame
+// travels on it.
+func (c *Client) bind(ctx context.Context, conn *quic.Conn, lane Lane) (*quic.Stream, error) {
 	var token string
 	if c.cfg.Tokens != nil {
 		t, err := c.cfg.Tokens.Token(ctx)
@@ -312,7 +343,7 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn) (*quic.Stream, error
 		Role:         wire.RoleClient,
 		ClusterID:    c.cfg.Cluster,
 		DomainID:     c.cfg.Domain,
-		Capabilities: []uint16{LaneUnary},
+		Capabilities: []uint16{uint16(lane)},
 	})
 	if err != nil {
 		return nil, err
@@ -326,7 +357,7 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn) (*quic.Stream, error
 	if err := writeFrame(stream, hello); err != nil {
 		return nil, ErrNotConnected
 	}
-	if err := readHelloAck(helloCtx, stream); err != nil {
+	if err := readHelloAck(helloCtx, stream, lane); err != nil {
 		return nil, err
 	}
 	if c.cfg.Tokens == nil {
@@ -341,7 +372,7 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn) (*quic.Stream, error
 // readHelloAck reads the negotiation answer and requires the endpoint to
 // have granted the lane the Hello declared. A Close frame carries the
 // endpoint's rejection reason; anything else is a protocol violation.
-func readHelloAck(ctx context.Context, stream *quic.Stream) error {
+func readHelloAck(ctx context.Context, stream *quic.Stream, lane Lane) error {
 	answer, err := readOneFrame(ctx, stream)
 	if err != nil {
 		return ErrNegotiationRejected
@@ -353,7 +384,7 @@ func readHelloAck(ctx context.Context, stream *quic.Stream) error {
 	switch m := msg.(type) {
 	case wire.HelloAck:
 		for _, capability := range m.Capabilities {
-			if capability == LaneUnary {
+			if capability == uint16(lane) {
 				return nil
 			}
 		}
@@ -429,7 +460,8 @@ func (c *Client) adopt(ack wire.BindAck, credential [32]byte) error {
 	case c.bound == nil:
 		c.bound = &binding{session: ack.Session, expiresAt: expires, credential: credential, epoch: 1}
 	case c.bound.session == ack.Session:
-		// A rebind of the same session refreshes its validity.
+		// A rebind of the same session refreshes its validity; the lanes
+		// of one client bind one session.
 		c.bound.credential = credential
 		if expires.After(c.bound.expiresAt) {
 			c.bound.expiresAt = expires
@@ -446,38 +478,60 @@ func (c *Client) adopt(ack wire.BindAck, credential [32]byte) error {
 }
 
 // drop closes and forgets `failed` so the next call reconnects, but only
-// while it is still the shared connection. A late failure from a
+// while it is still the unary connection. A late failure from a
 // connection that was already replaced must not close its healthy
 // replacement; that stale connection was closed when it was dropped.
 func (c *Client) drop(failed *quic.Conn) {
-	c.mu.Lock()
-	current := c.conn == failed && failed != nil
-	var control *quic.Stream
-	if current {
-		control = c.control
-		c.conn, c.control = nil, nil
-		c.Reconnects++
+	if failed == nil {
+		return
 	}
+	c.dropLane(LaneUnary, failed)
+}
+
+// dropLane closes and forgets a lane's connection (only `conn` when
+// given, so a newer connection is kept).
+func (c *Client) dropLane(lane Lane, conn *quic.Conn) {
+	c.mu.Lock()
+	current := c.conns[lane]
+	if current == nil || (conn != nil && current != conn) {
+		c.mu.Unlock()
+		return
+	}
+	control := c.controls[lane]
+	delete(c.conns, lane)
+	delete(c.controls, lane)
+	c.Reconnects++
 	c.mu.Unlock()
 	if control != nil {
 		_ = control.Close()
 	}
-	if current {
-		_ = failed.CloseWithError(0, "drop")
+	_ = current.CloseWithError(0, "drop")
+}
+
+// dropAll drops every lane, so each rebinds on its next use.
+func (c *Client) dropAll() {
+	c.mu.Lock()
+	lanes := make([]Lane, 0, len(c.conns))
+	for lane := range c.conns {
+		lanes = append(lanes, lane)
+	}
+	c.mu.Unlock()
+	for _, lane := range lanes {
+		c.dropLane(lane, nil)
 	}
 }
 
-// Close ends the connection and forgets the binding; a later Connect
+// Close closes every lane and forgets the binding; a later Connect
 // negotiates and binds afresh.
 func (c *Client) Close() {
 	c.mu.Lock()
-	conn, control := c.conn, c.control
-	c.conn, c.control, c.bound = nil, nil, nil
+	conns, controls := c.conns, c.controls
+	c.conns, c.controls, c.bound = map[Lane]*quic.Conn{}, map[Lane]*quic.Stream{}, nil
 	c.mu.Unlock()
-	if control != nil {
+	for _, control := range controls {
 		_ = control.Close()
 	}
-	if conn != nil {
+	for _, conn := range conns {
 		_ = conn.CloseWithError(0, "close")
 	}
 }
@@ -525,7 +579,10 @@ func (c *Client) Do(ctx context.Context, frame []byte) (Outcome, error) {
 	if !ok {
 		return Outcome{}, ErrProtocol
 	}
-	if response.Tag == wire.OutcomePending || response.Tag == wire.OutcomeUnknown {
+	if response.Tag == wire.OutcomePending {
+		return Outcome{Unknown: true, Pending: true}, nil
+	}
+	if response.Tag == wire.OutcomeUnknown {
 		return Outcome{Unknown: true}, nil
 	}
 	return Outcome{Response: &response}, nil
