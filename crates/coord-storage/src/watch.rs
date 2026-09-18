@@ -64,10 +64,18 @@ impl WatchSpec {
     }
 
     fn filter(&self, namespace: &NamespaceId, events: &[KvEvent]) -> Vec<KvEvent> {
+        self.filter_each(events.iter().map(|e| (namespace, e)))
+    }
+
+    /// Filter events that each carry their own namespace.
+    fn filter_each<'a>(
+        &self,
+        events: impl IntoIterator<Item = (&'a NamespaceId, &'a KvEvent)>,
+    ) -> Vec<KvEvent> {
         events
-            .iter()
-            .filter(|e| self.matches(namespace, &e.key))
-            .map(|e| {
+            .into_iter()
+            .filter(|(ns, e)| self.matches(ns, &e.key))
+            .map(|(_, e)| {
                 let mut e = e.clone();
                 if !self.prev_kv {
                     e.prev = None;
@@ -211,6 +219,16 @@ impl WatchHub {
             if watcher.closed.is_some() || revision <= watcher.frontier {
                 continue;
             }
+            // A start revision beyond the registration frontier is an
+            // inclusive lower bound on live delivery too: revisions below it
+            // are neither delivered nor counted as progress.
+            if watcher
+                .spec
+                .start_revision
+                .is_some_and(|start| revision < start)
+            {
+                continue;
+            }
             let matching = watcher.spec.filter(&namespace, events);
             if watcher.replay_complete {
                 watcher.processed_through = revision;
@@ -284,13 +302,31 @@ impl WatchHub {
         Ok(Registration { id, replay })
     }
 
-    /// Feed one replayed revision (in order). Filtering applies here too.
+    /// Feed one replayed revision (in order) whose events all belong to
+    /// `namespace`. Filtering applies here too.
     pub fn replay(
         &self,
         id: WatchId,
         namespace: NamespaceId,
         revision: KvRevision,
         events: &[KvEvent],
+    ) -> Result<(), ReplayError> {
+        let stored: Vec<(NamespaceId, KvEvent)> =
+            events.iter().map(|e| (namespace, e.clone())).collect();
+        self.replay_stored(id, revision, &stored)
+    }
+
+    /// Feed one replayed revision (in order) whose events each carry the
+    /// namespace they were stored in. A revision may hold keys of several
+    /// namespaces; each event is filtered by its own.
+    ///
+    /// On `QueueFull` nothing is recorded: the caller drains the queue and
+    /// retries the same revision.
+    pub fn replay_stored(
+        &self,
+        id: WatchId,
+        revision: KvRevision,
+        events: &[(NamespaceId, KvEvent)],
     ) -> Result<(), ReplayError> {
         let mut state = lock(&self.inner);
         let watcher = state
@@ -310,14 +346,19 @@ impl WatchHub {
                 processed_through: watcher.processed_through,
             });
         }
-        watcher.processed_through = revision;
-        let matching = watcher.spec.filter(&namespace, events);
+        let matching = watcher
+            .spec
+            .filter_each(events.iter().map(|(ns, e)| (ns, e)));
         if matching.is_empty() {
+            watcher.processed_through = revision;
             return Ok(());
         }
         if watcher.queued_events + matching.len() > watcher.spec.queue_capacity {
             return Err(ReplayError::QueueFull);
         }
+        // The cursor advances only once the batch is accepted, so a paced
+        // retry of the same revision is in order, not `OutOfOrder`.
+        watcher.processed_through = revision;
         watcher.queued_events += matching.len();
         watcher.replay.push_back(WatchBatch {
             revision,
@@ -474,8 +515,12 @@ pub fn replay_from_view<V: OrderedRead>(
     }
     let mut rev = from;
     loop {
-        if let Some(events) = crate::views::events_at(view, rev)? {
-            hub.replay(id, namespace, rev, &events)?;
+        if let Some(events) = crate::views::stored_events_at(view, rev)? {
+            // Each stored event keeps the namespace it was written in; the
+            // watch's namespace only selects, it never relabels.
+            let stored: Vec<(NamespaceId, KvEvent)> =
+                events.into_iter().map(|e| (e.namespace, e.event)).collect();
+            hub.replay_stored(id, rev, &stored)?;
         } else {
             // A revision without events (never produced) still counts as
             // processed so progress can pass it.

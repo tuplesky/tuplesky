@@ -54,7 +54,10 @@ pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};
 pub use retry::{Admission, Resolution, RetryBinding};
 pub use view::{GatedReader, GatedView, ViewError};
-pub use views::{ViewBudget, ViewBuildError, build_read_view, events_at, scan_current_page};
+pub use views::{
+    StoredEvent, ViewBudget, ViewBuildError, build_read_view, events_at, scan_current_page,
+    stored_events_at,
+};
 pub use watch::{CloseReason, WatchBatch, WatchHub, WatchId, WatchItem, WatchSpec};
 pub use worker::{FlushOutcome, GroupLimits, StoreWorker, SubmitError, WorkerState};
 
