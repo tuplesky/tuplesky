@@ -123,6 +123,16 @@ must be re-checked against the paper text at the task-19 review.
 | (no watches in the prototype) | `[EXT]` a revision's complete event set reaches watches only after the durable commit | `Applier::apply` -> `WatchHub::publish` | `cluster.rs::watch_events_follow_irrevocable_application` |
 | `optExec` / speculative delivery on the leader | Out of scope here (task-29); the learner never executes on a proposal alone | review boundary | one-leader-response test |
 
+## Recovery summaries and payload transfer (task-25)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| `fillNewLeaderAckN`: iterates volatile `cmdDescs` | `[EXT]` the report is built from the actor's durable ledger (records whose batches completed `JournalDurable`), never from in-memory phases or a lagging projection (Section 4.8) | `summary::DurableLedger::report`, `Follower::report`, `Leader::report` | `tests/recovery.rs::reports_come_from_durable_state_at_the_cut_not_in_memory_phases` |
+| `MNewLeaderAckN` as one message | `[EXT]` bounded verified pages binding replica, ballots, page, total and digest; an incomplete or corrupt transfer never counts (Section 19.3) | `summary::{paginate, ReportPage, ReportAssembler}` | `tests/recovery.rs::pages_assemble_only_when_complete_and_verified` |
+| `fillNewLeaderAckN`: `NOOP` `ACCEPT` for proposals without descriptors | `[EXT: rejected]` a command known by identity only is absent from the report; its payload is fetched and rehashed against the identity before it exists (Section 4.7) | `Follower::{missing_payloads, request_payloads}`, `ProtocolMessage::{PayloadRequest, PayloadResponse}`, `FollowerRejection::PayloadIdentityMismatch` | `tests/recovery.rs::a_missing_payload_is_fetched_and_rehashed_never_fabricated` |
+| `handleNewLeader`: `stopDescs`, status `RECOVERING` | A promise for a higher ballot fences late old-ballot proposals and unreleased sends; the durable rows and promise survive a crash and reproduce the report | `FollowerRejection::StaleBallot`, `Follower::recover` | `tests/recovery.rs::old_ballot_work_is_held_across_recovery_and_required_state_survives_a_crash` |
+| `handleNewLeaderAckNs` phase merge | Legal phase differences select; incompatible accepted candidates from real reports are diagnosed | `recovery::select` over `DurableLedger` reports | `tests/recovery.rs::legal_phase_differences_select_and_incompatible_candidates_are_diagnosed` |
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |

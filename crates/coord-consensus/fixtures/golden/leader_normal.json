@@ -23,6 +23,8 @@
     [
       "c1 durable",
       [
+        "persist b3 base=None [protocol_v1:0000000000000001013652d2a1dfb24fcf167c2b6e3ace3f600833cc70ebaecd5b0fbfcf235448318a]",
+        "persist b4 base=None [protocol_v1:0000000000000001015806c24d55618aed5f5eeff9e035cd3b1e67c144043c91de37b457a14bb13520]",
         "send proposal seq=0 deps=0 anchors=1 to 0101 requires [b1] ballot=0",
         "send proposal seq=0 deps=0 anchors=1 to 0202 requires [b1] ballot=0",
         "send leader-reply seq=0 deps=0 to f0f0 requires [b1] ballot=0"
