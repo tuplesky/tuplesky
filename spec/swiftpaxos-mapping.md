@@ -147,6 +147,20 @@ must be re-checked against the paper text at the task-19 review.
 | Executed commands after a restart | `[EXT]` the executed identities are durable with the application rows (Section 6.5); recovery restores the execution frontier and a re-proposal never regresses a learned or executed phase | `Follower::restore_execution`, `CommandTable::restore_executed`, `Follower::advance_pending` | learned-outcomes test |
 | (roles are fixed in the prototype) | `[EXT]` roles convert through the recovered state: learned outcomes, execution frontier, payloads and bindings survive; a deposed leader carries a pending Sync into its follower role | `role::RecoveredState`, `Leader::{deposed, into_recovered}`, `Follower::{from_recovered, into_recovered, won}` | competing-campaigns test |
 
+## Bounded speculation and result release (task-29)
+
+| Source behavior | Rule | Rust item | Test |
+|---|---|---|---|
+| leader `optExec`: execute at proposal time, reply to the client before commit (`deliver` with `r.optExec && r.Id == r.leader()`) | `[EXT: stricter]` the leader computes a *tentative* result over a disposable overlay (durable view plus the tentative plans of every earlier unexecuted proposal in its order); nothing tentative reaches state, events, watches, sessions or credentials, and the overlay is bounded and discarded on any role change | `coord_storage::speculate::{speculate, Overlay, SpeculationLimits}`, `Leader::{next_speculable, speculated, decline_speculation, tentative}` | `crates/coord-storage/tests/recovery.rs::released_results_precede_materialization_and_equal_the_established_ones` |
+| client learns from the leader's reply once the fast or slow quorum agrees | The release gate: a tentative result leaves the replica only when the command and its whole prefix are committed by the learning predicate, so command, closed predecessor order, authorization (the view the plan was authorized on, unchanged by a KV-only prefix) and the exact result are determined by durable evidence; the released capability carries the established result and the exact response, never events | `speculation::ReleaseGate`, `coord_core::capability::ReleasedResult`, `Effect::Released` | same; `a_fast_result_followed_by_a_leader_crash_before_commit_propagation_recovers_the_same_outcome` (released before materialization, reproduced by recovery) |
+| (no such check in the prototype) | `[EXT]` a materialized outcome that disagrees with a released tentative result halts the replica (`LearnError::Speculation`); it never serves two answers | `Speculation::reconcile`, `Leader::applied` | forced-slow comparison (released equals established on both paths) |
+| speculation across leaders | `[EXT]` a deposed or lost leader's tentative results never surface: the new ballot may order the same commands differently and the old leader released nothing that was not learned | `Speculation::clear` on role change, gate stops at the first unlearned proposal | `tentative_results_of_a_lost_leader_never_surface` |
+| (n/a) | Only KV operations at the current revision without leases are speculated; leases, explicit-revision reads, compaction, Kine and internal commands, and invocations the retry layer would not admit as new, take the finalized path | `speculate::speculable`, `SpeculationRefused` | released-results test (lease operations are never released early) |
+
+No extra WAN commit phase is added, the learning predicates are unchanged,
+and durability is not weakened: a speculative release needs exactly the
+evidence a final one needs, minus the materialization round trip.
+
 ## Full fast-path learning evidence (task-28)
 
 | Source handler / rule | Rule | Rust item | Test |

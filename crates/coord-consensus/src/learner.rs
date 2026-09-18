@@ -69,6 +69,10 @@ pub enum LearnError {
     Establish(EstablishError),
     /// The execution position cannot advance.
     Overflow,
+    /// A speculatively released result disagrees with the materialized
+    /// outcome (task-29): the replica must stop rather than serve two
+    /// answers.
+    Speculation(crate::speculation::SpeculationMismatch),
 }
 
 /// The learner of one replica: the execution frontier, the learning mode

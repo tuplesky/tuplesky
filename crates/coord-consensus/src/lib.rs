@@ -99,6 +99,7 @@ pub mod quorum;
 pub mod recovery;
 pub mod role;
 pub mod rows;
+pub mod speculation;
 pub mod summary;
 pub mod vote;
 
@@ -126,6 +127,10 @@ pub use rows::{
     dependency_update, encode_dependency, encode_payload, encode_promise, encode_proposal,
     encode_sync, payload_key, payload_update, promise_key, promise_update, proposal_key,
     proposal_update, sync_key, sync_update,
+};
+pub use speculation::{
+    DEFAULT_SPECULATION_BOUND, ReleaseGate, Speculation, SpeculationMismatch, SpeculationRequest,
+    TentativeOutcome,
 };
 pub use summary::{
     DurableLedger, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler, ReportPage,
