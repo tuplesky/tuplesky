@@ -18,12 +18,13 @@ use coord_consensus::ProtocolMessage;
 use coord_core::capability::ReleasedResult;
 use coord_core::event::PeerProvenance;
 use coord_state::plan::{KvEvent, KvEventKind};
-use coord_storage::watch::{Registration, chunk};
+use coord_storage::watch::Registration;
 use coord_storage::{CloseReason, WatchBatch, WatchHub, WatchId, WatchItem, WatchSpec};
 use coord_types::ids::KvRevision;
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, EventKindV1, EventV1, Frame, MAX_EVENTS_PER_BATCH, MessageV1,
-    WatchCloseReasonV1, WatchCloseV1, WatchEventsV1, WatchOpenV1, WatchProgressV1, decode,
+    BoundedBytes, BoundedVec, EventKindV1, EventV1, Frame, KindRange, MAX_EVENTS_PER_BATCH,
+    MessageV1, WatchCloseReasonV1, WatchCloseV1, WatchEventsV1, WatchOpenV1, WatchProgressV1,
+    decode,
 };
 use coord_types::{CommandId, RetryKey};
 
@@ -164,7 +165,7 @@ impl Dispatcher {
                         Action::Pending { command }
                     }
                     Ok(Submitted::Resolved(response)) => {
-                        self.admission.settled(&caller.session);
+                        self.admission.settled(&key);
                         Action::Respond(Delivery {
                             connection,
                             retry_key: key,
@@ -172,7 +173,7 @@ impl Dispatcher {
                         })
                     }
                     Err(refusal) => {
-                        self.admission.settled(&caller.session);
+                        self.admission.settled(&key);
                         let (code, detail) = match refusal {
                             SubmitRefusal::Malformed => (codes::MALFORMED_REQUEST, "malformed"),
                             SubmitRefusal::RequestIdentityConflict { .. } => (
@@ -290,22 +291,26 @@ impl Dispatcher {
         while let Some(item) = hub.next(id, &mut authorize) {
             match item {
                 WatchItem::Batch(batch) => {
-                    for fragment in chunk(&batch, MAX_EVENTS_PER_BATCH) {
-                        let events: Vec<EventV1> = fragment
-                            .events
-                            .iter()
-                            .map(|e| event_v1(e, fragment.revision))
-                            .collect();
-                        out.push(
-                            MessageV1::WatchEvents(WatchEventsV1 {
+                    match watch_frames(watch_id, &batch) {
+                        Ok(frames) => out.extend(frames),
+                        Err(()) => {
+                            // A revision that cannot be framed at all is
+                            // not something to panic on after the hub has
+                            // already handed it over: the watch is closed
+                            // at its last complete revision and the client
+                            // reopens from there.
+                            self.watches.remove(&(connection, watch_id));
+                            out.push(close_frame(
                                 watch_id,
-                                revision: fragment.revision,
-                                events: BoundedVec::new(events).expect("chunked to the bound"),
-                                complete: fragment.complete,
-                            })
-                            .encode()
-                            .expect("bounded"),
-                        );
+                                WatchCloseReasonV1::SourceLost,
+                                batch
+                                    .revision
+                                    .get()
+                                    .checked_sub(1)
+                                    .and_then(|r| KvRevision::new(r).ok()),
+                            ));
+                            break;
+                        }
                     }
                 }
                 WatchItem::Progress(revision) => out.push(
@@ -361,7 +366,7 @@ impl Dispatcher {
     /// the collector directly): frees the session slot, detaches the
     /// owner and yields the delivery for the attached caller, if any.
     pub fn settle_release(&mut self, release: &Release) -> Option<Delivery> {
-        self.admission.settled(&release.session);
+        self.admission.settled(&release.retry_key);
         let connection = self.owner.remove(&release.retry_key);
         if let Some(c) = connection
             && let Some(set) = self.by_connection.get_mut(&c)
@@ -389,7 +394,7 @@ impl Dispatcher {
                     set.remove(&expired.retry_key);
                 }
                 self.collector.cancel(&expired.retry_key);
-                self.admission.settled(&expired.session);
+                self.admission.settled(&expired.retry_key);
                 out.push(Delivery {
                     connection,
                     retry_key: expired.retry_key,
@@ -427,7 +432,19 @@ impl Dispatcher {
     }
 
     fn attach(&mut self, connection: u64, key: RetryKey) {
-        self.owner.insert(key, connection);
+        // A retry can arrive on a new connection. Leaving the key in the
+        // old connection's set would make that connection's close remove
+        // the new owner and cancel the request, so the release would
+        // never reach the connection now waiting for it.
+        if let Some(previous) = self.owner.insert(key, connection)
+            && previous != connection
+            && let Some(keys) = self.by_connection.get_mut(&previous)
+        {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.by_connection.remove(&previous);
+            }
+        }
         self.by_connection
             .entry(connection)
             .or_default()
@@ -500,8 +517,74 @@ const fn close_reason(reason: CloseReason) -> WatchCloseReasonV1 {
     }
 }
 
+/// The encoded size a watch frame may take: the class limit of the watch
+/// kind range, less room for the frame header and the message's own
+/// fields. Fragmenting by event count alone was not enough — a batch of
+/// fewer than [`MAX_EVENTS_PER_BATCH`] large events still overran the
+/// limit, and the encode that discovered it did so after the hub had
+/// dequeued the batch.
+const MAX_WATCH_PAYLOAD: usize = (KindRange::Watch.max_frame_length() as usize) - 64 * 1024;
+
+/// What one event costs in an encoded frame: its bytes plus room for the
+/// length prefixes, revisions and version around them. Deliberately an
+/// over-estimate, so a fragment built to this budget always encodes.
+fn event_cost(event: &KvEvent) -> usize {
+    event.key.len()
+        + event.entry.as_ref().map_or(0, |e| e.value.len())
+        + event.prev.as_ref().map_or(0, |p| p.value.len())
+        + 64
+}
+
+/// Frame one complete revision, fragmented by both event count and
+/// encoded size. `Err` means even a single event does not fit, which the
+/// caller answers by closing the watch rather than by panicking.
+fn watch_frames(watch_id: u64, batch: &WatchBatch) -> Result<Vec<Vec<u8>>, ()> {
+    let mut fragments: Vec<Vec<&KvEvent>> = Vec::new();
+    let mut current: Vec<&KvEvent> = Vec::new();
+    let mut bytes = 0usize;
+    for event in &batch.events {
+        let cost = event_cost(event);
+        if cost > MAX_WATCH_PAYLOAD {
+            return Err(());
+        }
+        if !current.is_empty()
+            && (current.len() == MAX_EVENTS_PER_BATCH || bytes + cost > MAX_WATCH_PAYLOAD)
+        {
+            fragments.push(core::mem::take(&mut current));
+            bytes = 0;
+        }
+        bytes += cost;
+        current.push(event);
+    }
+    // A revision with no events still yields one complete fragment.
+    fragments.push(current);
+    let last = fragments.len() - 1;
+    let mut out = Vec::with_capacity(fragments.len());
+    for (i, events) in fragments.into_iter().enumerate() {
+        let events: Vec<EventV1> = events
+            .into_iter()
+            .map(|e| event_v1(e, batch.revision))
+            .collect();
+        out.push(
+            MessageV1::WatchEvents(WatchEventsV1 {
+                watch_id,
+                revision: batch.revision,
+                events: BoundedVec::new(events).map_err(|_| ())?,
+                complete: i == last,
+            })
+            .encode()
+            .map_err(|_| ())?,
+        );
+    }
+    Ok(out)
+}
+
 fn event_v1(event: &KvEvent, revision: KvRevision) -> EventV1 {
     let entry = event.entry.as_ref();
+    // A delete has no new entry: its metadata is the removed one's, which
+    // the event still carries. Reporting zero would lose the deleted
+    // key's creation revision although it is right there.
+    let prev = event.prev.as_ref();
     EventV1 {
         kind: match event.kind {
             KvEventKind::Put => EventKindV1::Put,
@@ -510,12 +593,100 @@ fn event_v1(event: &KvEvent, revision: KvRevision) -> EventV1 {
         key: BoundedBytes::new(event.key.clone()).expect("stored keys are bounded"),
         value: BoundedBytes::new(entry.map(|e| e.value.clone()).unwrap_or_default())
             .expect("stored values are bounded"),
-        create_revision: entry.map(|e| e.create_revision).unwrap_or(KvRevision::ZERO),
+        create_revision: entry
+            .or(prev)
+            .map(|e| e.create_revision)
+            .unwrap_or(KvRevision::ZERO),
         mod_revision: entry.map(|e| e.mod_revision).unwrap_or(revision),
         version: entry.map(|e| e.version).unwrap_or(0),
-        prev_value: event
-            .prev
-            .as_ref()
+        prev_value: prev
             .map(|p| BoundedBytes::new(p.value.clone()).expect("stored values are bounded")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use coord_state::KvEntry;
+    use coord_storage::watch::WatchBatch;
+
+    use super::*;
+
+    fn rev(n: u64) -> KvRevision {
+        KvRevision::new(n).expect("non-zero")
+    }
+
+    fn entry(value: Vec<u8>, created: u64, modified: u64) -> KvEntry {
+        KvEntry {
+            value,
+            create_revision: rev(created),
+            mod_revision: rev(modified),
+            version: 1,
+            lease: None,
+            lease_generation: None,
+        }
+    }
+
+    #[test]
+    fn a_revision_of_large_events_is_fragmented_by_encoded_size() {
+        // Fragmenting by event count alone let a batch of fewer than
+        // MAX_EVENTS_PER_BATCH large events exceed the watch class limit,
+        // and the encode that discovered it ran after the hub had already
+        // handed the batch over.
+        let events: Vec<KvEvent> = (0..32u32)
+            .map(|i| KvEvent {
+                kind: KvEventKind::Put,
+                key: i.to_be_bytes().to_vec(),
+                entry: Some(entry(vec![7u8; 1024 * 1024], 1, 2)),
+                prev: None,
+            })
+            .collect();
+        let batch = WatchBatch {
+            revision: rev(2),
+            events,
+        };
+        let frames = watch_frames(9, &batch).expect("every event fits on its own");
+        assert!(
+            frames.len() > 1,
+            "32 MiB of events is more than one frame: {}",
+            frames.len()
+        );
+        for frame in &frames {
+            assert!(
+                frame.len() <= KindRange::Watch.max_frame_length() as usize,
+                "a fragment stays within the class limit: {}",
+                frame.len()
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_revision_is_still_one_complete_fragment() {
+        let batch = WatchBatch {
+            revision: rev(5),
+            events: Vec::new(),
+        };
+        assert_eq!(watch_frames(9, &batch).expect("framed").len(), 1);
+    }
+
+    #[test]
+    fn a_delete_event_reports_the_removed_entry_creation_revision() {
+        // The removed entry is in `prev`, so reading only `entry` reported
+        // zero and native watch clients lost the deleted key's creation
+        // metadata although the event still carried it.
+        let event = KvEvent {
+            kind: KvEventKind::Delete,
+            key: b"k".to_vec(),
+            entry: None,
+            prev: Some(entry(b"v".to_vec(), 3, 7)),
+        };
+        let encoded = event_v1(&event, rev(9));
+        assert_eq!(encoded.kind, EventKindV1::Delete);
+        assert_eq!(encoded.create_revision, rev(3));
+        assert_eq!(encoded.mod_revision, rev(9), "the delete's own revision");
+        assert_eq!(
+            encoded.prev_value.as_ref().map(|v| v.as_slice()),
+            Some(&b"v"[..])
+        );
+        assert!(encoded.value.as_slice().is_empty());
     }
 }

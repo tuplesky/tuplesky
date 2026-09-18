@@ -25,7 +25,7 @@ native SDK talks to a frontend because it is not a trusted collector.
 ## Frames
 
 See `spec/wire-v1.md`, "Collector frames": `Submit` (`0x0103`, collector
-to every voter), `Release` (`0x0104`, leader to collector), `Evidence`
+to every voter), `Release` (`0x0701`, leader to collector), `Evidence`
 (`0x0700`, voter to collector). Evidence is the postcard `ProtocolMessage`
 the voter published to its frontend peer identity: `LeaderReply`,
 `FastAck` or `SlowAck`. Anything else in an `Evidence` frame is

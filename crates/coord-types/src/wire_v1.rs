@@ -90,7 +90,12 @@ impl KindRange {
             KindRange::Configuration => 256 * 1024,
             KindRange::ObserverReplication => 8 * 1024 * 1024 + 64 * 1024,
             KindRange::Snapshot => 1024 * 1024 + 64 * 1024,
-            KindRange::CollectorEvidence => 1024 * 1024,
+            // A release carries an established result, which the storage
+            // layer bounds at MAX_RESULT_BYTES: the class that carries it
+            // has to be able to hold one, or a valid result between the
+            // two limits could never reach the collector and its request
+            // would stay pending for ever.
+            KindRange::CollectorEvidence => 8 * 1024 * 1024 + 64 * 1024,
             KindRange::ReadFence => 64 * 1024,
         }
     }

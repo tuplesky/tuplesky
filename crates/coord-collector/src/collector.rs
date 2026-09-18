@@ -38,8 +38,14 @@ use coord_types::wire_v1::{
 use coord_types::{CommandId, RetryKey};
 
 use crate::codes;
+
 use crate::trace::{CollectorEvent, command_hex, replica_hex};
 use crate::wire::{SubmitV1, submit_frame};
+
+/// The largest result a client can actually be handed: an API-class
+/// frame, less room for the response's own fields and the frame header.
+const MAX_DELIVERABLE_RESULT_BYTES: usize =
+    (coord_types::wire_v1::KindRange::Api.max_frame_length() as usize) - 64 * 1024;
 
 /// Configuration of one domain's collector.
 #[derive(Clone, Debug)]
@@ -305,7 +311,7 @@ impl Collector {
             });
         }
         let frame = submit_frame(&SubmitV1 {
-            receipt: admitted.receipt.clone(),
+            receipt: crate::wire::AdmissionClaimsV1::of(&admitted.receipt),
             request: request.clone(),
         })
         .map_err(|_| SubmitRefusal::Malformed)?;
@@ -440,10 +446,10 @@ impl Collector {
             return Err(EvidenceError::NotLeader { sender });
         }
         let established = released.established();
-        if established.epoch() != quorum.epoch {
+        if established.epoch() != quorum.epoch() {
             return Err(EvidenceError::WrongEpoch);
         }
-        if established.ballot() != quorum.ballot {
+        if established.ballot() != quorum.ballot() {
             return Err(EvidenceError::WrongBallot);
         }
         let command = established.command();
@@ -496,15 +502,20 @@ impl Collector {
         let fast = matches!(learned, Learned::Fast { .. });
         let voters: Vec<String> = entry.votes.voted().iter().map(replica_hex).collect();
         let established = released.established();
+        // What the client can be answered with is bounded by the API
+        // frame class, not by the storage result bound: a result between
+        // the two is real but undeliverable, and saying so is an answer
+        // while silence is not.
+        let deliverable = released.response().len() <= MAX_DELIVERABLE_RESULT_BYTES;
         let response = match BoundedBytes::new(released.response().to_vec()) {
-            Ok(result) => ResponseV1 {
+            Ok(result) if deliverable => ResponseV1 {
                 command_id: command,
                 outcome: OutcomeV1::Ok {
                     revision: established.revision(),
                     result,
                 },
             },
-            Err(_) => codes::error_response(command, codes::RESULT_TOO_LARGE, "result bound"),
+            _ => codes::error_response(command, codes::RESULT_TOO_LARGE, "result bound"),
         };
         self.retain(entry.retry_key, command, response.clone());
         self.trace.push(CollectorEvent::Released {
@@ -610,7 +621,7 @@ impl Collector {
             entry.released = None;
         }
         self.trace.push(CollectorEvent::Reconfigured {
-            ballot: quorum.ballot.number,
+            ballot: quorum.ballot().number,
             reset,
         });
         self.config.quorum = quorum;

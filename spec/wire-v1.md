@@ -139,7 +139,7 @@ kind at the collector boundary, like peer evidence.
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
 | Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionReceipt, request: RequestV1 }` (postcard); API class limit |
-| Release | `0x0104` | leader to collector | `ReleasedResult` (postcard); API class limit |
+| Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
 | Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
 
 A voter admits `Submit` only from a connection bound to a collector role

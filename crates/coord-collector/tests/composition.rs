@@ -19,10 +19,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coord_collector::{
-    Action, Admission, AdmissionLimits, Caller, Collector, CollectorConfig, CollectorEvent,
-    Delivery, Dispatcher, EvidenceError, HoldReason, KIND_EVIDENCE, KIND_RELEASE, Progress,
-    SubmitRefusal, Submitted, admitted_from_submit, codes, decode_evidence, decode_release,
-    frontend_frame,
+    Action, Admission, AdmissionLimits, AdmissionRefusal, Caller, Collector, CollectorConfig,
+    CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason, KIND_EVIDENCE, KIND_RELEASE,
+    Progress, SubmitRefusal, Submitted, admitted_from_submit, codes, decode_evidence,
+    decode_release, frontend_frame,
 };
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, FastAck, Follower, FollowerConfig,
@@ -151,7 +151,7 @@ fn request(seq: u64, op: CanonicalOperation, deadline_ms: u32) -> (CommandId, Re
 
 fn frame_of(bytes: &[u8]) -> Frame {
     let mut reader = FrameReader::new();
-    reader.push(bytes);
+    reader.push(bytes).expect("within the reader bound");
     let frame = reader.next_frame().unwrap().expect("one frame");
     assert!(reader.next_frame().unwrap().is_none());
     frame
@@ -231,15 +231,22 @@ fn node(n: u8, me: u8) -> Node {
             .unwrap(),
         );
     }
+    // Session and policy rows are admission rows: they need an ordered
+    // batch, so the bootstrap carries the application base.
+    let base = worker.application_base();
     worker
         .submit(PersistBatch {
             barrier: alloc.allocate(),
-            base: None,
+            base: Some(base),
             updates,
         })
         .unwrap();
     worker.flush().unwrap();
     let applier = Applier::new(worker, alloc).unwrap();
+    // Execution positions are absolute: the ordered bootstrap batch
+    // already occupies the first of them, so a machine starts from the
+    // frontier the store is at, not from zero.
+    let bootstrapped = applier.worker().application_base().execution_position;
     let mut machine = if me == 0 {
         Machine::Leader(Leader::new(
             LeaderConfig {
@@ -250,15 +257,19 @@ fn node(n: u8, me: u8) -> Node {
                 capacity: 64,
             },
             None,
+            bootstrapped,
         ))
     } else {
-        Machine::Follower(Follower::new(FollowerConfig {
-            identity: identity(n, me),
-            quorum: quorum(n),
-            genesis: ballot(),
-            frontend: FRONTEND,
-            capacity: 64,
-        }))
+        Machine::Follower(
+            Follower::new(FollowerConfig {
+                identity: identity(n, me),
+                quorum: quorum(n),
+                genesis: ballot(),
+                frontend: FRONTEND,
+                capacity: 64,
+            })
+            .restore_execution(bootstrapped, []),
+        )
     };
     match &mut machine {
         Machine::Leader(m) => m.set_learning(LearningMode::Full),
@@ -1357,4 +1368,98 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
         e,
         CollectorEvent::Evidence { accepted: false, reason: Some(r), .. } if r.contains("NotAVoter")
     )));
+}
+
+#[test]
+fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
+    // The bound counts distinct unresolved requests. Counting every
+    // admission instead refused a client's first retry under a bound of
+    // one, and under any bound left the session permanently busy once the
+    // retries outnumbered the single release that settles them.
+    let mut gate = Admission::new(
+        CLUSTER,
+        DOMAIN,
+        AdmissionLimits {
+            max_pending_per_session: 1,
+        },
+    );
+    let (_, first) = request(1, put(b"a", b"1"), 0);
+    gate.admit(0, &caller(), &first).expect("admitted");
+    assert_eq!(gate.pending(&SESSION), 1);
+    for _ in 0..8 {
+        gate.admit(0, &caller(), &first)
+            .expect("a retry of the same request is the same request");
+        assert_eq!(gate.pending(&SESSION), 1, "no slot was taken");
+    }
+    // A different request is refused while the one slot is occupied.
+    let (_, other) = request(2, put(b"b", b"2"), 0);
+    assert!(matches!(
+        gate.admit(0, &caller(), &other),
+        Err(AdmissionRefusal::SessionBusy { pending: 1 })
+    ));
+    // One settlement frees the request, however many times it was
+    // retried, and settling it again frees nothing else.
+    gate.settled(&first.retry_key);
+    assert_eq!(gate.pending(&SESSION), 0);
+    gate.settled(&first.retry_key);
+    gate.admit(0, &caller(), &other).expect("the slot is free");
+    assert_eq!(gate.pending(&SESSION), 1);
+}
+
+#[test]
+fn a_request_retried_on_a_new_connection_survives_the_old_one_closing() {
+    // A retry can arrive on a new connection. Leaving the key in the old
+    // connection's set made that connection's close remove the new owner
+    // and cancel the request, so the release never reached the connection
+    // that was waiting for it.
+    let mut w = World::new(23);
+    let (command, first) = w.submit(7, 1, put(b"c", b"1"));
+    assert!(matches!(first, Action::FanOut(_)));
+    // The client reconnects and retries the same request.
+    let (again, second) = w.submit(8, 1, put(b"c", b"1"));
+    assert_eq!(again, command, "the same request, not a new one");
+    assert!(matches!(second, Action::Pending { .. }));
+    // The old connection goes away: it owns nothing now, so nothing is
+    // cancelled.
+    let hub = w.hub();
+    assert!(
+        w.frontend.on_connection_closed(7, &hub).is_empty(),
+        "the reattached request is not the old connection's to cancel"
+    );
+    w.settle();
+    let (_, response) = w
+        .delivered(&command)
+        .expect("the release reaches the connection now attached");
+    assert_eq!(response.command_id, command);
+    let to = w
+        .deliveries
+        .iter()
+        .find(|(_, d)| response_of(d).command_id == command)
+        .map(|(_, d)| d.connection)
+        .expect("delivered");
+    assert_eq!(to, 8, "delivered to the connection that retried");
+}
+
+#[test]
+fn a_release_larger_than_an_api_frame_still_reaches_the_collector() {
+    // The release used to take the API class limit while a result may be
+    // as large as the storage bound, so a valid result between the two
+    // could not be framed, never reached the collector, and left its
+    // request pending for ever with nothing to answer.
+    let established = EstablishedResult::restore(coord_core::capability::EstablishedRecord {
+        command: CommandId(Digest32([1; 32])),
+        epoch: epoch(),
+        ballot: ballot(),
+        position: ExecutionPosition::new(2).unwrap(),
+        result_digest: Digest32([2; 32]),
+        revision: Some(KvRevision::new(3).unwrap()),
+        fast_path: false,
+    })
+    .expect("a valid established record");
+    let big = vec![0u8; 6 * 1024 * 1024];
+    let released =
+        coord_core::capability::ReleasedResult::from_gate(established, big.clone(), false);
+    let frame = coord_collector::release_frame(&released).expect("a large result still frames");
+    let decoded = decode_release(&frame_of(&frame)).expect("round trip");
+    assert_eq!(decoded.response().len(), big.len());
 }
