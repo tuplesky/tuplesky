@@ -73,6 +73,7 @@ pending.
 | `check-docs [--render]` | run `scripts/ci/check_docs.py` |
 | `check-ci` | unit tests of the classifier, gate and documentation checker |
 | `msrv` | `cargo +1.90.0 check --workspace --locked` |
+| `loom` | `RUSTFLAGS=--cfg loom` model checks of local concurrency boundaries (watch handoff), run by the Rust CI job |
 | `ci` | the pull-request sequence |
 
 The Python scripts are the CI-owned implementations so the lightweight jobs

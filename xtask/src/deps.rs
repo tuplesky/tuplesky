@@ -111,13 +111,24 @@ pub(crate) fn check(root: &Path, offline: bool) -> Result<()> {
         bail!("Cargo.lock is missing; commit a locked resolution");
     }
     check_exact_pins(root)?;
-    let json = crate::output(
-        root,
-        "cargo",
-        &["metadata", "--format-version", "1", "--locked"],
-    )?;
-    let metadata: Metadata = serde_json::from_str(&json).context("parsing cargo metadata")?;
-    check_graph(&metadata)?;
+    // Filter by each supported platform so `cfg(loom)`-only dependencies
+    // (never set in production builds) do not appear in the normal graph.
+    for platform in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let json = crate::output(
+            root,
+            "cargo",
+            &[
+                "metadata",
+                "--format-version",
+                "1",
+                "--locked",
+                "--filter-platform",
+                platform,
+            ],
+        )?;
+        let metadata: Metadata = serde_json::from_str(&json).context("parsing cargo metadata")?;
+        check_graph(&metadata)?;
+    }
     let go_sum = root.join("adapters/kine/go.sum");
     if !go_sum.is_file() {
         bail!("adapters/kine/go.sum is missing");
