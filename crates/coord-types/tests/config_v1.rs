@@ -85,7 +85,10 @@ fn handoff_record(previous: Digest32) -> GroupConfigurationV1 {
 
 fn ballot_record() -> BallotConfigurationV1 {
     BallotConfigurationV1 {
+        cluster: ClusterId([1; 16]),
+        domain: DomainId([2; 16]),
         epoch: epoch(2),
+        configuration_certificate: Digest32([0xdd; 32]),
         ballot: Ballot {
             epoch: epoch(2),
             number: 3,
@@ -291,6 +294,18 @@ fn ballot_and_catalog_shapes_are_validated() {
     let mut other_fast = b.clone();
     other_fast.fast_set = vec![node(1), node(2), node(4)];
     assert_ne!(b.ballot_message(), other_fast.ballot_message());
+    // The context a promise was made in is part of what it signs: the same
+    // ballot under another domain, cluster or configuration record is a
+    // different message, so its promises cannot be carried there.
+    let mut other_domain = b.clone();
+    other_domain.domain = DomainId([3; 16]);
+    assert_ne!(b.ballot_message(), other_domain.ballot_message());
+    let mut other_cluster = b.clone();
+    other_cluster.cluster = ClusterId([9; 16]);
+    assert_ne!(b.ballot_message(), other_cluster.ballot_message());
+    let mut other_certificate = b.clone();
+    other_certificate.configuration_certificate = Digest32([0xde; 32]);
+    assert_ne!(b.ballot_message(), other_certificate.ballot_message());
 
     let e = endpoints();
     e.validate_shape().unwrap();

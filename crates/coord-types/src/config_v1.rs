@@ -8,7 +8,8 @@
 //!   the first epoch, a majority of the previous epoch's voters for a
 //!   handoff). Its certificate hash is the chain link.
 //! * [`BallotConfigurationV1`] binds a ballot's leader and immutable fast
-//!   set under an epoch, with the voters' recovery promises as evidence.
+//!   set to one cluster, domain and configuration certificate under an
+//!   epoch, with the voters' recovery promises as evidence.
 //! * [`ConfigurationHintV1`] is what an authenticated response or error may
 //!   carry: it triggers a refresh and authorizes nothing.
 //! * [`EndpointCatalogV1`] and [`ObserverCatalogV1`] change addresses,
@@ -373,10 +374,23 @@ impl GroupConfigurationV1 {
 
 /// A ballot's leader and immutable fast set under an epoch, with the
 /// voters' promises as evidence that the ballot was recovered.
+///
+/// A promise is a statement about one configuration of one domain, so the
+/// record names that configuration exactly: the cluster and domain it was
+/// made in and the certificate hash of the epoch record whose voters made
+/// it. All three are signed, so a promise cannot be carried into another
+/// context.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BallotConfigurationV1 {
+    /// Cluster/restore identity the promises were made in.
+    pub cluster: ClusterId,
+    /// Domain the promises were made in.
+    pub domain: DomainId,
     /// Epoch.
     pub epoch: ConfigurationEpoch,
+    /// Certificate hash of the epoch's record: the exact configuration the
+    /// promisers held when they promised.
+    pub configuration_certificate: Digest32,
     /// Ballot (its leader leads every quorum).
     pub ballot: Ballot,
     /// Quorum policy the fast set was chosen under.
@@ -410,9 +424,23 @@ impl BallotConfigurationV1 {
     }
 
     /// The message every promise signs.
+    ///
+    /// The preimage opens with the promise's context — cluster, domain and
+    /// the certificate hash of the epoch record the promisers held — before
+    /// the ballot itself. A message that named only the numbers made an
+    /// honest promise from one domain valid evidence in every other domain
+    /// that shares the same voter identities, incarnations and keys: with
+    /// no key compromise at all, a replayed certificate installed a leader
+    /// and fast set those voters never authorized there. Verification
+    /// checks the three context fields against the chain that holds them
+    /// (`coord-membership`), which is only meaningful because they are
+    /// signed here.
     pub fn ballot_message(&self) -> Digest32 {
         let mut parts: Vec<Vec<u8>> = alloc::vec![
+            self.cluster.as_bytes().to_vec(),
+            self.domain.as_bytes().to_vec(),
             self.epoch.to_be_bytes().to_vec(),
+            self.configuration_certificate.0.to_vec(),
             self.ballot.number.to_be_bytes().to_vec(),
             self.ballot.leader.as_bytes().to_vec(),
             self.quorum_policy.0.to_be_bytes().to_vec(),
