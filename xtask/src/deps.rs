@@ -1,7 +1,10 @@
 //! Dependency policy (task-01, design Sections 16.1-16.3):
 //!
 //! * `Cargo.lock` exists and every workspace dependency is an exact pin, a path
-//!   or a Git revision.
+//!   or a Git revision. Every workspace member manifest inherits its external
+//!   dependencies from the workspace table (`workspace = true`) or pins them
+//!   the same way, so no member can add a floating requirement that a later
+//!   lockfile update would silently move.
 //! * Every workspace member declares `package.metadata.tuplesky.role` as one of
 //!   `core`, `production`, `tool` or `test-only`.
 //! * No `core`, `production` or `tool` crate reaches a test-only crate (a
@@ -79,6 +82,8 @@ struct Package {
     id: String,
     source: Option<String>,
     #[serde(default)]
+    manifest_path: String,
+    #[serde(default)]
     metadata: Option<serde_json::Value>,
 }
 
@@ -117,6 +122,7 @@ pub(crate) fn check(root: &Path, offline: bool) -> Result<()> {
         &["metadata", "--format-version", "1", "--locked"],
     )?;
     let metadata: Metadata = serde_json::from_str(&json).context("parsing cargo metadata")?;
+    check_member_pins(&metadata)?;
     check_graph(&metadata)?;
     let go_sum = root.join("adapters/kine/go.sum");
     if !go_sum.is_file() {
@@ -168,6 +174,86 @@ fn check_exact_pins(root: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Dependency tables a member manifest may declare, directly or under
+/// `[target.<cfg>.*]`.
+const DEPENDENCY_TABLES: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
+/// Every external dependency declared by a workspace member must be inherited
+/// from the workspace table or pinned exactly, so `cargo metadata --locked`
+/// and cargo-deny never see a floating requirement that the root check does
+/// not cover.
+fn check_member_pins(metadata: &Metadata) -> Result<()> {
+    let mut bad = Vec::new();
+    for package in metadata
+        .packages
+        .iter()
+        .filter(|p| metadata.workspace_members.contains(&p.id))
+    {
+        let text = std::fs::read_to_string(&package.manifest_path)
+            .with_context(|| format!("reading {}", package.manifest_path))?;
+        let manifest: toml::Value =
+            toml::from_str(&text).with_context(|| format!("parsing {}", package.manifest_path))?;
+        for entry in unpinned_member_dependencies(&manifest) {
+            bad.push(format!("{}: {entry}", package.name));
+        }
+    }
+    if !bad.is_empty() {
+        bail!(
+            "member dependencies must use `workspace = true`, an exact `=` pin, a path or a git rev: {}",
+            bad.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Names (`table.name`) of dependencies in one member manifest that neither
+/// inherit from the workspace nor pin exactly.
+fn unpinned_member_dependencies(manifest: &toml::Value) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut tables: Vec<(String, &toml::Value)> = Vec::new();
+    for table in DEPENDENCY_TABLES {
+        if let Some(v) = manifest.get(table) {
+            tables.push(((*table).to_string(), v));
+        }
+    }
+    if let Some(targets) = manifest.get("target").and_then(|t| t.as_table()) {
+        for (cfg, spec) in targets {
+            for table in DEPENDENCY_TABLES {
+                if let Some(v) = spec.get(table) {
+                    tables.push((format!("target.{cfg}.{table}"), v));
+                }
+            }
+        }
+    }
+    for (table, deps) in tables {
+        let Some(deps) = deps.as_table() else {
+            bad.push(format!("{table} (not a table)"));
+            continue;
+        };
+        for (name, spec) in deps {
+            if !member_spec_is_pinned(spec) {
+                bad.push(format!("{table}.{name}"));
+            }
+        }
+    }
+    bad
+}
+
+fn member_spec_is_pinned(spec: &toml::Value) -> bool {
+    match spec {
+        toml::Value::String(v) => v.starts_with('='),
+        toml::Value::Table(t) => {
+            t.get("workspace").and_then(|w| w.as_bool()) == Some(true)
+                || t.contains_key("path")
+                || (t.contains_key("git") && t.contains_key("rev"))
+                || t.get("version")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| v.starts_with('='))
+        }
+        _ => false,
+    }
 }
 
 fn role_of(package: &Package) -> Option<&str> {
@@ -357,6 +443,46 @@ mod tests {
             m.entry(a).or_default().push(b);
         }
         m
+    }
+
+    #[test]
+    fn member_manifest_requires_inherited_or_exact_dependencies() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+            [package]
+            name = "m"
+            [dependencies]
+            a = { workspace = true }
+            b = "=1.2.3"
+            c = { version = "=0.1.0", features = ["x"] }
+            d = { path = "../d" }
+            e = { git = "https://example.invalid/e", rev = "abc" }
+            floating = "1.2"
+            caret = { version = "^1", optional = true }
+            [dev-dependencies]
+            f = { workspace = true }
+            loose = { version = "0.5" }
+            [build-dependencies]
+            g = "2"
+            [target.'cfg(unix)'.dependencies]
+            h = { git = "https://example.invalid/h", branch = "main" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            unpinned_member_dependencies(&manifest),
+            vec![
+                "dependencies.caret",
+                "dependencies.floating",
+                "dev-dependencies.loose",
+                "build-dependencies.g",
+                "target.cfg(unix).dependencies.h",
+            ]
+        );
+        let clean: toml::Value =
+            toml::from_str("[package]\nname = \"m\"\n[dependencies]\na = { workspace = true }")
+                .unwrap();
+        assert!(unpinned_member_dependencies(&clean).is_empty());
     }
 
     #[test]

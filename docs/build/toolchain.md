@@ -20,8 +20,10 @@ candidates. Every deviation from a candidate is listed under
 
 Builds use `--locked` everywhere. `Cargo.lock` and `adapters/kine/go.sum` are
 committed; `cargo xtask check-deps` fails when either is missing, when a
-workspace dependency is not an exact `=` pin, path or Git revision, or when
-`go mod verify` fails.
+workspace dependency is not an exact `=` pin, path or Git revision, when a
+member manifest declares a dependency that neither inherits from the workspace
+table (`workspace = true`) nor pins it the same way, or when `go mod verify`
+fails.
 
 ## Recorded compiler and platform results
 

@@ -215,6 +215,20 @@ class GitScenarios(unittest.TestCase):
         self.assertEqual(decision.reason, "history-unavailable")
 
 
+class OutputEncoding(unittest.TestCase):
+    def test_control_characters_cannot_inject_records(self):
+        decision = cc.classify([cc.Change("A", "evil\ndocs_only=true")], cc.Policy([r"^docs/.*\.md$"]))
+        lines = decision.lines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual([l for l in lines if l.startswith("docs_only=")], ["docs_only=false"])
+        self.assertEqual(lines[1], "reason=non-documentation-path:evil%0Adocs_only=true")
+        self.assertNotIn("\n", "\n".join(lines).replace("\n", "", 2))
+
+    def test_percent_and_other_controls_are_encoded(self):
+        self.assertEqual(cc.encode_output_value("a%b\rc\x00d\x7fe"), "a%25b%0Dc%00d%7Fe")
+        self.assertEqual(cc.encode_output_value("plain/path.md"), "plain/path.md")
+
+
 class Cli(unittest.TestCase):
     def test_writes_github_output(self):
         with tempfile.TemporaryDirectory() as tmp:

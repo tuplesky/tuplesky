@@ -53,9 +53,30 @@ class Decision:
     def lines(self) -> list[str]:
         return [
             f"docs_only={'true' if self.docs_only else 'false'}",
-            f"reason={self.reason}",
+            f"reason={encode_output_value(self.reason)}",
             f"changed_files={self.changed_files}",
         ]
+
+
+def encode_output_value(value: str) -> str:
+    """Make ``value`` safe as a single-line ``key=value`` output record.
+
+    ``reason`` embeds Git paths, and a legal Git filename may contain a line
+    break or other control characters. Written verbatim to ``$GITHUB_OUTPUT``
+    such a path would terminate the record early and let the remainder be
+    parsed as a second ``key=value`` line (for example ``docs_only=true``),
+    which the workflow uses to skip the heavy jobs. Percent-encode ``%`` and
+    every control character so the record stays one line and decodes
+    unambiguously.
+    """
+    out = []
+    for ch in value:
+        code = ord(ch)
+        if ch == "%" or code < 0x20 or code == 0x7F:
+            out.append(f"%{code:02X}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 class Policy:
