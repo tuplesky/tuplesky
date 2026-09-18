@@ -29,7 +29,11 @@ pub struct Campaign {
     bound: Option<BarrierId>,
     durable: bool,
     published: bool,
-    payloads_requested: bool,
+    /// Voters the missing payloads were already asked for. A voter that
+    /// promises later is asked too: the ones asked first may be gone, and
+    /// the campaign must not wait forever on a live quorum that holds the
+    /// payload.
+    payloads_requested: BTreeSet<ReplicaId>,
 }
 
 impl Campaign {
@@ -45,7 +49,7 @@ impl Campaign {
             bound: None,
             durable: false,
             published: false,
-            payloads_requested: false,
+            payloads_requested: BTreeSet::new(),
         }
     }
 
@@ -55,15 +59,19 @@ impl Campaign {
         &self.promised
     }
 
-    /// Whether the payloads the selection needs were already requested.
-    pub const fn payloads_requested(&self) -> bool {
-        self.payloads_requested
+    /// Promised voters that have not been asked for the missing payloads
+    /// yet, `me` excluded: whom to ask now.
+    pub fn payload_requests_due(&self, me: ReplicaId) -> Vec<ReplicaId> {
+        self.promised
+            .iter()
+            .filter(|v| **v != me && !self.payloads_requested.contains(v))
+            .copied()
+            .collect()
     }
 
-    /// Record that the missing payloads were requested from the reporting
-    /// voters (asked once; the selection waits for them).
-    pub const fn mark_payloads_requested(&mut self) {
-        self.payloads_requested = true;
+    /// Record that the missing payloads were requested from `voters`.
+    pub fn mark_payloads_requested(&mut self, voters: &[ReplicaId]) {
+        self.payloads_requested.extend(voters.iter().copied());
     }
 
     /// A campaign resumed from a durably bound selection (after a crash):
