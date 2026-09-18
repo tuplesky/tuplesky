@@ -115,6 +115,17 @@ Observed transitive facts to carry into task-j02:
 | `toml` requirement `=1.1.6` | Kept | Resolves to `1.1.6+spec-1.1.0` |
 | Workspace license `FSL-1.1-ALv2` | `deny.toml` ignores private (`publish = false`) crates | Not an SPDX identifier; not a third-party dependency |
 
+## Accepted advisories
+
+`cargo deny check` runs with the live RustSec database in CI. Advisories with
+no upgrade path are ignored in `deny.toml` only after review, with the reason
+recorded here. Every entry is accepted for development and test builds and is
+to be resolved or re-justified before a production release.
+
+| Advisory | Crate | Nature | Why no upgrade | Why unreachable here |
+|---|---|---|---|---|
+| RUSTSEC-2024-0437 | protobuf 2.28.0 | stack overflow (denial of service) when skipping unknown group fields in untrusted input; patched in 3.7.2+ | the pinned raft-engine revision requires protobuf 2 directly and through prometheus 0.13; the 2.x line is unmaintained | raft-engine is a dependency of `tools/raft-engine-smoke` only, no daemon or library crate links it, and the engine decodes only its own on-disk log entries |
+
 ## Reproducing
 
 ```text
