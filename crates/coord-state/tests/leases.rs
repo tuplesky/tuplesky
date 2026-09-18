@@ -2,120 +2,17 @@
 //! stable non-reused identities, ownership, quotas rechecked on value
 //! growth, and revocation deleting exactly the current attachments.
 
-use std::collections::BTreeMap;
+mod common;
 
-use coord_core::effect::ApplyBase;
-use coord_state::planner::{apply_leases, apply_to_map};
+use common::*;
 use coord_state::{
-    ApplyPlan, KvEntry, KvEventKind, LeasePurpose, LeaseRecord, LeaseStatus, Mutation, Outcome,
-    PlanError, PlanLimits, ReadView, attachment_cost, plan,
+    KvEventKind, LeasePurpose, LeaseRecord, LeaseStatus, Mutation, Outcome, PlanError,
+    attachment_cost, plan,
 };
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
 
-const NS: NamespaceId = NamespaceId([7; 16]);
 const OTHER_NS: NamespaceId = NamespaceId([8; 16]);
-const ALICE: PrincipalId = PrincipalId([0xa; 16]);
-const BOB: PrincipalId = PrincipalId([0xb; 16]);
-const L1: LeaseId = LeaseId([1; 16]);
-const L2: LeaseId = LeaseId([2; 16]);
-
-fn rev(n: u64) -> KvRevision {
-    KvRevision::new(n).unwrap()
-}
-
-fn req(op: CanonicalOperation) -> LogicalRequest {
-    let mut r = LogicalRequest::new(NS, op);
-    r.canonicalize();
-    r
-}
-
-fn put(key: &[u8], value: &[u8], lease: Option<LeaseId>) -> LogicalRequest {
-    req(CanonicalOperation::Put(PutOp {
-        key: key.to_vec(),
-        value: value.to_vec(),
-        lease,
-        prev_kv: false,
-    }))
-}
-
-fn grant(id: LeaseId, ttl: u32) -> LogicalRequest {
-    req(CanonicalOperation::LeaseGrant {
-        lease_id: id,
-        ttl_seconds: ttl,
-    })
-}
-
-fn revoke(id: LeaseId) -> LogicalRequest {
-    req(CanonicalOperation::LeaseRevoke { lease_id: id })
-}
-
-fn ttl(id: LeaseId, keys: bool) -> LogicalRequest {
-    req(CanonicalOperation::LeaseTimeToLive { lease_id: id, keys })
-}
-
-/// In-memory domain: current entries, lease records and the reverse index
-/// derived from the entries (what common storage builds for the planner).
-struct Fixture {
-    current: BTreeMap<Vec<u8>, KvEntry>,
-    leases: BTreeMap<LeaseId, LeaseRecord>,
-    revision: u64,
-    position: u64,
-    limits: PlanLimits,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        Fixture {
-            current: BTreeMap::new(),
-            leases: BTreeMap::new(),
-            revision: 0,
-            position: 0,
-            limits: PlanLimits::default(),
-        }
-    }
-
-    fn view(&self, principal: PrincipalId) -> ReadView {
-        let base = ApplyBase {
-            configuration: ConfigurationEpoch::ZERO,
-            execution_position: ExecutionPosition::new(self.position).unwrap(),
-        };
-        let mut v = ReadView::empty(base, NS, principal, rev(self.revision));
-        v.current = self.current.clone();
-        v.leases = self.leases.clone();
-        for (k, e) in &self.current {
-            if let Some(l) = e.lease {
-                v.lease_keys.entry(l).or_default().insert(k.clone());
-            }
-        }
-        for l in self.leases.keys() {
-            v.lease_keys.entry(*l).or_default();
-        }
-        v
-    }
-
-    fn run_as(&mut self, principal: PrincipalId, r: &LogicalRequest) -> ApplyPlan {
-        let v = self.view(principal);
-        let p = plan(r, &v, &self.limits).unwrap();
-        assert_eq!(p.position.get(), self.position + 1);
-        apply_to_map(&mut self.current, &p);
-        apply_leases(&mut self.leases, &p);
-        self.position += 1;
-        if let Some(r) = p.revision {
-            assert_eq!(r.get(), self.revision + 1);
-            self.revision = r.get();
-        }
-        p
-    }
-
-    fn run(&mut self, r: &LogicalRequest) -> ApplyPlan {
-        self.run_as(ALICE, r)
-    }
-
-    fn record(&self, id: LeaseId) -> &LeaseRecord {
-        &self.leases[&id]
-    }
-}
 
 #[test]
 fn grant_is_stable_never_reused_and_needs_no_revision() {
@@ -360,16 +257,10 @@ fn kine_private_bindings_and_other_namespaces_are_invisible() {
             .outcome,
         Outcome::ErrLeaseNotFound
     );
-    // Renewal is task-16.
-    let v = f.view(ALICE);
+    // Renewal of a hidden binding is invisible too.
     assert_eq!(
-        plan(
-            &req(CanonicalOperation::LeaseKeepAlive { lease_id: L1 }),
-            &v,
-            &f.limits
-        )
-        .unwrap_err(),
-        PlanError::Unsupported
+        f.run(&keep_alive(L2)).response.outcome,
+        Outcome::ErrLeaseNotFound
     );
 }
 

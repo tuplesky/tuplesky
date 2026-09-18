@@ -4,7 +4,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_core::effect::ApplyBase;
-use coord_types::ids::{KvRevision, LeaseGeneration, LeaseId, NamespaceId, PrincipalId};
+use coord_types::ids::{
+    KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId, PrincipalId,
+};
 use coord_types::logical_v1::{BranchOp, CanonicalOperation};
 
 use crate::lease::LeaseRecord;
@@ -55,6 +57,8 @@ pub struct ReadView {
     pub kv_revision: KvRevision,
     /// Compaction floor: history strictly below it is unavailable.
     pub compact_floor: KvRevision,
+    /// Replicated lease expiry authority epoch (`ZERO`: none established).
+    pub lease_authority: LeaseAuthorityEpoch,
     /// Current entries covering the request's keys.
     pub current: BTreeMap<Vec<u8>, KvEntry>,
     /// Historical snapshots, one per explicit revision the request reads
@@ -83,6 +87,7 @@ impl ReadView {
             principal,
             kv_revision,
             compact_floor: KvRevision::ZERO,
+            lease_authority: LeaseAuthorityEpoch::ZERO,
             current: BTreeMap::new(),
             historical: Vec::new(),
             leases: BTreeMap::new(),

@@ -378,6 +378,7 @@ fn registry_and_stamp_fixtures_are_frozen() {
             meta_fields::EXECUTION_FRONTIER,
             meta_fields::KV_REVISION,
             meta_fields::RETENTION_FLOOR,
+            meta_fields::LEASE_AUTHORITY,
         ]
         .iter()
         .map(|f| String::from_utf8(f.to_vec()).unwrap())

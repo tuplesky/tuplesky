@@ -153,6 +153,8 @@ pub mod meta_fields {
     pub const KV_REVISION: &[u8] = b"kv_revision";
     /// MVCC retention floor.
     pub const RETENTION_FLOOR: &[u8] = b"retention_floor";
+    /// Replicated lease expiry authority epoch (Section 7.2).
+    pub const LEASE_AUTHORITY: &[u8] = b"lease_authority";
 }
 
 #[cfg(test)]
