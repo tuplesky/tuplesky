@@ -502,3 +502,157 @@ fn a_restored_instance_continues_its_sequence_and_never_reuses_one() {
     let id = c.submit(0, &put(b"e", b"1"), 0).unwrap();
     assert_eq!(id, RequestId(5));
 }
+
+fn resets(actions: &[SdkAction]) -> Vec<(ConnectionId, RequestId)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            SdkAction::Reset {
+                connection,
+                request,
+            } => Some((*connection, *request)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_timed_out_stream_is_reset_before_its_credit_is_reused() {
+    // Nothing closes the original stream when its deadline passes, so
+    // handing its permit straight to the resolution put both on a
+    // connection sized for one and repeated delayed responses defeated
+    // the advertised stream bound.
+    let mut c = client(ClientConfig {
+        resolve_interval: 100,
+        pool: PoolLimits {
+            max_streams_per_connection: 1,
+            ..PoolLimits::default()
+        },
+        ..ClientConfig::default()
+    });
+    let c1 = connected(&mut c, 0, 1);
+    let id = c.submit(0, &put(b"a", b"1"), 50).unwrap();
+    assert_eq!(sends(&c.take_actions()).len(), 1);
+    c.tick(50);
+    let actions = c.take_actions();
+    // The reset comes with the resolution, naming the abandoned stream.
+    assert_eq!(resets(&actions), vec![(c1, id)], "{actions:?}");
+    assert_eq!(resolves(&actions).len(), 1);
+    let order = actions
+        .iter()
+        .position(|a| matches!(a, SdkAction::Reset { .. }))
+        .zip(
+            actions
+                .iter()
+                .position(|a| matches!(a, SdkAction::Resolve { .. })),
+        )
+        .expect("both present");
+    assert!(
+        order.0 < order.1,
+        "the reset precedes the reuse: {actions:?}"
+    );
+}
+
+#[test]
+fn a_queued_request_does_not_time_out_before_it_is_sent() {
+    // The deadline counts from admission. Starting it while the request
+    // was still queued turned one the pool never transmitted into an
+    // unknown outcome and asked the endpoint to resolve an identity it
+    // had never seen.
+    let mut c = client(ClientConfig::default());
+    // No connection: nothing can be sent.
+    let id = c.submit(0, &put(b"a", b"1"), 50).unwrap();
+    assert!(c.take_actions().is_empty(), "nothing was sent");
+    c.tick(1_000);
+    assert!(
+        c.take_completions().is_empty(),
+        "a queued request has no deadline yet"
+    );
+    assert!(c.take_actions().is_empty(), "and nothing to resolve");
+    assert_eq!(c.state(id), Some(&RequestState::Queued));
+    // Once it is admitted the clock starts, and only then.
+    let _ = connected(&mut c, 1_000, 1);
+    assert_eq!(sends(&c.take_actions()).len(), 1);
+    c.tick(1_049);
+    assert!(c.take_completions().is_empty());
+    c.tick(1_050);
+    assert_eq!(c.take_completions().len(), 1, "50ms after the send");
+}
+
+#[test]
+fn a_retry_of_an_active_request_still_refuses_a_changed_payload() {
+    // Returning early for a queued, in-flight or resolving sequence
+    // skipped the local conflict check exactly where it matters most.
+    let mut c = client(ClientConfig::default());
+    let _ = connected(&mut c, 0, 1);
+    let id = c.submit(0, &put(b"a", b"1"), 0).unwrap();
+    assert_eq!(c.state(id), Some(&RequestState::InFlight(ConnectionId(1))));
+    assert!(matches!(
+        c.retry(1, id.0, &put(b"a", b"2"), 0),
+        Err(ClientError::Invocation(InvocationError::PayloadConflict {
+            sequence
+        })) if sequence == id.0
+    ));
+    // The same payload is still accepted and changes nothing.
+    assert_eq!(c.retry(1, id.0, &put(b"a", b"1"), 0).unwrap(), id);
+    assert_eq!(c.state(id), Some(&RequestState::InFlight(ConnectionId(1))));
+}
+
+#[test]
+fn a_retry_may_not_change_the_deadline_the_original_frame_carried() {
+    // The deadline is in the frame but not in the command identity, so a
+    // binding that recorded only the identity let a retry pass the
+    // conflict check while sending different bytes and moving the
+    // collector's deadline under the same invocation.
+    let mut c = client(ClientConfig::default());
+    let _ = connected(&mut c, 0, 1);
+    let id = c.submit(0, &put(b"a", b"1"), 40).unwrap();
+    let original = sends(&c.take_actions())[0].2.clone();
+    assert!(matches!(
+        c.retry(1, id.0, &put(b"a", b"1"), 90),
+        Err(ClientError::Invocation(InvocationError::DeadlineConflict {
+            sequence,
+            bound: 40,
+        })) if sequence == id.0
+    ));
+    // The original deadline is accepted, and a retry after a restart
+    // rebuilds exactly the frame that was sent.
+    let mut restored = Client::new(ClientConfig::default(), c.instance().clone(), provider());
+    let _ = connected(&mut restored, 2, 1);
+    let again = restored.retry(2, id.0, &put(b"a", b"1"), 40).unwrap();
+    assert_eq!(again, id);
+    assert_eq!(sends(&restored.take_actions())[0].2, original);
+}
+
+#[test]
+fn finished_identity_bindings_do_not_accumulate_for_ever() {
+    // A client in service cannot call `ClientInstance::retire` itself, so
+    // a workload that submits, completes and forgets would grow the
+    // binding map and the serialized instance state without bound while
+    // keeping `outstanding()` small.
+    let mut c = client(ClientConfig::default());
+    let c1 = connected(&mut c, 0, 1);
+    for i in 0..8u64 {
+        let id = c.submit(i, &put(b"k", &[i as u8]), 0).unwrap();
+        let command = c.invocation(id).unwrap().command_id;
+        let _ = c.take_actions();
+        c.on_frame(i, c1, &ok_frame(command, i + 1)).unwrap();
+        let _ = c.take_completions();
+        c.forget(id);
+        assert_eq!(c.retired_through(), id.0, "retired as the prefix closes");
+    }
+    assert_eq!(c.outstanding(), 0);
+    // A request forgotten while its outcome is unknown keeps its binding:
+    // it may still be retried under its own identity.
+    let pending = c.submit(100, &put(b"z", b"1"), 10).unwrap();
+    let _ = c.take_actions();
+    c.tick(110);
+    let _ = c.take_completions();
+    let _ = c.take_actions();
+    c.forget(pending);
+    assert_eq!(
+        c.retired_through(),
+        8,
+        "the unknown request holds the floor where it is"
+    );
+}
