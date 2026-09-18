@@ -85,7 +85,8 @@ and progress plumbing.
   quinn, rustls, getrandom, rand, rand_chacha, rand_core, reqwest, axum,
   hyper or mio through normal or build dependencies (Sections 11, 16.3, 18.2).
 * No `core`, `production` or `tool` crate reaches a `test-only` workspace
-  crate (coord-sim, coord-store-testkit, coord-storage-fjall) or an external
+  crate (coord-sim, coord-store-testkit, coord-storage-fjall,
+  coord-store-bench) or an external
   test aid (proptest, loom, arbitrary, libfuzzer-sys, criterion, quickcheck,
   fjall) through normal or build dependencies. Simulator entropy, model
   engines and the experimental state engine therefore cannot be linked into

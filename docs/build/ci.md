@@ -74,7 +74,18 @@ pending.
 | `check-ci` | unit tests of the classifier, gate and documentation checker |
 | `msrv` | `cargo +1.90.0 check --workspace --locked` |
 | `loom` | `RUSTFLAGS=--cfg loom` model checks of local concurrency boundaries (watch handoff), run by the Rust CI job |
+| `store-differential` | replays the committed fixture and the experiment workload on the model, redb and Fjall engines and compares the logical results; no cost is reported (task-s04) |
+| `store-bench` | measures one state engine under the experiment workload, in release, into a fresh run root (task-s04) |
+| `store-compare` | paired, order-alternated engine comparison; semantics are checked first and a difference disqualifies the cost figures (task-s04) |
 | `ci` | the pull-request sequence |
+
+The three `store-*` commands run the test-only `store-experiment` harness of
+`crates/coord-store-bench`. They are evidence, not a gate: they are
+deliberately outside `ci`, they allocate an absent run root under
+`--experiment-dir` (never a store root, never an existing run), and they
+leave every manifest and raw measurement, including a failed run's, in
+place. The correctness half of that harness does run in `ci`, as the
+crate's ordinary tests.
 
 The Python scripts are the CI-owned implementations so the lightweight jobs
 never need the Rust toolchain; `xtask` delegates to them rather than
