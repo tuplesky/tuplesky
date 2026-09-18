@@ -12,6 +12,7 @@ members = [
     "crates/coord-oracle",
     "crates/coord-store-api",
     "crates/coord-store-testkit",
+    "crates/coord-journal-api",
     "crates/coord-store-bench",
     "crates/coord-storage",
     "crates/coord-storage-redb",
@@ -55,6 +56,7 @@ coord-consensus = { path = "crates/coord-consensus" }
 coord-oracle = { path = "crates/coord-oracle" }
 coord-store-api = { path = "crates/coord-store-api" }
 coord-store-testkit = { path = "crates/coord-store-testkit" }
+coord-journal-api = { path = "crates/coord-journal-api" }
 coord-store-bench = { path = "crates/coord-store-bench" }
 coord-storage-redb = { path = "crates/coord-storage-redb" }
 coord-storage-fjall = { path = "crates/coord-storage-fjall" }
