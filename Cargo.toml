@@ -13,6 +13,7 @@ members = [
     "crates/coord-store-testkit",
     "crates/coord-storage",
     "crates/coord-storage-redb",
+    "crates/coord-redb-faultkit",
     "crates/coord-sim",
     "xtask",
     "tools/raft-engine-smoke",
@@ -38,6 +39,7 @@ coord-store-api = { path = "crates/coord-store-api" }
 coord-store-testkit = { path = "crates/coord-store-testkit" }
 coord-storage-redb = { path = "crates/coord-storage-redb" }
 coord-storage = { path = "crates/coord-storage" }
+coord-redb-faultkit = { path = "crates/coord-redb-faultkit" }
 coord-sim = { path = "crates/coord-sim" }
 
 # Encoding and identity (Section 16.2).
