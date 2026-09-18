@@ -581,6 +581,7 @@ dependencies = [
 name = "coord-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "coord-consensus",
  "coord-core",
  "coord-redb-faultkit",
  "coord-state",

@@ -34,15 +34,34 @@
 //!   identity nor any vote, and it never selects anything: the physical
 //!   generation lifecycle (`coord-storage-redb`) does that afterwards.
 //!
+//! * [`trim`] (task-51; Sections 5.3, 17.5-17.6, 17.16.5): the conservative
+//!   reference increment of semantic forgetting. A [`trim::CheckpointAckV1`]
+//!   per voter records durable possession of one checkpoint;
+//!   [`trim::establish_floor`] turns those into a [`trim::TrimFloor`] only
+//!   when every configured voter acknowledged the identical
+//!   `(configuration, boundary, root)`, and an acknowledgement from a
+//!   replica outside the voter set is refused, so observers supply no trim
+//!   votes. [`trim::publish_floor`] makes the floor durable before any
+//!   deletion and never lowers it, [`trim::TrimFence`] answers delayed
+//!   below-floor traffic from retained common state instead of re-creating
+//!   protocol rows, and [`trim::plan_trim`] emits bounded batches of
+//!   `protocol_v1` deletions for commands executed at or below the floor,
+//!   never a promise, a bound Sync, an unresolved obligation or a row a
+//!   retained command depends on. A missing voter stops trimming and
+//!   [`trim::trim_backpressure`] reports the retained rows against the bound
+//!   the caller refuses new work at; nothing is ever evicted.
+//!
 //! This is not `LocalRecoveryCheckpointV1` (task-j04): it carries no
 //! promises, votes, stamps, journal sequences or physical files, gives a
-//! learner no identity or authority, and authorizes no trimming.
+//! learner no identity or authority, and by itself authorizes no trimming:
+//! only the all-voter floor of [`trim`] does that.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod export;
 pub mod install;
 pub mod manifest;
+pub mod trim;
 pub mod verify;
 
 pub use export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
@@ -53,6 +72,11 @@ pub use install::{
 pub use manifest::{
     CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1, RowV1,
     SHARED_CHECKPOINT_FORMAT_V1, SharedCheckpointV1, SharedManifestV1,
+};
+pub use trim::{
+    CheckpointAckV1, FenceDecision, TrimBackpressure, TrimError, TrimFence, TrimFloor, TrimLimits,
+    TrimPlan, TrimmedFloorV1, ack_key, ack_update, establish_floor, plan_trim, publish_floor,
+    published_floor, read_acks, trim_backpressure,
 };
 pub use verify::{VerifyError, verify_shared};
 
