@@ -127,3 +127,24 @@ capability identifier; the acceptor admits it only for the dialing role.
 Each lane is a separate connection with its own stream limits, windows and
 queues; a peer pair therefore holds at most one connection per admitted
 lane and direction.
+
+## Collector frames (task-33)
+
+The trusted collector (`spec/collector-v1.md`) uses three raw kinds. Two
+are in the API range because they carry or answer a client request and
+take its class limit; the evidence frame is in the collector-evidence
+range. None is decodable by the typed decoder: they are dispatched by raw
+kind at the collector boundary, like peer evidence.
+
+| Kind | Value | Direction | Payload |
+|---|---|---|---|
+| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionReceipt, request: RequestV1 }` (postcard); API class limit |
+| Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
+| Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
+
+A voter admits `Submit` only from a connection bound to a collector role
+(`Frontend`, `KineCollector`); `Evidence` and `Release` are only ever
+sent by voters, and nothing received on an API-class connection is a
+vote. Frozen frontend error codes of `ResponseV1::Err` are listed in
+`crates/coord-collector/src/codes.rs`; pending and unknown outcomes use
+the `Pending` and `Unknown` outcomes, not error codes.

@@ -58,6 +58,8 @@ pub enum HashDomain {
     AuthGrantCommitment,
     /// Dependency-path chain digests of per-key conflict logs (task-21).
     DependencyPath,
+    /// Admission receipt identities minted at the trusted boundary (task-33).
+    AdmissionReceipt,
 }
 
 impl HashDomain {
@@ -72,6 +74,7 @@ impl HashDomain {
             HashDomain::FinalizedFrame => "tuplesky coord.v1 2026-09 finalized-frame",
             HashDomain::AuthGrantCommitment => "tuplesky coord.v1 2026-09 auth-grant-commitment",
             HashDomain::DependencyPath => "tuplesky coord.v1 2026-09 dependency-path",
+            HashDomain::AdmissionReceipt => "tuplesky coord.v1 2026-09 admission-receipt",
         }
     }
 

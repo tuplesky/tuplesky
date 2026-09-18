@@ -248,7 +248,8 @@ C2 has a single fast set.
 | No fabricated `NOOP`/`ACCEPT` placeholder for un-initialized proposals | `[EXT]` rejected | Section 4.7: placeholders cannot masquerade as processed commands |
 | Durable cut and publication obligations | `[EXT]` | Sections 4.8, 5.1 |
 | Epoch on every ballot and configuration | `[EXT]` | Section 10.5; membership is outside the paper |
-| Speculative result path, Kine collector, observers | out of scope here | Sections 4.5, 6.6, 6.7; later tasks |
+| Client-side learning (`swift/client.go` `accept`, `acceptFastAndSlowAck`) at the trusted collector | `coord-collector` `Collector::on_evidence` over `VoteSet::learned` (task-33); release additionally requires the leader's release gate | `[EXT]` on top of the source predicate; `spec/collector-v1.md` |
+| Kine collector epoch integration, observers | out of scope here | Sections 4.5, 6.6, 6.7; later tasks |
 
 ## Bounded models and counterexamples
 

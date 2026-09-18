@@ -266,6 +266,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "coord-collector"
+version = "0.1.0"
+dependencies = [
+ "coord-consensus",
+ "coord-core",
+ "coord-state",
+ "coord-storage",
+ "coord-store-api",
+ "coord-store-testkit",
+ "coord-transport",
+ "coord-transport-sim",
+ "coord-transport-testkit",
+ "coord-types",
+ "postcard",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "coord-consensus"
 version = "0.1.0"
 dependencies = [
