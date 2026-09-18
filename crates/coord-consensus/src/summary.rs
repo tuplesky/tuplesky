@@ -123,6 +123,8 @@ impl DurableLedger {
                     phase: r.phase,
                     deps: r.deps.clone(),
                     path: r.path,
+                    paths: r.paths.clone(),
+                    seqnum: r.synced_seq.unwrap_or(0),
                     keys: r.keys.clone(),
                     payload_present: true,
                 })

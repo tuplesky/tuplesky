@@ -156,8 +156,9 @@ pub fn payload_key(command: &CommandId) -> Vec<u8> {
     command.as_bytes().to_vec()
 }
 
-fn envelope<T: Serialize>(
+fn envelope_at<T: Serialize>(
     kind: u16,
+    schema_version: u16,
     value: &T,
     what: &'static str,
 ) -> Result<Vec<u8>, EngineError> {
@@ -165,10 +166,41 @@ fn envelope<T: Serialize>(
         postcard::to_allocvec(value).map_err(|_| EngineError::new(ErrorClass::Limit, what))?;
     StoreEnvelopeV1 {
         record_kind: kind,
-        schema_version: 1,
+        schema_version,
         payload,
     }
     .encode()
+}
+
+fn envelope<T: Serialize>(
+    kind: u16,
+    value: &T,
+    what: &'static str,
+) -> Result<Vec<u8>, EngineError> {
+    envelope_at(kind, 1, value, what)
+}
+
+/// Open an envelope of `kind`, returning its schema version and payload.
+/// The payload layout of a schema version is fixed once written, so a
+/// reader decides by version which decoder to run rather than guessing.
+fn open(kind: u16, bytes: &[u8], what: &'static str) -> Result<(u16, Vec<u8>), EngineError> {
+    let env = StoreEnvelopeV1::decode(bytes)?;
+    if env.record_kind != kind {
+        return Err(EngineError::new(ErrorClass::Corrupt, what));
+    }
+    Ok((env.schema_version, env.payload))
+}
+
+fn decode_exact<T: for<'de> Deserialize<'de>>(
+    payload: &[u8],
+    what: &'static str,
+) -> Result<T, EngineError> {
+    let (value, rest): (T, &[u8]) = postcard::take_from_bytes(payload)
+        .map_err(|_| EngineError::new(ErrorClass::Corrupt, what))?;
+    if !rest.is_empty() {
+        return Err(EngineError::new(ErrorClass::Corrupt, what));
+    }
+    Ok(value)
 }
 
 fn unwrap<T: for<'de> Deserialize<'de>>(
@@ -176,16 +208,11 @@ fn unwrap<T: for<'de> Deserialize<'de>>(
     bytes: &[u8],
     what: &'static str,
 ) -> Result<T, EngineError> {
-    let env = StoreEnvelopeV1::decode(bytes)?;
-    if env.record_kind != kind || env.schema_version != 1 {
+    let (version, payload) = open(kind, bytes, what)?;
+    if version != 1 {
         return Err(EngineError::new(ErrorClass::Corrupt, what));
     }
-    let (value, rest): (T, &[u8]) = postcard::take_from_bytes(&env.payload)
-        .map_err(|_| EngineError::new(ErrorClass::Corrupt, what))?;
-    if !rest.is_empty() {
-        return Err(EngineError::new(ErrorClass::Corrupt, what));
-    }
-    Ok(value)
+    decode_exact(&payload, what)
 }
 
 /// Encode a payload row.
@@ -273,14 +300,82 @@ pub fn sync_key(epoch: ConfigurationEpoch, ballot: &Ballot) -> Vec<u8> {
     out
 }
 
-/// Encode a Sync row.
-pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
-    envelope(SYNC_KIND, record, "sync encode")
+/// Schema version of the Sync row. Version 1 carried no path evidence in
+/// its entries; version 2 (task-28) carries the combined digest, the
+/// per-key digests and the leader sequence number they were synchronized
+/// at, so the layout changed and the version had to change with it.
+pub const SYNC_SCHEMA_VERSION: u16 = 2;
+
+/// A version 1 Sync entry: dependencies only, no path evidence.
+#[derive(Clone, Debug, Deserialize)]
+struct SyncEntryV1 {
+    command: CommandId,
+    phase: crate::phase::Phase,
+    deps: Vec<CommandId>,
 }
 
-/// Decode a Sync row.
+/// A version 1 Sync decision.
+#[derive(Clone, Debug, Deserialize)]
+struct SyncDecisionV1 {
+    ballot: Ballot,
+    source_ballot: Ballot,
+    entries: alloc::collections::BTreeMap<CommandId, SyncEntryV1>,
+    reproposed: alloc::collections::BTreeSet<CommandId>,
+}
+
+/// A version 1 Sync row.
+#[derive(Clone, Debug, Deserialize)]
+struct SyncRecordV1Legacy {
+    decision: SyncDecisionV1,
+}
+
+/// Encode a Sync row.
+pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
+    envelope_at(SYNC_KIND, SYNC_SCHEMA_VERSION, record, "sync encode")
+}
+
+/// Decode a Sync row, including one written by a revision that stored the
+/// version 1 layout. A version 1 selection is read back with empty path
+/// evidence, which is what that revision knew: the dependencies it bound
+/// are preserved exactly, and the replica realigns nothing it has no
+/// evidence for. Any other version is refused rather than misread.
 pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
-    unwrap(SYNC_KIND, bytes, "sync record")
+    let (version, payload) = open(SYNC_KIND, bytes, "sync record")?;
+    match version {
+        SYNC_SCHEMA_VERSION => decode_exact(&payload, "sync record"),
+        1 => {
+            let legacy: SyncRecordV1Legacy = decode_exact(&payload, "sync record")?;
+            Ok(SyncRecordV1 {
+                decision: SyncDecision {
+                    ballot: legacy.decision.ballot,
+                    source_ballot: legacy.decision.source_ballot,
+                    entries: legacy
+                        .decision
+                        .entries
+                        .into_iter()
+                        .map(|(c, e)| {
+                            (
+                                c,
+                                crate::recovery::SyncEntry {
+                                    command: e.command,
+                                    phase: e.phase,
+                                    deps: e.deps,
+                                    path: crate::graph::empty_path(),
+                                    paths: Vec::new(),
+                                    seqnum: 0,
+                                },
+                            )
+                        })
+                        .collect(),
+                    reproposed: legacy.decision.reproposed,
+                },
+            })
+        }
+        _ => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "sync record of an unsupported schema version",
+        )),
+    }
 }
 
 /// The update persisting a bound Sync selection.

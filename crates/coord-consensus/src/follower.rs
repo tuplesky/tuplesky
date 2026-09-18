@@ -810,6 +810,16 @@ impl Follower {
             }
             for command in ready {
                 let entry = self.sync_pending.remove(&command).expect("ready");
+                // Installing the selection means installing its whole
+                // evidence, not only the combined digest: the per-key
+                // logs are realigned to the selected order first, so a
+                // later command derives its dependencies from the chosen
+                // tail rather than this replica's pre-accept one. The
+                // realignment is idempotent and monotone in the sequence
+                // number, so it also runs for a record already committed
+                // here, whose dependencies are then left alone.
+                self.table
+                    .record_leader_path(command, entry.seqnum, &entry.paths);
                 // The selected order replaces a local one that is merely
                 // accepted: an ACCEPT record from a lower synchronized
                 // ballot may legally disagree with the chosen entry, and
@@ -819,7 +829,7 @@ impl Follower {
                 if self.table.phase_of(&command) < Some(Phase::Commit)
                     && self
                         .table
-                        .adopt(command, entry.deps.clone(), None, entry.path)
+                        .adopt(command, entry.deps.clone(), Some(&entry.paths), entry.path)
                         .is_err()
                 {
                     continue;

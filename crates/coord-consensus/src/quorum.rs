@@ -188,16 +188,6 @@ impl BallotConfiguration {
         Ok(())
     }
 
-    /// The voters of the configuration.
-    pub const fn voters(&self) -> &BTreeSet<ReplicaId> {
-        &self.voters
-    }
-
-    /// The fixed fast set (C2) or every voter (C1).
-    pub const fn fast_set(&self) -> &BTreeSet<ReplicaId> {
-        &self.fast_set
-    }
-
     /// Number of voters.
     pub fn voter_count(&self) -> usize {
         self.voters.len()
