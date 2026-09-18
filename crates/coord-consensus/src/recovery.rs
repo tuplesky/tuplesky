@@ -38,7 +38,7 @@ pub struct ReportEntry {
 }
 
 /// A replica's report for a new ballot (`MNewLeaderAckN`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RecoveryReport {
     /// Reporting replica.
     pub replica: ReplicaId,

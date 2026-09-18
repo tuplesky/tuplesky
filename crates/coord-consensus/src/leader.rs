@@ -37,10 +37,12 @@ use crate::learner::{AppliedOutcome, LearnError, Learner};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
+use crate::recovery::RecoveryReport;
 use crate::rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, dependency_update, payload_update,
     proposal_update,
 };
+use crate::summary::DurableLedger;
 use crate::vote::{FastAck, Vote, VoteError, VoteSet};
 
 /// The single conservative conflict key: every command in a domain
@@ -123,6 +125,7 @@ pub struct Leader {
     proposals: BTreeMap<CommandId, Proposal>,
     votes: BTreeMap<CommandId, VoteSet>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
+    ledger: DurableLedger,
     learner: Learner,
     seqnum: u64,
     rejections: Vec<Rejection>,
@@ -145,10 +148,22 @@ impl Leader {
             proposals: BTreeMap::new(),
             votes: BTreeMap::new(),
             payloads: BTreeMap::new(),
+            ledger: DurableLedger::new(),
             learner: Learner::new(ExecutionPosition::ZERO),
             seqnum: 0,
             rejections: Vec::new(),
         }
+    }
+
+    /// The durable ledger (journal-durable records only).
+    pub const fn ledger(&self) -> &DurableLedger {
+        &self.ledger
+    }
+
+    /// The recovery report for `ballot` from durable state at this cut.
+    pub fn report(&self, ballot: Ballot) -> RecoveryReport {
+        self.ledger
+            .report(self.config.identity.replica, ballot, self.ballots.synced())
     }
 
     /// The next command to execute through the materializer, if any.
@@ -306,11 +321,15 @@ impl Leader {
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
         self.seqnum += 1;
-        let record = self
+        // The leader's proposal is its own acceptance of its order: the
+        // durable dependency row records ACCEPT (the in-memory phase
+        // follows once the batch is durable and the guards hold).
+        let mut record = self
             .table
             .record(&command)
             .expect("just initialized")
             .clone();
+        record.phase = Phase::Accept;
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let updates = alloc::vec![
             payload_update(
@@ -339,6 +358,7 @@ impl Leader {
             base: None,
             updates,
         });
+        self.ledger.stage(barrier, command, record);
         let proposal = FastAck {
             replica: self.config.identity.replica,
             ballot,
@@ -409,11 +429,13 @@ impl Leader {
         {
             match event {
                 StorageEvent::JournalDurable { .. } => {
+                    self.ledger.durable(barrier);
                     if let Some(p) = self.proposals.get_mut(&command) {
                         p.durable = true;
                     }
                 }
                 StorageEvent::Failed { .. } => {
+                    self.ledger.failed(barrier);
                     self.proposals.remove(&command);
                     self.votes.remove(&command);
                     self.rejections.push(Rejection::ProposalFailed(command));
@@ -492,10 +514,50 @@ impl Leader {
             }
             ProtocolMessage::FastAck(ack) => self.collect(from, Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => self.collect(from, Vote::Slow(ack)),
+            ProtocolMessage::PayloadRequest { commands } => self.serve_payloads(from, &commands),
             ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
-            | ProtocolMessage::LeaderReply { .. } => Vec::new(),
+            | ProtocolMessage::LeaderReply { .. }
+            | ProtocolMessage::ReportPage(_)
+            | ProtocolMessage::PayloadResponse { .. } => Vec::new(),
         }
+    }
+
+    /// Serve durable payloads to a peer; a payload whose proposal batch is
+    /// not durable is not served.
+    fn serve_payloads(&mut self, to: ReplicaId, commands: &[CommandId]) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let context = self
+            .ballots
+            .context(boot, self.config.quorum.ballot, LocalJournalSeq::ZERO);
+        let responses: Vec<ProtocolMessage> = commands
+            .iter()
+            .filter(|c| self.proposals.get(c).is_some_and(|p| p.durable))
+            .filter_map(|c| {
+                self.payloads
+                    .get(c)
+                    .map(|p| ProtocolMessage::PayloadResponse {
+                        command: *c,
+                        payload: p.clone(),
+                    })
+            })
+            .collect();
+        if let Some(outbox) = self.outbox.as_mut() {
+            for m in responses {
+                outbox.publish(PendingSend {
+                    context,
+                    requires: Vec::new(),
+                    to: PeerId {
+                        replica: to,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: m.encode(),
+                });
+            }
+        }
+        self.release()
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {

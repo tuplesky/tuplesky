@@ -39,7 +39,9 @@ use crate::learner::{AppliedOutcome, LearnError, Learner};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
+use crate::recovery::RecoveryReport;
 use crate::rows::{PayloadRecordV1, PromiseRecordV1, dependency_update, payload_update};
+use crate::summary::DurableLedger;
 use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
 
 /// Static configuration of a follower.
@@ -83,6 +85,10 @@ pub enum FollowerRejection {
     Promise(PromiseRejection),
     /// A peer frame did not decode.
     MalformedPeerMessage,
+    /// A proposal of a ballot this replica no longer votes in.
+    StaleBallot,
+    /// A payload response that does not rehash to its identity.
+    PayloadIdentityMismatch(CommandId),
 }
 
 /// A leader proposal not yet adopted: held until the payload arrives and
@@ -117,6 +123,9 @@ pub struct Follower {
     pending: BTreeMap<BarrierId, Pending>,
     votes: BTreeMap<CommandId, VoteSet>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
+    durable_payloads: BTreeMap<BarrierId, CommandId>,
+    served_payloads: alloc::collections::BTreeSet<CommandId>,
+    ledger: DurableLedger,
     learner: Learner,
     rejections: Vec<FollowerRejection>,
 }
@@ -131,6 +140,8 @@ impl Follower {
     ) -> Self {
         let ballots =
             BallotState::recover(config.identity.clone(), config.genesis, durable_promise);
+        let rows: Vec<(CommandId, CommandRecord)> = rows.into_iter().collect();
+        let ledger = DurableLedger::restore(rows.iter().cloned());
         let table = CommandTable::restore(Some(config.capacity), rows);
         let adopted = table
             .records()
@@ -150,6 +161,9 @@ impl Follower {
             pending: BTreeMap::new(),
             votes: BTreeMap::new(),
             payloads: BTreeMap::new(),
+            durable_payloads: BTreeMap::new(),
+            served_payloads: alloc::collections::BTreeSet::new(),
+            ledger,
             learner: Learner::new(ExecutionPosition::ZERO),
             rejections: Vec::new(),
         }
@@ -159,6 +173,53 @@ impl Follower {
     pub fn next_executable(&self) -> Option<CommandId> {
         self.learner
             .next_executable(&self.table, |c| self.adopted.get(c).map(|(s, _)| *s))
+    }
+
+    /// The durable ledger (journal-durable records only).
+    pub const fn ledger(&self) -> &DurableLedger {
+        &self.ledger
+    }
+
+    /// The recovery report for `ballot` from durable state at this cut.
+    pub fn report(&self, ballot: Ballot) -> RecoveryReport {
+        self.ledger
+            .report(self.config.identity.replica, ballot, self.ballots.synced())
+    }
+
+    /// Commands known by identity (a held proposal) without a payload.
+    pub fn missing_payloads(&self) -> Vec<CommandId> {
+        self.held
+            .keys()
+            .filter(|c| self.table.phase_of(c).is_none())
+            .copied()
+            .collect()
+    }
+
+    /// Ask `from` for the payloads this replica lacks; the request has no
+    /// durable prerequisite and is released at once.
+    pub fn request_payloads(&mut self, from: ReplicaId) -> Vec<Effect> {
+        let commands = self.missing_payloads();
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        let context = self
+            .ballots
+            .context(boot, self.config.quorum.ballot, LocalJournalSeq::ZERO);
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: PeerId {
+                    replica: from,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: ProtocolMessage::PayloadRequest { commands }.encode(),
+            });
+        }
+        self.release()
     }
 
     /// The durable payload of an initialized command.
@@ -270,11 +331,23 @@ impl Follower {
                 return Vec::new();
             }
         };
-        let (Ok(logical), retry_key) = (request.logical(), request.retry_key) else {
+        self.on_request(request.retry_key, request.logical.as_slice().to_vec())
+    }
+
+    /// A canonical request reached this replica (from the frontend, or as
+    /// a transferred payload): initialize, persist, vote.
+    fn on_request(&mut self, retry_key: RetryKey, logical: Vec<u8>) -> Vec<Effect> {
+        let Ok((request, rest)) =
+            postcard::take_from_bytes::<coord_types::logical_v1::LogicalRequest>(&logical)
+        else {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
         };
-        let Ok(command) = CommandId::derive(&retry_key, &logical) else {
+        if !rest.is_empty() {
+            self.rejections.push(FollowerRejection::MalformedRequest);
+            return Vec::new();
+        }
+        let Ok(command) = CommandId::derive(&retry_key, &request) else {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
         };
@@ -315,7 +388,7 @@ impl Follower {
             command,
             PayloadRecordV1 {
                 retry_key,
-                logical: request.logical.as_slice().to_vec(),
+                logical: logical.clone(),
             },
         );
         let epoch = self.config.identity.epoch;
@@ -326,14 +399,7 @@ impl Follower {
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let updates = alloc::vec![
-            payload_update(
-                &command,
-                &PayloadRecordV1 {
-                    retry_key,
-                    logical: request.logical.as_slice().to_vec(),
-                },
-            )
-            .expect("bounded"),
+            payload_update(&command, &PayloadRecordV1 { retry_key, logical }).expect("bounded"),
             dependency_update(epoch, &command, &record).expect("bounded"),
         ];
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
@@ -342,6 +408,8 @@ impl Follower {
             updates,
         })];
         self.pending.insert(barrier, Pending::Vote(command));
+        self.ledger.stage(barrier, command, record);
+        self.durable_payloads.insert(barrier, command);
         // Own vote joins whatever evidence (a held proposal) already
         // arrived for this command; it never replaces it.
         let set = self
@@ -372,6 +440,14 @@ impl Follower {
     }
 
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {
+        if self.ballots.promised() != self.config.quorum.ballot
+            || self.ballots.in_flight().is_some()
+        {
+            // A promise for a higher ballot fences every old-ballot voting
+            // transition, including proposals arriving late.
+            self.rejections.push(FollowerRejection::StaleBallot);
+            return Vec::new();
+        }
         if from != self.config.quorum.leader()
             || proposal.replica != from
             || proposal.ballot != self.config.quorum.ballot
@@ -448,6 +524,7 @@ impl Follower {
                     ],
                 }));
                 self.pending.insert(barrier, Pending::Adoption(command));
+                self.ledger.stage(barrier, command, record);
                 let ack = SlowAck {
                     replica: self.config.identity.replica,
                     ballot: self.config.quorum.ballot,
@@ -472,6 +549,10 @@ impl Follower {
             match event {
                 StorageEvent::JournalDurable { .. } => {
                     self.pending.remove(&barrier);
+                    self.ledger.durable(barrier);
+                    if let Some(c) = self.durable_payloads.remove(&barrier) {
+                        self.served_payloads.insert(c);
+                    }
                     if let Pending::Adoption(c) = pending
                         && let Some(entry) = self.adopted.get_mut(&c)
                     {
@@ -480,6 +561,8 @@ impl Follower {
                 }
                 StorageEvent::Failed { .. } => {
                     self.pending.remove(&barrier);
+                    self.ledger.failed(barrier);
+                    self.durable_payloads.remove(&barrier);
                     let command = match pending {
                         Pending::Vote(c) | Pending::Adoption(c) => c,
                     };
@@ -533,8 +616,71 @@ impl Follower {
             ProtocolMessage::Proposal(p) => self.on_proposal(from, p),
             ProtocolMessage::FastAck(ack) => self.collect(from, Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => self.collect(from, Vote::Slow(ack)),
-            ProtocolMessage::Promise { .. } | ProtocolMessage::LeaderReply { .. } => Vec::new(),
+            ProtocolMessage::PayloadRequest { commands } => self.serve_payloads(from, &commands),
+            ProtocolMessage::PayloadResponse { command, payload } => {
+                self.on_payload(command, payload)
+            }
+            ProtocolMessage::Promise { .. }
+            | ProtocolMessage::LeaderReply { .. }
+            | ProtocolMessage::ReportPage(_) => Vec::new(),
         }
+    }
+
+    /// Serve durable payloads to a peer; an undurable payload is not
+    /// served (it is not yet a fact).
+    fn serve_payloads(&mut self, to: ReplicaId, commands: &[CommandId]) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let context = self
+            .ballots
+            .context(boot, self.config.quorum.ballot, LocalJournalSeq::ZERO);
+        let responses: Vec<ProtocolMessage> = commands
+            .iter()
+            .filter(|c| self.served_payloads.contains(c))
+            .filter_map(|c| {
+                self.payloads
+                    .get(c)
+                    .map(|p| ProtocolMessage::PayloadResponse {
+                        command: *c,
+                        payload: p.clone(),
+                    })
+            })
+            .collect();
+        if let Some(outbox) = self.outbox.as_mut() {
+            for m in responses {
+                outbox.publish(PendingSend {
+                    context,
+                    requires: Vec::new(),
+                    to: PeerId {
+                        replica: to,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: m.encode(),
+                });
+            }
+        }
+        self.release()
+    }
+
+    /// A transferred payload: it must rehash to the identity it claims;
+    /// then it is treated exactly like an admitted request.
+    fn on_payload(&mut self, command: CommandId, payload: PayloadRecordV1) -> Vec<Effect> {
+        let request: Result<coord_types::logical_v1::LogicalRequest, _> =
+            postcard::from_bytes(&payload.logical);
+        let ok = request
+            .ok()
+            .and_then(|r| CommandId::derive(&payload.retry_key, &r).ok())
+            .is_some_and(|id| id == command);
+        if !ok {
+            self.rejections
+                .push(FollowerRejection::PayloadIdentityMismatch(command));
+            return Vec::new();
+        }
+        if self.table.phase_of(&command).is_some() {
+            return Vec::new();
+        }
+        self.on_request(payload.retry_key, payload.logical)
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {
