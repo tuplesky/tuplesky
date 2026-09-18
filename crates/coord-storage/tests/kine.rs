@@ -132,7 +132,7 @@ impl<E: LocalEngine> Domain<E> {
         self.worker
             .submit(PersistBatch {
                 barrier: self.alloc.allocate(),
-                base: None,
+                base: Some(self.worker.application_base()),
                 updates: vec![update],
             })
             .unwrap();
