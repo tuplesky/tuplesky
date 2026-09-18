@@ -104,6 +104,12 @@ impl TestCa {
         }
     }
 
+    /// The CA certificate in DER, for tests that must hand the trust
+    /// anchor to something outside this process.
+    pub const fn certificate_der(&self) -> &CertificateDer<'static> {
+        &self.der
+    }
+
     /// Trust anchors containing only this CA.
     pub fn roots(&self) -> Arc<rustls::RootCertStore> {
         let mut roots = rustls::RootCertStore::empty();

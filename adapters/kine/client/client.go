@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"sync"
@@ -32,12 +33,30 @@ var (
 	// ErrBindRejected: the frontend refused the session binding (the
 	// token was not accepted, or the answer was not an acknowledgement).
 	ErrBindRejected = errors.New("bind rejected")
+	// ErrNegotiationRejected: the frontend did not acknowledge the Hello
+	// with the declared lane, so the connection is not usable.
+	ErrNegotiationRejected = errors.New("negotiation rejected")
+	// ErrSessionConflict: one credential named two sessions, or a
+	// configured session was not the one acknowledged. Never a silent
+	// identity change.
+	ErrSessionConflict = errors.New("session conflict")
 )
+
+// LaneUnary is the capability that declares the unary request lane in the
+// Hello (spec/wire-v1.md, task-31).
+const LaneUnary uint16 = 0x0011
 
 // TokenSource supplies the service token presented at binding. A
 // *Provider is the production source.
 type TokenSource interface {
 	Token(ctx context.Context) (string, error)
+}
+
+// invalidator is the optional part of a TokenSource that can be told its
+// cached credential was refused, so the next binding exchanges a fresh
+// one instead of presenting the same rejected token again.
+type invalidator interface {
+	Invalidate()
 }
 
 // Outcome is a request's result.
@@ -67,10 +86,40 @@ type Config struct {
 	// Cluster and Domain identify the origin.
 	Cluster [16]byte
 	Domain  [16]byte
+	// PinnedSession, when set, is the only session this client accepts:
+	// an acknowledgement naming another one is refused rather than
+	// adopted, so a deployment that pins its session fails closed.
+	PinnedSession *[16]byte
 	// Limits bounds the pool.
 	Limits PoolLimits
 	// FrameTimeout bounds one request/response exchange.
 	FrameTimeout time.Duration
+	// BindingMargin is how long before the acknowledged expiry a binding
+	// stops admitting new work, so the client rebinds rather than have
+	// the frontend close the connection under it (default 5s).
+	BindingMargin time.Duration
+	// Clock is the time source (injected for tests).
+	Clock func() time.Time
+}
+
+// binding is what the frontend acknowledged: the session, how long it
+// admits work, the credential that established it (by digest; the token
+// itself is never kept) and the rollover epoch.
+type binding struct {
+	session   [16]byte
+	expiresAt time.Time
+	// credential identifies the token presented, so the same credential
+	// naming two sessions can be told apart from a freshly exchanged one
+	// naming a new session.
+	credential [32]byte
+	// epoch advances once per rollover. Work allocated under an earlier
+	// epoch keeps the identity it was allocated under.
+	epoch uint64
+}
+
+// active reports whether the binding still admits new work at `now`.
+func (b *binding) active(now time.Time, margin time.Duration) bool {
+	return now.Add(margin).Before(b.expiresAt)
 }
 
 // Client is a bounded QUIC client to one frontend.
@@ -85,21 +134,21 @@ type Client struct {
 	// wait for its result instead of each dialing a connection of their
 	// own.
 	dialing chan struct{}
+	// control is the negotiation stream of `conn`: it stays open for the
+	// connection's life because a Close frame travels on it.
+	control *quic.Stream
 	sem     chan struct{}
-	// session bound by the last acknowledged Bind.
-	session *[16]byte
+	// bound is what the last acknowledged Bind established.
+	bound *binding
 	// Reconnects performed (for tests).
 	Reconnects int
+	// Rollovers to a new session performed (for tests).
+	Rollovers int
 }
 
 // New builds a client that dials `addr`.
 func New(addr string, cfg Config) *Client {
-	if cfg.FrameTimeout == 0 {
-		cfg.FrameTimeout = 10 * time.Second
-	}
-	if cfg.Limits.MaxStreams <= 0 {
-		cfg.Limits.MaxStreams = 64
-	}
+	cfg = withDefaults(cfg)
 	tlsConf := cfg.TLS.Clone()
 	if len(tlsConf.NextProtos) == 0 {
 		tlsConf.NextProtos = []string{ALPNNativeAPI}
@@ -117,25 +166,46 @@ func New(addr string, cfg Config) *Client {
 	return c
 }
 
-// newWithDialer is a test hook injecting a dialer (an in-process server).
-func newWithDialer(cfg Config, dial func(ctx context.Context) (*quic.Conn, error)) *Client {
+// withDefaults fills the unset bounds.
+func withDefaults(cfg Config) Config {
 	if cfg.FrameTimeout == 0 {
 		cfg.FrameTimeout = 10 * time.Second
 	}
 	if cfg.Limits.MaxStreams <= 0 {
 		cfg.Limits.MaxStreams = 64
 	}
+	if cfg.BindingMargin == 0 {
+		cfg.BindingMargin = 5 * time.Second
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = time.Now
+	}
+	return cfg
+}
+
+// newWithDialer is a test hook injecting a dialer (an in-process server).
+func newWithDialer(cfg Config, dial func(ctx context.Context) (*quic.Conn, error)) *Client {
+	cfg = withDefaults(cfg)
 	return &Client{cfg: cfg, dialFn: dial, sem: make(chan struct{}, cfg.Limits.MaxStreams)}
 }
 
-// connect returns a live connection, dialing and binding (Hello) if
-// needed. A binding presents the service token once. Only one goroutine
-// dials at a time: the others wait for that attempt to settle and then
-// re-check, so a burst of requests on a fresh or dropped client shares
-// one connection rather than opening one per request.
+// connect returns a live connection, dialing and negotiating it if
+// needed. A connection whose acknowledged binding no longer admits work
+// is dropped first: the frontend refuses a rebind that names another
+// session on a live connection, so a rolled-over session needs a fresh
+// one. Only one goroutine dials at a time: the others wait for that
+// attempt to settle and then re-check, so a burst of requests on a fresh
+// or dropped client shares one connection rather than opening one per
+// request.
 func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
 	for {
 		c.mu.Lock()
+		if c.bound != nil && !c.bound.active(c.cfg.Clock(), c.cfg.BindingMargin) && c.conn != nil {
+			expired := c.conn
+			c.mu.Unlock()
+			c.drop(expired)
+			c.mu.Lock()
+		}
 		if c.conn != nil {
 			conn := c.conn
 			c.mu.Unlock()
@@ -156,10 +226,10 @@ func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
 		c.dialing = done
 		c.mu.Unlock()
 
-		conn, err := c.dialAndBind(ctx)
+		conn, control, err := c.dialAndBind(ctx)
 		c.mu.Lock()
 		if err == nil {
-			c.conn = conn
+			c.conn, c.control = conn, control
 		}
 		c.dialing = nil
 		close(done)
@@ -169,29 +239,50 @@ func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
 }
 
 // dialAndBind dials one connection and binds it, closing it on a failed
-// bind so it never leaks.
-func (c *Client) dialAndBind(ctx context.Context) (*quic.Conn, error) {
+// bind so it never leaks. The negotiation stream comes back with the
+// connection: it stays open for the connection's life.
+func (c *Client) dialAndBind(ctx context.Context) (*quic.Conn, *quic.Stream, error) {
 	conn, err := c.dialFn(ctx)
 	if err != nil {
-		return nil, ErrNotConnected
+		return nil, nil, ErrNotConnected
 	}
-	if err := c.bind(ctx, conn); err != nil {
+	control, err := c.bind(ctx, conn)
+	if err != nil {
 		_ = conn.CloseWithError(2, "bind failed")
-		return nil, err
+		return nil, nil, err
 	}
-	return conn, nil
+	return conn, control, nil
 }
 
 // Session is the replicated session the frontend acknowledged at the
 // last binding, when a token source is configured and a connection was
 // bound.
 func (c *Client) Session() ([16]byte, bool) {
+	session, _, ok := c.Binding()
+	return session, ok
+}
+
+// Binding is the session the frontend last acknowledged and the rollover
+// epoch it belongs to. The epoch advances whenever a freshly exchanged
+// credential established a new session, so a caller can tell whether the
+// identity its outstanding work was allocated under is still current.
+func (c *Client) Binding() ([16]byte, uint64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.session == nil {
-		return [16]byte{}, false
+	if c.bound == nil {
+		return [16]byte{}, 0, false
 	}
-	return *c.session, true
+	return c.bound.session, c.bound.epoch, true
+}
+
+// BindingExpiry is when the acknowledged binding stops admitting work.
+func (c *Client) BindingExpiry() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.bound == nil {
+		return time.Time{}, false
+	}
+	return c.bound.expiresAt, true
 }
 
 // Connect establishes and binds the connection now (the backend's Start
@@ -202,40 +293,76 @@ func (c *Client) Connect(ctx context.Context) error {
 	return err
 }
 
-// bind opens the control stream and sends the Hello, then presents the
-// service token once in a Bind frame and reads the acknowledgement.
-func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
+// bind negotiates the connection: the Hello declaring the unary lane
+// travels on the control stream and the HelloAck is read back before
+// anything else is sent, so a refused negotiation is never mistaken for
+// a usable connection. The service token is then presented once in a
+// Bind frame. The control stream is returned and stays open, because a
+// Close frame travels on it.
+func (c *Client) bind(ctx context.Context, conn *quic.Conn) (*quic.Stream, error) {
 	var token string
 	if c.cfg.Tokens != nil {
 		t, err := c.cfg.Tokens.Token(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		token = t
-	}
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		return ErrNotConnected
 	}
 	hello, err := wire.Encode(wire.Hello{
 		Role:         wire.RoleClient,
 		ClusterID:    c.cfg.Cluster,
 		DomainID:     c.cfg.Domain,
-		Capabilities: []uint16{0x0011},
+		Capabilities: []uint16{LaneUnary},
 	})
 	if err != nil {
-		return err
+		return nil, err
+	}
+	helloCtx, cancel := context.WithTimeout(ctx, c.cfg.FrameTimeout)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(helloCtx)
+	if err != nil {
+		return nil, ErrNotConnected
 	}
 	if err := writeFrame(stream, hello); err != nil {
-		return err
+		return nil, ErrNotConnected
 	}
-	// The control stream stays open; the client reads no HelloAck body in
-	// this preview (negotiation detail is exercised by the Rust adapter).
-	_ = stream.Close()
+	if err := readHelloAck(helloCtx, stream); err != nil {
+		return nil, err
+	}
 	if c.cfg.Tokens == nil {
-		return nil
+		return stream, nil
 	}
-	return c.bindSession(ctx, conn, token)
+	if err := c.bindSession(ctx, conn, token); err != nil {
+		return nil, err
+	}
+	return stream, nil
+}
+
+// readHelloAck reads the negotiation answer and requires the endpoint to
+// have granted the lane the Hello declared. A Close frame carries the
+// endpoint's rejection reason; anything else is a protocol violation.
+func readHelloAck(ctx context.Context, stream *quic.Stream) error {
+	answer, err := readOneFrame(ctx, stream)
+	if err != nil {
+		return ErrNegotiationRejected
+	}
+	msg, err := wire.Decode(answer)
+	if err != nil {
+		return ErrProtocol
+	}
+	switch m := msg.(type) {
+	case wire.HelloAck:
+		for _, capability := range m.Capabilities {
+			if capability == LaneUnary {
+				return nil
+			}
+		}
+		return ErrNegotiationRejected
+	case wire.Close:
+		return ErrNegotiationRejected
+	default:
+		return ErrProtocol
+	}
 }
 
 // bindSession presents the token on its own stream and requires a
@@ -258,16 +385,63 @@ func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string)
 	_ = stream.Close()
 	answer, err := readOneFrame(bindCtx, stream)
 	if err != nil {
+		c.invalidateToken()
 		return ErrBindRejected
 	}
 	ack, err := wire.DecodeBindAck(answer)
 	if err != nil {
+		c.invalidateToken()
 		return ErrBindRejected
 	}
-	session := ack.Session
+	return c.adopt(ack, sha256.Sum256([]byte(token)))
+}
+
+// invalidateToken tells a caching token source that the credential it
+// handed out was refused, so the next binding exchanges a fresh one.
+func (c *Client) invalidateToken() {
+	if source, ok := c.cfg.Tokens.(invalidator); ok {
+		source.Invalidate()
+	}
+}
+
+// adopt records what an acknowledgement established.
+//
+// A binding is not remembered forever: it carries the validity the
+// frontend acknowledged, and a credential refresh legitimately produces
+// a new session, because the STS admits a fresh assertion as a fresh
+// admission. Refusing every later session would make ordinary credential
+// rotation permanently unusable; adopting one silently would let the
+// endpoint move this client's identity underneath it. So exactly one
+// transition is a rollover: a credential this client has not presented
+// before naming a session other than the current one. New work then
+// continues under the new session while invocations already allocated
+// keep the identity they were allocated under - their retry keys are
+// what makes a retry the same invocation, and rewriting them would turn
+// an unresolved write into a second write.
+func (c *Client) adopt(ack wire.BindAck, credential [32]byte) error {
+	expires := time.Unix(int64(ack.ExpiresAt), 0)
 	c.mu.Lock()
-	c.session = &session
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.cfg.PinnedSession != nil && *c.cfg.PinnedSession != ack.Session {
+		return ErrSessionConflict
+	}
+	switch {
+	case c.bound == nil:
+		c.bound = &binding{session: ack.Session, expiresAt: expires, credential: credential, epoch: 1}
+	case c.bound.session == ack.Session:
+		// A rebind of the same session refreshes its validity.
+		c.bound.credential = credential
+		if expires.After(c.bound.expiresAt) {
+			c.bound.expiresAt = expires
+		}
+	case c.bound.credential == credential:
+		// One credential named two sessions: the endpoint is not
+		// consistent about this client's identity. Fail closed.
+		return ErrSessionConflict
+	default:
+		c.bound = &binding{session: ack.Session, expiresAt: expires, credential: credential, epoch: c.bound.epoch + 1}
+		c.Rollovers++
+	}
 	return nil
 }
 
@@ -278,13 +452,33 @@ func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string)
 func (c *Client) drop(failed *quic.Conn) {
 	c.mu.Lock()
 	current := c.conn == failed && failed != nil
+	var control *quic.Stream
 	if current {
-		c.conn = nil
+		control = c.control
+		c.conn, c.control = nil, nil
 		c.Reconnects++
 	}
 	c.mu.Unlock()
+	if control != nil {
+		_ = control.Close()
+	}
 	if current {
 		_ = failed.CloseWithError(0, "drop")
+	}
+}
+
+// Close ends the connection and forgets the binding; a later Connect
+// negotiates and binds afresh.
+func (c *Client) Close() {
+	c.mu.Lock()
+	conn, control := c.conn, c.control
+	c.conn, c.control, c.bound = nil, nil, nil
+	c.mu.Unlock()
+	if control != nil {
+		_ = control.Close()
+	}
+	if conn != nil {
+		_ = conn.CloseWithError(0, "close")
 	}
 }
 

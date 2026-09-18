@@ -19,16 +19,16 @@ type Instance struct {
 
 	mu    sync.Mutex
 	next  uint64
-	bound map[uint64]binding // sequence -> what the sequence was bound to
+	bound map[uint64]allocation // sequence -> what the sequence was bound to
 }
 
-// binding is what an allocated sequence is bound to: the command id and
+// allocation is what an allocated sequence is bound to: the command id and
 // a digest of the canonical frame, so a retry that keeps the command id
 // but changes the logical bytes or the deadline is refused as a conflict
 // rather than emitted as a different frame under the same retry key. The
 // digest, not the frame, is kept so a bound sequence does not retain its
 // payload.
-type binding struct {
+type allocation struct {
 	commandID [32]byte
 	frame     [sha256.Size]byte
 }
@@ -49,7 +49,7 @@ func NewInstance(cfg InstanceConfig) *Instance {
 		session:  cfg.Session,
 		instance: cfg.Instance,
 		next:     1,
-		bound:    make(map[uint64]binding),
+		bound:    make(map[uint64]allocation),
 	}
 }
 
@@ -83,7 +83,7 @@ func (i *Instance) Allocate(logical []byte, commandID [32]byte, deadlineMs uint3
 		return Invocation{}, err
 	}
 	i.next = seq + 1
-	i.bound[seq] = binding{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
+	i.bound[seq] = allocation{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
 	return inv, nil
 }
 
@@ -107,7 +107,7 @@ func (i *Instance) AllocateFor(
 		return Invocation{}, err
 	}
 	i.next = seq + 1
-	i.bound[seq] = binding{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
+	i.bound[seq] = allocation{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
 	return inv, nil
 }
 

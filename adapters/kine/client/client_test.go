@@ -71,6 +71,8 @@ type serverBehavior struct {
 	expectToken string
 	session     [16]byte
 	binds       atomic.Int64
+	// refuseHello answers the negotiation with a Close instead of an ack.
+	refuseHello atomic.Bool
 }
 
 // runServer starts an in-process quic-go frontend. It reads the control
@@ -115,8 +117,29 @@ func serveConn(ctx context.Context, conn *quic.Conn, b *serverBehavior) {
 		}
 		if first {
 			first = false
-			// Drain the Hello; do not answer a body.
-			go func() { _, _ = readFramePayload(stream) }()
+			// Answer the Hello with the lane it declared, as the native
+			// endpoint does, and leave the control stream open.
+			go func(s *quic.Stream) {
+				frame, err := readFramePayload(s)
+				if err != nil {
+					return
+				}
+				msg, err := wire.Decode(frame)
+				if err != nil {
+					return
+				}
+				hello, ok := msg.(wire.Hello)
+				if !ok {
+					return
+				}
+				if b.refuseHello.Load() {
+					out, _ := wire.Encode(wire.Close{Code: 2, Reason: []byte("lane")})
+					_, _ = s.Write(out)
+					return
+				}
+				out, _ := wire.Encode(wire.HelloAck{Capabilities: hello.Capabilities, MaxInflight: 64})
+				_, _ = s.Write(out)
+			}(stream)
 			continue
 		}
 		go func(s *quic.Stream) {
@@ -129,7 +152,12 @@ func serveConn(ctx context.Context, conn *quic.Conn, b *serverBehavior) {
 				bind, err := wire.DecodeBind(frame)
 				var out []byte
 				if err == nil && b.expectToken != "" && string(bind.Token) == b.expectToken {
-					out, _ = wire.EncodeBindAck(wire.BindAck{Session: b.session, ExpiresAt: 1, Scope: 1, RuleGeneration: 1})
+					out, _ = wire.EncodeBindAck(wire.BindAck{
+						Session:        b.session,
+						ExpiresAt:      uint64(time.Now().Add(time.Hour).Unix()),
+						Scope:          1,
+						RuleGeneration: 1,
+					})
 				} else {
 					out, _ = wire.Encode(wire.Close{Code: 2, Reason: []byte("bind refused")})
 				}

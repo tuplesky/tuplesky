@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -63,6 +64,11 @@ type DSN struct {
 	AssertionFile string
 	STSURL        string
 	Audience      string
+	// STSCAFile is the CA that signs the STS endpoint's certificate. It
+	// is required when the STS is served with a cluster CA the host trust
+	// store does not carry; without it the host store is used. It never
+	// disables verification.
+	STSCAFile string
 	// DeadlineMs is the per-request deadline.
 	DeadlineMs uint32
 }
@@ -87,7 +93,7 @@ func parseID(q url.Values, name string, required bool) ([16]byte, bool, error) {
 var knownParams = map[string]bool{
 	"cluster": true, "domain": true, "namespace": true, "client-instance": true,
 	"session": true, "assertion": true, "sts": true, "audience": true,
-	"server-name": true, "deadline-ms": true,
+	"sts-ca": true, "server-name": true, "deadline-ms": true,
 }
 
 // ParseDSN parses `coord://frontend:port?cluster=..&domain=..&namespace=..
@@ -150,6 +156,7 @@ func ParseDSN(raw string) (DSN, error) {
 	if !strings.HasPrefix(d.STSURL, "https://") {
 		return DSN{}, fmt.Errorf("%w: sts must be https", ErrInsecureOption)
 	}
+	d.STSCAFile = q.Get("sts-ca")
 	if v := q.Get("server-name"); v != "" {
 		d.ServerName = v
 	}
@@ -193,6 +200,32 @@ func trustRoot(cfg *drivers.Config) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// stsClient is the HTTP client the credential provider exchanges with:
+// redirects and proxies are off, and the STS certificate is verified
+// against the configured CA when one is given, the host store otherwise.
+// Verification is never skipped.
+func stsClient(caFile string) (*http.Client, error) {
+	transport := &http.Transport{Proxy: nil}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("sts CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("sts CA: no certificate found")
+		}
+		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("redirects disabled")
+		},
+	}, nil
+}
+
 // New is the registered constructor: it never elects a leader (the
 // domain's voters do), and returns the native backend.
 func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
@@ -204,10 +237,15 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	if err != nil {
 		return false, nil, err
 	}
+	stsHTTP, err := stsClient(dsn.STSCAFile)
+	if err != nil {
+		return false, nil, err
+	}
 	provider := client.NewProvider(client.ProviderConfig{
 		TokenFile: dsn.AssertionFile,
 		STSURL:    dsn.STSURL,
 		Audience:  dsn.Audience,
+		HTTP:      stsHTTP,
 	})
 	native := client.New(dsn.Frontend, client.Config{
 		TLS: &tls.Config{
@@ -215,10 +253,11 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 			ServerName: dsn.ServerName,
 			MinVersion: tls.VersionTLS13,
 		},
-		Tokens:       provider,
-		Cluster:      dsn.Cluster,
-		Domain:       dsn.Domain,
-		FrameTimeout: time.Duration(dsn.DeadlineMs) * time.Millisecond,
+		Tokens:        provider,
+		Cluster:       dsn.Cluster,
+		Domain:        dsn.Domain,
+		PinnedSession: dsn.Session,
+		FrameTimeout:  time.Duration(dsn.DeadlineMs) * time.Millisecond,
 	})
 	b, err := backend.New(backend.Config{
 		Client:         native,

@@ -514,8 +514,17 @@ impl Transport {
         limits: Limits,
     ) -> Result<Transport, TransportError> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        // One endpoint serves both ALPNs, and rustls decides client
+        // authentication before the negotiated ALPN is visible to the
+        // verifier, so presence is relaxed here and the plane's contract
+        // is enforced in `negotiate_incoming`: a peer-class connection,
+        // and every API role that acts for others, is rejected without a
+        // certificate. `allow_unauthenticated` relaxes presence only: a
+        // certificate that is presented is still chained to `local.roots`
+        // by the same verifier, so peer authentication is unchanged.
         let verifier =
             WebPkiClientVerifier::builder_with_provider(local.roots.clone(), provider.clone())
+                .allow_unauthenticated()
                 .build()
                 .map_err(tls_err)?;
         let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -1137,7 +1146,18 @@ async fn negotiate_incoming(
     conn: &quinn::Connection,
 ) -> Result<Negotiated, (CloseReason, Option<SendStream>)> {
     let class = negotiated_class(conn).map_err(|r| (r, None))?;
-    let certs = peer_certs(conn).map_err(|r| (r, None))?;
+    // The peer plane is mutually authenticated. The native API plane
+    // authenticates this server and authorizes work by the session
+    // binding a client presents above this layer, so a client
+    // certificate is optional there; which roles that covers is decided
+    // once `Hello` declares one.
+    let certs = match peer_certs(conn) {
+        Ok(certs) => Some(certs),
+        Err(reason) => match class {
+            Class::Api => None,
+            Class::Peer => return Err((reason, None)),
+        },
+    };
     let (mut send, recv) = match timeout(shared.limits.handshake_timeout, conn.accept_bi()).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err((CloseReason::Transport(e.to_string()), None)),
@@ -1174,9 +1194,29 @@ async fn negotiate_incoming(
         Ok(l) => l,
         Err(e) => return Err((CloseReason::Rejected(format!("lane {e:?}")), Some(send))),
     };
-    let bound = match shared.binder.bind(&certs, &hello) {
-        Ok(b) => b,
-        Err(e) => return Err((CloseReason::Rejected(format!("{e:?}")), Some(send))),
+    let bound = match &certs {
+        Some(certs) => match shared.binder.bind(certs, &hello) {
+            Ok(b) => b,
+            Err(e) => return Err((CloseReason::Rejected(format!("{e:?}")), Some(send))),
+        },
+        // Without a certificate only `Client` is admissible: a frontend
+        // or Kine collector acts for other principals and must prove
+        // that with mutual TLS. An anonymous client is bound to nothing
+        // but its connection; every request it makes is refused until a
+        // session binding authorizes it, and no replica identity or
+        // provenance is ever derived from it.
+        None if hello.role == PeerRole::Client => BoundIdentity {
+            role: PeerRole::Client,
+            replica: None,
+            incarnation: None,
+            capabilities: Vec::new(),
+        },
+        None => {
+            return Err((
+                CloseReason::Rejected("client certificate".into()),
+                Some(send),
+            ));
+        }
     };
     let mut granted: Vec<u16> = hello
         .capabilities
