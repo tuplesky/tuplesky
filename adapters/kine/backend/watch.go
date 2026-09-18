@@ -45,7 +45,16 @@ type watchState struct {
 	// terminal ends the watch from WaitForSyncTo or Close.
 	terminal error
 	cancel   context.CancelFunc
-	closed   bool
+	// withdrawn records that a synchronization wait gave up on this watch
+	// and asked it to end. It stays in `watches` until the pump has
+	// stopped and its delivery channel is closed, because a cancellation
+	// that has only been *requested* leaves Kine's watcher goroutine
+	// parked on its progress channel, ready to advertise a revision this
+	// watch never delivered.
+	withdrawn bool
+	// closed is set once the pump has stopped and the delivery channel is
+	// closed, so nothing more can reach Kine's watcher through it.
+	closed bool
 }
 
 // wake replaces the change channel; called with wmu held.
@@ -56,19 +65,34 @@ func (b *Backend) wake() {
 
 func (b *Backend) advance(ws *watchState, revision uint64) {
 	b.wmu.Lock()
-	if revision > ws.processed {
+	// A withdrawn watch is on its way out: a marker that arrives after
+	// its cancellation was requested is not delivery through the awaited
+	// revision, and must not release the wait that gave up on it.
+	if !ws.withdrawn && revision > ws.processed {
 		ws.processed = revision
 		b.wake()
 	}
 	b.wmu.Unlock()
 }
 
+// endWatch publishes the watch's teardown. It runs only after the
+// delivery channel is closed, so an observer that sees `closed` knows
+// nothing can be delivered through this watch any more.
 func (b *Backend) endWatch(ws *watchState) {
 	b.wmu.Lock()
 	ws.closed = true
 	delete(b.watches, ws.id)
 	b.wake()
 	b.wmu.Unlock()
+}
+
+// teardownDelay is the configured fault-injection pause between asking a
+// watch to stop and finishing its teardown. Production leaves it zero;
+// tests widen the window in which the watch is cancelled but still live.
+func (b *Backend) teardownDelay() {
+	if b.cfg.WatchTeardownDelay > 0 {
+		time.Sleep(b.cfg.WatchTeardownDelay)
+	}
 }
 
 // Watch opens one native event stream from `revision` (inclusive; 0
@@ -145,8 +169,13 @@ func (b *Backend) observeWatch(kind string, ws *watchState, outcome string) {
 }
 
 func (b *Backend) runWatch(ctx context.Context, ws *watchState, key, end string, events chan<- []*server.Event, errc chan<- error) {
-	defer close(events)
+	// Teardown order matters: the delivery channel is closed before the
+	// watch is published as ended, so a synchronization wait that is
+	// blocked on this watch cannot return while Kine's watcher goroutine
+	// is still parked on a live channel.
 	defer b.endWatch(ws)
+	defer close(events)
+	defer b.teardownDelay()
 	defer ws.cancel()
 	fail := func(err error) {
 		errc <- err
@@ -306,12 +335,36 @@ func (b *Backend) pump(ctx context.Context, ws *watchState, w *client.Watch, eve
 	}
 }
 
+// laggingLocked is the set of live watches that have not processed
+// `target` yet; wmu must be held.
+func (b *Backend) laggingLocked(target uint64) []*watchState {
+	var lagging []*watchState
+	for _, ws := range b.watches {
+		if !ws.closed && ws.processed < target {
+			lagging = append(lagging, ws)
+		}
+	}
+	return lagging
+}
+
 // WaitForSyncTo blocks until every open watch has processed `revision`
 // (delivered its events through it, or received the domain's progress
 // beyond them), so a progress notification Kine sends afterwards never
-// precedes an event. The wait ends early only by terminating the
-// lagging watches (SyncTimeout) or by Close; it never returns while a
-// live watch is behind.
+// precedes an event.
+//
+// Returning is what lets the bridge publish progress at `revision`, on
+// both of its paths: ProgressIfSynced offers the revision to each
+// watch's progress channel and ProgressAll broadcasts once every channel
+// accepts. A watch whose Kine-side goroutine is parked on that channel
+// accepts it whether or not this side has asked the watch to stop, so
+// requesting cancellation is not enough to keep the watch out of
+// progress publication: a watch that cannot synchronize is terminated
+// *and then waited for*, until its pump has stopped and its delivery
+// channel is closed. The wait therefore never reports synchronization
+// that did not happen; only Close (through the root context) ends it
+// otherwise. Blocking the bridge's progress timer is the conservative
+// failure: a false progress report would make a consumer skip the events
+// it never received.
 func (b *Backend) WaitForSyncTo(revision int64) {
 	if revision <= 0 {
 		return
@@ -319,43 +372,44 @@ func (b *Backend) WaitForSyncTo(revision int64) {
 	target := uint64(revision)
 	deadline := time.NewTimer(b.cfg.SyncTimeout)
 	defer deadline.Stop()
+	withdrawn := false
 	for {
 		b.wmu.Lock()
 		if b.root.Err() != nil {
 			b.wmu.Unlock()
 			return
 		}
-		var lagging []*watchState
-		for _, ws := range b.watches {
-			if !ws.closed && ws.processed < target {
-				lagging = append(lagging, ws)
-			}
-		}
+		lagging := b.laggingLocked(target)
 		if len(lagging) == 0 {
 			b.wmu.Unlock()
 			return
 		}
 		changed := b.changed
+		b.wmu.Unlock()
+		if withdrawn {
+			// The laggards were asked to stop; wait for them to be gone.
+			select {
+			case <-changed:
+			case <-b.root.Done():
+				return
+			}
+			continue
+		}
 		select {
+		case <-changed:
+		case <-b.root.Done():
+			return
 		case <-deadline.C:
-			for _, ws := range lagging {
+			b.wmu.Lock()
+			for _, ws := range b.laggingLocked(target) {
 				if ws.terminal == nil {
 					ws.terminal = ErrSyncTimeout
 				}
+				ws.withdrawn = true
 				ws.cancel()
 			}
 			b.wmu.Unlock()
-			return
-		default:
-		}
-		b.wmu.Unlock()
-		select {
-		case <-changed:
-		case <-deadline.C:
-			// Loop once more to terminate the laggards.
-			deadline.Reset(0)
-		case <-b.root.Done():
-			return
+			withdrawn = true
 		}
 	}
 }
