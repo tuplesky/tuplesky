@@ -26,6 +26,7 @@ members = [
     "crates/coord-session",
     "crates/coord-login",
     "crates/coordctl",
+    "crates/coord-node-issuer",
     "xtask",
     "tools/raft-engine-smoke",
 ]
@@ -63,6 +64,7 @@ coord-sts = { path = "crates/coord-sts" }
 coord-session = { path = "crates/coord-session" }
 coord-login = { path = "crates/coord-login" }
 coordctl = { path = "crates/coordctl" }
+coord-node-issuer = { path = "crates/coord-node-issuer" }
 
 # Encoding and identity (Section 16.2).
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
@@ -78,7 +80,9 @@ rustls = { version = "=0.23.44", default-features = false, features = ["std", "a
 rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 # Test certificates only (never a production dependency edge).
-rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "x509-parser"] }
+x509-parser = { version = "=0.18.1", default-features = false }
+time = { version = "=0.3.55", default-features = false }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json", "form", "query"] }
 openidconnect = { version = "=4.0.1", default-features = false, features = ["reqwest"] }
 oauth2 = { version = "=5.0.0", default-features = false, features = ["reqwest"] }

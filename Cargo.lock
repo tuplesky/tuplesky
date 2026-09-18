@@ -643,6 +643,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-node-issuer"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "coord-authn",
+ "coord-sts",
+ "coord-types",
+ "jsonwebtoken",
+ "rcgen",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "x509-parser",
+]
+
+[[package]]
 name = "coord-oracle"
 version = "0.1.0"
 dependencies = [
