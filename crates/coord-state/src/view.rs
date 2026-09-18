@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use coord_core::effect::ApplyBase;
 use coord_types::ids::{KvRevision, LeaseGeneration, LeaseId, NamespaceId};
+use coord_types::logical_v1::{BranchOp, CanonicalOperation};
 use serde::{Deserialize, Serialize};
 
 /// A stored key's entry.
@@ -52,8 +53,9 @@ pub struct ReadView {
     pub compact_floor: KvRevision,
     /// Current entries covering the request's keys.
     pub current: BTreeMap<Vec<u8>, KvEntry>,
-    /// Historical snapshot when the request reads an explicit revision.
-    pub historical: Option<HistoricalView>,
+    /// Historical snapshots, one per explicit revision the request reads
+    /// (a transaction may read several); see [`historical_revisions`].
+    pub historical: Vec<HistoricalView>,
     /// Leases known to exist (for attachment checks).
     pub leases: BTreeSet<LeaseId>,
 }
@@ -67,8 +69,37 @@ impl ReadView {
             kv_revision,
             compact_floor: KvRevision::ZERO,
             current: BTreeMap::new(),
-            historical: None,
+            historical: Vec::new(),
             leases: BTreeSet::new(),
         }
     }
+
+    /// The snapshot for `revision`, if the view carries it.
+    pub fn historical_at(&self, revision: KvRevision) -> Option<&HistoricalView> {
+        self.historical.iter().find(|h| h.revision == revision)
+    }
+}
+
+/// Every explicit revision `op` reads, top level or inside either transaction
+/// branch, in ascending order. The view builder must supply a snapshot for
+/// each one (those at or above the compaction floor and at or below the
+/// current revision); the planner reports `ViewIncomplete` otherwise.
+pub fn historical_revisions(op: &CanonicalOperation) -> Vec<KvRevision> {
+    let mut out: BTreeSet<KvRevision> = BTreeSet::new();
+    match op {
+        CanonicalOperation::Range(r) => {
+            out.extend(r.revision);
+        }
+        CanonicalOperation::Txn(t) => {
+            for branch in [&t.success, &t.failure] {
+                for b in branch {
+                    if let BranchOp::Range(r) = b {
+                        out.extend(r.revision);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out.into_iter().collect()
 }

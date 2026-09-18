@@ -373,10 +373,10 @@ fn historical_reads_use_the_supplied_snapshot() {
             lease_generation: None,
         },
     );
-    v.historical = Some(HistoricalView {
+    v.historical = vec![HistoricalView {
         revision: rev(1),
         entries,
-    });
+    }];
     let p = plan(&at1, &v, &PlanLimits::default()).unwrap();
     assert_eq!(p.revision, None);
     if let Outcome::Range { items, .. } = &p.response.outcome {
@@ -497,4 +497,182 @@ fn lease_attachment_produces_index_mutations() {
         lease,
         key: b"k".to_vec()
     }));
+}
+
+fn entry_at(value: &[u8], revision: u64) -> KvEntry {
+    KvEntry {
+        value: value.to_vec(),
+        create_revision: rev(revision),
+        mod_revision: rev(revision),
+        version: 1,
+        lease: None,
+        lease_generation: None,
+    }
+}
+
+fn range_at(key: &[u8], revision: u64) -> BranchOp {
+    BranchOp::Range(RangeOp {
+        range: KeyRange::exact(key.to_vec()),
+        revision: Some(rev(revision)),
+        limit: 0,
+        keys_only: false,
+        count_only: false,
+    })
+}
+
+#[test]
+fn transactions_read_every_historical_revision_they_name() {
+    let txn = req(CanonicalOperation::Txn(TxnOp {
+        compares: vec![],
+        success: vec![range_at(b"k", 1), range_at(b"k", 2)],
+        failure: vec![],
+    }));
+    assert_eq!(
+        coord_state::historical_revisions(&txn.operation),
+        vec![rev(1), rev(2)]
+    );
+    let mut current = BTreeMap::new();
+    current.insert(b"k".to_vec(), entry_at(b"v3", 3));
+    let mut v = view(&current, 3, 5);
+    // One snapshot is not enough: the other range cannot be answered.
+    v.historical = vec![HistoricalView {
+        revision: rev(1),
+        entries: BTreeMap::from([(b"k".to_vec(), entry_at(b"v1", 1))]),
+    }];
+    assert_eq!(
+        plan(&txn, &v, &PlanLimits::default()).unwrap_err(),
+        PlanError::ViewIncomplete
+    );
+    v.historical.push(HistoricalView {
+        revision: rev(2),
+        entries: BTreeMap::from([(b"k".to_vec(), entry_at(b"v2", 2))]),
+    });
+    let p = plan(&txn, &v, &PlanLimits::default()).unwrap();
+    assert_eq!(p.revision, None);
+    match &p.response.outcome {
+        Outcome::Txn { results, .. } => {
+            let values: Vec<&[u8]> = results
+                .iter()
+                .map(|r| match r {
+                    Outcome::Range { items, .. } => items[0].entry.value.as_slice(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(values, vec![b"v1".as_slice(), b"v2"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn response_budget_covers_the_whole_transaction() {
+    let mut current = BTreeMap::new();
+    current.insert(b"a".to_vec(), entry_at(&[1; 1000], 1));
+    current.insert(b"b".to_vec(), entry_at(&[2; 1000], 2));
+    let v = view(&current, 2, 2);
+    let read = |key: &[u8]| {
+        BranchOp::Range(RangeOp {
+            range: KeyRange::exact(key.to_vec()),
+            revision: None,
+            limit: 0,
+            keys_only: false,
+            count_only: false,
+        })
+    };
+    let txn = req(CanonicalOperation::Txn(TxnOp {
+        compares: vec![],
+        success: vec![read(b"a"), read(b"b")],
+        failure: vec![],
+    }));
+    // Each result alone fits; together they do not.
+    let limits = PlanLimits {
+        max_response_bytes: 1_500,
+        ..PlanLimits::default()
+    };
+    assert_eq!(
+        plan(&txn, &v, &limits).unwrap_err(),
+        PlanError::ResponseTooLarge
+    );
+    let limits = PlanLimits {
+        max_response_bytes: 4_000,
+        ..PlanLimits::default()
+    };
+    assert!(plan(&txn, &v, &limits).is_ok());
+}
+
+#[test]
+fn interval_delete_over_a_branch_key_is_rejected_before_planning() {
+    let txn = req(CanonicalOperation::Txn(TxnOp {
+        compares: vec![],
+        success: vec![
+            BranchOp::Put(PutOp {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease: None,
+                prev_kv: false,
+            }),
+            BranchOp::DeleteRange(DeleteRangeOp {
+                range: KeyRange::interval(b"a".to_vec(), b"z".to_vec()),
+                prev_kv: false,
+            }),
+        ],
+        failure: vec![],
+    }));
+    let v = view(&BTreeMap::new(), 0, 0);
+    assert_eq!(
+        plan(&txn, &v, &PlanLimits::default()).unwrap_err(),
+        PlanError::Invalid(coord_types::error::ValidationError::DuplicateKeyInBranch)
+    );
+}
+
+#[test]
+fn zero_limit_is_the_schema_maximum_page() {
+    let mut current = BTreeMap::new();
+    for i in 0..=limits::MAX_PAGE_LIMIT {
+        current.insert(format!("k{i:06}").into_bytes(), entry_at(b"", 1));
+    }
+    let v = view(&current, 1, 1);
+    let read = req(CanonicalOperation::Range(RangeOp {
+        range: KeyRange::interval(b"k".to_vec(), b"l".to_vec()),
+        revision: None,
+        limit: 0,
+        keys_only: true,
+        count_only: false,
+    }));
+    match plan(&read, &v, &PlanLimits::default())
+        .unwrap()
+        .response
+        .outcome
+    {
+        Outcome::Range { items, count, more } => {
+            assert_eq!(items.len(), limits::MAX_PAGE_LIMIT as usize);
+            assert_eq!(count, u64::from(limits::MAX_PAGE_LIMIT) + 1);
+            assert!(more);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn non_mutating_commands_plan_at_the_maximum_revision() {
+    let mut current = BTreeMap::new();
+    current.insert(b"k".to_vec(), entry_at(b"v", 1));
+    let mut v = view(&current, 1, 1);
+    v.kv_revision = KvRevision::MAX;
+    let read = get(KeyRange::exact(b"k".to_vec()));
+    let p = plan(&read, &v, &PlanLimits::default()).unwrap();
+    assert_eq!(p.revision, None);
+    assert_eq!(p.response.revision, KvRevision::MAX);
+    let empty_delete = req(CanonicalOperation::DeleteRange(DeleteRangeOp {
+        range: KeyRange::exact(b"missing".to_vec()),
+        prev_kv: false,
+    }));
+    assert!(plan(&empty_delete, &v, &PlanLimits::default()).is_ok());
+    let compact = req(CanonicalOperation::Compact { revision: rev(1) });
+    assert!(plan(&compact, &v, &PlanLimits::default()).is_ok());
+    // A mutation cannot take a revision past the maximum.
+    assert_eq!(
+        plan(&put(b"k", b"w"), &v, &PlanLimits::default()).unwrap_err(),
+        PlanError::CounterOverflow
+    );
 }
