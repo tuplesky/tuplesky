@@ -27,12 +27,15 @@ use std::ops::Bound;
 use coord_core::effect::StoreUpdate;
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
-use coord_types::ids::KvRevision;
+use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::ordered_key;
 use serde::{Deserialize, Serialize};
 
 use crate::codecs;
 use crate::sync::{Arc, Mutex, lock};
+
+/// Logical identity of a history row: `(namespace, key)`.
+type HistoryKey = (NamespaceId, Vec<u8>);
 
 /// `meta_v1` field holding the history GC cursor.
 pub const HISTORY_GC_FIELD: &[u8] = b"history_gc_cursor";
@@ -40,6 +43,11 @@ pub const HISTORY_GC_FIELD: &[u8] = b"history_gc_cursor";
 pub const EVENTS_GC_FIELD: &[u8] = b"events_gc_through";
 /// Record kind of the GC cursor rows.
 pub const GC_RECORD_KIND: u16 = 0x0004;
+
+/// Byte limit of one history scan page: the largest schema-valid history row
+/// (an envelope payload plus its ordered key) always fits, so a
+/// maximum-size value cannot stall collection with a `Limit` error.
+const HISTORY_PAGE_BYTES: u32 = coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD as u32 + 64 * 1024;
 
 /// Persisted history GC cursor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,55 +240,78 @@ pub fn plan_gc<V: OrderedRead>(
     };
     let mut history_done = cursor.done || floor == KvRevision::ZERO;
     if !history_done {
-        // Scan forward from the cursor, grouping rows by key; only complete
-        // groups are decided in this step.
+        // Stream rows in (namespace, key, revision) order and decide each
+        // one on arrival: a version above the floor is kept; a version at or
+        // below the floor is the candidate to keep for its key until a newer
+        // version at or below the floor arrives, which deletes it. Only the
+        // current candidate is undecided, so the budget is checked on every
+        // row and the cursor rests on the last decided row: a hot key with
+        // thousands of versions costs at most one re-examined row per step.
         let mut request = ScanRequest {
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
             direction: Direction::Forward,
             resume_after: cursor.after.clone(),
             max_rows: NonZeroU32::new(256).expect("nonzero"),
-            max_bytes: NonZeroU32::new(1 << 20).expect("nonzero"),
+            max_bytes: NonZeroU32::new(HISTORY_PAGE_BYTES).expect("nonzero"),
         };
-        // (namespace, key) -> versions (row key, revision, is tombstone)
-        let mut group: Vec<(Vec<u8>, KvRevision, bool)> = Vec::new();
-        let mut group_key: Option<(coord_types::ids::NamespaceId, Vec<u8>)> = None;
-        let mut last_complete: Option<Vec<u8>> = cursor.after.clone();
+        // Newest version at or below the floor seen so far for the current
+        // key: (row key, (namespace, key)).
+        let mut candidate: Option<(Vec<u8>, HistoryKey)> = None;
+        let mut last_decided: Option<Vec<u8>> = cursor.after.clone();
         let mut exhausted = false;
         'scan: loop {
             let page = view.scan_page(Collection::KvHistoryV1.id(), &request)?;
             for row in &page.rows {
+                if examined >= budget.max_examined || deleted >= budget.max_deletes {
+                    break 'scan;
+                }
                 let decoded = ordered_key::decode_history(&row.key)
                     .map_err(|_| EngineError::new(ErrorClass::Corrupt, "history key"))?;
                 let revision = decoded.revision.expect("history key has revision");
-                let tombstone = codecs::decode_history(&row.value)?.entry.is_none();
-                let this_key = (decoded.namespace, decoded.key);
-                if group_key.as_ref() != Some(&this_key) {
-                    // Previous group is complete: decide it.
-                    if let Some(prev_last) =
-                        decide_group(&mut group, floor, &mut updates, &mut deleted)
-                    {
-                        last_complete = Some(prev_last);
-                    }
-                    if examined >= budget.max_examined || deleted >= budget.max_deletes {
-                        break 'scan;
-                    }
-                    group_key = Some(this_key);
-                }
-                group.push((row.key.clone(), revision, tombstone));
                 examined += 1;
+                let this_key = (decoded.namespace, decoded.key);
+                match candidate.take() {
+                    Some((row_key, key)) if key == this_key && revision <= floor => {
+                        // A newer version at or below the floor supersedes it.
+                        updates.push(StoreUpdate {
+                            collection: Collection::KvHistoryV1.id(),
+                            key: row_key.clone(),
+                            value: None,
+                        });
+                        deleted += 1;
+                        last_decided = Some(row_key);
+                        candidate = Some((row.key.clone(), this_key));
+                    }
+                    Some((row_key, _)) => {
+                        // Key changed or this version is above the floor: the
+                        // candidate is the kept version of its key.
+                        last_decided = Some(row_key);
+                        if revision <= floor {
+                            candidate = Some((row.key.clone(), this_key));
+                        } else {
+                            last_decided = Some(row.key.clone());
+                        }
+                    }
+                    None => {
+                        if revision <= floor {
+                            candidate = Some((row.key.clone(), this_key));
+                        } else {
+                            last_decided = Some(row.key.clone());
+                        }
+                    }
+                }
             }
             if page.exhausted {
-                if let Some(prev_last) = decide_group(&mut group, floor, &mut updates, &mut deleted)
-                {
-                    last_complete = Some(prev_last);
+                if let Some((row_key, _)) = candidate.take() {
+                    last_decided = Some(row_key);
                 }
                 exhausted = true;
                 break;
             }
             request.resume_after = page.rows.last().map(|r| r.key.clone());
         }
-        cursor.after = last_complete;
+        cursor.after = last_decided;
         cursor.done = exhausted;
         history_done = exhausted;
         updates.push(StoreUpdate {
@@ -312,13 +343,26 @@ pub fn plan_gc<V: OrderedRead>(
                 max_bytes: NonZeroU32::new(u32::MAX).expect("nonzero"),
             };
             let page = view.scan_page(Collection::EventsV1.id(), &request)?;
+            // The deletion budget applies inside a revision too: delete as
+            // many of its rows as the budget allows and advance the frontier
+            // only once the whole revision is gone (the next step finds the
+            // remaining rows).
+            let mut partial = false;
             for row in page.rows {
+                if deleted >= budget.max_deletes {
+                    partial = true;
+                    break;
+                }
                 updates.push(StoreUpdate {
                     collection: Collection::EventsV1.id(),
                     key: row.key,
                     value: None,
                 });
                 deleted += 1;
+            }
+            if partial {
+                events_done = false;
+                break;
             }
             events_through = next;
         }
@@ -339,35 +383,4 @@ pub fn plan_gc<V: OrderedRead>(
         deleted,
         done: history_done && events_done,
     })
-}
-
-/// Decide one key's versions: keep the newest version at or below the
-/// floor and everything above it; delete older ones. Returns the last row
-/// key of the group (the cursor position) when the group was non-empty.
-fn decide_group(
-    group: &mut Vec<(Vec<u8>, KvRevision, bool)>,
-    floor: KvRevision,
-    updates: &mut Vec<StoreUpdate>,
-    deleted: &mut usize,
-) -> Option<Vec<u8>> {
-    if group.is_empty() {
-        return None;
-    }
-    let last_key = group.last().map(|(k, _, _)| k.clone());
-    let newest_at_or_below = group
-        .iter()
-        .filter(|(_, r, _)| *r <= floor)
-        .map(|(_, r, _)| *r)
-        .max();
-    for (row_key, revision, _tombstone) in group.drain(..) {
-        if revision <= floor && Some(revision) != newest_at_or_below {
-            updates.push(StoreUpdate {
-                collection: Collection::KvHistoryV1.id(),
-                key: row_key,
-                value: None,
-            });
-            *deleted += 1;
-        }
-    }
-    last_key
 }
