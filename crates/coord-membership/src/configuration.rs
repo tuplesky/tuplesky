@@ -16,7 +16,11 @@
 //! [`ClientConfiguration`] is the cached, monotonically installed view a
 //! collector or client keeps: hints trigger refreshes, endpoint and
 //! observer catalogs move generations within an epoch, and a ballot's fast
-//! set is immutable once held.
+//! set is immutable once held. Voter-signed evidence is only accepted for
+//! the context it was signed for: a ballot certificate names the cluster,
+//! domain and configuration certificate its promisers held, and all three
+//! must be this chain's, so evidence cannot be carried between domains
+//! that happen to share voter identities and keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -219,6 +223,11 @@ pub enum BallotError {
     Quorum(ConfigurationError),
     /// The record's policy differs from the epoch's.
     PolicyMismatch,
+    /// The promises were made in another cluster or domain.
+    OriginMismatch,
+    /// The promises name another configuration record for the epoch than
+    /// the one the chain holds.
+    CertificateMismatch,
     /// A different fast set under a ballot already held: the fast set is
     /// immutable within a ballot; a change needs a higher ballot.
     FastSetChanged,
@@ -522,16 +531,30 @@ impl ConfigurationChain {
     }
 
     /// Verify a ballot configuration against its epoch: promises from a
-    /// majority of that epoch's exact voters, and a fast set the source
+    /// majority of that epoch's exact voters, made for this chain's own
+    /// cluster, domain and configuration record, and a fast set the source
     /// quorum rules accept. Returns the consensus configuration.
+    ///
+    /// The context is checked before the promises are: a signature can only
+    /// say which epoch of which domain it was made for because the message
+    /// carries all of it. Two domains that share voter identities,
+    /// incarnations and keys otherwise accept each other's certificates
+    /// whenever their epoch numbers and policies line up, which installs a
+    /// leader and fast set that domain's voters never promised.
     pub fn verify_ballot(
         &self,
         ballot: &BallotConfigurationV1,
     ) -> Result<BallotConfiguration, BallotError> {
         ballot.validate_shape().map_err(BallotError::Shape)?;
+        if ballot.cluster != self.cluster || ballot.domain != self.domain {
+            return Err(BallotError::OriginMismatch);
+        }
         let epoch = self
             .at(ballot.epoch)
             .ok_or(BallotError::Evidence(EvidenceError::UnknownEpoch))?;
+        if ballot.configuration_certificate != epoch.certificate() {
+            return Err(BallotError::CertificateMismatch);
+        }
         if ballot.quorum_policy != epoch.record().quorum_policy {
             return Err(BallotError::PolicyMismatch);
         }
