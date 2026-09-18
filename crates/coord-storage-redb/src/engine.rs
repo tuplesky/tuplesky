@@ -148,6 +148,10 @@ pub struct RedbEngine {
     path: std::path::PathBuf,
     cache_bytes: usize,
     writer_open: bool,
+    /// Set when a reopen failed: the file could not be verified again, so
+    /// nothing is served or accepted until a later reopen succeeds. The
+    /// placeholder database installed during reopen is never exposed.
+    quarantined: bool,
 }
 
 impl RedbEngine {
@@ -162,7 +166,20 @@ impl RedbEngine {
             path,
             cache_bytes,
             writer_open: false,
+            quarantined: false,
         }
+    }
+
+    /// Whether a failed reopen left the engine unavailable.
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    fn quarantine_error() -> EngineError {
+        EngineError::new(
+            ErrorClass::Corrupt,
+            "engine quarantined after a failed reopen",
+        )
     }
 
     /// Process-model crash: drop every handle to the database file and
@@ -178,11 +195,16 @@ impl RedbEngine {
         }
         let closed = std::mem::replace(&mut self.db, Arc::new(placeholder_database()?));
         drop(closed);
+        // Until the file is open again the engine is quarantined: a failed
+        // open must not leave the in-memory placeholder serving reads or
+        // accepting "durable" commits that vanish with the process.
+        self.quarantined = true;
         let db = redb::Database::builder()
             .set_cache_size(self.cache_bytes)
             .open(&self.path)
             .map_err(|e| EngineError::new(ErrorClass::Corrupt, redact(&e)))?;
         self.db = Arc::new(db);
+        self.quarantined = false;
         Ok(())
     }
 
@@ -203,6 +225,7 @@ fn placeholder_database() -> Result<redb::Database, EngineError> {
 #[derive(Clone)]
 pub struct RedbReader {
     db: Arc<redb::Database>,
+    quarantined: bool,
 }
 
 /// A pinned cross-table snapshot.
@@ -235,6 +258,9 @@ impl SnapshotSource for RedbReader {
     type View = RedbView;
 
     fn snapshot(&self) -> Result<RedbView, EngineError> {
+        if self.quarantined {
+            return Err(RedbEngine::quarantine_error());
+        }
         let txn = self.db.begin_read().map_err(|e| match e {
             redb::TransactionError::Storage(s) => storage_error(s),
             other => EngineError::new(ErrorClass::Busy, redact(&other)),
@@ -339,10 +365,14 @@ impl LocalEngine for RedbEngine {
     fn reader(&self) -> RedbReader {
         RedbReader {
             db: self.db.clone(),
+            quarantined: self.quarantined,
         }
     }
 
     fn begin_write(&mut self) -> Result<RedbWrite<'_>, EngineError> {
+        if self.quarantined {
+            return Err(RedbEngine::quarantine_error());
+        }
         if self.writer_open {
             return Err(EngineError::new(ErrorClass::Busy, "writer already open"));
         }
