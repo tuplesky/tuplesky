@@ -180,7 +180,7 @@ fn closure_traversal_is_exact_and_incremental() {
         steps += 1;
         match t.closure_step(cursor, 3).unwrap() {
             ClosureProgress::Continue(c) => {
-                assert!(!c.frontier().is_empty());
+                assert!(c.remaining() > 0);
                 cursor = c;
             }
             ClosureProgress::Complete(done) => break done,
@@ -277,4 +277,133 @@ fn dependency_rows_round_trip() {
     );
     assert!(dependency_key(epoch, &cmd(1)) < dependency_key(epoch, &cmd(2)) || cmd(1) > cmd(2));
     let _ = ReplicaId([0; 16]);
+}
+
+#[test]
+fn closure_steps_charge_every_edge_and_frontier_entry() {
+    // c100 depends on c0..c99 directly (and each of those on nothing):
+    // with a budget of one unit per step, no step may examine more than
+    // one edge or frontier entry, so a wide dependency list takes as many
+    // steps as it has edges instead of being expanded in one visit.
+    let mut t = CommandTable::new();
+    for i in 0..100u8 {
+        t.initialize(cmd(i), payload(i), vec![vec![i]]).unwrap();
+        t.accept(cmd(i), vec![]).unwrap();
+    }
+    t.initialize(cmd(100), payload(100), vec![vec![100]])
+        .unwrap();
+    t.accept(cmd(100), (0..100u8).map(cmd).collect()).unwrap();
+    let mut cursor = t.closure_start(cmd(100)).unwrap();
+    let mut steps = 0usize;
+    let done = loop {
+        steps += 1;
+        match t.closure_step(cursor, 1).unwrap() {
+            ClosureProgress::Continue(c) => cursor = c,
+            ClosureProgress::Complete(done) => break done,
+        }
+    };
+    assert_eq!(done.members.len(), 100);
+    assert_eq!(done.visits, 100);
+    assert!(steps >= 100, "one edge or entry per unit: {steps} steps");
+    // The same traversal with a large budget spends the same total work
+    // and reaches the same closure.
+    let cursor = t.closure_start(cmd(100)).unwrap();
+    let ClosureProgress::Complete(whole) = t.closure_step(cursor, usize::MAX).unwrap() else {
+        panic!()
+    };
+    assert_eq!(whole.members, done.members);
+    // A diamond: both branches name c0, and the second edge to it costs
+    // a unit even though nothing is pushed for it.
+    let mut d = CommandTable::new();
+    d.initialize(cmd(0), payload(0), vec![vec![0]]).unwrap();
+    d.accept(cmd(0), vec![]).unwrap();
+    for i in 1..=2u8 {
+        d.initialize(cmd(i), payload(i), vec![vec![i]]).unwrap();
+        d.accept(cmd(i), vec![cmd(0)]).unwrap();
+    }
+    d.initialize(cmd(3), payload(3), vec![vec![3]]).unwrap();
+    d.accept(cmd(3), vec![cmd(1), cmd(2)]).unwrap();
+    let mut cursor = d.closure_start(cmd(3)).unwrap();
+    let mut steps = 0usize;
+    let done = loop {
+        steps += 1;
+        match d.closure_step(cursor, 1).unwrap() {
+            ClosureProgress::Continue(c) => cursor = c,
+            ClosureProgress::Complete(done) => break done,
+        }
+    };
+    assert_eq!(done.members, BTreeSet::from([cmd(0), cmd(1), cmd(2)]));
+    assert_eq!(done.visits, 3);
+    // Three frontier entries taken (c1, c2, c0) and two edges examined
+    // (c1 -> c0, c2 -> c0): five units, so five single-unit steps.
+    assert_eq!(steps, 5, "{steps}");
+}
+
+#[test]
+fn a_hot_key_keeps_working_after_its_executed_predecessor_is_retired() {
+    let mut t = CommandTable::with_capacity(2);
+    t.initialize(cmd(0), payload(0), k("hot")).unwrap();
+    t.accept(cmd(0), vec![]).unwrap();
+    t.initialize(cmd(1), payload(1), k("hot")).unwrap();
+    assert_eq!(t.record(&cmd(1)).unwrap().deps, vec![cmd(0)]);
+    t.accept(cmd(1), vec![cmd(0)]).unwrap();
+    t.commit(cmd(0)).unwrap();
+    t.execute(cmd(0)).unwrap();
+    // c0 is retired while c1 still depends on it: c1 keeps seeing an
+    // executed dependency and can commit, execute and be traversed.
+    t.retire(&cmd(0)).unwrap();
+    assert_eq!(t.phase_of(&cmd(0)), Some(Phase::Executed));
+    assert!(t.tombstones().contains(&cmd(0)));
+    t.commit(cmd(1)).unwrap();
+    let cursor = t.closure_start(cmd(1)).unwrap();
+    let ClosureProgress::Complete(closure) = t.closure_step(cursor, usize::MAX).unwrap() else {
+        panic!()
+    };
+    assert_eq!(closure.members, BTreeSet::from([cmd(0)]));
+    // A new command on the hot key no longer depends on the retired,
+    // executed predecessor (its effects are complete); it depends on c1.
+    let i2 = t.initialize(cmd(2), payload(2), k("hot")).unwrap();
+    assert_eq!(i2.deps, vec![cmd(1)]);
+    t.accept(cmd(2), vec![cmd(1)]).unwrap();
+    t.execute(cmd(1)).unwrap();
+    // Retiring c1 drops c0's tombstone, the last reference to it.
+    t.retire(&cmd(1)).unwrap();
+    assert!(t.tombstones().contains(&cmd(1)));
+    assert!(!t.tombstones().contains(&cmd(0)));
+    assert_eq!(t.phase_of(&cmd(0)), None);
+    t.commit(cmd(2)).unwrap();
+    t.execute(cmd(2)).unwrap();
+    t.retire(&cmd(2)).unwrap();
+    assert!(t.tombstones().is_empty(), "nothing references anything");
+    // The key's next command depends on nothing: the index was cleared.
+    let i3 = t.initialize(cmd(3), payload(3), k("hot")).unwrap();
+    assert_eq!(i3.deps, vec![]);
+}
+
+#[test]
+fn applied_synchronizations_are_not_taken_for_early_evidence() {
+    let (a, b) = (cmd(1), cmd(2));
+    let mut t = CommandTable::new();
+    let ia = t.initialize(a, payload(1), k("key")).unwrap();
+    t.record_leader_path(a, 1, &ia.paths);
+    let before = t.log(b"key").unwrap().clone();
+    assert_eq!(before.pending(), &[]);
+    assert!(before.applied().contains(&a));
+    // The same synchronization again, and an older reordered copy: no
+    // change, and no early entry is recorded.
+    t.record_leader_path(a, 1, &ia.paths);
+    t.record_leader_path(a, 0, &[(b"key".to_vec(), Digest32([7; 32]))]);
+    assert_eq!(t.log(b"key").unwrap(), &before);
+    // A genuinely early synchronization is still remembered and applied
+    // on append, and forgotten with the command.
+    t.record_leader_path(b, 2, &[(b"key".to_vec(), Digest32([9; 32]))]);
+    let ib = t.initialize(b, payload(2), k("key")).unwrap();
+    assert_eq!(ib.paths[0].1, Digest32([9; 32]));
+    assert_eq!(t.log(b"key").unwrap().pending(), &[]);
+    t.accept(a, vec![]).unwrap();
+    t.commit(a).unwrap();
+    t.execute(a).unwrap();
+    t.retire(&a).unwrap();
+    assert!(!t.log(b"key").unwrap().applied().contains(&a));
+    assert!(t.log(b"key").unwrap().applied().contains(&b));
 }
