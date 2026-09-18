@@ -32,6 +32,21 @@ var (
 	// ErrBindRejected: the frontend refused the session binding (the
 	// token was not accepted, or the answer was not an acknowledgement).
 	ErrBindRejected = errors.New("bind rejected")
+	// ErrWatchLost: the watch stream or its connection ended without a
+	// close frame; resume from the last complete revision.
+	ErrWatchLost = errors.New("watch lost")
+)
+
+// Lane is one admitted connection lane (spec/wire-v1.md, task-31): each
+// lane is a separate connection declared by its capability in the Hello.
+type Lane uint16
+
+// The lanes a Kine collector uses.
+const (
+	// LaneUnary carries requests and responses.
+	LaneUnary Lane = 0x0011
+	// LaneWatch carries long-lived event streams.
+	LaneWatch Lane = 0x0012
 )
 
 // TokenSource supplies the service token presented at binding. A
@@ -47,6 +62,11 @@ type Outcome struct {
 	// Unknown is true when the outcome could not be established (timeout,
 	// reset, or an Unknown/Pending answer): resolve by identity.
 	Unknown bool
+	// Pending is true when the endpoint answered Pending: it knows the
+	// identity and the outcome is not established yet (resolve again
+	// later). Unknown without Pending after a resolution means the
+	// endpoint does not know the identity, so the invocation is re-sent.
+	Pending bool
 }
 
 // PoolLimits bounds the warm pool.
@@ -78,9 +98,9 @@ type Client struct {
 	cfg    Config
 	dialFn func(ctx context.Context) (*quic.Conn, error)
 
-	mu   sync.Mutex
-	conn *quic.Conn
-	sem  chan struct{}
+	mu    sync.Mutex
+	conns map[Lane]*quic.Conn
+	sem   chan struct{}
 	// session bound by the last acknowledged Bind.
 	session *[16]byte
 	// Reconnects performed (for tests).
@@ -100,8 +120,9 @@ func New(addr string, cfg Config) *Client {
 		tlsConf.NextProtos = []string{ALPNNativeAPI}
 	}
 	c := &Client{
-		cfg: cfg,
-		sem: make(chan struct{}, cfg.Limits.MaxStreams),
+		cfg:   cfg,
+		sem:   make(chan struct{}, cfg.Limits.MaxStreams),
+		conns: map[Lane]*quic.Conn{},
 	}
 	c.dialFn = func(ctx context.Context) (*quic.Conn, error) {
 		return quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
@@ -120,15 +141,20 @@ func newWithDialer(cfg Config, dial func(ctx context.Context) (*quic.Conn, error
 	if cfg.Limits.MaxStreams <= 0 {
 		cfg.Limits.MaxStreams = 64
 	}
-	return &Client{cfg: cfg, dialFn: dial, sem: make(chan struct{}, cfg.Limits.MaxStreams)}
+	return &Client{cfg: cfg, dialFn: dial, sem: make(chan struct{}, cfg.Limits.MaxStreams), conns: map[Lane]*quic.Conn{}}
 }
 
-// connect returns a live connection, dialing and binding (Hello) if
-// needed. A binding presents the service token once.
+// connect returns the live unary-lane connection, dialing and binding
+// (Hello) if needed. A binding presents the service token once.
 func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
+	return c.connectLane(ctx, LaneUnary)
+}
+
+// connectLane returns the live connection of `lane`, dialing and binding
+// it if needed. Every lane binds the same session.
+func (c *Client) connectLane(ctx context.Context, lane Lane) (*quic.Conn, error) {
 	c.mu.Lock()
-	if c.conn != nil {
-		conn := c.conn
+	if conn := c.conns[lane]; conn != nil {
 		c.mu.Unlock()
 		return conn, nil
 	}
@@ -138,12 +164,18 @@ func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
 	if err != nil {
 		return nil, ErrNotConnected
 	}
-	if err := c.bind(ctx, conn); err != nil {
+	if err := c.bind(ctx, conn, lane); err != nil {
 		_ = conn.CloseWithError(2, "bind failed")
 		return nil, err
 	}
 	c.mu.Lock()
-	c.conn = conn
+	if existing := c.conns[lane]; existing != nil {
+		// A concurrent dial won; keep one connection per lane.
+		c.mu.Unlock()
+		_ = conn.CloseWithError(0, "duplicate")
+		return existing, nil
+	}
+	c.conns[lane] = conn
 	c.mu.Unlock()
 	return conn, nil
 }
@@ -168,9 +200,10 @@ func (c *Client) Connect(ctx context.Context) error {
 	return err
 }
 
-// bind opens the control stream and sends the Hello, then presents the
-// service token once in a Bind frame and reads the acknowledgement.
-func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
+// bind opens the control stream and sends the Hello declaring `lane`,
+// then presents the service token once in a Bind frame and reads the
+// acknowledgement.
+func (c *Client) bind(ctx context.Context, conn *quic.Conn, lane Lane) error {
 	var token string
 	if c.cfg.Tokens != nil {
 		t, err := c.cfg.Tokens.Token(ctx)
@@ -187,7 +220,7 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
 		Role:         wire.RoleClient,
 		ClusterID:    c.cfg.Cluster,
 		DomainID:     c.cfg.Domain,
-		Capabilities: []uint16{0x0011},
+		Capabilities: []uint16{uint16(lane)},
 	})
 	if err != nil {
 		return err
@@ -232,22 +265,43 @@ func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string)
 	}
 	session := ack.Session
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session != nil && *c.session != session {
+		// Lanes of one client bind one session; a different one is a
+		// refused binding, never a silent identity change.
+		return ErrBindRejected
+	}
 	c.session = &session
-	c.mu.Unlock()
 	return nil
 }
 
-// drop closes and forgets the connection so the next call reconnects.
-func (c *Client) drop() {
+// drop closes and forgets the unary connection so the next call
+// reconnects.
+func (c *Client) drop() { c.dropLane(LaneUnary, nil) }
+
+// dropLane closes and forgets a lane's connection (only `conn` when
+// given, so a newer connection is kept).
+func (c *Client) dropLane(lane Lane, conn *quic.Conn) {
 	c.mu.Lock()
-	conn := c.conn
-	c.conn = nil
-	if conn != nil {
-		c.Reconnects++
+	current := c.conns[lane]
+	if current == nil || (conn != nil && current != conn) {
+		c.mu.Unlock()
+		return
 	}
+	delete(c.conns, lane)
+	c.Reconnects++
 	c.mu.Unlock()
-	if conn != nil {
-		_ = conn.CloseWithError(0, "drop")
+	_ = current.CloseWithError(0, "drop")
+}
+
+// Close closes every lane.
+func (c *Client) Close() {
+	c.mu.Lock()
+	conns := c.conns
+	c.conns = map[Lane]*quic.Conn{}
+	c.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.CloseWithError(0, "close")
 	}
 }
 
@@ -294,7 +348,10 @@ func (c *Client) Do(ctx context.Context, frame []byte) (Outcome, error) {
 	if !ok {
 		return Outcome{}, ErrProtocol
 	}
-	if response.Tag == wire.OutcomePending || response.Tag == wire.OutcomeUnknown {
+	if response.Tag == wire.OutcomePending {
+		return Outcome{Unknown: true, Pending: true}, nil
+	}
+	if response.Tag == wire.OutcomeUnknown {
 		return Outcome{Unknown: true}, nil
 	}
 	return Outcome{Response: &response}, nil

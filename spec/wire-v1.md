@@ -196,3 +196,15 @@ and Kine-binding derivations (BLAKE3 derive-key contexts of
 `kine_bindings_v1.json`), and `Bind`/`BindAck` (raw kinds, not part of
 the typed registry). A schema change on either side requires reviewed
 fixtures on both.
+
+task-47 adds the `Compact` operation and the `Compacted` outcome to the
+mirrored subsets, and uses the watch lane (capability `0x0012`, a second
+bound connection of the same session): each watch is one bidirectional
+stream carrying the `WatchOpen` first, then `WatchEvents` (chunks of one
+revision until `complete`), `WatchProgress` and the final `WatchClose`;
+the client cancels by writing a `WatchClose` (`Cancelled`) on that stream.
+`start_revision` is inclusive on both sides; the adapter resumes a lost
+stream from its last complete revision plus one. On the unary lane a
+`Pending` answer means the endpoint knows the identity (resolve again),
+while an `Unknown` answer to a `ResolveRequest` means it never saw it, so
+the identical `Request` is re-sent under the same retry key.

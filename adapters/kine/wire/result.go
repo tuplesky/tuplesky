@@ -15,6 +15,7 @@ type OutcomeKind uint8
 // The outcomes a Kine request can receive.
 const (
 	OutcomeRange               OutcomeKind = 2
+	OutcomeCompacted           OutcomeKind = 4
 	OutcomeErrCompacted        OutcomeKind = 5
 	OutcomeErrFutureRevision   OutcomeKind = 6
 	OutcomeErrLeaseExists      OutcomeKind = 11
@@ -122,7 +123,7 @@ func DecodeResult(payload []byte) (Result, error) {
 		if out.Prev, err = readOptionKineKv(r); err != nil {
 			return Result{}, err
 		}
-	case OutcomeErrCompacted, OutcomeErrFutureRevision, OutcomeErrLeaseExists,
+	case OutcomeCompacted, OutcomeErrCompacted, OutcomeErrFutureRevision, OutcomeErrLeaseExists,
 		OutcomeKineCreated, OutcomeErrKeyExists, OutcomeErrSessionInvalid,
 		OutcomeErrPermissionDenied:
 	default:
@@ -197,7 +198,7 @@ func (res Result) Encode() ([]byte, error) {
 	case OutcomeKineDeleted:
 		w.boolean(res.Deleted)
 		writeOptionKineKv(w, res.Prev)
-	case OutcomeErrCompacted, OutcomeErrFutureRevision, OutcomeErrLeaseExists,
+	case OutcomeCompacted, OutcomeErrCompacted, OutcomeErrFutureRevision, OutcomeErrLeaseExists,
 		OutcomeKineCreated, OutcomeErrKeyExists, OutcomeErrSessionInvalid,
 		OutcomeErrPermissionDenied:
 	default:
