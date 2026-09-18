@@ -54,7 +54,7 @@ pub mod vote;
 
 pub use ballot::{
     BallotState, ConfigurationIdentity, PromiseEffects, PromiseInFlight, PromiseOutcome,
-    PromiseRejection, ReplicaRole,
+    PromiseRejection, ReplicaRole, SyncRejection,
 };
 pub use commands::{CommandRecord, CommandTable, InitError};
 pub use messages::ProtocolMessage;

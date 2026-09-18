@@ -147,11 +147,18 @@ impl CommandTable {
 
     /// Adopt the leader's order for an initialized command (ACCEPT), under
     /// the source guard.
+    ///
+    /// Phases only advance: a delayed or duplicate ACCEPT for a command
+    /// already committed or executed is idempotent and changes neither
+    /// the phase nor the dependencies the later phase was reached with.
     pub fn accept(
         &mut self,
         command: CommandId,
         deps: Vec<CommandId>,
     ) -> Result<(), GuardViolation> {
+        if self.phase_of(&command).is_some_and(|p| p > Phase::Accept) {
+            return Ok(());
+        }
         guard_accept(&deps, |c| self.phase_of(c))?;
         let record = self.initialized_mut(&command)?;
         record.deps = deps;
@@ -159,17 +166,27 @@ impl CommandTable {
         Ok(())
     }
 
-    /// Mark a learned command (COMMIT), under the source guard.
+    /// Mark a learned command (COMMIT), under the source guard. Idempotent
+    /// for a command already committed or executed.
     pub fn commit(&mut self, command: CommandId) -> Result<(), GuardViolation> {
-        let deps = self.initialized(&command)?.deps.clone();
+        let record = self.initialized(&command)?;
+        if record.phase >= Phase::Commit {
+            return Ok(());
+        }
+        let deps = record.deps.clone();
         guard_commit(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Commit;
         Ok(())
     }
 
-    /// Mark an executed command, under the source guard.
+    /// Mark an executed command, under the source guard. Idempotent for a
+    /// command already executed.
     pub fn execute(&mut self, command: CommandId) -> Result<(), GuardViolation> {
-        let deps = self.initialized(&command)?.deps.clone();
+        let record = self.initialized(&command)?;
+        if record.phase >= Phase::Executed {
+            return Ok(());
+        }
+        let deps = record.deps.clone();
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
         Ok(())
