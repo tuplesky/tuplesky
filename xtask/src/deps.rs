@@ -11,6 +11,10 @@
 //!   workspace member with role `test-only` or a listed external test crate)
 //!   through normal or build dependencies. Insecure test entropy, simulators
 //!   and model engines therefore cannot enter production artifacts.
+//! * Boundary constructors that turn plain data into a sealed capability
+//!   (`VerifierToken::for_boundary`, `PeerProvenance::from_transport`) appear
+//!   only in the reviewed boundary crates or in test-only crates. Library
+//!   sources are scanned; integration tests are exempt.
 //! * No crate in the resolved graph is a forbidden alternative TLS stack.
 //! * Git sources are limited to the reviewed raft-engine pin.
 //! * `cargo deny check` enforces licenses, advisories, bans and sources.
@@ -57,6 +61,15 @@ const CORE_FORBIDDEN: &[&str] = &[
 /// raft-engine must build with no optional feature (no scripting, internals,
 /// nightly allocator, failpoints or optional codecs).
 const FEATURE_AUDIT: &[(&str, &[&str])] = &[("raft-engine", &[])];
+
+/// Constructors that cast unverified data into a sealed capability, and the
+/// non-test crates allowed to contain them (design Sections 3, 9.3, 18.1).
+/// Test-only crates are always allowed: the dependency policy keeps them out
+/// of production artifacts.
+const BOUNDARY_CONSTRUCTORS: &[(&str, &[&str])] = &[
+    ("VerifierToken::for_boundary", &["coord-collector"]),
+    ("PeerProvenance::from_transport", &["coord-transport"]),
+];
 
 /// Crates that must not appear anywhere in the resolved graph.
 const FORBIDDEN: &[&str] = &["openssl", "openssl-sys", "native-tls", "hyper-tls"];
@@ -124,6 +137,7 @@ pub(crate) fn check(root: &Path, offline: bool) -> Result<()> {
     let metadata: Metadata = serde_json::from_str(&json).context("parsing cargo metadata")?;
     check_member_pins(&metadata)?;
     check_graph(&metadata)?;
+    check_boundary_constructors(&metadata)?;
     let go_sum = root.join("adapters/kine/go.sum");
     if !go_sum.is_file() {
         bail!("adapters/kine/go.sum is missing");
@@ -254,6 +268,82 @@ fn member_spec_is_pinned(spec: &toml::Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Scan the library sources (`src/`) of every non-test workspace member for
+/// boundary constructors outside their allow list.
+fn check_boundary_constructors(metadata: &Metadata) -> Result<()> {
+    let mut violations = Vec::new();
+    for package in metadata
+        .packages
+        .iter()
+        .filter(|p| metadata.workspace_members.contains(&p.id))
+    {
+        // Test-only crates never reach production artifacts, and this crate
+        // holds the policy text itself.
+        if role_of(package) == Some("test-only") || package.name == "xtask" {
+            continue;
+        }
+        let src = Path::new(&package.manifest_path)
+            .parent()
+            .context("manifest without a directory")?
+            .join("src");
+        for file in rust_files(&src)? {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            for hit in boundary_violations(&package.name, &text) {
+                violations.push(format!("{} ({hit})", file.display()));
+            }
+        }
+    }
+    if !violations.is_empty() {
+        bail!(
+            "boundary constructors outside their allowed crates: {}",
+            violations.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Every `.rs` file under `dir`, recursively; empty when `dir` is missing.
+fn rust_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    if !dir.is_dir() {
+        return Ok(out);
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The boundary constructors `text` mentions that `crate_name` may not use.
+/// Doc comments and line comments are ignored; `#[cfg(test)]` modules are
+/// not, so an in-crate unit test that needs one belongs in `tests/`.
+fn boundary_violations(crate_name: &str, text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (symbol, allowed) in BOUNDARY_CONSTRUCTORS {
+        if allowed.contains(&crate_name) {
+            continue;
+        }
+        let mentioned = text.lines().any(|line| {
+            let code = line.trim_start();
+            !code.starts_with("//") && code.contains(symbol)
+        });
+        if mentioned {
+            out.push((*symbol).to_string());
+        }
+    }
+    out
 }
 
 fn role_of(package: &Package) -> Option<&str> {
@@ -483,6 +573,30 @@ mod tests {
             toml::from_str("[package]\nname = \"m\"\n[dependencies]\na = { workspace = true }")
                 .unwrap();
         assert!(unpinned_member_dependencies(&clean).is_empty());
+    }
+
+    #[test]
+    fn boundary_constructors_are_confined_to_their_crates() {
+        let text = "// PeerProvenance::from_transport in a comment is fine\n\
+                    /// and VerifierToken::for_boundary in docs too\n\
+                    let p = PeerProvenance::from_transport(a, b, c);\n";
+        assert_eq!(
+            boundary_violations("coord-storage", text),
+            vec!["PeerProvenance::from_transport"]
+        );
+        assert!(boundary_violations("coord-transport", text).is_empty());
+        let both = "VerifierToken::for_boundary(); PeerProvenance::from_transport(x, y, z);";
+        assert_eq!(
+            boundary_violations("coord-consensus", both),
+            vec![
+                "VerifierToken::for_boundary",
+                "PeerProvenance::from_transport"
+            ]
+        );
+        assert_eq!(
+            boundary_violations("coord-collector", both),
+            vec!["PeerProvenance::from_transport"]
+        );
     }
 
     #[test]

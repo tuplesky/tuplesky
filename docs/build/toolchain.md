@@ -69,6 +69,11 @@ added by the tasks that first use them, with the same exact-pin rule.
   cannot be linked into production artifacts.
 * openssl, openssl-sys, native-tls and hyper-tls are forbidden anywhere in
   the resolved graph.
+* Boundary constructors that cast plain data into a sealed capability
+  (`VerifierToken::for_boundary`, `PeerProvenance::from_transport`) may appear
+  in library sources only of the reviewed boundary crates (`coord-collector`,
+  `coord-transport`) or of test-only crates; the scan ignores comments and
+  integration tests.
 * Git sources are limited to the reviewed raft-engine revision.
 * Feature audit: raft-engine must resolve with an empty feature set.
 * `cargo deny check` applies `deny.toml` (advisories, licenses, bans,
