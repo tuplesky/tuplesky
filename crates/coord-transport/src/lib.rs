@@ -54,7 +54,7 @@ pub use endpoint::{
 pub use frames::{FrameError, KIND_PEER_EVIDENCE, evidence_frame};
 pub use identity::{BindError, BoundIdentity, IdentityBinder, role_class};
 pub use lane::{Lane, LaneError, LaneLimits, lane_of_hello, role_lanes};
-pub use sched::{FairQueue, LaneStats, QueueError, WaitStats};
+pub use sched::{FairQueue, LaneStats, QueueError, Queued, WaitStats};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";
