@@ -13,6 +13,7 @@ members = [
     "crates/coord-store-api",
     "crates/coord-store-testkit",
     "crates/coord-journal-api",
+    "crates/coord-journal-raft-engine",
     "crates/coord-storage",
     "crates/coord-storage-redb",
     "crates/coord-redb-faultkit",
@@ -55,6 +56,7 @@ coord-oracle = { path = "crates/coord-oracle" }
 coord-store-api = { path = "crates/coord-store-api" }
 coord-store-testkit = { path = "crates/coord-store-testkit" }
 coord-journal-api = { path = "crates/coord-journal-api" }
+coord-journal-raft-engine = { path = "crates/coord-journal-raft-engine" }
 coord-storage-redb = { path = "crates/coord-storage-redb" }
 coord-storage = { path = "crates/coord-storage" }
 coord-redb-faultkit = { path = "crates/coord-redb-faultkit" }

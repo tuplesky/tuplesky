@@ -642,6 +642,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-journal-raft-engine"
+version = "0.1.0"
+dependencies = [
+ "coord-core",
+ "coord-journal-api",
+ "coord-store-api",
+ "coord-types",
+ "postcard",
+ "raft-engine",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "coord-login"
 version = "0.1.0"
 dependencies = [

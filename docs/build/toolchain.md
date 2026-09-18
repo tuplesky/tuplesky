@@ -39,7 +39,7 @@ claimed as qualification (Section 22.2).
 | bytes | =1.12.1 | default | |
 | blake3 | =1.8.7 | default | domain-separated identity hashing |
 | redb | =4.2.0 | std (no default) | production state engine; not yet linked by a crate |
-| raft-engine | git `097c499a19fbb38754c73aa2f31532329df7c0c6` | none (no default) | shared journal candidate; see audit below |
+| raft-engine | git `097c499a19fbb38754c73aa2f31532329df7c0c6` | none (no default) | shared journal engine (`coord-journal-raft-engine`, task-j02) and the smoke tool; see audit below |
 | thiserror | =2.0.20 | no default | |
 | anyhow | =1.0.104 | default | binaries/tooling only |
 | clap | =4.6.6 | std, derive, help, usage, error-context | tooling and binaries |
@@ -89,13 +89,46 @@ postcard `ValueCodec` against them and its tests show: appended (never
 clobbered) encoding, rejection of trailing bytes and oversized payloads,
 multi-group synced writes surviving reopen, `Engine::write` returning a byte
 count (not a sequence), and a usable batch after a codec failure. This is a
-smoke test of the engine API, not the task-j02 journal adapter.
+smoke test of the engine API, not the journal adapter.
 
-Observed transitive facts to carry into task-j02:
+`crates/coord-journal-raft-engine` (task-j02, role `production`) is the
+journal adapter over the same pin: one region per `StorageStreamId`, one entry
+per `JournalRecordV1` at its `LocalJournalSeq`, a bounded postcard `ValueCodec`
+(the built-in protobuf, bincode and JSON codecs are unused), journal identity
+and stream mappings in the indexed key/value region `0`, every group written as
+one nonempty `LogBatch` with `sync = true`, compaction written as an explicit
+synced `Command::Compact` under a durable checkpoint pointer, and
+`purge_expired_files` results reported as diagnostics only. Audited engine
+behavior the adapter relies on:
+
+* `Engine::write` with a nonempty batch panics through
+  `expect("pipe::sync()")` when the file sync fails (Section 17.15). The
+  adapter does not catch that panic; it propagates to the supervisor and the
+  journal mutex is poisoned, so every later call reports a fail-stop error. An
+  ordinary error returned after submission (`TryAgain`, I/O, `Full`) is treated
+  the same way. Recovery is a fresh open, which derives the actual valid
+  records from the log files; the fault-filesystem test
+  `sync_failure_inside_a_write_panics_and_fail_stops_until_reopen` exercises
+  the real path through `FileSystem::Handle::sync`.
+* `Engine::write` returns the on-disk byte count of the batch, which is
+  compressed (lz4) above `batch_compression_threshold` (8 KiB by default):
+  it is recorded as evidence and never mapped to a sequence.
+* `Engine::compact_to` writes its `Compact` command with `sync = false` and
+  logs (does not return) write errors; the adapter never calls it.
+* `RecoveryMode::TolerateAnyCorruption` is not offered (`RecoveryPolicy` has
+  only `AbsoluteConsistency` and `TolerateTailCorruption`, the qualified
+  torn-tail case). Log recycling and prefill are disabled so a fresh file never
+  carries stale records.
+* The engine locks its directory (`LOCK`); a second opener fails with
+  `Error::Other`, mapped to `OpenError::Busy`.
+
+Observed transitive facts (from the task-01 audit, still true at task-j02):
 
 * `fail` 0.5 (non-optional) pulls `rand` 0.8 and `rand_chacha` 0.3 into the
-  normal graph of anything linking raft-engine. Production entropy must still
-  come from OS sources; the policy forbids these crates only in `core` crates.
+  normal graph of anything linking raft-engine, now including the production
+  crate `coord-journal-raft-engine`. Production entropy must still come from
+  OS sources; the policy forbids these crates only in `core` crates, and the
+  adapter never uses them.
 * `protobuf` 2.28 is present for the legacy codec; it is not used on the
   native wire (Section 16.4).
 * `lz4-sys` is pinned by the engine at `=1.9.5`; `prometheus` 0.13 and
@@ -125,7 +158,7 @@ to be resolved or re-justified before a production release.
 
 | Advisory | Crate | Nature | Why no upgrade | Why unreachable here |
 |---|---|---|---|---|
-| RUSTSEC-2024-0437 | protobuf 2.28.0 | stack overflow (denial of service) when skipping unknown group fields in untrusted input; patched in 3.7.2+ | the pinned raft-engine revision requires protobuf 2 directly and through prometheus 0.13; the 2.x line is unmaintained | raft-engine is a dependency of `tools/raft-engine-smoke` only, no daemon or library crate links it, and the engine decodes only its own on-disk log entries |
+| RUSTSEC-2024-0437 | protobuf 2.28.0 | stack overflow (denial of service) when skipping unknown group fields in untrusted input; patched in 3.7.2+ | the pinned raft-engine revision requires protobuf 2 directly and through prometheus 0.13; the 2.x line is unmaintained | raft-engine is linked by `crates/coord-journal-raft-engine` (task-j02) and `tools/raft-engine-smoke`; both use the bounded postcard `ValueCodec`, never `ProtobufCodec`, so no protobuf message is ever parsed, and the engine decodes only its own on-disk log files, never network input; protobuf is not on the native wire (Section 16.4) |
 | RUSTSEC-2023-0071 | rsa 0.9.10 | Marvin attack: timing side channel in RSA private-key operations that can leak the key to a network observer | no patched release exists (tracked upstream since 2023); openidconnect 4.0.1 requires the crate unconditionally | only openidconnect (coord-login) uses it, for public-key verification of upstream identity-provider signatures; no RSA private key is created, held or used in the workspace, and the broker signs with ES256 through aws-lc-rs
 
 ## Reproducing
