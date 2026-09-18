@@ -170,6 +170,43 @@ fn incompatible_bundles_fail_clearly() {
         ),
         "{err}"
     );
+    // A build that cannot state its lock digest or commit cannot claim
+    // reproducibility: unknown on either side is a mismatch, not a pass.
+    let mut unknown_lock = bundle.clone();
+    unknown_lock.build.lock_digest = None;
+    let err = unknown_lock
+        .check_compatible(&BuildIdentity::current())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ReplayError::Incompatible {
+                field: "lock_digest",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let mut without_lock = BuildIdentity::current();
+    without_lock.lock_digest = None;
+    assert!(matches!(
+        bundle.check_compatible(&without_lock),
+        Err(ReplayError::Incompatible {
+            field: "lock_digest",
+            ..
+        })
+    ));
+    let mut with_commit = bundle.clone();
+    with_commit.build.git_commit = Some("abc123".to_owned());
+    let mut current = BuildIdentity::current();
+    current.git_commit = None;
+    assert!(matches!(
+        with_commit.check_compatible(&current),
+        Err(ReplayError::Incompatible {
+            field: "git_commit",
+            ..
+        })
+    ));
     let mut wrong_format = bundle.clone();
     wrong_format.format = "something-else".to_owned();
     assert!(matches!(
@@ -210,4 +247,51 @@ fn insertion_ties_are_explicit_in_the_trace() {
         values,
         expected.iter().map(Vec::as_slice).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn malformed_scenarios_are_rejected_before_running() {
+    let bundle =
+        ReplayBundleV1::record(Scenario::new(seed(7), ActorKind::DurableEcho, 1), "invalid");
+    let mut zero_nodes = bundle.clone();
+    zero_nodes.scenario.nodes = 0;
+    assert!(matches!(
+        zero_nodes.replay(),
+        Err(ReplayError::InvalidScenario(_))
+    ));
+    let mut foreign_fault = bundle.clone();
+    foreign_fault.scenario.faults = vec![Fault::Crash { node: 5, tick: 1 }];
+    assert!(matches!(
+        foreign_fault.replay(),
+        Err(ReplayError::InvalidScenario(_))
+    ));
+    let mut inverted = bundle;
+    inverted.scenario.workload.min_gap = 9;
+    inverted.scenario.workload.max_gap = 1;
+    assert!(matches!(
+        inverted.replay(),
+        Err(ReplayError::InvalidScenario(_))
+    ));
+    let mut scenario = Scenario::new(seed(7), ActorKind::DurableEcho, 0);
+    assert!(scenario.validate().is_err());
+    scenario.nodes = 1;
+    assert!(scenario.validate().is_ok());
+}
+
+#[test]
+fn boot_precedes_every_other_event_and_stale_incarnations_are_fenced() {
+    let mut scenario = Scenario::new(seed(8), ActorKind::DurableEcho, 3);
+    scenario.workload.requests = 30;
+    scenario.faults = vec![
+        Fault::Crash { node: 1, tick: 10 },
+        Fault::Restart { node: 1, tick: 20 },
+        Fault::Crash { node: 2, tick: 25 },
+        Fault::Restart { node: 2, tick: 26 },
+    ];
+    let mut world = World::new(scenario);
+    world.run(|_, _| {});
+    assert_eq!(world.events_before_boot(), 0);
+    // The echo actors only address the external client, so no send names a
+    // node incarnation and nothing is fenced in this scenario.
+    assert_eq!(world.stale_incarnation_sends(), 0);
 }

@@ -118,6 +118,15 @@ pub enum Fault {
 }
 
 impl Fault {
+    /// Every node the fault names.
+    pub fn nodes(&self) -> Vec<NodeId> {
+        match self {
+            Fault::Crash { node, .. } | Fault::Restart { node, .. } => vec![*node],
+            Fault::Cut { from, to, .. } | Fault::Heal { from, to, .. } => vec![*from, *to],
+            Fault::FailBatch { node, .. } => vec![*node],
+        }
+    }
+
     /// Tick at which the fault is scheduled (batch failures apply on submit).
     pub const fn tick(&self) -> u64 {
         match self {
@@ -153,6 +162,28 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    /// Reject configurations the world cannot run. Called by replay before
+    /// any scheduling; [`World::new`] panics on an invalid scenario because
+    /// programmatic construction is a caller bug, while a loaded bundle
+    /// reports [`ReplayError::InvalidScenario`].
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.nodes == 0 {
+            return Err("a scenario needs at least one node");
+        }
+        for fault in &self.faults {
+            if fault.nodes().iter().any(|n| *n >= self.nodes) {
+                return Err("a fault names a node outside the scenario");
+            }
+        }
+        if self.workload.min_gap > self.workload.max_gap {
+            return Err("workload min_gap exceeds max_gap");
+        }
+        if self.storage.min_delay > self.storage.max_delay {
+            return Err("storage min_delay exceeds max_delay");
+        }
+        Ok(())
+    }
+
     /// A default scenario for `actor` with `nodes` nodes.
     pub fn new(seed: [u8; 32], actor: ActorKind, nodes: NodeId) -> Self {
         Scenario {
@@ -241,6 +272,9 @@ pub enum ReplayError {
     },
     /// The bundle could not be read or parsed.
     Unreadable(String),
+    /// The bundle's scenario is malformed (for example zero nodes with a
+    /// workload); running it would abort rather than produce an outcome.
+    InvalidScenario(String),
     /// The replay ran but produced a different outcome.
     Diverged {
         /// Report produced now.
@@ -262,6 +296,7 @@ impl std::fmt::Display for ReplayError {
                 "bundle {field} is {expected:?} but this build has {found:?}; not reproducible here"
             ),
             ReplayError::Unreadable(e) => write!(f, "bundle unreadable: {e}"),
+            ReplayError::InvalidScenario(e) => write!(f, "bundle scenario invalid: {e}"),
             ReplayError::Diverged { .. } => {
                 f.write_str("replay diverged from the recorded outcome")
             }
@@ -366,15 +401,23 @@ impl ReplayBundleV1 {
                 &build.generator,
             ));
         }
-        if let (Some(a), Some(b)) = (&self.build.lock_digest, &build.lock_digest)
-            && a != b
-        {
-            return Err(mismatch("lock_digest", a, b));
+        // A missing identity on either side is not a match: a build that
+        // cannot prove it used the same lockfile or source cannot claim to
+        // reproduce the bundle.
+        let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "<unknown>".to_owned());
+        if self.build.lock_digest != build.lock_digest {
+            return Err(mismatch(
+                "lock_digest",
+                &shown(&self.build.lock_digest),
+                &shown(&build.lock_digest),
+            ));
         }
-        if let (Some(a), Some(b)) = (&self.build.git_commit, &build.git_commit)
-            && a != b
-        {
-            return Err(mismatch("git_commit", a, b));
+        if self.build.git_commit != build.git_commit {
+            return Err(mismatch(
+                "git_commit",
+                &shown(&self.build.git_commit),
+                &shown(&build.git_commit),
+            ));
         }
         Ok(())
     }
@@ -382,6 +425,9 @@ impl ReplayBundleV1 {
     /// Replay under this build: compatibility first, then exact outcome.
     pub fn replay(&self) -> Result<Outcome, ReplayError> {
         self.check_compatible(&BuildIdentity::current())?;
+        self.scenario
+            .validate()
+            .map_err(|e| ReplayError::InvalidScenario(e.to_owned()))?;
         let outcome = run_scenario(&self.scenario);
         let violations: Vec<(NodeId, Vec<u8>)> = outcome
             .violations
