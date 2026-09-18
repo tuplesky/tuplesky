@@ -2,7 +2,7 @@
 
 **Status:** Proposed implementation design for review, consolidated v0.7.  
 **Date:** 2026-09-17.  
-**Companion:** [Implementation PR plan](tuplesky-prs-plan.md).  
+**Companion:** [Implementation task plan](tuplesky-prs-plan.md).  
 **Implementation:** Rust 2024; selected dependency candidates and build gates are in Section 16.  
 **Scope:** A self-contained specification. Earlier baselines, supplements and amendments are not additional normative documents. Existing `coord-*` package names, proposed ALPN identifiers and wire identifiers remain unchanged.
 
@@ -77,7 +77,7 @@ Observers have no protocol-level count ceiling, but per-domain/process/region/co
 <a id="s1-5"></a>
 ### 1.5 Fault-tolerance and cost model
 
-For `v` voters, preserving majority availability after loss of a region containing `r` voters requires `v - r >= floor(v / 2) + 1`, in addition to usable communication and recovery. Three voters therefore require three separate regions to survive any one whole-region outage. Five can use 2-2-1 placement for that objective; five copies do not imply tolerance of two arbitrary regional outages.
+For `v` voters, preserving majority availability after loss of a region containing `r` voters requires `v - r >= floor(v / 2) + 1`, in addition to usable communication and recovery. Three voters therefore require three separate regions to survive any one whole-region outage. Five can use 2-2-1 placement for that objective; five copies do not imply tolerance of two arbitrary regional outages. Losing a two-voter region leaves exactly three voters: no further voter failure can be tolerated until redundancy is restored. This is a majority-availability condition, not a fast-path guarantee; a fixed C2 set touching the lost region is unavailable until an authorized replacement ballot/set exists.
 
 Use `v` for voters and `o` for observers. Agreement dissemination is O(v²); finalized distribution is O(o) logical deliveries at fixed voter factor. Do not create O((v+o)²) communication by enrolling observers in vote broadcast. Aggregate work scales with domain load and replication factor, not the square of the number of tenants.
 
@@ -148,7 +148,7 @@ flowchart TB
     Auth --> IdP
     Auth -->|"Replicated session / policy commands"| Front
     Human <-->|"postcard over QUIC API"| Front
-    K8s <-->|"local etcd gRPC edge"| Kine
+    K8s <-->|"restricted local or mTLS etcd edge"| Kine
     Kine -->|"HTTPS workload exchange"| Auth
     Front <--> A
     Front <--> B
@@ -181,6 +181,8 @@ The public API never exposes tentative values. Even a tentative read can disclos
 ### 3.1 Transport and compatibility boundaries
 
 Kine performs etcd protobuf conversion only at the compatibility edge and is deployed beside or within the API server's region. The authorized adapter talks directly to the assigned voters. It does not require another remote frontend hop. The native SDK continues to use a frontend because it is not a trusted protocol collector.
+
+The API-server-to-Kine etcd gRPC connection is a privileged storage edge. It must use a permission-restricted Unix-domain socket within the trusted deployment boundary, an explicitly isolated loopback/network namespace containing only the trusted API-server/Kine components, or mutually authenticated TLS. A cross-host endpoint, even within one region or private network, requires mTLS: the API server verifies Kine's server identity and Kine admits only explicitly authorized API-server client identities for its bound domain. Trusting every certificate under a broad tenant/node CA is not sufficient. No plaintext network listener, server-authentication-only substitute, insecure verifier or automatic insecure fallback is permitted. Limit listener reachability as defense in depth; Kubernetes end-user authorization is not replaced by network reachability or a tenant header. Include certificate rotation/expiry and rejected unauthenticated, wrong-domain and unauthorized-client cases in task-46 and task-48.
 
 No HTTP/2, gRPC, SQL polling or mandatory JSON conversion is on the native inter-region data path. Browser/device flows, issuer discovery, JWKS, introspection when configured and RFC 8693 exchange remain HTTPS credential-establishment traffic. Already authenticated operations must not perform another global token exchange per request.
 
@@ -788,7 +790,7 @@ The first consensus composition is fixed-membership. Production membership is an
 stateDiagram-v2
     [*] --> Stable
     Stable --> Preparing: Authorize successor and stage replicas
-    Preparing --> Stable: Cancel before seal
+    Preparing --> Stable: Authorized cancellation before sealing
     Preparing --> Sealing: Staging readiness verified
     Sealing --> TerminalRecovery: Old quorum durably fenced
     TerminalRecovery --> Installing: Unique terminal certificate
@@ -798,8 +800,12 @@ stateDiagram-v2
     TerminalRecovery --> HandoffRecovery: Coordinator fails
     Installing --> HandoffRecovery: Coordinator fails
     Activating --> HandoffRecovery: Coordinator fails
-    HandoffRecovery --> TerminalRecovery: Recover recorded transition
+    HandoffRecovery --> Stable: Certified pre-seal cancellation
+    HandoffRecovery --> Sealing: Partial seal requires reconciliation
+    HandoffRecovery --> TerminalRecovery: Old quorum seal established
 ```
+
+On coordinator failure, select the recovery path from authoritative durable transition evidence, not merely the last in-memory lifecycle label. A pre-seal return to Stable requires a protocol-validated cancellation that excludes a completed irreversible seal and fences outstanding/stale attempts for that transition. The absence of a local seal record, a timeout or a missing reply is not such evidence. A partial seal or indeterminate seal write is reconciled without clearing any voter's persistent fence; continue the authorized Sealing procedure or remain blocked when required authority is unavailable. Enter TerminalRecovery only after recovering or establishing the authorized old-quorum seal. Reuse an already selected terminal certificate or activated successor rather than recomputing an incompatible outcome or rolling back stages. These are explicit task-54, task-55 and task-57 model and recovery obligations, not a claim that the cancellation protocol has been proved.
 
 This lifecycle is not a completed proof. Permit one transition per domain. Prepare exact successor incarnations and non-voting staging copies. Readiness includes validated common checkpoint, compatible schema, bounded suffix, disk/capacity and ability to install terminal state; current KV revision alone is insufficient.
 
@@ -1039,9 +1045,22 @@ Use simulator true time to test declared lease clock assumptions. Passing an inv
 <a id="s12-4"></a>
 ### 12.4 Verification layers
 
-Model normal operations, learning, recovery and persistence before optimizing; extend separately for checkpoints/handoff. Explore tractable three-/five-voter cases, not claim an unrestricted proof. Every implementation PR runs regressions, bounded deterministic campaigns, relevant fuzz/concurrency tests. Larger scheduled runs cover multi-fault workloads, outages, credentials and minimization. Preserve minimized failures without real secrets.
+Model normal operations, learning, recovery and persistence before optimizing; extend separately for checkpoints/handoff. Explore tractable three-/five-voter cases, not claim an unrestricted proof. Every code-, contract-, build- or CI-affecting implementation PR runs the applicable regressions, bounded deterministic campaigns and fuzz/concurrency tests. Documentation-only edits follow Section 12.4.1 instead of starting the heavy build matrix. Larger scheduled runs cover multi-fault workloads, outages, credentials and minimization. Preserve minimized failures without real secrets.
 
-Real processes, actual TLS/QUIC, filesystems, Kine/API servers and network impairment independently test kernel/crypto/IdP behavior. Differential compatibility allows only documented deviations. Future documentation CI renders every Mermaid block, including sequence diagrams; avoid message semicolons or escape them as `#59;`. This design PR does not include local authoring scripts or claim these implementation suites have run. [S25]
+Real processes, actual TLS/QUIC, filesystems, Kine/API servers and network impairment independently test kernel/crypto/IdP behavior. Differential compatibility allows only documented deviations. Future documentation CI renders every Mermaid block, including sequence diagrams; avoid message semicolons or escape them as `#59;`. The design package does not include local authoring scripts or claim these implementation suites have run. [S25]
+
+<a id="s12-4-1"></a>
+#### 12.4.1 GitHub Actions routing for documentation-only changes
+
+The workflows and reviewed change-filter script are deliverables of task-01, not local document-authoring tooling. Create a lightweight CI entry workflow, a documentation job/workflow, and a reusable Rust/Go build-test workflow. For pull requests, pushes to maintained branches and merge-group checks, the entry workflow first classifies changes; it invokes the heavy jobs only when the change is not proven documentation-only. Skipping means avoiding the expensive jobs and their toolchain setup, not eliminating the small classifier/check run. Scheduled and manual full-qualification runs bypass the docs-only optimization. Extend bounded/per-platform test jobs as their implementation tasks land; do not advertise unimplemented suites as passing.
+
+Use an explicit, reviewed allowlist of non-executable documentation paths, not a blanket `*.md` or `docs/**` exclusion that could hide build inputs or executable fixtures. Any code, Cargo/go manifest or lockfile, toolchain, schema, fixture, model, build script, CI workflow, local action, filter or filter-policy change requires the appropriate heavy CI. Unknown paths also require heavy CI. Changes to documentation checks still run those checks; ordinary prose-only edits run Markdown/link/reference/task-graph/Mermaid checks without scheduling the Rust matrix.
+
+The script consumes the complete Git change set, not a truncated API page or the first matching filename. For PRs compare the fetched base/head merge-base to the head; for pushes compare event before/after revisions; for merge groups compare the event's base and combined head, including every queued change. Handle additions, deletions, type changes and both old/new rename paths with NUL-safe parsing. An empty/unknown comparison, missing history or unsupported event must never produce a docs-only classification: recover enough history, conservatively select full CI, or fail the required gate. Pass event IDs/paths as data, never interpolated executable shell. Test changes beyond 300 files and code-to-doc renames explicitly.
+
+Keep a stable required `CI` gate that runs after classification and selected jobs, including when a dependency failed or was skipped. It succeeds only when the classifier and required documentation checks succeed and every selected heavy check succeeds; a heavy-job skip is acceptable only for a validated docs-only decision. Failure, cancellation or missing output must not be converted to green by unconditional success. Do not use workflow-level `paths-ignore` as the sole required-check strategy: a filtered-out workflow can leave its required check pending. Conditional heavy jobs avoid that issue while retaining a lightweight check result. See [GitHub required-check behavior](https://docs.github.com/en/enterprise-cloud@latest/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks) and [conditional jobs](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-jobs-with-conditions).
+
+Run untrusted changes using `pull_request` with minimal read-only permissions, no repository secrets or privileged persistent runner, pinned action/tool revisions and bounded execution. Do not execute PR code in privileged `pull_request_target` jobs. Disable checkout credential persistence where no push is needed. Include `merge_group: checks_requested` when merge-queue checks are required; manual success is not a substitute for a required PR/merge-group check. See [GitHub workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows). A temporary scratch validator is not the repository filter or the future CI implementation.
 
 <a id="s13"></a>
 ## 13. Operations, resource controls and security
@@ -1086,7 +1105,7 @@ These are capability groupings, not merge order; Section 23 and the task DAG con
 
 Keep external guarantees, resource budgets, real revision semantics and deployment fixed when comparing. Report native/Kine separately and retain Raft/Multi-Paxos plus all-to-all-ack baselines. Test 3/5 voters; observer counts 0/1/10/100 as experimental loads, not promised support; home/distributed/migrating traffic; direct watches versus relays; one versus many journal groups; strict versus qualified replay projection; separate fresh redb/Fjall fixtures.
 
-Report p50/p95/p99/p99.9 mutation, per-region event and read latency; sustainable load at stated latency target; records/bytes/syncs per operation/group; source bandwidth, observer lag, queues, index memory, checkpoint/rewrite costs; handoff pause, full recovery and expiry lateness. Include one voter absent, source loss, actual authentication, compaction and steady maintenance. Never label strict journal+redb as one-fsync or replay mode as faster without measurements.
+Report p50/p95/p99/p99.9 mutation, per-region event and read latency; sustainable load at stated latency target; records/bytes/syncs per operation/group; source bandwidth, observer lag, queues, index memory, checkpoint/rewrite costs; handoff pause, full recovery and expiry lateness. Include one voter absent, source loss, actual authentication, compaction and steady maintenance. Exercise the explicit five-voter 2-2-1 whole-region-loss schedules in Section 21.5, separating fixed-fast-set loss with a surviving leader from leader-region loss and subsequent recovery; measure the bare-majority interval and restoration of failure margin. Never label strict journal+redb as one-fsync or replay mode as faster without measurements.
 
 <a id="s15"></a>
 ## 15. Decisions requiring implementation evidence
@@ -1105,7 +1124,7 @@ No library selection proves the service extensions. Do not substitute assumption
 
 redb remains production materialized state, not a dependency of common semantics. Each local domain has one state adapter while many streams share bounded journal shards. redb ordered snapshots/single-writer transactions fit the model but copy-on-write, versions, long views and synchronization consume resources. No superiority over LSM is assumed. Fjall comparison uses identical logical semantics in fresh isolated storage. [I1-I4, I22-I24]
 
-Use Rust 2024 and initial declared minimum 1.90 matching the selected redb. PR-01 resolves/builds the entire graph/toolchain on Linux x86_64/aarch64; one crate's MSRV is not proof the workspace builds. The following are recorded starting pins from the original 2026-09-11 dependency review (storage rechecked 2026-09-12), not a compiled lockfile or a new current-version verification. Commit Cargo.lock, go.sum, toolchain/tool hashes and build with locked resolution. [I1]
+Use Rust 2024 and initial declared minimum 1.90 matching the selected redb. task-01 resolves/builds the entire graph/toolchain on Linux x86_64/aarch64; one crate's MSRV is not proof the workspace builds. The following are recorded starting pins from the original 2026-09-11 dependency review (storage rechecked 2026-09-12), not a compiled lockfile or a new current-version verification. Commit Cargo.lock, go.sum, toolchain/tool hashes and build with locked resolution. [I1]
 
 | Layer | Starting candidates | Boundary |
 |---|---|---|
@@ -1130,7 +1149,7 @@ Use Rust 2024 and initial declared minimum 1.90 matching the selected redb. PR-0
 | Go edge | quic-go v0.62.0 and a full Kine commit | Restricted native codec/collector/backend, no voting state machine |
 | Shared journal | raft-engine Git pin in Section 16.4 | Storage reuse only, no raft-rs |
 
-Major-only entries select a family; PR-01 reviews an exact patch. Cargo toml requirement is `=1.1.6` despite upstream spec build metadata. cargo-deny/nextest/fuzz/TLC/Mermaid tools have a reviewed checksummed manifest. No floating branches, silent feature activation, unreviewed override or prerelease bridge. Dependency updates are separate PRs rerunning affected compatibility/recovery/security/simulation suites.
+Major-only entries select a family; task-01 reviews an exact patch. Cargo toml requirement is `=1.1.6` despite upstream spec build metadata. cargo-deny/nextest/fuzz/TLC/Mermaid tools have a reviewed checksummed manifest. No floating branches, silent feature activation, unreviewed override or prerelease bridge. Dependency updates are separate PRs rerunning affected compatibility/recovery/security/simulation suites.
 
 <a id="s16-2"></a>
 ### 16.2 Feature selection
@@ -1296,7 +1315,7 @@ tx.commit()?;
 
 Immediate and local two-phase hardening are selected from the reviewed redb contract; keep quick-repair off initially and measure recovery. The latter is not another WAN phase and its I/O cost remains in strict benchmarks. [I2, I3]
 
-Optional `journaled-replay`: after PR-J06 qualification, atomic working-state updates need not fsync each transaction because durable redo plus a published durable checkpoint reconstruct acknowledged state. Discard or validate working generations after crash; never depend on an unsynced live database as the only source. Provide a separate internal atomic-working-state capability and durable checkpoint method; do not weaken commit_durable or expose an unsafe actor/operator switch. Keep strict mode until the full composed matrix and measured benefit justify enabling replay mode.
+Optional `journaled-replay`: after task-j06 qualification, atomic working-state updates need not fsync each transaction because durable redo plus a published durable checkpoint reconstruct acknowledged state. Discard or validate working generations after crash; never depend on an unsynced live database as the only source. Provide a separate internal atomic-working-state capability and durable checkpoint method; do not weaken commit_durable or expose an unsafe actor/operator switch. Keep strict mode until the full composed matrix and measured benefit justify enabling replay mode.
 
 <a id="s17-4"></a>
 ### 17.4 Application materialization and speculation
@@ -1307,7 +1326,7 @@ Validate/journal the complete plan; materialization rechecks its recorded base a
 
 State/cache/events advance only after atomic application, recoverable journal/checkpoint coverage, establishment and required authorization; strict mode additionally honors selected projection durability. Reader gates prevent premature native visibility. No surviving KV update can lose its corresponding result/index.
 
-A trusted collector may return a fully established speculative response without waiting for another materialization round trip only after exact durable evidence proves result/predecessors/permission. PR-29 requires PR-27 crash qualification and PR-28 full learning. Events and credentials still await irrevocable application. No extra volatile COMMIT quorum is assumed.
+A trusted collector may return a fully established speculative response without waiting for another materialization round trip only after exact durable evidence proves result/predecessors/permission. task-29 requires task-27 crash qualification and task-28 full learning. Events and credentials still await irrevocable application. No extra volatile COMMIT quorum is assumed.
 
 <a id="s17-5"></a>
 ### 17.5 MVCC and physical maintenance
@@ -1425,7 +1444,7 @@ Normative adapter semantics:
 6. Commit/sync failures are Indeterminate unless specific noncommit evidence exists. Corruption, uncertain I/O and abort cleanup failure quarantine affected work. Only pre-commit shared guard rejection is an ordinary replan. A deadline proves neither cancellation nor rollback.
 7. No actor-facing weak durability, savepoint rollback, TTL/merge callback, native transaction ID or public engine sequence. Optional maintenance cannot change guarantees.
 
-Do not expose successful commit followed by optional public flush. The adapter may combine engine primitives internally but offers indivisible durable success. PR-J06 adds separately typed atomic-working-state capability and durable checkpoint publication; it never implements commit_durable with weaker behavior. No production network task runs database I/O, and no unbounded per-vote blocking tasks are created.
+Do not expose successful commit followed by optional public flush. The adapter may combine engine primitives internally but offers indivisible durable success. task-j06 adds separately typed atomic-working-state capability and durable checkpoint publication; it never implements commit_durable with weaker behavior. No production network task runs database I/O, and no unbounded per-vote blocking tasks are created.
 
 <a id="s17-10"></a>
 ### 17.10 Registry, stamps and visibility
@@ -1505,7 +1524,7 @@ Use paired repetitions, alternated/randomized engine order, same scheduled offer
 
 Hold shared journal/profile/topology fixed for state-engine comparison, labeling strict single-store references separately. Redb one-phase/sensitivity runs cannot silently replace two-phase primary configuration. Tuned runs may vary private caches/grouping/compression within equivalent budgets with all differences recorded. Do not force identical layouts. Record CPU/RSS, device counters when available, peak space, view age/debt/reopen and warm/cold assumptions; fresh directory/restart does not prove cold OS cache. Keep maintenance enabled and report unfinished debt. Short bursts are not steady state.
 
-PR-S01/S02 establish contract/model/reference; S03/S04 add fresh Fjall experiments. No engine migration or extra production-engine gate is introduced. Normal local recovery/checkpoint obligations remain mandatory.
+ task-s01, task-s02 establish contract/model/reference; task-s03, task-s04 add fresh Fjall experiments. No engine migration or extra production-engine gate is introduced. Normal local recovery/checkpoint obligations remain mandatory.
 
 <a id="s17-15"></a>
 ### 17.15 Journal failures and shared-resource limits
@@ -1757,7 +1776,7 @@ TLC models cover full learning, persistence/recovery, floor activation and seale
 
 Use proptest for canonical IDs/keys, histories and loss/retry transformations; Loom for completion gates/channels/watch registration/shutdown; fuzz frames/JWK/CSR/storage import with allocation budgets. Insecure test verifier success is not auth qualification.
 
-Proposed future task entry points include check-contracts, sim/replay, store-conformance, per-engine crash matrix, fresh store-differential/store-bench/store-compare, wire-interop, model recovery, kube-storage-conformance and bench-wan. They belong to implementation tasks, not authoring scripts delivered by this PR. Every permanent regression and bounded seed set runs in CI; longer schedules cover outages/storage pressure. No retry-until-green or unexplained flaky suppression; minimize/fix the harness or save the counterexample.
+Proposed future task entry points include check-contracts, sim/replay, store-conformance, per-engine crash matrix, fresh store-differential/store-bench/store-compare, wire-interop, model recovery, kube-storage-conformance and bench-wan. They belong to implementation tasks, not local document-authoring scripts. Every applicable permanent regression and bounded seed set runs in code/contract CI under Section 12.4.1; longer schedules cover outages/storage pressure. No retry-until-green or unexplained flaky suppression; minimize/fix the harness or save the counterexample.
 
 <a id="s21-4"></a>
 ### 21.4 Journal and composed fault evidence
@@ -1779,6 +1798,7 @@ Inject death around append/sync, projection transactions, checkpoint file/rename
 | Membership | Competing successor, coordinator crash each state, removed disk return, partial new install, 3↔5 resizing |
 | Storage | Cross-group batch, callback reorder, sync panic, disk full, torn unacknowledged tail, corrupt prefix, checkpoint/trim crash |
 | Isolation | Hot tenant, stalled consumer, relay storm, snapshot flood, rewrite and lagging projection while other domains proceed |
+| Regional loss (five voters, 2-2-1) | Lose a two-voter region that contains a member of the fixed C2 fast set while the leader survives: use the surviving slow majority without a fast-path timeout, measure degraded latency and backlog, and explicitly report zero additional voter-failure margin. Separately lose the leader region and require recovery before progress; a later valid ballot may restore a fast set. A further survivor failure must not produce successful new writes. |
 | Identity | Observer attempts vote, policy during replay, stale reconnect grants, issuer/credential outage |
 
 Increase population/load in simulation and real integration beyond small finite models. Configuration/certificate checks are not substitutes for quorum/source predicates.
@@ -1891,12 +1911,12 @@ Instrument admission/verification, client transit, fan-out, dependency closure, 
 
 Measure scheduled arrivals to avoid coordinated omission, achieved load/errors/samples and tails. Match durability/CPU/payload/placement/faults. Strict journal+redb two-phase is initial primary; any replay or weaker sensitivity profile is separate, with maintenance/recovery included. Isolated codec/TLS/syscall/storage microbenchmarks cannot become nondurable production headlines.
 
-PR-S04 is early local storage evaluation; later WAN/Kine harnesses reuse fresh independent fixtures. No migration/mixed-engine qualification is needed for experiment. Report whole-operation queue and commit-return, not only sync, and retain missing metrics as unavailable.
+task-s04 is early local storage evaluation; later WAN/Kine harnesses reuse fresh independent fixtures. No migration/mixed-engine qualification is needed for experiment. Report whole-operation queue and commit-return, not only sync, and retain missing metrics as unavailable.
 
 <a id="s23"></a>
 ## 23. Implementation gates and review plan
 
-The [89-task plan](tuplesky-prs-plan.md) partitions delivery with direct prerequisites, bounded scope and explicit acceptance; task IDs are backlog labels, not existing GitHub PR numbers. Independent work may run concurrently, but cannot land before prerequisites. Existing IDs remain stable; S05-S08 are retired, not reused.
+The [89-task plan](tuplesky-prs-plan.md) partitions delivery with direct prerequisites, bounded scope and explicit acceptance; task IDs are backlog labels, not existing GitHub PR numbers. Independent work may run concurrently, but cannot land before prerequisites. Existing IDs remain stable; task-s05 through task-s08 are retired, not reused.
 
 | Gate | Evidence and allowed exposure |
 |---|---|
@@ -1919,10 +1939,10 @@ No performance shortcut/operator flag can bypass a correctness gate. Production 
 | Observer/Kine preview | Frozen adapter, complete replay/progress/cancel, scoped roles and failover |
 | Operational replacement | Quorum-safe semantic floors, sealed handoff, epoch-aware clients, promotion discipline and local journal checkpoints |
 | Strict production | Actual engine panic/crash/platform matrix, bounded shared resources and mixed histories |
-| Replay profile | PR-J06, reconstruction/visibility proofs and full composed matrix with measured benefit; otherwise absent/disabled |
+| Replay profile | task-j06, reconstruction/visibility proofs and full composed matrix with measured benefit; otherwise absent/disabled |
 | Observer current reads | ReadFence-specific temporal/permission/snapshot tests; otherwise authoritative full-read path |
 
-PR-66 additionally requires PR-Q01. Journal/observer/client-aware membership tasks extend reference increments without circular prerequisites. S03/S04 stay isolated experiments, J06 optional. The source-issue guards are integrated into protocol/storage/lifecycle tests, not a separate unresolved amendment reviewers must apply manually.
+task-66 additionally requires task-q01. Journal/observer/client-aware membership tasks extend reference increments without circular prerequisites. task-s03, task-s04 stay isolated experiments, task-j06 optional. The source-issue guards are integrated into protocol/storage/lifecycle tests, not a separate unresolved amendment reviewers must apply manually.
 
 <a id="s24"></a>
 ## 24. References and consolidation provenance
@@ -2004,4 +2024,4 @@ References support source protocols, standards and recorded library behavior; th
 
 Consolidated from the original v0.5 design, v0.6 observer/membership/journal revision and source-issue safeguards present at repository commit `2acf4eb724a36dcdb74baeb0c3b13368bc1317eb`. Historical documents remain in Git history, not competing specifications in this tree. Overlapping explanations are combined while preserving the detailed service contracts and explicit replacement of single-store authority and frontend-only Kine routing.
 
-The strict per-output authorization requirement was retained explicitly because observer admission and ordered policy replay did not specify its removal. This is stated in Section 6.9.3 rather than silently relaxing the older security contract. Proposed references/incremental fixtures remain distinct from production composition. No external-version re-verification, Rust/Go build, protocol proof/trace execution, real storage fault qualification or benchmark is claimed by this document consolidation. Local workspace/authoring scripts and generated reports are excluded from the PR.
+The strict per-output authorization requirement was retained explicitly because observer admission and ordered policy replay did not specify its removal. This is stated in Section 6.9.3 rather than silently relaxing the older security contract. Proposed references/incremental fixtures remain distinct from production composition. No external-version re-verification, Rust/Go build, protocol proof/trace execution, real storage fault qualification or benchmark is claimed by this document consolidation. Local workspace/authoring scripts and generated reports are not part of the design package.
