@@ -1,0 +1,37 @@
+[package]
+name = "coord-login"
+description = "OIDC browser login through an upstream relying-party client, the service code flow with PKCE, exact redirects and bounded pending logins, and device authorization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+coord-state.workspace = true
+coord-authn.workspace = true
+coord-sts.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+openidconnect.workspace = true
+oauth2.workspace = true
+reqwest.workspace = true
+blake3.workspace = true
+rustls.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+coord-core.workspace = true
+coord-storage.workspace = true
+coord-store-api.workspace = true
+coord-store-testkit.workspace = true
+rcgen.workspace = true
+jsonwebtoken.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
