@@ -1,16 +1,19 @@
-//! task-30 acceptance on real loopback endpoints: role negotiation and
-//! peer frames with bound provenance; malformed frames and origin, role,
-//! version and identity mismatches fail closed; no application 0-RTT; a
-//! transport completion is never durability or establishment; bounded
-//! shutdown and stream limits; sparse connections only where asked.
+//! task-30 and task-31 acceptance on real loopback endpoints: role and
+//! lane negotiation with bound provenance; malformed frames and origin,
+//! role, lane, version and identity mismatches fail closed; no
+//! application 0-RTT; a transport completion is never durability or
+//! establishment; bounded shutdown and stream limits; sparse connections
+//! only where asked; a stalled bulk consumer cannot starve control; the
+//! destination budget is shared across lanes with a control reserve;
+//! oversize frames are refused before buffering; fan-out admits each
+//! destination on its own; queue wait, credit wait and RTT are distinct.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use coord_transport::{
-    ALPN_API, ALPN_PEER, BoundIdentity, Class, CloseReason, Limits, Transport, TransportEvent,
-    evidence_frame,
+    ALPN_API, ALPN_PEER, BudgetLimits, Class, CloseReason, Destination, Lane, LaneLimits, Limits,
+    SendError, Transport, TransportError, TransportEvent, evidence_frame,
 };
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
@@ -20,6 +23,7 @@ use tokio::time::timeout;
 
 const CLUSTER: ClusterId = ClusterId([1; 16]);
 const DOMAIN: DomainId = DomainId([2; 16]);
+const OTHER_DOMAIN: DomainId = DomainId([3; 16]);
 
 fn r(i: u8) -> ReplicaId {
     ReplicaId([i; 16])
@@ -63,15 +67,19 @@ fn fixture(roles: &[PeerRole]) -> Fixture {
     }
 }
 
-fn bind(f: &Fixture, i: usize) -> Transport {
+fn bind_with(f: &Fixture, i: usize, limits: Limits) -> Transport {
     let local = f.ids[i].local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]);
     Transport::bind(
         "127.0.0.1:0".parse().unwrap(),
         local,
         f.binder.clone(),
-        limits(),
+        limits,
     )
     .unwrap()
+}
+
+fn bind(f: &Fixture, i: usize) -> Transport {
+    bind_with(f, i, limits())
 }
 
 async fn event(t: &mut Transport) -> TransportEvent {
@@ -81,18 +89,33 @@ async fn event(t: &mut Transport) -> TransportEvent {
         .expect("endpoint alive")
 }
 
-async fn connect_peer(from: &Transport, to: &Transport, to_id: &TestIdentity) -> SocketAddr {
+async fn event_in(t: &mut Transport, lane: Lane) -> TransportEvent {
+    timeout(Duration::from_secs(5), t.next_event_in(lane))
+        .await
+        .expect("event within deadline")
+        .expect("endpoint alive")
+}
+
+async fn connect_lane(from: &Transport, to: &Transport, to_id: &TestIdentity, lane: Lane) {
     let addr = to.local_addr().unwrap();
     from.connect(
         addr,
         &to_id.name,
         PeerRole::Voter,
         Some(inc(1)),
+        lane,
         to_id.expected(),
     )
     .await
     .unwrap();
-    addr
+}
+
+fn dest(i: u8, lane: Lane) -> Destination {
+    Destination::Replica {
+        replica: r(i),
+        incarnation: inc(1),
+        lane,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -101,47 +124,64 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
     let mut a = bind(&f, 0);
     let mut b = bind(&f, 1);
     let c = bind(&f, 2);
-    connect_peer(&a, &b, &f.ids[1]).await;
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
     match event(&mut a).await {
         TransportEvent::Connected {
-            class, identity, ..
+            class,
+            lane,
+            identity,
+            ..
         } => {
             assert_eq!(class, Class::Peer);
+            assert_eq!(lane, Lane::Control);
             assert_eq!(identity.replica, Some(r(1)));
             assert_eq!(identity.incarnation, Some(inc(1)));
             assert_eq!(identity.role, PeerRole::Voter);
-            assert_eq!(identity.capabilities, vec![1, 2], "granted intersection");
+            assert_eq!(
+                identity.capabilities,
+                vec![1, 2, Lane::Control.capability()],
+                "granted intersection plus the lane"
+            );
         }
         other => panic!("{other:?}"),
     }
     match event(&mut b).await {
-        TransportEvent::Connected { identity, .. } => {
+        TransportEvent::Connected { identity, lane, .. } => {
             assert_eq!(identity.replica, Some(r(0)));
+            assert_eq!(lane, Lane::Control);
         }
         other => panic!("{other:?}"),
     }
     // A frame each way over the one connection; provenance is what
     // negotiation bound, not what the frame claims.
-    a.send_peer(r(1), inc(1), evidence_frame(b"vote-from-a").unwrap())
-        .await
-        .unwrap();
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"vote-from-a").unwrap(),
+    )
+    .unwrap();
     match event(&mut b).await {
         TransportEvent::PeerFrame {
             provenance,
+            lane,
             kind,
             payload,
             ..
         } => {
             assert_eq!(provenance.from(), r(0));
             assert_eq!(provenance.incarnation(), inc(1));
+            assert_eq!(lane, Lane::Control);
             assert_eq!(kind, coord_transport::KIND_PEER_EVIDENCE);
             assert_eq!(payload, b"vote-from-a");
         }
         other => panic!("{other:?}"),
     }
-    b.send_peer(r(0), inc(1), evidence_frame(b"ack-from-b").unwrap())
-        .await
-        .unwrap();
+    b.send(
+        dest(0, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"ack-from-b").unwrap(),
+    )
+    .unwrap();
     match event(&mut a).await {
         TransportEvent::PeerFrame {
             provenance,
@@ -153,15 +193,42 @@ async fn voters_negotiate_roles_and_exchange_frames_with_bound_provenance() {
         }
         other => panic!("{other:?}"),
     }
-    // Sparse: nothing dialed the third voter, and it dialed nobody.
+    // Sparse: nothing dialed the third voter, and it dialed nobody; the
+    // bulk lane to b was never opened either.
     assert_eq!(a.connections(), 1);
     assert_eq!(b.connections(), 1);
     assert_eq!(c.connections(), 0);
+    assert_eq!(
+        a.send(
+            dest(2, Lane::Control),
+            DOMAIN,
+            evidence_frame(b"x").unwrap()
+        ),
+        Err(SendError::NotConnected)
+    );
+    assert_eq!(
+        a.send(dest(1, Lane::Bulk), DOMAIN, evidence_frame(b"x").unwrap()),
+        Err(SendError::NotConnected)
+    );
+    // A voter may not open a unary lane.
+    let err = a
+        .connect(
+            b.local_addr().unwrap(),
+            &f.ids[1].name,
+            PeerRole::Voter,
+            Some(inc(1)),
+            Lane::Unary,
+            f.ids[1].expected(),
+        )
+        .await;
     assert!(matches!(
-        a.send_peer(r(2), inc(1), evidence_frame(b"x").unwrap())
-            .await,
-        Err(coord_transport::SendError::NotConnected)
+        err,
+        Err(TransportError::LaneNotAdmitted(Lane::Unary))
     ));
+    let stats = a.stats(r(1), inc(1), Lane::Control).unwrap();
+    assert_eq!(stats.frames, 1);
+    assert_eq!(stats.queue_wait.count, 1);
+    assert_eq!(stats.credit_wait.count, 1);
 }
 
 /// A raw client endpoint presenting `id`'s certificate, for driving the
@@ -182,16 +249,30 @@ fn raw_client(f: &Fixture, id: &TestIdentity, alpn: &[u8]) -> quinn::Endpoint {
     endpoint
 }
 
-fn hello(role: PeerRole, cluster: ClusterId, incarnation: Option<ReplicaIncarnation>) -> Vec<u8> {
+fn hello_with(
+    role: PeerRole,
+    cluster: ClusterId,
+    incarnation: Option<ReplicaIncarnation>,
+    capabilities: Vec<u16>,
+) -> Vec<u8> {
     MessageV1::Hello(HelloV1 {
         role,
         cluster_id: cluster,
         domain_id: DOMAIN,
         incarnation,
-        capabilities: BoundedVec::new(vec![1]).unwrap(),
+        capabilities: BoundedVec::new(capabilities).unwrap(),
     })
     .encode()
     .unwrap()
+}
+
+fn hello(role: PeerRole, cluster: ClusterId, incarnation: Option<ReplicaIncarnation>) -> Vec<u8> {
+    hello_with(
+        role,
+        cluster,
+        incarnation,
+        vec![1, Lane::Control.capability()],
+    )
 }
 
 /// Send `first` as the first control frame and return how the acceptor
@@ -249,7 +330,7 @@ async fn malformed_frames_and_mismatches_fail_closed() {
     let reason = first_frame(&f, voter, ALPN_PEER, &mut acceptor, vec![0xff; 3]).await;
     assert_eq!(reason, CloseReason::Timeout);
     // A header whose length is below the minimum is malformed before any
-    // payload is read.
+    // payload is read; one above the class limit likewise.
     let mut short = Vec::new();
     short.extend_from_slice(&2u32.to_be_bytes());
     short.extend_from_slice(&0x0001u16.to_be_bytes());
@@ -259,8 +340,6 @@ async fn malformed_frames_and_mismatches_fail_closed() {
         matches!(reason, CloseReason::Malformed(ref m) if m.contains("LengthBelowMinimum")),
         "{reason:?}"
     );
-    // A frame above the negotiation class limit is refused before any
-    // payload is read.
     let mut oversize = Vec::new();
     oversize.extend_from_slice(&(64 * 1024 + 1u32).to_be_bytes());
     oversize.extend_from_slice(&0x0001u16.to_be_bytes());
@@ -311,6 +390,25 @@ async fn malformed_frames_and_mismatches_fail_closed() {
     )
     .await;
     assert_eq!(reason, CloseReason::Rejected("incarnation".into()));
+    // No lane, two lanes, or a lane the role may not open.
+    for caps in [
+        vec![1],
+        vec![Lane::Control.capability(), Lane::Bulk.capability()],
+        vec![Lane::Unary.capability()],
+    ] {
+        let reason = first_frame(
+            &f,
+            voter,
+            ALPN_PEER,
+            &mut acceptor,
+            hello_with(PeerRole::Voter, CLUSTER, Some(inc(1)), caps),
+        )
+        .await;
+        assert!(
+            matches!(reason, CloseReason::Rejected(ref m) if m.starts_with("lane")),
+            "{reason:?}"
+        );
+    }
     // A certificate entitled to Frontend claiming Voter, and a certificate
     // the binder never issued.
     let frontend = &f.ids[2];
@@ -358,13 +456,11 @@ async fn malformed_frames_and_mismatches_fail_closed() {
             &f.ids[0].name,
             PeerRole::Voter,
             Some(inc(1)),
+            Lane::Control,
             wrong,
         )
         .await;
-    assert!(
-        matches!(err, Err(coord_transport::TransportError::Rejected(_))),
-        "{err:?}"
-    );
+    assert!(matches!(err, Err(TransportError::Rejected(_))), "{err:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -428,11 +524,14 @@ async fn transport_completion_is_not_durability_or_establishment() {
     let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
     let a = bind(&f, 0);
     let mut b = bind(&f, 1);
-    connect_peer(&a, &b, &f.ids[1]).await;
-    // The send completes while the receiver has not looked at anything.
-    a.send_peer(r(1), inc(1), evidence_frame(b"proposal").unwrap())
-        .await
-        .unwrap();
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    // The send is admitted while the receiver has not looked at anything.
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"proposal").unwrap(),
+    )
+    .unwrap();
     let mut kinds = Vec::new();
     for _ in 0..2 {
         kinds.push(match event(&mut b).await {
@@ -453,7 +552,7 @@ async fn shutdown_is_bounded_and_stream_bounds_hold() {
     let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
     let mut a = bind(&f, 0);
     let mut b = bind(&f, 1);
-    connect_peer(&a, &b, &f.ids[1]).await;
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
     assert!(matches!(
         event(&mut a).await,
         TransportEvent::Connected { .. }
@@ -510,13 +609,178 @@ async fn shutdown_is_bounded_and_stream_bounds_hold() {
         other => panic!("{other:?}"),
     }
     assert_eq!(a.connections(), 0);
-    let _ = (
-        ALPN_API,
-        BoundIdentity {
-            role: PeerRole::Voter,
-            replica: None,
-            incarnation: None,
-            capabilities: vec![],
-        },
+}
+
+/// Limits that make bulk stall quickly: tiny queues, one bulk stream and
+/// a small destination budget with a control reserve.
+fn tight_limits() -> Limits {
+    let mut l = limits();
+    l.event_queue = 2;
+    l.lanes[Lane::Bulk.index()] = LaneLimits {
+        max_uni_streams: 1,
+        queue_depth: 2,
+        max_groups: 2,
+        ..LaneLimits::BULK
+    };
+    l.budget = BudgetLimits {
+        destination_bytes: 48 * 1024,
+        node_bytes: 96 * 1024,
+        control_reserve: 16 * 1024,
+        max_opens: 8,
+    };
+    l
+}
+
+fn bulk_frame(fill: u8) -> Vec<u8> {
+    evidence_frame(&vec![fill; 20 * 1024]).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_bulk_consumer_cannot_starve_control_and_the_budget_is_shared() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let a = bind_with(&f, 0, tight_limits());
+    let mut b = bind_with(&f, 1, tight_limits());
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    connect_lane(&a, &b, &f.ids[1], Lane::Bulk).await;
+    assert_eq!(a.connections(), 2, "one connection per lane");
+    assert!(matches!(
+        event_in(&mut b, Lane::Control).await,
+        TransportEvent::Connected {
+            lane: Lane::Control,
+            ..
+        }
+    ));
+    assert!(matches!(
+        event_in(&mut b, Lane::Bulk).await,
+        TransportEvent::Connected {
+            lane: Lane::Bulk,
+            ..
+        }
+    ));
+    // b never reads its bulk lane again. a pushes bulk until every bound
+    // pushes back: the bulk queue refuses, the sender waits on credit and
+    // the destination budget never exceeds its shared part.
+    let mut refused = 0;
+    let mut admitted = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        match a.send(dest(1, Lane::Bulk), DOMAIN, bulk_frame(0xbb)) {
+            Ok(()) => admitted += 1,
+            Err(SendError::QueueFull { lane: Lane::Bulk }) => {
+                refused += 1;
+                if refused > 20 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(
+        refused > 0,
+        "the bulk queue refused after {admitted} frames"
     );
+    let (_, peak) = a.budget_of(r(1), inc(1)).unwrap();
+    assert!(peak > 0);
+    assert!(
+        peak <= 48 * 1024 - 16 * 1024,
+        "bulk never took the control reserve: peak {peak}"
+    );
+    let bulk = a.stats(r(1), inc(1), Lane::Bulk).unwrap();
+    assert!(bulk.refused > 0);
+    assert!(bulk.queued > 0);
+    // Control still flows, promptly, over its own connection and queue,
+    // using the reserve the bulk lane cannot touch.
+    let started = std::time::Instant::now();
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"vote-while-bulk-stalls").unwrap(),
+    )
+    .unwrap();
+    match event_in(&mut b, Lane::Control).await {
+        TransportEvent::PeerFrame { payload, lane, .. } => {
+            assert_eq!(lane, Lane::Control);
+            assert_eq!(payload, b"vote-while-bulk-stalls");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let control = a.stats(r(1), inc(1), Lane::Control).unwrap();
+    assert_eq!(control.refused, 0);
+    assert_eq!(control.frames, 1);
+    // Waits are measured apart from the RTT: bulk waited for credit while
+    // the loopback RTT stayed small.
+    assert!(bulk.credit_wait.count >= 1);
+    assert!(bulk.queue_wait.count >= 1);
+    assert!(control.rtt < Duration::from_secs(1));
+    // A frame the bulk lane could never hold is refused up front.
+    let huge = evidence_frame(&vec![0u8; 40 * 1024]).unwrap();
+    assert!(matches!(
+        a.send(dest(1, Lane::Bulk), DOMAIN, huge),
+        Err(SendError::TooLarge { .. })
+    ));
+    // Draining bulk at b lets the backlog through.
+    let mut drained = 0;
+    while drained < admitted {
+        match timeout(Duration::from_secs(5), b.next_event_in(Lane::Bulk)).await {
+            Ok(Some(TransportEvent::PeerFrame {
+                lane: Lane::Bulk, ..
+            })) => drained += 1,
+            Ok(Some(_)) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(drained, admitted);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fan_out_admits_each_destination_on_its_own_and_groups_share_fairly() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter, PeerRole::Voter]);
+    let a = bind_with(&f, 0, tight_limits());
+    let mut b = bind_with(&f, 1, tight_limits());
+    let mut c = bind_with(&f, 2, tight_limits());
+    connect_lane(&a, &b, &f.ids[1], Lane::Bulk).await;
+    connect_lane(&a, &c, &f.ids[2], Lane::Bulk).await;
+    let _ = event_in(&mut b, Lane::Bulk).await;
+    let _ = event_in(&mut c, Lane::Bulk).await;
+    // Saturate b's bulk lane (b does not read it); c stays idle.
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut saturated = false;
+    while std::time::Instant::now() < deadline {
+        if a.send(dest(1, Lane::Bulk), DOMAIN, bulk_frame(0x11))
+            .is_err()
+        {
+            saturated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(saturated);
+    // Fan-out: b is refused, c is admitted and delivered; the same frame
+    // in another group is admitted for b on its own queue (fair share), and
+    // a third group is beyond the group bound.
+    let out = a.fan_out(
+        &[(r(1), inc(1)), (r(2), inc(1))],
+        Lane::Bulk,
+        DOMAIN,
+        &bulk_frame(0x22),
+    );
+    assert_eq!(out[0], Err(SendError::QueueFull { lane: Lane::Bulk }));
+    assert_eq!(out[1], Ok(()));
+    match event_in(&mut c, Lane::Bulk).await {
+        TransportEvent::PeerFrame { payload, .. } => assert_eq!(payload[0], 0x22),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        a.send(dest(1, Lane::Bulk), OTHER_DOMAIN, bulk_frame(0x33)),
+        Ok(())
+    );
+    assert_eq!(
+        a.send(dest(1, Lane::Bulk), DomainId([4; 16]), bulk_frame(0x44)),
+        Err(SendError::TooManyGroups { lane: Lane::Bulk })
+    );
+    // Node-wide accounting covers both destinations.
+    let (_, node_peak) = a.node_budget();
+    assert!(node_peak > 0 && node_peak <= 96 * 1024);
 }

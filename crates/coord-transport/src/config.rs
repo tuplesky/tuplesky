@@ -7,6 +7,9 @@ use coord_types::ids::{ClusterId, DomainId};
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
+use crate::budget::BudgetLimits;
+use crate::lane::LaneLimits;
+
 /// ALPN of the native API plane (clients, trusted frontends, Kine
 /// collectors). Not a registered standard.
 pub const ALPN_API: &[u8] = b"coord-api/1";
@@ -60,10 +63,15 @@ pub struct Limits {
     pub idle_timeout: Duration,
     /// Keep-alive interval (liveness only; never a lease or membership).
     pub keep_alive: Duration,
-    /// Depth of the owned event queue; readers wait when it is full.
+    /// Depth of each lane's owned event queue; that lane's readers wait
+    /// when it is full while the other lanes keep flowing.
     pub event_queue: usize,
     /// Unary requests a peer may keep in flight (`HelloAck.max_inflight`).
     pub max_inflight: u32,
+    /// Per-lane stream limits, windows and queues (task-31).
+    pub lanes: [LaneLimits; 4],
+    /// Shared destination and node byte budgets (task-31).
+    pub budget: BudgetLimits,
 }
 
 impl Default for Limits {
@@ -78,6 +86,8 @@ impl Default for Limits {
             keep_alive: Duration::from_secs(5),
             event_queue: 1024,
             max_inflight: 64,
+            lanes: LaneLimits::DEFAULTS,
+            budget: BudgetLimits::default(),
         }
     }
 }
