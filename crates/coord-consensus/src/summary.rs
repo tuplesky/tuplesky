@@ -122,6 +122,8 @@ impl DurableLedger {
                     command: *c,
                     phase: r.phase,
                     deps: r.deps.clone(),
+                    path: r.path,
+                    keys: r.keys.clone(),
                     payload_present: true,
                 })
                 .collect(),

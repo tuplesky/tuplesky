@@ -3,8 +3,11 @@
 //! with the slow set, `deliver`).
 //!
 //! A command is learned when its slow predicate holds (the leader's order
-//! adopted by a majority including the leader) and every dependency is
-//! committed; it executes when every dependency has executed, in the
+//! adopted by a majority including the leader) or, with full learning
+//! (task-28), when the fast predicate holds (the leader's proposal and the
+//! path evidence of every other member of the ballot's fixed fast set
+//! equal to the leader's), and every dependency is committed; it executes
+//! when every dependency has executed, in the
 //! leader's sequence order, at the next execution position. Application
 //! itself happens through the common materializer outside this crate; the
 //! learner turns the materializer's outcome into the sealed
@@ -12,7 +15,7 @@
 //! `Effect::Established`. A leader reply, or any single response, can
 //! never establish anything here.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_core::capability::{EstablishError, EstablishedResult, EstablishmentEvidence};
@@ -24,7 +27,18 @@ use serde::{Deserialize, Serialize};
 use crate::commands::CommandTable;
 use crate::graph::ClosureProgress;
 use crate::phase::{GuardViolation, Phase, guard_execute};
-use crate::vote::VoteSet;
+use crate::vote::{Learned, VoteSet};
+
+/// Which learning predicates a replica applies (design Section 18.3:
+/// the slow path is the reference; fast learning is the measured
+/// optimization with the same evidence structures).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LearningMode {
+    /// Fast and slow predicates.
+    Full,
+    /// The slow predicate only (forced slow path).
+    SlowOnly,
+}
 
 /// What the common materializer reports after applying a command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,16 +71,40 @@ pub enum LearnError {
     Overflow,
 }
 
-/// The learner of one replica: the execution frontier.
+/// The learner of one replica: the execution frontier, the learning mode
+/// and which committed commands the fast predicate learned (measurement
+/// evidence carried into the established result).
 #[derive(Clone, Debug)]
 pub struct Learner {
     executed_through: ExecutionPosition,
+    mode: LearningMode,
+    fast: BTreeSet<CommandId>,
 }
 
 impl Learner {
-    /// A learner whose durable execution frontier is `executed_through`.
+    /// A learner whose durable execution frontier is `executed_through`,
+    /// with full learning.
     pub const fn new(executed_through: ExecutionPosition) -> Self {
-        Learner { executed_through }
+        Self::with_mode(executed_through, LearningMode::Full)
+    }
+
+    /// A learner with an explicit learning mode.
+    pub const fn with_mode(executed_through: ExecutionPosition, mode: LearningMode) -> Self {
+        Learner {
+            executed_through,
+            mode,
+            fast: BTreeSet::new(),
+        }
+    }
+
+    /// The learning mode.
+    pub const fn mode(&self) -> LearningMode {
+        self.mode
+    }
+
+    /// Change the learning mode (a forced slow path for comparison runs).
+    pub const fn set_mode(&mut self, mode: LearningMode) {
+        self.mode = mode;
     }
 
     /// Highest executed position.
@@ -74,25 +112,34 @@ impl Learner {
         self.executed_through
     }
 
-    /// Commit every accepted command whose slow predicate holds and whose
-    /// dependencies are committed; repeat while progress is made. Returns
-    /// the commands committed.
+    /// Commit every accepted command whose learning predicate holds and
+    /// whose dependencies are committed; repeat while progress is made.
+    /// Returns the commands committed. Fast and slow learning yield the
+    /// same dependencies (the leader's); only the evidence differs.
     pub fn commit_learned(
+        &mut self,
         table: &mut CommandTable,
         votes: &BTreeMap<CommandId, VoteSet>,
     ) -> Vec<CommandId> {
         let mut committed = Vec::new();
         loop {
-            let candidates: Vec<CommandId> = votes
+            let candidates: Vec<(CommandId, Learned)> = votes
                 .iter()
-                .filter(|(c, v)| {
-                    table.phase_of(c) == Some(Phase::Accept) && v.learned_slow().is_some()
+                .filter(|(c, _)| table.phase_of(c) == Some(Phase::Accept))
+                .filter_map(|(c, v)| {
+                    let learned = match self.mode {
+                        LearningMode::Full => v.learned(),
+                        LearningMode::SlowOnly => v.learned_slow(),
+                    }?;
+                    Some((*c, learned))
                 })
-                .map(|(c, _)| *c)
                 .collect();
             let mut progressed = false;
-            for c in candidates {
+            for (c, learned) in candidates {
                 if table.commit(c).is_ok() {
+                    if matches!(learned, Learned::Fast { .. }) {
+                        self.fast.insert(c);
+                    }
                     committed.push(c);
                     progressed = true;
                 }
@@ -101,6 +148,11 @@ impl Learner {
                 return committed;
             }
         }
+    }
+
+    /// Whether `command` was committed by the fast predicate here.
+    pub fn learned_fast(&self, command: &CommandId) -> bool {
+        self.fast.contains(command)
     }
 
     /// The next command to execute: committed, every dependency executed,
@@ -156,6 +208,7 @@ impl Learner {
         };
         table.execute(command).map_err(LearnError::Guard)?;
         self.executed_through = expected;
+        let fast_path = self.fast.remove(&command);
         EstablishedResult::establish(EstablishmentEvidence {
             command,
             epoch,
@@ -164,7 +217,7 @@ impl Learner {
             closed_predecessors: closed,
             result_digest: outcome.result_digest,
             revision: outcome.revision,
-            fast_path: false,
+            fast_path,
         })
         .map_err(LearnError::Establish)
     }

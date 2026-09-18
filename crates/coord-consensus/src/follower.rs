@@ -36,7 +36,7 @@ use coord_types::{CommandId, RetryKey};
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::campaign::Campaign;
 use crate::commands::{CommandRecord, CommandTable, InitError};
-use crate::learner::{AppliedOutcome, LearnError, Learner};
+use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -315,7 +315,7 @@ impl Follower {
             self.table.restore_executed(&c);
             self.adopted.entry(c).or_insert((u64::MAX, true));
         }
-        self.learner = Learner::new(through);
+        self.learner = Learner::with_mode(through, self.learner.mode());
         self
     }
 
@@ -817,7 +817,10 @@ impl Follower {
                 // graph than the replicas that installed the selection.
                 // Committed and executed records keep their dependencies.
                 if self.table.phase_of(&command) < Some(Phase::Commit)
-                    && self.table.accept(command, entry.deps.clone()).is_err()
+                    && self
+                        .table
+                        .adopt(command, entry.deps.clone(), None, entry.path)
+                        .is_err()
                 {
                     continue;
                 }
@@ -932,7 +935,18 @@ impl Follower {
     }
 
     fn learn(&mut self) {
-        Learner::commit_learned(&mut self.table, &self.votes);
+        self.learner.commit_learned(&mut self.table, &self.votes);
+    }
+
+    /// Choose the learning predicates (full, or the forced slow path for
+    /// comparison runs); carried across role changes and restarts.
+    pub const fn set_learning(&mut self, mode: LearningMode) {
+        self.learner.set_mode(mode);
+    }
+
+    /// The learning mode in effect.
+    pub const fn learning(&self) -> LearningMode {
+        self.learner.mode()
     }
 
     /// A fresh follower with nothing durable.
@@ -1231,7 +1245,12 @@ impl Follower {
                 if self.table.phase_of(&command) < Some(Phase::Commit)
                     && self
                         .table
-                        .accept(command, held.proposal.deps.clone())
+                        .adopt(
+                            command,
+                            held.proposal.deps.clone(),
+                            Some(&held.proposal.paths),
+                            held.proposal.path,
+                        )
                         .is_err()
                 {
                     continue;

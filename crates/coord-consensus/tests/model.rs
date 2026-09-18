@@ -237,6 +237,18 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("r1-fast-redelivered", fast(1, b, c1, &deps, 7, None)),
             ("r2-fast-outside-fast-set", fast(2, b, c1, &deps, 7, None)),
             ("r2-wrong-ballot", slow(2, ballot(2, 0), c1)),
+            (
+                "r2-other-epoch",
+                slow(
+                    2,
+                    Ballot {
+                        epoch: ConfigurationEpoch::new(2).unwrap(),
+                        number: 1,
+                        leader: r(0),
+                    },
+                    c1,
+                ),
+            ),
         ],
     );
     // Forged proposals and redelivered adoptions, in every order.
@@ -310,6 +322,11 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
     assert_eq!(
         fast_path.rejected["r2-wrong-ballot"],
         VoteError::WrongBallot
+    );
+    assert_eq!(
+        fast_path.rejected["r2-other-epoch"],
+        VoteError::WrongBallot,
+        "a ballot of another epoch never counts"
     );
     // Redelivered copies are duplicates whichever arrives second; a
     // replica's fast acknowledgement and its adoption both count once.
@@ -404,11 +421,25 @@ struct RecoveryScenario {
     highest_phase_wins: BTreeMap<String, (Phase, Vec<CommandId>)>,
 }
 
+/// Synthetic path evidence: a function of the command and its
+/// dependency order, so equal local orders give equal paths and different
+/// orders differ (what the per-key hash chains of task-21 guarantee).
+fn path_of(c: CommandId, deps: &[CommandId]) -> Digest32 {
+    let mut d = [0u8; 32];
+    d[0] = c.0.0[0];
+    for (i, dep) in deps.iter().enumerate() {
+        d[1 + (i % 31)] ^= dep.0.0[0].wrapping_add(i as u8 + 1);
+    }
+    Digest32(d)
+}
+
 fn entry(c: CommandId, phase: Phase, deps: &[CommandId]) -> ReportEntry {
     ReportEntry {
         command: c,
         phase,
         deps: deps.to_vec(),
+        path: path_of(c, deps),
+        keys: vec![b"*".to_vec()],
         payload_present: true,
     }
 }
@@ -417,6 +448,21 @@ fn report(replica: u8, cballot: u64, entries: Vec<ReportEntry>) -> RecoveryRepor
     RecoveryReport {
         replica: r(replica),
         ballot: ballot(2, 1),
+        committed_ballot: ballot(cballot, 0),
+        entries,
+    }
+}
+
+/// A report for a new ballot other than the five-voter default.
+fn report_for(
+    replica: u8,
+    new_ballot: Ballot,
+    cballot: u64,
+    entries: Vec<ReportEntry>,
+) -> RecoveryReport {
+    RecoveryReport {
+        replica: r(replica),
+        ballot: new_ballot,
         committed_ballot: ballot(cballot, 0),
         entries,
     }
@@ -568,6 +614,8 @@ fn recovery_selection_is_source_defined_and_order_independent() {
             command: cmd(5),
             phase: Phase::Accept,
             deps: vec![],
+            path: path_of(cmd(5), &[]),
+            keys: vec![b"*".to_vec()],
             payload_present: false,
         }],
     });
@@ -602,6 +650,172 @@ fn recovery_selection_is_source_defined_and_order_independent() {
     );
 
     fixture("recovery_scenarios.json", &vec![scenario, bad, half]);
+}
+
+#[test]
+fn possible_fast_decisions_are_recovered_from_the_fixed_fast_set() {
+    // Three voters; the source ballot 0 is led by r0, whose default fast
+    // set is {r0, r1}; ballot 1 is led by r2 and hears from r1 and itself.
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (c1, c2, c3) = (cmd(1), cmd(2), cmd(3));
+    // r1 pre-accepted c1 then c2 in what may be the leader's order (the
+    // leader may have replied fast to both); r2 saw them the other way
+    // round. The member's order is adopted, in every delivery order.
+    let agreed = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(c1, Phase::PreAccept, &[]),
+                entry(c2, Phase::PreAccept, &[c1]),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(c2, Phase::PreAccept, &[]),
+                entry(c1, Phase::PreAccept, &[c2]),
+            ],
+        ),
+    ];
+    let scenario = explore_recovery("possible-fast-decision-adopted", &cfg, &agreed);
+    let decision = select(&cfg, &agreed).unwrap();
+    assert_eq!(decision.entries[&c1].phase, Phase::Accept);
+    assert_eq!(decision.entries[&c1].deps, vec![]);
+    assert_eq!(decision.entries[&c2].phase, Phase::Accept);
+    assert_eq!(decision.entries[&c2].deps, vec![c1]);
+    assert!(decision.reproposed.is_empty());
+    assert_eq!(scenario.outcome.as_ref().unwrap(), &summarize(&decision));
+    // The naive merge keeps no pre-accepted command: it would re-propose
+    // both, possibly in r2's order (the recorded counterexample).
+    assert!(
+        scenario
+            .highest_phase_wins
+            .get(&format!("{c1:?}"))
+            .is_none_or(|(p, _)| *p == Phase::PreAccept)
+    );
+
+    // The source leader among the reports: its rows are authoritative and
+    // a command it never proposed is re-proposed, whatever r1 holds.
+    let with_leader = vec![
+        report_for(0, ballot(1, 2), 0, vec![entry(c1, Phase::Accept, &[])]),
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(c1, Phase::Accept, &[]),
+                entry(c2, Phase::PreAccept, &[c1]),
+            ],
+        ),
+    ];
+    let leader_present = explore_recovery("source-leader-present", &cfg, &with_leader);
+    let decision = select(&cfg, &with_leader).unwrap();
+    assert_eq!(
+        decision.entries.keys().copied().collect::<Vec<_>>(),
+        vec![c1]
+    );
+    assert_eq!(decision.reproposed, BTreeSet::from([c2]));
+    assert_eq!(
+        leader_present.outcome.as_ref().unwrap(),
+        &summarize(&decision)
+    );
+
+    // An adopted command the member ordered after a candidate, or reached
+    // through a different path, proves the member's order is not the
+    // leader's: no fast decision was possible, both are re-proposed.
+    let inconsistent = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(c3, Phase::PreAccept, &[]),
+                entry(c1, Phase::PreAccept, &[c3]),
+                entry(c2, Phase::PreAccept, &[c1]),
+            ],
+        ),
+        report_for(2, ballot(1, 2), 0, vec![entry(c1, Phase::Accept, &[])]),
+    ];
+    let inconsistent_scenario =
+        explore_recovery("member-order-differs-from-the-leader", &cfg, &inconsistent);
+    let decision = select(&cfg, &inconsistent).unwrap();
+    assert_eq!(
+        decision.entries.keys().copied().collect::<Vec<_>>(),
+        vec![c1]
+    );
+    assert_eq!(decision.entries[&c1].deps, vec![]);
+    assert_eq!(decision.reproposed, BTreeSet::from([c2, c3]));
+    assert_eq!(
+        inconsistent_scenario.outcome.as_ref().unwrap(),
+        &summarize(&decision)
+    );
+
+    // Five voters: the source fast set is {r0, r1, r2}; ballot 1 is led by
+    // r3 and hears from r1, r2 and r3. Members disagreeing on a path, or
+    // one never having seen the command, prove no fast decision.
+    let cfg5 = config(5, 3, &[3, 4, 0], 1);
+    let disagreeing = vec![
+        report_for(
+            1,
+            ballot(1, 3),
+            0,
+            vec![
+                entry(c1, Phase::PreAccept, &[]),
+                entry(c2, Phase::PreAccept, &[c1]),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 3),
+            0,
+            vec![
+                entry(c3, Phase::PreAccept, &[]),
+                entry(c1, Phase::PreAccept, &[c3]),
+            ],
+        ),
+        report_for(3, ballot(1, 3), 0, vec![]),
+    ];
+    let disagreeing_scenario = explore_recovery("fast-set-members-disagree", &cfg5, &disagreeing);
+    let decision = select(&cfg5, &disagreeing).unwrap();
+    assert!(decision.entries.is_empty());
+    assert_eq!(decision.reproposed, BTreeSet::from([c1, c2, c3]));
+    assert_eq!(
+        disagreeing_scenario.outcome.as_ref().unwrap(),
+        &summarize(&decision)
+    );
+    let partial = vec![
+        report_for(
+            1,
+            ballot(1, 3),
+            0,
+            vec![
+                entry(c1, Phase::PreAccept, &[]),
+                entry(c2, Phase::PreAccept, &[c1]),
+            ],
+        ),
+        report_for(2, ballot(1, 3), 0, vec![entry(c1, Phase::PreAccept, &[])]),
+        report_for(3, ballot(1, 3), 0, vec![]),
+    ];
+    let decision = select(&cfg5, &partial).unwrap();
+    assert_eq!(
+        decision.entries.keys().copied().collect::<Vec<_>>(),
+        vec![c1]
+    );
+    assert_eq!(decision.reproposed, BTreeSet::from([c2]));
+
+    fixture(
+        "possible_fast_scenarios.json",
+        &vec![
+            scenario,
+            leader_present,
+            inconsistent_scenario,
+            disagreeing_scenario,
+        ],
+    );
 }
 
 /// A minimal replica model for the guard schedule of Section 21.6: phases

@@ -115,7 +115,7 @@ pub use graph::{
 pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal, Rejection,
 };
-pub use learner::{AppliedOutcome, LearnError, Learner};
+pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{PathAnchors, ProtocolMessage};
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
