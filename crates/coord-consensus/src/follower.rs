@@ -29,12 +29,13 @@ use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{Event, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
-use coord_types::ids::{Ballot, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{Ballot, ExecutionPosition, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{MessageV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection};
 use crate::commands::{CommandRecord, CommandTable, InitError};
+use crate::learner::{AppliedOutcome, LearnError, Learner};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -111,9 +112,12 @@ pub struct Follower {
     table: CommandTable,
     bindings: BTreeMap<RetryKey, CommandId>,
     held: BTreeMap<CommandId, HeldProposal>,
-    adopted: BTreeMap<CommandId, bool>,
+    /// Adopted commands: leader sequence number and whether durable.
+    adopted: BTreeMap<CommandId, (u64, bool)>,
     pending: BTreeMap<BarrierId, Pending>,
     votes: BTreeMap<CommandId, VoteSet>,
+    payloads: BTreeMap<CommandId, PayloadRecordV1>,
+    learner: Learner,
     rejections: Vec<FollowerRejection>,
 }
 
@@ -131,7 +135,7 @@ impl Follower {
         let adopted = table
             .records()
             .filter(|(_, r)| r.phase >= Phase::Accept)
-            .map(|(c, _)| (*c, true))
+            .map(|(c, _)| (*c, (u64::MAX, true)))
             .collect();
         Follower {
             config,
@@ -145,8 +149,48 @@ impl Follower {
             adopted,
             pending: BTreeMap::new(),
             votes: BTreeMap::new(),
+            payloads: BTreeMap::new(),
+            learner: Learner::new(ExecutionPosition::ZERO),
             rejections: Vec::new(),
         }
+    }
+
+    /// The next command to execute through the materializer, if any.
+    pub fn next_executable(&self) -> Option<CommandId> {
+        self.learner
+            .next_executable(&self.table, |c| self.adopted.get(c).map(|(s, _)| *s))
+    }
+
+    /// The durable payload of an initialized command.
+    pub fn payload(&self, command: &CommandId) -> Option<&PayloadRecordV1> {
+        self.payloads.get(command)
+    }
+
+    /// The execution frontier.
+    pub const fn executed_through(&self) -> ExecutionPosition {
+        self.learner.executed_through()
+    }
+
+    /// The materializer applied `command`: seal and publish the established
+    /// result, then learn whatever the new phase enables.
+    pub fn applied(
+        &mut self,
+        command: CommandId,
+        outcome: &AppliedOutcome,
+    ) -> Result<Vec<Effect>, LearnError> {
+        let result = self.learner.established(
+            &mut self.table,
+            command,
+            self.config.identity.epoch,
+            self.config.quorum.ballot,
+            outcome,
+        )?;
+        self.learn();
+        Ok(alloc::vec![Effect::Established(result)])
+    }
+
+    fn learn(&mut self) {
+        Learner::commit_learned(&mut self.table, &self.votes);
     }
 
     /// A fresh follower with nothing durable.
@@ -182,12 +226,6 @@ impl Follower {
     /// Sends still waiting for durability.
     pub fn pending_sends(&self) -> usize {
         self.outbox.as_ref().map_or(0, |o| o.pending().len())
-    }
-
-    fn in_fast_set(&self) -> bool {
-        self.config
-            .quorum
-            .fast_eligible(&self.config.identity.replica)
     }
 
     fn publish_to_voters_and_frontend(&mut self, barrier: BarrierId, message: ProtocolMessage) {
@@ -273,6 +311,13 @@ impl Follower {
             }
         };
         self.bindings.insert(retry_key, command);
+        self.payloads.insert(
+            command,
+            PayloadRecordV1 {
+                retry_key,
+                logical: request.logical.as_slice().to_vec(),
+            },
+        );
         let epoch = self.config.identity.epoch;
         let record = self
             .table
@@ -297,7 +342,17 @@ impl Follower {
             updates,
         })];
         self.pending.insert(barrier, Pending::Vote(command));
-        if self.in_fast_set() {
+        // Own vote joins whatever evidence (a held proposal) already
+        // arrived for this command; it never replaces it.
+        let set = self
+            .votes
+            .entry(command)
+            .or_insert_with(|| VoteSet::new(self.config.quorum.clone(), command));
+        if self
+            .config
+            .quorum
+            .fast_eligible(&self.config.identity.replica)
+        {
             let ack = FastAck {
                 replica: self.config.identity.replica,
                 ballot: self.config.quorum.ballot,
@@ -307,13 +362,8 @@ impl Follower {
                 path: init.path,
                 seqnum: None,
             };
-            let mut set = VoteSet::new(self.config.quorum.clone(), command);
-            set.add(Vote::Fast(ack.clone())).expect("own vote");
-            self.votes.insert(command, set);
+            let _ = set.add(Vote::Fast(ack.clone()));
             self.publish_to_voters_and_frontend(barrier, ProtocolMessage::FastAck(ack));
-        } else {
-            self.votes
-                .insert(command, VoteSet::new(self.config.quorum.clone(), command));
         }
         // A proposal that arrived before the payload can now be adopted
         // (once its dependencies allow it).
@@ -373,6 +423,7 @@ impl Follower {
                 .map(|(c, _)| *c)
                 .collect();
             if ready.is_empty() {
+                self.learn();
                 return effects;
             }
             for command in ready {
@@ -384,7 +435,8 @@ impl Follower {
                 {
                     continue;
                 }
-                self.adopted.insert(command, false);
+                self.adopted
+                    .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
                 let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();
                 let barrier = self.alloc.as_mut().expect("booted").allocate();
@@ -420,8 +472,10 @@ impl Follower {
             match event {
                 StorageEvent::JournalDurable { .. } => {
                     self.pending.remove(&barrier);
-                    if let Pending::Adoption(c) = pending {
-                        self.adopted.insert(c, true);
+                    if let Pending::Adoption(c) = pending
+                        && let Some(entry) = self.adopted.get_mut(&c)
+                    {
+                        entry.1 = true;
                     }
                 }
                 StorageEvent::Failed { .. } => {
@@ -435,6 +489,7 @@ impl Follower {
                 _ => {}
             }
         }
+        self.learn();
         self.release()
     }
 
@@ -496,6 +551,7 @@ impl Follower {
         if let Err(e) = set.add(vote) {
             self.rejections.push(FollowerRejection::Vote(e));
         }
+        self.learn();
         Vec::new()
     }
 }

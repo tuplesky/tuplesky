@@ -281,8 +281,8 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         "two adoption batches (c1 then c2), no send before durability"
     );
     assert!(f.held().is_empty());
-    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
-    assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Commit));
     assert_eq!(
         f.table().record(&c2).unwrap().deps,
         vec![c1],
@@ -352,8 +352,8 @@ fn conflict_arrival_permutations_converge_on_the_leader_order() {
         assert_eq!(acks, 6);
         assert_eq!(f.table().record(&c1).unwrap().deps, vec![]);
         assert_eq!(f.table().record(&c2).unwrap().deps, vec![c1]);
-        assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
-        assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+        assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+        assert_eq!(f.table().phase_of(&c2), Some(Phase::Commit));
         assert!(f.held().is_empty());
     }
     // A proposal from a non-leader, or for another ballot, is foreign.
@@ -537,12 +537,13 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     assert_eq!(adoption.len(), 1);
     f.step(durable_of(&adoption, 2).remove(0));
     let votes = f.votes(&c1).unwrap();
-    assert!(votes.learned().is_some(), "the predicate would hold");
+    assert!(votes.learned_slow().is_some(), "the slow predicate holds");
     assert_eq!(
         f.table().phase_of(&c1),
-        Some(Phase::Accept),
-        "no COMMIT here: learning is task-24"
+        Some(Phase::Commit),
+        "learned slowly: committed, executed only once applied"
     );
+    assert_eq!(f.next_executable(), Some(c1));
     // The guard is explicit: a proposal whose dependency is unknown here
     // stays held, and the table refuses the transition outright.
     let (_, c9) = admitted(9, 9, 9);

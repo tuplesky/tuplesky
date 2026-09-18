@@ -335,8 +335,9 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
     assert_eq!(leader.table().phase_of(&c2), Some(Phase::Accept));
     assert_eq!(leader.pending_sends(), 0);
     assert!(leader.take_rejections().is_empty());
-    // No learning here: the leader's own vote is collected, nothing more.
-    assert!(leader.votes(&c1).unwrap().learned().is_none());
+    // The leader's own vote alone learns nothing.
+    assert!(leader.votes(&c1).unwrap().learned_slow().is_none());
+    assert_eq!(leader.next_executable(), None);
     golden("leader_normal.json", &trace);
 }
 
@@ -540,10 +541,11 @@ fn votes_are_collected_but_never_learned_here() {
     );
     let votes = leader.votes(&c1).unwrap();
     assert_eq!(votes.voted(), [r(0), r(1), r(2)].into());
-    // The predicate would hold, but the leader emits nothing for it: no
-    // Established effect, no COMMIT (task-24 decides learning).
-    assert!(votes.learned().is_some());
-    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
+    // The slow predicate holds: the command is committed (task-24), but
+    // nothing is established until the materializer applies it.
+    assert!(votes.learned_slow().is_some());
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(leader.next_executable(), Some(c1));
     // Acknowledgements for an unknown command are refused.
     let (_, unknown) = admitted(7, 7, 7);
     let stray = FastAck {

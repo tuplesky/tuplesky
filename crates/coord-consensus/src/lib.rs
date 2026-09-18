@@ -58,6 +58,12 @@
 //!   be at least ACCEPT and publishes the slow acknowledgement only once
 //!   the adopted order is durable; duplicates converge; the table is
 //!   rebuilt from durable rows after a crash.
+//! * [`learner`] (task-24): the conservative slow learner: a command
+//!   commits when the leader's order is adopted by a majority including
+//!   the leader and its dependencies are committed, executes in leader
+//!   sequence order once every dependency executed, and the materializer's
+//!   outcome is sealed into an `EstablishedResult` at the next execution
+//!   position. A single leader reply establishes nothing.
 //! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
 //!   rows and the postcard-encoded protocol messages of this increment.
 #![forbid(unsafe_code)]
@@ -70,6 +76,7 @@ pub mod commands;
 pub mod follower;
 pub mod graph;
 pub mod leader;
+pub mod learner;
 pub mod messages;
 pub mod phase;
 pub mod publication;
@@ -88,6 +95,7 @@ pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,
 };
 pub use leader::{CONSERVATIVE_KEY, Leader, LeaderConfig, Proposal, Rejection};
+pub use learner::{AppliedOutcome, LearnError, Learner};
 pub use messages::ProtocolMessage;
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};

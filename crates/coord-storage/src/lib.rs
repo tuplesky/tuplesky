@@ -63,9 +63,16 @@
 //! * Protocol rows (task-20): [`protocol`] reads the epoch's durable
 //!   promise row so a rebooted replica recovers its promise from the
 //!   projection.
+//! * Ordered application (task-24): [`apply::Applier`] executes the
+//!   command the consensus learner selected: rehash the durable payload,
+//!   admit through the retry layer (a retained result is returned, never
+//!   re-executed), build the authorized view, plan, apply atomically with
+//!   the retry binding, and publish the revision's events to the watch hub
+//!   only after the durable commit.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod apply;
 pub mod codecs;
 pub mod compaction;
 pub mod lowering;
@@ -79,6 +86,7 @@ pub mod views;
 pub mod watch;
 pub mod worker;
 
+pub use apply::{Applier, ApplyError};
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};

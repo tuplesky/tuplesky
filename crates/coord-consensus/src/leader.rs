@@ -26,13 +26,14 @@ use coord_core::event::{Event, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{Ballot, ExecutionPosition, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{MessageV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection};
 use crate::commands::{CommandTable, InitError};
+use crate::learner::{AppliedOutcome, LearnError, Learner};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -121,6 +122,8 @@ pub struct Leader {
     bindings: BTreeMap<RetryKey, CommandId>,
     proposals: BTreeMap<CommandId, Proposal>,
     votes: BTreeMap<CommandId, VoteSet>,
+    payloads: BTreeMap<CommandId, PayloadRecordV1>,
+    learner: Learner,
     seqnum: u64,
     rejections: Vec<Rejection>,
 }
@@ -141,9 +144,49 @@ impl Leader {
             bindings: BTreeMap::new(),
             proposals: BTreeMap::new(),
             votes: BTreeMap::new(),
+            payloads: BTreeMap::new(),
+            learner: Learner::new(ExecutionPosition::ZERO),
             seqnum: 0,
             rejections: Vec::new(),
         }
+    }
+
+    /// The next command to execute through the materializer, if any.
+    pub fn next_executable(&self) -> Option<CommandId> {
+        self.learner
+            .next_executable(&self.table, |c| self.proposals.get(c).map(|p| p.seqnum))
+    }
+
+    /// The durable payload of a proposed command.
+    pub fn payload(&self, command: &CommandId) -> Option<&PayloadRecordV1> {
+        self.payloads.get(command)
+    }
+
+    /// The execution frontier.
+    pub const fn executed_through(&self) -> ExecutionPosition {
+        self.learner.executed_through()
+    }
+
+    /// The materializer applied `command`: seal and publish the established
+    /// result, then learn whatever the new phase enables.
+    pub fn applied(
+        &mut self,
+        command: CommandId,
+        outcome: &AppliedOutcome,
+    ) -> Result<Vec<Effect>, LearnError> {
+        let result = self.learner.established(
+            &mut self.table,
+            command,
+            self.config.identity.epoch,
+            self.config.quorum.ballot,
+            outcome,
+        )?;
+        self.learn();
+        Ok(alloc::vec![Effect::Established(result)])
+    }
+
+    fn learn(&mut self) {
+        Learner::commit_learned(&mut self.table, &self.votes);
     }
 
     /// Whether this replica leads the promised ballot.
@@ -252,6 +295,13 @@ impl Leader {
                 }
             };
         self.bindings.insert(request.retry_key, command);
+        self.payloads.insert(
+            command,
+            PayloadRecordV1 {
+                retry_key: request.retry_key,
+                logical: request.logical.as_slice().to_vec(),
+            },
+        );
         let ballot = self.config.quorum.ballot;
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
@@ -372,6 +422,7 @@ impl Leader {
             }
         }
         self.advance_pending();
+        self.learn();
         self.release()
     }
 
@@ -463,6 +514,7 @@ impl Leader {
         if let Err(e) = set.add(vote) {
             self.rejections.push(Rejection::Vote(e));
         }
+        self.learn();
         Vec::new()
     }
 }
