@@ -62,14 +62,19 @@ impl StoreEnvelopeV1 {
 }
 
 /// The applied stamp persisted atomically with every projection update.
+///
+/// The store sequence and the journal sequence it represents map one to one,
+/// so the fields are private and the only constructor derives the journal
+/// sequence from the store sequence: a stamp whose two sequences disagree
+/// cannot be built, encoded or decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedStamp {
     /// Last materialized store sequence.
-    pub store_seq: StoreSeq,
+    store_seq: StoreSeq,
     /// Local journal sequence it represents (one-to-one with `store_seq`).
-    pub journal_seq: LocalJournalSeq,
+    journal_seq: LocalJournalSeq,
     /// Digest binding the last immutable batch and its guard context.
-    pub last_batch_digest: Digest32,
+    last_batch_digest: Digest32,
 }
 
 /// Record kind of the applied stamp inside `meta_v1`.
@@ -78,6 +83,30 @@ pub const STAMP_RECORD_KIND: u16 = 0x0001;
 pub const STAMP_SCHEMA_VERSION: u16 = 1;
 
 impl AppliedStamp {
+    /// A stamp for `store_seq`; the journal sequence is derived, never chosen.
+    pub fn new(store_seq: StoreSeq, last_batch_digest: Digest32) -> Self {
+        AppliedStamp {
+            store_seq,
+            journal_seq: store_seq.journal_seq(),
+            last_batch_digest,
+        }
+    }
+
+    /// Last materialized store sequence.
+    pub const fn store_seq(&self) -> StoreSeq {
+        self.store_seq
+    }
+
+    /// Local journal sequence the stamp represents.
+    pub const fn journal_seq(&self) -> LocalJournalSeq {
+        self.journal_seq
+    }
+
+    /// Digest binding the last immutable batch and its guard context.
+    pub const fn last_batch_digest(&self) -> Digest32 {
+        self.last_batch_digest
+    }
+
     /// Encode as an envelope value.
     pub fn to_envelope(&self) -> Result<Vec<u8>, EngineError> {
         let payload = postcard::to_allocvec(self)
