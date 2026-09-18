@@ -247,7 +247,7 @@ snapshot boundary like the collector, binding and configuration frames.
 
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
-| Manifest | `0x0600` | donor to learner | `SharedManifestV1 { format, cluster, domain, configuration, boundary { execution_position, kv_revision, retention_floor, lease_authority }, collections[] { collection, rows, bytes }, chunks[] { ordinal, rows, bytes, first, last, digest }, root }` |
+| Manifest | `0x0600` | donor to learner | `SharedManifestV1 { format, cluster, domain, configuration, boundary { execution_position, kv_revision, retention_floor, lease_authority }, collections[] { collection, rows, bytes }, chunks[] { ordinal, rows, bytes, first, last, digest }, root }`, encoded at most the class limit less the frame header's kind and version |
 | Chunk | `0x0601` | donor to learner | `ChunkV1 { ordinal, rows[] { collection, key, value } }`, at most 1 MiB plus one maximal row |
 
 Rows are the common collections of the registry (never `meta_v1`,
@@ -259,6 +259,16 @@ The receiver verifies root, digests, order, uniqueness, counts and bounds
 (`coord_checkpoint::verify_shared`) before any install (task-50). The
 artifact carries no node identity, incarnation, boot, stamp or journal
 sequence and is not the local recovery checkpoint (task-j04).
+
+The manifest is not paginated: one Manifest frame carries the whole
+descriptor list, so the encoded manifest is itself a supported-size bound
+of the artifact rather than a property of the transport. Export refuses a
+checkpoint whose manifest exceeds it (`ManifestTooLarge`) and structural
+verification refuses to accept one, so an artifact that passes either can
+always be framed. Chunk count alone does not decide it, since every
+descriptor also carries its chunk's first and last key; the derived count
+ceiling `MAX_CHUNKS` is only what the frame could describe if every
+boundary key were empty.
 
 ## Go mirror (task-44)
 
