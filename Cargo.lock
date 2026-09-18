@@ -596,6 +596,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "coord-core",
+ "coord-state",
+ "coord-storage",
+ "coord-storage-redb",
+ "coord-store-api",
+ "coord-store-testkit",
+ "coord-types",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "coord-collector"
 version = "0.1.0"
 dependencies = [
