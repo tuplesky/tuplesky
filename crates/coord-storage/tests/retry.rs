@@ -86,8 +86,14 @@ impl<E: LocalEngine> Domain<E> {
     }
 
     fn activate_session(&mut self, window: u32) {
-        let update = retry::session_update(&SESSION, true, window).unwrap();
-        self.admin(vec![update]);
+        let update = coord_storage::policy::bootstrap_session(
+            &SESSION,
+            PrincipalId([0xaa; 16]),
+            window,
+            true,
+        )
+        .unwrap();
+        self.admin(update);
     }
 
     /// Full path: admit -> (plan -> apply) or retained result.
@@ -98,7 +104,7 @@ impl<E: LocalEngine> Domain<E> {
     ) -> (Admission, Option<coord_state::Response>) {
         let b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
-        let admission = retry::admit(gated.view(), &b).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
         if admission != Admission::New {
             return (admission, None);
         }
@@ -266,8 +272,10 @@ fn retired_or_unknown_sessions_and_retired_sequences_never_execute() {
     );
     assert_eq!(d.kv_revision(), 3);
     // Retire the session: nothing executes, retries are not served.
-    let update = retry::session_update(&SESSION, false, 4).unwrap();
-    d.admin(vec![update]);
+    let update =
+        coord_storage::policy::bootstrap_session(&SESSION, PrincipalId([0xaa; 16]), 4, false)
+            .unwrap();
+    d.admin(update);
     assert_eq!(d.submit(5, &request).0, Admission::SessionRetired);
     assert_eq!(d.submit(6, &put(b"k", b"v6")).0, Admission::SessionRetired);
     assert_eq!(d.resolve(6, &put(b"k", b"v6"), true), Resolution::NoSession);
@@ -388,12 +396,14 @@ fn crash_between_materialization_and_notification_never_duplicates() {
 fn admission_rows_change_only_in_execution_order() {
     use coord_storage::SubmitError;
     let mut d = Domain::new(ModelEngine::new());
-    let update = retry::session_update(&SESSION, true, 4).unwrap();
+    let update =
+        coord_storage::policy::bootstrap_session(&SESSION, PrincipalId([0xaa; 16]), 4, true)
+            .unwrap();
     assert_eq!(
         d.worker.submit(PersistBatch {
             barrier: d.alloc.allocate(),
             base: None,
-            updates: vec![update],
+            updates: update,
         }),
         Err(SubmitError::AdmissionRowsRequireOrdering)
     );
@@ -408,7 +418,7 @@ fn admission_is_revalidated_atomically_with_the_application_batch() {
     let b = binding(1, &request);
     // Admit and plan from one snapshot.
     let gated = d.worker.reader().snapshot().unwrap();
-    assert_eq!(retry::admit(gated.view(), &b).unwrap(), Admission::New);
+    assert_eq!(retry::admit(gated.view(), &b, |_| true).unwrap(), Admission::New);
     let view = build_read_view(
         &gated,
         NS,
@@ -420,8 +430,10 @@ fn admission_is_revalidated_atomically_with_the_application_batch() {
     let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
     drop(gated);
     // A session retirement is ordered in between.
-    let update = retry::session_update(&SESSION, false, 8).unwrap();
-    d.admin(vec![update]);
+    let update =
+        coord_storage::policy::bootstrap_session(&SESSION, PrincipalId([0xaa; 16]), 8, false)
+            .unwrap();
+    d.admin(update);
     // The bound command's batch carries the base its admission was checked
     // at, so it is rejected instead of executing under a retired session.
     let outcome = apply_plan(&mut d.worker, d.alloc.allocate(), NS, &planned, Some(&b)).unwrap();

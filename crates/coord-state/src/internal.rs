@@ -1,8 +1,19 @@
 //! Internal replicated commands: ordered like client commands, planned
-//! against the same views, never issued by clients.
+//! against the same views, never issued by clients. They come from the
+//! service itself (expiry, authority) or from the trusted boundary
+//! (admission receipts, grant commitments, policy administration).
 
-use coord_types::ids::{LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId};
+use alloc::vec;
+use alloc::vec::Vec;
+
+use coord_types::identity::Digest32;
+use coord_types::ids::{
+    LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId, PolicyRuleId, PrincipalId,
+    SessionId, TrustRuleId,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::policy::{AdmissionReceiptV1, GrantKind, PolicyRule, TrustRule};
 
 /// A command the service submits to its own ordered history.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -31,6 +42,73 @@ pub enum InternalCommand {
         /// New epoch; must exceed the current one.
         epoch: LeaseAuthorityEpoch,
     },
+    /// Consume a single-use admission receipt (and, for a browser/device
+    /// login, its pending code commitment) and create the session, after
+    /// rechecking the trust rule against current replicated policy.
+    ConsumeAdmission {
+        /// Namespace the command is planned in.
+        namespace: NamespaceId,
+        /// The receipt.
+        receipt: AdmissionReceiptV1,
+        /// Code commitment to consume atomically, if any.
+        code: Option<Digest32>,
+        /// Refresh family to bind to the session, if any (must be pending
+        /// or already belong to the session).
+        refresh_family: Option<Digest32>,
+        /// Outstanding retry window for the session's clients.
+        window: u32,
+    },
+    /// Retire a session; ordered revocation denies execution at later
+    /// positions.
+    RetireSession {
+        /// Namespace the command is planned in.
+        namespace: NamespaceId,
+        /// Session.
+        session: SessionId,
+    },
+    /// Order a grant commitment (a code hash or a refresh family's first
+    /// secret commitment); entropy was generated outside consensus.
+    CommitGrant {
+        /// Namespace the command is planned in.
+        namespace: NamespaceId,
+        /// Commitment digest.
+        commitment: Digest32,
+        /// Kind (`Code` or `RefreshFamily`).
+        kind: GrantKind,
+    },
+    /// Rotate a refresh family: the presented secret must be the current
+    /// one at the expected generation; a retired secret revokes the family
+    /// and its session.
+    AdvanceRefresh {
+        /// Namespace the command is planned in.
+        namespace: NamespaceId,
+        /// Family commitment (row key).
+        family: Digest32,
+        /// Commitment of the secret presented.
+        presented: Digest32,
+        /// Commitment of the next secret.
+        next: Digest32,
+    },
+    /// Write or remove a permission rule.
+    PutPolicyRule {
+        /// Namespace the command is planned in.
+        namespace: NamespaceId,
+        /// Principal the rule belongs to.
+        principal: PrincipalId,
+        /// Rule identity.
+        rule: PolicyRuleId,
+        /// Rule (`None` removes; `Some` must name the same principal).
+        record: Option<PolicyRule>,
+    },
+    /// Write a trust rule (create, disable, or regenerate).
+    PutTrustRule {
+        /// Namespace the command is planned in.
+        namespace: NamespaceId,
+        /// Rule identity.
+        rule: TrustRuleId,
+        /// New state.
+        record: TrustRule,
+    },
 }
 
 impl InternalCommand {
@@ -38,7 +116,52 @@ impl InternalCommand {
     pub const fn namespace(&self) -> NamespaceId {
         match self {
             InternalCommand::ExpireLease { namespace, .. }
-            | InternalCommand::EstablishLeaseAuthority { namespace, .. } => *namespace,
+            | InternalCommand::EstablishLeaseAuthority { namespace, .. }
+            | InternalCommand::ConsumeAdmission { namespace, .. }
+            | InternalCommand::RetireSession { namespace, .. }
+            | InternalCommand::CommitGrant { namespace, .. }
+            | InternalCommand::AdvanceRefresh { namespace, .. }
+            | InternalCommand::PutPolicyRule { namespace, .. }
+            | InternalCommand::PutTrustRule { namespace, .. } => *namespace,
+        }
+    }
+
+    /// Sessions the command reads or writes.
+    pub fn sessions(&self) -> Vec<SessionId> {
+        match self {
+            InternalCommand::ConsumeAdmission { receipt, .. } => vec![receipt.session],
+            InternalCommand::RetireSession { session, .. } => vec![*session],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Grant commitments the command reads or writes (the refresh family's
+    /// session is loaded by the view builder when it exists).
+    pub fn grants(&self) -> Vec<Digest32> {
+        match self {
+            InternalCommand::ConsumeAdmission {
+                receipt,
+                code,
+                refresh_family,
+                ..
+            } => {
+                let mut out = vec![receipt.receipt_id];
+                out.extend(*code);
+                out.extend(*refresh_family);
+                out
+            }
+            InternalCommand::CommitGrant { commitment, .. } => vec![*commitment],
+            InternalCommand::AdvanceRefresh { family, .. } => vec![*family],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Trust rules the command reads.
+    pub fn trust_rules(&self) -> Vec<TrustRuleId> {
+        match self {
+            InternalCommand::ConsumeAdmission { receipt, .. } => vec![receipt.trust_rule],
+            InternalCommand::PutTrustRule { rule, .. } => vec![*rule],
+            _ => Vec::new(),
         }
     }
 
@@ -46,7 +169,7 @@ impl InternalCommand {
     pub const fn lease(&self) -> Option<LeaseId> {
         match self {
             InternalCommand::ExpireLease { lease_id, .. } => Some(*lease_id),
-            InternalCommand::EstablishLeaseAuthority { .. } => None,
+            _ => None,
         }
     }
 }

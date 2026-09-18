@@ -128,12 +128,14 @@ impl<E: LocalEngine> Domain<E> {
     }
 
     fn activate_session(&mut self) {
-        let update = retry::session_update(&SESSION, true, 16).unwrap();
+        let update =
+            coord_storage::policy::bootstrap_session(&SESSION, PrincipalId([0xaa; 16]), 16, true)
+                .unwrap();
         self.worker
             .submit(PersistBatch {
                 barrier: self.alloc.allocate(),
                 base: Some(self.worker.application_base()),
-                updates: vec![update],
+                updates: update,
             })
             .unwrap();
         assert_eq!(self.worker.flush().unwrap().committed, 1);
@@ -143,7 +145,7 @@ impl<E: LocalEngine> Domain<E> {
     fn run(&mut self, request: &LogicalRequest, seq: u64) -> (Admission, coord_state::Response) {
         let b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
-        let admission = retry::admit(gated.view(), &b).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
         if let Admission::Retry(record) = &admission {
             let stored: coord_state::Response = postcard::from_bytes(&record.response).unwrap();
             return (admission.clone(), stored);
