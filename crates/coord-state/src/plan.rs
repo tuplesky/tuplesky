@@ -210,6 +210,11 @@ pub enum RejectionReason {
     CounterOverflow,
     /// The operation is not planned by this planner.
     Unsupported,
+    /// The state the request would have to read to be planned exceeds the
+    /// schema's view budget. The budget is a replicated constant, not a
+    /// local setting, so every replica reaches this rejection for the
+    /// same command against the same state.
+    ViewTooLarge,
 }
 
 /// A Kine-facing entry: the entry's value and revisions plus the TTL of
