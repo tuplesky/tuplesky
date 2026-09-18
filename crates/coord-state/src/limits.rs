@@ -11,6 +11,11 @@ pub struct PlanLimits {
     pub max_events_per_revision: usize,
     /// Maximum keys a single range delete may remove.
     pub max_delete_keys: usize,
+    /// Maximum keys attached to one lease.
+    pub max_lease_attachments: u32,
+    /// Maximum worst-case deletion/event bytes of one lease's attachments,
+    /// rechecked on every write of an attached key.
+    pub max_lease_bytes: u64,
 }
 
 impl Default for PlanLimits {
@@ -19,6 +24,8 @@ impl Default for PlanLimits {
             max_response_bytes: 8 * 1024 * 1024,
             max_events_per_revision: 4096,
             max_delete_keys: 4096,
+            max_lease_attachments: 128,
+            max_lease_bytes: 8 * 1024 * 1024,
         }
     }
 }

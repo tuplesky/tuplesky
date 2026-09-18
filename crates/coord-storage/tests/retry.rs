@@ -101,7 +101,14 @@ impl<E: LocalEngine> Domain<E> {
         if admission != Admission::New {
             return (admission, None);
         }
-        let view = build_read_view(&gated, NS, request, ViewBudget::default()).unwrap();
+        let view = build_read_view(
+            &gated,
+            NS,
+            PrincipalId([0xaa; 16]),
+            request,
+            ViewBudget::default(),
+        )
+        .unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
         match apply_plan(
@@ -309,7 +316,14 @@ fn crash_between_materialization_and_notification_never_duplicates() {
             // way the client never learned the outcome.
             let b = binding(1, &request);
             let gated = d.worker.reader().snapshot().unwrap();
-            let view = build_read_view(&gated, NS, &request, ViewBudget::default()).unwrap();
+            let view = build_read_view(
+                &gated,
+                NS,
+                PrincipalId([0xaa; 16]),
+                &request,
+                ViewBudget::default(),
+            )
+            .unwrap();
             let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
             drop(gated);
             let _ = apply_plan(&mut d.worker, d.alloc.allocate(), NS, &planned, Some(&b));

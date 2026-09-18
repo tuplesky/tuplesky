@@ -4,7 +4,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_core::effect::ApplyBase;
-use coord_types::ids::{KvRevision, LeaseGeneration, LeaseId, NamespaceId};
+use coord_types::ids::{KvRevision, LeaseGeneration, LeaseId, NamespaceId, PrincipalId};
+
+use crate::lease::LeaseRecord;
 use serde::{Deserialize, Serialize};
 
 /// A stored key's entry.
@@ -46,6 +48,8 @@ pub struct ReadView {
     pub base: ApplyBase,
     /// Namespace of the request.
     pub namespace: NamespaceId,
+    /// Principal the request executes as (from its admitted session).
+    pub principal: PrincipalId,
     /// Current domain revision.
     pub kv_revision: KvRevision,
     /// Compaction floor: history strictly below it is unavailable.
@@ -54,21 +58,33 @@ pub struct ReadView {
     pub current: BTreeMap<Vec<u8>, KvEntry>,
     /// Historical snapshot when the request reads an explicit revision.
     pub historical: Option<HistoricalView>,
-    /// Leases known to exist (for attachment checks).
-    pub leases: BTreeSet<LeaseId>,
+    /// Lease records the request may touch: every lease named by the
+    /// request plus every lease attached to a loaded current entry.
+    /// Absent means the lease does not exist.
+    pub leases: BTreeMap<LeaseId, LeaseRecord>,
+    /// Attached keys of the leases the request revokes or inspects, whose
+    /// current entries are also in `current`.
+    pub lease_keys: BTreeMap<LeaseId, BTreeSet<Vec<u8>>>,
 }
 
 impl ReadView {
     /// Empty view at a base.
-    pub fn empty(base: ApplyBase, namespace: NamespaceId, kv_revision: KvRevision) -> Self {
+    pub fn empty(
+        base: ApplyBase,
+        namespace: NamespaceId,
+        principal: PrincipalId,
+        kv_revision: KvRevision,
+    ) -> Self {
         ReadView {
             base,
             namespace,
+            principal,
             kv_revision,
             compact_floor: KvRevision::ZERO,
             current: BTreeMap::new(),
             historical: None,
-            leases: BTreeSet::new(),
+            leases: BTreeMap::new(),
+            lease_keys: BTreeMap::new(),
         }
     }
 }

@@ -108,7 +108,14 @@ impl Domain {
 
     fn apply(&mut self, request: &LogicalRequest) -> Option<KvRevision> {
         let gated = self.worker.reader().snapshot().unwrap();
-        let view = build_read_view(&gated, NS, request, ViewBudget::default()).unwrap();
+        let view = build_read_view(
+            &gated,
+            NS,
+            PrincipalId([0xaa; 16]),
+            request,
+            ViewBudget::default(),
+        )
+        .unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
         assert!(matches!(

@@ -9,7 +9,7 @@ use coord_state::KvEvent;
 use coord_state::view::{HistoricalView, KvEntry, ReadView};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
-use coord_types::ids::{KvRevision, NamespaceId};
+use coord_types::ids::{KvRevision, LeaseId, NamespaceId, PrincipalId};
 use coord_types::logical_v1::{BranchOp, CanonicalOperation, KeyRange, LogicalRequest, RangeOp};
 use coord_types::ordered_key;
 
@@ -89,6 +89,53 @@ fn touches(op: &CanonicalOperation) -> Vec<Touch> {
         _ => {}
     }
     out
+}
+
+/// Leases a request names directly.
+fn named_leases(op: &CanonicalOperation) -> Vec<LeaseId> {
+    let mut out = Vec::new();
+    match op {
+        CanonicalOperation::Put(p) => out.extend(p.lease),
+        CanonicalOperation::Txn(t) => {
+            for b in t.success.iter().chain(&t.failure) {
+                if let BranchOp::Put(p) = b {
+                    out.extend(p.lease);
+                }
+            }
+        }
+        CanonicalOperation::LeaseGrant { lease_id, .. }
+        | CanonicalOperation::LeaseKeepAlive { lease_id }
+        | CanonicalOperation::LeaseRevoke { lease_id }
+        | CanonicalOperation::LeaseTimeToLive { lease_id, .. } => out.push(*lease_id),
+        CanonicalOperation::Range(_)
+        | CanonicalOperation::DeleteRange(_)
+        | CanonicalOperation::Compact { .. } => {}
+    }
+    out
+}
+
+/// The lease whose attached keys the request needs, if any.
+fn needs_attachments(op: &CanonicalOperation) -> Option<LeaseId> {
+    match op {
+        CanonicalOperation::LeaseRevoke { lease_id } => Some(*lease_id),
+        CanonicalOperation::LeaseTimeToLive {
+            lease_id,
+            keys: true,
+        } => Some(*lease_id),
+        _ => None,
+    }
+}
+
+/// Exclusive upper bound of every key starting with `prefix`.
+fn prefix_upper(prefix: &[u8]) -> Bound<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.pop() {
+        if last != 0xff {
+            upper.push(last + 1);
+            return Bound::Excluded(upper);
+        }
+    }
+    Bound::Unbounded
 }
 
 struct Budget {
@@ -175,10 +222,14 @@ fn history_bounds(namespace: &NamespaceId, touch: &Touch) -> (Vec<u8>, Bound<Vec
 /// an explicit revision `R` at or above the retention floor and at or below
 /// the current revision, a historical snapshot is built by scanning every
 /// version in the interval and choosing, per key, the greatest version at
-/// or below `R`, excluding tombstones, before any limit applies.
+/// or below `R`, excluding tombstones, before any limit applies. Lease
+/// records are loaded for every lease the request names and every lease a
+/// loaded entry references; a revocation or key-listing inspection also
+/// loads the lease's reverse index and the entries it points at.
 pub fn build_read_view<V: OrderedRead>(
     gated: &GatedView<V>,
     namespace: NamespaceId,
+    principal: PrincipalId,
     request: &LogicalRequest,
     budget: ViewBudget,
 ) -> Result<ReadView, ViewBuildError> {
@@ -189,7 +240,12 @@ pub fn build_read_view<V: OrderedRead>(
     };
     let kv_revision = codecs::read_kv_revision(view)?;
     let compact_floor = codecs::read_retention_floor(view)?;
-    let mut read_view = ReadView::empty(gated.meta().frontier.as_base(), namespace, kv_revision);
+    let mut read_view = ReadView::empty(
+        gated.meta().frontier.as_base(),
+        namespace,
+        principal,
+        kv_revision,
+    );
     read_view.compact_floor = compact_floor;
     let touched = touches(&request.operation);
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -207,6 +263,40 @@ pub fn build_read_view<V: OrderedRead>(
                     .current
                     .insert(decoded.key, codecs::decode_current(&value)?);
             }
+        }
+    }
+    // Attached keys of a lease the request revokes or lists, and their
+    // current entries (so a revocation deletes exactly what is attached).
+    if let Some(lease) = needs_attachments(&request.operation) {
+        let prefix = codecs::lease_key_prefix(&lease, &namespace);
+        let upper = prefix_upper(&prefix);
+        let mut keys = BTreeSet::new();
+        for (row_key, _) in scan_all(view, Collection::LeaseKeysV1, prefix, upper, &mut budget)? {
+            let (_, ns, key) = codecs::decode_lease_key_row(&row_key)?;
+            if ns != namespace {
+                continue;
+            }
+            if !read_view.current.contains_key(&key) {
+                let current = codecs::current_key(&namespace, &key);
+                if let Some(value) = view.get(Collection::KvCurrentV1.id(), &current)? {
+                    budget.charge(1, current.len() + value.len())?;
+                    read_view
+                        .current
+                        .insert(key.clone(), codecs::decode_current(&value)?);
+                }
+            }
+            keys.insert(key);
+        }
+        read_view.lease_keys.insert(lease, keys);
+    }
+    // Lease records: named by the request or referenced by loaded entries.
+    let mut lease_ids: BTreeSet<LeaseId> = named_leases(&request.operation).into_iter().collect();
+    lease_ids.extend(read_view.current.values().filter_map(|e| e.lease));
+    for id in lease_ids {
+        let row = codecs::lease_row_key(&id);
+        if let Some(value) = view.get(Collection::LeaseV1.id(), &row)? {
+            budget.charge(1, row.len() + value.len())?;
+            read_view.leases.insert(id, codecs::decode_lease(&value)?);
         }
     }
     if let CanonicalOperation::Range(RangeOp {

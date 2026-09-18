@@ -91,8 +91,14 @@ impl<E: LocalEngine> Domain<E> {
         let mut replans = 0;
         loop {
             let gated = self.worker.reader().snapshot().unwrap();
-            let view =
-                build_read_view(&gated, request.namespace, request, ViewBudget::default()).unwrap();
+            let view = build_read_view(
+                &gated,
+                request.namespace,
+                PrincipalId([0xaa; 16]),
+                request,
+                ViewBudget::default(),
+            )
+            .unwrap();
             let planned = plan(request, &view, &PlanLimits::default()).unwrap();
             match apply_plan(
                 &mut self.worker,
@@ -156,6 +162,7 @@ fn to_oracle(o: &Outcome) -> OracleOutcome {
         Outcome::Compacted => OracleOutcome::Compacted,
         Outcome::ErrCompacted => OracleOutcome::ErrCompacted,
         Outcome::ErrFutureRevision => OracleOutcome::ErrFutureRevision,
+        other => panic!("the oracle model has no lease outcomes: {other:?}"),
     }
 }
 
@@ -317,7 +324,14 @@ fn stale_base_replans_instead_of_applying_against_different_state() {
     let gated = domain.worker.reader().snapshot().unwrap();
     let request_a = put(b"k", b"a");
     let request_b = put(b"k", b"b");
-    let view = build_read_view(&gated, NS, &request_a, ViewBudget::default()).unwrap();
+    let view = build_read_view(
+        &gated,
+        NS,
+        PrincipalId([0xaa; 16]),
+        &request_a,
+        ViewBudget::default(),
+    )
+    .unwrap();
     let plan_a = plan(&request_a, &view, &PlanLimits::default()).unwrap();
     let plan_b = plan(&request_b, &view, &PlanLimits::default()).unwrap();
     assert_eq!(plan_a.base, plan_b.base);
@@ -345,7 +359,14 @@ fn stale_base_replans_instead_of_applying_against_different_state() {
     );
     // State reflects only plan A; a fresh view replans B correctly.
     let gated = domain.worker.reader().snapshot().unwrap();
-    let view = build_read_view(&gated, NS, &request_b, ViewBudget::default()).unwrap();
+    let view = build_read_view(
+        &gated,
+        NS,
+        PrincipalId([0xaa; 16]),
+        &request_b,
+        ViewBudget::default(),
+    )
+    .unwrap();
     assert_eq!(view.current[b"k".as_slice()].value, b"a");
     let plan_b2 = plan(&request_b, &view, &PlanLimits::default()).unwrap();
     assert_eq!(plan_b2.revision, Some(rev(3)));
@@ -537,7 +558,14 @@ fn ahead_of_durability_views_are_refused_until_reconciled() {
     domain.run(&put(b"a", b"1"));
     let request = put(b"a", b"2");
     let gated = domain.worker.reader().snapshot().unwrap();
-    let view = build_read_view(&gated, NS, &request, ViewBudget::default()).unwrap();
+    let view = build_read_view(
+        &gated,
+        NS,
+        PrincipalId([0xaa; 16]),
+        &request,
+        ViewBudget::default(),
+    )
+    .unwrap();
     let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
     drop(gated);
     domain
@@ -562,9 +590,15 @@ fn ahead_of_durability_views_are_refused_until_reconciled() {
     domain.worker.reconcile().unwrap();
     let gated = domain.worker.reader().snapshot().unwrap();
     assert_eq!(
-        build_read_view(&gated, NS, &request, ViewBudget::default())
-            .unwrap()
-            .current[b"a".as_slice()]
+        build_read_view(
+            &gated,
+            NS,
+            PrincipalId([0xaa; 16]),
+            &request,
+            ViewBudget::default()
+        )
+        .unwrap()
+        .current[b"a".as_slice()]
         .value,
         b"2"
     );
@@ -627,7 +661,13 @@ fn crash_mid_apply_leaves_no_partial_events_or_frontier_mismatch() {
                 Ok(g) => g,
                 Err(_) => break,
             };
-            let view = match build_read_view(&gated, NS, r, ViewBudget::default()) {
+            let view = match build_read_view(
+                &gated,
+                NS,
+                PrincipalId([0xaa; 16]),
+                r,
+                ViewBudget::default(),
+            ) {
                 Ok(v) => v,
                 Err(_) => break,
             };

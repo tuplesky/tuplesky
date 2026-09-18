@@ -1,12 +1,13 @@
 //! Common row schemas (design Section 17.1). Keys use the reviewed ordered
 //! encoders; values are `StoreEnvelopeV1` with frozen record kinds.
 
+use coord_state::lease::LeaseRecord;
 use coord_state::view::KvEntry;
 use coord_state::{KvEvent, KvEventKind};
 use coord_store_api::engine::{EngineError, ErrorClass};
 use coord_store_api::envelope::StoreEnvelopeV1;
 use coord_store_api::registry::meta_fields;
-use coord_types::ids::{KvRevision, LeaseId, NamespaceId};
+use coord_types::ids::{KvRevision, LeaseGeneration, LeaseId, NamespaceId};
 use coord_types::ordered_key;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,8 @@ pub const EVENT_KIND: u16 = 0x0001;
 pub const COUNTER_KIND: u16 = 0x0003;
 /// Record kind of a lease reverse-index row in `lease_keys_v1`.
 pub const LEASE_KEY_KIND: u16 = 0x0001;
+/// Record kind of a lease record in `lease_v1`.
+pub const LEASE_KIND: u16 = 0x0001;
 
 fn corrupt(what: &'static str) -> EngineError {
     EngineError::new(ErrorClass::Corrupt, what)
@@ -112,6 +115,40 @@ pub fn lease_key(lease: &LeaseId, namespace: &NamespaceId, key: &[u8]) -> Vec<u8
     out
 }
 
+/// Prefix of every reverse-index key of `lease` in `namespace`.
+pub fn lease_key_prefix(lease: &LeaseId, namespace: &NamespaceId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.extend_from_slice(lease.as_bytes());
+    out.extend_from_slice(namespace.as_bytes());
+    out
+}
+
+/// Decode a reverse-index key into its lease, namespace and user key.
+pub fn decode_lease_key_row(key: &[u8]) -> Result<(LeaseId, NamespaceId, Vec<u8>), EngineError> {
+    if key.len() < 16 {
+        return Err(corrupt("lease_keys key length"));
+    }
+    let lease = LeaseId::from_slice(&key[..16]).map_err(|_| corrupt("lease_keys lease id"))?;
+    let decoded =
+        ordered_key::decode_current(&key[16..]).map_err(|_| corrupt("lease_keys current key"))?;
+    Ok((lease, decoded.namespace, decoded.key))
+}
+
+/// Lease record row key: the lease identity.
+pub fn lease_row_key(lease: &LeaseId) -> Vec<u8> {
+    lease.as_bytes().to_vec()
+}
+
+/// A reverse-index row: the binding's generation and the bound entry's
+/// modification revision (what a conditional expiration matches).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseKeyRecordV1 {
+    /// Lease generation bound.
+    pub generation: LeaseGeneration,
+    /// Modification revision of the bound entry.
+    pub mod_revision: KvRevision,
+}
+
 /// Encode a current entry.
 pub fn encode_current(entry: &KvEntry) -> Result<Vec<u8>, EngineError> {
     encode(KV_CURRENT_KIND, entry)
@@ -152,10 +189,24 @@ pub fn decode_counter(bytes: &[u8]) -> Result<u64, EngineError> {
     decode(COUNTER_KIND, bytes, "counter record")
 }
 
-/// Encode a lease reverse-index row (empty payload for now; task-15 adds
-/// generation and expected mod revision).
-pub fn encode_lease_key() -> Result<Vec<u8>, EngineError> {
-    encode(LEASE_KEY_KIND, &())
+/// Encode a lease reverse-index row.
+pub fn encode_lease_key(record: &LeaseKeyRecordV1) -> Result<Vec<u8>, EngineError> {
+    encode(LEASE_KEY_KIND, record)
+}
+
+/// Decode a lease reverse-index row.
+pub fn decode_lease_key(bytes: &[u8]) -> Result<LeaseKeyRecordV1, EngineError> {
+    decode(LEASE_KEY_KIND, bytes, "lease_keys record")
+}
+
+/// Encode a lease record.
+pub fn encode_lease(record: &LeaseRecord) -> Result<Vec<u8>, EngineError> {
+    encode(LEASE_KIND, record)
+}
+
+/// Decode a lease record.
+pub fn decode_lease(bytes: &[u8]) -> Result<LeaseRecord, EngineError> {
+    decode(LEASE_KIND, bytes, "lease record")
 }
 
 /// Convert a planner event into its row record.
