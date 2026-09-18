@@ -413,3 +413,88 @@ fn gc_is_incremental_crash_resumable_and_identical_across_engines() {
     assert_eq!(c.map(|c| (c.floor, c.done)), Some((rev(10), true)));
     assert_eq!(e.through, rev(9));
 }
+
+#[test]
+fn gc_budgets_hold_inside_hot_keys_and_wide_revisions() {
+    // One hot key with many versions, then a range delete producing one
+    // revision with many events.
+    let mut d = Domain::new(ModelEngine::new());
+    for i in 0..40u8 {
+        d.run(&put(b"hot", &[i]));
+    }
+    for i in 0..12u8 {
+        d.run(&put(&[b'r', i], b"x"));
+    }
+    let wide = LogicalRequest::new(
+        NS,
+        CanonicalOperation::DeleteRange(DeleteRangeOp {
+            range: KeyRange::interval(b"r".to_vec(), b"s".to_vec()),
+            prev_kv: false,
+        }),
+    );
+    d.run(&wide); // revision 53: twelve events
+    d.run(&compact(53));
+    let tiny = GcBudget {
+        max_examined: 3,
+        max_deletes: 2,
+    };
+    let mut steps = 0;
+    loop {
+        let gated = d.worker.reader().snapshot().unwrap();
+        let step = plan_gc(gated.view(), &d.holds, tiny).unwrap();
+        drop(gated);
+        assert!(
+            step.examined <= tiny.max_examined,
+            "examined {}",
+            step.examined
+        );
+        assert!(step.deleted <= tiny.max_deletes, "deleted {}", step.deleted);
+        steps += 1;
+        if !step.updates.is_empty() {
+            d.worker
+                .submit(PersistBatch {
+                    barrier: d.alloc.allocate(),
+                    base: None,
+                    updates: step.updates,
+                })
+                .unwrap();
+            assert_eq!(d.worker.flush().unwrap().committed, 1);
+        }
+        if step.done {
+            break;
+        }
+        assert!(steps < 10_000, "gc must terminate");
+    }
+    assert!(
+        steps > 20,
+        "a tiny budget takes many bounded steps: {steps}"
+    );
+    // The hot key keeps only its version at the floor; every revision
+    // below the floor lost its events, including the wide one's twelve.
+    assert_eq!(d.history_revisions_of(b"hot"), vec![40]);
+    assert_eq!(d.event_revisions(), vec![53]);
+    // The same end state as one unbounded pass.
+    let mut big = Domain::new(ModelEngine::new());
+    for i in 0..40u8 {
+        big.run(&put(b"hot", &[i]));
+    }
+    for i in 0..12u8 {
+        big.run(&put(&[b'r', i], b"x"));
+    }
+    big.run(&wide);
+    big.run(&compact(53));
+    big.gc(GcBudget::default());
+    assert_eq!(big.history_rows(), d.history_rows());
+}
+
+#[test]
+fn gc_collects_maximum_size_history_rows() {
+    let mut d = Domain::new(ModelEngine::new());
+    let big = vec![0x5a; coord_types::logical_v1::limits::MAX_VALUE_BYTES];
+    d.run(&put(b"big", &big)); // 1
+    d.run(&put(b"big", &big)); // 2
+    d.run(&put(b"big", b"small")); // 3
+    d.run(&compact(3));
+    d.gc(GcBudget::default());
+    assert_eq!(d.history_revisions_of(b"big"), vec![3]);
+}
