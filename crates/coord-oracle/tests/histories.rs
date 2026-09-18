@@ -476,3 +476,236 @@ fn model_semantics_match_design_rules() {
         Outcome::Unsupported
     );
 }
+
+#[test]
+fn compaction_keeps_the_newest_version_at_the_floor() {
+    // Put a@1, compact to 1, delete a@2: a read at revision 1 must still see
+    // the version written at revision 1 (Section 17.5 retention).
+    let mut m = KvModel::default();
+    m.apply(&put(b"a", b"v"), None);
+    m.apply(
+        &CanonicalOperation::Compact {
+            revision: KvRevision::new(1).unwrap(),
+        },
+        None,
+    );
+    m.apply(
+        &CanonicalOperation::DeleteRange(DeleteRangeOp {
+            range: KeyRange::exact(b"a".to_vec()),
+            prev_kv: false,
+        }),
+        None,
+    );
+    let r = m.apply(&get_at(b"a", 1), None);
+    assert_eq!(r.revision, 2);
+    assert_eq!(
+        r.outcome,
+        Outcome::Range {
+            items: vec![RangeItem {
+                key: b"a".to_vec(),
+                entry: entry(b"v", 1, 1, 1)
+            }],
+            count: 1,
+            more: false
+        }
+    );
+    // Below the floor is still Compacted.
+    m.apply(&put(b"b", b"w"), None);
+    m.apply(
+        &CanonicalOperation::Compact {
+            revision: KvRevision::new(3).unwrap(),
+        },
+        None,
+    );
+    assert_eq!(
+        m.apply(&get_at(b"a", 2), None).outcome,
+        Outcome::ErrCompacted
+    );
+    assert_eq!(
+        m.apply(&get_at(b"b", 3), None).outcome.clone(),
+        Outcome::Range {
+            items: vec![RangeItem {
+                key: b"b".to_vec(),
+                entry: entry(b"w", 3, 3, 1)
+            }],
+            count: 1,
+            more: false
+        }
+    );
+}
+
+#[test]
+fn retry_identity_binds_the_operation_not_only_the_response() {
+    // put(x) then put(y) under one retry key: the second is served the
+    // cached first response, which the retry contract forbids for a changed
+    // payload even though the responses agree.
+    let mut h = History::new();
+    h.invoke(1, 1, 0, Some(7), put(b"k", b"x"));
+    h.respond(1, 1, put_resp(1));
+    h.invoke(2, 1, 2, Some(7), put(b"k", b"y"));
+    h.respond(2, 3, put_resp(1));
+    let verdict = check_history(&h);
+    assert!(verdict.violations.iter().any(|v| matches!(
+        v,
+        Violation::RetryInconsistent {
+            first: 1,
+            second: 2
+        }
+    )));
+    // The same payload retried is fine.
+    let mut ok = History::new();
+    ok.invoke(1, 1, 0, Some(7), put(b"k", b"x"));
+    ok.respond(1, 1, put_resp(1));
+    ok.invoke(2, 1, 2, Some(7), put(b"k", b"x"));
+    ok.respond(2, 3, put_resp(1));
+    assert!(check_history(&ok).ok());
+}
+
+#[test]
+fn every_watch_revision_must_be_produced_by_the_witness() {
+    let event = |value: &[u8]| WatchEvent {
+        kind: WatchEventKind::Put,
+        key: b"a".to_vec(),
+        value: value.to_vec(),
+    };
+    // A batch for a revision no operation produced is unexplained.
+    let mut orphan = History::new();
+    orphan.watch(1, 1, vec![event(b"v")]);
+    assert!(!check_history(&orphan).ok());
+
+    // A batch attributable to a pending mutation forces the witness to
+    // apply that mutation, and its content must match.
+    let mut pending_match = History::new();
+    pending_match.invoke(1, 1, 0, None, put(b"a", b"v"));
+    pending_match.watch(5, 1, vec![event(b"v")]);
+    assert!(check_history(&pending_match).ok());
+    let mut pending_mismatch = History::new();
+    pending_mismatch.invoke(1, 1, 0, None, put(b"a", b"v"));
+    pending_mismatch.watch(5, 1, vec![event(b"other")]);
+    assert!(!check_history(&pending_mismatch).ok());
+}
+
+#[test]
+fn watch_delivery_cannot_precede_the_mutation_invocation() {
+    let event = WatchEvent {
+        kind: WatchEventKind::Put,
+        key: b"a".to_vec(),
+        value: b"v".to_vec(),
+    };
+    // Event delivered at tick 1 for a put invoked at tick 10: speculative.
+    let mut early = History::new();
+    early.invoke(1, 1, 10, None, put(b"a", b"v"));
+    early.respond(1, 12, put_resp(1));
+    early.watch(1, 1, vec![event.clone()]);
+    assert!(!check_history(&early).ok());
+    // Delivered at or after the invocation: fine, even before the response.
+    let mut ok = History::new();
+    ok.invoke(1, 1, 10, None, put(b"a", b"v"));
+    ok.respond(1, 12, put_resp(1));
+    ok.watch(10, 1, vec![event]);
+    assert!(check_history(&ok).ok());
+}
+
+#[test]
+fn watch_batch_order_within_a_revision_is_significant() {
+    let txn = {
+        let mut op = CanonicalOperation::Txn(TxnOp {
+            compares: vec![],
+            success: vec![
+                BranchOp::Put(PutOp {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                    lease: None,
+                    prev_kv: false,
+                }),
+                BranchOp::Put(PutOp {
+                    key: b"b".to_vec(),
+                    value: b"2".to_vec(),
+                    lease: None,
+                    prev_kv: false,
+                }),
+            ],
+            failure: vec![],
+        });
+        op.canonicalize();
+        op
+    };
+    let resp = ModelResponse {
+        revision: 1,
+        outcome: Outcome::Txn {
+            succeeded: true,
+            results: vec![Outcome::Put { prev: None }, Outcome::Put { prev: None }],
+        },
+    };
+    let a = WatchEvent {
+        kind: WatchEventKind::Put,
+        key: b"a".to_vec(),
+        value: b"1".to_vec(),
+    };
+    let b = WatchEvent {
+        kind: WatchEventKind::Put,
+        key: b"b".to_vec(),
+        value: b"2".to_vec(),
+    };
+    let mut reversed = History::new();
+    reversed.invoke(1, 1, 0, None, txn.clone());
+    reversed.respond(1, 1, resp.clone());
+    reversed.watch(2, 1, vec![b.clone(), a.clone()]);
+    assert!(!check_history(&reversed).ok());
+    let mut duplicated = History::new();
+    duplicated.invoke(1, 1, 0, None, txn.clone());
+    duplicated.respond(1, 1, resp.clone());
+    duplicated.watch(2, 1, vec![a.clone(), a.clone(), b.clone()]);
+    assert!(!check_history(&duplicated).ok());
+    // Two deliveries of the identical ordered batch are one batch.
+    let mut twice = History::new();
+    twice.invoke(1, 1, 0, None, txn);
+    twice.respond(1, 1, resp);
+    twice.watch(2, 1, vec![a.clone(), b.clone()]);
+    twice.watch(3, 1, vec![a, b]);
+    assert!(check_history(&twice).ok());
+}
+
+#[test]
+fn zero_limit_reads_the_schema_maximum_page() {
+    let mut m = KvModel::default();
+    let n = limits::MAX_PAGE_LIMIT as usize + 1;
+    for i in 0..n {
+        m.apply(&put(format!("k{i:06}").as_bytes(), b"v"), None);
+    }
+    let r = m.apply(
+        &CanonicalOperation::Range(RangeOp {
+            range: KeyRange::interval(b"k".to_vec(), b"l".to_vec()),
+            revision: None,
+            limit: 0,
+            keys_only: true,
+            count_only: false,
+        }),
+        None,
+    );
+    match r.outcome {
+        Outcome::Range { items, count, more } => {
+            assert_eq!(items.len(), limits::MAX_PAGE_LIMIT as usize);
+            assert_eq!(count, n as u64);
+            assert!(more);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn fingerprint_distinguishes_lease_state() {
+    let mut with_lease = KvModel::default();
+    with_lease.apply(
+        &CanonicalOperation::Put(PutOp {
+            key: b"a".to_vec(),
+            value: b"v".to_vec(),
+            lease: Some(coord_types::ids::LeaseId([9; 16])),
+            prev_kv: false,
+        }),
+        None,
+    );
+    let mut without = KvModel::default();
+    without.apply(&put(b"a", b"v"), None);
+    assert_ne!(with_lease.fingerprint(), without.fingerprint());
+}

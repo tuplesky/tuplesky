@@ -1,6 +1,6 @@
 //! Structural checks and the complete-domain linearizability search.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use coord_types::logical_v1::CanonicalOperation;
 
@@ -19,10 +19,18 @@ struct Op {
     response: Option<ModelResponse>,
 }
 
+/// One observed watch batch: the ordered events of a revision and the
+/// earliest real time any watcher delivered it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WatchBatch {
+    tick: u64,
+    events: Vec<WatchEvent>,
+}
+
 struct Prepared {
     ops: Vec<Op>,
-    /// Watch batches by revision (events as sets).
-    watches: BTreeMap<u64, BTreeSet<WatchEvent>>,
+    /// Watch batches by revision, events in delivery order.
+    watches: BTreeMap<u64, WatchBatch>,
     violations: Vec<Violation>,
 }
 
@@ -30,7 +38,7 @@ fn prepare(history: &History) -> Prepared {
     let mut ops: Vec<Op> = Vec::new();
     let mut index: BTreeMap<OpId, usize> = BTreeMap::new();
     let mut violations = Vec::new();
-    let mut watches: BTreeMap<u64, BTreeSet<WatchEvent>> = BTreeMap::new();
+    let mut watches: BTreeMap<u64, WatchBatch> = BTreeMap::new();
     let mut last_watch_revision = 0u64;
     for obs in history.observations() {
         match obs {
@@ -75,7 +83,9 @@ fn prepare(history: &History) -> Prepared {
                 }),
             },
             Observation::WatchBatch {
-                revision, events, ..
+                tick,
+                revision,
+                events,
             } => {
                 if *revision < last_watch_revision {
                     violations.push(Violation::WatchOrder {
@@ -83,16 +93,23 @@ fn prepare(history: &History) -> Prepared {
                     });
                 }
                 last_watch_revision = last_watch_revision.max(*revision);
-                let set: BTreeSet<WatchEvent> = events.iter().cloned().collect();
-                match watches.get(revision) {
-                    Some(existing) if *existing != set => {
+                // Order and multiplicity within a revision batch are part of
+                // what consumers observe, so batches compare as sequences.
+                match watches.get_mut(revision) {
+                    Some(existing) if existing.events != *events => {
                         violations.push(Violation::ConflictingWatchBatches {
                             revision: *revision,
                         })
                     }
-                    Some(_) => {}
+                    Some(existing) => existing.tick = existing.tick.min(*tick),
                     None => {
-                        watches.insert(*revision, set);
+                        watches.insert(
+                            *revision,
+                            WatchBatch {
+                                tick: *tick,
+                                events: events.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -115,15 +132,22 @@ fn is_mutation(op: &CanonicalOperation) -> bool {
 }
 
 /// Revisions must be unique among acknowledged mutations: a response whose
-/// revision advanced belongs to exactly one operation.
+/// revision advanced belongs to exactly one operation. A retry identity binds
+/// one canonical operation to one response: a second invocation under the
+/// same identity must carry the same operation (a changed payload must be
+/// rejected, never served the cached result) and receive the same response.
 fn check_revisions(ops: &[Op], violations: &mut Vec<Violation>) {
     let mut seen: BTreeMap<u64, OpId> = BTreeMap::new();
     let mut by_retry: BTreeMap<u64, &Op> = BTreeMap::new();
     for op in ops {
-        let Some(resp) = &op.response else { continue };
         if let Some(retry) = op.retry {
             if let Some(first) = by_retry.get(&retry) {
-                if first.response.as_ref() != Some(resp) {
+                let same_op = first.op == op.op;
+                let same_response = match (&first.response, &op.response) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                };
+                if !same_op || !same_response {
                     violations.push(Violation::RetryInconsistent {
                         first: first.id,
                         second: op.id,
@@ -133,6 +157,7 @@ fn check_revisions(ops: &[Op], violations: &mut Vec<Violation>) {
             }
             by_retry.insert(retry, op);
         }
+        let Some(resp) = &op.response else { continue };
         if !is_mutation(&op.op) {
             continue;
         }
@@ -163,7 +188,10 @@ fn check_revisions(ops: &[Op], violations: &mut Vec<Violation>) {
 
 struct Search<'a> {
     ops: &'a [Op],
-    watches: &'a BTreeMap<u64, BTreeSet<WatchEvent>>,
+    watches: &'a BTreeMap<u64, WatchBatch>,
+    /// Highest revision any watch batch reported; the witness must produce
+    /// every one of them.
+    max_watched: u64,
     memo: HashSet<(Vec<u64>, [u8; 32])>,
     nodes: u64,
     best_explained: usize,
@@ -203,11 +231,16 @@ impl Search<'_> {
             self.best_explained = completed_done;
             self.best_stuck = None;
         }
+        // Success: every completed operation is placed and every observed
+        // watch revision was produced by a placed mutation. A batch that the
+        // model never generated (including one attributable only to a
+        // pending mutation the witness left unapplied) is not explained.
         if self
             .ops
             .iter()
             .enumerate()
             .all(|(i, o)| done[i] || o.respond.is_none())
+            && self.max_watched <= model.revision()
         {
             return Some(order.clone());
         }
@@ -244,17 +277,15 @@ impl Search<'_> {
                 continue;
             }
             // A mutation that advanced the revision must agree with any
-            // observed watch batch for that revision.
+            // observed watch batch for that revision, event for event and in
+            // order, and the batch cannot have been delivered before the
+            // mutation was even invoked: a watch event observed earlier than
+            // its mutation's invocation is a speculative delivery.
             if produced.revision != model.revision()
                 && let Some(observed) = self.watches.get(&produced.revision)
             {
-                let modeled: BTreeSet<WatchEvent> = next
-                    .events_at(produced.revision)
-                    .unwrap_or(&[])
-                    .iter()
-                    .cloned()
-                    .collect();
-                if modeled != *observed {
+                let modeled = next.events_at(produced.revision).unwrap_or(&[]);
+                if modeled != observed.events.as_slice() || op.invoke > observed.tick {
                     continue;
                 }
             }
@@ -283,6 +314,7 @@ pub fn check_history_bounded(history: &History, node_limit: u64) -> Verdict {
     let mut search = Search {
         ops: &prepared.ops,
         watches: &prepared.watches,
+        max_watched: prepared.watches.keys().next_back().copied().unwrap_or(0),
         memo: HashSet::new(),
         nodes: 0,
         best_explained: 0,
