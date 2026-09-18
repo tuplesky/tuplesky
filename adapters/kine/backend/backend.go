@@ -92,6 +92,10 @@ type Backend struct {
 
 	mu       sync.Mutex
 	instance *client.Instance
+	// epoch is the client binding epoch `instance` was built for. A later
+	// epoch means the frontend acknowledged a new session, so new work is
+	// allocated under a new instance.
+	epoch uint64
 }
 
 // New validates the configuration.
@@ -130,32 +134,47 @@ func (b *Backend) Start(ctx context.Context) error {
 		return mapClientError(err)
 	}
 	b.mu.Lock()
-	if b.instance == nil {
-		session, bound := b.cfg.Client.Session()
-		switch {
-		case bound && b.cfg.Session != nil && *b.cfg.Session != session:
-			b.mu.Unlock()
-			return ErrSessionMismatch
-		case !bound && b.cfg.Session == nil:
-			b.mu.Unlock()
-			return ErrNoSession
-		case !bound:
-			session = *b.cfg.Session
-		}
-		b.instance = client.NewInstance(client.InstanceConfig{
-			Cluster:  b.cfg.Cluster,
-			Domain:   b.cfg.Domain,
-			Session:  session,
-			Instance: b.cfg.ClientInstance,
-		})
-	}
+	err := b.adoptBindingLocked()
 	b.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	// See kubernetes staging/src/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go:
 	// the API server's health check reads this key.
-	_, err := b.Create(ctx, server.HealthKey, []byte(server.HealthVal), 0)
+	_, err = b.Create(ctx, server.HealthKey, []byte(server.HealthVal), 0)
 	if err != nil && !errors.Is(err, server.ErrKeyExists) {
 		return err
 	}
+	return nil
+}
+
+// adoptBindingLocked makes the instance match the client's current
+// binding. A new epoch means the frontend acknowledged a new session
+// (an ordinary credential refresh does this), so later work is allocated
+// under a fresh instance from sequence one. Invocations already
+// allocated keep the instance they were allocated under: their retry
+// keys and frames are already built, so an unresolved write is resolved
+// as itself rather than re-sent as a different one.
+func (b *Backend) adoptBindingLocked() error {
+	session, epoch, bound := b.cfg.Client.Binding()
+	switch {
+	case bound && b.cfg.Session != nil && *b.cfg.Session != session:
+		return ErrSessionMismatch
+	case !bound && b.cfg.Session == nil:
+		return ErrNoSession
+	case !bound:
+		session, epoch = *b.cfg.Session, 1
+	}
+	if b.instance != nil && b.epoch == epoch {
+		return nil
+	}
+	b.instance = client.NewInstance(client.InstanceConfig{
+		Cluster:  b.cfg.Cluster,
+		Domain:   b.cfg.Domain,
+		Session:  session,
+		Instance: b.cfg.ClientInstance,
+	})
+	b.epoch = epoch
 	return nil
 }
 
@@ -164,6 +183,9 @@ func (b *Backend) instanceOrErr() (*client.Instance, error) {
 	defer b.mu.Unlock()
 	if b.instance == nil {
 		return nil, ErrNotStarted
+	}
+	if err := b.adoptBindingLocked(); err != nil {
+		return nil, err
 	}
 	return b.instance, nil
 }
@@ -187,6 +209,13 @@ func kindName(op wire.LogicalOp) string {
 // (the payload may depend on the retry key), send it, resolve an unknown
 // outcome by identity a bounded number of times, and decode the result.
 func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryKey) wire.LogicalOp) (wire.Result, error) {
+	// The identity an invocation is allocated under has to be the one the
+	// connection is bound to, so the binding is made current before the
+	// retry key is formed: connecting afterwards could roll the session
+	// over underneath a key already built from the previous one.
+	if err := b.cfg.Client.Connect(ctx); err != nil {
+		return wire.Result{}, mapClientError(err)
+	}
 	inst, err := b.instanceOrErr()
 	if err != nil {
 		return wire.Result{}, status.Error(codes.Unavailable, err.Error())

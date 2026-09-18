@@ -27,6 +27,11 @@ type Config struct {
 	Token string
 	// Session is the session acknowledged to a correct Bind.
 	Session [16]byte
+	// Admit, when set, decides what a Bind presenting `token` is
+	// acknowledged with, so a test can drive real credential rotation:
+	// a later credential may name a later session. It takes precedence
+	// over Token and Session.
+	Admit func(token string) (session [16]byte, expiresAt time.Time, ok bool)
 	// Cert is the frontend's TLS identity.
 	Cert tls.Certificate
 }
@@ -37,8 +42,12 @@ type Logged struct {
 	Kind string
 	// Op names the logical operation of a request.
 	Op string
+	// Session of the retry key (empty for a bind).
+	Session [16]byte
 	// Sequence of the retry key.
 	Sequence uint64
+	// CommandID the frame named (requests and resolutions).
+	CommandID [32]byte
 	// Executed says whether the model applied a command (a retained
 	// result answers a retry without executing again).
 	Executed bool
@@ -60,6 +69,7 @@ type Server struct {
 	mu       sync.Mutex
 	retained map[wire.RetryKey]retained
 	log      []Logged
+	conns    map[*quic.Conn]struct{}
 
 	// PendingOnce answers the next Request with a Pending outcome (the
 	// result is still retained for resolution).
@@ -129,17 +139,32 @@ func Start(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{cfg: cfg, model: NewModel(), udp: udp, ln: ln, cancel: cancel, retained: map[wire.RetryKey]retained{}}
+	s := &Server{cfg: cfg, model: NewModel(), udp: udp, ln: ln, cancel: cancel, retained: map[wire.RetryKey]retained{}, conns: map[*quic.Conn]struct{}{}}
 	go func() {
 		for {
 			conn, err := ln.Accept(ctx)
 			if err != nil {
 				return
 			}
+			s.mu.Lock()
+			s.conns[conn] = struct{}{}
+			s.mu.Unlock()
 			go s.serve(ctx, conn)
 		}
 	}()
 	return s, nil
+}
+
+// DropConnections closes every accepted connection (a frontend restart
+// or network loss); the client must reconnect and resume.
+func (s *Server) DropConnections() {
+	s.mu.Lock()
+	conns := s.conns
+	s.conns = map[*quic.Conn]struct{}{}
+	s.mu.Unlock()
+	for conn := range conns {
+		_ = conn.CloseWithError(4, "dropped")
+	}
 }
 
 // Addr is the frontend address.
@@ -184,11 +209,45 @@ func (s *Server) serve(ctx context.Context, conn *quic.Conn) {
 		}
 		if first {
 			first = false
-			go func() { _, _ = readFrame(stream) }()
+			go s.negotiate(stream)
 			continue
 		}
 		go s.handle(stream)
 	}
+}
+
+// negotiate answers the Hello on the control stream and leaves it open,
+// as the native endpoint does: a Close frame travels on it.
+func (s *Server) negotiate(stream *quic.Stream) {
+	frame, err := readFrame(stream)
+	if err != nil {
+		return
+	}
+	msg, err := wire.Decode(frame)
+	if err != nil {
+		return
+	}
+	hello, ok := msg.(wire.Hello)
+	if !ok {
+		out, _ := wire.Encode(wire.Close{Code: 1, Reason: []byte("first frame not hello")})
+		_, _ = stream.Write(out)
+		return
+	}
+	// Exactly one lane capability (the 0x0010..0x0013 block) declares the
+	// connection's lane, as the native endpoint requires.
+	granted := make([]uint16, 0, len(hello.Capabilities))
+	for _, capability := range hello.Capabilities {
+		if capability >= 0x0010 && capability <= 0x0013 {
+			granted = append(granted, capability)
+		}
+	}
+	if len(granted) != 1 {
+		out, _ := wire.Encode(wire.Close{Code: 2, Reason: []byte("lane")})
+		_, _ = stream.Write(out)
+		return
+	}
+	out, _ := wire.Encode(wire.HelloAck{Capabilities: granted, MaxInflight: 64})
+	_, _ = stream.Write(out)
 }
 
 func (s *Server) handle(stream *quic.Stream) {
@@ -203,8 +262,9 @@ func (s *Server) handle(stream *quic.Stream) {
 		s.Binds.Add(1)
 		s.record(Logged{Kind: "bind"})
 		bind, err := wire.DecodeBind(frame)
-		if err == nil && s.cfg.Token != "" && string(bind.Token) == s.cfg.Token {
-			out, _ = wire.EncodeBindAck(wire.BindAck{Session: s.cfg.Session, ExpiresAt: uint64(time.Now().Add(time.Hour).Unix()), Scope: 1, RuleGeneration: 1})
+		session, expires, ok := s.admit(err, bind)
+		if ok {
+			out, _ = wire.EncodeBindAck(wire.BindAck{Session: session, ExpiresAt: uint64(expires.Unix()), Scope: 1, RuleGeneration: 1})
 		} else {
 			out, _ = wire.Encode(wire.Close{Code: 2, Reason: []byte("bind refused")})
 		}
@@ -223,6 +283,20 @@ func (s *Server) handle(stream *quic.Stream) {
 		}
 	}
 	_, _ = stream.Write(out)
+}
+
+// admit decides what a binding request establishes.
+func (s *Server) admit(decodeErr error, bind wire.Bind) ([16]byte, time.Time, bool) {
+	if decodeErr != nil {
+		return [16]byte{}, time.Time{}, false
+	}
+	if s.cfg.Admit != nil {
+		return s.cfg.Admit(string(bind.Token))
+	}
+	if s.cfg.Token != "" && string(bind.Token) == s.cfg.Token {
+		return s.cfg.Session, time.Now().Add(time.Hour), true
+	}
+	return [16]byte{}, time.Time{}, false
 }
 
 func opName(op wire.LogicalOp) string {
@@ -252,19 +326,19 @@ func (s *Server) request(req wire.Request) []byte {
 	s.mu.Unlock()
 	if seen {
 		if prior.commandID != commandID {
-			s.record(Logged{Kind: "request", Op: "conflict", Sequence: req.RetryKey.RequestSequence})
+			s.record(Logged{Kind: "request", Op: "conflict", Session: req.RetryKey.SessionID, Sequence: req.RetryKey.RequestSequence, CommandID: commandID})
 			return encodeResponse(wire.Response{CommandID: commandID, Tag: wire.OutcomeErr, Code: 0x0001, Detail: []byte("identity conflict")})
 		}
-		s.record(Logged{Kind: "request", Op: "retained", Sequence: req.RetryKey.RequestSequence})
+		s.record(Logged{Kind: "request", Op: "retained", Session: req.RetryKey.SessionID, Sequence: req.RetryKey.RequestSequence, CommandID: commandID})
 		return prior.response
 	}
 	logical, err := wire.DecodeLogical(req.Logical)
 	if err != nil {
-		s.record(Logged{Kind: "request", Op: "malformed", Sequence: req.RetryKey.RequestSequence})
+		s.record(Logged{Kind: "request", Op: "malformed", Session: req.RetryKey.SessionID, Sequence: req.RetryKey.RequestSequence, CommandID: commandID})
 		return encodeResponse(wire.Response{CommandID: commandID, Tag: wire.OutcomeErr, Code: 0x0003, Detail: []byte("malformed")})
 	}
 	result, mutated := s.model.Apply(logical)
-	s.record(Logged{Kind: "request", Op: opName(logical.Op), Sequence: req.RetryKey.RequestSequence, Executed: true})
+	s.record(Logged{Kind: "request", Op: opName(logical.Op), Session: req.RetryKey.SessionID, Sequence: req.RetryKey.RequestSequence, CommandID: commandID, Executed: true})
 	payload, _ := result.Encode()
 	resp := wire.Response{CommandID: commandID, Tag: wire.OutcomeOk, Result: payload}
 	if mutated {
@@ -281,7 +355,7 @@ func (s *Server) request(req wire.Request) []byte {
 }
 
 func (s *Server) resolve(req wire.ResolveRequest) []byte {
-	s.record(Logged{Kind: "resolve", Sequence: req.RetryKey.RequestSequence})
+	s.record(Logged{Kind: "resolve", Session: req.RetryKey.SessionID, Sequence: req.RetryKey.RequestSequence, CommandID: req.CommandID})
 	if s.ForgetAll.Load() || s.ForgetOnce.CompareAndSwap(true, false) {
 		return encodeResponse(wire.Response{CommandID: req.CommandID, Tag: wire.OutcomeUnknown})
 	}
