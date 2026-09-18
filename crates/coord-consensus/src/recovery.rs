@@ -50,6 +50,15 @@ pub struct ReportEntry {
     /// command, the leader's once adopted (task-28 possible-fast-decision
     /// recovery compares them).
     pub path: Digest32,
+    /// Per-key path digests at the cut, the components the combined
+    /// `path` is built from. A Sync installs these, not only the combined
+    /// digest, so a replica adopting the selected order realigns its own
+    /// per-key logs to it and later commands derive their dependencies
+    /// from the selected tail.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Leader sequence number the per-key digests were synchronized at
+    /// (zero when no leader order has been recorded for the command).
+    pub seqnum: u64,
     /// Conflict keys of the payload.
     pub keys: Vec<Vec<u8>>,
     /// Whether the payload is durably known (a placeholder is not).
@@ -81,6 +90,13 @@ pub struct SyncEntry {
     /// The leader's path evidence for the command (installed with it so
     /// a later recovery compares against the same evidence).
     pub path: Digest32,
+    /// The per-key digests the combined `path` is built from: adopting
+    /// the entry installs these into the record and synchronizes the
+    /// per-key logs, so the replica's derived tails follow the selected
+    /// order rather than its own pre-accept one.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Leader sequence number the per-key digests were synchronized at.
+    pub seqnum: u64,
 }
 
 /// The selected recovery result (`MSync`).
@@ -214,6 +230,8 @@ pub fn select(
                             phase,
                             deps: e.deps.clone(),
                             path: e.path,
+                            paths: e.paths.clone(),
+                            seqnum: e.seqnum,
                         },
                     );
                 }
@@ -227,6 +245,14 @@ pub fn select(
                     }
                     if phase > existing.phase {
                         existing.phase = phase;
+                    }
+                    // The reporters of one source ballot adopted one
+                    // leader order, so their per-key digests agree; take
+                    // the most recently synchronized copy, which is a
+                    // maximum and therefore independent of report order.
+                    if e.seqnum > existing.seqnum {
+                        existing.seqnum = e.seqnum;
+                        existing.paths = e.paths.clone();
                     }
                 }
             }
@@ -278,7 +304,7 @@ fn possible_fast_decisions(
     // The fast set of the source ballot (the default rule until the
     // retained operator quorum table of task-m01).
     let Ok(source_config) =
-        BallotConfiguration::c2_default(config.epoch, source_ballot, config.voters().clone())
+        BallotConfiguration::c2_default(config.epoch(), source_ballot, config.voters().clone())
     else {
         return;
     };
@@ -358,6 +384,8 @@ fn possible_fast_decisions(
                 phase: Phase::Accept,
                 deps: e.deps,
                 path: e.path,
+                paths: e.paths,
+                seqnum: e.seqnum,
             },
         );
     }

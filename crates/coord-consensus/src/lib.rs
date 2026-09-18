@@ -123,11 +123,11 @@ pub use quorum::{BallotConfiguration, ConfigurationError, FastQuorumClass};
 pub use recovery::{RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, select};
 pub use role::{PendingReport, RecoveredState};
 pub use rows::{
-    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SyncRecordV1, decode_dependency,
-    decode_payload, decode_promise, decode_proposal, decode_sync, dependency_key,
-    dependency_update, encode_dependency, encode_payload, encode_promise, encode_proposal,
-    encode_sync, payload_key, payload_update, promise_key, promise_update, proposal_key,
-    proposal_update, sync_key, sync_update,
+    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,
+    SyncRecordV1, decode_dependency, decode_payload, decode_promise, decode_proposal, decode_sync,
+    dependency_key, dependency_update, encode_dependency, encode_payload, encode_promise,
+    encode_proposal, encode_sync, payload_key, payload_update, promise_key, promise_update,
+    proposal_key, proposal_update, sync_key, sync_update,
 };
 pub use summary::{
     DurableLedger, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler, ReportPage,

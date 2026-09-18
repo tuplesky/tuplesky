@@ -439,6 +439,8 @@ fn entry(c: CommandId, phase: Phase, deps: &[CommandId]) -> ReportEntry {
         phase,
         deps: deps.to_vec(),
         path: path_of(c, deps),
+        paths: vec![(b"*".to_vec(), path_of(c, deps))],
+        seqnum: 0,
         keys: vec![b"*".to_vec()],
         payload_present: true,
     }
@@ -615,6 +617,8 @@ fn recovery_selection_is_source_defined_and_order_independent() {
             phase: Phase::Accept,
             deps: vec![],
             path: path_of(cmd(5), &[]),
+            paths: vec![(b"*".to_vec(), path_of(cmd(5), &[]))],
+            seqnum: 0,
             keys: vec![b"*".to_vec()],
             payload_present: false,
         }],
