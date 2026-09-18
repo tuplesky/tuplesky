@@ -64,6 +64,12 @@
 //!   sequence order once every dependency executed, and the materializer's
 //!   outcome is sealed into an `EstablishedResult` at the next execution
 //!   position. A single leader reply establishes nothing.
+//! * [`summary`] (task-25): the durable ledger an actor keeps of its own
+//!   journal-durable command records, the recovery report built from it
+//!   at the cut (never from in-memory phases or a lagging projection),
+//!   bounded verified report pages and their assembler; payload transfer
+//!   with identity rehash so a missing payload is fetched, never
+//!   fabricated.
 //! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
 //!   rows and the postcard-encoded protocol messages of this increment.
 #![forbid(unsafe_code)]
@@ -83,6 +89,7 @@ pub mod publication;
 pub mod quorum;
 pub mod recovery;
 pub mod rows;
+pub mod summary;
 pub mod vote;
 
 pub use ballot::{
@@ -108,6 +115,10 @@ pub use rows::{
     decode_promise, decode_proposal, dependency_key, dependency_update, encode_dependency,
     encode_payload, encode_promise, encode_proposal, payload_key, payload_update, promise_key,
     promise_update, proposal_key, proposal_update,
+};
+pub use summary::{
+    DurableLedger, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler, ReportPage,
+    paginate,
 };
 pub use vote::{FastAck, Learned, SlowAck, Vote, VoteError, VoteSet};
 

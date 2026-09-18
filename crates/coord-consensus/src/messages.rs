@@ -11,6 +11,8 @@ use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ReplicaId};
 use serde::{Deserialize, Serialize};
 
+use crate::rows::PayloadRecordV1;
+use crate::summary::ReportPage;
 use crate::vote::{FastAck, SlowAck};
 
 /// Per-key path digests through one command, in key order.
@@ -56,6 +58,20 @@ pub enum ProtocolMessage {
         deps: Vec<CommandId>,
         /// Dependency-path evidence.
         path: Digest32,
+    },
+    /// One page of a recovery report (`MNewLeaderAckN`, bounded).
+    ReportPage(ReportPage),
+    /// A request for the durable payloads of commands a replica lacks.
+    PayloadRequest {
+        /// Commands.
+        commands: Vec<CommandId>,
+    },
+    /// A durable payload; the receiver rehashes it against the identity.
+    PayloadResponse {
+        /// Command.
+        command: CommandId,
+        /// Payload.
+        payload: PayloadRecordV1,
     },
 }
 
