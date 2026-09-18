@@ -89,10 +89,10 @@ fn admin() -> Admin {
     }
 }
 
-fn manifest(voters: &[&Node]) -> GenesisManifest {
+fn manifest(cluster: ClusterId, domain: DomainId, voters: &[&Node]) -> GenesisManifest {
     GenesisManifest {
-        cluster: hex_id(&CLUSTER.0),
-        domain: hex_id(&DOMAIN.0),
+        cluster: hex_id(&cluster.0),
+        domain: hex_id(&domain.0),
         epoch: 1,
         voters: voters
             .iter()
@@ -115,12 +115,14 @@ fn sorted(voters: &[&Node]) -> Vec<VoterRecordV1> {
 
 fn root_record(
     admin: &Admin,
+    cluster: ClusterId,
+    domain: DomainId,
     manifest: &GenesisManifest,
     voters: &[&Node],
 ) -> GroupConfigurationV1 {
     let mut record = GroupConfigurationV1 {
-        cluster: CLUSTER,
-        domain: DOMAIN,
+        cluster,
+        domain,
         epoch: epoch(1),
         voters: sorted(voters),
         quorum_policy: QuorumPolicyId::C2_FIXED_MAJORITY,
@@ -144,8 +146,8 @@ fn handoff_record(
     approvers: &[&Node],
 ) -> GroupConfigurationV1 {
     let mut record = GroupConfigurationV1 {
-        cluster: CLUSTER,
-        domain: DOMAIN,
+        cluster: previous.cluster,
+        domain: previous.domain,
         epoch: previous.epoch.checked_next().unwrap(),
         voters: sorted(new_voters),
         quorum_policy: QuorumPolicyId::C2_FIXED_MAJORITY,
@@ -165,8 +167,36 @@ fn handoff_record(
     record
 }
 
+/// A ballot certificate for the configuration `record`: the promises are
+/// made for that record's cluster, domain and certificate hash, which is
+/// what a verifier compares against its own chain.
 fn ballot_record(
-    epoch_no: u64,
+    record: &GroupConfigurationV1,
+    number: u64,
+    leader: &Node,
+    fast: &[&Node],
+    promisers: &[&Node],
+) -> BallotConfigurationV1 {
+    ballot_for(
+        record.cluster,
+        record.domain,
+        record.epoch,
+        record.certificate_hash(),
+        number,
+        leader,
+        fast,
+        promisers,
+    )
+}
+
+/// A ballot certificate for a context named field by field, so a test can
+/// state one that no chain holds.
+#[expect(clippy::too_many_arguments, reason = "every field is the context")]
+fn ballot_for(
+    cluster: ClusterId,
+    domain: DomainId,
+    epoch_no: ConfigurationEpoch,
+    certificate: Digest32,
     number: u64,
     leader: &Node,
     fast: &[&Node],
@@ -175,9 +205,12 @@ fn ballot_record(
     let mut fast_set: Vec<ReplicaId> = fast.iter().map(|n| n.id).collect();
     fast_set.sort();
     let mut b = BallotConfigurationV1 {
-        epoch: epoch(epoch_no),
+        cluster,
+        domain,
+        epoch: epoch_no,
+        configuration_certificate: certificate,
         ballot: Ballot {
-            epoch: epoch(epoch_no),
+            epoch: epoch_no,
             number,
             leader: leader.id,
         },
@@ -271,13 +304,13 @@ impl World {
             nodes.insert(n, Node::new(n, 1));
         }
         let initial = [&nodes[&1], &nodes[&2], &nodes[&3]];
-        let manifest = manifest(&initial);
+        let manifest = manifest(CLUSTER, DOMAIN, &initial);
         // The manifest is what deployment trust delivers: verify it the
         // production way before anchoring.
         let signed: SignedGenesis = sign_genesis(&manifest, &admin.enc).unwrap();
         let verified = verify_genesis(&signed, &admin.dec, PROTOCOL).unwrap();
         let anchor = GenesisAnchor::new(&verified, admin.dec.clone()).unwrap();
-        let root = root_record(&admin, &verified, &initial);
+        let root = root_record(&admin, CLUSTER, DOMAIN, &verified, &initial);
         World {
             admin,
             nodes,
@@ -291,6 +324,26 @@ impl World {
     fn chain(&self) -> ConfigurationChain {
         ConfigurationChain::from_genesis(&self.anchor, self.root.clone()).unwrap()
     }
+    /// A second, independently anchored domain over the very same voters,
+    /// incarnations and keys, with the same admin and the same quorum
+    /// policy: the deployment shape in which nothing but the signed
+    /// context tells one domain's evidence from the other's.
+    fn sibling(&self, cluster: ClusterId, domain: DomainId) -> Sibling {
+        let initial = [self.n(1), self.n(2), self.n(3)];
+        let manifest = manifest(cluster, domain, &initial);
+        let signed: SignedGenesis = sign_genesis(&manifest, &self.admin.enc).unwrap();
+        let verified = verify_genesis(&signed, &self.admin.dec, PROTOCOL).unwrap();
+        Sibling {
+            anchor: GenesisAnchor::new(&verified, self.admin.dec.clone()).unwrap(),
+            root: root_record(&self.admin, cluster, domain, &verified, &initial),
+        }
+    }
+}
+
+/// Another domain's trusted root and epoch-one record.
+struct Sibling {
+    anchor: GenesisAnchor,
+    root: GroupConfigurationV1,
 }
 
 #[test]
@@ -467,7 +520,9 @@ fn every_fabrication_is_rejected() {
     let other_admin = admin();
     let forged_root = root_record(
         &other_admin,
-        &manifest(&[w.n(1), w.n(2), w.n(3)]),
+        CLUSTER,
+        DOMAIN,
+        &manifest(CLUSTER, DOMAIN, &[w.n(1), w.n(2), w.n(3)]),
         &[w.n(1), w.n(2), w.n(3)],
     );
     assert_eq!(
@@ -476,7 +531,9 @@ fn every_fabrication_is_rejected() {
     );
     let other_voters = root_record(
         &w.admin,
-        &manifest(&[w.n(1), w.n(2), w.n(3)]),
+        CLUSTER,
+        DOMAIN,
+        &manifest(CLUSTER, DOMAIN, &[w.n(1), w.n(2), w.n(3)]),
         &[w.n(1), w.n(2), w.n(4)],
     );
     assert_eq!(
@@ -485,7 +542,9 @@ fn every_fabrication_is_rejected() {
     );
     let other_manifest = root_record(
         &w.admin,
-        &manifest(&[w.n(1), w.n(2)]),
+        CLUSTER,
+        DOMAIN,
+        &manifest(CLUSTER, DOMAIN, &[w.n(1), w.n(2)]),
         &[w.n(1), w.n(2), w.n(3)],
     );
     assert_eq!(
@@ -540,7 +599,7 @@ fn directory_is_not_transition_authority() {
         records: vec![w.root.clone(), real.clone()],
         complete: true,
         ballot: Some(ballot_record(
-            2,
+            &real,
             1,
             w.n(1),
             &[w.n(1), w.n(2), w.n(3)],
@@ -580,12 +639,15 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     let w = World::new();
     let five = [w.n(1), w.n(2), w.n(3), w.n(4), w.n(5)];
     let e2 = handoff_record(&w.root, &five, &[w.n(1), w.n(2)]);
+    // Built but never installed: a ballot may name an epoch the chain has
+    // not reached.
+    let e3 = handoff_record(&e2, &five, &[w.n(1), w.n(2), w.n(3)]);
     let mut client = ClientConfiguration::bootstrap(&w.anchor, w.root.clone()).unwrap();
-    client.install_configuration(e2).unwrap();
+    client.install_configuration(e2.clone()).unwrap();
     let leader = w.n(1);
     let promisers = [w.n(1), w.n(2), w.n(3)];
 
-    let b1 = ballot_record(2, 1, leader, &[w.n(1), w.n(2), w.n(3)], &promisers);
+    let b1 = ballot_record(&e2, 1, leader, &[w.n(1), w.n(2), w.n(3)], &promisers);
     client.install_ballot(b1.clone()).unwrap();
     let held = client.ballot().unwrap();
     assert_eq!(held.fast_size(), 3);
@@ -593,7 +655,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     assert!(!held.fast_eligible(&node(4)));
     // An arbitrary "fastest majority" for another request under the same
     // ballot is refused: the fast set is immutable within the ballot.
-    let other = ballot_record(2, 1, leader, &[w.n(1), w.n(4), w.n(5)], &promisers);
+    let other = ballot_record(&e2, 1, leader, &[w.n(1), w.n(4), w.n(5)], &promisers);
     assert_eq!(
         client.install_ballot(other),
         Err(BallotError::FastSetChanged)
@@ -603,7 +665,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     client.install_ballot(b1).unwrap();
     // A higher ballot may choose a new fast set (with fresh promises).
     let b2 = ballot_record(
-        2,
+        &e2,
         2,
         w.n(4),
         &[w.n(4), w.n(5), w.n(1)],
@@ -612,17 +674,17 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     client.install_ballot(b2).unwrap();
     assert_eq!(client.ballot().unwrap().ballot.number, 2);
     // A lower ballot is stale.
-    let b0 = ballot_record(2, 1, leader, &[w.n(1), w.n(2), w.n(3)], &promisers);
+    let b0 = ballot_record(&e2, 1, leader, &[w.n(1), w.n(2), w.n(3)], &promisers);
     assert_eq!(client.install_ballot(b0), Err(BallotError::Stale));
 
     // Source quorum rules: not a majority, excludes the leader, non-voter.
     assert_eq!(
-        client.install_ballot(ballot_record(2, 3, leader, &[w.n(1), w.n(2)], &promisers)),
+        client.install_ballot(ballot_record(&e2, 3, leader, &[w.n(1), w.n(2)], &promisers)),
         Err(BallotError::Quorum(ConfigurationError::FastSetNotMajority))
     );
     assert_eq!(
         client.install_ballot(ballot_record(
-            2,
+            &e2,
             3,
             leader,
             &[w.n(2), w.n(3), w.n(4)],
@@ -634,7 +696,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     );
     assert_eq!(
         client.install_ballot(ballot_record(
-            2,
+            &e2,
             3,
             leader,
             &[w.n(1), w.n(2), w.n(6)],
@@ -645,7 +707,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     // Evidence rules: an observer's promise, a minority, a stale key.
     assert_eq!(
         client.install_ballot(ballot_record(
-            2,
+            &e2,
             3,
             leader,
             &[w.n(1), w.n(2), w.n(3)],
@@ -657,7 +719,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     );
     assert_eq!(
         client.install_ballot(ballot_record(
-            2,
+            &e2,
             3,
             leader,
             &[w.n(1), w.n(2), w.n(3)],
@@ -671,7 +733,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     let one_v2 = Node::new(1, 2);
     assert_eq!(
         client.install_ballot(ballot_record(
-            2,
+            &e2,
             3,
             leader,
             &[w.n(1), w.n(2), w.n(3)],
@@ -684,7 +746,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     // Another epoch's ballot: stale or unknown.
     assert_eq!(
         client.install_ballot(ballot_record(
-            1,
+            &w.root,
             9,
             leader,
             &[w.n(1), w.n(2)],
@@ -694,7 +756,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
     );
     assert_eq!(
         client.install_ballot(ballot_record(
-            3,
+            &e3,
             1,
             leader,
             &[w.n(1), w.n(2), w.n(3)],
@@ -702,6 +764,83 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
         )),
         Err(BallotError::Evidence(EvidenceError::UnknownEpoch))
     );
+    // The held epoch under another configuration record of that epoch: the
+    // promisers named a certificate this chain does not hold, so whatever
+    // they promised, they did not promise it here.
+    assert_eq!(
+        client.install_ballot(ballot_for(
+            CLUSTER,
+            DOMAIN,
+            epoch(2),
+            Digest32([0x11; 32]),
+            3,
+            leader,
+            &[w.n(1), w.n(2), w.n(3)],
+            &promisers
+        )),
+        Err(BallotError::CertificateMismatch)
+    );
+}
+
+#[test]
+fn a_ballot_certificate_of_one_domain_is_refused_by_another_that_shares_its_voters() {
+    let w = World::new();
+    // Two domains of one deployment: the same voters at the same
+    // incarnations under the same keys, the same admin, the same quorum
+    // policy and the same epoch numbering. Only the domain differs, so
+    // nothing but what the promises actually say can tell the two apart.
+    let sibling = w.sibling(CLUSTER, DomainId([3; 16]));
+    let mut here = ClientConfiguration::bootstrap(&w.anchor, w.root.clone()).unwrap();
+    let mut there = ClientConfiguration::bootstrap(&sibling.anchor, sibling.root.clone()).unwrap();
+    assert_eq!(here.current().epoch(), there.current().epoch());
+    assert_eq!(here.current().voters(), there.current().voters());
+
+    let promisers = [w.n(1), w.n(2)];
+    let mine = ballot_record(&w.root, 7, w.n(1), &[w.n(1), w.n(2)], &promisers);
+    here.install_ballot(mine.clone()).unwrap();
+    // Valid evidence, replayed. Every ballot and epoch number matches what
+    // the receiving domain would accept, the signers are its own voters at
+    // its own incarnations, and the signatures verify under the keys it
+    // holds. It is still a promise about somewhere else.
+    assert_eq!(
+        there.install_ballot(mine.clone()),
+        Err(BallotError::OriginMismatch)
+    );
+    assert!(there.ballot().is_none());
+    // Relabelling the certificate with the receiving domain does not
+    // launder it: the configuration it names is not the one held there.
+    let relabelled = BallotConfigurationV1 {
+        domain: sibling.root.domain,
+        ..mine.clone()
+    };
+    assert_eq!(
+        there.install_ballot(relabelled),
+        Err(BallotError::CertificateMismatch)
+    );
+    // Restamping both is what the binding costs an attacker: the promises
+    // are over the old context, so they no longer verify at all.
+    let restamped = BallotConfigurationV1 {
+        domain: sibling.root.domain,
+        configuration_certificate: sibling.root.certificate_hash(),
+        ..mine.clone()
+    };
+    assert_eq!(
+        there.install_ballot(restamped),
+        Err(BallotError::Evidence(EvidenceError::Signature {
+            node: node(1)
+        }))
+    );
+    // The same holds across clusters that share a domain identifier.
+    let restored = w.sibling(ClusterId([4; 16]), DOMAIN);
+    let mut elsewhere =
+        ClientConfiguration::bootstrap(&restored.anchor, restored.root.clone()).unwrap();
+    assert_eq!(
+        elsewhere.install_ballot(mine.clone()),
+        Err(BallotError::OriginMismatch)
+    );
+    // The domain the promises were made in still holds them.
+    assert_eq!(here.ballot().unwrap().ballot.number, 7);
+    here.install_ballot(mine).unwrap();
 }
 
 #[test]
@@ -867,7 +1006,7 @@ fn historical_evidence_verifies_without_an_issuer() {
         Err(EvidenceError::UnknownEpoch)
     );
     // An old epoch's ballot configuration verifies as history too.
-    let b = ballot_record(1, 4, w.n(1), &[w.n(1), w.n(2)], &[w.n(1), w.n(3)]);
+    let b = ballot_record(&w.root, 4, w.n(1), &[w.n(1), w.n(2)], &[w.n(1), w.n(3)]);
     let config = chain.verify_ballot(&b).unwrap();
     assert_eq!(config.epoch, epoch(1));
     assert_eq!(config.fast_size(), 2);

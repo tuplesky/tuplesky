@@ -212,10 +212,19 @@ certificate plus approvals of a majority of the previous epoch's voters
 for a handoff. The activation message is the domain-separated digest
 (`configuration-activation`) of every field except the signatures; the
 certificate hash (`configuration-record`) covers the complete record.
-`BallotConfigurationV1` binds a ballot's leader and sorted fast set under
-an epoch with the voters' promises over the `configuration-ballot`
-message; catalogs carry one voter attestation over the
-`configuration-catalog` message. Frozen digests and frames:
+`BallotConfigurationV1 { cluster, domain, epoch,
+configuration_certificate, ballot, quorum_policy, fast_set[<=16],
+promises[<=16] }` binds a ballot's leader and sorted fast set to one
+cluster, one domain and one configuration record under an epoch, with the
+voters' promises over the `configuration-ballot` message. That message is
+the domain-separated digest of cluster, domain, epoch, the configuration
+certificate hash, the ballot number, the leader, the policy and the fast
+set, in that order; a verifier accepts the certificate only for its own
+cluster and domain and only when the named configuration certificate is
+the one its chain holds for that epoch. Without the three context fields
+the same promises are valid evidence in any domain sharing those voter
+identities, incarnations and keys. Catalogs carry one voter attestation
+over the `configuration-catalog` message. Frozen digests and frames:
 `crates/coord-types/fixtures/config_frames_v1.json`.
 
 A response, a hint or a larger epoch number authorizes nothing: the
