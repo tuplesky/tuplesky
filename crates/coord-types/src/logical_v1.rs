@@ -117,6 +117,48 @@ pub struct PutOp {
     pub prev_kv: bool,
 }
 
+/// Kine `Create`: create the key if absent, with an optional private TTL
+/// binding (design Section 6.6). The binding identity is derived at the
+/// trusted boundary from the stable request so retries reproduce it; it is
+/// present exactly when `ttl_seconds > 0`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KineCreateOp {
+    /// Key.
+    pub key: Vec<u8>,
+    /// Value.
+    pub value: Vec<u8>,
+    /// Kine-facing TTL in seconds (`0`: none).
+    pub ttl_seconds: u32,
+    /// Derived hidden binding identity when `ttl_seconds > 0`.
+    pub binding: Option<LeaseId>,
+}
+
+/// Kine `Update`: compare the key's modification revision and update it,
+/// replacing (or with TTL `0`, removing) its private TTL binding.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KineUpdateOp {
+    /// Key.
+    pub key: Vec<u8>,
+    /// Value.
+    pub value: Vec<u8>,
+    /// Expected current modification revision.
+    pub expected_mod_revision: KvRevision,
+    /// Kine-facing TTL in seconds (`0`: none).
+    pub ttl_seconds: u32,
+    /// Derived hidden binding identity when `ttl_seconds > 0`.
+    pub binding: Option<LeaseId>,
+}
+
+/// Kine `Delete`: delete the key when its modification revision matches
+/// (`None`: unconditionally).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KineDeleteOp {
+    /// Key.
+    pub key: Vec<u8>,
+    /// Expected current modification revision; `None` deletes unconditionally.
+    pub expected_mod_revision: Option<KvRevision>,
+}
+
 /// Delete a key or interval atomically.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DeleteRangeOp {
@@ -243,6 +285,14 @@ pub enum CanonicalOperation {
         /// Revision at or below which history may be discarded.
         revision: KvRevision,
     },
+    /// Kine create-if-absent with atomic private TTL binding (appended;
+    /// discriminant 9).
+    KineCreate(KineCreateOp),
+    /// Kine compare-mod-revision-and-update with TTL replacement
+    /// (discriminant 10).
+    KineUpdate(KineUpdateOp),
+    /// Kine conditional delete (discriminant 11).
+    KineDelete(KineDeleteOp),
 }
 
 /// A canonical logical request: domain-scoped tenant plus operation.
@@ -390,6 +440,22 @@ impl CanonicalOperation {
                     return Err(ValidationError::ZeroRevision);
                 }
             }
+            CanonicalOperation::KineCreate(c) => {
+                cost += validate_kine_write(&c.key, &c.value, c.ttl_seconds, c.binding)?;
+            }
+            CanonicalOperation::KineUpdate(u) => {
+                cost += validate_kine_write(&u.key, &u.value, u.ttl_seconds, u.binding)?;
+                if u.expected_mod_revision == KvRevision::ZERO {
+                    return Err(ValidationError::ZeroRevision);
+                }
+            }
+            CanonicalOperation::KineDelete(d) => {
+                validate_key(&d.key)?;
+                if d.expected_mod_revision == Some(KvRevision::ZERO) {
+                    return Err(ValidationError::ZeroRevision);
+                }
+                cost += d.key.len();
+            }
         }
         if cost > limits::MAX_REQUEST_BYTES {
             return Err(ValidationError::RequestTooLarge);
@@ -406,17 +472,41 @@ fn validate_range(r: &RangeOp) -> Result<usize, ValidationError> {
     Ok(r.range.byte_cost())
 }
 
-fn validate_put(p: &PutOp) -> Result<usize, ValidationError> {
-    if p.key.is_empty() {
+fn validate_key(key: &[u8]) -> Result<(), ValidationError> {
+    if key.is_empty() {
         return Err(ValidationError::EmptyKey);
     }
-    if p.key.len() > limits::MAX_KEY_BYTES {
+    if key.len() > limits::MAX_KEY_BYTES {
         return Err(ValidationError::KeyTooLong);
     }
+    Ok(())
+}
+
+fn validate_put(p: &PutOp) -> Result<usize, ValidationError> {
+    validate_key(&p.key)?;
     if p.value.len() > limits::MAX_VALUE_BYTES {
         return Err(ValidationError::ValueTooLong);
     }
     Ok(p.key.len() + p.value.len())
+}
+
+fn validate_kine_write(
+    key: &[u8],
+    value: &[u8],
+    ttl_seconds: u32,
+    binding: Option<LeaseId>,
+) -> Result<usize, ValidationError> {
+    validate_key(key)?;
+    if value.len() > limits::MAX_VALUE_BYTES {
+        return Err(ValidationError::ValueTooLong);
+    }
+    if ttl_seconds > limits::MAX_LEASE_TTL_SECONDS {
+        return Err(ValidationError::TtlTooLong);
+    }
+    if binding.is_some() != (ttl_seconds > 0) {
+        return Err(ValidationError::BindingMismatch);
+    }
+    Ok(key.len() + value.len())
 }
 
 #[cfg(test)]

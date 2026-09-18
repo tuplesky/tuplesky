@@ -74,6 +74,9 @@ fn touches(op: &CanonicalOperation) -> Vec<Touch> {
     match op {
         CanonicalOperation::Range(r) => out.push(of_range(&r.range)),
         CanonicalOperation::Put(p) => out.push(Touch::Exact(p.key.clone())),
+        CanonicalOperation::KineCreate(c) => out.push(Touch::Exact(c.key.clone())),
+        CanonicalOperation::KineUpdate(u) => out.push(Touch::Exact(u.key.clone())),
+        CanonicalOperation::KineDelete(d) => out.push(Touch::Exact(d.key.clone())),
         CanonicalOperation::DeleteRange(d) => out.push(of_range(&d.range)),
         CanonicalOperation::Txn(t) => {
             for c in &t.compares {
@@ -97,6 +100,8 @@ fn named_leases(op: &CanonicalOperation) -> Vec<LeaseId> {
     let mut out = Vec::new();
     match op {
         CanonicalOperation::Put(p) => out.extend(p.lease),
+        CanonicalOperation::KineCreate(c) => out.extend(c.binding),
+        CanonicalOperation::KineUpdate(u) => out.extend(u.binding),
         CanonicalOperation::Txn(t) => {
             for b in t.success.iter().chain(&t.failure) {
                 if let BranchOp::Put(p) = b {
@@ -110,6 +115,7 @@ fn named_leases(op: &CanonicalOperation) -> Vec<LeaseId> {
         | CanonicalOperation::LeaseTimeToLive { lease_id, .. } => out.push(*lease_id),
         CanonicalOperation::Range(_)
         | CanonicalOperation::DeleteRange(_)
+        | CanonicalOperation::KineDelete(_)
         | CanonicalOperation::Compact { .. } => {}
     }
     out

@@ -58,6 +58,38 @@ pub fn ttl(id: LeaseId, keys: bool) -> LogicalRequest {
     req(CanonicalOperation::LeaseTimeToLive { lease_id: id, keys })
 }
 
+pub fn kine_create(key: &[u8], value: &[u8], ttl: u32, binding: Option<LeaseId>) -> LogicalRequest {
+    req(CanonicalOperation::KineCreate(KineCreateOp {
+        key: key.to_vec(),
+        value: value.to_vec(),
+        ttl_seconds: ttl,
+        binding,
+    }))
+}
+
+pub fn kine_update(
+    key: &[u8],
+    value: &[u8],
+    expected: u64,
+    ttl: u32,
+    binding: Option<LeaseId>,
+) -> LogicalRequest {
+    req(CanonicalOperation::KineUpdate(KineUpdateOp {
+        key: key.to_vec(),
+        value: value.to_vec(),
+        expected_mod_revision: rev(expected),
+        ttl_seconds: ttl,
+        binding,
+    }))
+}
+
+pub fn kine_delete(key: &[u8], expected: Option<u64>) -> LogicalRequest {
+    req(CanonicalOperation::KineDelete(KineDeleteOp {
+        key: key.to_vec(),
+        expected_mod_revision: expected.map(rev),
+    }))
+}
+
 pub fn establish(epoch: u64) -> InternalCommand {
     InternalCommand::EstablishLeaseAuthority {
         namespace: NS,

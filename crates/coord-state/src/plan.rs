@@ -123,6 +123,37 @@ pub enum Outcome {
     /// The command carried an authority epoch that is not the current one
     /// (a former leader's expiration, or a stale establishment).
     ErrStaleAuthority,
+    /// Kine create succeeded; the header revision is the creation revision.
+    KineCreated,
+    /// Kine create found the key present (exact duplicate-key result).
+    ErrKeyExists,
+    /// Kine compare-and-update result from one execution point.
+    KineUpdated {
+        /// Whether the update applied.
+        updated: bool,
+        /// The current entry after the operation (`None`: key absent).
+        current: Option<KineKv>,
+    },
+    /// Kine conditional delete result from one execution point.
+    KineDeleted {
+        /// Whether the key is gone (absent keys report `true`, as the
+        /// reference bridge does).
+        deleted: bool,
+        /// The entry the operation saw (`None`: key absent).
+        prev: Option<KineKv>,
+    },
+}
+
+/// A Kine-facing entry: the stored entry plus the TTL of its private
+/// binding (never the hidden binding identity).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KineKv {
+    /// Key.
+    pub key: Vec<u8>,
+    /// Entry.
+    pub entry: KvEntry,
+    /// Kine-facing TTL in seconds (`0`: no binding).
+    pub ttl_seconds: u32,
 }
 
 /// Response to the client: header revision plus outcome.

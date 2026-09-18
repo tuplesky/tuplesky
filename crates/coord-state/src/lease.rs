@@ -34,6 +34,9 @@ pub enum LeaseStatus {
     Revoked,
     /// Expired by a matching conditional expiration (task-16).
     Expired,
+    /// A Kine private binding superseded by a later write of its key
+    /// (task-17); the record is a tombstone.
+    Replaced,
 }
 
 /// The replicated lease record stored in `lease_v1`.

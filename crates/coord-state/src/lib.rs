@@ -33,6 +33,14 @@
 //! match, and [`expiry::LeaseScheduler`] arms conservative deadlines from
 //! observation ticks under documented clock assumptions without ever
 //! consulting a clock inside application.
+//!
+//! Kine primitives (task-17; Section 6.6): `KineCreate`, `KineUpdate` and
+//! `KineDelete` are single logical operations returning every revision and
+//! conflict fact from one execution point. A positive Kine TTL creates a
+//! hidden private binding ([`lease::LeasePurpose::KinePrivate`]) attached
+//! to exactly that key version, replaced or removed atomically by the next
+//! write of the key, so a stale expiration of a replaced binding is a
+//! no-op. A failed compare changes neither data nor binding.
 #![forbid(unsafe_code)]
 #![no_std]
 #![warn(missing_docs)]
@@ -53,7 +61,7 @@ pub use expiry::{
 pub use internal::InternalCommand;
 pub use lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 pub use limits::PlanLimits;
-pub use plan::{ApplyPlan, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
+pub use plan::{ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
 pub use planner::{PlanError, plan, plan_internal};
 pub use view::{HistoricalView, KvEntry, ReadView};
 
