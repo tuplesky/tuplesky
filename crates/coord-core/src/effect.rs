@@ -9,7 +9,7 @@ use coord_types::ids::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::capability::EstablishedResult;
+use crate::capability::{EstablishedResult, ReleasedResult};
 
 /// Random 16-byte identity of one process boot, allocated by the world.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -157,4 +157,9 @@ pub enum Effect {
         /// Correlation identity.
         request: u64,
     },
+    /// Publish a released result (task-29) to the trusted boundary: the
+    /// established result and its exact response, speculative (before
+    /// materialization, under the complete learning predicate) or final.
+    /// Never events or credentials.
+    Released(ReleasedResult),
 }

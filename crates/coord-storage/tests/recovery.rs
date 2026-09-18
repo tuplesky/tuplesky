@@ -31,7 +31,7 @@ use coord_consensus::{
     LeaderConfig, LearningMode, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole, SyncDecision,
 };
 use coord_consensus::{CONSERVATIVE_KEY, CommandRecord};
-use coord_core::capability::{AdmissionReceipt, EstablishedResult, VerifierToken};
+use coord_core::capability::{AdmissionReceipt, EstablishedResult, ReleasedResult, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageEvent,
@@ -45,7 +45,10 @@ use coord_state::{LeaseStatus, Outcome, Response};
 use coord_storage::codecs::RetryRecordV1;
 use coord_storage::policy::{bootstrap_session, rule_update};
 use coord_storage::protocol::{RecoveredProtocol, read_protocol};
-use coord_storage::{Applier, GroupLimits, StoreWorker, ViewBudget, active_leases};
+use coord_storage::{
+    Applier, GroupLimits, Overlay, SpeculationLimits, StoreWorker, ViewBudget, active_leases,
+    speculate,
+};
 use coord_storage_redb::RedbEngine;
 use coord_store_api::engine::{OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
@@ -135,6 +138,14 @@ struct Node {
     /// The replica stopped executing: the materializer's outcome and the
     /// learner disagreed (a fail-closed detection, not a crash).
     halted: Option<String>,
+    /// Tentative plans of the leader's unexecuted proposals (task-29).
+    overlay: Overlay,
+    /// Results released to the trusted boundary: the capability, whether
+    /// it preceded the command's execution here, and the watch hub's
+    /// published revision at that moment.
+    released: Vec<(ReleasedResult, bool, u64)>,
+    /// Commands the speculation companion refused.
+    declined: Vec<CommandId>,
 }
 
 impl Node {
@@ -181,6 +192,12 @@ impl Node {
         match self.role.as_mut().unwrap() {
             Role::Leader(m) => m.applied(c, o).map_err(|e| format!("{e:?}")),
             Role::Follower(m) => m.applied(c, o).map_err(|e| format!("{e:?}")),
+        }
+    }
+    fn tentative_of(&self, c: &CommandId) -> Option<coord_consensus::TentativeOutcome> {
+        match self.role.as_ref()? {
+            Role::Leader(m) => m.tentative(c).cloned(),
+            Role::Follower(_) => None,
         }
     }
     fn applier(&mut self) -> &mut Applier<RedbEngine> {
@@ -297,6 +314,9 @@ fn fresh_node(me: usize, learning: LearningMode) -> Node {
         batches: 0,
         omit_dependency_rows: false,
         halted: None,
+        overlay: Overlay::new(),
+        released: Vec::new(),
+        declined: Vec::new(),
     };
     node.step(Event::Boot {
         boot_id: boot,
@@ -449,7 +469,51 @@ impl Cluster {
                     self.nodes[dest as usize].inbox.push_back((from, frame));
                 }
                 Effect::Established(result) => self.nodes[i].established.push(result),
+                Effect::Released(result) => {
+                    let node = &mut self.nodes[i];
+                    let before = !node.executed.contains(&result.established().command());
+                    let published = node.applier.as_ref().unwrap().hub().published().get();
+                    node.released.push((result, before, published));
+                }
                 other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// Speculate every proposal the leader of node `i` asks for (task-29),
+    /// releasing whatever the learned prefix allows.
+    fn speculate(&mut self, i: usize) {
+        loop {
+            if !self.nodes[i].alive {
+                return;
+            }
+            let Some(Role::Leader(leader)) = self.nodes[i].role.as_ref() else {
+                return;
+            };
+            let Some(request) = leader.next_speculable() else {
+                return;
+            };
+            let payload = leader.payload(&request.command).expect("proposed").clone();
+            let node = &mut self.nodes[i];
+            let outcome = speculate(
+                node.applier.as_ref().unwrap().worker(),
+                &mut node.overlay,
+                &SpeculationLimits::default(),
+                &request,
+                &payload,
+            );
+            let Some(Role::Leader(leader)) = node.role.as_mut() else {
+                unreachable!()
+            };
+            match outcome {
+                Ok(outcome) => {
+                    let effects = leader.speculated(outcome);
+                    self.handle(i, effects);
+                }
+                Err(_) => {
+                    leader.decline_speculation(request.command);
+                    node.declined.push(request.command);
+                }
             }
         }
     }
@@ -474,6 +538,7 @@ impl Cluster {
                     None => Vec::new(),
                 };
                 self.nodes[i].role = Some(Role::Follower(follower));
+                self.nodes[i].overlay.clear();
                 self.handle(i, effects);
             }
             let won = matches!(&self.nodes[i].role, Some(Role::Follower(f)) if f.won().is_some());
@@ -516,6 +581,9 @@ impl Cluster {
             }
             self.convert_roles();
             for i in 0..self.nodes.len() {
+                self.speculate(i);
+            }
+            for i in 0..self.nodes.len() {
                 loop {
                     if !self.nodes[i].alive || self.nodes[i].halted.is_some() {
                         break;
@@ -526,6 +594,7 @@ impl Cluster {
                     let payload = self.nodes[i].payload(&c).expect("payload known");
                     let outcome = self.nodes[i].applier().apply(c, &payload).unwrap();
                     progressed = true;
+                    self.nodes[i].overlay.retire(&c);
                     match self.nodes[i].applied(c, &outcome) {
                         Ok(effects) => {
                             self.nodes[i].executed.push(c);
@@ -598,6 +667,7 @@ impl Cluster {
                 frame: frame.clone(),
             }));
             self.handle(i, effects);
+            self.speculate(i);
         }
         command
     }
@@ -612,6 +682,8 @@ impl Cluster {
         node.role = None;
         node.applier = None;
         node.inbox.clear();
+        node.overlay.clear();
+        node.declined.clear();
         node.alive = false;
     }
 
@@ -1444,6 +1516,19 @@ fn forced_slow_and_fast_learning_yield_equal_results() {
             assert_eq!(cluster.nodes[i].executed, cluster.nodes[0].executed);
             assert_eq!(cluster.rows(i), cluster.rows(0));
         }
+        let released: Vec<(u64, CommandId, Digest32, Vec<u8>)> = cluster.nodes[0]
+            .released
+            .iter()
+            .map(|(r, _, _)| {
+                let e = r.established();
+                (
+                    e.position().get(),
+                    e.command(),
+                    e.result_digest(),
+                    r.response().to_vec(),
+                )
+            })
+            .collect();
         (
             cluster.nodes[0].executed.clone(),
             cluster.rows(0),
@@ -1451,6 +1536,7 @@ fn forced_slow_and_fast_learning_yield_equal_results() {
             acknowledged(&cluster.nodes[0]),
             fast,
             check_history(&cluster.history).ok(),
+            released,
         )
     };
     let slow = run(LearningMode::SlowOnly);
@@ -1465,6 +1551,141 @@ fn forced_slow_and_fast_learning_yield_equal_results() {
     );
     assert!(full.4 > 0, "full learning took the fast path at least once");
     assert!(slow.5 && full.5);
+    assert_eq!(slow.6, full.6, "both paths release the same results");
+    assert!(!full.6.is_empty());
+}
+
+/// The commands of the base history the speculation companion accepts:
+/// KV operations without leases at the current revision.
+fn speculable_commands(cluster: &Cluster) -> Vec<CommandId> {
+    cluster
+        .ops
+        .iter()
+        .filter(|(_, op, _)| coord_storage::speculable(op))
+        .map(|(_, _, c)| *c)
+        .collect()
+}
+
+#[test]
+fn released_results_precede_materialization_and_equal_the_established_ones() {
+    let mut cluster = Cluster::new(21);
+    for (seq, op) in base_history() {
+        cluster.admit(seq, op);
+        cluster.settle();
+    }
+    cluster.admit(7, put(b"a", b"7"));
+    cluster.admit(8, get(b"b"));
+    cluster.settle();
+    let kv = speculable_commands(&cluster);
+    assert_eq!(kv.len(), 6);
+    let leader = &cluster.nodes[0];
+    assert_eq!(leader.executed.len(), 8);
+    let by_command: BTreeMap<CommandId, &EstablishedResult> = leader
+        .established
+        .iter()
+        .map(|e| (e.command(), e))
+        .collect();
+    let records = cluster.retry_records(0);
+    // Every KV command was released speculatively before it executed,
+    // with the position, revision, digest and exact response that
+    // materialization later established and retained, and no watch event
+    // of its revision had been published at release.
+    for c in &kv {
+        let (r, before, published) = leader
+            .released
+            .iter()
+            .find(|(r, _, _)| r.established().command() == *c)
+            .unwrap_or_else(|| panic!("{c:?} released"));
+        assert!(r.speculative() && *before);
+        let e = by_command[c];
+        assert_eq!(r.established().position(), e.position());
+        assert_eq!(r.established().result_digest(), e.result_digest());
+        assert_eq!(r.established().revision(), e.revision());
+        if let Some(rev) = e.revision() {
+            assert!(*published < rev.get(), "no event before application");
+        }
+        let seq = cluster.ops.iter().find(|(_, _, cc)| cc == c).unwrap().0;
+        assert_eq!(records[&seq].response, r.response());
+    }
+    // The lease grant and the leased put were declined and never released
+    // early; materialization alone establishes them.
+    let lease_ops: Vec<CommandId> = cluster
+        .ops
+        .iter()
+        .filter(|(_, _, c)| !kv.contains(c))
+        .map(|(_, _, c)| *c)
+        .collect();
+    assert_eq!(lease_ops.len(), 2);
+    for c in &lease_ops {
+        assert!(leader.declined.contains(c), "{c:?} declined");
+        assert!(
+            leader
+                .released
+                .iter()
+                .all(|(r, _, _)| r.established().command() != *c)
+        );
+        assert!(by_command.contains_key(c));
+    }
+    // Followers release nothing; every node converges; the overlay drained.
+    assert!(cluster.nodes[1].released.is_empty());
+    assert!(cluster.nodes[2].released.is_empty());
+    assert_eq!(cluster.rows(1), cluster.rows(0));
+    assert_eq!(cluster.rows(2), cluster.rows(0));
+    assert!(cluster.nodes[0].overlay.is_empty());
+}
+
+#[test]
+fn tentative_results_of_a_lost_leader_never_surface() {
+    let mut cluster = Cluster::new(23);
+    // Nothing the leader sends reaches anyone and no acknowledgement
+    // reaches it: it speculates but never learns.
+    cluster.drop_proposals = vec![(0, 1), (0, 2)];
+    cluster.cut = vec![(1, 0), (2, 0)];
+    let c1 = cluster.admit_to(1, put(b"a", b"1"), &[0]);
+    let c2 = cluster.admit_to(2, put(b"a", b"2"), &[0, 1, 2]);
+    cluster.admit_to(1, put(b"a", b"1"), &[1, 2]);
+    cluster.settle();
+    let leader = &cluster.nodes[0];
+    let t1 = leader.tentative_of(&c1).expect("speculated");
+    let t2 = leader.tentative_of(&c2).expect("speculated");
+    assert_eq!(t1.position.get(), 1);
+    assert_eq!(t2.position.get(), 2);
+    assert!(
+        leader.released.is_empty(),
+        "nothing learned, nothing released"
+    );
+    assert!(leader.executed.is_empty());
+    // The leader is lost. The followers saw the writes the other way
+    // round and recover in that order.
+    cluster.crash(0, Tail::None);
+    cluster.cut.clear();
+    cluster.drop_proposals.clear();
+    cluster.campaign(1, ballot(1, 1));
+    cluster.settle();
+    assert_eq!(cluster.leaders(), vec![1]);
+    for i in [1usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, vec![c2, c1], "node {i}");
+    }
+    let acked = acknowledged(&cluster.nodes[1]);
+    // The tentative results would have been wrong for this history: c1
+    // now overwrites a=2 at position two; neither ever surfaced.
+    let final_c1 = acked.iter().find(|(_, c, _)| *c == c1).unwrap();
+    assert_ne!(final_c1.2, t1.result_digest);
+    assert_eq!(final_c1.0, 2);
+    cluster.observe(1);
+    cluster.observe_retries(1, 100);
+    assert!(check_history(&cluster.history).ok());
+    // The new leader's own releases equal its established results.
+    assert!(!cluster.nodes[1].released.is_empty());
+    for (r, _, _) in &cluster.nodes[1].released {
+        let e = cluster.nodes[1]
+            .established
+            .iter()
+            .find(|e| e.command() == r.established().command())
+            .unwrap();
+        assert_eq!(r.established().result_digest(), e.result_digest());
+        assert_eq!(r.established().position(), e.position());
+    }
 }
 
 #[test]
@@ -1488,6 +1709,18 @@ fn a_fast_result_followed_by_a_leader_crash_before_commit_propagation_recovers_t
         assert!(cluster.nodes[1].executed.is_empty());
         assert!(cluster.nodes[2].executed.is_empty());
         let acked = acknowledged(&cluster.nodes[0]);
+        // Both results were released speculatively, before the leader
+        // materialized them, and equal what materialization established.
+        let released: Vec<(u64, CommandId, Digest32)> = cluster.nodes[0]
+            .released
+            .iter()
+            .map(|(r, before, _)| {
+                assert!(r.speculative() && *before, "seed {seed}");
+                let e = r.established();
+                (e.position().get(), e.command(), e.result_digest())
+            })
+            .collect();
+        assert_eq!(released, acked, "seed {seed}: released equals established");
         cluster.observe(0);
         // The leader is lost before any COMMIT could propagate. Recovery
         // from r1's pre-accepted order (r2's own differs) reproduces the
