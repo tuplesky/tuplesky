@@ -63,8 +63,12 @@ pub enum ValidationError {
     EmptyRange,
     /// Too many comparisons plus branch operations in one transaction.
     TransactionTooLarge,
-    /// The same key is written more than once within one transaction branch.
+    /// Two writes in one transaction branch select a common key (an exact
+    /// key written twice, or an interval delete overlapping another write).
     DuplicateKeyInBranch,
+    /// A comparison operand does not match its target (counters for
+    /// version/revision targets, bytes for the value, a lease for the lease).
+    OperandMismatch,
     /// A nested transaction, which the initial schema excludes.
     NestedTransaction,
     /// The whole request exceeds the logical request byte budget.
@@ -87,7 +91,8 @@ impl fmt::Display for ValidationError {
             ValidationError::ValueTooLong => "value exceeds limit",
             ValidationError::EmptyRange => "range end must exceed range start",
             ValidationError::TransactionTooLarge => "transaction exceeds work limit",
-            ValidationError::DuplicateKeyInBranch => "duplicate key write within one branch",
+            ValidationError::DuplicateKeyInBranch => "overlapping key writes within one branch",
+            ValidationError::OperandMismatch => "comparison operand does not match its target",
             ValidationError::NestedTransaction => "nested transactions are unsupported",
             ValidationError::RequestTooLarge => "request exceeds byte budget",
             ValidationError::ZeroTtl => "lease TTL must be positive",
