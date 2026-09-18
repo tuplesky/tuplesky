@@ -11,6 +11,7 @@ members = [
     "crates/coord-oracle",
     "crates/coord-store-api",
     "crates/coord-store-testkit",
+    "crates/coord-storage",
     "crates/coord-storage-redb",
     "crates/coord-sim",
     "xtask",
@@ -36,6 +37,7 @@ coord-oracle = { path = "crates/coord-oracle" }
 coord-store-api = { path = "crates/coord-store-api" }
 coord-store-testkit = { path = "crates/coord-store-testkit" }
 coord-storage-redb = { path = "crates/coord-storage-redb" }
+coord-storage = { path = "crates/coord-storage" }
 coord-sim = { path = "crates/coord-sim" }
 
 # Encoding and identity (Section 16.2).

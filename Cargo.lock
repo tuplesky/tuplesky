@@ -189,6 +189,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-storage"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "coord-core",
+ "coord-storage-redb",
+ "coord-store-api",
+ "coord-store-testkit",
+ "coord-types",
+ "postcard",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "coord-storage-redb"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,25 @@
+[package]
+name = "coord-storage"
+description = "Common storage coordination: guards, lowering, stamps, bounded grouping and the durable-view gate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+coord-core.workspace = true
+coord-store-api.workspace = true
+serde = { workspace = true, features = ["std"] }
+postcard.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+coord-store-testkit.workspace = true
+coord-storage-redb.workspace = true
+tempfile.workspace = true

@@ -415,6 +415,12 @@ impl Generation {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+
+    /// Split into the engine and the root lock. The lock must outlive every
+    /// use of the engine; dropping it lets another opener in.
+    pub fn into_parts(self) -> (RedbEngine, RootLock, StoreManifestV1) {
+        (self.engine, self._lock, self.manifest)
+    }
 }
 
 /// Table definition helper re-exported for callers that inspect raw tables
