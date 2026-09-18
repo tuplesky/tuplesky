@@ -312,4 +312,12 @@ impl FjallGeneration {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+
+    /// Split into the engine and the root lock, mirroring the redb
+    /// reference: a caller that moves the engine into the common worker
+    /// must keep the lock alive for as long as it uses the engine, because
+    /// dropping it lets another opener in.
+    pub fn into_parts(self) -> (FjallEngine, RootLock, StoreManifestV1) {
+        (self.engine, self._lock, self.manifest)
+    }
 }
