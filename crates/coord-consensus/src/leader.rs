@@ -21,8 +21,8 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch};
-use coord_core::event::{Event, StorageEvent};
+use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch, StoreUpdate};
+use coord_core::event::{Event, StorageError, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
 use coord_types::identity::Digest32;
@@ -31,9 +31,9 @@ use coord_types::wire_v1::{MessageV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 use serde::{Deserialize, Serialize};
 
-use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection};
+use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandTable, InitError};
-use crate::messages::ProtocolMessage;
+use crate::messages::{PathAnchors, ProtocolMessage};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::rows::{
@@ -82,8 +82,11 @@ pub enum Rejection {
     Duplicate(CommandId),
     /// The command table is full.
     Backpressure,
-    /// A proposal batch failed; the command is not proposed.
-    ProposalFailed(CommandId),
+    /// A proposal batch was definitely rejected and is being presented
+    /// again unchanged under a new barrier.
+    ProposalRetried(CommandId),
+    /// The leader stopped leading; a new election recovers the role.
+    Fenced(FenceReason),
     /// A peer message was rejected.
     Vote(VoteError),
     /// A `NewLeader` was rejected.
@@ -105,9 +108,41 @@ pub struct Proposal {
     pub deps: Vec<CommandId>,
     /// Path evidence.
     pub path: Digest32,
+    /// Per-key path anchors published with the proposal.
+    pub paths: PathAnchors,
     /// Whether the batch is durable.
     pub durable: bool,
+    /// The rows of the batch, kept so a definitely rejected write can be
+    /// presented again unchanged under a new barrier.
+    pub updates: Vec<StoreUpdate>,
+    /// Persistence attempts made for this proposal.
+    pub attempts: u32,
 }
+
+/// Why the leader stopped leading. A fenced leader admits nothing and
+/// votes no more; the role is recovered by a new election.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FenceReason {
+    /// A proposal write's outcome is unknown, so its payload, dependency
+    /// and proposal rows may or may not be durable. Continuing to lead
+    /// could omit that state from a later recovery cut.
+    ProposalUnresolved {
+        /// The command whose write is unresolved.
+        command: CommandId,
+        /// What storage reported.
+        error: StorageError,
+    },
+    /// A definitely rejected proposal was presented again as often as
+    /// allowed without becoming durable.
+    ProposalRetriesExhausted {
+        /// The command.
+        command: CommandId,
+    },
+}
+
+/// How often a definitely rejected proposal batch is presented again
+/// before the leader stops leading.
+pub const MAX_PROPOSAL_ATTEMPTS: u32 = 3;
 
 /// The leader machine of one domain.
 #[derive(Debug)]
@@ -123,6 +158,7 @@ pub struct Leader {
     votes: BTreeMap<CommandId, VoteSet>,
     seqnum: u64,
     rejections: Vec<Rejection>,
+    fenced: Option<FenceReason>,
 }
 
 impl Leader {
@@ -143,14 +179,37 @@ impl Leader {
             votes: BTreeMap::new(),
             seqnum: 0,
             rejections: Vec::new(),
+            fenced: None,
         }
     }
 
-    /// Whether this replica leads the promised ballot.
+    /// Whether this replica leads the promised ballot: it votes in this
+    /// epoch (a non-voting role never proposes), its identity agrees with
+    /// the ballot configuration, the promised ballot is the configured
+    /// one and no promise is in flight, and it has not been fenced.
     pub fn is_leading(&self) -> bool {
-        self.ballots.promised() == self.config.quorum.ballot
-            && self.config.quorum.ballot.leader == self.config.identity.replica
+        let identity = &self.config.identity;
+        let quorum = &self.config.quorum;
+        self.fenced.is_none()
+            && identity.role == ReplicaRole::Voter
+            && identity.epoch == quorum.epoch()
+            && identity.voters == *quorum.voters()
+            && quorum.is_voter(&identity.replica)
+            && self.ballots.promised() == quorum.ballot()
+            && quorum.ballot().leader == identity.replica
             && self.ballots.in_flight().is_none()
+    }
+
+    /// Why the leader stopped leading, if it did.
+    pub const fn fenced(&self) -> Option<FenceReason> {
+        self.fenced
+    }
+
+    fn fence(&mut self, reason: FenceReason) {
+        if self.fenced.is_none() {
+            self.fenced = Some(reason);
+            self.rejections.push(Rejection::Fenced(reason));
+        }
     }
 
     /// The command table (phases, dependencies, paths).
@@ -252,7 +311,7 @@ impl Leader {
                 }
             };
         self.bindings.insert(request.retry_key, command);
-        let ballot = self.config.quorum.ballot;
+        let ballot = self.config.quorum.ballot();
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
         self.seqnum += 1;
@@ -262,7 +321,7 @@ impl Leader {
             .expect("just initialized")
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
-        let updates = alloc::vec![
+        let updates: Vec<StoreUpdate> = alloc::vec![
             payload_update(
                 &command,
                 &PayloadRecordV1 {
@@ -287,13 +346,14 @@ impl Leader {
         let persist = Effect::Persist(PersistBatch {
             barrier,
             base: None,
-            updates,
+            updates: updates.clone(),
         });
         let proposal = FastAck {
             replica: self.config.identity.replica,
             ballot,
             command,
             deps: init.deps.clone(),
+            paths: init.paths.clone(),
             path: init.path,
             seqnum: Some(seqnum),
         };
@@ -338,7 +398,10 @@ impl Leader {
                 seqnum,
                 deps: init.deps,
                 path: init.path,
+                paths: init.paths,
                 durable: false,
+                updates,
+                attempts: 1,
             },
         );
         alloc::vec![persist]
@@ -362,16 +425,102 @@ impl Leader {
                         p.durable = true;
                     }
                 }
-                StorageEvent::Failed { .. } => {
-                    self.proposals.remove(&command);
-                    self.votes.remove(&command);
-                    self.rejections.push(Rejection::ProposalFailed(command));
+                // Only a definite rejection proves the rows are absent; the
+                // same batch is then presented again unchanged, keeping the
+                // command, its identity binding and its dependents intact.
+                // Any other failure may have written some or all of them, so
+                // the leader stops leading instead of continuing over state
+                // a later recovery cut could miss.
+                StorageEvent::Failed {
+                    error: StorageError::DefinitelyNotCommitted,
+                    ..
+                } => {
+                    let retry = self.retry_proposal(command);
+                    self.advance_pending();
+                    let mut effects = retry;
+                    effects.extend(self.release());
+                    return effects;
+                }
+                StorageEvent::Failed { error, .. } => {
+                    self.fence(FenceReason::ProposalUnresolved {
+                        command,
+                        error: *error,
+                    });
                 }
                 _ => {}
             }
         }
         self.advance_pending();
         self.release()
+    }
+
+    /// Present a definitely rejected proposal batch again, unchanged, under
+    /// a new barrier, and republish the sends that waited on the old one.
+    /// The leader stops leading once the attempts are spent.
+    fn retry_proposal(&mut self, command: CommandId) -> Vec<Effect> {
+        let Some(proposal) = self.proposals.get(&command) else {
+            return Vec::new();
+        };
+        if proposal.attempts >= MAX_PROPOSAL_ATTEMPTS {
+            self.fence(FenceReason::ProposalRetriesExhausted { command });
+            return Vec::new();
+        }
+        let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
+            return Vec::new();
+        };
+        let barrier = alloc.allocate();
+        let proposal = self.proposals.get_mut(&command).expect("checked above");
+        proposal.barrier = barrier;
+        proposal.attempts += 1;
+        let batch = PersistBatch {
+            barrier,
+            base: None,
+            updates: proposal.updates.clone(),
+        };
+        let ack = FastAck {
+            replica: self.config.identity.replica,
+            ballot: self.config.quorum.ballot(),
+            command,
+            deps: proposal.deps.clone(),
+            paths: proposal.paths.clone(),
+            path: proposal.path,
+            seqnum: Some(proposal.seqnum),
+        };
+        let seqnum = proposal.seqnum;
+        let deps = proposal.deps.clone();
+        let path = proposal.path;
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut().expect("booted");
+        for voter in &self.config.identity.voters {
+            if *voter == self.config.identity.replica {
+                continue;
+            }
+            outbox.publish(PendingSend {
+                context,
+                requires: alloc::vec![barrier],
+                to: PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: ProtocolMessage::Proposal(ack.clone()).encode(),
+            });
+        }
+        outbox.publish(PendingSend {
+            context,
+            requires: alloc::vec![barrier],
+            to: self.config.frontend,
+            frame: ProtocolMessage::LeaderReply {
+                ballot,
+                command,
+                seqnum,
+                deps,
+                path,
+            }
+            .encode(),
+        });
+        self.rejections.push(Rejection::ProposalRetried(command));
+        alloc::vec![Effect::Persist(batch)]
     }
 
     /// Adopt the leader's own order for every durable proposal whose
@@ -404,7 +553,7 @@ impl Leader {
             .map_or_else(Vec::new, |o| o.release(&promised))
     }
 
-    fn on_peer(&mut self, from: ReplicaId, frame: &[u8]) -> Vec<Effect> {
+    fn on_peer(&mut self, from: PeerId, frame: &[u8]) -> Vec<Effect> {
         let Ok(message) = ProtocolMessage::decode(frame) else {
             self.rejections.push(Rejection::MalformedPeerMessage);
             return Vec::new();
@@ -438,8 +587,8 @@ impl Leader {
                     }
                 }
             }
-            ProtocolMessage::FastAck(ack) => self.collect(from, Vote::Fast(ack)),
-            ProtocolMessage::SlowAck(ack) => self.collect(from, Vote::Slow(ack)),
+            ProtocolMessage::FastAck(ack) => self.collect(from.replica, Vote::Fast(ack)),
+            ProtocolMessage::SlowAck(ack) => self.collect(from.replica, Vote::Slow(ack)),
             ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. } => Vec::new(),
@@ -484,7 +633,12 @@ impl DeterministicMachine for Leader {
             Event::Admitted(request) => self.on_admitted(&request.frame),
             Event::Storage(event) => self.on_storage(&event),
             Event::Peer(message) => {
-                let from = message.provenance().from();
+                // The authenticated sender, at the exact incarnation the
+                // transport bound; replies are addressed to it.
+                let from = PeerId {
+                    replica: message.provenance().from(),
+                    incarnation: message.provenance().incarnation(),
+                };
                 self.on_peer(from, message.frame())
             }
             Event::Timer(_)

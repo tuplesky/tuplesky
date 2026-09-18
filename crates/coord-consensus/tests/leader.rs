@@ -9,9 +9,9 @@ use std::path::PathBuf;
 
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandTable, ConfigurationIdentity, FastAck,
-    GuardViolation, Leader, LeaderConfig, Phase, ProtocolMessage, Rejection, ReplicaRole, SlowAck,
-    VoteError, decode_dependency, decode_payload, decode_proposal, dependency_key, payload_key,
-    proposal_key,
+    FenceReason, GuardViolation, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Phase,
+    ProtocolMessage, Rejection, ReplicaRole, SlowAck, VoteError, decode_dependency, decode_payload,
+    decode_proposal, dependency_key, payload_key, proposal_key,
 };
 use coord_core::capability::{AdmissionReceipt, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -66,6 +66,12 @@ fn config() -> LeaderConfig {
         frontend: FRONTEND,
         capacity: 8,
     }
+}
+
+fn leader_with_role(role: ReplicaRole) -> Leader {
+    let mut config = config();
+    config.identity.role = role;
+    Leader::new(config, None)
 }
 
 fn booted() -> Leader {
@@ -172,8 +178,13 @@ fn summarize(effect: &Effect) -> String {
                 .collect();
             let message = ProtocolMessage::decode(frame).unwrap();
             let kind = match &message {
-                ProtocolMessage::Proposal(p) => {
-                    format!("proposal seq={} deps={}", p.seqnum.unwrap(), p.deps.len())
+                ProtocolMessage::Proposal(ack) => {
+                    format!(
+                        "proposal seq={} deps={} anchors={}",
+                        ack.seqnum.unwrap(),
+                        ack.deps.len(),
+                        ack.paths.len()
+                    )
                 }
                 ProtocolMessage::LeaderReply { seqnum, deps, .. } => {
                     format!("leader-reply seq={seqnum} deps={}", deps.len())
@@ -395,22 +406,30 @@ fn premature_phases_are_blocked_while_dependencies_lag() {
     let (e2, c2) = admitted(2, 2, 2);
     let effects1 = leader.step(e1);
     let effects2 = leader.step(e2);
-    // c1's batch fails: c1 is not proposed; c2 (durable) still cannot
-    // accept because its dependency lags, and the table refuses commit and
-    // execution for both.
+    // c1's batch is definitely rejected: the same rows are presented again
+    // under a new barrier, so c1 keeps its identity and its dependents;
+    // c2 (durable) still cannot accept because its dependency lags, and
+    // the table refuses commit and execution for both.
     let Effect::Persist(b1) = &effects1[0] else {
         panic!()
     };
-    let dropped = leader.step(Event::Storage(StorageEvent::Failed {
+    let retried = leader.step(Event::Storage(StorageEvent::Failed {
         barrier_id: b1.barrier,
         error: StorageError::DefinitelyNotCommitted,
     }));
-    assert!(dropped.is_empty(), "no send is released by a failed batch");
+    let [Effect::Persist(again)] = retried.as_slice() else {
+        panic!("the rejected batch is presented again: {retried:?}")
+    };
+    assert_ne!(again.barrier, b1.barrier, "a fresh barrier");
+    assert_eq!(again.updates, b1.updates, "the same rows, unchanged");
     assert_eq!(
         leader.take_rejections(),
-        vec![Rejection::ProposalFailed(c1)]
+        vec![Rejection::ProposalRetried(c1)]
     );
-    assert!(leader.proposal(&c1).is_none());
+    let proposal = leader.proposal(&c1).expect("still proposed");
+    assert_eq!(proposal.attempts, 2);
+    assert!(!proposal.durable);
+    assert!(leader.is_leading(), "a definite rejection does not fence");
     let released = leader.step(durable(&effects2, 1).remove(0));
     assert_eq!(released.len(), 3, "c2's own evidence is published");
     assert_eq!(
@@ -431,8 +450,107 @@ fn premature_phases_are_blocked_while_dependencies_lag() {
         table.execute(c2),
         Err(GuardViolation::DependencyNotExecuted { dep: c1 })
     );
-    // The dropped sends of c1 are gone: its proposal never reaches anyone.
-    assert_eq!(leader.pending_sends(), 0);
+    // c1's sends wait on the new barrier instead of the rejected one.
+    assert_eq!(leader.pending_sends(), 3);
+}
+
+#[test]
+fn an_unresolved_proposal_write_stops_the_leader() {
+    for error in [
+        StorageError::Indeterminate,
+        StorageError::Quarantine,
+        StorageError::NoSpace,
+    ] {
+        let mut leader = booted();
+        let (e1, c1) = admitted(1, 1, 1);
+        let effects = leader.step(e1);
+        let Effect::Persist(batch) = &effects[0] else {
+            panic!()
+        };
+        assert!(leader.is_leading());
+        // The rows may or may not be durable: the leader stops instead of
+        // admitting more work over state a recovery cut could miss.
+        let out = leader.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: batch.barrier,
+            error,
+        }));
+        assert!(out.is_empty(), "nothing is persisted or released: {out:?}");
+        assert_eq!(
+            leader.fenced(),
+            Some(FenceReason::ProposalUnresolved { command: c1, error })
+        );
+        assert!(!leader.is_leading());
+        assert_eq!(
+            leader.take_rejections(),
+            vec![Rejection::Fenced(FenceReason::ProposalUnresolved {
+                command: c1,
+                error
+            })]
+        );
+        // The command stays in the table: its rows may exist.
+        assert!(leader.proposal(&c1).is_some());
+        assert_eq!(leader.table().phase_of(&c1), Some(Phase::PreAccept));
+        // A further request is refused, naming the promised ballot.
+        let (e2, _) = admitted(2, 2, 2);
+        assert!(leader.step(e2).is_empty());
+        assert!(matches!(
+            leader.take_rejections().as_slice(),
+            [Rejection::NotLeading { .. }]
+        ));
+    }
+}
+
+#[test]
+fn repeated_rejection_stops_the_leader_instead_of_retrying_forever() {
+    let mut leader = booted();
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut effects = leader.step(e1);
+    for attempt in 1..MAX_PROPOSAL_ATTEMPTS {
+        let Effect::Persist(batch) = &effects[0] else {
+            panic!()
+        };
+        effects = leader.step(Event::Storage(StorageEvent::Failed {
+            barrier_id: batch.barrier,
+            error: StorageError::DefinitelyNotCommitted,
+        }));
+        assert_eq!(leader.proposal(&c1).unwrap().attempts, attempt + 1);
+        assert!(leader.is_leading());
+        leader.take_rejections();
+    }
+    let Effect::Persist(batch) = &effects[0] else {
+        panic!()
+    };
+    let out = leader.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: batch.barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    assert!(out.is_empty());
+    assert_eq!(
+        leader.fenced(),
+        Some(FenceReason::ProposalRetriesExhausted { command: c1 })
+    );
+    assert!(!leader.is_leading());
+}
+
+#[test]
+fn a_non_voting_role_never_leads() {
+    for role in [ReplicaRole::Observer, ReplicaRole::Learner] {
+        let mut leader = leader_with_role(role);
+        leader.step(Event::Boot {
+            boot_id: BootId([1; 16]),
+            incarnation: ReplicaIncarnation::new(1).unwrap(),
+        });
+        assert!(
+            !leader.is_leading(),
+            "{role:?} names the ballot's leader but never votes"
+        );
+        let (e1, _) = admitted(1, 1, 1);
+        assert!(leader.step(e1).is_empty(), "{role:?} persists nothing");
+        assert!(matches!(
+            leader.take_rejections().as_slice(),
+            [Rejection::NotLeading { .. }]
+        ));
+    }
 }
 
 #[test]
@@ -493,11 +611,13 @@ fn votes_are_collected_but_never_learned_here() {
     let effects = leader.step(e1);
     leader.step(durable(&effects, 1).remove(0));
     let path = leader.proposal(&c1).unwrap().path;
+    let paths = leader.proposal(&c1).unwrap().paths.clone();
     let ack = |replica: u8| FastAck {
         replica: r(replica),
         ballot: ballot(0, 0),
         command: c1,
         deps: vec![],
+        paths: paths.clone(),
         path,
         seqnum: None,
     };

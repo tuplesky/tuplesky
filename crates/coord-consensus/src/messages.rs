@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::vote::{FastAck, SlowAck};
 
+/// Per-key path digests through one command, in key order.
+pub type PathAnchors = Vec<(Vec<u8>, Digest32)>;
+
 /// A peer message of the ballot/promise increment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProtocolMessage {
@@ -33,7 +36,8 @@ pub enum ProtocolMessage {
         replica: ReplicaId,
     },
     /// The leader's proposal for a command (`MFastAck` from the leader,
-    /// carrying its sequence number).
+    /// carrying its sequence number and the per-key path anchors a
+    /// follower feeds to `CommandTable::record_leader_path`).
     Proposal(FastAck),
     /// A follower's fast acknowledgement (`MFastAck`).
     FastAck(FastAck),

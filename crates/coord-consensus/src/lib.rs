@@ -76,8 +76,10 @@ pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireEr
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,
 };
-pub use leader::{CONSERVATIVE_KEY, Leader, LeaderConfig, Proposal, Rejection};
-pub use messages::ProtocolMessage;
+pub use leader::{
+    CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal, Rejection,
+};
+pub use messages::{PathAnchors, ProtocolMessage};
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, FastQuorumClass};
