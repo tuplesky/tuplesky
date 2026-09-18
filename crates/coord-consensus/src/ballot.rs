@@ -100,8 +100,28 @@ pub struct PromiseInFlight {
     pub ballot: Ballot,
     /// Barrier of the promise row.
     pub barrier: BarrierId,
-    /// Candidate the reply goes to.
-    pub to: ReplicaId,
+    /// Candidate (at its authenticated incarnation) the reply goes to.
+    pub to: PeerId,
+}
+
+/// Why a synchronization was not recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncRejection {
+    /// The ballot's epoch is not this configuration.
+    WrongEpoch {
+        /// Configured epoch.
+        expected: ConfigurationEpoch,
+        /// Epoch received.
+        got: ConfigurationEpoch,
+    },
+    /// The ballot precedes the highest synchronized ballot (a delayed
+    /// Sync of an older ballot): the record never regresses.
+    Regression {
+        /// Highest synchronized ballot.
+        synced: Ballot,
+        /// Ballot received.
+        got: Ballot,
+    },
 }
 
 /// The effects of accepting a `NewLeader`.
@@ -129,7 +149,11 @@ pub struct BallotState {
     identity: ConfigurationIdentity,
     promised: Ballot,
     synced: Ballot,
-    in_flight: Option<PromiseInFlight>,
+    /// Every promise persisted and not yet durable, in ascending ballot
+    /// order. Each completes independently: a durable row advances the
+    /// promise to its ballot (if higher), a failed row is forgotten while
+    /// the others stay tracked, so no accepted promise is ever lost.
+    in_flight: Vec<PromiseInFlight>,
     elections: u64,
 }
 
@@ -149,7 +173,7 @@ impl BallotState {
             identity,
             promised,
             synced,
-            in_flight: None,
+            in_flight: Vec::new(),
             elections: 0,
         }
     }
@@ -170,9 +194,15 @@ impl BallotState {
         self.synced
     }
 
-    /// The promise in flight, if any.
-    pub const fn in_flight(&self) -> Option<&PromiseInFlight> {
-        self.in_flight.as_ref()
+    /// The highest promise in flight, if any (the bound new ballots must
+    /// exceed).
+    pub fn in_flight(&self) -> Option<&PromiseInFlight> {
+        self.in_flight.last()
+    }
+
+    /// Every promise in flight, in ascending ballot order.
+    pub fn promises_in_flight(&self) -> &[PromiseInFlight] {
+        &self.in_flight
     }
 
     /// Number of durable promise advances since recovery (same-boot
@@ -200,24 +230,28 @@ impl BallotState {
     }
 
     fn bound(&self) -> Ballot {
-        match &self.in_flight {
+        match self.in_flight.last() {
             Some(p) => p.ballot,
             None => self.promised,
         }
     }
 
-    /// Handle `NewLeader { ballot }` from `from`. On acceptance the promise
-    /// row is persisted and the reply is published requiring it and
-    /// `outstanding` (every barrier submitted before this cut and not yet
-    /// complete).
+    /// Handle `NewLeader { ballot }` from the candidate `from` (its
+    /// authenticated replica and incarnation, which the reply is addressed
+    /// to so a stale incarnation of the candidate never receives it). On
+    /// acceptance the promise row is persisted and the reply is published
+    /// requiring it and `outstanding` (every barrier submitted before this
+    /// cut and not yet complete).
     pub fn on_new_leader(
         &mut self,
-        from: ReplicaId,
+        from: PeerId,
         ballot: Ballot,
         boot: BootId,
         alloc: &mut BarrierAllocator,
         outstanding: &[BarrierId],
     ) -> Result<PromiseEffects, PromiseRejection> {
+        let candidate = from;
+        let from = candidate.replica;
         if ballot.epoch != self.identity.epoch {
             return Err(PromiseRejection::WrongEpoch {
                 expected: self.identity.epoch,
@@ -259,10 +293,7 @@ impl BallotState {
         let reply = PendingSend {
             context: self.context(boot, ballot, LocalJournalSeq::ZERO),
             requires,
-            to: PeerId {
-                replica: from,
-                incarnation: ReplicaIncarnation::ZERO,
-            },
+            to: candidate,
             frame: ProtocolMessage::Promise {
                 ballot,
                 synced: self.synced,
@@ -270,32 +301,35 @@ impl BallotState {
             }
             .encode(),
         };
-        self.in_flight = Some(PromiseInFlight {
+        self.in_flight.push(PromiseInFlight {
             ballot,
             barrier,
-            to: from,
+            to: candidate,
         });
         Ok(PromiseEffects { persist, reply })
     }
 
-    /// Observe a storage fact; a durable promise row advances the promised
-    /// ballot, a failed one leaves the earlier promise in force.
+    /// Observe a storage fact about one in-flight promise: a durable row
+    /// advances the promised ballot to its ballot (rows of several promises
+    /// may complete in any order; the promise never moves backward), a
+    /// failed one is dropped while the earlier promise, and every other
+    /// promise in flight, stay in force.
     pub fn on_storage(&mut self, event: &StorageEvent) -> Option<PromiseOutcome> {
-        let pending = self.in_flight.as_ref()?;
-        if event.barrier() != Some(pending.barrier) {
-            return None;
-        }
+        let index = self
+            .in_flight
+            .iter()
+            .position(|p| Some(p.barrier) == event.barrier())?;
         match event {
             StorageEvent::JournalDurable { .. } => {
-                let ballot = pending.ballot;
-                self.promised = ballot;
-                self.in_flight = None;
+                let ballot = self.in_flight.remove(index).ballot;
+                if ballot.compare_same_epoch(&self.promised) == Some(core::cmp::Ordering::Greater) {
+                    self.promised = ballot;
+                }
                 self.elections += 1;
                 Some(PromiseOutcome::Promised(ballot))
             }
             StorageEvent::Failed { .. } => {
-                let ballot = pending.ballot;
-                self.in_flight = None;
+                let ballot = self.in_flight.remove(index).ballot;
                 Some(PromiseOutcome::Failed(ballot))
             }
             StorageEvent::Materialized { .. } | StorageEvent::LocalCheckpointPublished { .. } => {
@@ -305,12 +339,26 @@ impl BallotState {
     }
 
     /// Record that this replica synchronized to `ballot` (adopted a Sync);
-    /// the caller persists the row.
-    pub fn mark_synced(&mut self, ballot: Ballot) -> PromiseRecordV1 {
+    /// the caller persists the row. The ballot must belong to this
+    /// configuration and not precede the highest synchronized ballot: a
+    /// delayed Sync of an older ballot changes nothing.
+    pub fn mark_synced(&mut self, ballot: Ballot) -> Result<PromiseRecordV1, SyncRejection> {
+        if ballot.epoch != self.identity.epoch {
+            return Err(SyncRejection::WrongEpoch {
+                expected: self.identity.epoch,
+                got: ballot.epoch,
+            });
+        }
+        if ballot.compare_same_epoch(&self.synced) == Some(core::cmp::Ordering::Less) {
+            return Err(SyncRejection::Regression {
+                synced: self.synced,
+                got: ballot,
+            });
+        }
         self.synced = ballot;
-        PromiseRecordV1 {
+        Ok(PromiseRecordV1 {
             promised: self.promised,
             synced: self.synced,
-        }
+        })
     }
 }

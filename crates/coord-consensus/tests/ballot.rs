@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use coord_consensus::{
     BallotState, CommandTable, ConfigurationIdentity, GuardViolation, InitError, Phase,
-    PromiseOutcome, PromiseRecordV1, PromiseRejection, ProtocolMessage, ReplicaRole,
+    PromiseOutcome, PromiseRecordV1, PromiseRejection, ProtocolMessage, ReplicaRole, SyncRejection,
     decode_promise, promise_key,
 };
 use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch, StoreUpdate};
@@ -20,6 +20,13 @@ use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
 use coord_types::{CommandId, RetryKey};
+
+fn peer(i: u8) -> PeerId {
+    PeerId {
+        replica: r(i),
+        incarnation: ReplicaIncarnation::new(3).unwrap(),
+    }
+}
 
 fn r(i: u8) -> ReplicaId {
     ReplicaId([i; 16])
@@ -78,7 +85,7 @@ fn promise_reply_waits_for_the_row_and_every_batch_before_the_cut() {
     // Two batches submitted before the election, not yet durable.
     let pending = [a.allocate(), a.allocate()];
     let effects = state
-        .on_new_leader(r(2), ballot(1, 1, 2), b, &mut a, &pending)
+        .on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &pending)
         .unwrap();
     let Effect::Persist(batch) = &effects.persist else {
         panic!("promise must persist first")
@@ -128,16 +135,16 @@ fn promise_reply_waits_for_the_row_and_every_batch_before_the_cut() {
     // and after it is durable the promise only grows.
     let mut state = voter();
     let e = state
-        .on_new_leader(r(2), ballot(1, 5, 2), b, &mut a, &[])
+        .on_new_leader(peer(2), ballot(1, 5, 2), b, &mut a, &[])
         .unwrap();
     assert_eq!(
-        state.on_new_leader(r(0), ballot(1, 4, 0), b, &mut a, &[]),
+        state.on_new_leader(peer(0), ballot(1, 4, 0), b, &mut a, &[]),
         Err(PromiseRejection::NotHigher {
             promised: ballot(1, 5, 2)
         })
     );
     assert_eq!(
-        state.on_new_leader(r(2), ballot(1, 5, 2), b, &mut a, &[]),
+        state.on_new_leader(peer(2), ballot(1, 5, 2), b, &mut a, &[]),
         Err(PromiseRejection::NotHigher {
             promised: ballot(1, 5, 2)
         })
@@ -164,7 +171,7 @@ fn old_messages_cannot_lower_a_recovered_promise() {
     let mut storage = StorageModel::default();
     let mut state = voter();
     let e = state
-        .on_new_leader(r(2), ballot(1, 7, 2), b1, &mut a, &[])
+        .on_new_leader(peer(2), ballot(1, 7, 2), b1, &mut a, &[])
         .unwrap();
     let Effect::Persist(batch) = e.persist else {
         panic!()
@@ -198,20 +205,20 @@ fn old_messages_cannot_lower_a_recovered_promise() {
     // An old NewLeader arriving after the restart cannot lower it; the same
     // ballot is not higher either; a higher one is accepted.
     assert_eq!(
-        recovered.on_new_leader(r(0), ballot(1, 3, 0), b2, &mut a2, &[]),
+        recovered.on_new_leader(peer(0), ballot(1, 3, 0), b2, &mut a2, &[]),
         Err(PromiseRejection::NotHigher {
             promised: ballot(1, 7, 2)
         })
     );
     assert_eq!(
-        recovered.on_new_leader(r(2), ballot(1, 7, 2), b2, &mut a2, &[]),
+        recovered.on_new_leader(peer(2), ballot(1, 7, 2), b2, &mut a2, &[]),
         Err(PromiseRejection::NotHigher {
             promised: ballot(1, 7, 2)
         })
     );
     assert!(
         recovered
-            .on_new_leader(r(0), ballot(1, 8, 0), b2, &mut a2, &[])
+            .on_new_leader(peer(0), ballot(1, 8, 0), b2, &mut a2, &[])
             .is_ok()
     );
     // A promise that was in flight at the crash never became durable: the
@@ -220,7 +227,7 @@ fn old_messages_cannot_lower_a_recovered_promise() {
     let mut state = voter();
     let mut storage = StorageModel::default();
     let e = state
-        .on_new_leader(r(2), ballot(1, 9, 2), b1, &mut a, &[])
+        .on_new_leader(peer(2), ballot(1, 9, 2), b1, &mut a, &[])
         .unwrap();
     let Effect::Persist(batch) = e.persist else {
         panic!()
@@ -248,7 +255,7 @@ fn wrong_configuration_identity_never_votes() {
     // Another epoch.
     let mut state = voter();
     assert_eq!(
-        state.on_new_leader(r(2), ballot(2, 1, 2), b, &mut a, &[]),
+        state.on_new_leader(peer(2), ballot(2, 1, 2), b, &mut a, &[]),
         Err(PromiseRejection::WrongEpoch {
             expected: epoch(1),
             got: epoch(2)
@@ -256,12 +263,12 @@ fn wrong_configuration_identity_never_votes() {
     );
     // A non-voter candidate.
     assert_eq!(
-        state.on_new_leader(r(9), ballot(1, 1, 9), b, &mut a, &[]),
+        state.on_new_leader(peer(9), ballot(1, 1, 9), b, &mut a, &[]),
         Err(PromiseRejection::NotAVoter { from: r(9) })
     );
     // A ballot naming a leader other than the sender.
     assert_eq!(
-        state.on_new_leader(r(2), ballot(1, 1, 0), b, &mut a, &[]),
+        state.on_new_leader(peer(2), ballot(1, 1, 0), b, &mut a, &[]),
         Err(PromiseRejection::LeaderMismatch {
             leader: r(0),
             from: r(2)
@@ -273,7 +280,7 @@ fn wrong_configuration_identity_never_votes() {
     for role in [ReplicaRole::Observer, ReplicaRole::Learner] {
         let mut s = BallotState::recover(identity(role), ballot(1, 0, 0), None);
         assert_eq!(
-            s.on_new_leader(r(2), ballot(1, 1, 2), b, &mut a, &[]),
+            s.on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[]),
             Err(PromiseRejection::NotVoting { role })
         );
     }
@@ -300,7 +307,7 @@ fn a_same_boot_election_fences_obsolete_vote_callbacks() {
     outbox.publish(send);
     // An election for ballot (1, 1, r2) completes in the same boot.
     let e = state
-        .on_new_leader(r(2), ballot(1, 1, 2), b, &mut a, &[vote])
+        .on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[vote])
         .unwrap();
     let Effect::Persist(batch) = &e.persist else {
         panic!()
@@ -402,6 +409,14 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     table.execute(c2).unwrap();
     table.execute(c1).unwrap();
     assert_eq!(table.phase_of(&c1), Some(Phase::Executed));
+    // Phases only advance: a delayed or duplicate ACCEPT or COMMIT for an
+    // executed command is idempotent and keeps the dependencies the later
+    // phase was reached with.
+    table.accept(c1, vec![]).unwrap();
+    table.commit(c1).unwrap();
+    table.execute(c1).unwrap();
+    assert_eq!(table.phase_of(&c1), Some(Phase::Executed));
+    assert_eq!(table.record(&c1).unwrap().deps, vec![c2]);
     // A third command initialized now depends on the last in the index.
     assert_eq!(table.initialize(c3, Digest32([3; 32]), k), Ok(vec![c1]));
     assert_eq!(table.len(), 3);
@@ -420,4 +435,99 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
         base: None,
         updates: vec![],
     };
+}
+
+#[test]
+fn every_in_flight_promise_completes_independently() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    // Ballot 5 is promised and still in flight when ballot 10 arrives: the
+    // higher ballot is admitted (10 > 5) and both promises stay tracked.
+    let e5 = state
+        .on_new_leader(peer(2), ballot(1, 5, 2), b, &mut a, &[])
+        .unwrap();
+    let e10 = state
+        .on_new_leader(peer(0), ballot(1, 10, 0), b, &mut a, &[])
+        .unwrap();
+    let barrier = |e: &coord_consensus::PromiseEffects| match &e.persist {
+        Effect::Persist(batch) => batch.barrier,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(state.promises_in_flight().len(), 2);
+    assert_eq!(state.in_flight().unwrap().ballot, ballot(1, 10, 0));
+    // Replies are addressed to the candidate's authenticated incarnation.
+    assert_eq!(e5.reply.to, peer(2));
+    assert_eq!(e10.reply.to, peer(0));
+    assert_eq!(state.promises_in_flight()[0].to, peer(2));
+    // Ballot 5's row becomes durable first: the promise advances to 5 and
+    // ballot 10 stays in flight.
+    assert_eq!(
+        state.on_storage(&durable(barrier(&e5), 1)),
+        Some(PromiseOutcome::Promised(ballot(1, 5, 2)))
+    );
+    assert_eq!(state.promised(), ballot(1, 5, 2));
+    assert_eq!(state.promises_in_flight().len(), 1);
+    // Ballot 10's row fails: the durable promise is 5, not the genesis
+    // ballot, so a later ballot below 5 is still refused.
+    assert_eq!(
+        state.on_storage(&StorageEvent::Failed {
+            barrier_id: barrier(&e10),
+            error: StorageError::NoSpace
+        }),
+        Some(PromiseOutcome::Failed(ballot(1, 10, 0)))
+    );
+    assert_eq!(state.promised(), ballot(1, 5, 2));
+    assert_eq!(state.in_flight(), None);
+    assert_eq!(
+        state.on_new_leader(peer(0), ballot(1, 4, 0), b, &mut a, &[]),
+        Err(PromiseRejection::NotHigher {
+            promised: ballot(1, 5, 2)
+        })
+    );
+    // Rows completing out of order never move the promise backward.
+    let e6 = state
+        .on_new_leader(peer(0), ballot(1, 6, 0), b, &mut a, &[])
+        .unwrap();
+    let e7 = state
+        .on_new_leader(peer(2), ballot(1, 7, 2), b, &mut a, &[])
+        .unwrap();
+    state.on_storage(&durable(barrier(&e7), 2));
+    assert_eq!(state.promised(), ballot(1, 7, 2));
+    state.on_storage(&durable(barrier(&e6), 3));
+    assert_eq!(state.promised(), ballot(1, 7, 2));
+    assert_eq!(state.elections(), 3);
+    assert_eq!(state.in_flight(), None);
+}
+
+#[test]
+fn the_synchronized_ballot_never_regresses_or_leaves_the_epoch() {
+    let mut state = voter();
+    let record = state.mark_synced(ballot(1, 4, 0)).unwrap();
+    assert_eq!(record.synced, ballot(1, 4, 0));
+    // A delayed Sync of an older ballot, and one from another epoch, are
+    // rejected without touching the record; the same ballot is idempotent.
+    assert_eq!(
+        state.mark_synced(ballot(1, 2, 2)),
+        Err(SyncRejection::Regression {
+            synced: ballot(1, 4, 0),
+            got: ballot(1, 2, 2)
+        })
+    );
+    assert_eq!(
+        state.mark_synced(ballot(2, 9, 0)),
+        Err(SyncRejection::WrongEpoch {
+            expected: epoch(1),
+            got: epoch(2)
+        })
+    );
+    assert_eq!(state.synced(), ballot(1, 4, 0));
+    assert_eq!(
+        state.mark_synced(ballot(1, 4, 0)).unwrap().synced,
+        ballot(1, 4, 0)
+    );
+    assert_eq!(
+        state.mark_synced(ballot(1, 6, 2)).unwrap().synced,
+        ballot(1, 6, 2)
+    );
 }
