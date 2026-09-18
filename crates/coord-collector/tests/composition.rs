@@ -1168,7 +1168,11 @@ fn unary_and_finalized_watch_dispatch() {
         replay_from_view(&hub, gated.view(), registration.id, NS, from, through).unwrap();
     }
     hub.replay_complete(registration.id).unwrap();
-    assert!(w.frontend.pump_watch(&hub, 5, 9, |_| true).is_empty());
+    assert!(
+        w.frontend
+            .pump_watch(&hub, 5, 9, usize::MAX, |_| true)
+            .is_empty()
+    );
 
     // Two writes: hold the followers' evidence and the leader's release so
     // the leader has a tentative outcome while nothing is applied yet.
@@ -1188,13 +1192,15 @@ fn unary_and_finalized_watch_dispatch() {
         "nothing applied at the follower"
     );
     assert!(
-        w.frontend.pump_watch(&hub, 5, 9, |_| true).is_empty(),
+        w.frontend
+            .pump_watch(&hub, 5, 9, usize::MAX, |_| true)
+            .is_empty(),
         "a tentative value never reaches a watch"
     );
     let (c2, _) = w.submit(1, 2, put(b"w", b"2"));
     w.settle();
     assert!(w.delivered(&c1).is_some() && w.delivered(&c2).is_some());
-    let frames = w.frontend.pump_watch(&hub, 5, 9, |_| true);
+    let frames = w.frontend.pump_watch(&hub, 5, 9, usize::MAX, |_| true);
     let mut revisions = Vec::new();
     for f in &frames {
         match decode_stream(f).unwrap().as_slice() {
@@ -1228,7 +1234,11 @@ fn unary_and_finalized_watch_dispatch() {
         )),
         other => panic!("{other:?}"),
     }
-    assert!(w.frontend.pump_watch(&hub, 5, 9, |_| true).is_empty());
+    assert!(
+        w.frontend
+            .pump_watch(&hub, 5, 9, usize::MAX, |_| true)
+            .is_empty()
+    );
     assert_eq!(hub.open_watches(), 0);
 
     // Unary: a read after the writes sees the applied value; a frame the

@@ -273,21 +273,28 @@ impl Dispatcher {
         }
     }
 
-    /// Drain what the hub has for a watch into frames: complete-revision
-    /// batches chunked with `complete` on the last chunk, progress, and
-    /// the close. `authorize` is the output authorization of each batch.
+    /// Take up to `max_items` items the hub has for a watch into frames:
+    /// complete-revision batches chunked with `complete` on the last
+    /// chunk, progress, and the close. `authorize` is the output
+    /// authorization of each selected batch (task-37 binds it to one
+    /// fresh policy barrier per bounded pump).
     pub fn pump_watch(
         &mut self,
         hub: &WatchHub,
         connection: u64,
         watch_id: u64,
+        max_items: usize,
         mut authorize: impl FnMut(&WatchBatch) -> bool,
     ) -> Vec<Vec<u8>> {
         let Some(id) = self.watches.get(&(connection, watch_id)).copied() else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        while let Some(item) = hub.next(id, &mut authorize) {
+        let mut taken = 0;
+        while taken < max_items
+            && let Some(item) = hub.next(id, &mut authorize)
+        {
+            taken += 1;
             match item {
                 WatchItem::Batch(batch) => {
                     for fragment in chunk(&batch, MAX_EVENTS_PER_BATCH) {
