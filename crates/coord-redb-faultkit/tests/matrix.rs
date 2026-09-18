@@ -101,7 +101,7 @@ fn recovered_state(engine: &RedbEngine, max: u64) -> (u64, u64) {
             present = i;
         }
     }
-    (meta.stamp.store_seq.journal_seq().get(), present)
+    (meta.stamp.store_seq().journal_seq().get(), present)
 }
 
 #[test]
@@ -481,6 +481,59 @@ fn generation_directory_faults_fail_closed() {
 
 #[test]
 fn write_failure_is_reported_and_leaves_state_consistent() {
+    // Every write of the third transaction fails in turn, with nothing,
+    // one sector, four sectors, or every whole sector but the last of the
+    // buffer having landed first: the acknowledged prefix is recovered
+    // whatever the crash image keeps.
+    let (engine, shared) = fresh(FaultPlan::default());
+    let mut worker = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
+    assert_eq!(workload(&mut worker, 3), 3);
+    let after_two = {
+        let (engine, probe) = fresh(FaultPlan::default());
+        let mut w = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
+        assert_eq!(workload(&mut w, 2), 2);
+        probe.ops()
+    };
+    let third_ops = shared.ops() - after_two;
+    drop(worker);
+    for k in 1..=third_ops {
+        for prefix in [0usize, 512, 2048, usize::MAX] {
+            for tail in [Tail::All, Tail::Seeded(k * 7 + prefix.min(1000) as u64)] {
+                let (engine, shared) = fresh(FaultPlan::default());
+                let mut worker =
+                    StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
+                assert_eq!(workload(&mut worker, 2), 2);
+                let base = shared.ops();
+                shared.set_plan(FaultPlan {
+                    fail_write_at: Some(base + k),
+                    fail_write_prefix: prefix,
+                    ..FaultPlan::default()
+                });
+                let acked = workload(&mut worker, 1);
+                if shared.log().iter().all(|o| *o != Op::Failed) {
+                    // Ordinal k was not a write (a sync or set_len): nothing
+                    // failed and the transaction went through.
+                    assert_eq!(acked, 1);
+                    continue;
+                }
+                assert_eq!(
+                    acked, 0,
+                    "k={k} prefix={prefix}: a failed write must not acknowledge"
+                );
+                shared.crash();
+                let image = shared.crash_image(tail);
+                drop(worker);
+                let (engine, _) = reopen(image, FaultPlan::default())
+                    .unwrap_or_else(|e| panic!("k={k} prefix={prefix} tail={tail:?}: {e}"));
+                let (seq, present) = recovered_state(&engine, 3);
+                assert_eq!(seq, present, "k={k} prefix={prefix} tail={tail:?}");
+                assert!(
+                    seq == 2 || seq == 3,
+                    "k={k} prefix={prefix} tail={tail:?}: seq={seq}"
+                );
+            }
+        }
+    }
     let (engine, shared) = fresh(FaultPlan::default());
     let mut worker = StoreWorker::open(engine, boot(1), inc(), GroupLimits::default()).unwrap();
     assert_eq!(workload(&mut worker, 2), 2);

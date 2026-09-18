@@ -268,14 +268,7 @@ impl RedbEngine {
             return Err(EngineError::new(ErrorClass::Busy, "handles outstanding"));
         }
         let db = Arc::get_mut(&mut self.db).expect("sole owner");
-        match db.check_integrity() {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(EngineError::new(
-                ErrorClass::Corrupt,
-                "integrity check repaired or found inconsistencies",
-            )),
-            Err(e) => Err(EngineError::new(ErrorClass::Corrupt, redact(&e))),
-        }
+        check_integrity(db)
     }
 
     /// Process-model crash: drop every handle to the database file and
@@ -304,10 +297,13 @@ impl RedbEngine {
         // open must not leave the in-memory placeholder serving reads or
         // accepting "durable" commits that vanish with the process.
         self.quarantined = true;
-        let db = redb::Database::builder()
+        let mut db = redb::Database::builder()
             .set_cache_size(cache_bytes)
             .open(&path)
             .map_err(|e| EngineError::new(ErrorClass::Corrupt, redact(&e)))?;
+        // Corruption outside the meta pages does not stop `open`; every
+        // generation reopen verifies the tables before serving anything.
+        check_integrity(&mut db)?;
         self.db = Arc::new(db);
         self.quarantined = false;
         Ok(())
@@ -319,6 +315,19 @@ impl RedbEngine {
             Source::File { path, .. } => Some(path),
             Source::Backend => None,
         }
+    }
+}
+
+/// Verify every table's checksums; a repair or an inconsistency is
+/// corruption (nothing is repaired into a different state silently).
+fn check_integrity(db: &mut redb::Database) -> Result<(), EngineError> {
+    match db.check_integrity() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "integrity check repaired or found inconsistencies",
+        )),
+        Err(e) => Err(EngineError::new(ErrorClass::Corrupt, redact(&e))),
     }
 }
 

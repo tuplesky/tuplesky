@@ -144,16 +144,20 @@ impl RootLock {
         } else if !root.is_dir() {
             return Err(OpenError::NotInitialized);
         }
+        // An initialized root is one that carries `CURRENT`; its lock file
+        // may be (re)created because it is a per-root artifact that a copy
+        // or restore can lose. An uninitialized root gets no lock file.
+        let create_lock = create || root.join(CURRENT).is_file();
         let path = root.join("lock");
         let file = match File::options()
             .read(true)
             .write(true)
-            .create(create)
+            .create(create_lock)
             .truncate(false)
             .open(&path)
         {
             Ok(file) => file,
-            Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if !create_lock && e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(OpenError::NotInitialized);
             }
             Err(e) => return Err(OpenError::Io(e)),
@@ -393,8 +397,14 @@ impl Generation {
             check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
             check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
         }
+        // Damage outside the meta pages does not stop `open`; verify every
+        // table before the generation is returned, and quarantine on failure.
+        let mut engine = RedbEngine::from_database(db, db_path, options.cache_bytes);
+        engine
+            .verify_integrity()
+            .map_err(|e| OpenError::Corrupt(format!("integrity: {e}")))?;
         Ok(Generation {
-            engine: RedbEngine::from_database(db, db_path, options.cache_bytes),
+            engine,
             manifest,
             _lock: lock,
             directory,
