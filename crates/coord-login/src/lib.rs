@@ -18,16 +18,26 @@
 //!   multi-audience rule and keeps the principal as `(issuer, subject)`,
 //!   never an email.
 //!
+//! Device authorization ([`device`]) reuses the same upstream login from
+//! the verification page: the CLI polls with a secret device code within
+//! bounded intervals and attempts, the user code alone grants nothing,
+//! and an approved grant is taken by exactly one poll.
+//!
 //! Upstream codes are never reused as service codes; pending logins are
 //! bounded broker-local state (a restart forces a fresh login); every
 //! secret is redacted from diagnostics.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod device;
 pub mod http;
 pub mod service;
 pub mod upstream;
 
+pub use device::{
+    DeviceAuthorization, DeviceDisplay, DeviceError, DeviceLimits, DeviceLogin, Poll,
+    normalize_user_code, user_code,
+};
 pub use service::{
     Approved, LoginError, LoginLimits, RedeemRequest, Redeemed, Registration, ServiceLogin,
     StartRequest, Started, UpstreamIdentity, azp_policy,
