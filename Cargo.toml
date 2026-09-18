@@ -9,6 +9,7 @@ members = [
     "crates/coord-core",
     "crates/coord-oracle",
     "crates/coord-store-api",
+    "crates/coord-store-testkit",
     "crates/coord-sim",
     "xtask",
     "tools/raft-engine-smoke",
@@ -30,6 +31,7 @@ coord-types = { path = "crates/coord-types" }
 coord-core = { path = "crates/coord-core" }
 coord-oracle = { path = "crates/coord-oracle" }
 coord-store-api = { path = "crates/coord-store-api" }
+coord-store-testkit = { path = "crates/coord-store-testkit" }
 coord-sim = { path = "crates/coord-sim" }
 
 # Encoding and identity (Section 16.2).
