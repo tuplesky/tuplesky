@@ -31,6 +31,7 @@ const (
 // Logical operation discriminants (frozen `CanonicalOperation` order).
 const (
 	opRange      = 0
+	opCompact    = 8
 	opKineCreate = 9
 	opKineUpdate = 10
 	opKineDelete = 11
@@ -198,6 +199,21 @@ func (d KineDeleteOp) encodeOp(w *writer) {
 	}
 }
 
+// CompactOp advances the ordered MVCC retention floor to Revision (at
+// most the current revision); physical maintenance follows asynchronously.
+type CompactOp struct {
+	Revision uint64
+}
+
+func (CompactOp) discriminant() uint64 { return opCompact }
+func (c CompactOp) validate() (int, error) {
+	if c.Revision == 0 {
+		return 0, invalid("ZeroRevision")
+	}
+	return 0, nil
+}
+func (c CompactOp) encodeOp(w *writer) { w.varint(c.Revision) }
+
 func validateKineWrite(key, value []byte, ttl uint32, binding *[idBytes]byte) (int, error) {
 	if err := validateKey(key); err != nil {
 		return 0, err
@@ -278,6 +294,10 @@ func DecodeLogical(payload []byte) (LogicalRequest, error) {
 		out.Op, err = decodeKineUpdate(r)
 	case opKineDelete:
 		out.Op, err = decodeKineDelete(r)
+	case opCompact:
+		var rev uint64
+		rev, err = r.u64()
+		out.Op = CompactOp{Revision: rev}
 	default:
 		return LogicalRequest{}, invalid("UnsupportedOperation")
 	}

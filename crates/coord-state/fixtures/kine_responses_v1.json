@@ -384,6 +384,14 @@
       "payload_hex": "081601010b2f72656769737472792f61027661030702000000"
     },
     {
+      "name": "compacted",
+      "response": {
+        "revision": 20,
+        "outcome": "Compacted"
+      },
+      "payload_hex": "1404"
+    },
+    {
       "name": "err-compacted",
       "response": {
         "revision": 20,
