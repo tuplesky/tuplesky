@@ -111,7 +111,8 @@ Observed transitive facts to carry into task-j02:
 |---|---|---|
 | Go toolchain unspecified | `go 1.26.0` | quic-go v0.62.0 requires Go 1.26; `go mod tidy` raised the directive |
 | Rust minimum 1.90 | MSRV stays 1.90; exact toolchain 1.94.1 | raft-engine's own `rust-version` is 1.85; all workspace crates check with 1.90.0 |
-| tokio 1.53.1, quinn 0.11.11, rustls 0.23.44, fjall 3.1.10, openidconnect 4.0.1, reqwest 0.12.28 and the other unused candidates | Not added yet | Added by first consuming task with exact pins; presence in the index was confirmed on 2026-09-18 |
+| fjall 3.1.10, openidconnect 4.0.1, reqwest 0.12.28 and the other unused candidates | Not added yet | Added by first consuming task with exact pins; presence in the index was confirmed on 2026-09-18 |
+| rustls 0.23.44 | Pinned at `=0.23.45` | RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries) is patched in 0.23.45; quinn 0.11.11 and quinn-proto 0.11.17 accept it, and no other selection changes |
 | `toml` requirement `=1.1.6` | Kept | Resolves to `1.1.6+spec-1.1.0` |
 | Workspace license `FSL-1.1-ALv2` | `deny.toml` ignores private (`publish = false`) crates | Not an SPDX identifier; not a third-party dependency |
 
