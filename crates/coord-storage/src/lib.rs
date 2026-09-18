@@ -37,10 +37,16 @@
 //!   consumers with a resume point instead of skipping, progress that never
 //!   overtakes delivered events, per-output authorization and resumable
 //!   cancellation. [`sync`] swaps its primitives for loom under `cfg(loom)`.
+//! * [`compaction`] (task-14): the replicated retention floor lowered to
+//!   explicit view/watch holds gives the effective floor; incremental,
+//!   budgeted history and event garbage collection keeps the newest version
+//!   or tombstone at or below that floor per key plus everything newer, and
+//!   persists its cursors so it resumes after a crash.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod codecs;
+pub mod compaction;
 pub mod lowering;
 pub mod materialize;
 pub mod retry;
@@ -50,6 +56,7 @@ pub mod views;
 pub mod watch;
 pub mod worker;
 
+pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};
 pub use retry::{Admission, Resolution, RetryBinding};
