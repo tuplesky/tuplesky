@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::engine::{EngineError, ErrorClass};
 use crate::seq::StoreSeq;
 
-/// Maximum payload accepted inside an envelope (largest admitted value plus
-/// metadata headroom).
-pub const MAX_ENVELOPE_PAYLOAD: usize = 1024 * 1024 + 4096;
+/// Maximum payload accepted inside an envelope: the largest schema-valid row
+/// plus metadata headroom. An event record carries the new entry and the
+/// previous entry, each with a value of up to `MAX_VALUE_BYTES`, so the cap
+/// is two values, two keys and headroom.
+pub const MAX_ENVELOPE_PAYLOAD: usize = 2 * (1024 * 1024) + 2 * (8 * 1024) + 4096;
 
 /// Bounded value envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

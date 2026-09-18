@@ -655,3 +655,115 @@ fn crash_mid_apply_leaves_no_partial_events_or_frontier_mismatch() {
         }
     }
 }
+
+#[test]
+fn apply_plan_waits_for_its_own_barrier_behind_older_queued_work() {
+    use coord_core::effect::{PersistBatch, StoreUpdate};
+    use coord_core::event::StorageEvent;
+    let boot = BootId([9; 16]);
+    let limits = GroupLimits {
+        max_records: 1,
+        ..GroupLimits::default()
+    };
+    let mut worker = StoreWorker::open(ModelEngine::new(), boot, inc(), limits).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    // Older protocol work sits in the queue and fills the first group.
+    let older = alloc.allocate();
+    worker
+        .submit(PersistBatch {
+            barrier: older,
+            base: None,
+            updates: vec![StoreUpdate {
+                collection: Collection::ProtocolV1.id(),
+                key: b"vote".to_vec(),
+                value: Some(b"v".to_vec()),
+            }],
+        })
+        .unwrap();
+    let request = put(b"k", b"v");
+    let gated = worker.reader().snapshot().unwrap();
+    let view = build_read_view(&gated, NS, &request, ViewBudget::default()).unwrap();
+    let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
+    drop(gated);
+    let mine = alloc.allocate();
+    let outcome = apply_plan(&mut worker, mine, NS, &planned).unwrap();
+    let ApplyOutcome::Applied(events) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        events.iter().any(
+            |e| matches!(e, StorageEvent::JournalDurable { barrier_id, .. } if *barrier_id == mine)
+        ),
+        "the plan's own barrier must be durable before Applied is reported: {events:?}"
+    );
+    assert!(events.iter().any(
+        |e| matches!(e, StorageEvent::JournalDurable { barrier_id, .. } if *barrier_id == older)
+    ));
+    assert_eq!(worker.queued(), 0);
+    let view = worker.reader().snapshot().unwrap();
+    assert!(
+        view.view()
+            .get(
+                Collection::KvCurrentV1.id(),
+                &coord_storage::codecs::current_key(&NS, b"k")
+            )
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn transactions_get_a_historical_snapshot_per_revision_they_read() {
+    let mut domain = Domain::new(ModelEngine::new(), 1);
+    domain.run(&put(b"k", b"v1"));
+    domain.run(&put(b"k", b"v2"));
+    domain.run(&put(b"k", b"v3"));
+    let range_at = |r: u64| {
+        BranchOp::Range(RangeOp {
+            range: KeyRange::exact(b"k".to_vec()),
+            revision: Some(rev(r)),
+            limit: 0,
+            keys_only: false,
+            count_only: false,
+        })
+    };
+    let txn = req(
+        NS,
+        CanonicalOperation::Txn(TxnOp {
+            compares: vec![],
+            success: vec![range_at(1), range_at(2)],
+            failure: vec![],
+        }),
+    );
+    let response = domain.run(&txn);
+    let Outcome::Txn { results, .. } = response.outcome else {
+        panic!()
+    };
+    let values: Vec<Vec<u8>> = results
+        .iter()
+        .map(|r| match r {
+            Outcome::Range { items, .. } => items[0].entry.value.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(values, vec![b"v1".to_vec(), b"v2".to_vec()]);
+}
+
+#[test]
+fn a_maximum_size_value_stays_readable_through_views() {
+    let mut domain = Domain::new(ModelEngine::new(), 1);
+    let big = vec![0xab; coord_types::logical_v1::limits::MAX_VALUE_BYTES];
+    domain.run(&put(b"big", &big));
+    domain.run(&put(b"big", &big));
+    let response = domain.run(&get(KeyRange::exact(b"big".to_vec()), None, 0));
+    let Outcome::Range { items, .. } = response.outcome else {
+        panic!()
+    };
+    assert_eq!(items[0].entry.value.len(), big.len());
+    // History rows of the same size are readable at an explicit revision.
+    let response = domain.run(&get(KeyRange::exact(b"big".to_vec()), Some(1), 0));
+    let Outcome::Range { items, .. } = response.outcome else {
+        panic!()
+    };
+    assert_eq!(items[0].entry.value.len(), big.len());
+}
