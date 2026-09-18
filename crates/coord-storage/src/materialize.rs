@@ -102,6 +102,13 @@ pub fn plan_to_batch(
                     value: None,
                 });
             }
+            Mutation::LeaseAuthority { epoch } => {
+                updates.push(StoreUpdate {
+                    collection: Collection::MetaV1.id(),
+                    key: meta_fields::LEASE_AUTHORITY.to_vec(),
+                    value: Some(codecs::encode_counter(epoch.get())?),
+                });
+            }
             Mutation::CompactTo { revision } => {
                 updates.push(StoreUpdate {
                     collection: Collection::MetaV1.id(),

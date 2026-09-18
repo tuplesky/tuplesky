@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use coord_core::effect::{BootId, PersistBatch};
 use coord_core::outbox::BarrierAllocator;
 use coord_redb_faultkit::{FaultBackend, FaultPlan, Tail};
-use coord_state::{LeaseStatus, Outcome, PlanLimits, plan};
+use coord_state::{InternalCommand, LeaseStatus, Outcome, PlanLimits, plan, plan_internal};
 use coord_storage::codecs;
 use coord_storage::retry::{self, Admission, RetryBinding};
 use coord_storage::{
-    ApplyOutcome, GroupLimits, StoreWorker, ViewBudget, apply_plan, build_read_view, events_at,
+    ApplyOutcome, GroupLimits, StoreWorker, ViewBudget, active_leases, apply_plan,
+    build_internal_view, build_read_view, events_at,
 };
 use coord_storage_redb::RedbEngine;
 use coord_store_api::engine::{LocalEngine, OrderedRead, ScanRequest, SnapshotSource};
@@ -66,6 +67,27 @@ fn revoke(id: LeaseId) -> LogicalRequest {
 
 fn ttl(id: LeaseId, keys: bool) -> LogicalRequest {
     req(CanonicalOperation::LeaseTimeToLive { lease_id: id, keys })
+}
+
+fn keep_alive(id: LeaseId) -> LogicalRequest {
+    req(CanonicalOperation::LeaseKeepAlive { lease_id: id })
+}
+
+fn establish(epoch: u64) -> InternalCommand {
+    InternalCommand::EstablishLeaseAuthority {
+        namespace: NS,
+        epoch: LeaseAuthorityEpoch::new(epoch).unwrap(),
+    }
+}
+
+fn expire(id: LeaseId, seq: u64, epoch: u64) -> InternalCommand {
+    InternalCommand::ExpireLease {
+        namespace: NS,
+        lease_id: id,
+        generation: LeaseGeneration::new(1).unwrap(),
+        expected_renewal_sequence: seq,
+        authority_epoch: LeaseAuthorityEpoch::new(epoch).unwrap(),
+    }
 }
 
 fn retry_key(seq: u64) -> RetryKey {
@@ -138,6 +160,22 @@ impl<E: LocalEngine> Domain<E> {
             .unwrap()
             {
                 ApplyOutcome::Applied(_) => return (admission, planned.response.outcome),
+                ApplyOutcome::Replan => continue,
+                ApplyOutcome::Indeterminate => {
+                    self.worker.reconcile().unwrap();
+                }
+            }
+        }
+    }
+
+    fn run_internal(&mut self, command: &InternalCommand) -> Outcome {
+        loop {
+            let gated = self.worker.reader().snapshot().unwrap();
+            let view = build_internal_view(&gated, command, ViewBudget::default()).unwrap();
+            let planned = plan_internal(command, &view, &PlanLimits::default()).unwrap();
+            drop(gated);
+            match apply_plan(&mut self.worker, self.alloc.allocate(), NS, &planned, None).unwrap() {
+                ApplyOutcome::Applied(_) => return planned.response.outcome,
                 ApplyOutcome::Replan => continue,
                 ApplyOutcome::Indeterminate => {
                     self.worker.reconcile().unwrap();
@@ -523,4 +561,173 @@ fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
     );
     assert_eq!(d.lease(L1).unwrap().status, LeaseStatus::Revoked);
     assert!(d.bindings(L1).is_empty());
+}
+
+#[test]
+fn a_retried_keepalive_extends_once_and_renewals_are_replicated() {
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session();
+    d.run_as(ALICE, &grant(L1, 30));
+    let k = keep_alive(L1);
+    let renewed = |seq: u64| Outcome::LeaseKeptAlive {
+        lease_id: L1,
+        generation: LeaseGeneration::new(1).unwrap(),
+        renewal_sequence: seq,
+        ttl_seconds: 30,
+    };
+    let (admission, outcome) = d.run_bound(ALICE, &k, Some(1));
+    assert_eq!(admission, Admission::New);
+    assert_eq!(outcome, renewed(1));
+    assert_eq!(d.lease(L1).unwrap().renewal_sequence, 1);
+    // The same invocation presented again returns the retained renewal and
+    // does not extend the lease a second time.
+    let (admission, outcome) = d.run_bound(ALICE, &k, Some(1));
+    assert!(matches!(admission, Admission::Retry(_)));
+    assert_eq!(outcome, renewed(1));
+    assert_eq!(d.lease(L1).unwrap().renewal_sequence, 1);
+    // A new invocation is a new replicated renewal.
+    let (_, outcome) = d.run_bound(ALICE, &k, Some(2));
+    assert_eq!(outcome, renewed(2));
+    assert_eq!(d.lease(L1).unwrap().renewal_sequence, 2);
+    assert_eq!(d.kv_revision(), 0, "renewals take no KV revision");
+    assert_eq!(d.run_as(BOB, &keep_alive(L1)), Outcome::ErrLeasePermission);
+}
+
+#[test]
+fn expiration_through_storage_is_conditional_and_recovery_lists_active_leases() {
+    let (backend, _) = FaultBackend::new(Vec::new(), FaultPlan::default());
+    let mut d = Domain::new(RedbEngine::create_on_backend(backend, 4 << 20).unwrap());
+    d.run_as(ALICE, &grant(L1, 5));
+    d.run_as(ALICE, &grant(L2, 5));
+    d.run_as(ALICE, &put(b"a", b"1", Some(L1)));
+    d.run_as(ALICE, &put(b"b", b"2", Some(L1)));
+    d.run_as(ALICE, &put(b"c", b"3", Some(L2)));
+    // No authority yet: nothing expires, not even a command carrying the
+    // zero sentinel the unestablished frontier holds.
+    assert_eq!(
+        d.run_internal(&expire(L1, 0, 1)),
+        Outcome::ErrStaleAuthority
+    );
+    assert_eq!(
+        d.run_internal(&expire(L1, 0, 0)),
+        Outcome::ErrStaleAuthority,
+        "the zero epoch never authorizes an expiration"
+    );
+    assert_eq!(d.lease(L1).unwrap().status, LeaseStatus::Active);
+    assert_eq!(
+        d.run_internal(&establish(1)),
+        Outcome::LeaseAuthorityEstablished {
+            epoch: LeaseAuthorityEpoch::new(1).unwrap()
+        }
+    );
+    assert_eq!(d.run_internal(&establish(1)), Outcome::ErrStaleAuthority);
+    // A renewal ordered first makes the old expiration a no-op.
+    d.run_as(ALICE, &keep_alive(L1));
+    assert_eq!(d.run_internal(&expire(L1, 0, 1)), Outcome::ExpireStale);
+    assert_eq!(d.kv_revision(), 3);
+    // Matching: attachments deleted in one revision, record marked, index cleared.
+    assert_eq!(
+        d.run_internal(&expire(L1, 1, 1)),
+        Outcome::LeaseExpired { deleted: 2 }
+    );
+    assert_eq!(d.kv_revision(), 4);
+    let gated = d.worker.reader().snapshot().unwrap();
+    assert_eq!(events_at(gated.view(), rev(4)).unwrap().unwrap().len(), 2);
+    let recovered = active_leases(gated.view(), ViewBudget::default()).unwrap();
+    drop(gated);
+    assert_eq!(
+        recovered.len(),
+        1,
+        "only the surviving lease is armed on recovery"
+    );
+    assert_eq!(recovered[0].0, L2);
+    assert_eq!(recovered[0].1.renewal_sequence, 0);
+    assert_eq!(d.lease(L1).unwrap().status, LeaseStatus::Expired);
+    assert!(d.bindings(L1).is_empty());
+    assert_eq!(d.run_as(ALICE, &keep_alive(L1)), Outcome::ErrLeaseNotFound);
+    // A successor authority fences the former epoch's expirations.
+    d.run_internal(&establish(2));
+    assert_eq!(
+        d.run_internal(&expire(L2, 0, 1)),
+        Outcome::ErrStaleAuthority
+    );
+    assert!(d.lease(L2).unwrap().status == LeaseStatus::Active);
+    assert_eq!(
+        d.run_internal(&expire(L2, 0, 2)),
+        Outcome::LeaseExpired { deleted: 1 }
+    );
+    assert_eq!(d.kv_revision(), 5);
+    let gated = d.worker.reader().snapshot().unwrap();
+    assert!(
+        active_leases(gated.view(), ViewBudget::default())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn active_lease_recovery_pages_past_tombstones_within_a_small_budget() {
+    // Ended leases stay as tombstones and are examined by the recovery
+    // scan; with far more of them than one budget admits, recovery must
+    // still reach every active lease by paging.
+    use coord_storage::active_leases_page;
+    let mut d = Domain::new(ModelEngine::new());
+    let mut active = Vec::new();
+    for i in 0..40u8 {
+        let id = LeaseId([i + 0x10; 16]);
+        d.run_as(ALICE, &grant(id, 30));
+        if i % 8 == 0 {
+            active.push(id);
+        } else {
+            assert_eq!(
+                d.run_as(ALICE, &revoke(id)),
+                Outcome::LeaseRevoked { deleted: 0 }
+            );
+        }
+    }
+    let budget = ViewBudget {
+        max_rows: 7,
+        max_bytes: 1 << 20,
+    };
+    let gated = d.worker.reader().snapshot().unwrap();
+    let mut after = None;
+    let mut pages = 0;
+    let mut found = Vec::new();
+    loop {
+        let page = active_leases_page(gated.view(), after, budget).unwrap();
+        pages += 1;
+        assert!(page.leases.len() <= 7);
+        found.extend(page.leases.iter().map(|(id, _)| *id));
+        match page.next {
+            Some(next) => {
+                assert!(after.is_none_or(|a: LeaseId| next > a), "pages advance");
+                after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert!(pages >= 6, "40 rows under a 7-row budget take several pages");
+    assert_eq!(found, active);
+    assert_eq!(
+        active_leases(gated.view(), budget)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        active,
+        "the drained listing pages internally"
+    );
+    // A budget too small for even one row is an error, not an empty page
+    // that would never advance.
+    assert!(
+        active_leases_page(
+            gated.view(),
+            None,
+            ViewBudget {
+                max_rows: 1,
+                max_bytes: 8,
+            }
+        )
+        .is_err()
+    );
 }

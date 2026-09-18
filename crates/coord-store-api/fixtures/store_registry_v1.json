@@ -98,7 +98,8 @@
     "applied_stamp",
     "execution_frontier",
     "kv_revision",
-    "retention_floor"
+    "retention_floor",
+    "lease_authority"
   ],
   "stamp_example_hex": "01012482028202abababababababababababababababababababababababababababababababab",
   "envelope_example_hex": "8202030300ff07"

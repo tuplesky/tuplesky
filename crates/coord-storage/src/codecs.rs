@@ -4,10 +4,10 @@
 use coord_state::lease::LeaseRecord;
 use coord_state::view::KvEntry;
 use coord_state::{KvEvent, KvEventKind};
-use coord_store_api::engine::{EngineError, ErrorClass};
+use coord_store_api::engine::{EngineError, ErrorClass, OrderedRead};
 use coord_store_api::envelope::StoreEnvelopeV1;
-use coord_store_api::registry::meta_fields;
-use coord_types::ids::{KvRevision, LeaseGeneration, LeaseId, NamespaceId};
+use coord_store_api::registry::{Collection, meta_fields};
+use coord_types::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId};
 use coord_types::ordered_key;
 use serde::{Deserialize, Serialize};
 
@@ -250,6 +250,15 @@ pub fn read_retention_floor<V: coord_store_api::engine::OrderedRead>(
         Some(bytes) => KvRevision::new(decode_counter(&bytes)?)
             .map_err(|_| corrupt("retention floor out of range")),
         None => Ok(KvRevision::ZERO),
+    }
+}
+
+/// Read the lease expiry authority epoch (`ZERO` when never established).
+pub fn read_lease_authority<V: OrderedRead>(view: &V) -> Result<LeaseAuthorityEpoch, EngineError> {
+    match view.get(Collection::MetaV1.id(), meta_fields::LEASE_AUTHORITY)? {
+        None => Ok(LeaseAuthorityEpoch::ZERO),
+        Some(bytes) => LeaseAuthorityEpoch::new(decode_counter(&bytes)?)
+            .map_err(|_| corrupt("lease authority out of range")),
     }
 }
 
