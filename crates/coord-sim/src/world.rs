@@ -88,6 +88,8 @@ struct Node {
     incarnation: ReplicaIncarnation,
     clock_offset_ms: u64,
     last_clock_tick: Option<u64>,
+    /// Whether the current boot's machine has received `Event::Boot`.
+    booted: bool,
     persists: u64,
     held: Vec<(EffectContext, Vec<BarrierId>, PeerId, Vec<u8>)>,
 }
@@ -135,12 +137,17 @@ pub struct World {
     trace: blake3::Hasher,
     trace_len: u64,
     crashes: u32,
+    events_before_boot: u64,
+    stale_incarnation_sends: u64,
     started: bool,
 }
 
 impl World {
     /// Build a world for `scenario`; nothing runs until [`World::step`].
     pub fn new(scenario: Scenario) -> Self {
+        if let Err(e) = scenario.validate() {
+            panic!("invalid scenario: {e}");
+        }
         let mut rng = NamedStreams::new(scenario.seed);
         let mut nodes = Vec::new();
         for _ in 0..scenario.nodes {
@@ -153,6 +160,7 @@ impl World {
                 incarnation: ReplicaIncarnation::new(1).expect("bounded"),
                 clock_offset_ms,
                 last_clock_tick: None,
+                booted: false,
                 persists: 0,
                 held: Vec::new(),
             });
@@ -168,8 +176,22 @@ impl World {
             trace: blake3::Hasher::new_derive_key("tuplesky coord-sim trace v1"),
             trace_len: 0,
             crashes: 0,
+            events_before_boot: 0,
+            stale_incarnation_sends: 0,
             started: false,
         }
+    }
+
+    /// Events delivered to a machine before its `Boot` event in the current
+    /// boot; always zero, kept as an observable invariant.
+    pub fn events_before_boot(&self) -> u64 {
+        self.events_before_boot
+    }
+
+    /// Sends addressed to a node's obsolete or unknown incarnation and
+    /// therefore dropped (the `PeerId` fencing contract).
+    pub fn stale_incarnation_sends(&self) -> u64 {
+        self.stale_incarnation_sends
     }
 
     /// Scenario being run.
@@ -230,6 +252,7 @@ impl World {
         n.boot = Some(boot_id);
         n.boot_tick = self.schedule.now();
         n.last_clock_tick = None;
+        n.booted = false;
         n.held.clear();
         let incarnation = n.incarnation;
         let rows = n.storage.durable_rows();
@@ -284,7 +307,13 @@ impl World {
             return;
         }
         let now = self.schedule.now();
-        if self.nodes[node as usize].last_clock_tick != Some(now) {
+        let is_boot = matches!(event, Event::Boot { .. });
+        if !is_boot && !self.nodes[node as usize].booted {
+            self.events_before_boot += 1;
+        }
+        // `Boot` is the first event a machine sees: the clock snapshot for
+        // this tick is injected before the first non-boot event instead.
+        if !is_boot && self.nodes[node as usize].last_clock_tick != Some(now) {
             self.nodes[node as usize].last_clock_tick = Some(now);
             let clock = self.clock(node);
             self.record(b"clock", node, &clock.monotonic_ticks.to_be_bytes());
@@ -308,6 +337,9 @@ impl World {
         };
         let payload = format!("{event:?}");
         self.record(kind, node, payload.as_bytes());
+        if is_boot {
+            self.nodes[node as usize].booted = true;
+        }
         let effects = self.nodes[node as usize]
             .machine
             .as_mut()
@@ -441,6 +473,21 @@ impl World {
             self.record(b"send-unknown-peer", from, &[]);
             return;
         };
+        if usize::from(target) >= self.nodes.len() {
+            self.record(b"send-unknown-peer", from, &[]);
+            return;
+        }
+        // A `PeerId` addresses one exact incarnation. Anything else is fenced
+        // here exactly as a production transport must fence it.
+        if to.incarnation != self.nodes[usize::from(target)].incarnation {
+            self.stale_incarnation_sends += 1;
+            self.record(
+                b"send-stale-incarnation",
+                from,
+                &to.incarnation.get().to_be_bytes(),
+            );
+            return;
+        }
         let delivery = self.network.decide(&mut self.rng, from, target);
         for delay in delivery.copies {
             self.schedule.insert_after(
@@ -616,5 +663,40 @@ impl World {
     /// Explicit key type re-export for drivers that inspect ordering.
     pub fn key_type() -> core::marker::PhantomData<EventKey> {
         core::marker::PhantomData
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay::{ActorKind, Scenario};
+
+    #[test]
+    fn sends_to_a_stale_incarnation_are_fenced_before_scheduling() {
+        let mut world = World::new(Scenario::new([1; 32], ActorKind::DurableEcho, 2));
+        let before = world.schedule.len();
+        let stale = PeerId {
+            replica: replica_of(1),
+            incarnation: ReplicaIncarnation::new(2).unwrap(),
+        };
+        world.transmit(0, stale, vec![1]);
+        assert_eq!(world.stale_incarnation_sends(), 1);
+        assert_eq!(world.schedule.len(), before, "nothing was scheduled");
+        let current = PeerId {
+            replica: replica_of(1),
+            incarnation: ReplicaIncarnation::new(1).unwrap(),
+        };
+        world.transmit(0, current, vec![1]);
+        assert_eq!(world.stale_incarnation_sends(), 1);
+        assert!(
+            world.schedule.len() > before,
+            "the exact incarnation is delivered"
+        );
+        // A replica outside the scenario is unknown, not a panic.
+        let unknown = PeerId {
+            replica: replica_of(7),
+            incarnation: ReplicaIncarnation::new(1).unwrap(),
+        };
+        world.transmit(0, unknown, vec![1]);
     }
 }
