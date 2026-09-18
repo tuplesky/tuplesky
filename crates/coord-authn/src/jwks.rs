@@ -81,8 +81,14 @@ pub enum KeyLookup<'a> {
     /// refresh budget allows a fetch of the configured endpoint. The
     /// caller installs the document and looks up again.
     NeedRefresh,
-    /// Unknown here and no refresh is allowed now.
+    /// Unknown here and the issuer was asked recently enough that it
+    /// would have published the key: a denial.
     Unknown,
+    /// Unknown here, and no refresh may be requested right now because
+    /// the window's budget is spent. Treated as a denial: a flood of
+    /// distinct unknown kids must not become a flood of fetches. A burst
+    /// for one unknown kid is coalesced instead, by the refresh claim.
+    Throttled,
     /// The cached keys are beyond the staleness limit: nothing verifies
     /// until a refresh succeeds.
     Stale,
@@ -95,6 +101,12 @@ pub struct KeyCache {
     fetched_at: Option<u64>,
     window_start: u64,
     refreshes_in_window: u32,
+    /// A refresh of this issuer is already under way. The budget bounds
+    /// upstream fetches, so a lookup that will be served by a fetch
+    /// someone else is already performing must not spend it: without
+    /// this, one burst of concurrent misses exhausted the window and the
+    /// requests behind it were denied outright.
+    refresh_in_flight: bool,
     /// Refresh requests handed out.
     pub refresh_requests: u64,
     /// Lookups refused for lack of budget.
@@ -110,6 +122,7 @@ impl KeyCache {
             fetched_at: None,
             window_start: 0,
             refreshes_in_window: 0,
+            refresh_in_flight: false,
             refresh_requests: 0,
             refused: 0,
         }
@@ -137,7 +150,33 @@ impl KeyCache {
             .is_some_and(|t| now.saturating_sub(t) > self.limits.stale_limit_secs)
     }
 
+    /// Claim the refresh of this issuer, if nobody holds it. The holder
+    /// calls [`KeyCache::end_refresh`] when its fetch has finished,
+    /// whether or not it installed anything.
+    pub fn begin_refresh(&mut self) -> bool {
+        if self.refresh_in_flight {
+            return false;
+        }
+        self.refresh_in_flight = true;
+        true
+    }
+
+    /// Release the refresh claim.
+    pub fn end_refresh(&mut self) {
+        self.refresh_in_flight = false;
+    }
+
+    /// Whether a refresh of this issuer is under way.
+    pub const fn refreshing(&self) -> bool {
+        self.refresh_in_flight
+    }
+
     fn take_budget(&mut self, now: u64) -> bool {
+        // A fetch already under way will serve this lookup, so it costs
+        // no budget of its own: the budget counts fetches, not misses.
+        if self.refresh_in_flight {
+            return true;
+        }
         if now.saturating_sub(self.window_start) >= self.limits.window_secs {
             self.window_start = now;
             self.refreshes_in_window = 0;
@@ -181,7 +220,7 @@ impl KeyCache {
             // out of refresh budget: still usable.
             return KeyLookup::Found(&self.keys[kid]);
         }
-        KeyLookup::Unknown
+        KeyLookup::Throttled
     }
 
     /// Install a fetched key document at `now`, replacing the keys.

@@ -4,7 +4,8 @@
 //! are fetched once through the hardened fetcher, never per request; the
 //! clock and entropy are injected.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Form, State};
@@ -16,6 +17,22 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::exchange::{ExchangeError, ExchangeForm, SessionCreator, Sts};
+
+/// Reviews one presented token with the cluster's API server.
+///
+/// A `TokenReview` carries no token identifier and the verifier can only
+/// compare its username and audiences, so one result shared by every
+/// exchange would let a successful review of one token authorize another
+/// of the same service account — including one whose bound object was
+/// deleted. Each assertion is therefore reviewed on its own.
+pub trait TokenReviewer: Send + Sync {
+    /// Review `token`. `None` means the reviewer could not reach the API
+    /// server, and verification then fails closed.
+    fn review<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = Option<TokenReview>> + Send + 'a>>;
+}
 
 /// A clock the handlers read.
 pub trait ClockSource: Send + Sync {
@@ -87,22 +104,25 @@ impl Default for HttpLimits {
 
 /// Shared handler state.
 pub struct AppState {
-    /// The STS core.
-    pub sts: Mutex<Sts>,
+    /// The STS core. A plain mutex: the exchange is synchronous and runs
+    /// on the blocking pool, never on an executor worker.
+    pub sts: SyncMutex<Sts>,
     /// The port to replicated state.
-    pub creator: Mutex<Box<dyn SessionCreator + Send>>,
+    pub creator: SyncMutex<Box<dyn SessionCreator + Send>>,
     /// Key fetching (`None`: keys are installed out of band).
     pub fetcher: Option<HardenedFetcher>,
     /// Clock.
     pub clock: Box<dyn ClockSource>,
     /// Entropy.
     pub entropy: Box<dyn EntropySource>,
-    /// TokenReview results are obtained by the deployment's reviewer;
-    /// `None` here means offline modes only.
-    pub review: Option<TokenReview>,
+    /// Reviews each presented assertion; `None` means offline modes only.
+    pub reviewer: Option<Arc<dyn TokenReviewer>>,
     /// Bounds.
     pub limits: HttpLimits,
     permits: Semaphore,
+    /// One gate per issuer, so a burst on a cold cache produces one
+    /// upstream fetch and the rest wait for it.
+    fetches: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
 impl AppState {
@@ -116,15 +136,23 @@ impl AppState {
         limits: HttpLimits,
     ) -> Self {
         AppState {
-            sts: Mutex::new(sts),
-            creator: Mutex::new(creator),
+            sts: SyncMutex::new(sts),
+            creator: SyncMutex::new(creator),
             fetcher,
             clock,
             entropy,
-            review: None,
+            reviewer: None,
             limits,
             permits: Semaphore::new(limits.max_in_flight),
+            fetches: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Review every presented assertion with `reviewer`.
+    #[must_use]
+    pub fn with_reviewer(mut self, reviewer: Arc<dyn TokenReviewer>) -> Self {
+        self.reviewer = Some(reviewer);
+        self
     }
 }
 
@@ -162,49 +190,119 @@ async fn token(
     }
 }
 
+/// One synchronous exchange, on the blocking pool.
+///
+/// A production creator blocks waiting on replicated state; on an
+/// executor worker that call would never yield, the surrounding timeout
+/// could not fire, and enough stalled exchanges would starve unrelated
+/// handlers, key publication included.
+async fn attempt(
+    state: &Arc<AppState>,
+    form: &ExchangeForm,
+    clock: ClockHealth,
+    review: Option<TokenReview>,
+) -> Result<crate::ExchangeResponse, ExchangeError> {
+    let state = Arc::clone(state);
+    let form = form.clone();
+    let entropy = state.entropy.fill();
+    tokio::task::spawn_blocking(move || {
+        let mut sts = state.sts.lock().expect("sts lock");
+        let mut creator = state.creator.lock().expect("creator lock");
+        sts.exchange(&form, &clock, &entropy, review.as_ref(), creator.as_mut())
+    })
+    .await
+    .map_err(|_| ExchangeError::Unavailable("exchange worker"))?
+}
+
 async fn exchange(
-    state: &AppState,
+    state: &Arc<AppState>,
     form: ExchangeForm,
 ) -> Result<crate::ExchangeResponse, ExchangeError> {
     let clock = state.clock.read();
-    let entropy = state.entropy.fill();
-    let mut fetched = false;
-    loop {
-        let result = {
-            let mut sts = state.sts.lock().await;
-            let mut creator = state.creator.lock().await;
-            sts.exchange(
-                &form,
-                &clock,
-                &entropy,
-                state.review.as_ref(),
-                creator.as_mut(),
-            )
-        };
-        match result {
-            Err(ExchangeError::KeysUnavailable { name, jwks_url }) if !fetched => {
-                fetched = true;
-                let Some(fetcher) = &state.fetcher else {
-                    return Err(ExchangeError::Unavailable("issuer keys unavailable"));
-                };
-                let document = fetcher
-                    .fetch_jwks(&jwks_url)
-                    .await
-                    .map_err(|_| ExchangeError::Unavailable("issuer unreachable"))?;
-                let mut sts = state.sts.lock().await;
-                sts.verifier_mut()
-                    .registry_mut()
-                    .install_keys(&name, &document, clock.now)
-                    .map_err(|_| ExchangeError::Unavailable("issuer keys unusable"))?;
-            }
-            Err(ExchangeError::KeysUnavailable { .. }) => {
-                return Err(ExchangeError::Unavailable("issuer keys unavailable"));
-            }
-            other => return other,
+    // This assertion's own review, obtained before anything looks at it.
+    let review = match &state.reviewer {
+        Some(reviewer) => reviewer.review(&form.subject_token).await,
+        None => None,
+    };
+    let (name, jwks_url) = match attempt(state, &form, clock, review.clone()).await {
+        Err(ExchangeError::KeysUnavailable { name, jwks_url }) => (name, jwks_url),
+        other => return other,
+    };
+    let Some(fetcher) = &state.fetcher else {
+        return Err(ExchangeError::Unavailable("issuer keys unavailable"));
+    };
+    // One fetch per issuer for a whole burst. Without the gate every
+    // concurrent exchange on a cold cache called the endpoint itself,
+    // which is the unknown-key storm the refresh budget exists to bound.
+    let gate = {
+        let mut gates = state.fetches.lock().await;
+        Arc::clone(
+            gates
+                .entry(name.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    };
+    let _held = gate.lock().await;
+    // Claim the refresh before asking again. The claim makes a miss cost
+    // no refresh budget, so the ask below reports missing keys instead of
+    // denying the assertion outright once the burst has spent the
+    // window, and the requests queued behind this one are not denied
+    // either: the budget bounds upstream fetches, and the gate has
+    // already reduced this burst to one.
+    {
+        let mut sts = state.sts.lock().expect("sts lock");
+        if let Some(cache) = sts.verifier_mut().registry_mut().cache_mut(&name) {
+            cache.begin_refresh();
         }
+    }
+    let outcome = fetch_and_retry(state, &form, clock, review, fetcher, &name, &jwks_url).await;
+    {
+        let mut sts = state.sts.lock().expect("sts lock");
+        if let Some(cache) = sts.verifier_mut().registry_mut().cache_mut(&name) {
+            cache.end_refresh();
+        }
+    }
+    outcome
+}
+
+/// Under the issuer's gate and its refresh claim: ask once more in case
+/// the holder before this one already installed the keys, otherwise fetch
+/// them and ask again.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_and_retry(
+    state: &Arc<AppState>,
+    form: &ExchangeForm,
+    clock: ClockHealth,
+    review: Option<TokenReview>,
+    fetcher: &HardenedFetcher,
+    name: &str,
+    jwks_url: &str,
+) -> Result<crate::ExchangeResponse, ExchangeError> {
+    match attempt(state, form, clock, review.clone()).await {
+        Err(ExchangeError::KeysUnavailable { .. }) => {}
+        other => return other,
+    }
+    let document = fetcher
+        .fetch_jwks(jwks_url)
+        .await
+        .map_err(|_| ExchangeError::Unavailable("issuer unreachable"))?;
+    state
+        .sts
+        .lock()
+        .expect("sts lock")
+        .verifier_mut()
+        .registry_mut()
+        .install_keys(name, &document, clock.now)
+        .map_err(|_| ExchangeError::Unavailable("issuer keys unusable"))?;
+    match attempt(state, form, clock, review).await {
+        Err(ExchangeError::KeysUnavailable { .. }) => {
+            Err(ExchangeError::Unavailable("issuer keys unavailable"))
+        }
+        other => other,
     }
 }
 
 async fn jwks(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(state.sts.lock().await.ring().jwks())
+    let jwks = state.sts.lock().expect("sts lock").ring().jwks();
+    Json(jwks)
 }
