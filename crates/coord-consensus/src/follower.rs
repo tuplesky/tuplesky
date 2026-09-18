@@ -185,6 +185,9 @@ pub struct Follower {
     /// Voting messages of the promised ballot that arrived before its Sync
     /// (delivery is not ordered across peers); replayed once synchronized.
     awaiting_sync: Vec<(ReplicaId, ProtocolMessage)>,
+    /// A selection read back from durable state that this replica had
+    /// synchronized to but not finished installing.
+    resumed: Option<SyncDecision>,
     rejections: Vec<FollowerRejection>,
 }
 
@@ -205,9 +208,36 @@ impl Follower {
         payloads: impl IntoIterator<Item = (CommandId, PayloadRecordV1)>,
         executed_through: ExecutionPosition,
     ) -> Self {
+        Follower::recover_with_syncs(
+            config,
+            durable_promise,
+            rows,
+            payloads,
+            core::iter::empty(),
+            executed_through,
+        )
+    }
+
+    /// Recover with the epoch's durable Sync rows as well. The row of the
+    /// ballot this replica synchronized to is the selection it accepted:
+    /// its installation resumes here, so a restart between the marker and
+    /// the last installed entry cannot report a completed synchronization
+    /// over an incomplete ledger.
+    pub fn recover_with_syncs(
+        config: FollowerConfig,
+        durable_promise: Option<PromiseRecordV1>,
+        rows: impl IntoIterator<Item = (CommandId, CommandRecord)>,
+        payloads: impl IntoIterator<Item = (CommandId, PayloadRecordV1)>,
+        syncs: impl IntoIterator<Item = (Ballot, SyncDecision)>,
+        executed_through: ExecutionPosition,
+    ) -> Self {
         let payloads: BTreeMap<CommandId, PayloadRecordV1> = payloads.into_iter().collect();
         let ballots =
             BallotState::recover(config.identity.clone(), config.genesis, durable_promise);
+        let resumed: Option<SyncDecision> = syncs
+            .into_iter()
+            .find(|(b, _)| *b == ballots.synced())
+            .map(|(_, d)| d);
         let rows: Vec<(CommandId, CommandRecord)> = rows.into_iter().collect();
         let ledger = DurableLedger::restore(rows.iter().cloned());
         let table = CommandTable::restore(Some(config.capacity), rows);
@@ -247,7 +277,28 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
+            resumed,
         }
+        .resume_sync()
+    }
+
+    /// Queue the entries of a resumed selection that this replica has not
+    /// installed yet. Installation itself waits for boot, like everything
+    /// else that needs a barrier allocator.
+    fn resume_sync(mut self) -> Self {
+        let Some(decision) = self.resumed.take() else {
+            return self;
+        };
+        for (c, e) in &decision.entries {
+            if self.table.phase_of(c).is_none() {
+                let _ = self.table.expect(*c);
+            }
+            if self.table.phase_of(c) < Some(Phase::Commit) {
+                self.sync_pending.insert(*c, e.clone());
+            }
+        }
+        self.won = None;
+        self
     }
 
     /// Restore the durable execution frontier: the commands whose executed
@@ -304,6 +355,7 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
+            resumed: None,
         }
     }
 
@@ -610,13 +662,28 @@ impl Follower {
                 }
             };
             let barrier = self.alloc.as_mut().expect("booted").allocate();
+            // The selection goes down with the marker, in the one batch.
+            // A marker without it would let this replica restart claiming
+            // it had synchronized ballot B while its command ledger still
+            // held the old state, and recovery selection treats the
+            // highest synchronized ballot as the authoritative source of
+            // accepted state. Either both rows are durable or neither is,
+            // and a restart resumes the installation from the row.
+            let updates = alloc::vec![
+                sync_update(
+                    self.config.identity.epoch,
+                    &SyncRecordV1 {
+                        decision: decision.clone(),
+                    },
+                )
+                .expect("bounded"),
+                promise_update(self.config.identity.epoch, &record).expect("bounded"),
+            ];
             self.sync_barrier = Some((barrier, decision));
             return alloc::vec![Effect::Persist(PersistBatch {
                 barrier,
                 base: None,
-                updates: alloc::vec![
-                    promise_update(self.config.identity.epoch, &record).expect("bounded")
-                ],
+                updates,
             })];
         }
         // The promise row already records this synchronized ballot (a

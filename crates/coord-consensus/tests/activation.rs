@@ -383,7 +383,11 @@ impl Cluster {
     fn revive(&mut self, i: usize, q: BallotConfiguration) {
         let rows = dependency_rows(&self.nodes[i].storage);
         let promise = promise_row(&self.nodes[i].storage);
-        let mut f = Follower::recover(
+        let syncs: Vec<(Ballot, SyncDecision)> = sync_rows(&self.nodes[i].storage)
+            .into_iter()
+            .map(|d| (d.ballot, d))
+            .collect();
+        let mut f = Follower::recover_with_syncs(
             FollowerConfig {
                 identity: identity(i as u8),
                 genesis: ballot(0, 0),
@@ -394,6 +398,7 @@ impl Cluster {
             promise,
             rows,
             payload_rows(&self.nodes[i].storage),
+            syncs,
             ExecutionPosition::ZERO,
         )
         .restore_execution(
@@ -828,4 +833,63 @@ fn role_into_recovered(role: Role) -> coord_consensus::RecoveredState {
         Role::Leader(l) => l.into_recovered(),
         Role::Follower(f) => f.into_recovered(),
     }
+}
+
+#[test]
+fn a_receiving_follower_that_crashes_on_the_marker_still_holds_the_selection() {
+    // The synchronized-ballot marker and the selection it records go down
+    // together. A marker alone would let this replica restart claiming it
+    // had synchronized to ballot B while its ledger still held the old
+    // state, and recovery selection treats the highest synchronized
+    // ballot as the authoritative source of accepted state.
+    let mut c = Cluster::new(3);
+    let c1 = c.admit(1, 1);
+    let new = ballot(1, 2);
+    let f = c.nodes[1].follower_mut();
+    let promise = f.step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    for event in durable_events(&promise) {
+        f.step(event);
+    }
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            c1,
+            coord_consensus::SyncEntry {
+                command: c1,
+                phase: Phase::Accept,
+                deps: vec![],
+            },
+        )]),
+        reproposed: Default::default(),
+    };
+    let bound = f.step(peer_event(r(2), ProtocolMessage::Sync(decision.clone())));
+    // Exactly one batch, and it carries both rows: nothing can be durable
+    // without the other.
+    assert_eq!(bound.len(), 1, "{bound:?}");
+    let Effect::Persist(batch) = &bound[0] else {
+        panic!("{bound:?}")
+    };
+    assert_eq!(batch.updates.len(), 2, "the marker and the selection");
+    // Make that batch durable and crash before anything else happens.
+    let durable = coord_core::effect::PersistBatch {
+        barrier: batch.barrier,
+        base: batch.base,
+        updates: batch.updates.clone(),
+    };
+    let barrier = batch.barrier;
+    c.nodes[1].storage.submit(durable);
+    c.nodes[1].storage.complete(barrier).unwrap();
+    assert_eq!(
+        sync_rows(&c.nodes[1].storage).len(),
+        1,
+        "the selection is durable with the marker"
+    );
+    // Restart: the synchronized ballot and the selection come back
+    // together, and the selection's command is queued for installation.
+    c.crash(1);
+    c.revive(1, quorum(new));
+    assert_eq!(c.nodes[1].follower().ballots().synced(), new);
+    let recovered = sync_rows(&c.nodes[1].storage);
+    assert_eq!(recovered, vec![decision], "the selection survived");
 }
