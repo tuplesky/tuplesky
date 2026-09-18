@@ -207,6 +207,27 @@ installs epochs monotonically, treats a hint as a refresh trigger only,
 and lets endpoint and observer catalogs change addresses, certificate
 routing and serving topology but never the voter set.
 
+## Snapshot frames (task-49)
+
+`SharedCheckpointV1` (`crates/coord-checkpoint`) is carried by two raw
+kinds of the snapshot range (class limit 1 MiB + 64 KiB), dispatched at the
+snapshot boundary like the collector, binding and configuration frames.
+
+| Kind | Value | Direction | Payload |
+|---|---|---|---|
+| Manifest | `0x0600` | donor to learner | `SharedManifestV1 { format, cluster, domain, configuration, boundary { execution_position, kv_revision, retention_floor, lease_authority }, collections[] { collection, rows, bytes }, chunks[] { ordinal, rows, bytes, first, last, digest }, root }` |
+| Chunk | `0x0601` | donor to learner | `ChunkV1 { ordinal, rows[] { collection, key, value } }`, at most 1 MiB plus one maximal row |
+
+Rows are the common collections of the registry (never `meta_v1`,
+`protocol_v1` or `checkpoint_v1`) in identifier order and unsigned key
+order; a chunk's digest is the `shared-checkpoint-chunk` BLAKE3 of its
+encoded bytes and the manifest root is the `shared-checkpoint-root` digest
+of format, identity, boundary, collection summaries and chunk descriptors.
+The receiver verifies root, digests, order, uniqueness, counts and bounds
+(`coord_checkpoint::verify_shared`) before any install (task-50). The
+artifact carries no node identity, incarnation, boot, stamp or journal
+sequence and is not the local recovery checkpoint (task-j04).
+
 ## Go mirror (task-44)
 
 `adapters/kine/wire` mirrors the frame codec and the postcard subset of
