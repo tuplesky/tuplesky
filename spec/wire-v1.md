@@ -145,6 +145,8 @@ kind at the collector boundary, like peer evidence.
 A voter admits `Submit` only from a connection bound to a collector role
 (`Frontend`, `KineCollector`); `Evidence` and `Release` are only ever
 sent by voters, and nothing received on an API-class connection is a
-vote. Frozen frontend error codes of `ResponseV1::Err` are listed in
-`crates/coord-collector/src/codes.rs`; pending and unknown outcomes use
+vote. Frozen error codes of `ResponseV1::Err` are `wire_v1::codes` in
+`coord-types` (`0x0001` request identity conflict, `0x0002`
+backpressure, `0x0003` malformed request, `0x0004` not admitted, `0x0005`
+result too large; append-only); pending and unknown outcomes use
 the `Pending` and `Unknown` outcomes, not error codes.

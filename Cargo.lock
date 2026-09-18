@@ -332,6 +332,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-sdk"
+version = "0.1.0"
+dependencies = [
+ "coord-collector",
+ "coord-types",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "coord-sim"
 version = "0.1.0"
 dependencies = [
