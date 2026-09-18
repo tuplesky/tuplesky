@@ -44,7 +44,14 @@ then the appended Kine primitives `KineCreate`, `KineUpdate`, `KineDelete`
 (design Section 6.6): one logical operation each, returning every revision
 and conflict fact from one execution point. A Kine TTL is `ttl_seconds`
 plus a hidden binding identity derived from the stable request, present
-exactly when the TTL is positive; it is never a native lease ID.
+exactly when the TTL is positive; it is never a native lease ID. The
+trusted collector derives it as `kine_binding_id(retry_key)`: the first
+sixteen bytes of the `HashDomain::KineBinding` digest (context
+`tuplesky coord.v1 2026-09 kine-binding`) of the retry key's 72 canonical
+bytes (task-46). It depends on the retry key alone, so a transport retry
+reproduces it, the next sequence names a fresh identity (spent identities
+are never reused), and the payload that carries it does not feed back
+into its own derivation.
 
 Normalization: transaction comparisons form a conjunction, so they are
 sorted and de-duplicated before encoding; a non-canonical transaction is
@@ -80,6 +87,12 @@ half-open interval containing exactly the history rows of `key`.
 * `command_ids_v1.json`: `(retry key components, request JSON) -> payload hex
   and command id hex`, including a pair that differs only in admission
   context (same id) and a pair that differs in payload (different id).
+* `kine_bindings_v1.json`: `(retry key components) -> binding id hex`
+  (task-46), including a retry (same id), the next sequence and another
+  instance (different ids).
+* `crates/coord-state/fixtures/kine_responses_v1.json`: the Kine-facing
+  `Response` outcomes with their exact postcard bytes (task-46); regenerate
+  with `COORD_STATE_WRITE_FIXTURES=1 cargo test -p coord-state --test fixtures`.
 
 Regenerate with `COORD_TYPES_WRITE_FIXTURES=1 cargo test -p coord-types`
 only in a reviewed schema change.

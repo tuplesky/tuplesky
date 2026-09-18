@@ -1,0 +1,427 @@
+{
+  "schema": "kine_responses_v1",
+  "vectors": [
+    {
+      "name": "range-two-items-more",
+      "response": {
+        "revision": 12,
+        "outcome": {
+          "Range": {
+            "items": [
+              {
+                "key": [
+                  47,
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121,
+                  47,
+                  97
+                ],
+                "entry": {
+                  "value": [
+                    118,
+                    97
+                  ],
+                  "create_revision": 3,
+                  "mod_revision": 7,
+                  "version": 2,
+                  "lease": null,
+                  "lease_generation": null
+                }
+              },
+              {
+                "key": [
+                  47,
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121,
+                  47,
+                  98
+                ],
+                "entry": {
+                  "value": [
+                    118,
+                    98
+                  ],
+                  "create_revision": 11,
+                  "mod_revision": 11,
+                  "version": 1,
+                  "lease": [
+                    107,
+                    105,
+                    110,
+                    101,
+                    45,
+                    98,
+                    105,
+                    110,
+                    100,
+                    45,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    49
+                  ],
+                  "lease_generation": 1
+                }
+              }
+            ],
+            "count": 5,
+            "more": true
+          }
+        }
+      },
+      "payload_hex": "0c02020b2f72656769737472792f6102766103070200000b2f72656769737472792f620276620b0b01016b696e652d62696e642d30303030303101010501"
+    },
+    {
+      "name": "range-count-only",
+      "response": {
+        "revision": 9,
+        "outcome": {
+          "Range": {
+            "items": [],
+            "count": 3,
+            "more": false
+          }
+        }
+      },
+      "payload_hex": "0902000300"
+    },
+    {
+      "name": "range-empty",
+      "response": {
+        "revision": 9,
+        "outcome": {
+          "Range": {
+            "items": [],
+            "count": 0,
+            "more": false
+          }
+        }
+      },
+      "payload_hex": "0902000000"
+    },
+    {
+      "name": "range-keys-only",
+      "response": {
+        "revision": 9,
+        "outcome": {
+          "Range": {
+            "items": [
+              {
+                "key": [
+                  47,
+                  114,
+                  101,
+                  103,
+                  105,
+                  115,
+                  116,
+                  114,
+                  121,
+                  47,
+                  97
+                ],
+                "entry": {
+                  "value": [],
+                  "create_revision": 3,
+                  "mod_revision": 7,
+                  "version": 2,
+                  "lease": null,
+                  "lease_generation": null
+                }
+              }
+            ],
+            "count": 1,
+            "more": false
+          }
+        }
+      },
+      "payload_hex": "0902010b2f72656769737472792f610003070200000100"
+    },
+    {
+      "name": "kine-created",
+      "response": {
+        "revision": 5,
+        "outcome": "KineCreated"
+      },
+      "payload_hex": "0513"
+    },
+    {
+      "name": "err-key-exists",
+      "response": {
+        "revision": 5,
+        "outcome": "ErrKeyExists"
+      },
+      "payload_hex": "0514"
+    },
+    {
+      "name": "kine-updated-applied",
+      "response": {
+        "revision": 11,
+        "outcome": {
+          "KineUpdated": {
+            "updated": true,
+            "current": {
+              "key": [
+                47,
+                114,
+                101,
+                103,
+                105,
+                115,
+                116,
+                114,
+                121,
+                47,
+                98
+              ],
+              "entry": {
+                "value": [
+                  118,
+                  98
+                ],
+                "create_revision": 11,
+                "mod_revision": 11,
+                "version": 1,
+                "lease": [
+                  107,
+                  105,
+                  110,
+                  101,
+                  45,
+                  98,
+                  105,
+                  110,
+                  100,
+                  45,
+                  48,
+                  48,
+                  48,
+                  48,
+                  48,
+                  49
+                ],
+                "lease_generation": 1
+              },
+              "ttl_seconds": 30
+            }
+          }
+        }
+      },
+      "payload_hex": "0b1501010b2f72656769737472792f620276620b0b01016b696e652d62696e642d30303030303101011e"
+    },
+    {
+      "name": "kine-updated-mismatch",
+      "response": {
+        "revision": 7,
+        "outcome": {
+          "KineUpdated": {
+            "updated": false,
+            "current": {
+              "key": [
+                47,
+                114,
+                101,
+                103,
+                105,
+                115,
+                116,
+                114,
+                121,
+                47,
+                97
+              ],
+              "entry": {
+                "value": [
+                  118,
+                  97
+                ],
+                "create_revision": 3,
+                "mod_revision": 7,
+                "version": 2,
+                "lease": null,
+                "lease_generation": null
+              },
+              "ttl_seconds": 0
+            }
+          }
+        }
+      },
+      "payload_hex": "071500010b2f72656769737472792f61027661030702000000"
+    },
+    {
+      "name": "kine-updated-absent",
+      "response": {
+        "revision": 7,
+        "outcome": {
+          "KineUpdated": {
+            "updated": false,
+            "current": null
+          }
+        }
+      },
+      "payload_hex": "07150000"
+    },
+    {
+      "name": "kine-deleted-absent",
+      "response": {
+        "revision": 7,
+        "outcome": {
+          "KineDeleted": {
+            "deleted": true,
+            "prev": null
+          }
+        }
+      },
+      "payload_hex": "07160100"
+    },
+    {
+      "name": "kine-deleted-mismatch",
+      "response": {
+        "revision": 7,
+        "outcome": {
+          "KineDeleted": {
+            "deleted": false,
+            "prev": {
+              "key": [
+                47,
+                114,
+                101,
+                103,
+                105,
+                115,
+                116,
+                114,
+                121,
+                47,
+                98
+              ],
+              "entry": {
+                "value": [
+                  118,
+                  98
+                ],
+                "create_revision": 11,
+                "mod_revision": 11,
+                "version": 1,
+                "lease": [
+                  107,
+                  105,
+                  110,
+                  101,
+                  45,
+                  98,
+                  105,
+                  110,
+                  100,
+                  45,
+                  48,
+                  48,
+                  48,
+                  48,
+                  48,
+                  49
+                ],
+                "lease_generation": 1
+              },
+              "ttl_seconds": 30
+            }
+          }
+        }
+      },
+      "payload_hex": "071600010b2f72656769737472792f620276620b0b01016b696e652d62696e642d30303030303101011e"
+    },
+    {
+      "name": "kine-deleted-applied",
+      "response": {
+        "revision": 8,
+        "outcome": {
+          "KineDeleted": {
+            "deleted": true,
+            "prev": {
+              "key": [
+                47,
+                114,
+                101,
+                103,
+                105,
+                115,
+                116,
+                114,
+                121,
+                47,
+                97
+              ],
+              "entry": {
+                "value": [
+                  118,
+                  97
+                ],
+                "create_revision": 3,
+                "mod_revision": 7,
+                "version": 2,
+                "lease": null,
+                "lease_generation": null
+              },
+              "ttl_seconds": 0
+            }
+          }
+        }
+      },
+      "payload_hex": "081601010b2f72656769737472792f61027661030702000000"
+    },
+    {
+      "name": "err-compacted",
+      "response": {
+        "revision": 20,
+        "outcome": "ErrCompacted"
+      },
+      "payload_hex": "1405"
+    },
+    {
+      "name": "err-future-revision",
+      "response": {
+        "revision": 20,
+        "outcome": "ErrFutureRevision"
+      },
+      "payload_hex": "1406"
+    },
+    {
+      "name": "err-permission-denied",
+      "response": {
+        "revision": 20,
+        "outcome": "ErrPermissionDenied"
+      },
+      "payload_hex": "1418"
+    },
+    {
+      "name": "err-session-invalid",
+      "response": {
+        "revision": 20,
+        "outcome": "ErrSessionInvalid"
+      },
+      "payload_hex": "1417"
+    },
+    {
+      "name": "err-lease-exists",
+      "response": {
+        "revision": 20,
+        "outcome": "ErrLeaseExists"
+      },
+      "payload_hex": "140b"
+    }
+  ]
+}
