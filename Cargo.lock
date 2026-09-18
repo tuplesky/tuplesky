@@ -153,6 +153,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-oracle"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "coord-types",
+ "serde",
+]
+
+[[package]]
 name = "coord-sim"
 version = "0.1.0"
 dependencies = [
