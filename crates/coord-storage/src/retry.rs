@@ -20,7 +20,9 @@ use coord_types::identity::{CommandId, Digest32, HashDomain, RetryKey};
 use coord_types::ids::{ClientInstanceId, RequestSequence, SessionId};
 use serde::{Deserialize, Serialize};
 
-use crate::codecs::{self, ExecutedRecordV1, RetryFloorV1, RetryRecordV1, SessionStateV1};
+use coord_state::policy::SessionRecord;
+
+use crate::codecs::{self, ExecutedRecordV1, RetryFloorV1, RetryRecordV1};
 
 /// Default outstanding window when a session does not specify one.
 pub const DEFAULT_WINDOW: u32 = 1024;
@@ -90,10 +92,45 @@ pub enum Resolution {
 fn session_state<V: OrderedRead>(
     view: &V,
     session: &SessionId,
-) -> Result<Option<SessionStateV1>, EngineError> {
+) -> Result<Option<SessionRecord>, EngineError> {
     match view.get(Collection::SessionV1.id(), &codecs::session_key(session))? {
         Some(bytes) => Ok(Some(codecs::decode_session(&bytes)?)),
         None => Ok(None),
+    }
+}
+
+/// Whether a session record may execute now: active, and its trust rule
+/// enabled at the generation it was admitted under (Section 9.3).
+pub fn record_executable<V: OrderedRead>(
+    view: &V,
+    record: &SessionRecord,
+) -> Result<bool, EngineError> {
+    if !record.active {
+        return Ok(false);
+    }
+    match view.get(
+        Collection::PolicyV1.id(),
+        &codecs::trust_rule_key(&record.trust_rule),
+    )? {
+        Some(bytes) => {
+            let rule = codecs::decode_trust_rule(&bytes)?;
+            Ok(rule.enabled && rule.generation == record.rule_generation)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Whether `session` may execute now (see [`record_executable`]); an
+/// unknown session cannot. This is the authorization a retained result
+/// requires: a retired session, or one whose rule was disabled or
+/// regenerated, cannot read cached outcomes.
+pub fn session_executable<V: OrderedRead>(
+    view: &V,
+    session: &SessionId,
+) -> Result<bool, EngineError> {
+    match session_state(view, session)? {
+        Some(record) => record_executable(view, &record),
+        None => Ok(false),
     }
 }
 
@@ -134,7 +171,7 @@ pub fn admit<V: OrderedRead>(view: &V, binding: &RetryBinding) -> Result<Admissi
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
         None => return Ok(Admission::UnknownSession),
-        Some(s) if !s.active => return Ok(Admission::SessionRetired),
+        Some(s) if !record_executable(view, &s)? => return Ok(Admission::SessionRetired),
         Some(s) => s,
     };
     let floor = floor(
@@ -170,7 +207,7 @@ pub fn resolve<V: OrderedRead>(
 ) -> Result<Resolution, EngineError> {
     let key = &binding.retry_key;
     let session = match session_state(view, &key.session_id)? {
-        Some(s) if s.active => s,
+        Some(s) if record_executable(view, &s)? => s,
         _ => return Ok(Resolution::NoSession),
     };
     let floor = floor(
@@ -299,12 +336,11 @@ pub fn retire_updates<V: OrderedRead>(
 /// replaces this with the full session record; the key and collection stay.
 pub fn session_update(
     session: &SessionId,
-    active: bool,
-    window: u32,
+    record: &SessionRecord,
 ) -> Result<StoreUpdate, EngineError> {
     Ok(StoreUpdate {
         collection: Collection::SessionV1.id(),
         key: codecs::session_key(session),
-        value: Some(codecs::encode_session(&SessionStateV1 { active, window })?),
+        value: Some(codecs::encode_session(record)?),
     })
 }

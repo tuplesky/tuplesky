@@ -22,6 +22,7 @@
 pub mod check;
 pub mod history;
 pub mod model;
+pub mod policy;
 pub mod report;
 
 pub use check::check_history;

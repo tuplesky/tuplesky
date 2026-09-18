@@ -388,6 +388,12 @@ impl KvModel {
             .collect()
     }
 
+    /// Whether every comparison holds against the current state (the
+    /// conjunction selecting a transaction's success branch).
+    pub fn compares_hold(&self, compares: &[Compare]) -> bool {
+        compares.iter().all(|c| self.compare(c))
+    }
+
     fn compare(&self, c: &Compare) -> bool {
         let entry = self.current.get(&c.key);
         let ordering = match (&c.target, &c.operand) {

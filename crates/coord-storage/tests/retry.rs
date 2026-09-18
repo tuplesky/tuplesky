@@ -85,8 +85,14 @@ impl<E: LocalEngine> Domain<E> {
     }
 
     fn activate_session(&mut self, window: u32) {
-        let update = retry::session_update(&SESSION, true, window).unwrap();
-        self.admin(vec![update]);
+        let update = coord_storage::policy::bootstrap_session(
+            &SESSION,
+            PrincipalId([0xaa; 16]),
+            window,
+            true,
+        )
+        .unwrap();
+        self.admin(update);
     }
 
     /// Full path: admit -> (plan -> apply) or retained result.
@@ -264,8 +270,10 @@ fn retired_or_unknown_sessions_and_retired_sequences_never_execute() {
     );
     assert_eq!(d.kv_revision(), 3);
     // Retire the session: nothing executes, retries are not served.
-    let update = retry::session_update(&SESSION, false, 4).unwrap();
-    d.admin(vec![update]);
+    let update =
+        coord_storage::policy::bootstrap_session(&SESSION, PrincipalId([0xaa; 16]), 4, false)
+            .unwrap();
+    d.admin(update);
     assert_eq!(d.submit(5, &request).0, Admission::SessionRetired);
     assert_eq!(d.submit(6, &put(b"k", b"v6")).0, Admission::SessionRetired);
     assert_eq!(d.resolve(6, &put(b"k", b"v6"), true), Resolution::NoSession);

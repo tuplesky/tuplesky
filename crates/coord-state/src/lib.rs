@@ -41,6 +41,17 @@
 //! to exactly that key version, replaced or removed atomically by the next
 //! write of the key, so a stale expiration of a replaced binding is a
 //! no-op. A failed compare changes neither data nor binding.
+//!
+//! Sessions and policy (task-18; Sections 9.2-9.3, 20.3): [`policy`]
+//! defines immutable-principal sessions with scope ceilings and trust-rule
+//! generations, allow-only permission rules over key intervals, and grant
+//! commitments (consumed receipts, single-use codes, refresh families). A
+//! client view carries an [`policy::Authorization`]; the planner denies by
+//! default, requires permission for every comparison and for the selected
+//! branch only, full containment for ranges, explicit lease actions, and
+//! records denials as outcomes at the execution position. Admission,
+//! retirement, commitments, refresh rotation and rule writes are internal
+//! commands that advance execution without a KV revision.
 #![forbid(unsafe_code)]
 #![no_std]
 #![warn(missing_docs)]
@@ -52,6 +63,7 @@ pub mod lease;
 pub mod limits;
 pub mod plan;
 pub mod planner;
+pub mod policy;
 pub mod view;
 
 pub use expiry::{
@@ -63,6 +75,10 @@ pub use lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 pub use limits::PlanLimits;
 pub use plan::{ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
 pub use planner::{PlanError, plan, plan_internal};
+pub use policy::{
+    Action, AdmissionReceiptV1, Authorization, GrantKind, GrantRecord, GrantState, KeyInterval,
+    PolicyRule, SessionRecord, TrustRule,
+};
 pub use view::{HistoricalView, KvEntry, ReadView};
 
 /// Crate role marker used by the dependency-policy check.

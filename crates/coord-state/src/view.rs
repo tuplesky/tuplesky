@@ -4,11 +4,14 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_core::effect::ApplyBase;
+use coord_types::identity::Digest32;
 use coord_types::ids::{
-    KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId, PrincipalId,
+    KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId, PrincipalId, SessionId,
+    TrustRuleId,
 };
 
 use crate::lease::LeaseRecord;
+use crate::policy::{Authorization, GrantRecord, SessionRecord, TrustRule};
 use serde::{Deserialize, Serialize};
 
 /// A stored key's entry.
@@ -69,6 +72,15 @@ pub struct ReadView {
     /// Attached keys of the leases the request revokes or inspects, whose
     /// current entries are also in `current`.
     pub lease_keys: BTreeMap<LeaseId, BTreeSet<Vec<u8>>>,
+    /// Authorization context: `Some` for a client request executing under a
+    /// session (deny by default), `None` for a trusted internal view.
+    pub authorization: Option<Authorization>,
+    /// Session records an internal command touches.
+    pub sessions: BTreeMap<SessionId, SessionRecord>,
+    /// Grant commitments an internal command touches.
+    pub grants: BTreeMap<Digest32, GrantRecord>,
+    /// Trust rules an internal command touches.
+    pub trust_rules: BTreeMap<TrustRuleId, TrustRule>,
 }
 
 impl ReadView {
@@ -90,6 +102,10 @@ impl ReadView {
             historical: None,
             leases: BTreeMap::new(),
             lease_keys: BTreeMap::new(),
+            authorization: None,
+            sessions: BTreeMap::new(),
+            grants: BTreeMap::new(),
+            trust_rules: BTreeMap::new(),
         }
     }
 }

@@ -3,12 +3,14 @@
 use alloc::vec::Vec;
 
 use coord_core::effect::ApplyBase;
+use coord_types::identity::Digest32;
 use coord_types::ids::{
-    ExecutionPosition, KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId,
+    ExecutionPosition, KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::lease::LeaseRecord;
+use crate::policy::{GrantRecord, PolicyRule, SessionRecord, TrustRule};
 use crate::view::KvEntry;
 
 /// One item of a range result.
@@ -142,6 +144,40 @@ pub enum Outcome {
         /// The entry the operation saw (`None`: key absent).
         prev: Option<KineKv>,
     },
+    /// The session cannot execute: unknown, retired, or its trust rule is
+    /// disabled or regenerated.
+    ErrSessionInvalid,
+    /// Current policy does not permit the operation (or the selected
+    /// branch, or a comparison) at this execution point.
+    ErrPermissionDenied,
+    /// A session was created from a consumed receipt.
+    SessionCreated {
+        /// The session.
+        session: SessionId,
+    },
+    /// A session was retired.
+    SessionRetired,
+    /// The receipt was already consumed or the session identity exists.
+    ErrReceiptConsumed,
+    /// The trust rule named by a receipt is missing, disabled or at another
+    /// generation.
+    ErrTrustRuleInvalid,
+    /// A grant commitment was ordered.
+    GrantCommitted,
+    /// The commitment already exists.
+    ErrGrantExists,
+    /// The named grant is not pending (unknown, consumed or revoked).
+    ErrGrantUnavailable,
+    /// A refresh family rotated to a new secret commitment.
+    RefreshAdvanced {
+        /// Generation after rotation.
+        generation: u64,
+    },
+    /// A retired refresh secret was presented: the family and its session
+    /// are revoked.
+    ErrRefreshReuse,
+    /// A policy or trust rule was written or removed.
+    PolicyUpdated,
 }
 
 /// A Kine-facing entry: the stored entry plus the TTL of its private
@@ -229,6 +265,36 @@ pub enum Mutation {
         lease: LeaseId,
         /// Complete new record.
         record: LeaseRecord,
+    },
+    /// Write or remove a session record.
+    SessionWrite {
+        /// Session.
+        session: SessionId,
+        /// New record (`None` removes; retirement keeps the record).
+        record: Option<SessionRecord>,
+    },
+    /// Write a grant commitment row.
+    GrantWrite {
+        /// Commitment digest (the row key).
+        commitment: Digest32,
+        /// Record.
+        record: GrantRecord,
+    },
+    /// Write or remove a permission rule.
+    PolicyRuleWrite {
+        /// Principal the rule belongs to (part of the row key).
+        principal: coord_types::ids::PrincipalId,
+        /// Rule identity.
+        rule: coord_types::ids::PolicyRuleId,
+        /// New rule (`None` removes).
+        record: Option<PolicyRule>,
+    },
+    /// Write a trust rule.
+    TrustRuleWrite {
+        /// Rule identity.
+        rule: coord_types::ids::TrustRuleId,
+        /// New state.
+        record: TrustRule,
     },
     /// Establish the lease expiry authority epoch.
     LeaseAuthority {

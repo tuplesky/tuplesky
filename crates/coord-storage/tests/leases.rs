@@ -185,12 +185,14 @@ impl<E: LocalEngine> Domain<E> {
     }
 
     fn activate_session(&mut self) {
-        let update = retry::session_update(&SESSION, true, 16).unwrap();
+        let update =
+            coord_storage::policy::bootstrap_session(&SESSION, PrincipalId([0xaa; 16]), 16, true)
+                .unwrap();
         self.worker
             .submit(PersistBatch {
                 barrier: self.alloc.allocate(),
                 base: None,
-                updates: vec![update],
+                updates: update,
             })
             .unwrap();
         assert_eq!(self.worker.flush().unwrap().committed, 1);
