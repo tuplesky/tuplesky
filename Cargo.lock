@@ -740,11 +740,14 @@ dependencies = [
  "coord-store-api",
  "coord-store-testkit",
  "coord-sts",
+ "coord-transport",
+ "coord-transport-testkit",
  "coord-types",
  "postcard",
  "rcgen",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -768,8 +771,10 @@ dependencies = [
  "coord-core",
  "coord-oracle",
  "coord-types",
+ "postcard",
  "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

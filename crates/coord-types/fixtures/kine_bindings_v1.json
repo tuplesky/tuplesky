@@ -1,0 +1,42 @@
+{
+  "schema": "kine_bindings_v1",
+  "hash_context": "tuplesky coord.v1 2026-09 kine-binding",
+  "vectors": [
+    {
+      "name": "sequence-1",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "binding_id": "da2e461d0ef81ed1c5cee5409e927587"
+    },
+    {
+      "name": "sequence-1-retry",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "binding_id": "da2e461d0ef81ed1c5cee5409e927587"
+    },
+    {
+      "name": "sequence-2",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 2,
+      "binding_id": "d7635170beb937d67d442a70a6aba815"
+    },
+    {
+      "name": "other-instance",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303032",
+      "request_sequence": 1,
+      "binding_id": "a8adec35d277234ccce10fba00c5678e"
+    }
+  ]
+}

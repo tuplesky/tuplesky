@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{IdentityError, ValidationError};
 use crate::ids::{
-    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, EndpointGeneration,
+    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, EndpointGeneration, LeaseId,
     RequestSequence, SessionId,
 };
 use crate::logical_v1::LogicalRequest;
@@ -60,6 +60,9 @@ pub enum HashDomain {
     DependencyPath,
     /// Admission receipt identities minted at the trusted boundary (task-33).
     AdmissionReceipt,
+    /// Hidden private TTL binding identities of Kine writes, derived by the
+    /// trusted collector from the stable retry key (task-46; Section 6.6).
+    KineBinding,
 }
 
 impl HashDomain {
@@ -75,6 +78,7 @@ impl HashDomain {
             HashDomain::AuthGrantCommitment => "tuplesky coord.v1 2026-09 auth-grant-commitment",
             HashDomain::DependencyPath => "tuplesky coord.v1 2026-09 dependency-path",
             HashDomain::AdmissionReceipt => "tuplesky coord.v1 2026-09 admission-receipt",
+            HashDomain::KineBinding => "tuplesky coord.v1 2026-09 kine-binding",
         }
     }
 
@@ -143,6 +147,19 @@ impl CommandId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0.0
     }
+}
+
+/// The hidden private TTL binding identity of a Kine create/update: the
+/// first sixteen bytes of the [`HashDomain::KineBinding`] digest of the
+/// retry key's canonical bytes. Every invocation therefore names a fresh
+/// binding (identities are never reused, Section 6.6), a transport retry
+/// of the same invocation reproduces the same one, and the request payload
+/// (which carries the binding) never feeds back into its own derivation.
+pub fn kine_binding_id(retry_key: &RetryKey) -> LeaseId {
+    let digest = HashDomain::KineBinding.digest(&[&retry_key.canonical_bytes()]);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.0[..16]);
+    LeaseId(out)
 }
 
 /// Envelope/admission context that accompanies a request but is **not** part

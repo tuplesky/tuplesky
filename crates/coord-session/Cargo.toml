@@ -27,4 +27,7 @@ postcard.workspace = true
 coord-core.workspace = true
 coord-consensus.workspace = true
 coord-store-testkit.workspace = true
+coord-transport.workspace = true
+coord-transport-testkit.workspace = true
 rcgen.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

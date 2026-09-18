@@ -122,8 +122,15 @@ pub struct TlsProfile {
     pub max_early_data_size: u32,
     /// Client early data (always off).
     pub client_early_data: bool,
-    /// Mutual TLS required.
-    pub client_certificate_required: bool,
+    /// Mutual TLS required of peer-plane connections (`ALPN_PEER`).
+    pub peer_mutual_tls: bool,
+    /// Mutual TLS required of API-plane connections that act for others
+    /// (`Frontend`, `KineCollector`). A `Client` is not one of them: it
+    /// speaks only for itself and its authority is the session binding it
+    /// presents above this layer, so the API plane authenticates the
+    /// server and leaves the client certificate optional. A certificate a
+    /// client does present is always validated against the same roots.
+    pub api_mutual_tls_for_trusted_roles: bool,
     /// Active migration accepted by the server (always off).
     pub server_migration: bool,
 }
@@ -135,7 +142,8 @@ impl TlsProfile {
         aws_lc_provider: true,
         max_early_data_size: 0,
         client_early_data: false,
-        client_certificate_required: true,
+        peer_mutual_tls: true,
+        api_mutual_tls_for_trusted_roles: true,
         server_migration: false,
     };
 }
