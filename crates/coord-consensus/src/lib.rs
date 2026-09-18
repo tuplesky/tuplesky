@@ -49,6 +49,15 @@
 //!   `RequestIdentityConflict`; the leader adopts its own order only when
 //!   the proposal is durable and every dependency is at least ACCEPT; a
 //!   higher promise stops proposing. No learning happens here.
+//! * [`follower`] (task-23): the normal-operation follower machine: an
+//!   admitted request is initialized atomically and, for a fast-set
+//!   member, its fast acknowledgement is published only once payload,
+//!   dependencies and path evidence are durable; a leader proposal that
+//!   arrives before the payload is held against a placeholder invisible to
+//!   lookups; adoption of the leader's order waits for every dependency to
+//!   be at least ACCEPT and publishes the slow acknowledgement only once
+//!   the adopted order is durable; duplicates converge; the table is
+//!   rebuilt from durable rows after a crash.
 //! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
 //!   rows and the postcard-encoded protocol messages of this increment.
 #![forbid(unsafe_code)]
@@ -58,6 +67,7 @@ extern crate alloc;
 
 pub mod ballot;
 pub mod commands;
+pub mod follower;
 pub mod graph;
 pub mod leader;
 pub mod messages;
@@ -73,6 +83,7 @@ pub use ballot::{
     PromiseRejection, ReplicaRole,
 };
 pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
+pub use follower::{Follower, FollowerConfig, FollowerRejection, HeldProposal};
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,
 };

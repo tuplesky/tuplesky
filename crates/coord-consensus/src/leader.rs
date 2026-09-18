@@ -294,6 +294,7 @@ impl Leader {
             ballot,
             command,
             deps: init.deps.clone(),
+            paths: init.paths.clone(),
             path: init.path,
             seqnum: Some(seqnum),
         };

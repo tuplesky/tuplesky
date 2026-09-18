@@ -498,6 +498,7 @@ fn votes_are_collected_but_never_learned_here() {
         ballot: ballot(0, 0),
         command: c1,
         deps: vec![],
+        paths: vec![(CONSERVATIVE_KEY.to_vec(), path)],
         path,
         seqnum: None,
     };

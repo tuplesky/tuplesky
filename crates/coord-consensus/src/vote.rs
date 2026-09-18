@@ -38,7 +38,10 @@ pub struct FastAck {
     pub command: CommandId,
     /// Direct dependencies as the sender ordered them.
     pub deps: Vec<CommandId>,
-    /// Digest of the conflict path (per-key hash log) the sender saw.
+    /// Per-key path digests through the command (leader synchronization
+    /// input for followers).
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Combined digest of the conflict path the sender saw.
     pub path: Digest32,
     /// Leader sequence number (leader proposal only).
     pub seqnum: Option<u64>,

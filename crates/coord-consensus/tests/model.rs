@@ -73,6 +73,7 @@ fn fast(
         ballot: b,
         command: c,
         deps: deps.to_vec(),
+        paths: vec![(b"*".to_vec(), Digest32([path; 32]))],
         path: Digest32([path; 32]),
         seqnum: seq,
     })
