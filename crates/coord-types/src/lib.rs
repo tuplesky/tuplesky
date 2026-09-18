@@ -34,7 +34,7 @@ pub mod ordered_key;
 pub mod wire_v1;
 
 pub use error::{CounterOverflow, DecodeError, IdentityError, ValidationError};
-pub use identity::{AdmissionContext, CommandId, Digest32, HashDomain, RetryKey};
+pub use identity::{AdmissionContext, CommandId, Digest32, HashDomain, RetryKey, kine_binding_id};
 pub use ids::{
     Ballot, CatalogGeneration, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId,
     EndpointGeneration, ExecutionPosition, FinalizedFrameSeq, KvRevision, LeaseGeneration, LeaseId,

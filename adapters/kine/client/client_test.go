@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"sync"
@@ -64,6 +65,12 @@ type serverBehavior struct {
 	pending atomic.Bool
 	// requests seen.
 	requests atomic.Int64
+	// expectToken: when non-empty, a Bind must present exactly this token
+	// to be acknowledged with session; any other Bind is answered with a
+	// Close.
+	expectToken string
+	session     [16]byte
+	binds       atomic.Int64
 }
 
 // runServer starts an in-process quic-go frontend. It reads the control
@@ -113,11 +120,24 @@ func serveConn(ctx context.Context, conn *quic.Conn, b *serverBehavior) {
 			continue
 		}
 		go func(s *quic.Stream) {
-			b.requests.Add(1)
 			frame, err := readFramePayload(s)
 			if err != nil {
 				return
 			}
+			if frame.Kind == uint16(wire.KindBind) {
+				b.binds.Add(1)
+				bind, err := wire.DecodeBind(frame)
+				var out []byte
+				if err == nil && b.expectToken != "" && string(bind.Token) == b.expectToken {
+					out, _ = wire.EncodeBindAck(wire.BindAck{Session: b.session, ExpiresAt: 1, Scope: 1, RuleGeneration: 1})
+				} else {
+					out, _ = wire.Encode(wire.Close{Code: 2, Reason: []byte("bind refused")})
+				}
+				_, _ = s.Write(out)
+				_ = s.Close()
+				return
+			}
+			b.requests.Add(1)
 			msg, err := wire.Decode(frame)
 			if err != nil {
 				return
@@ -421,4 +441,74 @@ func TestStreamPoolIsBounded(t *testing.T) {
 	}
 	stop()
 	wg.Wait()
+}
+
+type staticTokens string
+
+func (s staticTokens) Token(context.Context) (string, error) { return string(s), nil }
+
+// A configured token source presents the token once per connection in a
+// Bind frame and learns the acknowledged session; a refused binding
+// never yields a usable connection.
+func TestBindPresentsTokenOnceAndLearnsSession(t *testing.T) {
+	cert, pool := testCert(t)
+	b := &serverBehavior{expectToken: "svc-token", session: [16]byte{7, 7}}
+	addr, stop := runServer(t, cert, b)
+	defer stop()
+	c := New(addr, Config{TLS: clientTLS(pool), Tokens: staticTokens("svc-token"), FrameTimeout: 2 * time.Second})
+	if _, ok := c.Session(); ok {
+		t.Fatal("session before binding")
+	}
+	inst := instance()
+	for seq := uint64(1); seq <= 2; seq++ {
+		inv, _ := inst.Allocate([]byte("op"), command(seq), 1000)
+		out, err := c.Do(context.Background(), inv.Frame)
+		if err != nil || out.Unknown {
+			t.Fatalf("seq %d: %v %+v", seq, err, out)
+		}
+	}
+	if got := b.binds.Load(); got != 1 {
+		t.Fatalf("binds %d, want 1 per connection", got)
+	}
+	if s, ok := c.Session(); !ok || s != b.session {
+		t.Fatalf("session %v %v", s, ok)
+	}
+	c.mu.Lock()
+	current := c.conn
+	c.mu.Unlock()
+	c.drop(current)
+	wrong := New(addr, Config{TLS: clientTLS(pool), Tokens: staticTokens("other"), FrameTimeout: 2 * time.Second})
+	inv, _ := inst.Allocate([]byte("op"), command(3), 1000)
+	if _, err := wrong.Do(context.Background(), inv.Frame); !errors.Is(err, ErrBindRejected) {
+		t.Fatalf("refused binding: %v", err)
+	}
+	if _, ok := wrong.Session(); ok {
+		t.Fatal("session after refusal")
+	}
+}
+
+// AllocateFor derives the payload from the allocated retry key and binds
+// the resulting identity; a failing build consumes no sequence.
+func TestAllocateForBindsDerivedIdentity(t *testing.T) {
+	inst := instance()
+	_, err := inst.AllocateFor(1, func(wire.RetryKey) ([]byte, [32]byte, error) {
+		return nil, [32]byte{}, errors.New("no")
+	})
+	if err == nil {
+		t.Fatal("build error swallowed")
+	}
+	var seen wire.RetryKey
+	inv, err := inst.AllocateFor(1, func(key wire.RetryKey) ([]byte, [32]byte, error) {
+		seen = key
+		return []byte("p"), command(9), nil
+	})
+	if err != nil || inv.Sequence != 1 || seen.RequestSequence != 1 || seen.ClientInstance != [16]byte{4} {
+		t.Fatalf("%v %+v %+v", err, inv, seen)
+	}
+	if _, err := inst.Retry(1, []byte("p"), command(8), 1); !errors.Is(err, ErrPayloadConflict) {
+		t.Fatalf("conflict: %v", err)
+	}
+	if _, err := inst.Retry(1, []byte("p"), command(9), 1); err != nil {
+		t.Fatal(err)
+	}
 }

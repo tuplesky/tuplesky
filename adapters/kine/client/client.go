@@ -29,7 +29,16 @@ var (
 	ErrUnknownOutcome = errors.New("unknown outcome")
 	// ErrProtocol: a frame the client did not expect.
 	ErrProtocol = errors.New("protocol violation")
+	// ErrBindRejected: the frontend refused the session binding (the
+	// token was not accepted, or the answer was not an acknowledgement).
+	ErrBindRejected = errors.New("bind rejected")
 )
+
+// TokenSource supplies the service token presented at binding. A
+// *Provider is the production source.
+type TokenSource interface {
+	Token(ctx context.Context) (string, error)
+}
 
 // Outcome is a request's result.
 type Outcome struct {
@@ -51,10 +60,10 @@ type Config struct {
 	// TLS binds trust and origin: the server certificate is validated
 	// against RootCAs and the ServerName; the native API ALPN is offered.
 	TLS *tls.Config
-	// Provider supplies the service token. On this branch a connection
-	// only requires that a token can be obtained; presenting it in a Bind
-	// frame is deferred to task-46 (see the package documentation).
-	Provider *Provider
+	// Tokens supplies the service token presented once per connection in
+	// the Bind frame that follows the Hello; nil binds no session (a
+	// deployment composition without a frontend session, test only).
+	Tokens TokenSource
 	// Cluster and Domain identify the origin.
 	Cluster [16]byte
 	Domain  [16]byte
@@ -77,6 +86,8 @@ type Client struct {
 	// own.
 	dialing chan struct{}
 	sem     chan struct{}
+	// session bound by the last acknowledged Bind.
+	session *[16]byte
 	// Reconnects performed (for tests).
 	Reconnects int
 }
@@ -171,14 +182,36 @@ func (c *Client) dialAndBind(ctx context.Context) (*quic.Conn, error) {
 	return conn, nil
 }
 
-// bind obtains a token, opens the control stream and sends the Hello. The
-// Hello has no token field and no Bind follows it here, so the token is
-// not presented; the Bind/BindAck exchange is deferred to task-46.
+// Session is the replicated session the frontend acknowledged at the
+// last binding, when a token source is configured and a connection was
+// bound.
+func (c *Client) Session() ([16]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session == nil {
+		return [16]byte{}, false
+	}
+	return *c.session, true
+}
+
+// Connect establishes and binds the connection now (the backend's Start
+// does this so a refused binding fails startup rather than the first
+// operation). It is idempotent on a live connection.
+func (c *Client) Connect(ctx context.Context) error {
+	_, err := c.connect(ctx)
+	return err
+}
+
+// bind opens the control stream and sends the Hello, then presents the
+// service token once in a Bind frame and reads the acknowledgement.
 func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
-	if c.cfg.Provider != nil {
-		if _, err := c.cfg.Provider.Token(ctx); err != nil {
+	var token string
+	if c.cfg.Tokens != nil {
+		t, err := c.cfg.Tokens.Token(ctx)
+		if err != nil {
 			return err
 		}
+		token = t
 	}
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -196,11 +229,45 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
 	if err := writeFrame(stream, hello); err != nil {
 		return err
 	}
-	// The client closes its side of the control stream without reading the
-	// HelloAck, and publishes the connection as ready without binding a
-	// session. The real frontend refuses such a connection's requests with
-	// NotBound; task-46 keeps the stream open, reads the HelloAck and binds.
+	// The control stream stays open; the client reads no HelloAck body in
+	// this preview (negotiation detail is exercised by the Rust adapter).
 	_ = stream.Close()
+	if c.cfg.Tokens == nil {
+		return nil
+	}
+	return c.bindSession(ctx, conn, token)
+}
+
+// bindSession presents the token on its own stream and requires a
+// BindAck within the frame timeout; anything else (a Close, a reset, a
+// timeout) is a rejected binding and the connection is not used.
+func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string) error {
+	frame, err := wire.EncodeBind(wire.Bind{Token: []byte(token)})
+	if err != nil {
+		return err
+	}
+	bindCtx, cancel := context.WithTimeout(ctx, c.cfg.FrameTimeout)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(bindCtx)
+	if err != nil {
+		return ErrNotConnected
+	}
+	if err := writeFrame(stream, frame); err != nil {
+		return ErrBindRejected
+	}
+	_ = stream.Close()
+	answer, err := readOneFrame(bindCtx, stream)
+	if err != nil {
+		return ErrBindRejected
+	}
+	ack, err := wire.DecodeBindAck(answer)
+	if err != nil {
+		return ErrBindRejected
+	}
+	session := ack.Session
+	c.mu.Lock()
+	c.session = &session
+	c.mu.Unlock()
 	return nil
 }
 
