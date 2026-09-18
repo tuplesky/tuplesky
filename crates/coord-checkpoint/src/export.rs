@@ -16,6 +16,11 @@
 //! execution position, a KV revision above the frontier) are an error, and
 //! the applied stamp and execution frontier are re-read between
 //! collections so a view that moved is refused, never mixed.
+//!
+//! The export also refuses to return a checkpoint whose manifest outgrows
+//! the single snapshot frame that carries it
+//! ([`crate::manifest::MAX_MANIFEST_BYTES`]): a
+//! successful export is one that can actually be transmitted.
 
 use std::fmt;
 
@@ -51,7 +56,8 @@ pub struct ExportLimits {
     pub page_bytes: u32,
     /// Encoded bytes at which a chunk is closed.
     pub chunk_target_bytes: usize,
-    /// Most chunks before the export is refused.
+    /// Most chunks before the export is refused, clamped to
+    /// [`MAX_CHUNKS`].
     pub max_chunks: usize,
 }
 
@@ -91,6 +97,10 @@ pub enum ExportError {
     },
     /// More chunks than the limit.
     TooManyChunks,
+    /// The accumulated manifest does not fit the one snapshot frame that
+    /// carries it. The rows are fine; there are more chunk descriptors, or
+    /// longer boundary keys, than the artifact supports.
+    ManifestTooLarge,
 }
 
 impl fmt::Display for ExportError {
@@ -206,7 +216,7 @@ pub fn export_shared<V: OrderedRead>(
     };
     let mut writer = ChunkWriter {
         target: limits.chunk_target_bytes.max(1),
-        max_chunks: limits.max_chunks.max(1),
+        max_chunks: limits.max_chunks.clamp(1, MAX_CHUNKS),
         current: Vec::new(),
         current_bytes: 0,
         chunks: Vec::new(),
@@ -239,6 +249,14 @@ pub fn export_shared<V: OrderedRead>(
         root: coord_types::identity::Digest32([0; 32]),
     };
     manifest.root = manifest.compute_root();
+    // The manifest is carried whole in one snapshot frame, so an export
+    // whose descriptors outgrow that frame has not succeeded: it would
+    // hand back an artifact that verifies and cannot be sent. Chunk count
+    // alone cannot decide this, because each descriptor also carries the
+    // chunk's first and last key, so the encoded manifest is measured.
+    if manifest.encode().is_err() {
+        return Err(ExportError::ManifestTooLarge);
+    }
     Ok(SharedCheckpointV1 {
         manifest,
         chunks: writer.chunks,

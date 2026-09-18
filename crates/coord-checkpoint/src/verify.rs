@@ -1,5 +1,10 @@
 //! Verification of a `SharedCheckpointV1` (design Section 17.6: "row
 //! order/uniqueness/counts/bounds, hashes and indexes" before install).
+//!
+//! The manifest's own encoded size is one of those bounds: it is carried
+//! whole in a single snapshot frame, so a manifest that outgrows the frame
+//! is refused here rather than passing verification as a checkpoint that
+//! cannot be transmitted.
 
 use std::fmt;
 
@@ -19,6 +24,10 @@ pub enum VerifyError {
         /// Format found.
         found: u16,
     },
+    /// The manifest does not fit the single snapshot frame that carries
+    /// it: too many chunk descriptors, boundary keys that are too long, or
+    /// both. Nothing can transmit it, so nothing may accept it.
+    ManifestTooLarge,
     /// The manifest's root is not the digest of its fields.
     RootMismatch,
     /// The collection summaries are not exactly the common registry in
@@ -86,6 +95,15 @@ pub fn verify_shared(
         return Err(VerifyError::UnsupportedFormat {
             found: manifest.format,
         });
+    }
+    // The size bound is structural. A manifest is carried whole in one
+    // snapshot frame, so one that exceeds the frame is an artifact that no
+    // donor can send and no learner can ever have received: accepting it
+    // here would call a checkpoint verified that only exists in memory.
+    // Chunk count alone does not decide it, because a descriptor carries
+    // the chunk's first and last key.
+    if manifest.encode().is_err() {
+        return Err(VerifyError::ManifestTooLarge);
     }
     if manifest.compute_root() != manifest.root {
         return Err(VerifyError::RootMismatch);
