@@ -147,6 +147,23 @@ must be re-checked against the paper text at the task-19 review.
 | Executed commands after a restart | `[EXT]` the executed identities are durable with the application rows (Section 6.5); recovery restores the execution frontier and a re-proposal never regresses a learned or executed phase | `Follower::restore_execution`, `CommandTable::restore_executed`, `Follower::advance_pending` | learned-outcomes test |
 | (roles are fixed in the prototype) | `[EXT]` roles convert through the recovered state: learned outcomes, execution frontier, payloads and bindings survive; a deposed leader carries a pending Sync into its follower role | `role::RecoveredState`, `Leader::{deposed, into_recovered}`, `Follower::{from_recovered, into_recovered, won}` | competing-campaigns test |
 
+## Full fast-path learning evidence (task-28)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| client `accept` (`swift/client.go`): `SHashesEq(leader.Checksum, ack.Checksum)` over `FQ`, `handleFastAndSlowAcks` | Fast learning: the leader's proposal and, from every other member of the ballot's fixed C2 fast set, a fast acknowledgement whose path evidence equals the leader's; the learned dependencies are the leader's, exactly as on the slow path | `VoteSet::learned` -> `Learned::Fast`, `Learner::commit_learned` with `LearningMode::Full` | `tests/model.rs::learning_is_order_independent_and_rejects_non_c2_evidence` (mixed ballot and epoch, duplicates, forged proposals), `crates/coord-storage/tests/recovery.rs::forced_slow_and_fast_learning_yield_equal_results` |
+| replica `getFastAndSlowAcksHandler`: `desc.phase = COMMIT` on either quorum | Replicas commit through the same predicate; the established result records which path learned it (measurement only); a forced slow path (`LearningMode::SlowOnly`) gives identical orders, rows, retained results and digests | `Learner::{set_mode, learned_fast}`, `EstablishedResult::fast_path` | forced-slow test |
+| `fastAckFromLeader`: `desc.dep = dep` on adoption; `recordLeaderHash` | `[EXT]` adoption records the leader's path evidence in the dependency row, so a recovery report carries the replica's own path for a pre-accepted command and the leader's once adopted | `CommandTable::adopt`, `Follower::{advance_pending, advance_sync}`, `ReportEntry::{path, keys}`, `SyncEntry::path` | possible-fast tests |
+| `handleNewLeaderAckNs` keeps only `ACCEPT`/`COMMIT` (the leader's own rows cover its fast replies while it lives) | `[EXT: paper-derived]` possible fast decisions: when the source leader is not among the reports, a command every reporting member of the source ballot's fast set pre-accepted with the same path may have been learned fast (any majority contains such a member) and is adopted with that order; a member that never saw it, saw a different path, ordered an adopted conflicting command after it, or reached one through a different path proves no fast decision was possible, and the command is re-proposed. No highest-phase priority | `recovery::select` -> `possible_fast_decisions` | `tests/model.rs::possible_fast_decisions_are_recovered_from_the_fixed_fast_set`, `crates/coord-storage/tests/recovery.rs::a_fast_result_followed_by_a_leader_crash_before_commit_propagation_recovers_the_same_outcome` |
+| `handleSync` install | The bound selection carries the path evidence it was chosen with; a restart of the candidate republishes it unchanged | `Follower::advance_sync`, `Campaign::resumed` | fast-result-then-crash test (restart tail) |
+
+The paper's recovery appendix was not reachable while this was written;
+the possible-fast rule is the Fast Paxos recovery rule instantiated for the
+fixed C2 set (fast set and majority intersect in at least one member) and
+is recorded as `[EXT: paper-derived]` until checked against the appendix.
+Speculative overlays and public fast responses (task-29) are not part of
+this task: nothing here releases a result before materialization.
+
 ## Crash-recovery qualification on the real engine (task-27)
 
 `crates/coord-storage/tests/recovery.rs` runs the production machines and
@@ -233,6 +250,9 @@ with the guard enforced and deliberately removed. Frozen results live in
   highest-phase-wins result that is *not* chosen (recorded as the
   counterexample), incompatible accepted candidates and a half-initialized
   entry;
+* `possible_fast_scenarios.json` (task-28): a possible fast decision
+  adopted from the fast-set member's order, the source leader present, a
+  member order that differs from the leader's, and disagreeing members;
 * `guard_removed_counterexample.json`: the trace with the guard enforced
   (violation at the leader-evidence step) and removed (the oracle finds a
   command committed while its dependency is below ACCEPT).

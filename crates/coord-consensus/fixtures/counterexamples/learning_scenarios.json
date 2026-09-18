@@ -1,7 +1,7 @@
 [
   {
     "name": "fast-path-with-invalid-evidence",
-    "permutations": 40320,
+    "permutations": 362880,
     "learned": {
       "Fast": {
         "deps": [
@@ -128,6 +128,7 @@
       "duplicate-fast-from-ReplicaId(01010101010101010101010101010101)": "Duplicate",
       "observer-r9-fast": "NotAVoter",
       "r2-fast-outside-fast-set": "NotInFastSet",
+      "r2-other-epoch": "WrongBallot",
       "r2-wrong-ballot": "WrongBallot"
     }
   },

@@ -12,11 +12,24 @@
 //! candidates must agree; an incompatible pair stops recovery with the
 //! evidence. Commands only pre-accepted are re-proposed, never fabricated
 //! as accepted no-ops.
+//!
+//! Possible fast decisions (task-28; design Sections 4.2, 4.9): with the
+//! fixed C2 fast set of the source ballot, a fast decision needs every
+//! member's path evidence to equal the leader's. Any majority of reports
+//! contains a member of that set, so when the source leader is not among
+//! the reports, a command every reporting fast-set member pre-accepted
+//! with the same path may have been learned fast; it is adopted with that
+//! order (and its prefix must be consistent with it), never re-proposed
+//! with a different one. A fast-set member that never saw the command, or
+//! saw a different path, proves no fast decision happened. This is the
+//! Fast Paxos recovery rule instantiated for C2 (intersection of one
+//! member), not a generic phase priority.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_types::CommandId;
+use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ReplicaId};
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +46,21 @@ pub struct ReportEntry {
     pub phase: Phase,
     /// Dependencies at the cut.
     pub deps: Vec<CommandId>,
+    /// Path evidence at the cut: the replica's own for a pre-accepted
+    /// command, the leader's once adopted (task-28 possible-fast-decision
+    /// recovery compares them).
+    pub path: Digest32,
+    /// Per-key path digests at the cut, the components the combined
+    /// `path` is built from. A Sync installs these, not only the combined
+    /// digest, so a replica adopting the selected order realigns its own
+    /// per-key logs to it and later commands derive their dependencies
+    /// from the selected tail.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Leader sequence number the per-key digests were synchronized at
+    /// (zero when no leader order has been recorded for the command).
+    pub seqnum: u64,
+    /// Conflict keys of the payload.
+    pub keys: Vec<Vec<u8>>,
     /// Whether the payload is durably known (a placeholder is not).
     pub payload_present: bool,
 }
@@ -59,6 +87,16 @@ pub struct SyncEntry {
     pub phase: Phase,
     /// Dependencies.
     pub deps: Vec<CommandId>,
+    /// The leader's path evidence for the command (installed with it so
+    /// a later recovery compares against the same evidence).
+    pub path: Digest32,
+    /// The per-key digests the combined `path` is built from: adopting
+    /// the entry installs these into the record and synchronizes the
+    /// per-key logs, so the replica's derived tails follow the selected
+    /// order rather than its own pre-accept one.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Leader sequence number the per-key digests were synchronized at.
+    pub seqnum: u64,
 }
 
 /// The selected recovery result (`MSync`).
@@ -191,6 +229,9 @@ pub fn select(
                             command: e.command,
                             phase,
                             deps: e.deps.clone(),
+                            path: e.path,
+                            paths: e.paths.clone(),
+                            seqnum: e.seqnum,
                         },
                     );
                 }
@@ -205,10 +246,19 @@ pub fn select(
                     if phase > existing.phase {
                         existing.phase = phase;
                     }
+                    // The reporters of one source ballot adopted one
+                    // leader order, so their per-key digests agree; take
+                    // the most recently synchronized copy, which is a
+                    // maximum and therefore independent of report order.
+                    if e.seqnum > existing.seqnum {
+                        existing.seqnum = e.seqnum;
+                        existing.paths = e.paths.clone();
+                    }
                 }
             }
         }
     }
+    possible_fast_decisions(config, source_ballot, reports, &mut entries);
     for c in entries.keys() {
         reproposed.remove(c);
     }
@@ -218,4 +268,125 @@ pub fn select(
         entries,
         reproposed,
     })
+}
+
+/// Adopt the commands that may have been learned fast under the source
+/// ballot (module documentation). `entries` already holds the ACCEPT and
+/// COMMIT state of the source reports, whose path evidence is the source
+/// leader's.
+///
+/// A command `c` is a candidate when every reporting member of the source
+/// fast set pre-accepted it with the same path. It is adopted, with that
+/// order, when the members' order is consistent with everything the
+/// leader is known to have ordered: every adopted command conflicting
+/// with `c` precedes it in the member's dependency closure with the
+/// leader's path (a learned command the leader ordered after `c` would
+/// have carried `c` as an accepted dependency, so `c` would not be a
+/// candidate), and every unadopted command in that closure is itself a
+/// candidate. Anything else proves the member's path differs from the
+/// leader's, so no fast decision was possible and the command is
+/// re-proposed.
+fn possible_fast_decisions(
+    config: &BallotConfiguration,
+    source_ballot: Ballot,
+    reports: &[RecoveryReport],
+    entries: &mut BTreeMap<CommandId, SyncEntry>,
+) {
+    let source_leader = source_ballot.leader;
+    if reports
+        .iter()
+        .any(|r| r.replica == source_leader && r.committed_ballot == source_ballot)
+    {
+        // The source leader's own rows are authoritative: a command it
+        // never proposed cannot have been learned fast.
+        return;
+    }
+    // The fast set of the source ballot (the default rule until the
+    // retained operator quorum table of task-m01).
+    let Ok(source_config) =
+        BallotConfiguration::c2_default(config.epoch(), source_ballot, config.voters().clone())
+    else {
+        return;
+    };
+    let fast_reporters: Vec<&RecoveryReport> = reports
+        .iter()
+        .filter(|r| {
+            r.committed_ballot == source_ballot
+                && r.replica != source_leader
+                && source_config.fast_set().contains(&r.replica)
+        })
+        .collect();
+    let Some(first) = fast_reporters.first() else {
+        return;
+    };
+    fn record<'a>(r: &'a RecoveryReport, c: &CommandId) -> Option<&'a ReportEntry> {
+        r.entries.iter().find(|e| e.command == *c)
+    }
+    // Candidates: pre-accepted by every reporting fast-set member with the
+    // same path evidence, and not already adopted.
+    let mut candidates: BTreeMap<CommandId, ReportEntry> = BTreeMap::new();
+    for e in &first.entries {
+        if e.phase != Phase::PreAccept || !e.payload_present || entries.contains_key(&e.command) {
+            continue;
+        }
+        let agreed = fast_reporters.iter().all(|r| {
+            record(r, &e.command).is_some_and(|o| {
+                o.phase == Phase::PreAccept && o.path == e.path && o.payload_present
+            })
+        });
+        if agreed {
+            candidates.insert(e.command, e.clone());
+        }
+    }
+    // The member's dependency closure of a command (over its own records).
+    let closure = |c: &CommandId| -> BTreeSet<CommandId> {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<CommandId> =
+            record(first, c).map(|e| e.deps.clone()).unwrap_or_default();
+        while let Some(d) = stack.pop() {
+            if seen.insert(d)
+                && let Some(e) = record(first, &d)
+            {
+                stack.extend(e.deps.iter().copied());
+            }
+        }
+        seen
+    };
+    let conflicts = |a: &[Vec<u8>], b: &[Vec<u8>]| a.iter().any(|k| b.contains(k));
+    loop {
+        let before = candidates.len();
+        let keys: Vec<CommandId> = candidates.keys().copied().collect();
+        for c in keys {
+            let entry = candidates[&c].clone();
+            let prefix = closure(&c);
+            let ordered_after_adopted = entries.values().all(|adopted| {
+                let a = record(first, &adopted.command);
+                !conflicts(&entry.keys, a.map_or(&[][..], |a| &a.keys))
+                    || (prefix.contains(&adopted.command)
+                        && a.is_some_and(|a| a.path == adopted.path))
+            });
+            let prefix_decided = prefix
+                .iter()
+                .all(|d| entries.contains_key(d) || candidates.contains_key(d));
+            if !ordered_after_adopted || !prefix_decided {
+                candidates.remove(&c);
+            }
+        }
+        if candidates.len() == before {
+            break;
+        }
+    }
+    for (c, e) in candidates {
+        entries.insert(
+            c,
+            SyncEntry {
+                command: c,
+                phase: Phase::Accept,
+                deps: e.deps,
+                path: e.path,
+                paths: e.paths,
+                seqnum: e.seqnum,
+            },
+        );
+    }
 }

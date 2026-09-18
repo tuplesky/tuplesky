@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandTable, InitError};
-use crate::learner::{AppliedOutcome, LearnError, Learner};
+use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{PathAnchors, ProtocolMessage};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -503,7 +503,18 @@ impl Leader {
     }
 
     fn learn(&mut self) {
-        Learner::commit_learned(&mut self.table, &self.votes);
+        self.learner.commit_learned(&mut self.table, &self.votes);
+    }
+
+    /// Choose the learning predicates (full, or the forced slow path for
+    /// comparison runs); carried across role changes and restarts.
+    pub const fn set_learning(&mut self, mode: LearningMode) {
+        self.learner.set_mode(mode);
+    }
+
+    /// The learning mode in effect.
+    pub const fn learning(&self) -> LearningMode {
+        self.learner.mode()
     }
 
     /// Whether this replica leads the promised ballot: it votes in this

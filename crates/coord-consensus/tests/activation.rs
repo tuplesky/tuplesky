@@ -737,6 +737,9 @@ fn a_synchronized_ballot_is_durable_before_anything_of_the_new_one() {
                 command: c1,
                 phase: Phase::Accept,
                 deps: vec![],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
             },
         )]),
         reproposed: Default::default(),
@@ -791,6 +794,9 @@ fn reproposals_follow_the_recovered_order_not_identity_order() {
                 command: a,
                 phase: Phase::Accept,
                 deps: vec![],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
             },
         ),
         (
@@ -799,6 +805,9 @@ fn reproposals_follow_the_recovered_order_not_identity_order() {
                 command: b,
                 phase: Phase::Accept,
                 deps: vec![a],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
             },
         ),
     ]);
@@ -859,6 +868,9 @@ fn a_receiving_follower_that_crashes_on_the_marker_still_holds_the_selection() {
                 command: c1,
                 phase: Phase::Accept,
                 deps: vec![],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
             },
         )]),
         reproposed: Default::default(),
@@ -892,4 +904,154 @@ fn a_receiving_follower_that_crashes_on_the_marker_still_holds_the_selection() {
     assert_eq!(c.nodes[1].follower().ballots().synced(), new);
     let recovered = sync_rows(&c.nodes[1].storage);
     assert_eq!(recovered, vec![decision], "the selection survived");
+}
+
+#[test]
+fn a_sync_installs_the_selected_per_key_evidence_not_only_the_combined_digest() {
+    // A replica pre-accepted a command in its own order, so its per-key
+    // log carries its own digest. The selection recovery binds carries the
+    // leader's per-key digests; installing it must realign the log to
+    // them. Replacing only the combined digest would leave the next
+    // command this replica pre-accepts derived from the local tail, and a
+    // later recovery would compare fast-set evidence nobody else holds.
+    let mut c = Cluster::new(3);
+    let c1 = c.admit(1, 1);
+    let key = coord_consensus::CONSERVATIVE_KEY.to_vec();
+    let local = c.nodes[1].follower().table().path_head(&key);
+    let chosen = Digest32([42; 32]);
+    assert_ne!(
+        local, chosen,
+        "the selection disagrees with the local order"
+    );
+    let new = ballot(1, 2);
+    let f = c.nodes[1].follower_mut();
+    let promise = f.step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    for event in durable_events(&promise) {
+        f.step(event);
+    }
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            c1,
+            coord_consensus::SyncEntry {
+                command: c1,
+                phase: Phase::Accept,
+                deps: vec![],
+                path: chosen,
+                paths: vec![(key.clone(), chosen)],
+                seqnum: 7,
+            },
+        )]),
+        reproposed: Default::default(),
+    };
+    let bound = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    for event in durable_events(&bound) {
+        f.step(event);
+    }
+    let record = f.table().record(&c1).expect("installed").clone();
+    assert_eq!(record.path, chosen, "the combined evidence is the leader's");
+    assert_eq!(
+        record.paths,
+        vec![(key.clone(), chosen)],
+        "the per-key evidence is installed, not only the combined digest"
+    );
+    assert_eq!(record.synced_seq, Some(7));
+    assert_eq!(
+        f.table().path_head(&key),
+        chosen,
+        "the key's log resumes at the selected order, not the local one"
+    );
+}
+
+#[test]
+fn a_sync_row_of_the_previous_layout_still_decodes() {
+    // The Sync row gained path evidence, which changed its payload
+    // layout. A node restarting on a row the parent revision wrote must
+    // read the selection it bound, not fail recovery as corrupt, so the
+    // row carries a schema version and the old layout has a decoder.
+    #[derive(serde::Serialize)]
+    struct LegacyEntry {
+        command: CommandId,
+        phase: Phase,
+        deps: Vec<CommandId>,
+    }
+    #[derive(serde::Serialize)]
+    struct LegacyDecision {
+        ballot: Ballot,
+        source_ballot: Ballot,
+        entries: BTreeMap<CommandId, LegacyEntry>,
+        reproposed: std::collections::BTreeSet<CommandId>,
+    }
+    #[derive(serde::Serialize)]
+    struct LegacyRecord {
+        decision: LegacyDecision,
+    }
+    let mut c = Cluster::new(3);
+    let c1 = c.admit(1, 1);
+    let c2 = c.admit(2, 2);
+    let legacy = LegacyRecord {
+        decision: LegacyDecision {
+            ballot: ballot(1, 2),
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::from([
+                (
+                    c1,
+                    LegacyEntry {
+                        command: c1,
+                        phase: Phase::Accept,
+                        deps: vec![],
+                    },
+                ),
+                (
+                    c2,
+                    LegacyEntry {
+                        command: c2,
+                        phase: Phase::Commit,
+                        deps: vec![c1],
+                    },
+                ),
+            ]),
+            reproposed: Default::default(),
+        },
+    };
+    let row = coord_store_api::envelope::StoreEnvelopeV1 {
+        record_kind: coord_consensus::SYNC_KIND,
+        schema_version: 1,
+        payload: postcard::to_allocvec(&legacy).unwrap(),
+    }
+    .encode()
+    .unwrap();
+    let decoded = decode_sync(&row).expect("the previous layout is still readable");
+    assert_eq!(decoded.decision.ballot, ballot(1, 2));
+    assert_eq!(decoded.decision.entries.len(), 2);
+    assert_eq!(decoded.decision.entries[&c2].deps, vec![c1]);
+    assert_eq!(decoded.decision.entries[&c2].phase, Phase::Commit);
+    // What that revision did not record is empty, never invented.
+    assert!(decoded.decision.entries[&c1].paths.is_empty());
+    assert_eq!(decoded.decision.entries[&c1].seqnum, 0);
+    assert_eq!(
+        decoded.decision.entries[&c1].path,
+        coord_consensus::empty_path()
+    );
+    // The row this revision writes carries the new version, and a version
+    // neither decoder knows is refused rather than misread.
+    let current = coord_consensus::encode_sync(&coord_consensus::SyncRecordV1 {
+        decision: decoded.decision.clone(),
+    })
+    .unwrap();
+    let env = coord_store_api::envelope::StoreEnvelopeV1::decode(&current).unwrap();
+    assert_eq!(env.schema_version, coord_consensus::SYNC_SCHEMA_VERSION);
+    assert_eq!(decode_sync(&current).unwrap().decision, decoded.decision);
+    let future = coord_store_api::envelope::StoreEnvelopeV1 {
+        record_kind: coord_consensus::SYNC_KIND,
+        schema_version: coord_consensus::SYNC_SCHEMA_VERSION + 1,
+        payload: env.payload,
+    }
+    .encode()
+    .unwrap();
+    assert!(
+        decode_sync(&future).is_err(),
+        "an unknown version is refused"
+    );
 }
