@@ -79,7 +79,10 @@ pub struct PeerProvenance {
 
 impl PeerProvenance {
     /// Construct at the transport boundary after TLS, role and membership
-    /// binding succeeded.
+    /// binding succeeded. Only transport crates may contain this call:
+    /// `cargo xtask check-deps` scans every non-test crate for it and rejects
+    /// any outside the reviewed allow list, so decoded bytes cannot be cast
+    /// into an authenticated peer event elsewhere.
     pub const fn from_transport(
         from: ReplicaId,
         incarnation: ReplicaIncarnation,

@@ -42,10 +42,23 @@ pub enum EstablishError {
     ZeroPosition,
 }
 
+impl EstablishError {
+    /// Stable description.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EstablishError::EpochMismatch => "ballot epoch differs from the stated epoch",
+            EstablishError::InconsistentClosure => "closure lists the command itself or duplicates",
+            EstablishError::ZeroPosition => "position zero is never established",
+        }
+    }
+}
+
 /// A result whose command, order, authorization and digest were established
 /// by the learning predicate. Fields are private; the only constructor is
-/// [`EstablishedResult::establish`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// [`EstablishedResult::establish`]. Deserialization decodes an untrusted
+/// [`EstablishedRecord`] and re-runs the structural checks, so bytes cannot
+/// produce a value `establish` would have refused.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EstablishedResult {
     command: CommandId,
     epoch: ConfigurationEpoch,
@@ -54,6 +67,34 @@ pub struct EstablishedResult {
     result_digest: Digest32,
     revision: Option<KvRevision>,
     fast_path: bool,
+}
+
+/// The serialized shape of an [`EstablishedResult`]: plain data with no
+/// establishment meaning. It is what storage or the wire carries; turning it
+/// back into a capability goes through [`EstablishedResult::restore`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EstablishedRecord {
+    /// Established command.
+    pub command: CommandId,
+    /// Epoch.
+    pub epoch: ConfigurationEpoch,
+    /// Ballot.
+    pub ballot: Ballot,
+    /// Execution position.
+    pub position: ExecutionPosition,
+    /// Result digest.
+    pub result_digest: Digest32,
+    /// KV revision, if any.
+    pub revision: Option<KvRevision>,
+    /// Fast-path marker.
+    pub fast_path: bool,
+}
+
+impl<'de> Deserialize<'de> for EstablishedResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let record = EstablishedRecord::deserialize(deserializer)?;
+        EstablishedResult::restore(record).map_err(|e| serde::de::Error::custom(e.as_str()))
+    }
 }
 
 impl EstablishedResult {
@@ -81,6 +122,41 @@ impl EstablishedResult {
             revision: evidence.revision,
             fast_path: evidence.fast_path,
         })
+    }
+
+    /// Rebuild a capability from its serialized record, re-checking the
+    /// structural invariants `establish` enforces (epoch consistency and a
+    /// nonzero position). The closure was validated when the record was
+    /// produced and is not carried.
+    pub fn restore(record: EstablishedRecord) -> Result<Self, EstablishError> {
+        if record.ballot.epoch != record.epoch {
+            return Err(EstablishError::EpochMismatch);
+        }
+        if record.position == ExecutionPosition::ZERO {
+            return Err(EstablishError::ZeroPosition);
+        }
+        Ok(EstablishedResult {
+            command: record.command,
+            epoch: record.epoch,
+            ballot: record.ballot,
+            position: record.position,
+            result_digest: record.result_digest,
+            revision: record.revision,
+            fast_path: record.fast_path,
+        })
+    }
+
+    /// The plain record of this capability.
+    pub const fn record(&self) -> EstablishedRecord {
+        EstablishedRecord {
+            command: self.command,
+            epoch: self.epoch,
+            ballot: self.ballot,
+            position: self.position,
+            result_digest: self.result_digest,
+            revision: self.revision,
+            fast_path: self.fast_path,
+        }
     }
 
     /// Established command.
@@ -116,8 +192,10 @@ impl EstablishedResult {
 /// Canonical trusted admission receipt (design Section 9.3): identity and
 /// relevant claims verified outside replicated execution, never a raw token.
 /// Only a verifier at the trusted boundary constructs it, through
-/// [`AdmissionReceipt::from_verifier`] with a [`VerifierToken`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// [`AdmissionReceipt::from_verifier`] with a [`VerifierToken`]. It is
+/// deliberately not deserializable: a receipt is minted per admission by the
+/// verifier and never restored from bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AdmissionReceipt {
     session: SessionId,
     rule_generation: u64,
@@ -127,14 +205,17 @@ pub struct AdmissionReceipt {
 }
 
 /// Proof that a verifier ran. It has no public constructor other than
-/// [`VerifierToken::for_boundary`], which is only meaningful in verifier
-/// code; state machines never receive one.
+/// [`VerifierToken::for_boundary`], which only the verifier boundary crates
+/// may call: `cargo xtask check-deps` scans every non-test crate for the
+/// constructor and rejects any crate outside the reviewed allow list, so a
+/// state machine or storage crate cannot label unverified input as admitted.
 #[derive(Debug)]
 pub struct VerifierToken(());
 
 impl VerifierToken {
     /// Mint a token. Callable only by boundary code that just verified
-    /// external credentials; core machines have no reason to call it.
+    /// external credentials; the dependency-policy check enforces the
+    /// allow list of crates that may contain this call.
     pub const fn for_boundary() -> Self {
         VerifierToken(())
     }

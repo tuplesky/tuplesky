@@ -16,3 +16,5 @@ coord-types.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+postcard.workspace = true
+coord-sim.workspace = true

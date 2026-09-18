@@ -6,6 +6,8 @@
 //! production crate that links it.
 #![forbid(unsafe_code)]
 
+pub mod ports;
+
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "test-only";
 
