@@ -17,6 +17,11 @@
 //!   revision rows (Section 17.2) with property-tested byte ordering.
 //! * [`wire_v1`]: bounded frames and stable transport DTOs (task-03,
 //!   Sections 11.2 and 19.1), decoded only within declared limits.
+//! * [`config_v1`]: the authoritative configuration records
+//!   (`GroupConfigurationV1`, `BallotConfigurationV1`), authenticated hints,
+//!   endpoint and observer catalogs and the bootstrap, subscription and
+//!   observer-discovery frames of the configuration kind range (task-m01,
+//!   Section 10.5). Verification of the chain lives in `coord-membership`.
 //!
 //! The crate performs no I/O, reads no clocks and generates no randomness. It
 //! is `no_std` + `alloc` so the compile boundary in `cargo xtask check-deps`
@@ -26,6 +31,7 @@
 #![warn(missing_docs)]
 extern crate alloc;
 
+pub mod config_v1;
 pub mod error;
 pub mod identity;
 pub mod ids;

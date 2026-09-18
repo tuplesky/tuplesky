@@ -169,6 +169,53 @@ is admitted before a binding, or after its validity ends; watches and
 results of already admitted work are released only through the fresh
 authorization barrier of `coord-session`.
 
+## Configuration frames (task-m01)
+
+Configuration discovery uses six raw kinds of the configuration range
+(class limit 256 KiB). Their DTOs are `coord_types::config_v1`; like the
+collector and binding frames they are dispatched by raw kind at the
+configuration boundary, not by the typed decoder, and the Go mirror does
+not carry them until task-m02.
+
+| Kind | Value | Direction | Payload |
+|---|---|---|---|
+| BootstrapRequest | `0x0400` | client to any node | `BootstrapRequestV1 { cluster, domain, known_epoch?, known_certificate? }` |
+| BootstrapResponse | `0x0401` | node to client | `BootstrapResponseV1 { records[<=64] of GroupConfigurationV1, complete, ballot?: BallotConfigurationV1, endpoints?: EndpointCatalogV1 }` |
+| Subscribe | `0x0402` | client to node | `SubscribeV1 { cluster, domain, epoch, endpoint_generation, catalog_generation }` |
+| Notice | `0x0403` | node to subscriber | `NoticeV1 { hint: ConfigurationHintV1 }` |
+| ObserverDiscoveryRequest | `0x0404` | client to node | `ObserverDiscoveryRequestV1 { cluster, domain, after?, limit (1..=64) }` |
+| ObserverDiscoveryPage | `0x0405` | node to client | `ObserverDiscoveryPageV1 { epoch, generation, entries[<=64], next?, complete }` |
+
+`GroupConfigurationV1` binds cluster, domain, epoch, the exact voters
+(node, committed incarnation, uncompressed P-256 public key), the quorum
+policy identifier (`1` C2 fixed majority, `2` C1), the previous epoch's
+certificate hash and the activation evidence: the genesis admin's ES256
+signature over the activation message for epoch one, or the terminal
+certificate plus approvals of a majority of the previous epoch's voters
+for a handoff. The activation message is the domain-separated digest
+(`configuration-activation`) of every field except the signatures; the
+certificate hash (`configuration-record`) covers the complete record.
+`BallotConfigurationV1 { cluster, domain, epoch,
+configuration_certificate, ballot, quorum_policy, fast_set[<=16],
+promises[<=16] }` binds a ballot's leader and sorted fast set to one
+cluster, one domain and one configuration record under an epoch, with the
+voters' promises over the `configuration-ballot` message. That message is
+the domain-separated digest of cluster, domain, epoch, the configuration
+certificate hash, the ballot number, the leader, the policy and the fast
+set, in that order; a verifier accepts the certificate only for its own
+cluster and domain and only when the named configuration certificate is
+the one its chain holds for that epoch. Without the three context fields
+the same promises are valid evidence in any domain sharing those voter
+identities, incarnations and keys. Catalogs carry one voter attestation
+over the `configuration-catalog` message. Frozen digests and frames:
+`crates/coord-types/fixtures/config_frames_v1.json`.
+
+A response, a hint or a larger epoch number authorizes nothing: the
+receiver verifies the chain from its trusted genesis (`coord-membership`),
+installs epochs monotonically, treats a hint as a refresh trigger only,
+and lets endpoint and observer catalogs change addresses, certificate
+routing and serving topology but never the voter set.
+
 ## Go mirror (task-44)
 
 `adapters/kine/wire` mirrors the frame codec and the postcard subset of

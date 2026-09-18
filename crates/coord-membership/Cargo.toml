@@ -13,6 +13,7 @@ role = "production"
 
 [dependencies]
 coord-types.workspace = true
+coord-consensus.workspace = true
 coord-transport.workspace = true
 coord-node-issuer.workspace = true
 serde = { workspace = true, features = ["std"] }
