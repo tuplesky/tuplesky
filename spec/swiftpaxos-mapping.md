@@ -147,6 +147,39 @@ must be re-checked against the paper text at the task-19 review.
 | Executed commands after a restart | `[EXT]` the executed identities are durable with the application rows (Section 6.5); recovery restores the execution frontier and a re-proposal never regresses a learned or executed phase | `Follower::restore_execution`, `CommandTable::restore_executed`, `Follower::advance_pending` | learned-outcomes test |
 | (roles are fixed in the prototype) | `[EXT]` roles convert through the recovered state: learned outcomes, execution frontier, payloads and bindings survive; a deposed leader carries a pending Sync into its follower role | `role::RecoveredState`, `Leader::{deposed, into_recovered}`, `Follower::{from_recovered, into_recovered, won}` | competing-campaigns test |
 
+## Crash-recovery qualification on the real engine (task-27)
+
+`crates/coord-storage/tests/recovery.rs` runs the production machines and
+the common materializer over `RedbEngine` on a fault-injecting backend
+(fidelity level B) under a seeded logical network (level A). A crash
+freezes the backend and derives the surviving image (torn, reordered
+unsynced tail included); the next process rebuilds its role from the
+projection alone through `coord_storage::protocol::read_protocol`.
+
+| Schedule (design Sections 5.1, 12.2, 21.6) | Property | Test |
+|---|---|---|
+| Lost leader, follower restart with a torn tail, campaign by a voter that never stored the payloads | Acknowledged outputs, retry digests and lease/policy rows survive; nothing executes twice; client retries answer identically; the observed history is linearizable | `acknowledged_outputs_retry_digests_and_lease_state_survive_a_lost_leader` |
+| Leader isolated from both followers | A minority establishes nothing and holds no unacknowledged rows; the majority recovers and serves; the stale leader's proposals are refused | `a_minority_cannot_write` |
+| Dependency rows deliberately omitted on one voter | The restart check (executed identities versus application frontier) fails closed; a replica ignoring it halts on `PositionMismatch`; the oracle rejects the recovered majority's answers | `a_deliberately_omitted_durable_record_is_detected` |
+| Crash after the Sync row is bound and published; crash before it is durable | The bound decision is republished, never reselected under the same ballot; without a bound row a valid new ballot is entered | `a_crash_after_publishing_the_sync_preserves_the_same_ballot_choice` |
+| Permuted promise/report deliveries | The same bound selection on every seed | `permuted_report_deliveries_select_the_same_result_on_the_real_engine` |
+| Follower restart at every consensus persist batch (before it reaches the engine, and after it is durable but before the completion event), then recovery under the restarted node's ballot | Every node reproduces the acknowledged order, rows and retry records | `follower_restarts_at_every_persist_boundary_reproduce_the_acknowledged_outcomes` |
+
+Extensions the qualification forced (focused review, not hidden):
+
+| Source behavior | Rule | Rust item |
+|---|---|---|
+| (no restart in the prototype) | `[EXT]` a restarted replica recovers its promise, dependency rows, bound selections, payloads and executed identities from the projection; the executed identities must account for the application frontier | `protocol::read_protocol`, `RecoveredProtocol::{resumable_sync, executed_through}` |
+| `handleNewLeaderAckNs` selects from identities | `[EXT]` a candidate that lacks the payload of a selected command fetches it from the reporting voters before the result is bound; the new leader re-proposes from payloads | `Follower::advance_campaign`, `Campaign::{promised, payloads_requested}` |
+| payload transfer | `[EXT]` payload requests and responses are published under the promised ballot: they are not voting transitions and a promise for a higher ballot must not fence them | `Follower::{request_payloads, serve_payloads}`, `Leader::serve_payloads` |
+
+Precise coverage: the reference `StoreWorker` over redb with protocol and
+application rows in one projection. Journal-first composition (task-j03,
+task-j05), quorum-certified checkpoints (task-30) and lagging-replica
+catch-up (task-50) are qualified by those tasks; crash points here are the
+consensus persist batches (the materializer's own crash matrix is tasks
+11/12/15). Reference redb evidence does not qualify raft-engine.
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |
