@@ -14,6 +14,15 @@
 //! * [`scenario`]: versioned `StoreScenarioV1` logical fixtures generated
 //!   from a seed, replayed against any engine and compared with an
 //!   independent map oracle and a frozen digest.
+//! * [`journal`] (task-j01): a deterministic model of the
+//!   `coord-journal-api` contract with mapping-before-use, head/chain
+//!   validation before append, scripted durable/definite/indeterminate
+//!   outcomes and retirement only under a durable pointer.
+//! * [`initialization`] (task-j01): every interleaving of two conflicting
+//!   proposals over the model journal, proving that initialized state and
+//!   its conflict-index visibility are one durable transition, that
+//!   placeholders never masquerade as processed commands and that the
+//!   dependency-phase guards read installed durable state.
 //!
 //! Events of the model are distinct kinds (visible, durable, checkpoint
 //! published, reopened); none of them is protocol establishment. The kit is
@@ -23,10 +32,14 @@
 #![warn(missing_docs)]
 
 pub mod conformance;
+pub mod initialization;
+pub mod journal;
 pub mod model;
 pub mod scenario;
 
 pub use conformance::{ConformanceHarness, ConformanceReport, ScriptedOutcome, run_all};
+pub use initialization::{InitMisbehavior, Violation, WorldConfig, explore};
+pub use journal::{AppendScript, JournalEvent, ModelJournal};
 pub use model::{Misbehavior, ModelEngine, ModelEvent};
 pub use scenario::{StoreScenarioV1, replay};
 
