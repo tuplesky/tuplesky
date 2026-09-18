@@ -8,19 +8,38 @@ use coord_store_api::engine::{EngineError, LocalEngine};
 use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::ids::NamespaceId;
 
+use crate::retry::RetryBinding;
+
 use crate::codecs;
 use crate::worker::{StoreWorker, SubmitError};
 
 /// Lower a plan into the immutable batch materialization will apply:
 /// current rows, history versions, complete events of the revision, lease
-/// index rows, the KV revision frontier and the retention floor. The batch
-/// carries the plan's base so the worker rechecks it in the transaction.
+/// index rows, the KV revision frontier, the retention floor and, when the
+/// command has a stable invocation identity, its retry record and executed
+/// identity. The batch carries the plan's base so the worker rechecks it in
+/// the transaction.
 pub fn plan_to_batch(
     barrier: BarrierId,
     namespace: NamespaceId,
     plan: &ApplyPlan,
+    binding: Option<&RetryBinding>,
 ) -> Result<PersistBatch, EngineError> {
     let mut updates = Vec::new();
+    if let Some(binding) = binding {
+        let response = postcard::to_allocvec(&plan.response).map_err(|_| {
+            EngineError::new(
+                coord_store_api::engine::ErrorClass::Limit,
+                "response encode",
+            )
+        })?;
+        updates.extend(crate::retry::binding_updates(
+            binding,
+            plan.position,
+            plan.revision,
+            response,
+        )?);
+    }
     let revision = plan.revision;
     for m in &plan.mutations {
         match m {
@@ -124,8 +143,9 @@ pub fn apply_plan<E: LocalEngine>(
     barrier: BarrierId,
     namespace: NamespaceId,
     plan: &ApplyPlan,
+    binding: Option<&RetryBinding>,
 ) -> Result<ApplyOutcome, EngineError> {
-    let batch = plan_to_batch(barrier, namespace, plan)?;
+    let batch = plan_to_batch(barrier, namespace, plan, binding)?;
     match worker.submit(batch) {
         Ok(()) => {}
         Err(SubmitError::NotReady(_)) => return Ok(ApplyOutcome::Indeterminate),

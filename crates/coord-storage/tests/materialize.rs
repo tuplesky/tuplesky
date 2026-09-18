@@ -99,6 +99,7 @@ impl<E: LocalEngine> Domain<E> {
                 self.alloc.allocate(),
                 request.namespace,
                 &planned,
+                None,
             )
             .unwrap()
             {
@@ -321,11 +322,25 @@ fn stale_base_replans_instead_of_applying_against_different_state() {
     let plan_b = plan(&request_b, &view, &PlanLimits::default()).unwrap();
     assert_eq!(plan_a.base, plan_b.base);
     assert!(matches!(
-        apply_plan(&mut domain.worker, domain.alloc.allocate(), NS, &plan_a).unwrap(),
+        apply_plan(
+            &mut domain.worker,
+            domain.alloc.allocate(),
+            NS,
+            &plan_a,
+            None
+        )
+        .unwrap(),
         ApplyOutcome::Applied(_)
     ));
     assert_eq!(
-        apply_plan(&mut domain.worker, domain.alloc.allocate(), NS, &plan_b).unwrap(),
+        apply_plan(
+            &mut domain.worker,
+            domain.alloc.allocate(),
+            NS,
+            &plan_b,
+            None
+        )
+        .unwrap(),
         ApplyOutcome::Replan
     );
     // State reflects only plan A; a fresh view replans B correctly.
@@ -335,7 +350,14 @@ fn stale_base_replans_instead_of_applying_against_different_state() {
     let plan_b2 = plan(&request_b, &view, &PlanLimits::default()).unwrap();
     assert_eq!(plan_b2.revision, Some(rev(3)));
     assert!(matches!(
-        apply_plan(&mut domain.worker, domain.alloc.allocate(), NS, &plan_b2).unwrap(),
+        apply_plan(
+            &mut domain.worker,
+            domain.alloc.allocate(),
+            NS,
+            &plan_b2,
+            None
+        )
+        .unwrap(),
         ApplyOutcome::Applied(_)
     ));
 }
@@ -523,7 +545,14 @@ fn ahead_of_durability_views_are_refused_until_reconciled() {
         .engine_mut()
         .script_commit(CommitScript::Indeterminate { applied: true });
     assert_eq!(
-        apply_plan(&mut domain.worker, domain.alloc.allocate(), NS, &planned).unwrap(),
+        apply_plan(
+            &mut domain.worker,
+            domain.alloc.allocate(),
+            NS,
+            &planned,
+            None
+        )
+        .unwrap(),
         ApplyOutcome::Indeterminate
     );
     assert!(matches!(
@@ -604,7 +633,13 @@ fn crash_mid_apply_leaves_no_partial_events_or_frontier_mismatch() {
             };
             drop(gated);
             let planned = plan(r, &view, &PlanLimits::default()).unwrap();
-            match apply_plan(&mut domain.worker, domain.alloc.allocate(), NS, &planned) {
+            match apply_plan(
+                &mut domain.worker,
+                domain.alloc.allocate(),
+                NS,
+                &planned,
+                None,
+            ) {
                 Ok(ApplyOutcome::Applied(_)) => applied += 1,
                 _ => break,
             }

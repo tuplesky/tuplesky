@@ -37,12 +37,14 @@
 pub mod codecs;
 pub mod lowering;
 pub mod materialize;
+pub mod retry;
 pub mod view;
 pub mod views;
 pub mod worker;
 
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};
+pub use retry::{Admission, Resolution, RetryBinding};
 pub use view::{GatedReader, GatedView, ViewError};
 pub use views::{ViewBudget, ViewBuildError, build_read_view, events_at, scan_current_page};
 pub use worker::{FlushOutcome, GroupLimits, StoreWorker, SubmitError, WorkerState};
