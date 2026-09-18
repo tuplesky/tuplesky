@@ -38,7 +38,7 @@ pub struct InstanceState {
     /// Next sequence to allocate (never reused).
     pub next_sequence: u64,
     /// Sequences whose payload is fixed, with their command identity.
-    pub bound: BTreeMap<u64, CommandId>,
+    pub bound: BTreeMap<u64, Binding>,
 }
 
 /// Why an invocation could not be built.
@@ -58,6 +58,27 @@ pub enum InvocationError {
         /// Sequence.
         sequence: u64,
     },
+    /// A retry named a sequence allocated with another deadline. The
+    /// deadline is part of the frame but not of the command identity, so
+    /// accepting it would send different bytes for the same invocation.
+    DeadlineConflict {
+        /// Sequence.
+        sequence: u64,
+        /// Deadline bound at allocation.
+        bound: u32,
+    },
+}
+
+/// What an allocated sequence is bound to: everything the original
+/// request frame is built from besides the request itself, so a retry
+/// after a restart reproduces that frame exactly rather than a frame
+/// that merely shares its identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
+    /// Identity derived at allocation.
+    pub command_id: CommandId,
+    /// Deadline the original frame carried.
+    pub deadline_ms: u32,
 }
 
 /// A client instance: the allocator of invocation identities.
@@ -127,12 +148,23 @@ impl ClientInstance {
         let key = self.key(sequence).ok_or(InvocationError::Exhausted)?;
         let invocation = build(key, request, deadline_ms)?;
         self.state.next_sequence = sequence.checked_add(1).ok_or(InvocationError::Exhausted)?;
-        self.state.bound.insert(sequence, invocation.command_id);
+        self.state.bound.insert(
+            sequence,
+            Binding {
+                command_id: invocation.command_id,
+                deadline_ms,
+            },
+        );
         Ok(invocation)
     }
 
     /// Rebuild the invocation of an allocated `sequence` for a retry: the
-    /// payload must be the one bound at allocation.
+    /// payload and the deadline must be the ones bound at allocation, so
+    /// the frame a retry sends is byte for byte the one it repeats. The
+    /// deadline is not part of the command identity, so a binding that
+    /// recorded only the identity would pass the conflict check and still
+    /// change the wire bytes and the collector's deadline under the same
+    /// invocation.
     pub fn retry(
         &self,
         sequence: u64,
@@ -145,9 +177,15 @@ impl ClientInstance {
             .get(&sequence)
             .copied()
             .ok_or(InvocationError::UnknownSequence { sequence })?;
+        if deadline_ms != bound.deadline_ms {
+            return Err(InvocationError::DeadlineConflict {
+                sequence,
+                bound: bound.deadline_ms,
+            });
+        }
         let key = self.key(sequence).ok_or(InvocationError::Exhausted)?;
         let invocation = build(key, request, deadline_ms)?;
-        if invocation.command_id != bound {
+        if invocation.command_id != bound.command_id {
             return Err(InvocationError::PayloadConflict { sequence });
         }
         Ok(invocation)

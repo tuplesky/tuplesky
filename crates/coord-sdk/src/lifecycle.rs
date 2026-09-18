@@ -22,7 +22,7 @@
 //! * Only typed API responses are understood. Any other frame is a
 //!   protocol violation: protocol evidence never reaches an application.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_types::CommandId;
 use coord_types::ids::KvRevision;
@@ -166,6 +166,16 @@ pub enum SdkAction {
         /// Frame bytes.
         frame: Vec<u8>,
     },
+    /// Reset the request's stream: its deadline passed and the client is
+    /// about to reuse the stream credit it held. Nothing else closes that
+    /// stream, so without this the original request and its resolution
+    /// would both be open on a connection sized for one.
+    Reset {
+        /// Connection.
+        connection: ConnectionId,
+        /// Request whose stream is abandoned.
+        request: RequestId,
+    },
 }
 
 /// Why the client refused an application call.
@@ -213,6 +223,15 @@ pub struct Client<P> {
     requests: BTreeMap<RequestId, Entry>,
     actions: VecDeque<SdkAction>,
     completions: VecDeque<Completion>,
+    /// Sequences below and including this are finished and their identity
+    /// bindings have been retired. A client in service never gets to call
+    /// `ClientInstance::retire` itself, so a workload that submits,
+    /// completes and forgets for ever would otherwise grow the binding
+    /// map and the serialized instance state without bound.
+    retired_through: u64,
+    /// Finished sequences above the floor, waiting for the gap below them
+    /// to close. Bounded by the gap, not by the work done.
+    finished: BTreeSet<u64>,
 }
 
 impl<P: CredentialProvider> Client<P> {
@@ -224,6 +243,8 @@ impl<P: CredentialProvider> Client<P> {
             credentials: CachedProvider::new(provider, config.credential_margin),
             instance,
             requests: BTreeMap::new(),
+            retired_through: 0,
+            finished: BTreeSet::new(),
             actions: VecDeque::new(),
             completions: VecDeque::new(),
         }
@@ -342,15 +363,20 @@ impl<P: CredentialProvider> Client<P> {
         deadline_ms: u32,
     ) -> Result<RequestId, ClientError> {
         let id = RequestId(sequence);
+        // Validate before anything else, including for a sequence that is
+        // still queued, in flight or resolving: the API promises that a
+        // changed payload under an allocated sequence is refused locally,
+        // and returning early for an active request skipped exactly that
+        // check for the requests it matters most for.
+        let invocation = self
+            .instance
+            .retry(sequence, request, deadline_ms)
+            .map_err(ClientError::Invocation)?;
         if let Some(e) = self.requests.get(&id)
             && !matches!(e.state, RequestState::Done(_))
         {
             return Ok(id);
         }
-        let invocation = self
-            .instance
-            .retry(sequence, request, deadline_ms)
-            .map_err(ClientError::Invocation)?;
         if let Some(e) = self.requests.get(&id)
             && let RequestState::Done(outcome) = &e.state
         {
@@ -387,10 +413,36 @@ impl<P: CredentialProvider> Client<P> {
         if let Some(p) = e.permit {
             self.pool.release(p);
         }
-        match e.state {
+        let outcome = match e.state {
             RequestState::Done(o) => Some(o),
             _ => Some(Outcome::Unknown),
+        };
+        // Only a request that reached a result is finished for good. One
+        // forgotten while its outcome is unknown may still be retried
+        // under its own identity, so its binding stays.
+        if matches!(outcome, Some(Outcome::Unknown)) {
+            return outcome;
         }
+        self.finished.insert(request.0);
+        self.retire_finished_prefix();
+        outcome
+    }
+
+    /// Retire the identity bindings of every finished sequence below the
+    /// first gap. A gap is a sequence still tracked, or one allocated and
+    /// never completed, and its binding has to survive for a retry.
+    fn retire_finished_prefix(&mut self) {
+        while self.finished.remove(&(self.retired_through + 1)) {
+            self.retired_through += 1;
+        }
+        if self.retired_through > 0 {
+            self.instance.retire(self.retired_through);
+        }
+    }
+
+    /// Sequences whose identity bindings have been retired.
+    pub const fn retired_through(&self) -> u64 {
+        self.retired_through
     }
 
     /// A frame arrived on a request stream of `connection`.
@@ -502,15 +554,29 @@ impl<P: CredentialProvider> Client<P> {
                 && let Some(deadline) = e.deadline
                 && now >= deadline
             {
+                // Nothing here closes the original stream, so reusing its
+                // permit for the resolution would put both on a connection
+                // sized for one: the reset is an action the application
+                // performs before the permit is handed out again.
+                let reset = match e.state {
+                    RequestState::InFlight(connection) => Some(connection),
+                    _ => None,
+                };
                 if let Some(p) = e.permit.take() {
                     self.pool.release(p);
                 }
                 e.state = RequestState::Unknown;
                 e.not_before = now;
-                expired.push((*id, e.invocation.command_id));
+                expired.push((*id, e.invocation.command_id, reset));
             }
         }
-        for (id, command_id) in expired {
+        for (id, command_id, reset) in expired {
+            if let Some(connection) = reset {
+                self.actions.push_back(SdkAction::Reset {
+                    connection,
+                    request: id,
+                });
+            }
             self.completions.push_back(Completion {
                 request: id,
                 command_id,
@@ -529,7 +595,12 @@ impl<P: CredentialProvider> Client<P> {
     }
 
     fn insert(&mut self, now: u64, id: RequestId, invocation: Invocation, deadline_ms: u32) {
-        let deadline = (deadline_ms > 0).then(|| now + u64::from(deadline_ms));
+        // `RequestV1.deadline_ms` counts from admission, and a queued
+        // request has not been admitted: starting the clock here turned a
+        // request the pool never transmitted into an unknown outcome and
+        // asked the endpoint to resolve an identity it had never seen.
+        // `pump` starts it on the first send.
+        let deadline = None;
         self.requests.insert(
             id,
             Entry {
