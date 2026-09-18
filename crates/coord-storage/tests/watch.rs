@@ -93,8 +93,12 @@ impl Domain {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> KvRevision {
+        self.put_in(NS, key, value)
+    }
+
+    fn put_in(&mut self, ns: NamespaceId, key: &[u8], value: &[u8]) -> KvRevision {
         let mut request = LogicalRequest::new(
-            NS,
+            ns,
             CanonicalOperation::Put(PutOp {
                 key: key.to_vec(),
                 value: value.to_vec(),
@@ -107,17 +111,18 @@ impl Domain {
     }
 
     fn apply(&mut self, request: &LogicalRequest) -> Option<KvRevision> {
+        let ns = request.namespace;
         let gated = self.worker.reader().snapshot().unwrap();
-        let view = build_read_view(&gated, NS, request, ViewBudget::default()).unwrap();
+        let view = build_read_view(&gated, ns, request, ViewBudget::default()).unwrap();
         let planned = plan(request, &view, &PlanLimits::default()).unwrap();
         drop(gated);
         assert!(matches!(
-            apply_plan(&mut self.worker, self.alloc.allocate(), NS, &planned, None).unwrap(),
+            apply_plan(&mut self.worker, self.alloc.allocate(), ns, &planned, None).unwrap(),
             ApplyOutcome::Applied(_)
         ));
         // Publish only after the durable commit, in revision order.
         if let Some(r) = planned.revision {
-            self.hub.publish(NS, r, &planned.events).unwrap();
+            self.hub.publish(ns, r, &planned.events).unwrap();
         }
         planned.revision
     }
@@ -392,4 +397,74 @@ fn publication_must_be_contiguous_and_in_order() {
     assert!(hub.publish(NS, rev(5), &[]).is_err(), "repeat");
     hub.publish(NS, rev(6), &[]).unwrap();
     assert_eq!(hub.published(), rev(6));
+}
+
+#[test]
+fn replay_keeps_each_events_stored_namespace() {
+    const OTHER: NamespaceId = NamespaceId([0x99; 16]);
+    let mut d = Domain::new();
+    d.put_in(OTHER, b"a", b"other"); // revision 1: same key, other namespace
+    d.put(b"a", b"mine"); // revision 2
+    let id = d.register_and_replay(spec(b"a", None, Some(1))).unwrap();
+    let items = drain(&d.hub, id);
+    assert_eq!(
+        revisions(&items),
+        vec![2],
+        "the revision written in another namespace must not be relabelled as ours"
+    );
+    // Live publication is namespace-exact as well.
+    d.put_in(OTHER, b"a", b"other2"); // 3
+    d.put(b"a", b"mine2"); // 4
+    assert_eq!(revisions(&drain(&d.hub, id)), vec![4]);
+}
+
+#[test]
+fn a_start_revision_beyond_the_frontier_suppresses_earlier_live_revisions() {
+    let mut d = Domain::new();
+    for i in 0..5u8 {
+        d.put(b"a", &[i]); // 1..=5
+    }
+    let registration = d.hub.register(spec(b"a", None, Some(8))).unwrap();
+    assert_eq!(registration.replay, None);
+    d.put(b"a", b"6");
+    d.put(b"a", b"7");
+    assert_eq!(
+        d.hub.next(registration.id, |_| true),
+        None,
+        "revisions below the inclusive start are neither delivered nor progress"
+    );
+    d.put(b"a", b"8");
+    d.put(b"a", b"9");
+    let items = drain(&d.hub, registration.id);
+    assert_eq!(revisions(&items), vec![8, 9]);
+}
+
+#[test]
+fn a_full_replay_queue_can_be_drained_and_the_revision_retried() {
+    let mut d = Domain::new();
+    d.put(b"a", b"1");
+    d.put(b"a", b"2");
+    let mut small = spec(b"a", None, Some(1));
+    small.queue_capacity = 1;
+    let registration = d.hub.register(small).unwrap();
+    assert_eq!(registration.replay, Some((rev(1), rev(2))));
+    let gated = d.worker.reader().snapshot().unwrap();
+    d.hub
+        .replay(registration.id, NS, rev(1), &[event(b"a")])
+        .unwrap();
+    assert_eq!(
+        d.hub.replay(registration.id, NS, rev(2), &[event(b"a")]),
+        Err(ReplayError::QueueFull)
+    );
+    // Drain, then the same revision is accepted (not OutOfOrder).
+    assert!(matches!(
+        d.hub.next(registration.id, |_| true),
+        Some(WatchItem::Batch(b)) if b.revision == rev(1)
+    ));
+    d.hub
+        .replay(registration.id, NS, rev(2), &[event(b"a")])
+        .unwrap();
+    drop(gated);
+    d.hub.replay_complete(registration.id).unwrap();
+    assert_eq!(revisions(&drain(&d.hub, registration.id)), vec![2]);
 }
