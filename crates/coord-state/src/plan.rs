@@ -123,6 +123,58 @@ pub enum Outcome {
     /// The command carried an authority epoch that is not the current one
     /// (a former leader's expiration, or a stale establishment).
     ErrStaleAuthority,
+    /// Kine create succeeded; the header revision is the creation revision.
+    KineCreated,
+    /// Kine create found the key present (exact duplicate-key result).
+    ErrKeyExists,
+    /// Kine compare-and-update result from one execution point.
+    KineUpdated {
+        /// Whether the update applied.
+        updated: bool,
+        /// The current entry after the operation (`None`: key absent).
+        current: Option<KineKv>,
+    },
+    /// Kine conditional delete result from one execution point.
+    KineDeleted {
+        /// Whether the key is gone (absent keys report `true`, as the
+        /// reference bridge does).
+        deleted: bool,
+        /// The entry the operation saw (`None`: key absent).
+        prev: Option<KineKv>,
+    },
+}
+
+/// A Kine-facing entry: the entry's value and revisions plus the TTL of
+/// its private binding. It deliberately carries no lease identity: the
+/// hidden binding (and any native lease) never reaches a Kine caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KineKv {
+    /// Key.
+    pub key: Vec<u8>,
+    /// Value.
+    pub value: Vec<u8>,
+    /// Revision at which the key was created.
+    pub create_revision: KvRevision,
+    /// Revision of the last modification.
+    pub mod_revision: KvRevision,
+    /// Version (number of modifications since creation).
+    pub version: u64,
+    /// Kine-facing TTL in seconds (`0`: no private binding).
+    pub ttl_seconds: u32,
+}
+
+impl KineKv {
+    /// The Kine-facing projection of `entry` at `key` with `ttl_seconds`.
+    pub fn project(key: &[u8], entry: &KvEntry, ttl_seconds: u32) -> Self {
+        KineKv {
+            key: key.to_vec(),
+            value: entry.value.clone(),
+            create_revision: entry.create_revision,
+            mod_revision: entry.mod_revision,
+            version: entry.version,
+            ttl_seconds,
+        }
+    }
 }
 
 /// Response to the client: header revision plus outcome.
