@@ -1,0 +1,665 @@
+{
+  "schema": "command_ids_v1",
+  "hash_context": "tuplesky coord.v1 2026-09 command-id",
+  "vectors": [
+    {
+      "name": "put",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "Put": {
+            "key": [
+              47,
+              107
+            ],
+            "value": [
+              118
+            ],
+            "lease": null,
+            "prev_kv": false
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d30303030303030303101022f6b01760000",
+      "command_id": "f2f63240844bfd3b44de8e97fd02cfdbe99ee3f157da9f3e7b1a51d8548565ed"
+    },
+    {
+      "name": "put-retry-same-identity",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "Put": {
+            "key": [
+              47,
+              107
+            ],
+            "value": [
+              118
+            ],
+            "lease": null,
+            "prev_kv": false
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d30303030303030303101022f6b01760000",
+      "command_id": "f2f63240844bfd3b44de8e97fd02cfdbe99ee3f157da9f3e7b1a51d8548565ed"
+    },
+    {
+      "name": "put-different-payload-same-retry-key",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "Put": {
+            "key": [
+              47,
+              107
+            ],
+            "value": [
+              119
+            ],
+            "lease": null,
+            "prev_kv": false
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d30303030303030303101022f6b01770000",
+      "command_id": "77a42295b832e74bd758043c12ce23afa68a8b1659cba1dd4ece1011ee7b82a0"
+    },
+    {
+      "name": "put-next-sequence",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 2,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "Put": {
+            "key": [
+              47,
+              107
+            ],
+            "value": [
+              118
+            ],
+            "lease": null,
+            "prev_kv": false
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d30303030303030303101022f6b01760000",
+      "command_id": "e2a9f95093e6b8d78bdf0fb5ef11d0c4707aca2c85d24a20fe730742d7d26363"
+    },
+    {
+      "name": "range-historical-keys-only",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "Range": {
+            "range": {
+              "key": [
+                47,
+                97
+              ],
+              "range_end": [
+                47,
+                98
+              ]
+            },
+            "revision": 10,
+            "limit": 50,
+            "keys_only": true,
+            "count_only": false
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d30303030303030303100022f6101022f62010a320100",
+      "command_id": "2a749de0bb4fbf19e3a13191aee9241ae07fd9d2d41526bc133a79d4d2ef38ff"
+    },
+    {
+      "name": "delete-prev-kv",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "DeleteRange": {
+            "range": {
+              "key": [
+                47,
+                107
+              ],
+              "range_end": null
+            },
+            "prev_kv": true
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d30303030303030303102022f6b0001",
+      "command_id": "21ec5f251b91b0371566ae1a116f9ae971e7516835584a0556c51feeda512dd9"
+    },
+    {
+      "name": "txn-canonical",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "Txn": {
+            "compares": [
+              {
+                "key": [
+                  47,
+                  106
+                ],
+                "target": "Value",
+                "result": "NotEqual",
+                "operand": {
+                  "Bytes": [
+                    0,
+                    1
+                  ]
+                }
+              },
+              {
+                "key": [
+                  47,
+                  106
+                ],
+                "target": "Lease",
+                "result": "Equal",
+                "operand": {
+                  "Lease": [
+                    108,
+                    101,
+                    97,
+                    115,
+                    101,
+                    45,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    49
+                  ]
+                }
+              },
+              {
+                "key": [
+                  47,
+                  107
+                ],
+                "target": "ModRevision",
+                "result": "Equal",
+                "operand": {
+                  "Counter": 3
+                }
+              }
+            ],
+            "success": [
+              {
+                "Put": {
+                  "key": [
+                    47,
+                    107
+                  ],
+                  "value": [
+                    110,
+                    101,
+                    119
+                  ],
+                  "lease": [
+                    108,
+                    101,
+                    97,
+                    115,
+                    101,
+                    45,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    48,
+                    49
+                  ],
+                  "prev_kv": true
+                }
+              }
+            ],
+            "failure": [
+              {
+                "Range": {
+                  "range": {
+                    "key": [
+                      47,
+                      107
+                    ],
+                    "range_end": null
+                  },
+                  "revision": null,
+                  "limit": 0,
+                  "keys_only": false,
+                  "count_only": false
+                }
+              }
+            ]
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d3030303030303030310303022f6a030301020001022f6a040002016c656173652d30303030303030303031022f6b020000030101022f6b036e6577016c656173652d30303030303030303031010100022f6b0000000000",
+      "command_id": "aa643c977b90326eaefbb1959f4a03a48cf95277e9be956e712d2fd0a8c7601e"
+    },
+    {
+      "name": "lease-grant",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "LeaseGrant": {
+            "lease_id": [
+              108,
+              101,
+              97,
+              115,
+              101,
+              45,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              49
+            ],
+            "ttl_seconds": 30
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d303030303030303031046c656173652d303030303030303030311e",
+      "command_id": "57f79e2cf5812faadfc9635f80f5874df4bdff3caa1d3f7f1409942abdadb06b"
+    },
+    {
+      "name": "lease-keepalive",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "LeaseKeepAlive": {
+            "lease_id": [
+              108,
+              101,
+              97,
+              115,
+              101,
+              45,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              49
+            ]
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d303030303030303031056c656173652d30303030303030303031",
+      "command_id": "5b1611fa7e0ffe0da59daaabc0b11f3d40b119bb07e892fb88f346fc31286d37"
+    },
+    {
+      "name": "lease-revoke",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "LeaseRevoke": {
+            "lease_id": [
+              108,
+              101,
+              97,
+              115,
+              101,
+              45,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              49
+            ]
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d303030303030303031066c656173652d30303030303030303031",
+      "command_id": "eaec2a5e88691865b90411eff767a4b22d8a589106e5b426626721c9b5fdfcf7"
+    },
+    {
+      "name": "lease-ttl",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "LeaseTimeToLive": {
+            "lease_id": [
+              108,
+              101,
+              97,
+              115,
+              101,
+              45,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              48,
+              49
+            ],
+            "keys": true
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d303030303030303031076c656173652d3030303030303030303101",
+      "command_id": "f0969dba0efdec2bd9a9ba0cf0148f313c5125fc3a4b1175712cd8d13598cc8f"
+    },
+    {
+      "name": "compact",
+      "cluster_id": "636c75737465722d3030303030303031",
+      "domain_id": "646f6d61696e2d303030303030303031",
+      "session_id": "73657373696f6e2d3030303030303031",
+      "client_instance_id": "636c69656e742d303030303030303031",
+      "request_sequence": 1,
+      "request": {
+        "schema_version": 1,
+        "namespace": [
+          116,
+          101,
+          110,
+          97,
+          110,
+          116,
+          45,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          48,
+          49
+        ],
+        "operation": {
+          "Compact": {
+            "revision": 1000
+          }
+        }
+      },
+      "payload_hex": "0174656e616e742d30303030303030303108e807",
+      "command_id": "ff753d0768ba6b51e4cafd734f205b3d2524004a3729fe2321b0b497465a66f6"
+    }
+  ]
+}
