@@ -43,6 +43,7 @@ use crate::rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, dependency_update, payload_update,
     proposal_update,
 };
+use crate::speculation::{ReleaseGate, Speculation, SpeculationRequest, TentativeOutcome};
 use crate::summary::DurableLedger;
 use crate::summary::{MAX_PAGE_ENTRIES, paginate};
 use crate::vote::{FastAck, Vote, VoteError, VoteSet};
@@ -171,6 +172,7 @@ pub struct Leader {
     seqnum: u64,
     report_due: Option<ReportDue>,
     pending_sync: Option<(ReplicaId, SyncDecision)>,
+    speculation: Speculation,
     rejections: Vec<Rejection>,
     fenced: Option<FenceReason>,
 }
@@ -205,6 +207,7 @@ impl Leader {
             seqnum: 0,
             report_due: None,
             pending_sync: None,
+            speculation: Speculation::new(),
             rejections: Vec::new(),
             fenced: None,
         }
@@ -285,6 +288,7 @@ impl Leader {
             seqnum: 0,
             report_due: state.report_due,
             pending_sync: None,
+            speculation: Speculation::new(),
             rejections: Vec::new(),
             fenced: None,
         };
@@ -491,6 +495,9 @@ impl Leader {
         command: CommandId,
         outcome: &AppliedOutcome,
     ) -> Result<Vec<Effect>, LearnError> {
+        self.speculation
+            .reconcile(command, outcome.position, outcome.result_digest)
+            .map_err(LearnError::Speculation)?;
         let result = self.learner.established(
             &mut self.table,
             command,
@@ -499,11 +506,84 @@ impl Leader {
             outcome,
         )?;
         self.learn();
-        Ok(alloc::vec![Effect::Established(result)])
+        let mut effects = alloc::vec![Effect::Established(result)];
+        effects.extend(self.release_ready());
+        Ok(effects)
     }
 
     fn learn(&mut self) {
         self.learner.commit_learned(&mut self.table, &self.votes);
+    }
+
+    /// Unexecuted proposals in the leader's order.
+    fn unexecuted_in_order(&self) -> Vec<CommandId> {
+        let mut ordered: Vec<(u64, CommandId)> = self
+            .proposals
+            .values()
+            .filter(|p| self.table.phase_of(&p.command) < Some(Phase::Executed))
+            .map(|p| (p.seqnum, p.command))
+            .collect();
+        ordered.sort();
+        ordered.into_iter().map(|(_, c)| c).collect()
+    }
+
+    /// The next proposal to speculate (task-29), if the bound allows and
+    /// every earlier unexecuted proposal has a tentative outcome.
+    pub fn next_speculable(&self) -> Option<SpeculationRequest> {
+        if !self.is_leading() {
+            return None;
+        }
+        self.speculation
+            .next_request(&self.unexecuted_in_order(), self.learner.executed_through())
+    }
+
+    /// Record a tentative outcome; releases whatever the learned prefix
+    /// now allows.
+    pub fn speculated(&mut self, outcome: TentativeOutcome) -> Vec<Effect> {
+        if !self.proposals.contains_key(&outcome.command) {
+            return Vec::new();
+        }
+        self.speculation.record(outcome);
+        self.release_ready()
+    }
+
+    /// The companion refused to speculate the command (not speculable or
+    /// over budget): the chain stops there until it executes.
+    pub fn decline_speculation(&mut self, command: CommandId) {
+        self.speculation.decline(command);
+    }
+
+    /// Bound on unexecuted proposals speculated ahead (zero disables).
+    pub const fn set_speculation_bound(&mut self, bound: usize) {
+        self.speculation.set_bound(bound);
+    }
+
+    /// The tentative outcome of a command, if computed and not executed.
+    pub fn tentative(&self, command: &CommandId) -> Option<&TentativeOutcome> {
+        self.speculation.outcome(command)
+    }
+
+    /// Release tentative results whose command and whole prefix are
+    /// learned (the release gate).
+    fn release_ready(&mut self) -> Vec<Effect> {
+        if !self.is_leading() {
+            return Vec::new();
+        }
+        let proposals = self.unexecuted_in_order();
+        let table = &self.table;
+        let learner = &self.learner;
+        let committed = |c: &CommandId| table.phase_of(c) >= Some(Phase::Commit);
+        let fast = |c: &CommandId| learner.learned_fast(c);
+        let gate = ReleaseGate {
+            epoch: self.config.identity.epoch,
+            ballot: self.config.quorum.ballot,
+            committed: &committed,
+            fast: &fast,
+        };
+        match gate.release(&mut self.speculation, &proposals) {
+            Ok(released) => released.into_iter().map(Effect::Released).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Choose the learning predicates (full, or the forced slow path for
@@ -1056,7 +1136,7 @@ impl Leader {
             self.rejections.push(Rejection::Vote(e));
         }
         self.learn();
-        Vec::new()
+        self.release_ready()
     }
 }
 
