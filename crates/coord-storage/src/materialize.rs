@@ -136,12 +136,30 @@ pub fn apply_plan<E: LocalEngine>(
             ));
         }
     }
-    let outcome = worker.flush()?;
-    if outcome.indeterminate {
-        return Ok(ApplyOutcome::Indeterminate);
+    // Flush until this plan's own barrier is resolved: a flush lowers one
+    // bounded group, so older queued work may go first and the plan stays
+    // queued (not durable) after the first flush. An absent event is never
+    // success.
+    let mut events = Vec::new();
+    loop {
+        let outcome = worker.flush()?;
+        if outcome.indeterminate {
+            return Ok(ApplyOutcome::Indeterminate);
+        }
+        let mine = outcome.events.iter().any(|e| e.barrier() == Some(barrier));
+        let rejected = outcome.events.iter().any(|e| matches!(e, StorageEvent::Failed { barrier_id, error: StorageError::DefinitelyNotCommitted } if *barrier_id == barrier));
+        events.extend(outcome.events);
+        if rejected {
+            return Ok(ApplyOutcome::Replan);
+        }
+        if mine {
+            return Ok(ApplyOutcome::Applied(events));
+        }
+        if worker.queued() == 0 {
+            return Err(EngineError::new(
+                coord_store_api::engine::ErrorClass::Corrupt,
+                "plan barrier was neither committed nor rejected",
+            ));
+        }
     }
-    if outcome.events.iter().any(|e| matches!(e, StorageEvent::Failed { barrier_id, error: StorageError::DefinitelyNotCommitted } if *barrier_id == barrier)) {
-        return Ok(ApplyOutcome::Replan);
-    }
-    Ok(ApplyOutcome::Applied(outcome.events))
 }

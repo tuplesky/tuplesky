@@ -127,9 +127,13 @@ fn scan_all<V: OrderedRead>(
         direction: Direction::Forward,
         resume_after: None,
         max_rows: NonZeroU32::new(256).expect("nonzero"),
-        max_bytes: NonZeroU32::new(1 << 20).expect("nonzero"),
+        // The page byte limit is the remaining view budget, so any
+        // schema-valid row (a value near `MAX_VALUE_BYTES` plus key and
+        // envelope) fits a page while the budget allows it.
+        max_bytes: NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?,
     };
     loop {
+        request.max_bytes = NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?;
         let page = view.scan_page(collection.id(), &request)?;
         for row in &page.rows {
             budget.charge(1, row.key.len() + row.value.len())?;
@@ -209,42 +213,66 @@ pub fn build_read_view<V: OrderedRead>(
             }
         }
     }
-    if let CanonicalOperation::Range(RangeOp {
-        revision: Some(r),
-        range,
-        ..
-    }) = &request.operation
-        && *r <= kv_revision
-        && *r >= compact_floor
-    {
-        let touch = match &range.range_end {
-            None => Touch::Exact(range.key.clone()),
-            Some(end) => Touch::Interval(range.key.clone(), end.clone()),
-        };
-        let (lower, upper) = history_bounds(&namespace, &touch);
+    // One historical snapshot per explicit revision the request reads, top
+    // level or inside a transaction branch, covering every range that reads
+    // that revision. Revisions outside the retained window get no snapshot:
+    // the planner answers those as compacted or future.
+    for r in coord_state::historical_revisions(&request.operation) {
+        if r > kv_revision || r < compact_floor {
+            continue;
+        }
         let mut chosen: BTreeMap<Vec<u8>, Option<KvEntry>> = BTreeMap::new();
-        for (row_key, value) in scan_all(view, Collection::KvHistoryV1, lower, upper, &mut budget)?
-        {
-            let decoded = ordered_key::decode_history(&row_key)
-                .map_err(|_| EngineError::new(ErrorClass::Corrupt, "kv_history key"))?;
-            let version = decoded.revision.expect("history key carries a revision");
-            if decoded.namespace != namespace || version > *r {
-                continue;
+        for touch in historical_touches(&request.operation, r) {
+            let (lower, upper) = history_bounds(&namespace, &touch);
+            for (row_key, value) in
+                scan_all(view, Collection::KvHistoryV1, lower, upper, &mut budget)?
+            {
+                let decoded = ordered_key::decode_history(&row_key)
+                    .map_err(|_| EngineError::new(ErrorClass::Corrupt, "kv_history key"))?;
+                let version = decoded.revision.expect("history key carries a revision");
+                if decoded.namespace != namespace || version > r {
+                    continue;
+                }
+                // Rows arrive in (key, revision) order, so the last version
+                // at or below R for a key wins.
+                chosen.insert(decoded.key, codecs::decode_history(&value)?.entry);
             }
-            // Rows arrive in (key, revision) order, so the last version at or
-            // below R for a key wins.
-            chosen.insert(decoded.key, codecs::decode_history(&value)?.entry);
         }
         let entries = chosen
             .into_iter()
             .filter_map(|(k, e)| e.map(|e| (k, e)))
             .collect();
-        read_view.historical = Some(HistoricalView {
-            revision: *r,
+        read_view.historical.push(HistoricalView {
+            revision: r,
             entries,
         });
     }
     Ok(read_view)
+}
+
+/// The ranges of `op` that read revision `r`.
+fn historical_touches(op: &CanonicalOperation, r: KvRevision) -> Vec<Touch> {
+    fn of_range(range: &RangeOp) -> Touch {
+        match &range.range.range_end {
+            None => Touch::Exact(range.range.key.clone()),
+            Some(end) => Touch::Interval(range.range.key.clone(), end.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    match op {
+        CanonicalOperation::Range(range) if range.revision == Some(r) => out.push(of_range(range)),
+        CanonicalOperation::Txn(t) => {
+            for b in t.success.iter().chain(&t.failure) {
+                if let BranchOp::Range(range) = b
+                    && range.revision == Some(r)
+                {
+                    out.push(of_range(range));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// One bounded page of current entries in `namespace` over `[lower, upper)`
