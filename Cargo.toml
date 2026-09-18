@@ -58,7 +58,7 @@ blake3 = "=1.8.7"
 # provider; Tokio stays outside the pure core (xtask check-deps).
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "=0.11.17", default-features = false, features = ["rustls-aws-lc-rs"] }
-rustls = { version = "=0.23.44", default-features = false, features = ["std", "aws_lc_rs"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "aws_lc_rs"] }
 rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 # Test certificates only (never a production dependency edge).
