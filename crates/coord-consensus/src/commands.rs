@@ -15,7 +15,7 @@
 //! refused with [`InitError::Backpressure`]; records in ACCEPT or COMMIT
 //! are never evicted to make room, only executed records can be retired.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_types::CommandId;
@@ -87,6 +87,8 @@ struct KeyState {
 pub struct CommandTable {
     records: BTreeMap<CommandId, CommandRecord>,
     keys: BTreeMap<Vec<u8>, KeyState>,
+    /// Executed commands retired while a live record depends on them.
+    executed: BTreeSet<CommandId>,
     capacity: Option<usize>,
 }
 
@@ -96,6 +98,7 @@ impl CommandTable {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
+            executed: BTreeSet::new(),
             capacity: None,
         }
     }
@@ -105,6 +108,7 @@ impl CommandTable {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
+            executed: BTreeSet::new(),
             capacity: Some(capacity),
         }
     }
@@ -188,6 +192,11 @@ impl CommandTable {
         Ok(Initialized { deps, paths, path })
     }
 
+    /// The path log of `key`, if any command touched it.
+    pub fn log(&self, key: &[u8]) -> Option<&PathLog> {
+        self.keys.get(key).map(|k| &k.log)
+    }
+
     /// The leader ordered `command` at `seqnum` with these per-key path
     /// digests: align this replica's logs so later commands' paths follow
     /// the leader's order (prototype `recordLeaderHash`/`updateLogs`).
@@ -218,12 +227,13 @@ impl CommandTable {
         self.records.get(command)
     }
 
-    /// Phase of an initialized command; a placeholder reports none.
+    /// Phase of an initialized command; a placeholder reports none. A
+    /// retired command a live record depends on reports `Executed`.
     pub fn phase_of(&self, command: &CommandId) -> Option<Phase> {
-        self.records
-            .get(command)
-            .filter(|r| r.payload.is_some())
-            .map(|r| r.phase)
+        match self.records.get(command) {
+            Some(r) => r.payload.is_some().then_some(r.phase),
+            None => self.executed.contains(command).then_some(Phase::Executed),
+        }
     }
 
     /// Conflicting commands for `keys` as the index sees them now.
@@ -287,17 +297,48 @@ impl CommandTable {
     }
 
     /// Forget an executed command. Unresolved acceptance is never deleted
-    /// for capacity; the conflict index keeps the identity so later
-    /// commands still depend on it.
+    /// for capacity. An executed command needs no successor to order after
+    /// it (its effects are complete), so the conflict index stops naming
+    /// it; a live record that already depends on it keeps seeing it as
+    /// executed through a tombstone, which is dropped with the last such
+    /// record, so the table keeps working on a hot key after recycling.
     pub fn retire(&mut self, command: &CommandId) -> Result<(), RetireError> {
-        match self.records.get(command) {
-            None => Err(RetireError::Unknown),
-            Some(r) if r.phase != Phase::Executed => Err(RetireError::NotExecuted(r.phase)),
-            Some(_) => {
-                self.records.remove(command);
-                Ok(())
+        let record = match self.records.get(command) {
+            None => return Err(RetireError::Unknown),
+            Some(r) if r.phase != Phase::Executed => {
+                return Err(RetireError::NotExecuted(r.phase));
+            }
+            Some(r) => r.clone(),
+        };
+        self.records.remove(command);
+        for key in &record.keys {
+            if let Some(state) = self.keys.get_mut(key) {
+                if state.last == Some(*command) {
+                    state.last = None;
+                }
+                state.log.forget(command);
             }
         }
+        if self.referenced(command) {
+            self.executed.insert(*command);
+        }
+        // Tombstones the retired record was the last to reference go too.
+        for dep in &record.deps {
+            if self.executed.contains(dep) && !self.referenced(dep) {
+                self.executed.remove(dep);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a live record depends on `command`.
+    fn referenced(&self, command: &CommandId) -> bool {
+        self.records.values().any(|r| r.deps.contains(command))
+    }
+
+    /// Executed commands retired while a live record still depends on them.
+    pub fn tombstones(&self) -> &BTreeSet<CommandId> {
+        &self.executed
     }
 
     /// Start an exact closure traversal from an initialized command.
@@ -314,11 +355,11 @@ impl CommandTable {
         budget: usize,
     ) -> Result<ClosureProgress, GuardViolation> {
         cursor
-            .step(budget, |c| {
-                self.records
-                    .get(c)
-                    .filter(|r| r.payload.is_some())
-                    .map(|r| r.deps.clone())
+            .step(budget, |c| match self.records.get(c) {
+                Some(r) => r.payload.is_some().then(|| r.deps.clone()),
+                // A retired executed dependency: complete, nothing beyond it
+                // is still needed for ordering.
+                None => self.executed.contains(c).then(Vec::new),
             })
             .map_err(|dep| GuardViolation::DependencyUnknown { dep })
     }

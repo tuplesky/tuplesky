@@ -46,6 +46,11 @@ pub struct PathLog {
     /// Leader synchronizations that arrived before the command was
     /// appended locally.
     early: BTreeMap<CommandId, (u64, Digest32)>,
+    /// Commands whose synchronization was applied, until the command table
+    /// retires them: a duplicate or reordered copy of an applied
+    /// synchronization is recognized instead of being taken for evidence
+    /// about a command not appended yet.
+    applied: BTreeSet<CommandId>,
 }
 
 impl Default for PathLog {
@@ -64,6 +69,7 @@ impl PathLog {
             pending: Vec::new(),
             head: empty,
             early: BTreeMap::new(),
+            applied: BTreeSet::new(),
         }
     }
 
@@ -108,6 +114,10 @@ impl PathLog {
     /// the highest seen, becomes the synchronized prefix; the head is
     /// recomputed over the remaining suffix (prototype `Update`).
     pub fn sync(&mut self, command: CommandId, seq: u64, hash: Digest32) {
+        if self.applied.contains(&command) {
+            // Already synchronized: a duplicate or reordered copy.
+            return;
+        }
         if !self.pending.contains(&command) {
             // Not appended yet: remember it for the append.
             self.early.insert(command, (seq, hash));
@@ -118,11 +128,24 @@ impl PathLog {
 
     fn sync_known(&mut self, command: CommandId, seq: u64, hash: Digest32) {
         self.pending.retain(|c| *c != command);
+        self.applied.insert(command);
         if self.synced_seq.is_none_or(|s| seq > s) {
             self.synced_seq = Some(seq);
             self.synced_hash = hash;
         }
         self.recompute();
+    }
+
+    /// Forget a retired command: its applied synchronization and any early
+    /// evidence. The log's prefix digest already covers it.
+    pub fn forget(&mut self, command: &CommandId) {
+        self.applied.remove(command);
+        self.early.remove(command);
+    }
+
+    /// Commands whose synchronization is applied and not yet forgotten.
+    pub fn applied(&self) -> &BTreeSet<CommandId> {
+        &self.applied
     }
 }
 
@@ -146,6 +169,9 @@ pub struct ClosureCursor {
     frontier: Vec<CommandId>,
     visited: BTreeSet<CommandId>,
     visits: usize,
+    /// The dependency list being expanded and how far it got, when a
+    /// step ran out of budget in the middle of one.
+    expanding: Option<(Vec<CommandId>, usize)>,
 }
 
 impl ClosureCursor {
@@ -158,6 +184,7 @@ impl ClosureCursor {
             frontier: deps.to_vec(),
             visited,
             visits: 0,
+            expanding: None,
         }
     }
 
@@ -171,7 +198,21 @@ impl ClosureCursor {
         &self.frontier
     }
 
-    /// Advance by at most `budget` visits. `deps_of` returns the direct
+    /// Units of work known to remain: frontier entries plus the rest of
+    /// a dependency list being expanded (more may be discovered).
+    pub fn remaining(&self) -> usize {
+        self.frontier.len()
+            + self
+                .expanding
+                .as_ref()
+                .map_or(0, |(deps, index)| deps.len() - index)
+    }
+
+    /// Advance by at most `budget` units of work, where every frontier
+    /// entry taken (visited or duplicate) and every dependency edge
+    /// examined costs one unit, so a step's work is bounded whatever the
+    /// size of a dependency list or of the frontier; an expansion cut off
+    /// mid-list resumes where it stopped. `deps_of` returns the direct
     /// dependencies of an initialized command, or `None` for a placeholder
     /// or unknown identity, which stops the traversal.
     pub fn step(
@@ -180,8 +221,23 @@ impl ClosureCursor {
         mut deps_of: impl FnMut(&CommandId) -> Option<Vec<CommandId>>,
     ) -> Result<ClosureProgress, CommandId> {
         let mut spent = 0;
-        while spent < budget {
-            let Some(next) = self.frontier.pop() else {
+        loop {
+            if let Some((deps, index)) = &mut self.expanding {
+                if *index < deps.len() {
+                    if spent >= budget {
+                        return Ok(ClosureProgress::Continue(self));
+                    }
+                    let d = deps[*index];
+                    *index += 1;
+                    spent += 1;
+                    if !self.visited.contains(&d) {
+                        self.frontier.push(d);
+                    }
+                    continue;
+                }
+                self.expanding = None;
+            }
+            let Some(&next) = self.frontier.last() else {
                 let mut members = self.visited;
                 members.remove(&self.root);
                 return Ok(ClosureProgress::Complete(Closure {
@@ -190,28 +246,18 @@ impl ClosureCursor {
                     visits: self.visits,
                 }));
             };
+            if spent >= budget {
+                return Ok(ClosureProgress::Continue(self));
+            }
+            self.frontier.pop();
+            spent += 1;
             if !self.visited.insert(next) {
                 continue;
             }
             let deps = deps_of(&next).ok_or(next)?;
-            spent += 1;
             self.visits += 1;
-            for d in deps {
-                if !self.visited.contains(&d) {
-                    self.frontier.push(d);
-                }
-            }
+            self.expanding = Some((deps, 0));
         }
-        if self.frontier.is_empty() {
-            let mut members = self.visited;
-            members.remove(&self.root);
-            return Ok(ClosureProgress::Complete(Closure {
-                root: self.root,
-                members,
-                visits: self.visits,
-            }));
-        }
-        Ok(ClosureProgress::Continue(self))
     }
 }
 
