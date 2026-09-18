@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, VecDeque};
 use coord_authn::ClockHealth;
 use coord_collector::{Action, Delivery, Dispatcher, codes};
 use coord_state::Response;
+use coord_state::policy::{Action as PolicyAction, KeyInterval};
 use coord_storage::WatchHub;
 use coord_types::RetryKey;
 use coord_types::ids::NamespaceId;
@@ -26,7 +27,7 @@ use coord_types::logical_v1::{BranchOp, CanonicalOperation, LogicalRequest};
 use coord_types::wire_v1::{Frame, MessageV1, OutcomeV1, decode, decode_stream};
 
 use crate::binding::{BindError, Binding, BindingConfig, verify_bind};
-use crate::gate::{PolicySource, carries_previous, protected_keys};
+use crate::gate::{PolicySource, carries_previous, is_read_output, protected_keys};
 use crate::wire::{BindAckV1, KIND_BIND, bind_ack_frame, decode_bind};
 
 /// What a frame produced.
@@ -47,8 +48,16 @@ pub enum Ingress {
 
 #[derive(Clone, Debug)]
 struct RequestInfo {
+    /// The identity this metadata was accepted under. It is what makes
+    /// the binding immutable: a later frame under the same retry key
+    /// describes the same command or it is not this request at all.
+    command: coord_types::CommandId,
     namespace: NamespaceId,
     keys: Vec<Vec<u8>>,
+    /// Intervals the request asked to read, so a replayed result is
+    /// reauthorized over what was asked for and not merely over what came
+    /// back.
+    intervals: Vec<KeyInterval>,
 }
 
 /// The frontend of one domain with session binding and output gating.
@@ -130,16 +139,29 @@ impl BoundFrontend {
         }
         let caller = binding.caller();
         let session = binding.session;
-        // Bookkeeping for later disclosures.
+        let scope = binding.scope_ceiling;
         let decoded = decode(frame).ok();
-        if let Some(MessageV1::Request(r)) = &decoded
-            && let Ok(logical) = r.logical()
-        {
-            self.remember(r.retry_key, &logical);
-        }
+        let presented = match &decoded {
+            Some(MessageV1::Request(r)) => r.logical().ok().map(|l| (r.retry_key, l)),
+            _ => None,
+        };
         let action = self
             .dispatcher
             .on_frame(clock.now, connection, &caller, frame, hub);
+        // Bookkeeping for later disclosures, recorded only for a request
+        // the dispatcher accepted under its own identity. Recording it
+        // before would let a conflicting payload under a pending retry
+        // key replace the namespace and keys that authorize the original
+        // command's result, and the rejection would not put them back.
+        match (&action, &presented) {
+            (Action::FanOut(f), Some((key, logical))) => {
+                self.remember(*key, f.command, logical);
+            }
+            (Action::Pending { command }, Some((key, logical))) => {
+                self.remember(*key, *command, logical);
+            }
+            _ => {}
+        }
         let action = match action {
             Action::WatchOpened {
                 connection,
@@ -155,7 +177,9 @@ impl BoundFrontend {
                     registration,
                 }
             }
-            Action::Respond(delivery) => Action::Respond(self.gate(delivery, session, policy)),
+            Action::Respond(delivery) => {
+                Action::Respond(self.gate(delivery, session, scope, policy))
+            }
             other => other,
         };
         Ingress::Action(action)
@@ -182,17 +206,31 @@ impl BoundFrontend {
         }
     }
 
-    fn remember(&mut self, key: RetryKey, logical: &LogicalRequest) {
+    /// Bind the disclosure metadata of `key` to the command it was
+    /// accepted under. The first accepted request wins: a retry presents
+    /// the same identity and therefore the same metadata, and anything
+    /// else is not this request.
+    fn remember(
+        &mut self,
+        key: RetryKey,
+        command: coord_types::CommandId,
+        logical: &LogicalRequest,
+    ) {
+        if let Some(existing) = self.requests.get(&key) {
+            debug_assert_eq!(existing.command, command, "identity decides the metadata");
+            return;
+        }
         let info = RequestInfo {
+            command,
             namespace: logical.namespace,
             keys: request_keys(logical),
+            intervals: request_intervals(logical),
         };
-        if self.requests.insert(key, info).is_none() {
-            self.order.push_back(key);
-            while self.order.len() > self.max_requests {
-                if let Some(old) = self.order.pop_front() {
-                    self.requests.remove(&old);
-                }
+        self.requests.insert(key, info);
+        self.order.push_back(key);
+        while self.order.len() > self.max_requests {
+            if let Some(old) = self.order.pop_front() {
+                self.requests.remove(&old);
             }
         }
     }
@@ -200,16 +238,21 @@ impl BoundFrontend {
     /// Gate a delivery for `connection`'s session (a release, a retained
     /// result or a resolution) against a fresh barrier.
     pub fn deliver(&mut self, delivery: Delivery, policy: &dyn PolicySource) -> Delivery {
-        let Some(session) = self.bindings.get(&delivery.connection).map(|b| b.session) else {
+        let Some((session, scope)) = self
+            .bindings
+            .get(&delivery.connection)
+            .map(|b| (b.session, b.scope_ceiling))
+        else {
             return delivery;
         };
-        self.gate(delivery, session, policy)
+        self.gate(delivery, session, scope, policy)
     }
 
     fn gate(
         &mut self,
         delivery: Delivery,
         session: coord_types::ids::SessionId,
+        scope: u32,
         policy: &dyn PolicySource,
     ) -> Delivery {
         let response = match decode_stream(&delivery.frame).as_deref() {
@@ -232,17 +275,42 @@ impl BoundFrontend {
                 None => return self.deny(delivery, response.command_id),
             }
         }
-        if keys.is_empty() {
+        // An empty key list is not evidence that nothing is disclosed: a
+        // count-only range names no key and still reports how many there
+        // were, and an empty range discloses absence. Read output is
+        // reauthorized whether or not it carries a key; only a pure
+        // mutation acknowledgement passes without a barrier.
+        let reads = is_read_output(&decoded);
+        if keys.is_empty() && !reads {
             return delivery;
         }
-        let Some(namespace) = info.map(|i| i.namespace) else {
+        let Some(info) = info else {
             return self.deny(delivery, response.command_id);
         };
-        self.barriers_read += 1;
-        match policy.barrier(namespace, &session) {
-            Ok(barrier) if barrier.permits_keys(keys.iter().map(Vec::as_slice)) => delivery,
-            _ => self.deny(delivery, response.command_id),
+        let namespace = info.namespace;
+        let intervals = info.intervals.clone();
+        // Read output also needs the bound token's own permission. The
+        // replicated session's ceiling can be wider than the scope in the
+        // token this connection presented, and a watch open bypasses
+        // unary admission entirely, so without this a token without the
+        // read bit would still receive read output.
+        if reads && scope & PolicyAction::Read.bit() == 0 {
+            return self.deny(delivery, response.command_id);
         }
+        self.barriers_read += 1;
+        let Ok(barrier) = policy.barrier(namespace, &session) else {
+            return self.deny(delivery, response.command_id);
+        };
+        if !barrier.permits_keys(keys.iter().map(Vec::as_slice)) {
+            return self.deny(delivery, response.command_id);
+        }
+        // What the request asked to read, not only what came back: the
+        // count, the truncation flag and the keys that are absent all
+        // describe the interval that was asked for.
+        if !intervals.iter().all(|i| barrier.permits_interval(i)) {
+            return self.deny(delivery, response.command_id);
+        }
+        delivery
     }
 
     fn deny(&mut self, delivery: Delivery, command: coord_types::CommandId) -> Delivery {
@@ -274,7 +342,15 @@ impl BoundFrontend {
         let binding = self.bindings.get(&connection);
         let namespace = self.watches.get(&(connection, watch_id)).copied();
         let barrier = match (binding, namespace) {
-            (Some(b), Some(ns)) if b.active(clock) => {
+            // Watch output is read output, and the bound token's scope
+            // restricts it like any other. A watch open bypasses unary
+            // admission, so without this a token without the read bit
+            // would receive events whenever the session alone permitted
+            // them; the replicated session's ceiling can be wider than
+            // the scope of the token this connection actually presented.
+            (Some(b), Some(ns))
+                if b.active(clock) && b.scope_ceiling & PolicyAction::Read.bit() != 0 =>
+            {
                 self.barriers_read += 1;
                 policy.barrier(ns, &b.session).ok()
             }
@@ -323,6 +399,43 @@ impl BoundFrontend {
 
 /// The keys a request names (whose previous values a response may
 /// disclose).
+/// The intervals a request asks to read. A replayed result is
+/// reauthorized over these, not only over the keys it returned.
+pub fn request_intervals(request: &LogicalRequest) -> Vec<KeyInterval> {
+    fn of_range(r: &coord_types::logical_v1::KeyRange) -> KeyInterval {
+        match &r.range_end {
+            None => KeyInterval::exact(&r.key),
+            Some(end) => KeyInterval {
+                lower: r.key.clone(),
+                upper: Some(end.clone()),
+            },
+        }
+    }
+    fn branch(ops: &[BranchOp], out: &mut Vec<KeyInterval>) {
+        for op in ops {
+            if let BranchOp::Range(r) = op {
+                out.push(of_range(&r.range));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    match &request.operation {
+        CanonicalOperation::Range(r) => out.push(of_range(&r.range)),
+        CanonicalOperation::Txn(t) => {
+            for c in &t.compares {
+                out.push(KeyInterval::exact(&c.key));
+            }
+            branch(&t.success, &mut out);
+            branch(&t.failure, &mut out);
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The keys a request names and whose previous values its response may
+/// carry without naming them (a `Put` with `prev_kv`, and the puts of a
+/// transaction branch).
 pub fn request_keys(request: &LogicalRequest) -> Vec<Vec<u8>> {
     fn branch(ops: &[BranchOp], out: &mut Vec<Vec<u8>>) {
         for op in ops {

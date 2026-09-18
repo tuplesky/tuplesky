@@ -62,7 +62,7 @@ fn clock(now: u64) -> ClockHealth {
 
 fn frame_of(bytes: &[u8]) -> Frame {
     let mut reader = FrameReader::new();
-    reader.push(bytes);
+    reader.push(bytes).expect("within the reader bound");
     reader.next_frame().unwrap().unwrap()
 }
 
@@ -98,10 +98,13 @@ impl Domain {
                 .unwrap(),
             );
         }
+        // Session and policy rows are admission rows: they need an
+        // ordered batch, so the bootstrap carries the application base.
+        let base = worker.application_base();
         worker
             .submit(PersistBatch {
                 barrier: alloc.allocate(),
-                base: None,
+                base: Some(base),
                 updates,
             })
             .unwrap();
@@ -126,6 +129,17 @@ impl Domain {
             session: SESSION,
         });
         assert_eq!(response.outcome, Outcome::SessionRetired);
+    }
+
+    /// Remove Alice's read permission entirely.
+    fn remove_read(&mut self) {
+        let response = self.apply(&InternalCommand::PutPolicyRule {
+            namespace: NS,
+            principal: ALICE,
+            rule: PolicyRuleId([1; 16]),
+            record: None,
+        });
+        assert!(!matches!(response.outcome, Outcome::ErrTrustRuleInvalid));
     }
 
     /// Narrow Alice's read permission to keys below "b".
@@ -740,4 +754,207 @@ fn previously_authorized_in_flight_work_follows_documented_semantics() {
         delivery(2, 4, c4, range_outcome(b"a")),
         &fresh.policy()
     )));
+}
+
+/// A token like [`token`] but with chosen claims.
+fn token_with(
+    ring: &KeyRing,
+    session: SessionId,
+    exp: u64,
+    scope: u32,
+    generation: u64,
+) -> Vec<u8> {
+    let claims = ServiceClaims {
+        iss: ISSUER.into(),
+        sub: hex(&ALICE.0),
+        aud: RESOURCE.into(),
+        sid: hex(&session.0),
+        scope,
+        rule: hex(&session.0),
+        generation,
+        jti: hex(&[9u8; 32]),
+        iat: NOW,
+        exp,
+    };
+    ring.sign(&claims).unwrap().into_bytes()
+}
+
+#[test]
+fn a_rejected_conflicting_request_never_replaces_the_accepted_metadata() {
+    // A conflicting payload under a pending retry key used to overwrite
+    // the namespace and keys that authorize the original command's
+    // result, and the rejection did not put them back. The eventual
+    // historical result was then authorized against a namespace the
+    // attacker chose, where it still had read access.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend(&ring);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+        panic!()
+    };
+    // The accepted request reads the protected namespace.
+    let (command, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    // A conflicting payload under the same retry key, naming another
+    // namespace: the dispatcher refuses it.
+    let mut other = LogicalRequest::new(NamespaceId([6; 16]), range(b"secret"));
+    other.canonicalize();
+    let key = retry_key(1);
+    let conflicting = frame_of(
+        &MessageV1::Request(RequestV1::new(key, &other, 0).unwrap())
+            .encode()
+            .unwrap(),
+    );
+    match f.on_frame(&clock(NOW), 1, &conflicting, &hub, &domain.policy()) {
+        Ingress::Action(Action::Respond(d)) => assert!(
+            matches!(outcome_of(&d), OutcomeV1::Err { code, .. }
+                if code == codes::REQUEST_IDENTITY_CONFLICT),
+            "{:?}",
+            outcome_of(&d)
+        ),
+        other => panic!("{other:?}"),
+    }
+    // The original result is still authorized in the original namespace,
+    // where read access has since been removed.
+    let mut domain = domain;
+    domain.remove_read();
+    let gated = f.deliver(
+        delivery(1, 1, command, range_outcome(b"secret")),
+        &domain.policy(),
+    );
+    assert!(
+        is_denied(&gated),
+        "the accepted request's namespace decides: {:?}",
+        outcome_of(&gated)
+    );
+}
+
+#[test]
+fn read_output_that_names_no_key_is_still_reauthorized() {
+    // An empty protected-key list is not an unprotected acknowledgement:
+    // a count-only range names no key and still reports how many there
+    // were, and an empty range discloses absence. Both used to be
+    // delivered without a fresh barrier, from cache, after revocation.
+    let ring = ring();
+    let mut domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend(&ring);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+        panic!()
+    };
+    let (command, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    let empty = Outcome::Range {
+        items: Vec::new(),
+        count: 7,
+        more: false,
+    };
+    // Permitted now.
+    let ok = f.deliver(delivery(1, 1, command, empty.clone()), &domain.policy());
+    assert!(!is_denied(&ok), "{:?}", outcome_of(&ok));
+    // Denied once read access is gone, although it names no key.
+    domain.remove_read();
+    let gated = f.deliver(delivery(1, 1, command, empty), &domain.policy());
+    assert!(is_denied(&gated), "{:?}", outcome_of(&gated));
+    // A pure mutation acknowledgement still needs no barrier.
+    let (put_command, put_req) = request(2, put(b"a", false));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 1, &put_req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    let ack = f.deliver(
+        delivery(1, 2, put_command, Outcome::Put { prev: None }),
+        &domain.policy(),
+    );
+    assert!(!is_denied(&ack), "{:?}", outcome_of(&ack));
+}
+
+#[test]
+fn a_token_without_the_read_bit_receives_no_read_output() {
+    // The replicated session's ceiling can be wider than the scope in the
+    // token a connection presented, and a watch open bypasses unary
+    // admission, so the bound scope has to restrict read output itself.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend(&ring);
+    let write_only = PolicyAction::Write.bit() | PolicyAction::Delete.bit();
+    let bind =
+        frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 100, write_only, 1)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+        panic!()
+    };
+    let (command, req) = request(1, range(b"secret"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+    let gated = f.deliver(
+        delivery(1, 1, command, range_outcome(b"secret")),
+        &domain.policy(),
+    );
+    assert!(
+        is_denied(&gated),
+        "the session permits the read; the token does not: {:?}",
+        outcome_of(&gated)
+    );
+}
+
+#[test]
+fn a_rebind_refreshes_validity_and_never_the_authorization_context() {
+    // The rebind check compared only the session, after which the new
+    // token replaced the principal, scope and rule generation: any valid
+    // same-session token could change what the connection may do, and a
+    // wider scope would widen every later admission.
+    let ring = ring();
+    let domain = Domain::new();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let mut f = frontend(&ring);
+    let narrow = PolicyAction::Read.bit();
+    let bind = frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 100, narrow, 1)).unwrap());
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+        panic!()
+    };
+    // The same session with a wider scope is refused.
+    let wider = frame_of(
+        &bind_frame(&token_with(
+            &ring,
+            SESSION,
+            NOW + 200,
+            PolicyAction::FULL_CEILING,
+            1,
+        ))
+        .unwrap(),
+    );
+    assert!(
+        matches!(
+            f.on_frame(&clock(NOW), 1, &wider, &hub, &domain.policy()),
+            Ingress::Rejected(_)
+        ),
+        "a rebind may not widen the scope"
+    );
+    // A later generation of the same session is refused too.
+    let regenerated =
+        frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 200, narrow, 2)).unwrap());
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 1, &regenerated, &hub, &domain.policy()),
+        Ingress::Rejected(_)
+    ));
+    // The same claims with a later expiry refresh validity.
+    let refreshed =
+        frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 200, narrow, 1)).unwrap());
+    let Ingress::Bound(ack) = f.on_frame(&clock(NOW), 1, &refreshed, &hub, &domain.policy()) else {
+        panic!("a pure refresh is accepted")
+    };
+    let ack = coord_session::decode_bind_ack(&frame_of(&ack)).unwrap();
+    assert_eq!(ack.expires_at, NOW + 200);
 }

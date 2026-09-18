@@ -56,6 +56,20 @@ impl AuthorizationBarrier {
         self.session_valid() && keys.into_iter().all(|k| self.permits_read(k))
     }
 
+    /// Whether the whole `interval` may be read now.
+    ///
+    /// A read result discloses more than the keys it happens to contain:
+    /// its count, its truncation flag and the keys it does *not* contain
+    /// are all statements about the interval that was asked for. Checking
+    /// only the returned keys would let a response for a wide interval
+    /// pass once policy had been narrowed to one key inside it.
+    pub fn permits_interval(&self, interval: &KeyInterval) -> bool {
+        self.session_valid()
+            && self
+                .authorization
+                .permits(&self.namespace, Action::Read, interval)
+    }
+
     /// Whether a selected watch batch may be delivered.
     pub fn permits_batch(&self, batch: &WatchBatch) -> bool {
         self.permits_keys(batch.events.iter().map(|e| e.key.as_slice()))
@@ -72,6 +86,15 @@ pub fn protected_keys(response: &Response) -> Vec<Vec<u8>> {
             Outcome::Range { items, .. } => out.extend(items.iter().map(|i| i.key.clone())),
             Outcome::Delete { prev, .. } => out.extend(prev.iter().map(|i| i.key.clone())),
             Outcome::Txn { results, .. } => results.iter().for_each(|r| walk(r, out)),
+            // A Kine conditional operation that did not apply still hands
+            // back the entry it saw, key and value: that is read output
+            // and is protected like any other.
+            Outcome::KineUpdated { current, .. } => {
+                out.extend(current.iter().map(|kv| kv.key.clone()));
+            }
+            Outcome::KineDeleted { prev, .. } => {
+                out.extend(prev.iter().map(|kv| kv.key.clone()));
+            }
             _ => {}
         }
     }
@@ -80,6 +103,29 @@ pub fn protected_keys(response: &Response) -> Vec<Vec<u8>> {
     out.sort();
     out.dedup();
     out
+}
+
+/// Whether a response is read output: it discloses state rather than
+/// only acknowledging a mutation.
+///
+/// An empty key list is not evidence of an unprotected acknowledgement. A
+/// count-only range names no key and still reports how many there were;
+/// an empty range discloses absence. Both have to be reauthorized, so
+/// they are classified by what the outcome *is*, not by what it happens
+/// to contain.
+pub fn is_read_output(response: &Response) -> bool {
+    fn walk(outcome: &Outcome) -> bool {
+        match outcome {
+            Outcome::Range { .. } | Outcome::KineUpdated { .. } | Outcome::KineDeleted { .. } => {
+                true
+            }
+            Outcome::Delete { prev, .. } => !prev.is_empty(),
+            Outcome::Put { prev } => prev.is_some(),
+            Outcome::Txn { results, .. } => results.iter().any(walk),
+            _ => false,
+        }
+    }
+    walk(&response.outcome)
 }
 
 /// Whether a response carries previous values of keys it does not name.
