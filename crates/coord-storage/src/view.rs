@@ -78,7 +78,7 @@ impl<V: OrderedRead> GatedView<V> {
 
     /// Store sequence the snapshot covers.
     pub fn store_seq(&self) -> StoreSeq {
-        self.meta.stamp.store_seq
+        self.meta.stamp.store_seq()
     }
 }
 
@@ -102,9 +102,9 @@ impl<R: SnapshotSource> GatedReader<R> {
         let view = self.reader.snapshot()?;
         let meta = DurableMeta::read(&view)?;
         let completed = self.frontier.completed();
-        if meta.stamp.store_seq.journal_seq().get() > completed {
+        if meta.stamp.store_seq().journal_seq().get() > completed {
             return Err(ViewError::AheadOfCompletion {
-                snapshot: meta.stamp.store_seq,
+                snapshot: meta.stamp.store_seq(),
                 completed: StoreSeq::from_journal(
                     coord_types::ids::LocalJournalSeq::new(completed).expect("bounded"),
                 ),

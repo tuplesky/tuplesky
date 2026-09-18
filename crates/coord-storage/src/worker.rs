@@ -108,7 +108,7 @@ impl<E: LocalEngine> StoreWorker<E> {
     ) -> Result<Self, EngineError> {
         let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
         let frontier = Arc::new(Frontier::default());
-        frontier.set_completed(meta.stamp.store_seq);
+        frontier.set_completed(meta.stamp.store_seq());
         Ok(StoreWorker {
             engine,
             boot,
@@ -222,6 +222,12 @@ impl<E: LocalEngine> StoreWorker<E> {
     }
 
     /// Lower one bounded group into a durable transaction.
+    ///
+    /// A failure before the commit is attempted (the transaction cannot be
+    /// opened, an update or the metadata cannot be written) is a definite
+    /// noncommit: the group goes back to the front of the queue so a later
+    /// flush retries it, and no barrier is left unresolved. A failure that
+    /// makes the durable state untrustworthy quarantines the worker.
     pub fn flush(&mut self) -> Result<FlushOutcome, EngineError> {
         if self.state != WorkerState::Ready {
             return Err(EngineError::new(ErrorClass::Busy, "worker not ready"));
@@ -230,36 +236,63 @@ impl<E: LocalEngine> StoreWorker<E> {
         if group.is_empty() {
             return Ok(FlushOutcome::default());
         }
+        match self.lower_group(group) {
+            Ok(outcome) => Ok(outcome),
+            Err((requeue, error)) => {
+                self.requeue_front(requeue);
+                Err(error)
+            }
+        }
+    }
+
+    /// Put batches back at the front of the queue in their original order.
+    fn requeue_front(&mut self, batches: Vec<PersistBatch>) {
+        for batch in batches.into_iter().rev() {
+            self.queued_bytes += batch_bytes(&batch);
+            self.queue.push_front(batch);
+        }
+    }
+
+    fn quarantine(&mut self, message: &str) -> EngineError {
+        self.frontier.quarantine();
+        self.state = WorkerState::Quarantined;
+        EngineError::new(ErrorClass::Corrupt, message)
+    }
+
+    /// Lower `group`; on a pre-commit failure return the batches that must
+    /// be retried (accepted so far plus not yet examined) with the error.
+    fn lower_group(
+        &mut self,
+        group: Vec<PersistBatch>,
+    ) -> Result<FlushOutcome, (Vec<PersistBatch>, EngineError)> {
         let mut outcome = FlushOutcome::default();
         let mut accepted: Vec<PersistBatch> = Vec::new();
         let mut seqs: Vec<LocalJournalSeq> = Vec::new();
         let mut meta = self.meta;
+        let mut remaining = group.into_iter();
+        // Everything up to `commit_durable` is definitely not committed:
+        // the transaction is dropped (aborted) on the way out.
         let commit_result = {
-            let mut tx = self.engine.begin_write()?;
+            let mut tx = match self.engine.begin_write() {
+                Ok(tx) => tx,
+                Err(e) => return Err((remaining.collect(), e)),
+            };
             // Guards validate against the durable accepted state, read
             // inside this very transaction.
             let durable = match DurableMeta::read(&tx) {
                 Ok(d) => d,
                 Err(e) => {
                     drop(tx);
-                    self.frontier.quarantine();
-                    self.state = WorkerState::Quarantined;
-                    return Err(EngineError::new(
-                        ErrorClass::Corrupt,
-                        format!("durable metadata unreadable: {e}"),
-                    ));
+                    let err = self.quarantine(&format!("durable metadata unreadable: {e}"));
+                    return Err((remaining.collect(), err));
                 }
             };
             if durable != self.meta {
                 drop(tx);
-                self.frontier.quarantine();
-                self.state = WorkerState::Quarantined;
-                return Err(EngineError::new(
-                    ErrorClass::Corrupt,
-                    "durable metadata diverged from the worker's record",
-                ));
+                let err = self.quarantine("durable metadata diverged from the worker's record");
+                return Err((remaining.collect(), err));
             }
-            for batch in group {
+            while let Some(batch) = remaining.next() {
                 if let Some(base) = batch.base
                     && base != meta.frontier.as_base()
                 {
@@ -270,41 +303,56 @@ impl<E: LocalEngine> StoreWorker<E> {
                     });
                     continue;
                 }
-                for update in &batch.updates {
-                    lower_update(&mut tx, update)?;
-                }
-                let seq =
-                    meta.stamp.journal_seq.checked_next().map_err(|_| {
+                let lowered: Result<(), EngineError> = (|| {
+                    for update in &batch.updates {
+                        lower_update(&mut tx, update)?;
+                    }
+                    let seq = meta.stamp.journal_seq().checked_next().map_err(|_| {
                         EngineError::new(ErrorClass::Limit, "store sequence exhausted")
                     })?;
-                let digest = batch_digest(&meta.stamp.last_batch_digest, &batch);
-                meta.stamp = AppliedStamp {
-                    store_seq: StoreSeq::from_journal(seq),
-                    journal_seq: seq,
-                    last_batch_digest: digest,
-                };
-                if let Some(base) = batch.base {
-                    meta.frontier = ExecutionFrontier {
-                        configuration: base.configuration,
-                        execution_position: base.execution_position.checked_next().map_err(
-                            |_| EngineError::new(ErrorClass::Limit, "execution position exhausted"),
-                        )?,
-                    };
+                    let digest = batch_digest(&meta.stamp.last_batch_digest(), &batch);
+                    meta.stamp = AppliedStamp::new(StoreSeq::from_journal(seq), digest);
+                    if let Some(base) = batch.base {
+                        meta.frontier = ExecutionFrontier {
+                            configuration: base.configuration,
+                            execution_position: base.execution_position.checked_next().map_err(
+                                |_| {
+                                    EngineError::new(
+                                        ErrorClass::Limit,
+                                        "execution position exhausted",
+                                    )
+                                },
+                            )?,
+                        };
+                    }
+                    seqs.push(seq);
+                    Ok(())
+                })();
+                if let Err(e) = lowered {
+                    drop(tx);
+                    let mut requeue = accepted;
+                    requeue.push(batch);
+                    requeue.extend(remaining);
+                    return Err((requeue, e));
                 }
-                seqs.push(seq);
                 accepted.push(batch);
             }
             if accepted.is_empty() {
-                tx.abort()?;
+                if let Err(e) = tx.abort() {
+                    return Err((Vec::new(), e));
+                }
                 return Ok(outcome);
             }
-            meta.write(&mut tx)?;
+            if let Err(e) = meta.write(&mut tx) {
+                drop(tx);
+                return Err((accepted, e));
+            }
             tx.commit_durable()
         };
         match commit_result {
             Ok(()) => {
                 self.meta = meta;
-                self.frontier.set_completed(meta.stamp.store_seq);
+                self.frontier.set_completed(meta.stamp.store_seq());
                 outcome.committed = accepted.len();
                 outcome
                     .events
@@ -341,17 +389,22 @@ impl<E: LocalEngine> StoreWorker<E> {
         if self.state != WorkerState::NeedsReconcile {
             return Err(EngineError::new(ErrorClass::Busy, "nothing to reconcile"));
         }
-        let pending = self.pending.take().expect("pending group");
+        // The pending group is the only copy of the indeterminate batches:
+        // it is consumed only after a conclusive comparison, so a transient
+        // read error leaves reconciliation retryable.
+        let expected = self.pending.as_ref().expect("pending group").expected;
         let observed = DurableMeta::read(&self.engine.reader().snapshot()?)?;
         let mut outcome = FlushOutcome::default();
-        if observed == pending.expected {
+        if observed == expected {
+            let pending = self.pending.take().expect("pending group");
             self.meta = observed;
-            self.frontier.set_completed(observed.stamp.store_seq);
+            self.frontier.set_completed(observed.stamp.store_seq());
             self.state = WorkerState::Ready;
             outcome.committed = pending.batches.len();
             outcome.events = Self::durable_events(&pending.seqs, &pending.batches);
             Ok(outcome)
         } else if observed == self.meta {
+            let pending = self.pending.take().expect("pending group");
             self.state = WorkerState::Ready;
             outcome.rejected = pending.batches.len();
             for batch in &pending.batches {
@@ -373,6 +426,6 @@ impl<E: LocalEngine> StoreWorker<E> {
 
     /// Digest of the last durable batch (diagnostic).
     pub fn last_digest(&self) -> Digest32 {
-        self.meta.stamp.last_batch_digest
+        self.meta.stamp.last_batch_digest()
     }
 }

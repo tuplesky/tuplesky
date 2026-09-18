@@ -139,7 +139,7 @@ fn generic_fixtures<E: LocalEngine>(engine: E) -> StoreWorker<E> {
         base,
         "protocol batch does not move the application frontier"
     );
-    assert_eq!(worker.meta().stamp.store_seq.journal_seq().get(), 3);
+    assert_eq!(worker.meta().stamp.store_seq().journal_seq().get(), 3);
     let b4 = alloc.allocate();
     worker.submit(app_batch(b4, base, b"k4", b"v4")).unwrap();
     let o = worker.flush().unwrap();
@@ -381,4 +381,167 @@ fn diverged_durable_metadata_quarantines() {
         worker.reader().snapshot(),
         Err(ViewError::Quarantined)
     ));
+}
+
+/// A model engine whose `begin_write` or `snapshot` can be made to fail
+/// once, to drive the worker's pre-commit and reconciliation error paths.
+struct FlakyEngine {
+    inner: ModelEngine,
+    fail_begin_write: bool,
+    fail_snapshot: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone)]
+struct FlakyReader {
+    inner: <ModelEngine as LocalEngine>::Reader,
+    fail_snapshot: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl coord_store_api::engine::SnapshotSource for FlakyReader {
+    type View =
+        <<ModelEngine as LocalEngine>::Reader as coord_store_api::engine::SnapshotSource>::View;
+    fn snapshot(&self) -> Result<Self::View, coord_store_api::engine::EngineError> {
+        if self.fail_snapshot.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(coord_store_api::engine::EngineError::new(
+                coord_store_api::engine::ErrorClass::Io,
+                "injected snapshot failure",
+            ));
+        }
+        self.inner.snapshot()
+    }
+}
+
+impl LocalEngine for FlakyEngine {
+    type Reader = FlakyReader;
+    type Write<'a> = <ModelEngine as LocalEngine>::Write<'a>;
+    fn reader(&self) -> FlakyReader {
+        FlakyReader {
+            inner: self.inner.reader(),
+            fail_snapshot: self.fail_snapshot.clone(),
+        }
+    }
+    fn begin_write(&mut self) -> Result<Self::Write<'_>, coord_store_api::engine::EngineError> {
+        if self.fail_begin_write {
+            return Err(coord_store_api::engine::EngineError::new(
+                coord_store_api::engine::ErrorClass::Io,
+                "injected begin_write failure",
+            ));
+        }
+        self.inner.begin_write()
+    }
+}
+
+#[test]
+fn pre_commit_failure_keeps_the_group_queued_and_retryable() {
+    let engine = FlakyEngine {
+        inner: ModelEngine::new(),
+        fail_begin_write: false,
+        fail_snapshot: Default::default(),
+    };
+    let mut worker = StoreWorker::open(engine, BOOT_A, inc(), GroupLimits::default()).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), BOOT_A);
+    let b1 = alloc.allocate();
+    let b2 = alloc.allocate();
+    worker
+        .submit(app_batch(b1, worker.application_base(), b"k1", b"v1"))
+        .unwrap();
+    worker.submit(proto_batch(b2, b"p")).unwrap();
+    assert_eq!(worker.queued(), 2);
+    worker.engine_mut().fail_begin_write = true;
+    let err = worker.flush().unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+    assert_eq!(
+        *worker.state(),
+        WorkerState::Ready,
+        "a definite pre-commit failure is not quarantine"
+    );
+    assert_eq!(
+        worker.queued(),
+        2,
+        "the dequeued group is back in the queue"
+    );
+    // Nothing was published for the batches: their barriers stay pending.
+    worker.engine_mut().fail_begin_write = false;
+    let o = worker.flush().unwrap();
+    assert_eq!(
+        durable_of(&o),
+        vec![b1, b2],
+        "retried in the original order"
+    );
+    assert_eq!(worker.queued(), 0);
+}
+
+#[test]
+fn reconciliation_read_error_keeps_the_pending_group() {
+    let fail_snapshot = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine = FlakyEngine {
+        inner: ModelEngine::new(),
+        fail_begin_write: false,
+        fail_snapshot: fail_snapshot.clone(),
+    };
+    let mut worker = StoreWorker::open(engine, BOOT_A, inc(), GroupLimits::default()).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), BOOT_A);
+    let b1 = alloc.allocate();
+    worker
+        .submit(app_batch(b1, worker.application_base(), b"k1", b"v1"))
+        .unwrap();
+    worker
+        .engine_mut()
+        .inner
+        .script_commit(CommitScript::Indeterminate { applied: true });
+    assert!(worker.flush().unwrap().indeterminate);
+    fail_snapshot.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(worker.reconcile().is_err());
+    assert_eq!(
+        *worker.state(),
+        WorkerState::NeedsReconcile,
+        "a transient read error leaves reconciliation retryable"
+    );
+    fail_snapshot.store(false, std::sync::atomic::Ordering::SeqCst);
+    let o = worker.reconcile().unwrap();
+    assert_eq!(durable_of(&o), vec![b1]);
+    assert_eq!(*worker.state(), WorkerState::Ready);
+}
+
+#[test]
+fn partially_missing_durable_metadata_is_corruption() {
+    use coord_store_api::engine::WriteTxn;
+    use coord_store_api::registry::meta_fields;
+    let meta = Collection::MetaV1.id();
+    // Stamp without frontier.
+    let mut engine = ModelEngine::new();
+    let worker = StoreWorker::open(engine, BOOT_A, inc(), GroupLimits::default()).unwrap();
+    engine = worker.into_engine();
+    {
+        let mut tx = engine.begin_write().unwrap();
+        let stamp = coord_store_api::envelope::AppliedStamp::new(
+            coord_store_api::seq::StoreSeq::INITIAL,
+            coord_types::identity::Digest32([0; 32]),
+        );
+        tx.put(
+            meta,
+            meta_fields::APPLIED_STAMP,
+            &stamp.to_envelope().unwrap(),
+        )
+        .unwrap();
+        tx.commit_durable().unwrap();
+    }
+    let err = match StoreWorker::open(engine, BOOT_B, inc(), GroupLimits::default()) {
+        Ok(_) => panic!("stamp without frontier must not open"),
+        Err(e) => e,
+    };
+    assert_eq!(err.class, coord_store_api::engine::ErrorClass::Corrupt);
+    // Frontier without stamp.
+    let mut engine = ModelEngine::new();
+    {
+        let mut tx = engine.begin_write().unwrap();
+        tx.put(meta, meta_fields::EXECUTION_FRONTIER, b"\x00\x00")
+            .unwrap();
+        tx.commit_durable().unwrap();
+    }
+    let err = match StoreWorker::open(engine, BOOT_B, inc(), GroupLimits::default()) {
+        Ok(_) => panic!("frontier without stamp must not open"),
+        Err(e) => e,
+    };
+    assert_eq!(err.class, coord_store_api::engine::ErrorClass::Corrupt);
 }
