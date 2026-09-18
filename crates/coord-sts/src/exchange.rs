@@ -13,11 +13,12 @@
 //! signing keys never do.
 
 use coord_authn::{
-    AdmissionLog, ClockHealth, Decision, TokenReview, TrustRuleConfig, VerifyError, WifVerifier,
-    mint,
+    AdmissionLog, ClockHealth, Decision, TokenReview, TrustRuleConfig, VerifiedIdentity,
+    VerifyError, WifVerifier, mint,
 };
 use coord_state::plan::Outcome;
 use coord_state::{InternalCommand, Response};
+use coord_types::identity::Digest32;
 use coord_types::ids::NamespaceId;
 use serde::{Deserialize, Serialize};
 
@@ -295,7 +296,23 @@ impl Sts {
             }
             Decision::Denied(_) => return Err(ExchangeError::InvalidGrant("assertion rejected")),
         };
-        let admitted = mint(&identity, &self.rules, clock, entropy)
+        self.issue(&identity, None, requested, clock, entropy, creator)
+    }
+
+    /// Admit a verified identity through the trust rules and issue a
+    /// service token once replicated state created the session: the
+    /// receipt is consumed together with `code` (a browser or device
+    /// login's grant commitment) when one is given.
+    pub fn issue(
+        &mut self,
+        identity: &VerifiedIdentity,
+        code: Option<Digest32>,
+        requested: Option<u32>,
+        clock: &ClockHealth,
+        entropy: &[u8; 32],
+        creator: &mut dyn SessionCreator,
+    ) -> Result<ExchangeResponse, ExchangeError> {
+        let admitted = mint(identity, &self.rules, clock, entropy)
             .map_err(|_| ExchangeError::InvalidGrant("no trust rule admits the identity"))?;
         let ceiling = admitted.receipt.scope_ceiling;
         let scope = match requested {
@@ -308,7 +325,7 @@ impl Sts {
             .create(InternalCommand::ConsumeAdmission {
                 namespace: self.config.namespace,
                 receipt: admitted.receipt.clone(),
-                code: None,
+                code,
                 refresh_family: None,
                 window: self.config.session_window,
             })
@@ -325,6 +342,9 @@ impl Sts {
             }
             Outcome::ErrReceiptConsumed => {
                 return Err(ExchangeError::InvalidGrant("receipt already consumed"));
+            }
+            Outcome::ErrGrantUnavailable => {
+                return Err(ExchangeError::InvalidGrant("grant already consumed"));
             }
             _ => return Err(ExchangeError::Server("unexpected session outcome")),
         }
@@ -352,7 +372,7 @@ impl Sts {
             .ring
             .sign(&claims)
             .map_err(|_| ExchangeError::Server("signing"))?;
-        self.log.record(&identity, &admitted, clock.now);
+        self.log.record(identity, &admitted, clock.now);
         self.issued += 1;
         Ok(ExchangeResponse {
             access_token,

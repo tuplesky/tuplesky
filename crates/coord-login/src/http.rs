@@ -1,0 +1,346 @@
+//! Bounded Axum handlers of the browser login (design Sections 8.1,
+//! 20.1): `GET /login/start` redirects the browser to the upstream
+//! authorization request, `GET /login/callback` completes the upstream
+//! leg and redirects the browser to the CLI's loopback with the one-time
+//! service code, and `POST /login/redeem` turns the code, verifier,
+//! client and redirect into a session and service token. Every step
+//! is bounded in body, concurrency and time; failures issue nothing.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use axum::extract::{DefaultBodyLimit, Form, Query, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use coord_authn::VerifiedIdentity;
+use coord_state::InternalCommand;
+use coord_state::plan::Outcome;
+use coord_state::policy::GrantKind;
+use coord_sts::{ClockSource, EntropySource, ExchangeError, HttpLimits, SessionCreator, Sts};
+use coord_types::ids::NamespaceId;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, Semaphore};
+
+use crate::service::{LoginError, RedeemRequest, ServiceLogin, StartRequest, UpstreamIdentity};
+use crate::upstream::{Upstream, UpstreamError};
+
+/// Shared handler state.
+pub struct LoginState {
+    /// The service-login core.
+    pub login: Mutex<ServiceLogin>,
+    /// Discovered upstream clients by configuration name.
+    pub upstreams: BTreeMap<String, Upstream>,
+    /// The hardened HTTP client for the upstream leg.
+    pub http: reqwest::Client,
+    /// The STS (trust rules, receipts, signing).
+    pub sts: Mutex<Sts>,
+    /// The port to replicated state.
+    pub creator: Mutex<Box<dyn SessionCreator + Send>>,
+    /// Clock.
+    pub clock: Box<dyn ClockSource>,
+    /// Entropy.
+    pub entropy: Box<dyn EntropySource>,
+    /// Namespace grant commands are planned in.
+    pub namespace: NamespaceId,
+    /// Bounds.
+    pub limits: HttpLimits,
+    permits: Semaphore,
+}
+
+impl LoginState {
+    /// Assemble the state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        login: ServiceLogin,
+        upstreams: BTreeMap<String, Upstream>,
+        http: reqwest::Client,
+        sts: Sts,
+        creator: Box<dyn SessionCreator + Send>,
+        clock: Box<dyn ClockSource>,
+        entropy: Box<dyn EntropySource>,
+        namespace: NamespaceId,
+        limits: HttpLimits,
+    ) -> Self {
+        LoginState {
+            login: Mutex::new(login),
+            upstreams,
+            http,
+            sts: Mutex::new(sts),
+            creator: Mutex::new(creator),
+            clock,
+            entropy,
+            namespace,
+            limits,
+            permits: Semaphore::new(limits.max_in_flight),
+        }
+    }
+}
+
+/// The router.
+pub fn router(state: Arc<LoginState>) -> Router {
+    let limit = state.limits.max_body_bytes;
+    Router::new()
+        .route("/login/start", get(start))
+        .route("/login/callback", get(callback))
+        .route("/login/redeem", post(redeem))
+        .layer(DefaultBodyLimit::max(limit))
+        .with_state(state)
+}
+
+fn error(status: StatusCode, code: &str, description: &str) -> Response {
+    (
+        status,
+        Json(json!({ "error": code, "error_description": description })),
+    )
+        .into_response()
+}
+
+fn login_error(e: &LoginError) -> Response {
+    let code = match e {
+        LoginError::TooManyPending => "temporarily_unavailable",
+        LoginError::UnknownClient | LoginError::ClientMismatch => "invalid_client",
+        LoginError::UnknownCode | LoginError::CodeExpired | LoginError::VerifierMismatch => {
+            "invalid_grant"
+        }
+        _ => "invalid_request",
+    };
+    let status = if matches!(e, LoginError::TooManyPending) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    error(status, code, &format!("{e:?}"))
+}
+
+fn redirect(location: &str) -> Response {
+    let mut r = StatusCode::FOUND.into_response();
+    if let Ok(v) = HeaderValue::from_str(location) {
+        r.headers_mut().insert(header::LOCATION, v);
+    }
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+#[derive(Deserialize)]
+struct StartQuery {
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    code_challenge_method: String,
+    state: String,
+}
+
+async fn start(State(state): State<Arc<LoginState>>, Query(q): Query<StartQuery>) -> Response {
+    let clock = state.clock.read();
+    let entropy = state.entropy.fill();
+    let request = StartRequest {
+        client_id: q.client_id,
+        redirect_uri: q.redirect_uri,
+        code_challenge: q.code_challenge,
+        code_challenge_method: q.code_challenge_method,
+        state: q.state,
+    };
+    let started = match state
+        .login
+        .lock()
+        .await
+        .start(clock.now, &request, &entropy)
+    {
+        Ok(s) => s,
+        Err(e) => return login_error(&e),
+    };
+    let Some(upstream) = state.upstreams.get(&started.upstream) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "upstream",
+        );
+    };
+    let url = upstream.authorize_url(
+        &started.upstream_state,
+        &started.upstream_nonce,
+        started.upstream_challenge,
+    );
+    redirect(&url)
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: String,
+    error: Option<String>,
+}
+
+async fn callback(
+    State(state): State<Arc<LoginState>>,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    let Ok(_permit) = state.permits.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "busy",
+        );
+    };
+    if q.error.is_some() {
+        return error(StatusCode::BAD_REQUEST, "access_denied", "upstream denied");
+    }
+    let Some(code) = q.code else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "missing code");
+    };
+    let clock = state.clock.read();
+    let (_, verifier, upstream_name, nonce) = {
+        let login = state.login.lock().await;
+        match login.upstream_exchange(&q.state) {
+            Ok((txn, verifier, name)) => {
+                let nonce = login.upstream_nonce(&q.state).unwrap_or_default();
+                (txn, verifier, name, nonce)
+            }
+            Err(e) => return login_error(&e),
+        }
+    };
+    let Some(upstream) = state.upstreams.get(&upstream_name) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "upstream",
+        );
+    };
+    let identity = match tokio::time::timeout(
+        state.limits.timeout,
+        upstream.exchange(code, verifier, &nonce, &state.http),
+    )
+    .await
+    {
+        Ok(Ok(i)) => i,
+        Ok(Err(UpstreamError::Policy(e))) => return login_error(&e),
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "upstream exchange",
+            );
+        }
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "timeout",
+            );
+        }
+    };
+    let entropy = state.entropy.fill();
+    let approved = match state.login.lock().await.approve(
+        clock.now,
+        &q.state,
+        identity,
+        &upstream.config().issuer,
+        &entropy,
+    ) {
+        Ok(a) => a,
+        Err(e) => return login_error(&e),
+    };
+    // The grant is ordered before the browser learns the code.
+    let committed = state
+        .creator
+        .lock()
+        .await
+        .create(InternalCommand::CommitGrant {
+            namespace: state.namespace,
+            commitment: approved.commitment,
+            kind: GrantKind::Code,
+        });
+    match committed {
+        Ok(r) if r.outcome == Outcome::GrantCommitted => redirect(&approved.redirect),
+        _ => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "grant",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct RedeemForm {
+    code: String,
+    code_verifier: String,
+    client_id: String,
+    redirect_uri: String,
+}
+
+async fn redeem(State(state): State<Arc<LoginState>>, Form(form): Form<RedeemForm>) -> Response {
+    let Ok(_permit) = state.permits.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "busy",
+        );
+    };
+    let clock = state.clock.read();
+    let request = RedeemRequest {
+        code: form.code,
+        code_verifier: form.code_verifier,
+        client_id: form.client_id,
+        redirect_uri: form.redirect_uri,
+    };
+    let redeemed = match state.login.lock().await.redeem(clock.now, &request) {
+        Ok(r) => r,
+        Err(e) => return login_error(&e),
+    };
+    let identity = verified(&redeemed.identity, &redeemed.upstream);
+    let entropy = state.entropy.fill();
+    let result = {
+        let mut sts = state.sts.lock().await;
+        let mut creator = state.creator.lock().await;
+        sts.issue(
+            &identity,
+            Some(redeemed.commitment),
+            None,
+            &clock,
+            &entropy,
+            creator.as_mut(),
+        )
+    };
+    match result {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(response).expect("serializable")),
+        )
+            .into_response(),
+        Err(e) => exchange_error(&e),
+    }
+}
+
+fn exchange_error(e: &ExchangeError) -> Response {
+    error(
+        StatusCode::from_u16(e.status()).expect("valid"),
+        e.code(),
+        e.description(),
+    )
+}
+
+/// The verified identity of a redeemed login, as trust rules see it:
+/// `(issuer, subject)`, never an email.
+pub fn verified(identity: &UpstreamIdentity, upstream: &str) -> VerifiedIdentity {
+    VerifiedIdentity {
+        name: upstream.to_string(),
+        issuer: identity.issuer.clone(),
+        subject: identity.subject.clone(),
+        audiences: identity.audiences.clone(),
+        expires_at: identity.expires_at,
+        issued_at: None,
+        azp: identity.authorized_party.clone(),
+        nonce: None,
+        claims: BTreeMap::new(),
+        workload: None,
+    }
+}
+
+/// Convenience for handlers that only need a value.
+pub fn value(v: Value) -> Json<Value> {
+    Json(v)
+}
