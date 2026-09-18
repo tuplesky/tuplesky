@@ -1,0 +1,10 @@
+{
+  "name": "tuplesky-doc-tools",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned mermaid-cli used by the documentation CI job (task-01). Install with `npm ci --prefix tools/mermaid`.",
+  "license": "FSL-1.1-ALv2",
+  "dependencies": {
+    "@mermaid-js/mermaid-cli": "11.17.0"
+  }
+}

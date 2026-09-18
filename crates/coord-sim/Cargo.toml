@@ -1,0 +1,16 @@
+[package]
+name = "coord-sim"
+description = "Deterministic world, controlled I/O, workloads and independent checkers (test-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# Never linked into production artifacts; enforced by `cargo xtask check-deps`.
+role = "test-only"
+
+[dependencies]
+coord-types.workspace = true
