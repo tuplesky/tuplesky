@@ -26,21 +26,35 @@
 //! `wire_v1` reader), handshake and read timeouts, event queue depth and
 //! a shutdown deadline. Connections are opened only when the runtime asks
 //! for one: nothing dials a mesh.
+//!
+//! Traffic isolation (task-31): a peer link has one connection per
+//! [`lane::Lane`] (control, unary, watch, bulk) with its own stream
+//! limits, windows and fair per-group queue, explicit CUBIC on all; bytes
+//! handed to QUIC are bounded per destination across lanes and per node
+//! across destinations with a control-only reserve; events are delivered
+//! per lane so a stalled bulk or watch consumer never blocks control; and
+//! queue wait, credit wait and RTT are measured as three quantities.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod budget;
 pub mod config;
 pub mod endpoint;
 pub mod frames;
 pub mod identity;
+pub mod lane;
+pub mod sched;
 
+pub use budget::{Budget, BudgetError, BudgetLimits};
 pub use config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
 pub use endpoint::{
-    CloseCode, CloseReason, ConnectionId, Responder, SendError, Transport, TransportError,
-    TransportEvent,
+    CloseCode, CloseReason, ConnectionId, Destination, Responder, SendError, Transport,
+    TransportError, TransportEvent,
 };
 pub use frames::{FrameError, KIND_PEER_EVIDENCE, evidence_frame};
 pub use identity::{BindError, BoundIdentity, IdentityBinder, role_class};
+pub use lane::{Lane, LaneError, LaneLimits, lane_of_hello, role_lanes};
+pub use sched::{FairQueue, LaneStats, QueueError, WaitStats};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";
