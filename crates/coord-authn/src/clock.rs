@@ -28,6 +28,9 @@ pub enum TimeError {
     IssuedInFuture,
     /// `iat` is older than the configured maximum age.
     TooOld,
+    /// A maximum age is configured and the token carries no `iat`, so the
+    /// ceiling cannot be enforced against it.
+    IssuedAtMissing,
 }
 
 impl ClockHealth {
@@ -69,15 +72,32 @@ impl ClockHealth {
         {
             return Err(TimeError::NotYetValid);
         }
-        if let Some(iat) = iat {
-            if iat > self.latest() {
-                return Err(TimeError::IssuedInFuture);
+        // The age ceiling is measured from the latest instant the reading
+        // may denote, so a token that may already be past it is refused:
+        // measuring from the earliest endpoint would admit one that is.
+        //
+        // The future-issuance check keeps the permissive endpoint on
+        // purpose. An `iat` within the uncertainty of now is what a
+        // freshly minted token looks like, so refusing anything above
+        // `earliest()` would deny every new token whenever the reading
+        // has any uncertainty at all; only an `iat` above `latest()` is
+        // certainly in the future.
+        match iat {
+            Some(iat) => {
+                if iat > self.latest() {
+                    return Err(TimeError::IssuedInFuture);
+                }
+                if let Some(max) = max_age
+                    && self.latest().saturating_sub(iat) > max
+                {
+                    return Err(TimeError::TooOld);
+                }
             }
-            if let Some(max) = max_age
-                && self.earliest().saturating_sub(iat) > max
-            {
-                return Err(TimeError::TooOld);
-            }
+            // A freshness ceiling cannot be enforced against a token that
+            // does not say when it was issued, so such a token does not
+            // satisfy it.
+            None if max_age.is_some() => return Err(TimeError::IssuedAtMissing),
+            None => {}
         }
         Ok(())
     }

@@ -150,6 +150,18 @@ impl Registry {
         let mut caches = BTreeMap::new();
         for c in configs {
             c.validate()?;
+            // The name selects the key cache. Two configurations sharing
+            // one would share its keys however far apart their issuer
+            // strings and JWKS endpoints are, so a token naming issuer A
+            // would verify under B's key whenever the kid and algorithm
+            // matched. The issuer string is the same: a second
+            // configuration for it would silently replace the first.
+            if caches.contains_key(&c.name) {
+                return Err(ConfigError::DuplicateName(c.name));
+            }
+            if by_issuer.contains_key(&c.issuer) {
+                return Err(ConfigError::DuplicateIssuer(c.issuer));
+            }
             caches.insert(c.name.clone(), KeyCache::new(limits));
             by_issuer.insert(c.issuer.clone(), c);
         }

@@ -44,7 +44,7 @@ pub mod receipt;
 pub mod verifier;
 
 pub use clock::{ClockHealth, TimeError};
-pub use config::{ConfigError, IssuerConfig};
+pub use config::{ConfigError, IssuerConfig, secure_endpoint};
 pub use http::{FetchConfig, FetchError, HardenedFetcher};
 pub use jwks::{JwksError, JwksLimits, KeyCache, KeyLookup};
 pub use log::{AdmissionLog, AdmittedRecord};
