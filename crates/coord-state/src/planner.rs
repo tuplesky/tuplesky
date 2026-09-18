@@ -1,5 +1,6 @@
 //! The planner.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -7,13 +8,16 @@ use coord_types::error::ValidationError;
 use coord_types::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId};
 use coord_types::logical_v1::{
     BranchOp, CanonicalOperation, Compare, CompareOperand, CompareResult, CompareTarget,
-    DeleteRangeOp, KeyRange, LogicalRequest, PutOp, RangeOp, limits,
+    DeleteRangeOp, KeyRange, KineCreateOp, KineDeleteOp, KineUpdateOp, LogicalRequest, PutOp,
+    RangeOp, limits,
 };
 
 use crate::internal::InternalCommand;
 use crate::lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 use crate::limits::PlanLimits;
-use crate::plan::{ApplyPlan, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
+use crate::plan::{
+    ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response,
+};
 use crate::view::{KvEntry, ReadView};
 
 /// Why no plan was produced. Nothing was changed.
@@ -45,13 +49,18 @@ pub enum PlanError {
 /// that discards every mutation planned so far.
 enum Abort {
     Error(PlanError),
-    Fail(Outcome),
+    Fail(Box<Outcome>),
 }
 
 impl From<PlanError> for Abort {
     fn from(e: PlanError) -> Self {
         Abort::Error(e)
     }
+}
+
+/// A recorded failure outcome that aborts the plan.
+fn fail(outcome: Outcome) -> Abort {
+    Abort::Fail(Box::new(outcome))
 }
 
 impl From<ValidationError> for PlanError {
@@ -84,7 +93,7 @@ impl Overlay<'_> {
     fn visible_lease(&self, id: &LeaseId) -> Result<LeaseRecord, Abort> {
         match self.lease(id) {
             Some(r) if r.is_native_active() && r.namespace == self.view.namespace => Ok(r.clone()),
-            _ => Err(Abort::Fail(Outcome::ErrLeaseNotFound)),
+            _ => Err(fail(Outcome::ErrLeaseNotFound)),
         }
     }
 
@@ -105,8 +114,25 @@ impl Overlay<'_> {
             .attached_bytes
             .checked_sub(attachment_cost(key, &entry.value))
             .ok_or(Abort::Error(PlanError::ViewInconsistent))?;
+        // A Kine private binding is private to one key version: once that
+        // version is gone the binding has ended and can never match again.
+        if record.purpose == LeasePurpose::KinePrivate && record.attached_keys == 0 {
+            record.status = LeaseStatus::Replaced;
+        }
         self.leases.insert(*id, record);
         Ok(())
+    }
+
+    /// Kine-facing view of an entry: the TTL of its live private binding
+    /// (a native lease is not a Kine TTL and reports zero), never the
+    /// binding identity.
+    fn kine_kv(&self, key: &[u8], entry: &KvEntry) -> KineKv {
+        let ttl_seconds = entry
+            .lease
+            .and_then(|l| self.lease(&l))
+            .filter(|r| r.purpose == LeasePurpose::KinePrivate && r.status == LeaseStatus::Active)
+            .map_or(0, |r| r.ttl_seconds);
+        KineKv::project(key, entry, ttl_seconds)
     }
 
     fn select(&self, range: &KeyRange) -> Vec<(Vec<u8>, KvEntry)> {
@@ -145,6 +171,10 @@ fn response_cost(items: &[RangeItem]) -> usize {
         .sum()
 }
 
+fn kine_kv_cost(kv: &KineKv) -> usize {
+    kv.key.len() + kv.value.len() + 48
+}
+
 /// Estimated encoded size of a complete outcome, transaction results
 /// included, so the response budget applies to the whole response and not
 /// only to each range result on its own.
@@ -154,6 +184,11 @@ fn outcome_cost(outcome: &Outcome) -> usize {
         Outcome::Delete { prev, .. } => response_cost(prev),
         Outcome::Range { items, .. } => response_cost(items),
         Outcome::Txn { results, .. } => results.iter().map(outcome_cost).sum(),
+        // A Kine result returns the current entry whether or not the
+        // comparison matched, so a mismatch is charged like a read.
+        Outcome::KineUpdated { current, .. } => current.as_ref().map_or(0, kine_kv_cost),
+        Outcome::KineDeleted { prev, .. } => prev.as_ref().map_or(0, kine_kv_cost),
+        Outcome::KineCreated | Outcome::ErrKeyExists => 0,
         Outcome::LeaseTimeToLive { keys, .. } => keys
             .as_ref()
             .map_or(0, |keys| keys.iter().map(|k| k.len() + 8).sum()),
@@ -250,7 +285,7 @@ fn put(
     if let Some(lease) = p.lease {
         let record = overlay.visible_lease(&lease)?;
         if record.owner != overlay.view.principal {
-            return Err(Abort::Fail(Outcome::ErrLeasePermission));
+            return Err(fail(Outcome::ErrLeasePermission));
         }
         generation = Some(record.generation);
     }
@@ -280,16 +315,16 @@ fn put(
             record.attached_keys = record
                 .attached_keys
                 .checked_add(1)
-                .ok_or(Abort::Fail(Outcome::ErrLeaseQuota))?;
+                .ok_or(fail(Outcome::ErrLeaseQuota))?;
         }
         record.attached_bytes = record
             .attached_bytes
             .checked_add(cost)
-            .ok_or(Abort::Fail(Outcome::ErrLeaseQuota))?;
+            .ok_or(fail(Outcome::ErrLeaseQuota))?;
         if record.attached_keys > limits.max_lease_attachments
             || record.attached_bytes > limits.max_lease_bytes
         {
-            return Err(Abort::Fail(Outcome::ErrLeaseQuota));
+            return Err(fail(Outcome::ErrLeaseQuota));
         }
         overlay.leases.insert(lease, record);
         mutations.push(Mutation::LeaseAttach {
@@ -400,7 +435,7 @@ fn attached_keys(
 
 fn grant(overlay: &mut Overlay<'_>, lease_id: LeaseId, ttl_seconds: u32) -> Result<Outcome, Abort> {
     if overlay.lease(&lease_id).is_some() {
-        return Err(Abort::Fail(Outcome::ErrLeaseExists));
+        return Err(fail(Outcome::ErrLeaseExists));
     }
     let generation = LeaseGeneration::new(1).expect("one is valid");
     overlay.leases.insert(
@@ -432,7 +467,7 @@ fn revoke(
 ) -> Result<Outcome, Abort> {
     let record = overlay.visible_lease(&lease_id)?;
     if record.owner != overlay.view.principal {
-        return Err(Abort::Fail(Outcome::ErrLeasePermission));
+        return Err(fail(Outcome::ErrLeasePermission));
     }
     let deleted = end_lease(
         overlay,
@@ -453,7 +488,7 @@ fn time_to_live(
 ) -> Result<Outcome, Abort> {
     let record = overlay.visible_lease(&lease_id)?;
     if record.owner != overlay.view.principal {
-        return Err(Abort::Fail(Outcome::ErrLeasePermission));
+        return Err(fail(Outcome::ErrLeasePermission));
     }
     let keys = if keys {
         let keys = attached_keys(overlay.view, &lease_id, &record)?;
@@ -549,13 +584,190 @@ fn plan_operation(
             time_to_live(overlay, *lease_id, *keys, limits)?
         }
         CanonicalOperation::LeaseKeepAlive { lease_id } => keep_alive(overlay, *lease_id)?,
+        CanonicalOperation::KineCreate(c) => {
+            kine_create(overlay, c, next_revision()?, limits, mutations, events)?
+        }
+        CanonicalOperation::KineUpdate(u) => {
+            kine_update(overlay, u, next_revision()?, limits, mutations, events)?
+        }
+        CanonicalOperation::KineDelete(d) => kine_delete(overlay, d, mutations, events)?,
+    })
+}
+
+/// Write `key` for Kine: detach (and thereby end) the previous private
+/// binding, create the new one when a TTL is given, write the entry.
+#[allow(clippy::too_many_arguments)]
+fn kine_write(
+    overlay: &mut Overlay<'_>,
+    key: &[u8],
+    value: &[u8],
+    ttl_seconds: u32,
+    binding: Option<LeaseId>,
+    prev: Option<KvEntry>,
+    revision: KvRevision,
+    limits: &PlanLimits,
+    mutations: &mut Vec<Mutation>,
+    events: &mut Vec<KvEvent>,
+) -> Result<KvEntry, Abort> {
+    if let Some(prev_entry) = &prev
+        && let Some(old) = prev_entry.lease
+    {
+        overlay.detach(&old, prev_entry, key)?;
+        mutations.push(Mutation::LeaseDetach {
+            lease: old,
+            key: key.to_vec(),
+        });
+    }
+    let mut generation = None;
+    if let Some(binding) = binding {
+        if overlay.lease(&binding).is_some() {
+            return Err(fail(Outcome::ErrLeaseExists));
+        }
+        let cost = attachment_cost(key, value);
+        if cost > limits.max_lease_bytes || limits.max_lease_attachments == 0 {
+            return Err(fail(Outcome::ErrLeaseQuota));
+        }
+        let generation_one = LeaseGeneration::new(1).expect("one is valid");
+        overlay.leases.insert(
+            binding,
+            LeaseRecord {
+                namespace: overlay.view.namespace,
+                generation: generation_one,
+                owner: overlay.view.principal,
+                ttl_seconds,
+                renewal_sequence: 0,
+                purpose: LeasePurpose::KinePrivate,
+                status: LeaseStatus::Active,
+                attached_keys: 1,
+                attached_bytes: cost,
+            },
+        );
+        mutations.push(Mutation::LeaseAttach {
+            lease: binding,
+            key: key.to_vec(),
+            generation: generation_one,
+            mod_revision: revision,
+        });
+        generation = Some(generation_one);
+    }
+    let entry = KvEntry {
+        value: value.to_vec(),
+        create_revision: prev.as_ref().map_or(revision, |e| e.create_revision),
+        mod_revision: revision,
+        version: prev.as_ref().map_or(1, |e| e.version + 1),
+        lease: binding,
+        lease_generation: generation,
+    };
+    mutations.push(Mutation::Write {
+        key: key.to_vec(),
+        entry: entry.clone(),
+    });
+    events.push(KvEvent {
+        kind: KvEventKind::Put,
+        key: key.to_vec(),
+        entry: Some(entry.clone()),
+        prev,
+    });
+    overlay.changed.insert(key.to_vec(), Some(entry.clone()));
+    Ok(entry)
+}
+
+fn kine_create(
+    overlay: &mut Overlay<'_>,
+    c: &KineCreateOp,
+    revision: KvRevision,
+    limits: &PlanLimits,
+    mutations: &mut Vec<Mutation>,
+    events: &mut Vec<KvEvent>,
+) -> Result<Outcome, Abort> {
+    if overlay.get(&c.key).is_some() {
+        return Err(fail(Outcome::ErrKeyExists));
+    }
+    kine_write(
+        overlay,
+        &c.key,
+        &c.value,
+        c.ttl_seconds,
+        c.binding,
+        None,
+        revision,
+        limits,
+        mutations,
+        events,
+    )?;
+    Ok(Outcome::KineCreated)
+}
+
+fn kine_update(
+    overlay: &mut Overlay<'_>,
+    u: &KineUpdateOp,
+    revision: KvRevision,
+    limits: &PlanLimits,
+    mutations: &mut Vec<Mutation>,
+    events: &mut Vec<KvEvent>,
+) -> Result<Outcome, Abort> {
+    let Some(prev) = overlay.get(&u.key).cloned() else {
+        return Ok(Outcome::KineUpdated {
+            updated: false,
+            current: None,
+        });
+    };
+    if prev.mod_revision != u.expected_mod_revision {
+        return Ok(Outcome::KineUpdated {
+            updated: false,
+            current: Some(overlay.kine_kv(&u.key, &prev)),
+        });
+    }
+    let entry = kine_write(
+        overlay,
+        &u.key,
+        &u.value,
+        u.ttl_seconds,
+        u.binding,
+        Some(prev),
+        revision,
+        limits,
+        mutations,
+        events,
+    )?;
+    Ok(Outcome::KineUpdated {
+        updated: true,
+        current: Some(KineKv::project(&u.key, &entry, u.ttl_seconds)),
+    })
+}
+
+fn kine_delete(
+    overlay: &mut Overlay<'_>,
+    d: &KineDeleteOp,
+    mutations: &mut Vec<Mutation>,
+    events: &mut Vec<KvEvent>,
+) -> Result<Outcome, Abort> {
+    let Some(prev) = overlay.get(&d.key).cloned() else {
+        return Ok(Outcome::KineDeleted {
+            deleted: true,
+            prev: None,
+        });
+    };
+    let seen = overlay.kine_kv(&d.key, &prev);
+    if let Some(expected) = d.expected_mod_revision
+        && prev.mod_revision != expected
+    {
+        return Ok(Outcome::KineDeleted {
+            deleted: false,
+            prev: Some(seen),
+        });
+    }
+    delete_entry(overlay, d.key.clone(), prev, mutations, events)?;
+    Ok(Outcome::KineDeleted {
+        deleted: true,
+        prev: Some(seen),
     })
 }
 
 fn keep_alive(overlay: &mut Overlay<'_>, lease_id: LeaseId) -> Result<Outcome, Abort> {
     let mut record = overlay.visible_lease(&lease_id)?;
     if record.owner != overlay.view.principal {
-        return Err(Abort::Fail(Outcome::ErrLeasePermission));
+        return Err(fail(Outcome::ErrLeasePermission));
     }
     record.renewal_sequence = record
         .renewal_sequence
@@ -613,7 +825,7 @@ fn plan_internal_command(
     match command {
         InternalCommand::EstablishLeaseAuthority { epoch, .. } => {
             if *epoch <= view.lease_authority {
-                return Err(Abort::Fail(Outcome::ErrStaleAuthority));
+                return Err(fail(Outcome::ErrStaleAuthority));
             }
             mutations.push(Mutation::LeaseAuthority { epoch: *epoch });
             Ok(Outcome::LeaseAuthorityEstablished { epoch: *epoch })
@@ -631,11 +843,11 @@ fn plan_internal_command(
             if view.lease_authority == LeaseAuthorityEpoch::ZERO
                 || *authority_epoch != view.lease_authority
             {
-                return Err(Abort::Fail(Outcome::ErrStaleAuthority));
+                return Err(fail(Outcome::ErrStaleAuthority));
             }
             let record = match overlay.lease(lease_id) {
                 Some(r) if r.status == LeaseStatus::Active => r.clone(),
-                _ => return Err(Abort::Fail(Outcome::ExpireStale)),
+                _ => return Err(fail(Outcome::ExpireStale)),
             };
             if record.namespace != view.namespace {
                 return Err(Abort::Error(PlanError::NamespaceMismatch));
@@ -643,7 +855,7 @@ fn plan_internal_command(
             if record.generation != *generation
                 || record.renewal_sequence != *expected_renewal_sequence
             {
-                return Err(Abort::Fail(Outcome::ExpireStale));
+                return Err(fail(Outcome::ExpireStale));
             }
             let deleted = end_lease(
                 overlay,
@@ -743,7 +955,7 @@ fn finish(
                 events: Vec::new(),
                 response: Response {
                     revision: view.kv_revision,
-                    outcome,
+                    outcome: *outcome,
                 },
             });
         }

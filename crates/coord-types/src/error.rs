@@ -81,6 +81,9 @@ pub enum ValidationError {
     ZeroRevision,
     /// Pagination limit exceeds the maximum page size.
     LimitTooLarge,
+    /// A Kine TTL binding identity must be present exactly when the TTL is
+    /// positive.
+    BindingMismatch,
 }
 
 impl fmt::Display for ValidationError {
@@ -98,6 +101,7 @@ impl fmt::Display for ValidationError {
             ValidationError::ZeroTtl => "lease TTL must be positive",
             ValidationError::TtlTooLong => "lease TTL exceeds limit",
             ValidationError::ZeroRevision => "revision must be positive",
+            ValidationError::BindingMismatch => "binding identity must match a positive TTL",
             ValidationError::LimitTooLarge => "page limit exceeds maximum",
         };
         f.write_str(text)
