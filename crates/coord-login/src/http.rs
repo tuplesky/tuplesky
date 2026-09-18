@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::device::{DeviceError, DeviceLogin, Poll};
 use crate::service::{LoginError, RedeemRequest, ServiceLogin, StartRequest, UpstreamIdentity};
 use crate::upstream::{Upstream, UpstreamError};
 
@@ -31,6 +32,8 @@ use crate::upstream::{Upstream, UpstreamError};
 pub struct LoginState {
     /// The service-login core.
     pub login: Mutex<ServiceLogin>,
+    /// The device-grant core.
+    pub device: Mutex<DeviceLogin>,
     /// Discovered upstream clients by configuration name.
     pub upstreams: BTreeMap<String, Upstream>,
     /// The hardened HTTP client for the upstream leg.
@@ -55,6 +58,7 @@ impl LoginState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         login: ServiceLogin,
+        device: DeviceLogin,
         upstreams: BTreeMap<String, Upstream>,
         http: reqwest::Client,
         sts: Sts,
@@ -66,6 +70,7 @@ impl LoginState {
     ) -> Self {
         LoginState {
             login: Mutex::new(login),
+            device: Mutex::new(device),
             upstreams,
             http,
             sts: Mutex::new(sts),
@@ -86,6 +91,11 @@ pub fn router(state: Arc<LoginState>) -> Router {
         .route("/login/start", get(start))
         .route("/login/callback", get(callback))
         .route("/login/redeem", post(redeem))
+        .route("/device/authorize", post(device_authorize))
+        .route("/device/verify", get(device_verify))
+        .route("/device/callback", get(device_callback))
+        .route("/device/deny", post(device_deny))
+        .route("/device/token", post(device_token))
         .layer(DefaultBodyLimit::max(limit))
         .with_state(state)
 }
@@ -327,6 +337,234 @@ fn exchange_error(e: &ExchangeError) -> Response {
         e.code(),
         e.description(),
     )
+}
+
+fn device_error(e: &DeviceError) -> Response {
+    let (status, code) = match e {
+        DeviceError::TooManyPending | DeviceError::TooManyAttempts => {
+            (StatusCode::TOO_MANY_REQUESTS, "slow_down")
+        }
+        DeviceError::UnknownClient => (StatusCode::BAD_REQUEST, "invalid_client"),
+        DeviceError::UnknownDeviceCode => (StatusCode::BAD_REQUEST, "invalid_grant"),
+        _ => (StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    error(status, code, &format!("{e:?}"))
+}
+
+#[derive(Deserialize)]
+struct DeviceAuthorizeForm {
+    client_id: String,
+}
+
+async fn device_authorize(
+    State(state): State<Arc<LoginState>>,
+    Form(form): Form<DeviceAuthorizeForm>,
+) -> Response {
+    let clock = state.clock.read();
+    let entropy = state.entropy.fill();
+    match state
+        .device
+        .lock()
+        .await
+        .authorize(clock.now, &form.client_id, &entropy)
+    {
+        Ok(a) => (
+            StatusCode::OK,
+            Json(json!({
+                "device_code": a.device_code,
+                "user_code": a.user_code,
+                "verification_uri": a.verification_uri,
+                "verification_uri_complete": a.verification_uri_complete,
+                "expires_in": a.expires_in,
+                "interval": a.interval,
+            })),
+        )
+            .into_response(),
+        Err(e) => device_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct UserCodeQuery {
+    user_code: String,
+}
+
+async fn device_verify(
+    State(state): State<Arc<LoginState>>,
+    Query(q): Query<UserCodeQuery>,
+) -> Response {
+    let clock = state.clock.read();
+    let entropy = state.entropy.fill();
+    let started = match state
+        .device
+        .lock()
+        .await
+        .begin_browser(clock.now, &q.user_code, &entropy)
+    {
+        Ok(s) => s,
+        Err(e) => return device_error(&e),
+    };
+    let Some(upstream) = state.upstreams.get(&started.upstream) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "upstream",
+        );
+    };
+    redirect(&upstream.authorize_url(
+        &started.upstream_state,
+        &started.upstream_nonce,
+        started.upstream_challenge,
+    ))
+}
+
+async fn device_callback(
+    State(state): State<Arc<LoginState>>,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    let Ok(_permit) = state.permits.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "busy",
+        );
+    };
+    let Some(code) = q.code else {
+        return error(StatusCode::BAD_REQUEST, "access_denied", "upstream denied");
+    };
+    let clock = state.clock.read();
+    let (verifier, upstream_name, nonce) =
+        match state.device.lock().await.upstream_exchange(&q.state) {
+            Ok(v) => v,
+            Err(e) => return device_error(&e),
+        };
+    let Some(upstream) = state.upstreams.get(&upstream_name) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "upstream",
+        );
+    };
+    let identity = match tokio::time::timeout(
+        state.limits.timeout,
+        upstream.exchange(code, verifier, &nonce, &state.http),
+    )
+    .await
+    {
+        Ok(Ok(i)) => i,
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "upstream exchange",
+            );
+        }
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "timeout",
+            );
+        }
+    };
+    let commitment = match state.device.lock().await.complete_browser(
+        clock.now,
+        &q.state,
+        identity,
+        &upstream.config().issuer,
+    ) {
+        Ok(c) => c,
+        Err(e) => return device_error(&e),
+    };
+    let committed = state
+        .creator
+        .lock()
+        .await
+        .create(InternalCommand::CommitGrant {
+            namespace: state.namespace,
+            commitment,
+            kind: GrantKind::Code,
+        });
+    match committed {
+        Ok(r) if r.outcome == Outcome::GrantCommitted => {
+            (StatusCode::OK, Json(json!({ "approved": true }))).into_response()
+        }
+        _ => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "grant",
+        ),
+    }
+}
+
+async fn device_deny(
+    State(state): State<Arc<LoginState>>,
+    Form(form): Form<UserCodeQuery>,
+) -> Response {
+    let clock = state.clock.read();
+    match state.device.lock().await.deny(clock.now, &form.user_code) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "denied": true }))).into_response(),
+        Err(e) => device_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceTokenForm {
+    grant_type: String,
+    device_code: String,
+}
+
+async fn device_token(
+    State(state): State<Arc<LoginState>>,
+    Form(form): Form<DeviceTokenForm>,
+) -> Response {
+    if form.grant_type != "urn:ietf:params:oauth:grant-type:device_code" {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "grant_type",
+        );
+    }
+    let Ok(_permit) = state.permits.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "busy",
+        );
+    };
+    let clock = state.clock.read();
+    let redeemed = match state.device.lock().await.poll(clock.now, &form.device_code) {
+        Ok(Poll::Approved(r)) => r,
+        Ok(Poll::Pending) => {
+            return error(StatusCode::BAD_REQUEST, "authorization_pending", "pending");
+        }
+        Ok(Poll::SlowDown) => return error(StatusCode::BAD_REQUEST, "slow_down", "interval"),
+        Ok(Poll::Denied) => return error(StatusCode::BAD_REQUEST, "access_denied", "denied"),
+        Ok(Poll::Expired) => return error(StatusCode::BAD_REQUEST, "expired_token", "expired"),
+        Err(e) => return device_error(&e),
+    };
+    let identity = verified(&redeemed.identity, &redeemed.upstream);
+    let entropy = state.entropy.fill();
+    let result = {
+        let mut sts = state.sts.lock().await;
+        let mut creator = state.creator.lock().await;
+        sts.issue(
+            &identity,
+            Some(redeemed.commitment),
+            None,
+            &clock,
+            &entropy,
+            creator.as_mut(),
+        )
+    };
+    match result {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(response).expect("serializable")),
+        )
+            .into_response(),
+        Err(e) => exchange_error(&e),
+    }
 }
 
 /// The verified identity of a redeemed login, as trust rules see it:
