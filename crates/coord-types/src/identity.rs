@@ -56,6 +56,8 @@ pub enum HashDomain {
     FinalizedFrame,
     /// One-time grant/code commitments stored in `auth_grant_v1`.
     AuthGrantCommitment,
+    /// Dependency-path chain digests of per-key conflict logs (task-21).
+    DependencyPath,
 }
 
 impl HashDomain {
@@ -69,6 +71,7 @@ impl HashDomain {
             HashDomain::LocalCheckpointRoot => "tuplesky coord.v1 2026-09 local-checkpoint-root",
             HashDomain::FinalizedFrame => "tuplesky coord.v1 2026-09 finalized-frame",
             HashDomain::AuthGrantCommitment => "tuplesky coord.v1 2026-09 auth-grant-commitment",
+            HashDomain::DependencyPath => "tuplesky coord.v1 2026-09 dependency-path",
         }
     }
 

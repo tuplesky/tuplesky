@@ -357,7 +357,7 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     let k = vec![b"k".to_vec()];
     // Leader evidence for c1 arrives first: a placeholder, invisible to
     // conflict lookups and to the guards.
-    table.expect(c1);
+    table.expect(c1).unwrap();
     assert_eq!(table.phase_of(&c1), None);
     assert_eq!(table.conflicts(&k), vec![]);
     assert_eq!(
@@ -366,15 +366,21 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     );
     // c2 initializes while c1 is still a placeholder: it cannot see c1.
     assert_eq!(
-        table.initialize(c2, Digest32([2; 32]), k.clone()),
-        Ok(vec![])
+        table
+            .initialize(c2, Digest32([2; 32]), k.clone())
+            .unwrap()
+            .deps,
+        vec![]
     );
     assert_eq!(table.phase_of(&c2), Some(Phase::PreAccept));
     // c1's payload arrives: one transition binds it, computes deps from the
     // index (now c2) and publishes it.
     assert_eq!(
-        table.initialize(c1, Digest32([1; 32]), k.clone()),
-        Ok(vec![c2])
+        table
+            .initialize(c1, Digest32([1; 32]), k.clone())
+            .unwrap()
+            .deps,
+        vec![c2]
     );
     assert_eq!(table.conflicts(&k), vec![c1]);
     // Duplicate / reordered initialization converges without change; a
@@ -418,7 +424,10 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     assert_eq!(table.phase_of(&c1), Some(Phase::Executed));
     assert_eq!(table.record(&c1).unwrap().deps, vec![c2]);
     // A third command initialized now depends on the last in the index.
-    assert_eq!(table.initialize(c3, Digest32([3; 32]), k), Ok(vec![c1]));
+    assert_eq!(
+        table.initialize(c3, Digest32([3; 32]), k).unwrap().deps,
+        vec![c1]
+    );
     assert_eq!(table.len(), 3);
     let _ = BTreeSet::<u8>::new();
     let _ = StoreUpdate {
