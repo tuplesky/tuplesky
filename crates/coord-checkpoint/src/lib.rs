@@ -9,7 +9,10 @@
 //!   root is a domain-separated BLAKE3 digest of exactly those fields.
 //!   Chunks ([`manifest::ChunkV1`]) hold rows in canonical order and are
 //!   hashed by their encoded bytes. Two raw kinds of the snapshot range
-//!   carry manifest and chunks.
+//!   carry manifest and chunks; the manifest is carried whole in one
+//!   frame, so its encoded size is bounded
+//!   ([`manifest::MAX_MANIFEST_BYTES`]) and export and verification both
+//!   hold it to that bound.
 //! * [`export`]: [`export::export_shared`] traverses one pinned
 //!   multi-collection view (any `OrderedRead`) through bounded pages, in
 //!   registry order and unsigned key order, and includes only common state
@@ -21,8 +24,9 @@
 //!   an error. The applied stamp is re-read between collections so a view
 //!   that changes under the export is refused rather than mixed.
 //! * [`verify`]: [`verify::verify_shared`] recomputes every chunk digest and
-//!   the root and checks order, uniqueness, counts, bounds and descriptors,
-//!   so an importer (task-50) trusts bytes only after this.
+//!   the root and checks order, uniqueness, counts, bounds (the manifest's
+//!   own encoded size among them) and descriptors, so an importer
+//!   (task-50) trusts bytes only after this.
 //!
 //! This is not `LocalRecoveryCheckpointV1` (task-j04): it carries no
 //! promises, votes, stamps, journal sequences or physical files, gives a
@@ -36,8 +40,8 @@ pub mod verify;
 
 pub use export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
 pub use manifest::{
-    CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1, RowV1,
-    SHARED_CHECKPOINT_FORMAT_V1, SharedCheckpointV1, SharedManifestV1,
+    CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1, MAX_CHUNKS,
+    MAX_MANIFEST_BYTES, RowV1, SHARED_CHECKPOINT_FORMAT_V1, SharedCheckpointV1, SharedManifestV1,
 };
 pub use verify::{VerifyError, verify_shared};
 

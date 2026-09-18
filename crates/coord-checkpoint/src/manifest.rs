@@ -8,6 +8,12 @@
 //! incarnation, boot, stamps or physical layout. Rows are
 //! `(collection, key, value)` in canonical order; a chunk is hashed by its
 //! encoded bytes.
+//!
+//! The manifest travels in one snapshot frame and is never paginated, so
+//! its encoded size is part of what the artifact supports: chunk count and
+//! boundary-key lengths together are bounded by [`MAX_MANIFEST_BYTES`],
+//! and an export or verification that would accept more fails instead of
+//! producing a checkpoint that cannot be transmitted.
 
 use std::fmt;
 
@@ -16,7 +22,7 @@ use coord_types::identity::{Digest32, HashDomain};
 use coord_types::ids::{
     ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition, KvRevision, LeaseAuthorityEpoch,
 };
-use coord_types::wire_v1::{Frame, WireError, encode_frame};
+use coord_types::wire_v1::{Frame, KindRange, WireError, encode_frame};
 use serde::{Deserialize, Serialize};
 
 /// Artifact format version. Bumped only by a reviewed schema change;
@@ -31,8 +37,28 @@ pub const MAX_CHUNK_BYTES: usize =
 pub const MAX_ROW_KEY_BYTES: usize = 32 * 1024;
 /// Longest row value (an envelope at its payload limit).
 pub const MAX_ROW_VALUE_BYTES: usize = MAX_ENVELOPE_PAYLOAD + 16;
-/// Most chunks in one checkpoint.
-pub const MAX_CHUNKS: usize = 1 << 20;
+/// Largest encoded manifest: exactly what one snapshot frame carries
+/// ([`kinds::MANIFEST`] is of the snapshot range, and a frame's length
+/// field covers its kind and version as well as the payload).
+///
+/// The manifest is not paginated: one frame carries all of it or the
+/// checkpoint cannot be transmitted at all. That makes this the
+/// artifact's own supported-size bound rather than a transport detail,
+/// and export and verification both hold a manifest to it, so a
+/// checkpoint that passes them can always be framed.
+pub const MAX_MANIFEST_BYTES: usize = KindRange::Snapshot.max_frame_length() as usize - 4;
+/// Smallest an encoded [`ChunkDescriptorV1`] can be: minimal varints for
+/// the ordinal and the two counts, both boundary keys empty, and the
+/// fixed digest.
+const MIN_CHUNK_DESCRIPTOR_BYTES: usize = 39;
+/// Most chunks in one checkpoint: what [`MAX_MANIFEST_BYTES`] can
+/// describe when every descriptor is at its smallest.
+///
+/// Real boundary keys are not empty, so reaching this count does not mean
+/// the manifest fits; the byte bound is what export and verification
+/// enforce. The count exists so a decoder can refuse an absurd chunk list
+/// before it walks it.
+pub const MAX_CHUNKS: usize = MAX_MANIFEST_BYTES / MIN_CHUNK_DESCRIPTOR_BYTES;
 
 /// Raw kinds of the snapshot range (class limit 1 MiB + 64 KiB).
 pub mod kinds {
@@ -147,13 +173,26 @@ impl SharedManifestV1 {
         self.collections.iter().map(|c| c.rows).sum()
     }
 
-    /// Portable encoding.
+    /// Portable encoding, held to [`MAX_MANIFEST_BYTES`].
+    ///
+    /// The bound is the manifest's, not the framing's: a descriptor list
+    /// that no snapshot frame can carry is not a checkpoint anyone can
+    /// send, so it is refused where it is produced instead of at the
+    /// moment of transmission.
     pub fn encode(&self) -> Result<Vec<u8>, ArtifactError> {
-        postcard::to_allocvec(self).map_err(|_| ArtifactError::TooLarge)
+        let bytes = postcard::to_allocvec(self).map_err(|_| ArtifactError::TooLarge)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(ArtifactError::TooLarge);
+        }
+        Ok(bytes)
     }
 
-    /// Exact decoding (no structural verification; see `verify`).
+    /// Exact decoding with the manifest bound checked before allocation
+    /// (no structural verification; see `verify`).
     pub fn decode(bytes: &[u8]) -> Result<Self, ArtifactError> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(ArtifactError::TooLarge);
+        }
         exact(bytes)
     }
 
@@ -166,7 +205,7 @@ impl SharedManifestV1 {
     /// Decode from a snapshot frame.
     pub fn from_frame(frame: &Frame) -> Result<Self, ArtifactError> {
         check_frame(frame, kinds::MANIFEST)?;
-        exact(&frame.payload)
+        Self::decode(&frame.payload)
     }
 }
 

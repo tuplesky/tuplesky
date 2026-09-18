@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use coord_checkpoint::export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
+use coord_checkpoint::manifest::ArtifactError;
 use coord_checkpoint::manifest::{
-    CHUNK_TARGET_BYTES, ChunkV1, SHARED_CHECKPOINT_FORMAT_V1, SharedCheckpointV1, SharedManifestV1,
-    kinds,
+    CHUNK_TARGET_BYTES, ChunkDescriptorV1, ChunkV1, MAX_CHUNKS, MAX_MANIFEST_BYTES,
+    SHARED_CHECKPOINT_FORMAT_V1, SharedCheckpointV1, SharedManifestV1, kinds,
 };
 use coord_checkpoint::verify::{VerifyError, verify_shared};
 use coord_state::plan::KvEventKind;
@@ -769,6 +770,138 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
     let mut trailing = f2.clone();
     trailing.payload.push(0);
     assert!(ChunkV1::from_frame(&trailing).is_err());
+
+    // A manifest with many chunks still frames: the round trip is over the
+    // whole descriptor list, not one descriptor.
+    let many = with_descriptors(&cp.manifest, MAX_CHUNKS / 2, 0);
+    assert!(many.encode().unwrap().len() > CHUNK_TARGET_BYTES / 4);
+    let mut reader = FrameReader::new();
+    reader.push(&many.frame().unwrap());
+    let framed = reader.next_frame().unwrap().unwrap();
+    assert_eq!(framed.kind, kinds::MANIFEST);
+    assert_eq!(SharedManifestV1::from_frame(&framed).unwrap(), many);
+}
+
+/// `manifest` with `count` synthetic chunk descriptors whose boundary keys
+/// are `key_bytes` long each. The root is recomputed, so what comes back
+/// is a manifest that is internally consistent and differs from the
+/// original only in how much it has to say.
+fn with_descriptors(
+    manifest: &SharedManifestV1,
+    count: usize,
+    key_bytes: usize,
+) -> SharedManifestV1 {
+    let mut out = manifest.clone();
+    out.chunks = (0..count)
+        .map(|i| ChunkDescriptorV1 {
+            ordinal: i as u32,
+            rows: 1,
+            bytes: 64,
+            first: (0, vec![0xa1; key_bytes]),
+            last: (0, vec![0xa2; key_bytes]),
+            digest: Digest32([i as u8; 32]),
+        })
+        .collect();
+    out.root = out.compute_root();
+    out
+}
+
+#[test]
+fn a_manifest_that_no_snapshot_frame_can_carry_is_neither_exported_nor_verified() {
+    let engine = model(Profile::default());
+    let cp = export(&engine, &ExportLimits::default());
+    let encoded = encoded_chunks(&cp);
+    verify_shared(&cp.manifest, &encoded).unwrap();
+
+    // Enough descriptors on their own. The chunk count is what the
+    // artifact permits, and it is still more than one frame holds.
+    let too_many = with_descriptors(&cp.manifest, MAX_CHUNKS, 0);
+    assert_eq!(too_many.frame(), Err(ArtifactError::TooLarge));
+    assert_eq!(
+        verify_shared(&too_many, &encoded),
+        Err(VerifyError::ManifestTooLarge)
+    );
+
+    // Or few descriptors with long boundary keys. A count bound cannot
+    // catch this one: each descriptor names its chunk's first and last
+    // key, and those are rows, not counters.
+    let long_keys = with_descriptors(&cp.manifest, 64, 16 * 1024);
+    assert!(long_keys.chunks.len() < MAX_CHUNKS);
+    assert_eq!(long_keys.frame(), Err(ArtifactError::TooLarge));
+    assert_eq!(
+        verify_shared(&long_keys, &encoded),
+        Err(VerifyError::ManifestTooLarge)
+    );
+
+    // The bound is the frame's, so a manifest just under it still travels.
+    let biggest = with_descriptors(&cp.manifest, 32, 16 * 1024);
+    let bytes = biggest.encode().unwrap();
+    assert!(bytes.len() <= MAX_MANIFEST_BYTES, "{}", bytes.len());
+    let mut reader = FrameReader::new();
+    reader.push(&biggest.frame().unwrap());
+    let framed = reader.next_frame().unwrap().unwrap();
+    assert_eq!(SharedManifestV1::from_frame(&framed).unwrap(), biggest);
+    // Its chunks are synthetic, so verification stops at the sequence, not
+    // at the size.
+    assert_eq!(
+        verify_shared(&biggest, &encoded),
+        Err(VerifyError::ChunkSequence)
+    );
+
+    // And an export refuses to hand one back. Long keys chunked one row at
+    // a time are the cheap way there: the rows are ordinary and well
+    // within their bounds, and it is the descriptors naming each chunk's
+    // first and last key that outgrow the frame.
+    let long = model_with_long_keys(64, 16 * 1024);
+    let view = long.reader().snapshot().unwrap();
+    assert_eq!(
+        export_shared(
+            &view,
+            origin(),
+            &ExportLimits {
+                chunk_target_bytes: 1,
+                ..ExportLimits::default()
+            }
+        ),
+        Err(ExportError::ManifestTooLarge)
+    );
+    // The same rows under the real chunk target pack into few chunks and
+    // export, verify and frame as they should: the bound is on what the
+    // manifest has to say, not on the state.
+    let packed = export(&long, &ExportLimits::default());
+    verify_shared(&packed.manifest, &encoded_chunks(&packed)).unwrap();
+    packed.manifest.frame().unwrap();
+    // The requested chunk ceiling never raises the artifact's own.
+    assert_eq!(ExportLimits::default().max_chunks, MAX_CHUNKS);
+    let wide = export(
+        &engine,
+        &ExportLimits {
+            chunk_target_bytes: 1,
+            max_chunks: usize::MAX,
+            ..ExportLimits::default()
+        },
+    );
+    assert!(wide.chunks.len() <= MAX_CHUNKS);
+    verify_shared(&wide.manifest, &encoded_chunks(&wide)).unwrap();
+}
+
+/// A domain whose keys are long. A chunk descriptor names its chunk's
+/// first and last key, so key length is manifest size.
+fn model_with_long_keys(rows: usize, key_bytes: usize) -> ModelEngine {
+    let mut engine = model(Profile::default());
+    let mut tx = engine.begin_write().unwrap();
+    for i in 0..rows {
+        let mut key = format!("long-{i:06}").into_bytes();
+        key.resize(key_bytes, b'k');
+        tx.put(
+            Collection::KvCurrentV1.id(),
+            &codecs::current_key(&NS, &key),
+            &codecs::encode_current(&entry(b"v", 3, 3, 1)).unwrap(),
+        )
+        .unwrap();
+    }
+    tx.commit_durable().unwrap();
+    engine
 }
 
 /// A view wrapper that mutates the engine through another handle on the
