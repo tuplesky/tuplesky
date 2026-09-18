@@ -103,6 +103,15 @@ pub struct KvModel {
 }
 
 impl KvModel {
+    /// Keys currently attached to `lease`, in order.
+    pub fn attached_keys(&self, lease: [u8; 16]) -> Vec<Vec<u8>> {
+        self.current
+            .iter()
+            .filter(|(_, e)| e.lease == Some(lease))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// Current revision.
     pub const fn revision(&self) -> u64 {
         self.revision
@@ -397,6 +406,12 @@ impl KvModel {
                 Some(h) => item.key >= range.key && item.key < *h,
             })
             .collect()
+    }
+
+    /// Whether every comparison holds against the current state (the
+    /// conjunction selecting a transaction's success branch).
+    pub fn compares_hold(&self, compares: &[Compare]) -> bool {
+        compares.iter().all(|c| self.compare(c))
     }
 
     fn compare(&self, c: &Compare) -> bool {

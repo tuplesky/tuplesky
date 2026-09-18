@@ -6,11 +6,12 @@ use std::num::NonZeroU32;
 use std::ops::Bound;
 
 use coord_state::lease::{LeaseRecord, LeaseStatus};
+use coord_state::policy::Authorization;
 use coord_state::view::{HistoricalView, KvEntry, ReadView};
 use coord_state::{InternalCommand, KvEvent};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
-use coord_types::ids::{KvRevision, LeaseId, NamespaceId, PrincipalId};
+use coord_types::ids::{KvRevision, LeaseId, NamespaceId, PrincipalId, SessionId};
 use coord_types::logical_v1::{BranchOp, CanonicalOperation, KeyRange, LogicalRequest, RangeOp};
 use coord_types::ordered_key;
 
@@ -276,6 +277,66 @@ fn load_leases<V: OrderedRead>(
     Ok(())
 }
 
+/// Load the authorization context of `session` in `namespace`: the session
+/// record, its trust rule and every permission rule of its principal.
+pub fn load_authorization<V: OrderedRead>(
+    view: &V,
+    namespace: NamespaceId,
+    session: &SessionId,
+    budget: ViewBudget,
+) -> Result<Authorization, ViewBuildError> {
+    let mut budget = Budget {
+        rows: budget.max_rows,
+        bytes: budget.max_bytes,
+    };
+    let mut out = Authorization {
+        session: None,
+        trust_rule: None,
+        rules: Vec::new(),
+    };
+    let key = codecs::session_key(session);
+    let Some(bytes) = view.get(Collection::SessionV1.id(), &key)? else {
+        return Ok(out);
+    };
+    budget.charge(1, key.len() + bytes.len())?;
+    let record = codecs::decode_session(&bytes)?;
+    let rule_key = codecs::trust_rule_key(&record.trust_rule);
+    if let Some(bytes) = view.get(Collection::PolicyV1.id(), &rule_key)? {
+        budget.charge(1, rule_key.len() + bytes.len())?;
+        out.trust_rule = Some(codecs::decode_trust_rule(&bytes)?);
+    }
+    let prefix = codecs::policy_rule_prefix(&record.principal);
+    let upper = prefix_upper(&prefix);
+    for (_, value) in scan_all(view, Collection::PolicyV1, prefix, upper, &mut budget)? {
+        let rule = codecs::decode_policy_rule(&value)?;
+        if rule.namespace == namespace {
+            out.rules.push(rule);
+        }
+    }
+    out.session = Some(record);
+    Ok(out)
+}
+
+/// Build the view a client request executing under `session` needs: the
+/// same as [`build_read_view`] plus the authorization context, with the
+/// principal taken from the session record (deny by default when absent).
+pub fn build_authorized_view<V: OrderedRead>(
+    gated: &GatedView<V>,
+    namespace: NamespaceId,
+    session: &SessionId,
+    request: &LogicalRequest,
+    budget: ViewBudget,
+) -> Result<ReadView, ViewBuildError> {
+    let authorization = load_authorization(gated.view(), namespace, session, budget)?;
+    let principal = authorization
+        .session
+        .as_ref()
+        .map_or(PrincipalId([0; 16]), |s| s.principal);
+    let mut read_view = build_read_view(gated, namespace, principal, request, budget)?;
+    read_view.authorization = Some(authorization);
+    Ok(read_view)
+}
+
 /// Build the view an internal command needs: the authority epoch and, for
 /// an expiration, the lease record, its reverse index and the entries it
 /// points at.
@@ -304,6 +365,34 @@ pub fn build_internal_view<V: OrderedRead>(
         let mut ids: BTreeSet<LeaseId> = BTreeSet::from([lease]);
         ids.extend(read_view.current.values().filter_map(|e| e.lease));
         load_leases(view, ids, &mut read_view, &mut budget)?;
+    }
+    for rule in command.trust_rules() {
+        let key = codecs::trust_rule_key(&rule);
+        if let Some(bytes) = view.get(Collection::PolicyV1.id(), &key)? {
+            budget.charge(1, key.len() + bytes.len())?;
+            read_view
+                .trust_rules
+                .insert(rule, codecs::decode_trust_rule(&bytes)?);
+        }
+    }
+    let mut sessions: BTreeSet<SessionId> = command.sessions().into_iter().collect();
+    for commitment in command.grants() {
+        let key = codecs::grant_key(&commitment);
+        if let Some(bytes) = view.get(Collection::AuthGrantV1.id(), &key)? {
+            budget.charge(1, key.len() + bytes.len())?;
+            let record = codecs::decode_grant(&bytes)?;
+            sessions.extend(record.session);
+            read_view.grants.insert(commitment, record);
+        }
+    }
+    for session in sessions {
+        let key = codecs::session_key(&session);
+        if let Some(bytes) = view.get(Collection::SessionV1.id(), &key)? {
+            budget.charge(1, key.len() + bytes.len())?;
+            read_view
+                .sessions
+                .insert(session, codecs::decode_session(&bytes)?);
+        }
     }
     Ok(read_view)
 }

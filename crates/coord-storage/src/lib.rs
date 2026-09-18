@@ -51,6 +51,15 @@
 //!   task-16 adds the `lease_authority` frontier row, the internal-command
 //!   view (`build_internal_view`) for conditional expiration and the
 //!   paginated `active_leases` listing a recovering scheduler arms from.
+//! * Sessions and policy (task-18): `session_v1` holds the full
+//!   `SessionRecord`, `policy_v1` trust rules (prefix `0x01`) and
+//!   per-principal permission rules (prefix `0x02 || principal`),
+//!   `auth_grant_v1` grant commitments keyed by digest. `build_authorized_view`
+//!   loads the session, its trust rule and its principal's rules at the
+//!   same snapshot as the entries, so denial and revocation are ordered at
+//!   execution; retry admission and result resolution require an
+//!   executable session, so a retired or rule-invalidated session cannot
+//!   read cached outcomes.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -58,6 +67,7 @@ pub mod codecs;
 pub mod compaction;
 pub mod lowering;
 pub mod materialize;
+pub mod policy;
 pub mod retry;
 pub mod sync;
 pub mod view;
@@ -72,7 +82,8 @@ pub use retry::{Admission, Resolution, RetryBinding};
 pub use view::{GatedReader, GatedView, ViewError};
 pub use views::{
     ActiveLeasePage, StoredEvent, ViewBudget, ViewBuildError, active_leases, active_leases_page,
-    build_internal_view, build_read_view, events_at, scan_current_page, stored_events_at,
+    build_authorized_view, build_internal_view, build_read_view, events_at, load_authorization,
+    scan_current_page, stored_events_at,
 };
 pub use watch::{CloseReason, WatchBatch, WatchHub, WatchId, WatchItem, WatchSpec};
 pub use worker::{FlushOutcome, GroupLimits, StoreWorker, SubmitError, WorkerState};
