@@ -133,6 +133,20 @@ must be re-checked against the paper text at the task-19 review.
 | `handleNewLeader`: `stopDescs`, status `RECOVERING` | A promise for a higher ballot fences late old-ballot proposals and unreleased sends; the durable rows and promise survive a crash and reproduce the report | `FollowerRejection::StaleBallot`, `Follower::recover` | `tests/recovery.rs::old_ballot_work_is_held_across_recovery_and_required_state_survives_a_crash` |
 | `handleNewLeaderAckNs` phase merge | Legal phase differences select; incompatible accepted candidates from real reports are diagnosed | `recovery::select` over `DurableLedger` reports | `tests/recovery.rs::legal_phase_differences_select_and_incompatible_candidates_are_diagnosed` |
 
+## Recovery selection and activation (task-26)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| `recover` channel in `run`: `MNewLeader` to all, `handleNewLeader` on self | The candidate promises itself durably first; the `NewLeader` to the others requires that row | `Follower::campaign` | `tests/activation.rs::learned_outcomes_survive_a_lost_leader_and_lost_commit_notifications` |
+| `reinitNewLeaderAckNs` (majority), `handleNewLeaderAckNs` | Selection runs on a majority of complete reports from promising voters (own included) | `campaign::Campaign::try_select` -> `recovery::select` | same; `tests/activation.rs::permuted_reports_give_the_same_selection` |
+| `sender.SendToAll(sync)` right after selection | `[EXT]` the selection is bound to the ballot in `protocol_v1` before any Sync is published; after a crash it is republished, never reselected (Section 4.9) | `rows::SyncRecordV1`, `Campaign::{bound, resumed}`, `Follower::resume_campaign` | `tests/activation.rs::a_crash_after_binding_the_sync_republishes_the_same_result` |
+| `handleSync`: `r.ballot > msg.Ballot -> return`; adopts higher ballots implicitly | `[EXT: stricter]` a Sync is adopted only for exactly the promised ballot and only from its leader | `Follower::on_sync` -> `FollowerRejection::SyncRejected` | `tests/activation.rs::competing_campaigns_and_delayed_replies_cannot_establish_divergence` |
+| `handleSync`: `r.cballot = msg.Ballot`, `r.FQ = AQ(ballot)`, descriptors reset, entries installed in dependency order | The synchronized ballot is persisted, the ballot's fast set activated, ballot-scoped votes reset, entries installed under the guards (missing payloads fetched first) | `Follower::{on_sync, advance_sync}`, `BallotConfiguration::c2_default` `[EXT: default fast-set rule until task-m01]` | learned-outcomes test |
+| `handleSync` on the leader: `MFastAck` per Sync command; re-propose the rest | The new leader re-proposes every Sync entry with the selected dependencies in dependency order, then the re-proposed commands | `Leader::from_recovered`, `Leader::repropose` | learned-outcomes test |
+| `handleSync` after a promise; voting messages of the new ballot delivered before the Sync | `[EXT]` a proposal or acknowledgement of the promised-but-unsynchronized ballot is held (bounded by the table capacity) and replayed after the Sync instead of being dropped; delivery is not ordered across peers | `Follower::{stash_until_sync, replay_awaiting}` | learned-outcomes test (reordered inboxes) |
+| Executed commands after a restart | `[EXT]` the executed identities are durable with the application rows (Section 6.5); recovery restores the execution frontier and a re-proposal never regresses a learned or executed phase | `Follower::restore_execution`, `CommandTable::restore_executed`, `Follower::advance_pending` | learned-outcomes test |
+| (roles are fixed in the prototype) | `[EXT]` roles convert through the recovered state: learned outcomes, execution frontier, payloads and bindings survive; a deposed leader carries a pending Sync into its follower role | `role::RecoveredState`, `Leader::{deposed, into_recovered}`, `Follower::{from_recovered, into_recovered, won}` | competing-campaigns test |
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |
