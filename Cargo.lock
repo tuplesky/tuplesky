@@ -178,6 +178,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-state"
+version = "0.1.0"
+dependencies = [
+ "coord-core",
+ "coord-oracle",
+ "coord-types",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "coord-store-api"
 version = "0.1.0"
 dependencies = [
