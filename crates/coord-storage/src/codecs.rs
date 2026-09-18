@@ -2,12 +2,16 @@
 //! encoders; values are `StoreEnvelopeV1` with frozen record kinds.
 
 use coord_state::lease::LeaseRecord;
+use coord_state::policy::{GrantRecord, PolicyRule, SessionRecord, TrustRule};
 use coord_state::view::KvEntry;
 use coord_state::{KvEvent, KvEventKind};
 use coord_store_api::engine::{EngineError, ErrorClass, OrderedRead};
 use coord_store_api::envelope::StoreEnvelopeV1;
 use coord_store_api::registry::{Collection, meta_fields};
-use coord_types::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId};
+use coord_types::ids::{
+    KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId, PolicyRuleId,
+    PrincipalId, TrustRuleId,
+};
 use coord_types::ordered_key;
 use serde::{Deserialize, Serialize};
 
@@ -313,13 +317,73 @@ pub struct ExecutedRecordV1 {
     pub result_digest: Digest32,
 }
 
-/// Minimal session state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionStateV1 {
-    /// Whether the session may submit work; a retired session never can.
-    pub active: bool,
-    /// Default outstanding window for new client instances.
-    pub window: u32,
+/// Record kind of a grant commitment row in `auth_grant_v1`.
+pub const GRANT_KIND: u16 = 0x0001;
+/// Record kind of a trust rule row in `policy_v1`.
+pub const TRUST_RULE_KIND: u16 = 0x0001;
+/// Record kind of a permission rule row in `policy_v1`.
+pub const POLICY_RULE_KIND: u16 = 0x0002;
+/// Key prefix byte of trust rules in `policy_v1`.
+pub const TRUST_RULE_PREFIX: u8 = 0x01;
+/// Key prefix byte of permission rules in `policy_v1`.
+pub const POLICY_RULE_PREFIX: u8 = 0x02;
+
+/// `auth_grant_v1` key: the commitment digest.
+pub fn grant_key(commitment: &Digest32) -> Vec<u8> {
+    commitment.0.to_vec()
+}
+
+/// `policy_v1` key of a trust rule.
+pub fn trust_rule_key(rule: &TrustRuleId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.push(TRUST_RULE_PREFIX);
+    out.extend_from_slice(rule.as_bytes());
+    out
+}
+
+/// `policy_v1` key prefix of every permission rule of `principal`.
+pub fn policy_rule_prefix(principal: &PrincipalId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.push(POLICY_RULE_PREFIX);
+    out.extend_from_slice(principal.as_bytes());
+    out
+}
+
+/// `policy_v1` key of a permission rule.
+pub fn policy_rule_key(principal: &PrincipalId, rule: &PolicyRuleId) -> Vec<u8> {
+    let mut out = policy_rule_prefix(principal);
+    out.extend_from_slice(rule.as_bytes());
+    out
+}
+
+/// Encode a grant commitment row.
+pub fn encode_grant(record: &GrantRecord) -> Result<Vec<u8>, EngineError> {
+    encode(GRANT_KIND, record)
+}
+
+/// Decode a grant commitment row.
+pub fn decode_grant(bytes: &[u8]) -> Result<GrantRecord, EngineError> {
+    decode(GRANT_KIND, bytes, "grant record")
+}
+
+/// Encode a trust rule row.
+pub fn encode_trust_rule(record: &TrustRule) -> Result<Vec<u8>, EngineError> {
+    encode(TRUST_RULE_KIND, record)
+}
+
+/// Decode a trust rule row.
+pub fn decode_trust_rule(bytes: &[u8]) -> Result<TrustRule, EngineError> {
+    decode(TRUST_RULE_KIND, bytes, "trust rule record")
+}
+
+/// Encode a permission rule row.
+pub fn encode_policy_rule(record: &PolicyRule) -> Result<Vec<u8>, EngineError> {
+    encode(POLICY_RULE_KIND, record)
+}
+
+/// Decode a permission rule row.
+pub fn decode_policy_rule(bytes: &[u8]) -> Result<PolicyRule, EngineError> {
+    decode(POLICY_RULE_KIND, bytes, "policy rule record")
 }
 
 /// `retry_v1` key: session, client instance, big-endian sequence.
@@ -374,10 +438,10 @@ pub fn decode_executed(bytes: &[u8]) -> Result<ExecutedRecordV1, EngineError> {
     decode(EXECUTED_KIND, bytes, "executed record")
 }
 /// Encode a session state.
-pub fn encode_session(record: &SessionStateV1) -> Result<Vec<u8>, EngineError> {
+pub fn encode_session(record: &SessionRecord) -> Result<Vec<u8>, EngineError> {
     encode(SESSION_KIND, record)
 }
 /// Decode a session state.
-pub fn decode_session(bytes: &[u8]) -> Result<SessionStateV1, EngineError> {
+pub fn decode_session(bytes: &[u8]) -> Result<SessionRecord, EngineError> {
     decode(SESSION_KIND, bytes, "session record")
 }

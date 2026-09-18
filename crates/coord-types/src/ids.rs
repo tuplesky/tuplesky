@@ -91,6 +91,15 @@ fixed_id!(
     /// leases; never a QUIC session, token or connection.
     PrincipalId
 );
+fixed_id!(
+    /// Identity of a trust rule (issuer mapping) sessions are created under;
+    /// its generation is stored in every session it admits.
+    TrustRuleId
+);
+fixed_id!(
+    /// Stable identity of one permission rule in `policy_v1`.
+    PolicyRuleId
+);
 
 macro_rules! checked_counter {
     ($(#[$doc:meta])* $name:ident, max = $max:expr) => {
