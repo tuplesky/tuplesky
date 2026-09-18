@@ -201,3 +201,123 @@ pub fn read_retention_floor<V: coord_store_api::engine::OrderedRead>(
         None => Ok(KvRevision::ZERO),
     }
 }
+
+// ---- task-12: retry, floor, executed and minimal session records ----
+
+use coord_types::identity::{CommandId, Digest32, RetryKey};
+use coord_types::ids::{ClientInstanceId, ExecutionPosition, RequestSequence, SessionId};
+
+/// Record kind of a retained result in `retry_v1`.
+pub const RETRY_KIND: u16 = 0x0001;
+/// Record kind of a floor in `retry_floor_v1`.
+pub const RETRY_FLOOR_KIND: u16 = 0x0001;
+/// Record kind of an executed identity in `executed_v1`.
+pub const EXECUTED_KIND: u16 = 0x0001;
+/// Record kind of the minimal session state in `session_v1` (task-18
+/// extends the record with principal, ceiling and generations).
+pub const SESSION_KIND: u16 = 0x0001;
+
+/// Retained result of one invocation (design Section 6.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryRecordV1 {
+    /// Command identity bound to the retry key (payload conflicts are
+    /// detected against it).
+    pub command_id: CommandId,
+    /// Execution position the command occupied.
+    pub position: ExecutionPosition,
+    /// KV revision it produced, if any.
+    pub revision: Option<KvRevision>,
+    /// Exact encoded response.
+    pub response: Vec<u8>,
+    /// Digest of the response.
+    pub result_digest: Digest32,
+}
+
+/// Retirement floor and outstanding window of one client instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryFloorV1 {
+    /// Highest retired sequence; at or below is never new work.
+    pub floor: RequestSequence,
+    /// Maximum outstanding sequences above the floor.
+    pub width: u32,
+}
+
+/// Applied identity of a command in `executed_v1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutedRecordV1 {
+    /// Execution position.
+    pub position: ExecutionPosition,
+    /// KV revision, if any.
+    pub revision: Option<KvRevision>,
+    /// Result digest.
+    pub result_digest: Digest32,
+}
+
+/// Minimal session state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStateV1 {
+    /// Whether the session may submit work; a retired session never can.
+    pub active: bool,
+    /// Default outstanding window for new client instances.
+    pub window: u32,
+}
+
+/// `retry_v1` key: session, client instance, big-endian sequence.
+pub fn retry_key(key: &RetryKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.extend_from_slice(key.session_id.as_bytes());
+    out.extend_from_slice(key.client_instance_id.as_bytes());
+    out.extend_from_slice(&key.request_sequence.to_be_bytes());
+    out
+}
+
+/// `retry_floor_v1` key: session then client instance.
+pub fn retry_floor_key(session: &SessionId, client: &ClientInstanceId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.extend_from_slice(session.as_bytes());
+    out.extend_from_slice(client.as_bytes());
+    out
+}
+
+/// `executed_v1` key: the command identity bytes.
+pub fn executed_key(command: &CommandId) -> Vec<u8> {
+    command.as_bytes().to_vec()
+}
+
+/// `session_v1` key: the session identity bytes.
+pub fn session_key(session: &SessionId) -> Vec<u8> {
+    session.as_bytes().to_vec()
+}
+
+/// Encode a retry record.
+pub fn encode_retry(record: &RetryRecordV1) -> Result<Vec<u8>, EngineError> {
+    encode(RETRY_KIND, record)
+}
+/// Decode a retry record.
+pub fn decode_retry(bytes: &[u8]) -> Result<RetryRecordV1, EngineError> {
+    decode(RETRY_KIND, bytes, "retry record")
+}
+/// Encode a floor.
+pub fn encode_retry_floor(record: &RetryFloorV1) -> Result<Vec<u8>, EngineError> {
+    encode(RETRY_FLOOR_KIND, record)
+}
+/// Decode a floor.
+pub fn decode_retry_floor(bytes: &[u8]) -> Result<RetryFloorV1, EngineError> {
+    decode(RETRY_FLOOR_KIND, bytes, "retry floor record")
+}
+/// Encode an executed identity.
+pub fn encode_executed(record: &ExecutedRecordV1) -> Result<Vec<u8>, EngineError> {
+    encode(EXECUTED_KIND, record)
+}
+/// Decode an executed identity.
+pub fn decode_executed(bytes: &[u8]) -> Result<ExecutedRecordV1, EngineError> {
+    decode(EXECUTED_KIND, bytes, "executed record")
+}
+/// Encode a session state.
+pub fn encode_session(record: &SessionStateV1) -> Result<Vec<u8>, EngineError> {
+    encode(SESSION_KIND, record)
+}
+/// Decode a session state.
+pub fn decode_session(bytes: &[u8]) -> Result<SessionStateV1, EngineError> {
+    decode(SESSION_KIND, bytes, "session record")
+}

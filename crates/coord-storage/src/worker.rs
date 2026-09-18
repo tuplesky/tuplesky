@@ -41,6 +41,16 @@ impl Default for GroupLimits {
     }
 }
 
+/// Collections whose rows decide admission of a command. They are written
+/// only by application batches, so every change is ordered against the
+/// execution frontier that admission was checked at.
+const ADMISSION_COLLECTIONS: &[coord_core::effect::CollectionId] = &[
+    coord_store_api::registry::Collection::SessionV1.id(),
+    coord_store_api::registry::Collection::RetryV1.id(),
+    coord_store_api::registry::Collection::RetryFloorV1.id(),
+    coord_store_api::registry::Collection::ExecutedV1.id(),
+];
+
 /// Worker state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerState {
@@ -61,6 +71,12 @@ pub enum SubmitError {
     BatchTooLarge,
     /// Queue is full; retry after a flush (accepted work is never evicted).
     QueueFull,
+    /// The batch writes admission state (sessions, retry records, retry
+    /// floors, executed identities) without an application base. Those
+    /// rows decide whether a command may execute, so they change only in
+    /// execution order: a batch carrying its base is rejected by the
+    /// frontier guard when anything was ordered in between.
+    AdmissionRowsRequireOrdering,
     /// Worker is not ready.
     NotReady(WorkerState),
 }
@@ -175,6 +191,14 @@ impl<E: LocalEngine> StoreWorker<E> {
         }
         if batch.barrier.boot_id != self.boot || batch.barrier.node_generation != self.incarnation {
             return Err(SubmitError::WrongBoot);
+        }
+        if batch.base.is_none()
+            && batch
+                .updates
+                .iter()
+                .any(|u| ADMISSION_COLLECTIONS.contains(&u.collection))
+        {
+            return Err(SubmitError::AdmissionRowsRequireOrdering);
         }
         let bytes = batch_bytes(&batch);
         if bytes > self.limits.max_single_batch_bytes {
