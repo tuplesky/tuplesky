@@ -390,3 +390,50 @@ fn keys_rotate_with_overlap_and_never_leave_the_process() {
         Some(KeyError::InvalidKey)
     );
 }
+
+#[test]
+fn a_downscoped_token_creates_a_session_at_the_scope_it_was_granted() {
+    // The narrower scope was signed into the token while the replicated
+    // session was created at the rule's ceiling. Execution reconstructs
+    // authorization from the session, so an operation presented through a
+    // read-only token would have run under a read/write session and the
+    // narrowing would have existed only in the token.
+    let k8s = k8s_issuer();
+    let mut domain = Domain::new();
+    let mut sts = sts(&k8s, "https://k8s/keys", KubernetesMode::Offline, 3600);
+    sts.verifier_mut()
+        .registry_mut()
+        .install_keys("k8s", &k8s.jwks, NOW)
+        .unwrap();
+    let token = assertion(&k8s, NOW, NOW + 600);
+    let mut f = form(&token);
+    f.scope = Some("read".into());
+    let r = sts
+        .exchange(&f, &clock(), &[9u8; 32], None, &mut domain)
+        .unwrap();
+    assert_eq!(r.scope, "read");
+    let ceiling = match domain.applied.last().expect("one command") {
+        coord_state::InternalCommand::ConsumeAdmission { receipt, .. } => receipt.scope_ceiling,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        ceiling,
+        Action::Read.bit(),
+        "the session is created at the granted scope, not the rule's ceiling"
+    );
+    // Asking for nothing still gets the rule's ceiling, in both places.
+    let mut wide = form(&token);
+    wide.scope = None;
+    let r = sts
+        .exchange(&wide, &clock(), &[10u8; 32], None, &mut domain)
+        .unwrap();
+    assert_eq!(r.scope, "read write delete");
+    let ceiling = match domain.applied.last().expect("a second command") {
+        coord_state::InternalCommand::ConsumeAdmission { receipt, .. } => receipt.scope_ceiling,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        ceiling,
+        Action::Read.bit() | Action::Write.bit() | Action::Delete.bit()
+    );
+}

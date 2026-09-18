@@ -38,7 +38,8 @@ pub use exchange::{
     StsConfig, TOKEN_TYPE_ACCESS, TOKEN_TYPE_ID, TOKEN_TYPE_JWT,
 };
 pub use http::{
-    AppState, ClockSource, EntropySource, HttpLimits, ProviderEntropy, SystemClock, router,
+    AppState, ClockSource, EntropySource, HttpLimits, ProviderEntropy, SystemClock, TokenReviewer,
+    router,
 };
 pub use keys::{KeyError, KeyRing, SigningKey};
 pub use token::{

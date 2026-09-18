@@ -303,11 +303,19 @@ impl Sts {
             Some(bits) => bits,
             None => ceiling,
         };
+        // The session is created at the scope actually granted, not at the
+        // rule's ceiling. Signing the narrower scope into the token while
+        // creating the session at the broader one left the narrowing
+        // nowhere but the token: execution reconstructs authorization
+        // from the replicated session, so an operation presented through
+        // a read-only token would have run under a read/write session.
+        let mut granted = admitted.receipt.clone();
+        granted.scope_ceiling = scope;
         // Replicated state decides: current policy and single use.
         let response = creator
             .create(InternalCommand::ConsumeAdmission {
                 namespace: self.config.namespace,
-                receipt: admitted.receipt.clone(),
+                receipt: granted,
                 code: None,
                 refresh_family: None,
                 window: self.config.session_window,
