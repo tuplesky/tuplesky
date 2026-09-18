@@ -38,7 +38,11 @@ pub struct FastAck {
     pub command: CommandId,
     /// Direct dependencies as the sender ordered them.
     pub deps: Vec<CommandId>,
-    /// Digest of the conflict path (per-key hash log) the sender saw.
+    /// Path digest through the command per key it touches, in key order.
+    /// The combined `path` is one-way and cannot be taken apart, so the
+    /// anchors a receiver needs to align its own logs travel beside it.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Combined digest of the conflict path the sender saw.
     pub path: Digest32,
     /// Leader sequence number (leader proposal only).
     pub seqnum: Option<u64>,
@@ -138,17 +142,17 @@ impl Learned {
 
 /// One ballot's acknowledgements for one command.
 #[derive(Clone, Debug)]
-pub struct VoteSet<'c> {
-    config: &'c BallotConfiguration,
+pub struct VoteSet {
+    config: BallotConfiguration,
     command: CommandId,
     leader: Option<FastAck>,
     fast: BTreeMap<ReplicaId, FastAck>,
     slow: BTreeSet<ReplicaId>,
 }
 
-impl<'c> VoteSet<'c> {
+impl VoteSet {
     /// An empty vote set for `command` under `config`.
-    pub const fn new(config: &'c BallotConfiguration, command: CommandId) -> Self {
+    pub const fn new(config: BallotConfiguration, command: CommandId) -> Self {
         VoteSet {
             config,
             command,

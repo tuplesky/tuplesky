@@ -87,6 +87,19 @@ must be re-checked against the paper text at the task-19 review.
 | `descPool` / `MaxDescRoutines` / `HISTORY_SIZE` | `[EXT]` bounded capacity refuses new work; unresolved acceptance is never evicted; only executed records retire | `CommandTable::{with_capacity, retire}`, `InitError::Backpressure`, `RetireError` | `tests/graph.rs::backpressure_refuses_new_work_without_deleting_unresolved_acceptance` |
 | `history[]` (volatile) | `[EXT]` required dependency state is a `protocol_v1` row per command (Section 5.2) | `rows::{dependency_key, dependency_update, decode_dependency}` | `tests/graph.rs::dependency_rows_round_trip` |
 
+## Leader proposal handlers (task-22)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| `ProposeChan` case in `run`: `getDepAndHashes`, `getCmdDescSeq(..., seq = leader)` | An admitted request is initialized atomically with conservative domain dependencies and path evidence before anything is published | `leader::Leader::on_admitted` -> `CommandTable::initialize`, `CONSERVATIVE_KEY` | `tests/leader.rs::proposals_are_published_with_exact_durable_support_and_match_the_model` (golden `fixtures/golden/leader_normal.json`) |
+| `handlePropose` on the leader: `MFastAck{Dep, Checksum, Seqnum}` sent to all; `r.seqnum++` | The leader proposal carries its sequence number and goes to every other voter | `ProtocolMessage::Proposal(FastAck{seqnum: Some})` | same |
+| `r.repchan.reply` / `MReply` to the client | `[EXT]` the leader reply goes to the trusted frontend and requires the durable proposal/payload state (Section 5.1, "leader reply used for learning") | `ProtocolMessage::LeaderReply`, `PendingSend.requires = [batch]` | same |
+| (volatile `proposes`, `history`) | `[EXT]` payload, dependency and proposal rows persisted in one batch (`payload_v1`, `protocol_v1`) | `rows::{payload_update, dependency_update, proposal_update}` | same |
+| `r.proposes[cmdId] = propose` (last writer) | `[EXT]` one retry key binds one payload; a different payload under the same key is `RequestIdentityConflict`; a repeated request is a no-op (Section 4.4) | `Rejection::{RequestIdentityConflict, Duplicate}` | `tests/leader.rs::reordered_and_duplicate_requests_cannot_bind_conflicting_payload` |
+| leader `desc.phase = ACCEPT` via `fastAckFromLeader` on itself | The leader adopts its own order only once the proposal is durable and every dependency is at least ACCEPT; COMMIT/execution are the learner's | `Leader::advance_pending` under `guard_accept` | `tests/leader.rs::premature_phases_are_blocked_while_dependencies_lag` |
+| `r.status != NORMAL -> return` in `handlePropose` | A higher promise stops proposing; unreleased proposals under the old ballot are fenced | `Leader::is_leading`, outbox release with `BallotState::promised` | `tests/leader.rs::a_higher_promise_stops_proposing_and_fences_unreleased_proposals` |
+| `commonCaseFastAck` / `handleLightSlowAck` on the leader | Acknowledgements are collected per command; learning is not decided here (task-24) | `Leader::collect` -> `VoteSet` | `tests/leader.rs::votes_are_collected_but_never_learned_here` |
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |
