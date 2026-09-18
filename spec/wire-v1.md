@@ -228,6 +228,22 @@ The receiver verifies root, digests, order, uniqueness, counts and bounds
 artifact carries no node identity, incarnation, boot, stamp or journal
 sequence and is not the local recovery checkpoint (task-j04).
 
+The install (`coord_checkpoint::install_shared`, task-50) accepts chunks
+against their descriptors, so a missing, duplicated, truncated or altered
+chunk blocks it, and writes the verified rows into the engine of an
+inactive generation whose cluster and domain already match the artifact.
+It closes with the boundary rows of `meta_v1` (KV revision, retention
+floor, lease authority and the execution frontier at the artifact's
+configuration epoch), a local applied stamp that represents nothing yet,
+and one node-private receipt in `checkpoint_v1`
+(`installed_shared_v1`, record kind `0x0001`: format, cluster, domain,
+configuration, boundary, root, chunks, rows). The receipt is local
+evidence that an install completed; it is never transmitted, never enters
+a common digest and grants no authority. No identity or `protocol_v1` row
+is written, so a learner inherits neither the donor's identity nor any
+promise or vote, and post-boundary commands and unresolved closure are
+transferred separately (task-25).
+
 ## Go mirror (task-44)
 
 `adapters/kine/wire` mirrors the frame codec and the postcard subset of
