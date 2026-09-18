@@ -138,17 +138,30 @@ pub struct ReplayOutcome {
     pub commits: u32,
 }
 
-fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
+/// Read every row of the collections a scenario references. Collections the
+/// workload never touches (for example an engine's identity records in
+/// `meta_v1`) are outside the logical comparison.
+fn read_all<E: LocalEngine>(engine: &E, scenario: &StoreScenarioV1) -> Result<FlatRows, String> {
+    let mut referenced: Vec<u16> = scenario
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Put { collection, .. } | Step::Delete { collection, .. } => Some(*collection),
+            _ => None,
+        })
+        .collect();
+    referenced.sort_unstable();
+    referenced.dedup();
     let view = engine.reader().snapshot().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for c in Collection::ALL {
+    for c in referenced {
         let mut request = ScanRequest::all(64, 1 << 20);
         loop {
             let page = view
-                .scan_page(c.id(), &request)
+                .scan_page(CollectionId(c), &request)
                 .map_err(|e| e.to_string())?;
             for r in &page.rows {
-                out.push((c.id().0, r.key.clone(), r.value.clone()));
+                out.push((c, r.key.clone(), r.value.clone()));
             }
             if page.exhausted {
                 break;
@@ -229,7 +242,7 @@ pub fn replay<E: LocalEngine>(
             }
         }
     }
-    let rows = read_all(engine)?;
+    let rows = read_all(engine, scenario)?;
     let expected: FlatRows = oracle
         .iter()
         .map(|((c, k), v)| (*c, k.clone(), v.clone()))
