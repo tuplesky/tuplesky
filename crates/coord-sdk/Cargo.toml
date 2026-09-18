@@ -1,0 +1,20 @@
+[package]
+name = "coord-sdk"
+description = "Native Rust SDK request lifecycle: credential providers, bounded warm pools, stable invocation identity, deadlines, resolution and typed retry errors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+serde = { workspace = true, features = ["std"] }
+postcard.workspace = true
+
+[dev-dependencies]
+coord-collector.workspace = true
