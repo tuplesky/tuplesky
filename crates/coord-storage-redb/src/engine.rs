@@ -142,11 +142,21 @@ fn scan<T: ReadableTable<&'static [u8], &'static [u8]>>(
     })
 }
 
+/// Where the database bytes live.
+enum Source {
+    /// A verified file under a generation directory.
+    File {
+        path: std::path::PathBuf,
+        cache_bytes: usize,
+    },
+    /// A caller-supplied storage backend (fault harnesses, in-memory tests).
+    Backend,
+}
+
 /// The engine: one redb database.
 pub struct RedbEngine {
     db: Arc<redb::Database>,
-    path: std::path::PathBuf,
-    cache_bytes: usize,
+    source: Source,
     writer_open: bool,
     /// Set when a reopen failed: the file could not be verified again, so
     /// nothing is served or accepted until a later reopen succeeds. The
@@ -163,8 +173,7 @@ impl RedbEngine {
     ) -> Self {
         RedbEngine {
             db: Arc::new(db),
-            path,
-            cache_bytes,
+            source: Source::File { path, cache_bytes },
             writer_open: false,
             quarantined: false,
         }
@@ -182,10 +191,92 @@ impl RedbEngine {
         )
     }
 
+    /// Open a database over a caller-supplied storage backend. This bypasses
+    /// the generation lifecycle (no manifest, lock or identity checks) and
+    /// exists for fault harnesses and in-memory tests; production roots go
+    /// through [`crate::Generation`]. An empty backend is refused: opening
+    /// never initializes.
+    pub fn from_backend(
+        backend: impl redb::StorageBackend,
+        cache_bytes: usize,
+    ) -> Result<Self, EngineError> {
+        let len = backend
+            .len()
+            .map_err(|e| EngineError::new(ErrorClass::Io, redact(&e)))?;
+        if len == 0 {
+            return Err(EngineError::new(
+                ErrorClass::Corrupt,
+                "empty backend; opening never initializes",
+            ));
+        }
+        let db = redb::Database::builder()
+            .set_cache_size(cache_bytes)
+            .create_with_backend(backend)
+            .map_err(|e| EngineError::new(ErrorClass::Corrupt, redact(&e)))?;
+        Ok(RedbEngine {
+            db: Arc::new(db),
+            source: Source::Backend,
+            writer_open: false,
+            quarantined: false,
+        })
+    }
+
+    /// Initialize a brand-new database over a backend and create every
+    /// registered table. Test-composition counterpart of `Generation::create`.
+    pub fn create_on_backend(
+        backend: impl redb::StorageBackend,
+        cache_bytes: usize,
+    ) -> Result<Self, EngineError> {
+        let len = backend
+            .len()
+            .map_err(|e| EngineError::new(ErrorClass::Io, redact(&e)))?;
+        if len != 0 {
+            return Err(EngineError::new(
+                ErrorClass::Corrupt,
+                "backend not empty; create never reinitializes",
+            ));
+        }
+        let db = redb::Database::builder()
+            .set_cache_size(cache_bytes)
+            .create_with_backend(backend)
+            .map_err(|e| EngineError::new(ErrorClass::Corrupt, redact(&e)))?;
+        {
+            let mut txn = db
+                .begin_write()
+                .map_err(|e| EngineError::new(ErrorClass::Io, redact(&e)))?;
+            txn.set_durability(redb::Durability::Immediate)
+                .map_err(|e| EngineError::new(ErrorClass::Unsupported, redact(&e)))?;
+            txn.set_two_phase_commit(true);
+            for c in Collection::ALL {
+                txn.open_table(table_definition(c)).map_err(table_error)?;
+            }
+            txn.commit()
+                .map_err(|e| EngineError::new(ErrorClass::Io, redact(&e)))?;
+        }
+        Ok(RedbEngine {
+            db: Arc::new(db),
+            source: Source::Backend,
+            writer_open: false,
+            quarantined: false,
+        })
+    }
+
+    /// Verify every table's checksums. Used by the lifecycle after an open
+    /// that redb reports as not cleanly shut down; failure is quarantine.
+    pub fn verify_integrity(&mut self) -> Result<(), EngineError> {
+        if Arc::strong_count(&self.db) > 1 || self.writer_open {
+            return Err(EngineError::new(ErrorClass::Busy, "handles outstanding"));
+        }
+        let db = Arc::get_mut(&mut self.db).expect("sole owner");
+        check_integrity(db)
+    }
+
     /// Process-model crash: drop every handle to the database file and
     /// reopen the same, already verified file. Fails closed while readers or
     /// a writer are outstanding, because a live handle would keep the file
-    /// open. Real disk-level faults are task-09.
+    /// open. Backend-sourced engines cannot reopen this way (the harness
+    /// rebuilds them from its durable image). Real disk-level faults are
+    /// task-09.
     pub fn reopen(&mut self) -> Result<(), EngineError> {
         if self.writer_open {
             return Err(EngineError::new(ErrorClass::Busy, "writer outstanding"));
@@ -193,24 +284,50 @@ impl RedbEngine {
         if Arc::strong_count(&self.db) > 1 {
             return Err(EngineError::new(ErrorClass::Busy, "readers outstanding"));
         }
+        let Source::File { path, cache_bytes } = &self.source else {
+            return Err(EngineError::new(
+                ErrorClass::Unsupported,
+                "backend-sourced engine cannot reopen",
+            ));
+        };
+        let (path, cache_bytes) = (path.clone(), *cache_bytes);
         let closed = std::mem::replace(&mut self.db, Arc::new(placeholder_database()?));
         drop(closed);
         // Until the file is open again the engine is quarantined: a failed
         // open must not leave the in-memory placeholder serving reads or
         // accepting "durable" commits that vanish with the process.
         self.quarantined = true;
-        let db = redb::Database::builder()
-            .set_cache_size(self.cache_bytes)
-            .open(&self.path)
+        let mut db = redb::Database::builder()
+            .set_cache_size(cache_bytes)
+            .open(&path)
             .map_err(|e| EngineError::new(ErrorClass::Corrupt, redact(&e)))?;
+        // Corruption outside the meta pages does not stop `open`; every
+        // generation reopen verifies the tables before serving anything.
+        check_integrity(&mut db)?;
         self.db = Arc::new(db);
         self.quarantined = false;
         Ok(())
     }
 
-    /// Path of the database file.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
+    /// Path of the database file, when file-sourced.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match &self.source {
+            Source::File { path, .. } => Some(path),
+            Source::Backend => None,
+        }
+    }
+}
+
+/// Verify every table's checksums; a repair or an inconsistency is
+/// corruption (nothing is repaired into a different state silently).
+fn check_integrity(db: &mut redb::Database) -> Result<(), EngineError> {
+    match db.check_integrity() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "integrity check repaired or found inconsistencies",
+        )),
+        Err(e) => Err(EngineError::new(ErrorClass::Corrupt, redact(&e))),
     }
 }
 
