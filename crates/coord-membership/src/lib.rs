@@ -24,15 +24,30 @@
 //!   stale generation, a wrong origin, or a frontend, observer or learner
 //!   never binds as a voter. Cloned identities carry the same
 //!   incarnation and are deduplicated by consensus, never counted twice.
+//! * [`configuration`] (task-m01): verification of the configuration
+//!   chain (`GroupConfigurationV1` records from the trusted genesis, each
+//!   epoch approved by a majority of the previous epoch's exact voters
+//!   under the keys that epoch recorded), ballot configurations under the
+//!   source quorum rules, voter-attested endpoint and observer catalogs,
+//!   and the monotonically installed client view driven by authenticated
+//!   hints and bootstrap responses. No directory, controller or larger
+//!   epoch number advances the chain; historical epochs verify without a
+//!   live issuer.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod binder;
+pub mod configuration;
 pub mod genesis;
 pub mod init;
 pub mod membership;
 
 pub use binder::PeerBinder;
+pub use configuration::{
+    BallotError, BootstrapOutcome, CatalogError, ChainError, ClientConfiguration,
+    ConfigurationChain, EvidenceError, GenesisAnchor, HintDecision, Installed, SignError,
+    VerifiedConfiguration, sign_message, verify_signature,
+};
 pub use genesis::{
     GenesisError, GenesisManifest, SignedGenesis, VoterSeed, sign_genesis, verify_genesis,
 };

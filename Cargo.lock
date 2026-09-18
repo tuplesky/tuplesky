@@ -706,6 +706,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "coord-authn",
+ "coord-consensus",
  "coord-node-issuer",
  "coord-sts",
  "coord-transport",
