@@ -13,6 +13,7 @@ use coord_types::ids::{Ballot, ConfigurationEpoch};
 use coord_types::{CommandId, RetryKey};
 
 use crate::commands::CommandRecord;
+use crate::recovery::SyncDecision;
 use serde::{Deserialize, Serialize};
 
 /// Record kind of the promise row.
@@ -29,6 +30,10 @@ pub const PROPOSAL_KIND: u16 = 0x0003;
 const PROPOSAL_TAG: u8 = 0x02;
 /// Record kind of a payload row in `payload_v1`.
 pub const PAYLOAD_KIND: u16 = 0x0001;
+/// Record kind of a bound Sync selection row.
+pub const SYNC_KIND: u16 = 0x0004;
+/// Key tag of Sync rows within an epoch.
+const SYNC_TAG: u8 = 0x03;
 
 /// The durable promise of one replica in one epoch: the highest ballot it
 /// promised (no lower ballot is voted after it) and the ballot it last
@@ -247,5 +252,45 @@ pub fn proposal_update(
         collection: Collection::ProtocolV1.id(),
         key: proposal_key(epoch, command),
         value: Some(encode_proposal(record)?),
+    })
+}
+
+/// The Sync result a candidate selected for a ballot, bound durably before
+/// publication (Section 4.9): after a crash it is reused, never reselected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncRecordV1 {
+    /// The selection.
+    pub decision: SyncDecision,
+}
+
+/// `protocol_v1` key of the Sync row of a ballot in an epoch.
+pub fn sync_key(epoch: ConfigurationEpoch, ballot: &Ballot) -> Vec<u8> {
+    let mut out = Vec::with_capacity(33);
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.push(SYNC_TAG);
+    out.extend_from_slice(&ballot.number.to_be_bytes());
+    out.extend_from_slice(ballot.leader.as_bytes());
+    out
+}
+
+/// Encode a Sync row.
+pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
+    envelope(SYNC_KIND, record, "sync encode")
+}
+
+/// Decode a Sync row.
+pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
+    unwrap(SYNC_KIND, bytes, "sync record")
+}
+
+/// The update persisting a bound Sync selection.
+pub fn sync_update(
+    epoch: ConfigurationEpoch,
+    record: &SyncRecordV1,
+) -> Result<StoreUpdate, EngineError> {
+    Ok(StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: sync_key(epoch, &record.decision.ballot),
+        value: Some(encode_sync(record)?),
     })
 }

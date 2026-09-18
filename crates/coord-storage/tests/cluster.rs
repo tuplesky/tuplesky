@@ -73,6 +73,7 @@ fn quorum(n: u8) -> BallotConfiguration {
     BallotConfiguration::c2(epoch(), ballot(), (0..n).map(r).collect(), fast).unwrap()
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Machine {
     Leader(Leader),
     Follower(Follower),

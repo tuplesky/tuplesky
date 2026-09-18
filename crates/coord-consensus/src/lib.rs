@@ -70,6 +70,14 @@
 //!   bounded verified report pages and their assembler; payload transfer
 //!   with identity rehash so a missing payload is fetched, never
 //!   fabricated.
+//! * [`campaign`], [`role`] (task-26): a candidate promises itself, asks
+//!   for promises and reports, runs the source selection on a majority of
+//!   complete reports, binds the Sync durably to the ballot before
+//!   publishing it, and activates the recovered ballot; followers adopt a
+//!   Sync only for the ballot they promised, install its entries under the
+//!   guards, and re-acknowledge the new leader's proposals; roles convert
+//!   through [`role::RecoveredState`] so learned outcomes, execution
+//!   frontier and retries survive the change.
 //! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
 //!   rows and the postcard-encoded protocol messages of this increment.
 #![forbid(unsafe_code)]
@@ -78,6 +86,7 @@
 extern crate alloc;
 
 pub mod ballot;
+pub mod campaign;
 pub mod commands;
 pub mod follower;
 pub mod graph;
@@ -88,6 +97,7 @@ pub mod phase;
 pub mod publication;
 pub mod quorum;
 pub mod recovery;
+pub mod role;
 pub mod rows;
 pub mod summary;
 pub mod vote;
@@ -96,6 +106,7 @@ pub use ballot::{
     BallotState, ConfigurationIdentity, PromiseEffects, PromiseInFlight, PromiseOutcome,
     PromiseRejection, ReplicaRole, SyncRejection,
 };
+pub use campaign::Campaign;
 pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
 pub use follower::{Follower, FollowerConfig, FollowerRejection, HeldProposal};
 pub use graph::{
@@ -110,11 +121,13 @@ pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, FastQuorumClass};
 pub use recovery::{RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, select};
+pub use role::{PendingReport, RecoveredState};
 pub use rows::{
-    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, decode_dependency, decode_payload,
-    decode_promise, decode_proposal, dependency_key, dependency_update, encode_dependency,
-    encode_payload, encode_promise, encode_proposal, payload_key, payload_update, promise_key,
-    promise_update, proposal_key, proposal_update,
+    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SyncRecordV1, decode_dependency,
+    decode_payload, decode_promise, decode_proposal, decode_sync, dependency_key,
+    dependency_update, encode_dependency, encode_payload, encode_promise, encode_proposal,
+    encode_sync, payload_key, payload_update, promise_key, promise_update, proposal_key,
+    proposal_update, sync_key, sync_update,
 };
 pub use summary::{
     DurableLedger, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler, ReportPage,
