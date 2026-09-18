@@ -60,6 +60,9 @@
 //!   execution; retry admission and result resolution require an
 //!   executable session, so a retired or rule-invalidated session cannot
 //!   read cached outcomes.
+//! * Protocol rows (task-20): [`protocol`] reads the epoch's durable
+//!   promise row so a rebooted replica recovers its promise from the
+//!   projection.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -68,6 +71,7 @@ pub mod compaction;
 pub mod lowering;
 pub mod materialize;
 pub mod policy;
+pub mod protocol;
 pub mod retry;
 pub mod sync;
 pub mod view;
