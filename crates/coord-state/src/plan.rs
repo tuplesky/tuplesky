@@ -178,6 +178,43 @@ pub enum Outcome {
     ErrRefreshReuse,
     /// A policy or trust rule was written or removed.
     PolicyUpdated,
+    /// The command was rejected at execution by a deterministic property
+    /// of the request and the state it executes against. It occupied its
+    /// execution position and produced this result; it changed nothing,
+    /// and executing it again can only reject it again.
+    ErrRejected {
+        /// What was rejected.
+        reason: RejectionReason,
+    },
+}
+
+/// Why a chosen command was rejected at execution. Every case is a
+/// deterministic function of the request and the state, so the rejection
+/// is the command's result rather than something to retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RejectionReason {
+    /// The request violates the frozen schema. The violation is a
+    /// property of the request bytes, so it is diagnosable from the
+    /// durable payload without carrying the detail in the replicated
+    /// result.
+    Invalid,
+    /// The request's namespace is not the one it executes in.
+    NamespaceMismatch,
+    /// The response would exceed the semantic response budget.
+    ResponseTooLarge,
+    /// The mutation would exceed the events-per-revision budget.
+    TooManyEvents,
+    /// The range delete would remove more keys than allowed.
+    TooManyDeletes,
+    /// The domain revision or execution position cannot advance.
+    CounterOverflow,
+    /// The operation is not planned by this planner.
+    Unsupported,
+    /// The state the request would have to read to be planned exceeds the
+    /// schema's view budget. The budget is a replicated constant, not a
+    /// local setting, so every replica reaches this rejection for the
+    /// same command against the same state.
+    ViewTooLarge,
 }
 
 /// A Kine-facing entry: the entry's value and revisions plus the TTL of

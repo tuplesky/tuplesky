@@ -5,6 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use coord_core::effect::ApplyBase;
 use coord_types::error::ValidationError;
 use coord_types::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId};
 use coord_types::logical_v1::{
@@ -17,7 +18,8 @@ use crate::internal::InternalCommand;
 use crate::lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 use crate::limits::PlanLimits;
 use crate::plan::{
-    ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response,
+    ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, RejectionReason,
+    Response,
 };
 use crate::policy::{
     Action, Authorization, GrantKind, GrantRecord, GrantState, KeyInterval, SessionRecord,
@@ -47,6 +49,61 @@ pub enum PlanError {
     CounterOverflow,
     /// The operation is not planned by this planner.
     Unsupported,
+}
+
+impl PlanError {
+    /// The terminal rejection this error records, if it is one: a
+    /// deterministic property of the request and the state rather than a
+    /// view that must be rebuilt. A terminal rejection is the command's
+    /// result (see [`rejection_plan`]); the other errors are the caller's
+    /// to retry with a fresh view.
+    pub const fn terminal(self) -> Option<RejectionReason> {
+        match self {
+            PlanError::Invalid(_) => Some(RejectionReason::Invalid),
+            PlanError::NamespaceMismatch => Some(RejectionReason::NamespaceMismatch),
+            PlanError::ResponseTooLarge => Some(RejectionReason::ResponseTooLarge),
+            PlanError::TooManyEvents => Some(RejectionReason::TooManyEvents),
+            PlanError::TooManyDeletes => Some(RejectionReason::TooManyDeletes),
+            PlanError::CounterOverflow => Some(RejectionReason::CounterOverflow),
+            PlanError::Unsupported => Some(RejectionReason::Unsupported),
+            // The view is wrong, not the request.
+            PlanError::ViewIncomplete | PlanError::ViewInconsistent => None,
+        }
+    }
+}
+
+/// The plan of a command that was chosen to execute and is then rejected
+/// for `reason`: it takes its execution position and produces a durable,
+/// retry-resolvable result, and changes nothing. Without it a chosen
+/// command that no state can satisfy would block every successor.
+pub fn rejection_plan(view: &ReadView, reason: RejectionReason) -> Result<ApplyPlan, PlanError> {
+    rejection_plan_at(view.base, view.kv_revision, reason)
+}
+
+/// The same rejection built from the base and revision alone, for a
+/// command that cannot even be given a view: the state it would have to
+/// read exceeds the schema's budget, so there is nothing to plan against
+/// and the rejection is the whole result.
+pub fn rejection_plan_at(
+    base: ApplyBase,
+    kv_revision: KvRevision,
+    reason: RejectionReason,
+) -> Result<ApplyPlan, PlanError> {
+    let position = base
+        .execution_position
+        .checked_next()
+        .map_err(|_| PlanError::CounterOverflow)?;
+    Ok(ApplyPlan {
+        base,
+        position,
+        revision: None,
+        mutations: Vec::new(),
+        events: Vec::new(),
+        response: Response {
+            revision: kv_revision,
+            outcome: Outcome::ErrRejected { reason },
+        },
+    })
 }
 
 /// Why a branch stopped: a planner error, or a recorded failure outcome
@@ -387,7 +444,8 @@ fn outcome_cost(outcome: &Outcome) -> usize {
         | Outcome::ErrGrantUnavailable
         | Outcome::RefreshAdvanced { .. }
         | Outcome::ErrRefreshReuse
-        | Outcome::PolicyUpdated => 0,
+        | Outcome::PolicyUpdated
+        | Outcome::ErrRejected { .. } => 0,
     }
 }
 

@@ -281,7 +281,11 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         "two adoption batches (c1 then c2), no send before durability"
     );
     assert!(f.held().is_empty());
-    assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
+    assert_eq!(
+        f.table().phase_of(&c1),
+        Some(Phase::Accept),
+        "adopted, but this replica's own vote is not durable yet"
+    );
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
     assert_eq!(
         f.table().record(&c2).unwrap().deps,
@@ -293,15 +297,22 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         let row = decode_dependency(b.updates[0].value.as_ref().unwrap()).unwrap();
         assert_eq!(row.phase, Phase::Accept, "adoption {i} persisted");
     }
-    let released = f.step(durable_of(&adoptions, 3).remove(0));
+    // The adoption rows become durable: only now does this replica's own
+    // slow vote count, and the commands are learned.
+    let mut released = Vec::new();
+    for event in durable_of(&adoptions, 3) {
+        released.extend(f.step(event));
+    }
+    assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+    assert_eq!(f.table().phase_of(&c2), Some(Phase::Commit));
     let slow: Vec<_> = sends(&released)
         .into_iter()
         .filter(|(_, m)| matches!(m, ProtocolMessage::SlowAck(_)))
         .collect();
     assert_eq!(
         slow.len(),
-        3,
-        "c1's slow ack to two voters and the frontend"
+        6,
+        "two slow acks to two voters and the frontend"
     );
     assert!(f.take_rejections().is_empty());
 }
@@ -352,8 +363,8 @@ fn conflict_arrival_permutations_converge_on_the_leader_order() {
         assert_eq!(acks, 6);
         assert_eq!(f.table().record(&c1).unwrap().deps, vec![]);
         assert_eq!(f.table().record(&c2).unwrap().deps, vec![c1]);
-        assert_eq!(f.table().phase_of(&c1), Some(Phase::Accept));
-        assert_eq!(f.table().phase_of(&c2), Some(Phase::Accept));
+        assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
+        assert_eq!(f.table().phase_of(&c2), Some(Phase::Commit));
         assert!(f.held().is_empty());
     }
     // A proposal from a non-leader, or for another ballot, is foreign.
@@ -399,7 +410,13 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
     assert_eq!(storage.crash(), 1);
     let rows = restore_rows(&storage);
     assert!(rows.is_empty());
-    let mut recovered = Follower::recover(config(1), None, rows, restore_payloads(&storage));
+    let mut recovered = Follower::recover(
+        config(1),
+        None,
+        rows,
+        restore_payloads(&storage),
+        ExecutionPosition::ZERO,
+    );
     recovered.step(boot_event());
     assert_eq!(
         recovered.pending_sends(),
@@ -433,7 +450,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
     assert_eq!(rows.len(), 1);
     let payloads = restore_payloads(&storage);
     assert_eq!(payloads.len(), 1, "the payload row carries the retry key");
-    let mut recovered = Follower::recover(config(1), None, rows, payloads);
+    let mut recovered = Follower::recover(config(1), None, rows, payloads, ExecutionPosition::ZERO);
     recovered.step(boot_event());
     assert_eq!(recovered.table().phase_of(&c1), Some(Phase::PreAccept));
     assert_eq!(
@@ -555,12 +572,13 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     assert_eq!(adoption.len(), 1);
     f.step(durable_of(&adoption, 2).remove(0));
     let votes = f.votes(&c1).unwrap();
-    assert!(votes.learned().is_some(), "the predicate would hold");
+    assert!(votes.learned_slow().is_some(), "the slow predicate holds");
     assert_eq!(
         f.table().phase_of(&c1),
-        Some(Phase::Accept),
-        "no COMMIT here: learning is task-24"
+        Some(Phase::Commit),
+        "learned slowly: committed, executed only once applied"
     );
+    assert_eq!(f.next_executable(), Some(c1));
     // The guard is explicit: a proposal whose dependency is unknown here
     // stays held, and the table refuses the transition outright.
     let (_, c9) = admitted(9, 9, 9);
@@ -690,7 +708,13 @@ fn recovery_rebuilds_retry_key_bindings_from_durable_payloads() {
     let payloads = restore_payloads(&storage);
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].0, c1);
-    let mut recovered = Follower::recover(config(1), None, restore_rows(&storage), payloads);
+    let mut recovered = Follower::recover(
+        config(1),
+        None,
+        restore_rows(&storage),
+        payloads,
+        ExecutionPosition::ZERO,
+    );
     recovered.step(boot_event());
     // The same retry key with other bytes derives another command; without
     // the rebuilt binding it would be admitted as a second command.
@@ -781,6 +805,7 @@ fn the_synchronized_path_anchor_survives_a_crash() {
         None,
         restore_rows(&storage),
         restore_payloads(&storage),
+        ExecutionPosition::ZERO,
     );
     assert_eq!(
         recovered.table().record(&c1).unwrap().synced_seq,
