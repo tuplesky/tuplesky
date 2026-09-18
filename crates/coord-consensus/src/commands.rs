@@ -310,6 +310,26 @@ impl CommandTable {
         Ok(())
     }
 
+    /// Adopt the leader's order and path evidence for a command
+    /// ([`CommandTable::accept`] plus the evidence the proposal or Sync
+    /// entry carried): from then on the record reports the leader's path,
+    /// which a later recovery compares fast-set evidence against.
+    pub fn adopt(
+        &mut self,
+        command: CommandId,
+        deps: Vec<CommandId>,
+        paths: Option<&[(Vec<u8>, Digest32)]>,
+        path: Digest32,
+    ) -> Result<(), GuardViolation> {
+        self.accept(command, deps)?;
+        let record = self.initialized_mut(&command)?;
+        if let Some(paths) = paths {
+            record.paths = paths.to_vec();
+        }
+        record.path = path;
+        Ok(())
+    }
+
     /// Mark a learned command (COMMIT), under the source guard.
     pub fn commit(&mut self, command: CommandId) -> Result<(), GuardViolation> {
         let deps = self.initialized(&command)?.deps.clone();

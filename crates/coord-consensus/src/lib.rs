@@ -113,7 +113,7 @@ pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,
 };
 pub use leader::{CONSERVATIVE_KEY, Leader, LeaderConfig, Proposal, Rejection};
-pub use learner::{AppliedOutcome, LearnError, Learner};
+pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::ProtocolMessage;
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};

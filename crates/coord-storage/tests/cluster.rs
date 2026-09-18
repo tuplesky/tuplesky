@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader,
-    LeaderConfig, PayloadRecordV1, ProtocolMessage, ReplicaRole,
+    LeaderConfig, LearningMode, PayloadRecordV1, ProtocolMessage, ReplicaRole,
 };
 use coord_core::capability::{AdmissionReceipt, EstablishedResult, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId, PersistBatch};
@@ -149,7 +149,7 @@ fn node(n: u8, me: u8) -> Node {
         .unwrap();
     worker.flush().unwrap();
     let applier = Applier::new(worker, alloc).unwrap();
-    let machine = if me == 0 {
+    let mut machine = if me == 0 {
         Machine::Leader(Leader::new(
             LeaderConfig {
                 identity: identity(n, me),
@@ -169,6 +169,12 @@ fn node(n: u8, me: u8) -> Node {
             capacity: 64,
         }))
     };
+    // task-24 qualifies the slow path; task-28's full learning is compared
+    // against it in `tests/recovery.rs`.
+    match &mut machine {
+        Machine::Leader(m) => m.set_learning(LearningMode::SlowOnly),
+        Machine::Follower(m) => m.set_learning(LearningMode::SlowOnly),
+    }
     let mut node = Node {
         machine,
         applier,
