@@ -7,6 +7,7 @@ resolver = "3"
 members = [
     "crates/coord-types",
     "crates/coord-core",
+    "crates/coord-oracle",
     "crates/coord-sim",
     "xtask",
     "tools/raft-engine-smoke",
@@ -26,6 +27,7 @@ publish = false
 # Internal crates.
 coord-types = { path = "crates/coord-types" }
 coord-core = { path = "crates/coord-core" }
+coord-oracle = { path = "crates/coord-oracle" }
 coord-sim = { path = "crates/coord-sim" }
 
 # Encoding and identity (Section 16.2).
