@@ -33,7 +33,7 @@ use coord_types::ids::{Ballot, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{MessageV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 
-use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection};
+use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
@@ -76,6 +76,12 @@ pub enum FollowerRejection {
     BatchFailed(CommandId),
     /// A proposal for another ballot or from a non-leader.
     ForeignProposal,
+    /// A higher promise is in flight or durable, so the configured ballot
+    /// no longer votes; the work belongs to the new leader.
+    FencedByPromise {
+        /// The ballot promised now.
+        promised: Ballot,
+    },
     /// A peer vote was rejected.
     Vote(VoteError),
     /// A `NewLeader` was rejected.
@@ -118,12 +124,17 @@ pub struct Follower {
 }
 
 impl Follower {
-    /// A follower from its configuration, the recovered promise row and
-    /// the durable dependency rows of the epoch.
+    /// A follower from its configuration, the recovered promise row, the
+    /// durable dependency rows of the epoch and the durable payload rows.
+    /// The payload rows carry the retry key each command was derived from,
+    /// so the one-key-one-payload binding survives a restart: a client
+    /// reusing a durable retry key with other bytes is a conflict, never a
+    /// second command.
     pub fn recover(
         config: FollowerConfig,
         durable_promise: Option<PromiseRecordV1>,
         rows: impl IntoIterator<Item = (CommandId, CommandRecord)>,
+        payloads: impl IntoIterator<Item = (CommandId, PayloadRecordV1)>,
     ) -> Self {
         let ballots =
             BallotState::recover(config.identity.clone(), config.genesis, durable_promise);
@@ -140,7 +151,10 @@ impl Follower {
             outbox: None,
             ballots,
             table,
-            bindings: BTreeMap::new(),
+            bindings: payloads
+                .into_iter()
+                .map(|(command, record)| (record.retry_key, command))
+                .collect(),
             held: BTreeMap::new(),
             adopted,
             pending: BTreeMap::new(),
@@ -151,7 +165,7 @@ impl Follower {
 
     /// A fresh follower with nothing durable.
     pub fn new(config: FollowerConfig) -> Self {
-        Self::recover(config, None, core::iter::empty())
+        Self::recover(config, None, core::iter::empty(), core::iter::empty())
     }
 
     /// The command table.
@@ -184,19 +198,39 @@ impl Follower {
         self.outbox.as_ref().map_or(0, |o| o.pending().len())
     }
 
+    /// Whether this follower may still vote in the configured ballot: it
+    /// votes in this epoch at all, has promised exactly that ballot, and
+    /// no higher promise is in flight. A promise for a higher ballot is
+    /// the recovery cut: nothing of the old ballot may be adopted or
+    /// acknowledged after it starts, whichever row becomes durable first.
+    fn may_vote(&self) -> bool {
+        self.config.identity.role == ReplicaRole::Voter
+            && self.ballots.promised() == self.config.quorum.ballot()
+            && self.ballots.in_flight().is_none()
+    }
+
     fn in_fast_set(&self) -> bool {
         self.config
             .quorum
             .fast_eligible(&self.config.identity.replica)
     }
 
+    /// Publish an acknowledgement that waits for `barrier` and for every
+    /// batch still outstanding: the payload batch of this command and the
+    /// acceptance batches of its prerequisites are all part of what the
+    /// acknowledgement claims, so none of them may still be volatile when
+    /// it leaves. (The outbox drops a send whose barrier fails.)
     fn publish_to_voters_and_frontend(&mut self, barrier: BarrierId, message: ProtocolMessage) {
         let Some(boot) = self.boot else {
             return;
         };
-        let context = self
-            .ballots
-            .context(boot, self.config.quorum.ballot(), LocalJournalSeq::ZERO);
+        let context =
+            self.ballots
+                .context(boot, self.config.quorum.ballot(), LocalJournalSeq::ZERO);
+        let mut requires: Vec<BarrierId> = self.pending.keys().copied().collect();
+        if !requires.contains(&barrier) {
+            requires.push(barrier);
+        }
         let frame = message.encode();
         let outbox = self.outbox.as_mut().expect("booted");
         for voter in &self.config.identity.voters {
@@ -205,7 +239,7 @@ impl Follower {
             }
             outbox.publish(PendingSend {
                 context,
-                requires: alloc::vec![barrier],
+                requires: requires.clone(),
                 to: PeerId {
                     replica: *voter,
                     incarnation: ReplicaIncarnation::ZERO,
@@ -215,7 +249,7 @@ impl Follower {
         }
         outbox.publish(PendingSend {
             context,
-            requires: alloc::vec![barrier],
+            requires,
             to: self.config.frontend,
             frame,
         });
@@ -223,6 +257,12 @@ impl Follower {
 
     fn on_admitted(&mut self, frame: &[u8]) -> Vec<Effect> {
         if self.boot.is_none() {
+            return Vec::new();
+        }
+        if !self.may_vote() {
+            self.rejections.push(FollowerRejection::FencedByPromise {
+                promised: self.ballots.promised(),
+            });
             return Vec::new();
         }
         let request = match decode_stream(frame).as_deref() {
@@ -322,6 +362,12 @@ impl Follower {
     }
 
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {
+        if !self.may_vote() {
+            self.rejections.push(FollowerRejection::FencedByPromise {
+                promised: self.ballots.promised(),
+            });
+            return Vec::new();
+        }
         if from != self.config.quorum.leader()
             || proposal.replica != from
             || proposal.ballot != self.config.quorum.ballot()
