@@ -72,12 +72,13 @@ impl<E: LocalEngine> Domain<E> {
         }
     }
 
-    /// Persist raw updates as a protocol/admin batch.
+    /// Persist admission rows as an ordered application batch at the
+    /// current frontier (session and floor changes are execution steps).
     fn admin(&mut self, updates: Vec<coord_core::effect::StoreUpdate>) {
         self.worker
             .submit(PersistBatch {
                 barrier: self.alloc.allocate(),
-                base: None,
+                base: Some(self.worker.application_base()),
                 updates,
             })
             .unwrap();
@@ -162,7 +163,8 @@ fn lost_response_with_the_same_identity_returns_the_same_result() {
     assert_eq!(d.kv_revision(), 1, "no new revision");
     let stored: coord_state::Response = postcard::from_bytes(&record.response).unwrap();
     assert_eq!(stored, response);
-    assert_eq!(record.position.get(), 1);
+    // Session activation is an ordered step, so the command is position 2.
+    assert_eq!(record.position.get(), 2);
     // Resolution returns the same record only under current authorization.
     assert_eq!(d.resolve(1, &request, true), Resolution::Result(record));
     assert_eq!(d.resolve(1, &request, false), Resolution::Unauthorized);
@@ -366,4 +368,131 @@ fn crash_between_materialization_and_notification_never_duplicates() {
             assert!(prev.is_none());
         }
     }
+}
+
+#[test]
+fn admission_rows_change_only_in_execution_order() {
+    use coord_storage::SubmitError;
+    let mut d = Domain::new(ModelEngine::new());
+    let update = retry::session_update(&SESSION, true, 4).unwrap();
+    assert_eq!(
+        d.worker.submit(PersistBatch {
+            barrier: d.alloc.allocate(),
+            base: None,
+            updates: vec![update],
+        }),
+        Err(SubmitError::AdmissionRowsRequireOrdering)
+    );
+    assert_eq!(d.worker.queued(), 0);
+}
+
+#[test]
+fn admission_is_revalidated_atomically_with_the_application_batch() {
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(8);
+    let request = put(b"k", b"v");
+    let b = binding(1, &request);
+    // Admit and plan from one snapshot.
+    let gated = d.worker.reader().snapshot().unwrap();
+    assert_eq!(retry::admit(gated.view(), &b).unwrap(), Admission::New);
+    let view = build_read_view(&gated, NS, &request, ViewBudget::default()).unwrap();
+    let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
+    drop(gated);
+    // A session retirement is ordered in between.
+    let update = retry::session_update(&SESSION, false, 8).unwrap();
+    d.admin(vec![update]);
+    // The bound command's batch carries the base its admission was checked
+    // at, so it is rejected instead of executing under a retired session.
+    let outcome = apply_plan(&mut d.worker, d.alloc.allocate(), NS, &planned, Some(&b)).unwrap();
+    assert_eq!(outcome, ApplyOutcome::Replan);
+    assert_eq!(d.kv_revision(), 0);
+    assert_eq!(d.submit(1, &request).0, Admission::SessionRetired);
+}
+
+#[test]
+fn a_stale_retirement_never_lowers_the_floor() {
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(8);
+    for seq in 1..=6u64 {
+        assert_eq!(d.submit(seq, &put(b"k", &[seq as u8])).0, Admission::New);
+    }
+    // Two acknowledgements computed from the same snapshot.
+    let gated = d.worker.reader().snapshot().unwrap();
+    let base = d.worker.application_base();
+    let through_2 = retry::retire_updates(
+        gated.view(),
+        &SESSION,
+        &CLIENT,
+        RequestSequence::new(2).unwrap(),
+    )
+    .unwrap();
+    let through_5 = retry::retire_updates(
+        gated.view(),
+        &SESSION,
+        &CLIENT,
+        RequestSequence::new(5).unwrap(),
+    )
+    .unwrap();
+    drop(gated);
+    // The later one is applied first.
+    d.worker
+        .submit(PersistBatch {
+            barrier: d.alloc.allocate(),
+            base: Some(base),
+            updates: through_5,
+        })
+        .unwrap();
+    assert_eq!(d.worker.flush().unwrap().committed, 1);
+    // The stale one is based at the old frontier: rejected, floor stays 5.
+    d.worker
+        .submit(PersistBatch {
+            barrier: d.alloc.allocate(),
+            base: Some(base),
+            updates: through_2,
+        })
+        .unwrap();
+    let o = d.worker.flush().unwrap();
+    assert_eq!(o.committed, 0);
+    assert_eq!(o.rejected, 1);
+    let gated = d.worker.reader().snapshot().unwrap();
+    assert_eq!(
+        retry::floor(gated.view(), &SESSION, &CLIENT, 8)
+            .unwrap()
+            .floor,
+        RequestSequence::new(5).unwrap()
+    );
+    // Sequences 3..=5 stay retired: never admitted as new work again.
+    drop(gated);
+    assert_eq!(
+        d.submit(4, &put(b"k", b"again")).0,
+        Admission::TooOld {
+            floor: RequestSequence::new(5).unwrap()
+        }
+    );
+}
+
+#[test]
+fn acknowledgements_beyond_the_active_window_are_rejected() {
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(4);
+    let gated = d.worker.reader().snapshot().unwrap();
+    // Floor 0, width 4: through 5 names a sequence that was never admitted.
+    let err = retry::retire_updates(
+        gated.view(),
+        &SESSION,
+        &CLIENT,
+        RequestSequence::new(5).unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(err.class, coord_store_api::engine::ErrorClass::Unsupported);
+    // Exactly the window edge is fine.
+    assert!(
+        retry::retire_updates(
+            gated.view(),
+            &SESSION,
+            &CLIENT,
+            RequestSequence::new(4).unwrap()
+        )
+        .is_ok()
+    );
 }

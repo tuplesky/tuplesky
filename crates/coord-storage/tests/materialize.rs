@@ -721,7 +721,7 @@ fn apply_plan_waits_for_its_own_barrier_behind_older_queued_work() {
     let planned = plan(&request, &view, &PlanLimits::default()).unwrap();
     drop(gated);
     let mine = alloc.allocate();
-    let outcome = apply_plan(&mut worker, mine, NS, &planned).unwrap();
+    let outcome = apply_plan(&mut worker, mine, NS, &planned, None).unwrap();
     let ApplyOutcome::Applied(events) = outcome else {
         panic!("{outcome:?}");
     };

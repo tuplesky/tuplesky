@@ -12,6 +12,15 @@
 //! results through a sequence, records at or below it are deleted, and a
 //! request at or below the floor is `TooOld`, never new work. Nothing here
 //! promises exactly-once across a lost upstream invocation identity.
+//!
+//! Admission is checked against a snapshot, and the rows it depends on
+//! (session state, retry records, floors, executed identities) change only
+//! through application batches, in execution order. A bound command's own
+//! batch carries the base its admission was checked at, so the worker's
+//! frontier guard rejects it atomically when a retirement, a floor update or
+//! a session change was ordered in between; the caller replans from a fresh
+//! view and admission runs again. A stale retirement is rejected the same
+//! way, so the floor never moves backward.
 
 use coord_core::effect::StoreUpdate;
 use coord_store_api::engine::{EngineError, OrderedRead};
@@ -239,8 +248,11 @@ pub fn binding_updates(
 
 /// Rows retiring every retained result of the client at or below
 /// `through` and advancing its floor. The caller only issues this after the
-/// client acknowledged receipt of every result through that sequence. The
-/// window width comes from the session record when no floor row exists yet.
+/// client acknowledged receipt of every result through that sequence, and
+/// applies the rows as an application batch based at the frontier of
+/// `view`, so a retirement computed from an older snapshot than one already
+/// applied is rejected rather than lowering the floor. The window width
+/// comes from the session record when no floor row exists yet.
 pub fn retire_updates<V: OrderedRead>(
     view: &V,
     session: &SessionId,
@@ -257,6 +269,15 @@ pub fn retire_updates<V: OrderedRead>(
     let mut updates = Vec::new();
     if through <= current.floor {
         return Ok(updates);
+    }
+    // Sequences beyond the active window were never admitted, so an
+    // acknowledgement past it is malformed: reject it instead of scanning
+    // every skipped sequence and advancing the floor past unissued work.
+    if through.get() - current.floor.get() > u64::from(current.width) {
+        return Err(EngineError::new(
+            coord_store_api::engine::ErrorClass::Unsupported,
+            "acknowledgement beyond the active window",
+        ));
     }
     let mut seq = current.floor;
     while seq < through {
