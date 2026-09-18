@@ -1,0 +1,8 @@
+# Exact toolchain for reproducible builds (task-01). The declared minimum
+# supported Rust version for consumers is recorded in Cargo.toml
+# (`rust-version = "1.90"`) and verified by the `msrv` CI job.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+profile = "minimal"

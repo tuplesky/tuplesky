@@ -1,0 +1,65 @@
+# cargo-deny policy (task-01, design Section 16.1). Run `cargo xtask check-deps`.
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Reviewed exceptions. Each entry records why no upgrade path exists and why
+# the vulnerable code is unreachable in this workspace; every entry is listed
+# in docs/build/toolchain.md ("Accepted advisories") and is to be revisited
+# before a production release.
+ignore = [
+    # protobuf 2.28.0: stack overflow when skipping unknown group fields in
+    # untrusted input (patched only in the 3.x line). It reaches the graph
+    # solely through the pinned raft-engine revision (directly, and via
+    # prometheus 0.13), which is used by tools/raft-engine-smoke only; no
+    # daemon or library crate links it, and raft-engine decodes only its own
+    # on-disk log entries, never network input.
+    { id = "RUSTSEC-2024-0437", reason = "protobuf 2 is pinned by raft-engine (smoke tool only); never parses untrusted input" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.9
+exceptions = []
+# Workspace crates are `publish = false` under FSL-1.1-ALv2 (not an SPDX id);
+# they are not third-party dependencies.
+private = { ignore = true }
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # No alternative TLS stacks: rustls with the AWS-LC provider is selected.
+    { crate = "openssl", reason = "rustls/aws-lc-rs is the only TLS stack" },
+    { crate = "openssl-sys", reason = "rustls/aws-lc-rs is the only TLS stack" },
+    { crate = "native-tls", reason = "rustls/aws-lc-rs is the only TLS stack" },
+    { crate = "hyper-tls", reason = "rustls/aws-lc-rs is the only TLS stack" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/tikv/raft-engine"]
