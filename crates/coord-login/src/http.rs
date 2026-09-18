@@ -18,13 +18,14 @@ use coord_authn::VerifiedIdentity;
 use coord_state::InternalCommand;
 use coord_state::plan::Outcome;
 use coord_state::policy::GrantKind;
-use coord_sts::{ClockSource, EntropySource, ExchangeError, HttpLimits, SessionCreator, Sts};
+use coord_sts::{ClockSource, EntropySource, ExchangeError, HttpLimits, Sts};
 use coord_types::ids::NamespaceId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::device::{DeviceError, DeviceLogin, Poll};
+use crate::refresh::{RefreshError, SessionBackend, new_family, refresh_token};
 use crate::service::{LoginError, RedeemRequest, ServiceLogin, StartRequest, UpstreamIdentity};
 use crate::upstream::{Upstream, UpstreamError};
 
@@ -41,7 +42,7 @@ pub struct LoginState {
     /// The STS (trust rules, receipts, signing).
     pub sts: Mutex<Sts>,
     /// The port to replicated state.
-    pub creator: Mutex<Box<dyn SessionCreator + Send>>,
+    pub creator: Mutex<Box<dyn SessionBackend + Send>>,
     /// Clock.
     pub clock: Box<dyn ClockSource>,
     /// Entropy.
@@ -62,7 +63,7 @@ impl LoginState {
         upstreams: BTreeMap<String, Upstream>,
         http: reqwest::Client,
         sts: Sts,
-        creator: Box<dyn SessionCreator + Send>,
+        creator: Box<dyn SessionBackend + Send>,
         clock: Box<dyn ClockSource>,
         entropy: Box<dyn EntropySource>,
         namespace: NamespaceId,
@@ -96,6 +97,8 @@ pub fn router(state: Arc<LoginState>) -> Router {
         .route("/device/callback", get(device_callback))
         .route("/device/deny", post(device_deny))
         .route("/device/token", post(device_token))
+        .route("/login/refresh", post(refresh_handler))
+        .route("/login/logout", post(logout_handler))
         .layer(DefaultBodyLimit::max(limit))
         .with_state(state)
 }
@@ -301,17 +304,95 @@ async fn redeem(State(state): State<Arc<LoginState>>, Form(form): Form<RedeemFor
         Ok(r) => r,
         Err(e) => return login_error(&e),
     };
-    let identity = verified(&redeemed.identity, &redeemed.upstream);
+    issue_with_family(
+        &state,
+        &redeemed.identity,
+        &redeemed.upstream,
+        redeemed.commitment,
+        &clock,
+    )
+    .await
+}
+
+/// Order a refresh family, create the session bound to it and the login
+/// grant, and answer with the service token and the refresh token.
+async fn issue_with_family(
+    state: &LoginState,
+    identity: &UpstreamIdentity,
+    upstream: &str,
+    code: coord_types::identity::Digest32,
+    clock: &coord_authn::ClockHealth,
+) -> Response {
+    let identity = verified(identity, upstream);
+    let (secret, family) = new_family(&state.entropy.fill());
     let entropy = state.entropy.fill();
     let result = {
         let mut sts = state.sts.lock().await;
         let mut creator = state.creator.lock().await;
+        match creator.create(InternalCommand::CommitGrant {
+            namespace: state.namespace,
+            commitment: family,
+            kind: GrantKind::RefreshFamily,
+        }) {
+            Ok(r) if r.outcome == Outcome::GrantCommitted => {}
+            _ => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "grant",
+                );
+            }
+        }
         sts.issue(
             &identity,
-            Some(redeemed.commitment),
+            Some(code),
+            Some(family),
             None,
+            clock,
+            &entropy,
+            creator.as_mut(),
+        )
+    };
+    match result {
+        Ok(mut response) => {
+            response.refresh_token = Some(refresh_token(&family, &secret));
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).expect("serializable")),
+            )
+                .into_response()
+        }
+        Err(e) => exchange_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RefreshForm {
+    refresh_token: String,
+}
+
+async fn refresh_handler(
+    State(state): State<Arc<LoginState>>,
+    Form(form): Form<RefreshForm>,
+) -> Response {
+    let Ok(_permit) = state.permits.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "busy",
+        );
+    };
+    let clock = state.clock.read();
+    let entropy = state.entropy.fill();
+    let result = {
+        let mut sts = state.sts.lock().await;
+        let mut creator = state.creator.lock().await;
+        crate::refresh::refresh(
+            &form.refresh_token,
+            state.namespace,
             &clock,
             &entropy,
+            &mut sts,
             creator.as_mut(),
         )
     };
@@ -321,7 +402,45 @@ async fn redeem(State(state): State<Arc<LoginState>>, Form(form): Form<RedeemFor
             Json(serde_json::to_value(response).expect("serializable")),
         )
             .into_response(),
-        Err(e) => exchange_error(&e),
+        Err(e) => refresh_error(&e),
+    }
+}
+
+async fn logout_handler(
+    State(state): State<Arc<LoginState>>,
+    Form(form): Form<RefreshForm>,
+) -> Response {
+    let result = {
+        let mut creator = state.creator.lock().await;
+        crate::refresh::logout(&form.refresh_token, state.namespace, creator.as_mut())
+    };
+    match result {
+        Ok(()) => (StatusCode::OK, Json(json!({ "logged_out": true }))).into_response(),
+        Err(e) => refresh_error(&e),
+    }
+}
+
+fn refresh_error(e: &RefreshError) -> Response {
+    match e {
+        RefreshError::Malformed => {
+            error(StatusCode::BAD_REQUEST, "invalid_request", "refresh_token")
+        }
+        RefreshError::UnknownFamily | RefreshError::SessionRetired => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "no such family or session",
+        ),
+        RefreshError::FamilyRevoked => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "refresh family revoked: a retired secret was presented; log in again",
+        ),
+        RefreshError::Unavailable => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "replicated state",
+        ),
+        RefreshError::Exchange(x) => exchange_error(x),
     }
 }
 
@@ -537,28 +656,14 @@ async fn device_token(
         Ok(Poll::Expired) => return error(StatusCode::BAD_REQUEST, "expired_token", "expired"),
         Err(e) => return device_error(&e),
     };
-    let identity = verified(&redeemed.identity, &redeemed.upstream);
-    let entropy = state.entropy.fill();
-    let result = {
-        let mut sts = state.sts.lock().await;
-        let mut creator = state.creator.lock().await;
-        sts.issue(
-            &identity,
-            Some(redeemed.commitment),
-            None,
-            &clock,
-            &entropy,
-            creator.as_mut(),
-        )
-    };
-    match result {
-        Ok(response) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(response).expect("serializable")),
-        )
-            .into_response(),
-        Err(e) => exchange_error(&e),
-    }
+    issue_with_family(
+        &state,
+        &redeemed.identity,
+        &redeemed.upstream,
+        redeemed.commitment,
+        &clock,
+    )
+    .await
 }
 
 /// The verified identity of a redeemed login, as trust rules see it:
