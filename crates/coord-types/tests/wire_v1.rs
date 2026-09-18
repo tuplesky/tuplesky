@@ -197,7 +197,7 @@ fn every_message_round_trips_and_streams_concatenate() {
     let mut reader = FrameReader::new();
     let mut count = 0;
     for b in &stream {
-        reader.push(&[*b]);
+        reader.push(&[*b]).unwrap();
         while let Some(frame) = reader.next_frame().unwrap() {
             decode(&frame).unwrap();
             count += 1;
@@ -213,7 +213,7 @@ fn every_header_truncation_is_incomplete_never_a_frame() {
     for cut in 1..frame.len() {
         let partial = &frame[..cut];
         let mut reader = FrameReader::new();
-        reader.push(partial);
+        reader.push(partial).unwrap();
         assert_eq!(reader.next_frame().unwrap(), None, "cut at {cut}");
         let err = reader.finish().unwrap_err();
         assert!(
@@ -255,9 +255,14 @@ fn length_below_minimum_and_above_class_limit_fail_before_allocation() {
     let over = KindRange::Negotiation.max_frame_length() + 1;
     header[..4].copy_from_slice(&over.to_be_bytes());
     let mut reader = FrameReader::new();
-    reader.push(&header);
+    reader.push(&header).unwrap();
     assert!(matches!(
         reader.next_frame(),
+        Err(WireError::LengthAboveClassLimit { .. })
+    ));
+    // Once the invalid header is buffered, no further byte is accepted.
+    assert!(matches!(
+        reader.push(&[0]),
         Err(WireError::LengthAboveClassLimit { .. })
     ));
     // Unregistered kinds get the smallest limit.
@@ -616,4 +621,53 @@ fn frame_vectors_are_frozen() {
             Err(e) => assert_eq!(v.expect, error_name(&e), "{}", v.name),
         }
     }
+}
+
+#[test]
+fn reader_compacts_consumed_bytes_and_caps_pending_bytes() {
+    use coord_types::wire_v1::MAX_PENDING_BYTES;
+    let frame = sample_messages()[3].1.encode().unwrap();
+    // Fragmented reads that always end partway into the next frame must not
+    // retain consumed prefixes: the allocation stays bounded by one frame.
+    let mut stream = Vec::new();
+    for _ in 0..64 {
+        stream.extend_from_slice(&frame);
+    }
+    let chunk = frame.len() / 2 + 3;
+    let mut reader = FrameReader::new();
+    let mut count = 0;
+    for piece in stream.chunks(chunk) {
+        reader.push(piece).unwrap();
+        while reader.next_frame().unwrap().is_some() {
+            count += 1;
+        }
+        assert!(
+            reader.buffered() <= frame.len() + chunk,
+            "buffer grew to {}",
+            reader.buffered()
+        );
+    }
+    assert_eq!(count, 64);
+    reader.finish().unwrap();
+
+    // A single push beyond the largest frame class is refused before copying.
+    let mut reader = FrameReader::new();
+    let too_much = vec![0u8; MAX_PENDING_BYTES + 1];
+    assert!(matches!(
+        reader.push(&too_much),
+        Err(WireError::ReceiveBufferFull { .. })
+    ));
+    assert_eq!(reader.pending(), 0);
+    // A valid largest-class header whose payload is one byte short fills the
+    // buffer up to the bound; undrained bytes past it are refused.
+    let mut partial = vec![0u8; MAX_PENDING_BYTES - 1];
+    partial[..4].copy_from_slice(&KindRange::Watch.max_frame_length().to_be_bytes());
+    partial[4..6].copy_from_slice(&0x0200u16.to_be_bytes());
+    reader.push(&partial).unwrap();
+    assert_eq!(reader.next_frame().unwrap(), None);
+    assert!(matches!(
+        reader.push(&[0, 0]),
+        Err(WireError::ReceiveBufferFull { .. })
+    ));
+    assert_eq!(reader.pending(), MAX_PENDING_BYTES - 1);
 }

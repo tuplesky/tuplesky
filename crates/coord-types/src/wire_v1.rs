@@ -202,6 +202,14 @@ pub enum WireError {
         /// Number of extra bytes.
         extra: usize,
     },
+    /// More bytes were pushed into a [`FrameReader`] than one frame of the
+    /// largest class can need; the caller did not drain frames between reads.
+    ReceiveBufferFull {
+        /// Bytes that would be pending after the push.
+        pending: usize,
+        /// Maximum pending bytes.
+        limit: usize,
+    },
     /// A bounded collection or byte string exceeded its declared limit.
     CollectionTooLarge {
         /// Declared element count.
@@ -236,6 +244,12 @@ impl fmt::Display for WireError {
             WireError::MalformedPayload => f.write_str("malformed payload"),
             WireError::TrailingPayloadBytes { extra } => {
                 write!(f, "{extra} trailing payload bytes")
+            }
+            WireError::ReceiveBufferFull { pending, limit } => {
+                write!(
+                    f,
+                    "receive buffer would hold {pending} bytes, limit {limit}"
+                )
             }
             WireError::CollectionTooLarge { declared, limit } => {
                 write!(f, "collection of {declared} exceeds limit {limit}")
@@ -301,11 +315,22 @@ pub fn encode_frame(kind: u16, version: u16, payload: &[u8]) -> Result<Vec<u8>, 
     Ok(out)
 }
 
+/// Largest number of bytes a [`FrameReader`] holds: one frame of the largest
+/// class including its length field. Anything beyond it means the caller did
+/// not drain complete frames between pushes.
+pub const MAX_PENDING_BYTES: usize = 4 + KindRange::Watch.max_frame_length() as usize;
+
 /// Incremental bounded frame reader over a byte stream.
 ///
 /// Feed bytes with [`FrameReader::push`], pull frames with
 /// [`FrameReader::next_frame`], and call [`FrameReader::finish`] when the
 /// stream ends: leftover bytes are an error, never silently ignored.
+///
+/// The reader never holds more than [`MAX_PENDING_BYTES`]: consumed bytes are
+/// compacted away on every push, a complete header is validated before its
+/// payload is buffered, and a push that would exceed the bound fails without
+/// copying. A peer therefore cannot grow the buffer beyond one frame of the
+/// largest class however the stream is fragmented.
 #[derive(Debug, Default)]
 pub struct FrameReader {
     buf: Vec<u8>,
@@ -321,20 +346,40 @@ impl FrameReader {
         }
     }
 
-    /// Append stream bytes. Buffering is bounded by the largest class limit
-    /// plus one header because [`Self::next_frame`] must be drained between
-    /// pushes to keep it that way; callers enforce their own read budget.
-    pub fn push(&mut self, bytes: &[u8]) {
-        if self.start > 0 && self.start == self.buf.len() {
-            self.buf.clear();
+    /// Append stream bytes. Fails, without buffering anything, when the
+    /// pending header is already invalid or when the pending bytes would
+    /// exceed [`MAX_PENDING_BYTES`]; the caller must drain
+    /// [`Self::next_frame`] between pushes.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), WireError> {
+        if self.start > 0 {
+            self.buf.drain(..self.start);
             self.start = 0;
         }
+        if self.buf.len() >= HEADER_LEN {
+            let mut header = [0u8; HEADER_LEN];
+            header.copy_from_slice(&self.buf[..HEADER_LEN]);
+            check_header(&header)?;
+        }
+        let pending = self.buf.len().saturating_add(bytes.len());
+        if pending > MAX_PENDING_BYTES {
+            return Err(WireError::ReceiveBufferFull {
+                pending,
+                limit: MAX_PENDING_BYTES,
+            });
+        }
         self.buf.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Bytes buffered but not yet consumed as frames.
     pub fn pending(&self) -> usize {
         self.buf.len() - self.start
+    }
+
+    /// Bytes currently owned by the buffer, consumed or not (allocation
+    /// footprint; never above [`MAX_PENDING_BYTES`] plus one push).
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
     }
 
     /// Next complete frame, `Ok(None)` when more bytes are needed. Header
@@ -874,13 +919,21 @@ pub fn decode(frame: &Frame) -> Result<MessageV1, WireError> {
 }
 
 /// Decode every frame of a complete stream; used by fixtures and the fuzz
-/// harness. Any error aborts, and leftover bytes are an error.
+/// harness. Any error aborts, and leftover bytes are an error. The stream is
+/// fed in bounded chunks and drained between them, as a transport would.
 pub fn decode_stream(bytes: &[u8]) -> Result<Vec<MessageV1>, WireError> {
     let mut reader = FrameReader::new();
-    reader.push(bytes);
     let mut out = Vec::new();
-    while let Some(frame) = reader.next_frame()? {
-        out.push(decode(&frame)?);
+    for chunk in bytes.chunks(64 * 1024) {
+        reader.push(chunk)?;
+        while let Some(frame) = reader.next_frame()? {
+            out.push(decode(&frame)?);
+        }
+    }
+    if bytes.is_empty() {
+        while let Some(frame) = reader.next_frame()? {
+            out.push(decode(&frame)?);
+        }
     }
     reader.finish()?;
     Ok(out)
