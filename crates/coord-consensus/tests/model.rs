@@ -135,7 +135,7 @@ fn explore(
     let mut result: Option<(Option<Learned>, BTreeMap<String, VoteError>)> = None;
     let perms = permutations(votes);
     for perm in &perms {
-        let mut set = VoteSet::new(cfg, c);
+        let mut set = VoteSet::new(cfg.clone(), c);
         let mut rejected = BTreeMap::new();
         for (label, v) in perm {
             if let Err(e) = set.add(v.clone()) {

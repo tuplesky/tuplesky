@@ -41,8 +41,16 @@
 //!   leader-synchronized prefix) whose heads are the dependency-path
 //!   evidence of fast acknowledgements, strictly stronger than direct-set
 //!   equality, and exact, budgeted closure traversal.
-//! * [`rows`], [`messages`]: the promise row of `protocol_v1` and the
-//!   postcard-encoded protocol messages of this increment.
+//! * [`leader`] (task-22): the normal-operation leader machine: an
+//!   admitted request is initialized atomically, its payload, dependency
+//!   and proposal rows are persisted in one batch, and the proposal to the
+//!   voters and the reply to the frontend are released only once that
+//!   batch is durable; a retry key already bound to another payload is
+//!   `RequestIdentityConflict`; the leader adopts its own order only when
+//!   the proposal is durable and every dependency is at least ACCEPT; a
+//!   higher promise stops proposing. No learning happens here.
+//! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
+//!   rows and the postcard-encoded protocol messages of this increment.
 #![forbid(unsafe_code)]
 #![no_std]
 #![warn(missing_docs)]
@@ -51,6 +59,7 @@ extern crate alloc;
 pub mod ballot;
 pub mod commands;
 pub mod graph;
+pub mod leader;
 pub mod messages;
 pub mod phase;
 pub mod publication;
@@ -67,14 +76,17 @@ pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireEr
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,
 };
+pub use leader::{CONSERVATIVE_KEY, Leader, LeaderConfig, Proposal, Rejection};
 pub use messages::ProtocolMessage;
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, FastQuorumClass};
 pub use recovery::{RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, select};
 pub use rows::{
-    PromiseRecordV1, decode_dependency, decode_promise, dependency_key, dependency_update,
-    encode_dependency, encode_promise, promise_key, promise_update,
+    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, decode_dependency, decode_payload,
+    decode_promise, decode_proposal, dependency_key, dependency_update, encode_dependency,
+    encode_payload, encode_promise, encode_proposal, payload_key, payload_update, promise_key,
+    promise_update, proposal_key, proposal_update,
 };
 pub use vote::{FastAck, Learned, SlowAck, Vote, VoteError, VoteSet};
 

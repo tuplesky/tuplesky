@@ -135,17 +135,17 @@ impl Learned {
 
 /// One ballot's acknowledgements for one command.
 #[derive(Clone, Debug)]
-pub struct VoteSet<'c> {
-    config: &'c BallotConfiguration,
+pub struct VoteSet {
+    config: BallotConfiguration,
     command: CommandId,
     leader: Option<FastAck>,
     fast: BTreeMap<ReplicaId, FastAck>,
     slow: BTreeSet<ReplicaId>,
 }
 
-impl<'c> VoteSet<'c> {
+impl VoteSet {
     /// An empty vote set for `command` under `config`.
-    pub const fn new(config: &'c BallotConfiguration, command: CommandId) -> Self {
+    pub const fn new(config: BallotConfiguration, command: CommandId) -> Self {
         VoteSet {
             config,
             command,
