@@ -706,7 +706,10 @@ fn active_lease_recovery_pages_past_tombstones_within_a_small_budget() {
             None => break,
         }
     }
-    assert!(pages >= 6, "40 rows under a 7-row budget take several pages");
+    assert!(
+        pages >= 6,
+        "40 rows under a 7-row budget take several pages"
+    );
     assert_eq!(found, active);
     assert_eq!(
         active_leases(gated.view(), budget)
