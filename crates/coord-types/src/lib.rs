@@ -15,6 +15,8 @@
 //!   one retry key.
 //! * [`ordered_key`]: the reviewed ordered-key encoder for namespace/key/
 //!   revision rows (Section 17.2) with property-tested byte ordering.
+//! * [`wire_v1`]: bounded frames and stable transport DTOs (task-03,
+//!   Sections 11.2 and 19.1), decoded only within declared limits.
 //!
 //! The crate performs no I/O, reads no clocks and generates no randomness. It
 //! is `no_std` + `alloc` so the compile boundary in `cargo xtask check-deps`
@@ -29,6 +31,7 @@ pub mod identity;
 pub mod ids;
 pub mod logical_v1;
 pub mod ordered_key;
+pub mod wire_v1;
 
 pub use error::{CounterOverflow, DecodeError, IdentityError, ValidationError};
 pub use identity::{AdmissionContext, CommandId, Digest32, HashDomain, RetryKey};

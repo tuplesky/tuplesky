@@ -10,6 +10,8 @@ members = [
     "xtask",
     "tools/raft-engine-smoke",
 ]
+# cargo-fuzz package; nightly-only, built separately (see fuzz/Cargo.toml).
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
