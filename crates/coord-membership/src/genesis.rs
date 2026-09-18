@@ -1,0 +1,240 @@
+//! The signed, immutable genesis manifest (design Sections 10.2, 20.4).
+//! The manifest travels as an ES256 JWT so it is verified against a
+//! pinned public key delivered through deployment trust; a larger epoch
+//! or a discovery-node signature alone is never sufficient.
+
+use coord_types::identity::{Digest32, HashDomain};
+use coord_types::ids::{
+    ClusterId, ConfigurationEpoch, DomainId, PrincipalId, ReplicaId, ReplicaIncarnation,
+};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// One initial voter's committed identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoterSeed {
+    /// Node identity (lowercase hex of the replica id).
+    pub node: String,
+    /// Committed key generation / incarnation.
+    pub incarnation: u64,
+}
+
+/// The genesis manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisManifest {
+    /// Cluster identity (lowercase hex).
+    pub cluster: String,
+    /// Domain identity (lowercase hex).
+    pub domain: String,
+    /// Configuration epoch of the initial membership.
+    pub epoch: u64,
+    /// Exact initial voters.
+    pub voters: Vec<VoterSeed>,
+    /// Issuer trust anchors (base64url CA certificate DERs).
+    pub issuer_roots: Vec<String>,
+    /// Admin principal (lowercase hex).
+    pub admin: String,
+    /// Protocol/version policy identifier.
+    pub protocol_version: u32,
+}
+
+/// Why a manifest was rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenesisError {
+    /// The token did not verify against the pinned key.
+    Signature,
+    /// Not ES256, or a key-location header.
+    Algorithm,
+    /// Malformed manifest.
+    Malformed,
+    /// A field did not parse (bad identity, empty voters, and so on).
+    Invalid,
+    /// The protocol version is not supported.
+    UnsupportedProtocol {
+        /// The manifest's version.
+        version: u32,
+    },
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+impl GenesisManifest {
+    /// Cluster.
+    pub fn cluster_id(&self) -> Option<ClusterId> {
+        Some(ClusterId(unhex(&self.cluster)?))
+    }
+    /// Domain.
+    pub fn domain_id(&self) -> Option<DomainId> {
+        Some(DomainId(unhex(&self.domain)?))
+    }
+    /// Epoch.
+    pub fn config_epoch(&self) -> Option<ConfigurationEpoch> {
+        ConfigurationEpoch::new(self.epoch).ok()
+    }
+    /// Admin principal.
+    pub fn admin_principal(&self) -> Option<PrincipalId> {
+        Some(PrincipalId(unhex(&self.admin)?))
+    }
+    /// A voter seed's replica identity and incarnation.
+    pub fn voter(seed: &VoterSeed) -> Option<(ReplicaId, ReplicaIncarnation)> {
+        Some((
+            ReplicaId(unhex(&seed.node)?),
+            ReplicaIncarnation::new(seed.incarnation).ok()?,
+        ))
+    }
+
+    /// A stable digest of the canonical manifest, used to pin it durably.
+    pub fn digest(&self) -> Digest32 {
+        let canonical = serde_json::to_vec(self).expect("serializable");
+        HashDomain::AuthGrantCommitment.digest(&[b"genesis-manifest", &canonical])
+    }
+
+    fn validate(&self, supported_protocol: u32) -> Result<(), GenesisError> {
+        if self.cluster_id().is_none()
+            || self.domain_id().is_none()
+            || self.config_epoch().is_none()
+            || self.admin_principal().is_none()
+            || self.voters.is_empty()
+            || self.issuer_roots.is_empty()
+        {
+            return Err(GenesisError::Invalid);
+        }
+        for seed in &self.voters {
+            if Self::voter(seed).is_none() {
+                return Err(GenesisError::Invalid);
+            }
+        }
+        if self.protocol_version != supported_protocol {
+            return Err(GenesisError::UnsupportedProtocol {
+                version: self.protocol_version,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A signed manifest as delivered (an ES256 JWT).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedGenesis(pub String);
+
+/// Sign a manifest with the admin ES256 key (provisioning trust).
+pub fn sign_genesis(
+    manifest: &GenesisManifest,
+    key: &EncodingKey,
+) -> Result<SignedGenesis, GenesisError> {
+    let mut header = Header::new(Algorithm::ES256);
+    header.typ = Some("genesis+jwt".into());
+    let mut claims = serde_json::to_value(manifest).map_err(|_| GenesisError::Malformed)?;
+    // A JWT needs registered claims for the verifier's required set.
+    if let Value::Object(map) = &mut claims {
+        map.insert("iss".into(), Value::from("tuplesky-genesis"));
+        map.insert("sub".into(), Value::from(manifest.cluster.clone()));
+        map.insert("aud".into(), Value::from(manifest.domain.clone()));
+        map.insert("exp".into(), Value::from(u64::MAX / 2));
+    }
+    encode(&header, &claims, key)
+        .map(SignedGenesis)
+        .map_err(|_| GenesisError::Signature)
+}
+
+/// Verify a delivered manifest against the pinned public key.
+pub fn verify_genesis(
+    signed: &SignedGenesis,
+    pinned: &DecodingKey,
+    supported_protocol: u32,
+) -> Result<GenesisManifest, GenesisError> {
+    let header = decode_header(&signed.0).map_err(|_| GenesisError::Malformed)?;
+    if header.alg != Algorithm::ES256
+        || header.jku.is_some()
+        || header.x5u.is_some()
+        || header.jwk.is_some()
+    {
+        return Err(GenesisError::Algorithm);
+    }
+    let mut validation = Validation::new(Algorithm::ES256);
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    validation.required_spec_claims.clear();
+    let data = decode::<GenesisManifest>(&signed.0, pinned, &validation)
+        .map_err(|_| GenesisError::Signature)?;
+    data.claims.validate(supported_protocol)?;
+    Ok(data.claims)
+}
+
+/// The base64url encoding of bytes (issuer roots).
+pub fn b64url(bytes: &[u8]) -> String {
+    coord_node_issuer_b64::encode(bytes)
+}
+
+/// Decode a base64url issuer root.
+pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    coord_node_issuer_b64::decode(s)
+}
+
+mod coord_node_issuer_b64 {
+    pub fn encode(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            if chunk.len() > 1 {
+                out.push(T[(n >> 6) as usize & 63] as char);
+            }
+            if chunk.len() > 2 {
+                out.push(T[n as usize & 63] as char);
+            }
+        }
+        out
+    }
+    pub fn decode(s: &str) -> Option<Vec<u8>> {
+        let rev = |c: u8| match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        };
+        let mut out = Vec::new();
+        let mut acc = 0u32;
+        let mut bits = 0;
+        for &c in s.as_bytes() {
+            let v = rev(c)?;
+            acc = (acc << 6) | u32::from(v);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        Some(out)
+    }
+}
+
+/// A helper for hex identities.
+pub fn hex_id(bytes: &[u8]) -> String {
+    hex(bytes)
+}
