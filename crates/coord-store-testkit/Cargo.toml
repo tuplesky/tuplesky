@@ -1,0 +1,25 @@
+[package]
+name = "coord-store-testkit"
+description = "Model state engine, storage conformance kit and logical replay fixtures (test-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# Development kit; never linked into production artifacts.
+role = "test-only"
+
+[dependencies]
+coord-types.workspace = true
+coord-core.workspace = true
+coord-store-api.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
