@@ -13,6 +13,18 @@ Start with the design's navigation table, then review the corresponding tasks. T
 
 Review particularly the distinction between journal durability, materialization and protocol establishment; observer progress/list-watch continuity and strict output authorization; exact configuration evidence and terminal handoff recovery; and the implementation gates for speculative results, replay materialization and read fences. Observer policy replay does not replace the retained per-selected-output authorization barrier.
 
+## Performance interpretation: leader locality remains relevant
+
+This is a reading aid for [the quorum rules](tuplesky-design.md#s4-1), [the fixed C2 policy](tuplesky-design.md#s4-2) and [the latency model](tuplesky-design.md#s4-6), not an additional protocol specification. **SwiftPaxos removes an avoidable sequential leader-relay path; it does not remove the leader from the quorum or erase its physical distance.** Every normal-operation fast and slow quorum includes the ballot's leader. "No dominant home region" describes the traffic distribution, not leaderless consensus or region-local write availability.
+
+For a warm, dependency-ready fast-path exchange, the idealized communication budget is the maximum collector-to-voter round trip over the configured fast quorum, including the leader. Thus a Singapore collector and Frankfurt leader still require the Frankfurt exchange even if other voters are nearby. Storage, computation, dependency readiness, queueing and API-edge delivery add costs; geographic distance alone does not determine which evidence is slowest. The slow path also retains leader-guided ordering.
+
+C2 permits one fixed fast quorum per ballot, not a different nearest majority per client. Merely moving leadership within an unchanged fast set does not change that set's idealized maximum RTT; changing the set requires the reviewed higher-ballot recovery. Regional observers offload eligible reads and event distribution, not write-quorum participation.
+
+Review [PR-M04](tuplesky-prs-plan.md#pr-m04) against these constraints: score the actual leader, whole fast set, client regions and degraded slow path while enforcing failure-domain limits. In [PR-62](tuplesky-prs-plan.md#pr-62), [PR-63](tuplesky-prs-plan.md#pr-63) and [PR-Q01](tuplesky-prs-plan.md#pr-q01), inspect per-region results for local and remote leaders, unfavorable fixed-fast placement, and comparably optimized Raft/Multi-Paxos placement. Parallel fan-out is not a claim of placement-independent latency, a fixed percentage improvement, or universally better end-to-end tails.
+
+## Review scope
+
 This PR contains only the two documents and Markdown navigation. Local authoring/consolidation/validation scripts, generated JSON reports or dependency graphs, caches, workspace files and workflows are excluded. Future service test tooling and CI described in the plan remain intended implementation work.
 
 Document checks are not service qualification. Rust/Go builds, full protocol/trace validation, actual engine crash campaigns, supported-platform testing and performance experiments remain explicit acceptance obligations. Dependency/source observations retain their stated review dates rather than claiming a new verification during consolidation.
