@@ -29,6 +29,13 @@ pub enum Misbehavior {
     FalseDurability,
     /// Pending writes of an open transaction are visible to snapshots.
     EarlyVisibility,
+    /// Point reads use the pinned image but scan pages read live rows.
+    UnpinnedScans,
+    /// A definite noncommit is published to live snapshots and only dropped
+    /// by the next reopen.
+    NoncommitVisibleUntilReopen,
+    /// Scans ignore `resume_after` and return the first page forever.
+    IgnoredResumeKey,
 }
 
 /// Scripted outcome of the next commit.
@@ -161,6 +168,7 @@ fn scan_rows(
 ) -> Result<RowPage, EngineError> {
     let ignore_upper = misbehaviors.contains(&Misbehavior::ReversedBounds);
     let swallow = misbehaviors.contains(&Misbehavior::SwallowedIteratorErrors);
+    let ignore_resume = misbehaviors.contains(&Misbehavior::IgnoredResumeKey);
     let in_upper = |k: &[u8]| -> bool {
         if ignore_upper {
             return true;
@@ -186,7 +194,11 @@ fn scan_rows(
     let mut bytes = 0usize;
     let mut visited = 0usize;
     for ((c, k), v) in iter {
-        if *c != collection.0 || !in_lower(k) || !in_upper(k) || !request.past_cursor(k) {
+        if *c != collection.0
+            || !in_lower(k)
+            || !in_upper(k)
+            || !(ignore_resume || request.past_cursor(k))
+        {
             continue;
         }
         if let Some(n) = error_after
@@ -260,8 +272,10 @@ impl OrderedRead for ModelView {
         let error_after = s.iterator_error_after.take();
         let misbehaviors = s.misbehaviors.clone();
         match &self.pinned {
-            Some(rows) => scan_rows(rows, collection, request, &misbehaviors, error_after),
-            None => scan_rows(&s.visible, collection, request, &misbehaviors, error_after),
+            Some(rows) if !misbehaviors.contains(&Misbehavior::UnpinnedScans) => {
+                scan_rows(rows, collection, request, &misbehaviors, error_after)
+            }
+            _ => scan_rows(&s.visible, collection, request, &misbehaviors, error_after),
         }
     }
 }
@@ -410,9 +424,19 @@ impl WriteTxn for ModelWrite<'_> {
                 }
                 Ok(())
             }
-            CommitScript::DefinitelyNotCommitted => Err(CommitFailure::DefinitelyNotCommitted(
-                EngineError::new(ErrorClass::Busy, "scripted definite noncommit"),
-            )),
+            CommitScript::DefinitelyNotCommitted => {
+                if s.misbehaviors
+                    .contains(&Misbehavior::NoncommitVisibleUntilReopen)
+                {
+                    // Published live, never durable: reopen discards it.
+                    apply(&mut s.visible, &self.pending, limit);
+                    s.volatile_txns.insert(txn);
+                }
+                Err(CommitFailure::DefinitelyNotCommitted(EngineError::new(
+                    ErrorClass::Busy,
+                    "scripted definite noncommit",
+                )))
+            }
             CommitScript::Indeterminate { applied } => {
                 if applied {
                     apply(&mut s.visible, &self.pending, limit);
