@@ -8,6 +8,7 @@ members = [
     "crates/coord-types",
     "crates/coord-core",
     "crates/coord-state",
+    "crates/coord-consensus",
     "crates/coord-oracle",
     "crates/coord-store-api",
     "crates/coord-store-testkit",
@@ -34,6 +35,7 @@ publish = false
 coord-types = { path = "crates/coord-types" }
 coord-core = { path = "crates/coord-core" }
 coord-state = { path = "crates/coord-state" }
+coord-consensus = { path = "crates/coord-consensus" }
 coord-oracle = { path = "crates/coord-oracle" }
 coord-store-api = { path = "crates/coord-store-api" }
 coord-store-testkit = { path = "crates/coord-store-testkit" }
