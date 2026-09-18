@@ -303,11 +303,8 @@ fn envelope_and_stamp_round_trip_and_reject_corruption() {
     assert_eq!(huge.encode().unwrap_err().class, ErrorClass::Limit);
 
     let seq = LocalJournalSeq::new(9).unwrap();
-    let stamp = AppliedStamp {
-        store_seq: StoreSeq::from_journal(seq),
-        journal_seq: seq,
-        last_batch_digest: Digest32([3; 32]),
-    };
+    let stamp = AppliedStamp::new(StoreSeq::from_journal(seq), Digest32([3; 32]));
+    assert_eq!(stamp.journal_seq(), seq);
     let bytes = stamp.to_envelope().unwrap();
     assert_eq!(AppliedStamp::from_envelope(&bytes).unwrap(), stamp);
     let wrong_kind = StoreEnvelopeV1 {
@@ -321,9 +318,17 @@ fn envelope_and_stamp_round_trip_and_reject_corruption() {
         AppliedStamp::from_envelope(&wrong_kind).unwrap_err().class,
         ErrorClass::Corrupt
     );
-    let mismatched = AppliedStamp {
+    // The API cannot build a mismatched stamp; bytes claiming one are corrupt.
+    #[derive(Serialize)]
+    struct RawStamp {
+        store_seq: StoreSeq,
+        journal_seq: LocalJournalSeq,
+        last_batch_digest: Digest32,
+    }
+    let mismatched = RawStamp {
         store_seq: StoreSeq::from_journal(LocalJournalSeq::new(8).unwrap()),
-        ..stamp
+        journal_seq: seq,
+        last_batch_digest: Digest32([3; 32]),
     };
     let bytes = StoreEnvelopeV1 {
         record_kind: STAMP_RECORD_KIND,
@@ -354,11 +359,7 @@ fn hex(b: &[u8]) -> String {
 #[test]
 fn registry_and_stamp_fixtures_are_frozen() {
     let seq = LocalJournalSeq::new(0x0102).unwrap();
-    let stamp = AppliedStamp {
-        store_seq: StoreSeq::from_journal(seq),
-        journal_seq: seq,
-        last_batch_digest: Digest32([0xab; 32]),
-    };
+    let stamp = AppliedStamp::new(StoreSeq::from_journal(seq), Digest32([0xab; 32]));
     let fixture = RegistryFixture {
         schema: "store_registry_v1".to_owned(),
         collections: Collection::ALL
