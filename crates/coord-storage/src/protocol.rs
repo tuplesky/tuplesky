@@ -15,6 +15,7 @@ use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, S
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ConfigurationEpoch, ExecutionPosition};
+use coord_types::logical_v1::LogicalRequest;
 use coord_types::{CommandId, RetryKey};
 
 use crate::codecs::{self, ExecutedRecordV1};
@@ -106,6 +107,24 @@ pub fn read_protocol<V: OrderedRead>(
     let mut syncs = Vec::new();
     let mut resume: Option<Vec<u8>> = None;
     let mut seen = 0u32;
+    // The budget bounds the whole recovery, not one page: every row of
+    // every page, and every payload and executed row read below, is
+    // charged against it, so a projection of many individually small rows
+    // cannot make recovery allocate without limit.
+    let mut bytes_left = budget.max_bytes;
+    let charge = |taken: usize, left: &mut u32| -> Result<(), EngineError> {
+        let taken = u32::try_from(taken).unwrap_or(u32::MAX);
+        match left.checked_sub(taken) {
+            Some(rest) => {
+                *left = rest;
+                Ok(())
+            }
+            None => Err(EngineError::new(
+                ErrorClass::Limit,
+                "protocol rows exceed the recovery byte budget",
+            )),
+        }
+    };
     loop {
         let page = view.scan_page(
             Collection::ProtocolV1.id(),
@@ -115,7 +134,7 @@ pub fn read_protocol<V: OrderedRead>(
                 direction: Direction::Forward,
                 resume_after: resume.clone(),
                 max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
-                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+                max_bytes: bytes_left.max(1).try_into().expect("non-zero"),
             },
         )?;
         for row in &page.rows {
@@ -126,6 +145,7 @@ pub fn read_protocol<V: OrderedRead>(
                     "protocol rows exceed the recovery budget",
                 ));
             }
+            charge(row.key.len() + row.value.len(), &mut bytes_left)?;
             match row.key.get(8) {
                 Some(&DEPENDENCY_TAG) if row.key.len() == 41 => {
                     let mut id = [0u8; 32];
@@ -149,13 +169,30 @@ pub fn read_protocol<V: OrderedRead>(
     for (command, record) in &records {
         if record.payload.is_some() {
             match view.get(Collection::PayloadV1.id(), &payload_key(command))? {
-                Some(bytes) => payloads.push((*command, decode_payload(&bytes)?)),
+                Some(bytes) => {
+                    charge(bytes.len(), &mut bytes_left)?;
+                    let payload = decode_payload(&bytes)?;
+                    // The row is only this command's payload if it rehashes
+                    // to this identity. A well-formed payload under the
+                    // wrong key would otherwise be bound to a retry key and
+                    // served to peers, and the mismatch would surface only
+                    // when the command executed.
+                    let request: LogicalRequest = postcard::from_bytes(&payload.logical)
+                        .map_err(|_| corrupt("recovered payload is not a canonical request"))?;
+                    let derived = CommandId::derive(&payload.retry_key, &request)
+                        .map_err(|_| corrupt("recovered payload has no derivable identity"))?;
+                    if derived != *command {
+                        return Err(corrupt("recovered payload does not match its command key"));
+                    }
+                    payloads.push((*command, payload));
+                }
                 None => return Err(corrupt("recovered command without its payload row")),
             }
         }
         if let Some(bytes) =
             view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))?
         {
+            charge(bytes.len(), &mut bytes_left)?;
             let ExecutedRecordV1 { position, .. } = codecs::decode_executed(&bytes)?;
             executed.push((*command, position));
         }

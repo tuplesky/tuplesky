@@ -25,10 +25,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use coord_consensus::rows::{dependency_update, payload_update};
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader,
     LeaderConfig, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole, SyncDecision,
 };
+use coord_consensus::{CONSERVATIVE_KEY, CommandRecord};
 use coord_core::capability::{AdmissionReceipt, EstablishedResult, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{
@@ -237,14 +239,18 @@ fn fresh_node(me: usize) -> Node {
     let boot = boot_id(me, 1);
     let mut worker = StoreWorker::open(engine, boot, inc(), GroupLimits::default()).unwrap();
     let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = worker.application_base();
     worker
         .submit(PersistBatch {
             barrier: alloc.allocate(),
-            base: None,
+            base: Some(base),
             updates: bootstrap_updates(),
         })
         .unwrap();
     worker.flush().unwrap();
+    // The bootstrap batch is ordered work: both machines resume from the
+    // application's durable execution position.
+    let executed_through = worker.application_base().execution_position;
     let applier = Applier::new(worker, alloc).unwrap();
     let role = if me == 0 {
         Role::Leader(Leader::new(
@@ -256,15 +262,22 @@ fn fresh_node(me: usize) -> Node {
                 capacity: 64,
             },
             None,
+            executed_through,
         ))
     } else {
-        Role::Follower(Follower::new(FollowerConfig {
-            identity: identity(me as u8),
-            quorum: quorum(ballot(0, 0)),
-            genesis: ballot(0, 0),
-            frontend: FRONTEND,
-            capacity: 64,
-        }))
+        Role::Follower(Follower::recover(
+            FollowerConfig {
+                identity: identity(me as u8),
+                quorum: quorum(ballot(0, 0)),
+                genesis: ballot(0, 0),
+                frontend: FRONTEND,
+                capacity: 64,
+            },
+            None,
+            core::iter::empty(),
+            core::iter::empty(),
+            executed_through,
+        ))
     };
     let mut node = Node {
         role: Some(role),
@@ -608,6 +621,8 @@ impl Cluster {
             },
             recovered.promise.clone(),
             recovered.records.clone(),
+            recovered.payloads.clone(),
+            frontier,
         )
         .restore_execution(frontier, executed)
         .restore_payloads(recovered.payloads.clone());
@@ -752,8 +767,21 @@ impl Cluster {
 /// executed identities recovered with the dependency rows must account
 /// for the application frontier (Section 5.2: a projection commit cannot
 /// compensate for a missing protocol row).
+/// Execution positions the ordered bootstrap batch occupies before any
+/// command runs: session and policy rows decide admission, so they are
+/// ordered work and advance the frontier.
+const BOOTSTRAP_POSITIONS: u64 = 1;
+
+/// The executed protocol rows must account for the application frontier:
+/// the last executed command sits exactly at it, or nothing has executed
+/// yet and the frontier has moved no further than the ordered bootstrap
+/// batch. A replica whose dependency rows were lost while its frontier
+/// advanced fails this check.
 fn recovery_consistent(recovered: &RecoveredProtocol, frontier: ExecutionPosition) -> bool {
-    recovered.executed_through() == frontier
+    match recovered.executed_through().get() {
+        0 => frontier.get() <= BOOTSTRAP_POSITIONS,
+        last => last == frontier.get(),
+    }
 }
 
 fn is_kv(op: &CanonicalOperation) -> bool {
@@ -922,7 +950,11 @@ fn acknowledged_outputs_retry_digests_and_lease_state_survive_a_lost_leader() {
     cluster.crash(1, Tail::Seeded(1));
     cluster.cut.clear();
     cluster.revive(1);
-    assert_eq!(cluster.nodes[1].executed_through().get(), 6);
+    // Six commands after the ordered bootstrap batch.
+    assert_eq!(
+        cluster.nodes[1].executed_through().get(),
+        6 + BOOTSTRAP_POSITIONS
+    );
     for c in &order {
         assert_eq!(
             cluster.nodes[1].follower().table().phase_of(c),
@@ -990,7 +1022,10 @@ fn acknowledged_outputs_retry_digests_and_lease_state_survive_a_lost_leader() {
         cluster.nodes[0].follower().ballots().promised(),
         ballot(0, 0)
     );
-    assert_eq!(cluster.nodes[0].executed_through().get(), 6);
+    assert_eq!(
+        cluster.nodes[0].executed_through().get(),
+        6 + BOOTSTRAP_POSITIONS
+    );
     assert_eq!(cluster.rows(0), rows_before);
 }
 
@@ -1069,7 +1104,7 @@ fn a_deliberately_omitted_durable_record_is_detected() {
     assert!(recovered.records.is_empty());
     assert_eq!(recovered.executed_through(), ExecutionPosition::ZERO);
     let frontier = worker.meta().frontier.execution_position;
-    assert_eq!(frontier.get(), 6);
+    assert_eq!(frontier.get(), 6 + BOOTSTRAP_POSITIONS);
     assert!(
         !recovery_consistent(&recovered, frontier),
         "the restart check fails closed"
@@ -1098,6 +1133,8 @@ fn a_deliberately_omitted_durable_record_is_detected() {
         },
         None,
         core::iter::empty(),
+        core::iter::empty(),
+        frontier,
     )
     .restore_execution(frontier, core::iter::empty());
     f.step(Event::Boot {
@@ -1354,4 +1391,137 @@ fn follower_restarts_at_every_persist_boundary_reproduce_the_acknowledged_outcom
         }
     }
     assert_eq!(covered as u64, total * 2);
+}
+
+#[test]
+fn recovery_refuses_a_payload_row_under_the_wrong_command_key() {
+    // A well-formed payload stored under another command's key is
+    // corruption, not a command: recovery must refuse it before the
+    // replica votes, rather than binding its retry key, serving it to
+    // peers and discovering the mismatch only at execution.
+    let (backend, _shared) = FaultBackend::new(Vec::new(), FaultPlan::default());
+    let engine = RedbEngine::create_on_backend(backend, CACHE).unwrap();
+    let boot = boot_id(0, 1);
+    let mut worker = StoreWorker::open(engine, boot, inc(), GroupLimits::default()).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = worker.application_base();
+    worker
+        .submit(PersistBatch {
+            barrier: alloc.allocate(),
+            base: Some(base),
+            updates: bootstrap_updates(),
+        })
+        .unwrap();
+    worker.flush().unwrap();
+    // A dependency row for `mine` whose payload row holds `other`'s bytes.
+    let mine = command_of(1);
+    let other = command_of(2);
+    assert_ne!(mine, other);
+    let record = CommandRecord {
+        phase: Phase::PreAccept,
+        deps: vec![],
+        keys: vec![CONSERVATIVE_KEY.to_vec()],
+        payload: Some(mine.0),
+        paths: vec![],
+        synced_seq: None,
+        path: coord_consensus::empty_path(),
+    };
+    let base = worker.application_base();
+    worker
+        .submit(PersistBatch {
+            barrier: alloc.allocate(),
+            base: Some(base),
+            updates: vec![
+                dependency_update(epoch(), &mine, &record).unwrap(),
+                payload_update(&mine, &payload_of(2)).unwrap(),
+            ],
+        })
+        .unwrap();
+    worker.flush().unwrap();
+    let gated = worker.reader().snapshot().unwrap();
+    let err = read_protocol(gated.view(), epoch(), ViewBudget::default())
+        .expect_err("the payload does not rehash to its key");
+    assert_eq!(err.class, coord_store_api::engine::ErrorClass::Corrupt);
+}
+
+#[test]
+fn recovery_charges_every_row_against_one_byte_budget() {
+    // The budget bounds the whole recovery: many rows that each fit a page
+    // must still be refused once their total exceeds it.
+    let (backend, _shared) = FaultBackend::new(Vec::new(), FaultPlan::default());
+    let engine = RedbEngine::create_on_backend(backend, CACHE).unwrap();
+    let boot = boot_id(0, 1);
+    let mut worker = StoreWorker::open(engine, boot, inc(), GroupLimits::default()).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = worker.application_base();
+    worker
+        .submit(PersistBatch {
+            barrier: alloc.allocate(),
+            base: Some(base),
+            updates: bootstrap_updates(),
+        })
+        .unwrap();
+    worker.flush().unwrap();
+    let mut updates = Vec::new();
+    for i in 0..32u64 {
+        let command = command_of(100 + i);
+        let record = CommandRecord {
+            phase: Phase::PreAccept,
+            deps: vec![],
+            keys: vec![CONSERVATIVE_KEY.to_vec()],
+            payload: Some(command.0),
+            paths: vec![],
+            synced_seq: None,
+            path: coord_consensus::empty_path(),
+        };
+        updates.push(dependency_update(epoch(), &command, &record).unwrap());
+        updates.push(payload_update(&command, &payload_of(100 + i)).unwrap());
+    }
+    let base = worker.application_base();
+    worker
+        .submit(PersistBatch {
+            barrier: alloc.allocate(),
+            base: Some(base),
+            updates,
+        })
+        .unwrap();
+    worker.flush().unwrap();
+    let gated = worker.reader().snapshot().unwrap();
+    // Generous rows, tight bytes: every row fits a page, the total does not.
+    let budget = ViewBudget {
+        max_rows: 10_000,
+        max_bytes: 1024,
+    };
+    let err = read_protocol(gated.view(), epoch(), budget)
+        .expect_err("the cumulative bytes exceed the budget");
+    assert_eq!(err.class, coord_store_api::engine::ErrorClass::Limit);
+    // The same rows load under a budget that admits them.
+    let recovered = read_protocol(gated.view(), epoch(), ViewBudget::default()).unwrap();
+    assert_eq!(recovered.records.len(), 32);
+}
+
+/// A canonical request whose identity is derived from sequence `seq`.
+fn request_of(seq: u64) -> LogicalRequest {
+    let mut r = LogicalRequest::new(
+        NS,
+        CanonicalOperation::Put(PutOp {
+            key: seq.to_be_bytes().to_vec(),
+            value: vec![7],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    r.canonicalize();
+    r
+}
+
+fn command_of(seq: u64) -> CommandId {
+    CommandId::derive(&retry_key(seq), &request_of(seq)).unwrap()
+}
+
+fn payload_of(seq: u64) -> coord_consensus::PayloadRecordV1 {
+    coord_consensus::PayloadRecordV1 {
+        retry_key: retry_key(seq),
+        logical: postcard::to_allocvec(&request_of(seq)).unwrap(),
+    }
 }

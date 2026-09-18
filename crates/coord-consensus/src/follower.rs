@@ -581,17 +581,16 @@ impl Follower {
                 .copied()
                 .collect();
             if !missing.is_empty() {
-                if campaign.payloads_requested() {
+                // Ask every promised voter that has not been asked yet, so a
+                // voter promising after the selection is still asked: the
+                // ones asked first may be gone while a live quorum holds the
+                // payload.
+                let me = self.config.identity.replica;
+                let voters = campaign.payload_requests_due(me);
+                if voters.is_empty() {
                     return Vec::new();
                 }
-                campaign.mark_payloads_requested();
-                let me = self.config.identity.replica;
-                let voters: Vec<ReplicaId> = campaign
-                    .promised()
-                    .iter()
-                    .filter(|v| **v != me)
-                    .copied()
-                    .collect();
+                campaign.mark_payloads_requested(&voters);
                 let context = self
                     .ballots
                     .context(boot, decision.ballot, LocalJournalSeq::ZERO);
@@ -648,6 +647,12 @@ impl Follower {
             if self.ballots.synced() == decision.ballot {
                 // Becoming the leader is part of activating the ballot,
                 // which waits for the synchronized row (see `activate`).
+                // A resumed campaign whose row is already durable and whose
+                // ballot is already active takes the role here instead,
+                // since there is nothing left to wait for.
+                if self.config.quorum.ballot() == decision.ballot {
+                    self.won = Some(decision);
+                }
             } else {
                 // A higher ballot was promised while the row was becoming
                 // durable: the bound Sync is void here and the campaign is
