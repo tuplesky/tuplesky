@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use coord_types::ids::KvRevision;
 use coord_types::logical_v1::{
     BranchOp, CanonicalOperation, Compare, CompareOperand, CompareResult, CompareTarget,
-    DeleteRangeOp, KeyRange, PutOp, RangeOp,
+    DeleteRangeOp, KeyRange, PutOp, RangeOp, limits,
 };
 
 use crate::history::{WatchEvent, WatchEventKind};
@@ -126,6 +126,15 @@ impl KvModel {
             h.update(&e.create_revision.to_be_bytes());
             h.update(&e.mod_revision.to_be_bytes());
             h.update(&e.version.to_be_bytes());
+            match &e.lease {
+                Some(l) => {
+                    h.update(&[1]);
+                    h.update(l);
+                }
+                None => {
+                    h.update(&[0]);
+                }
+            }
         }
         for (id, r) in &self.retries {
             h.update(&id.to_be_bytes());
@@ -207,7 +216,18 @@ impl KvModel {
                 let target = revision.get().min(self.revision);
                 if target > self.compact_floor {
                     self.compact_floor = target;
-                    self.history.retain(|(r, _), _| *r > target);
+                    // Keep the newest version (or tombstone) at or below the
+                    // floor for every key plus all newer versions, so a read
+                    // exactly at the floor stays answerable (Section 17.5).
+                    let mut newest: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+                    for (r, k) in self.history.keys() {
+                        if *r <= target {
+                            let e = newest.entry(k.clone()).or_insert(*r);
+                            *e = (*e).max(*r);
+                        }
+                    }
+                    self.history
+                        .retain(|(r, k), _| *r > target || newest.get(k) == Some(r));
                 }
                 ModelResponse {
                     revision: self.revision,
@@ -324,8 +344,10 @@ impl KvModel {
                 more: false,
             };
         }
+        // Zero selects the schema maximum page (`RangeOp` contract), never
+        // an unbounded page.
         let limit = if r.limit == 0 {
-            usize::MAX
+            limits::MAX_PAGE_LIMIT as usize
         } else {
             r.limit as usize
         };
