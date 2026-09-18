@@ -18,6 +18,7 @@ members = [
     "crates/coord-sim",
     "crates/coord-transport",
     "crates/coord-transport-testkit",
+    "crates/coord-transport-sim",
     "xtask",
     "tools/raft-engine-smoke",
 ]
@@ -47,6 +48,7 @@ coord-redb-faultkit = { path = "crates/coord-redb-faultkit" }
 coord-sim = { path = "crates/coord-sim" }
 coord-transport = { path = "crates/coord-transport" }
 coord-transport-testkit = { path = "crates/coord-transport-testkit" }
+coord-transport-sim = { path = "crates/coord-transport-sim" }
 
 # Encoding and identity (Section 16.2).
 postcard = { version = "=1.1.3", default-features = false, features = ["alloc"] }
