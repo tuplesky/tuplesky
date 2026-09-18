@@ -73,6 +73,19 @@ impl PathLog {
         }
     }
 
+    /// A log resumed at a synchronized digest with no pending suffix (used
+    /// when rebuilding from durable records).
+    pub fn resumed(digest: Digest32) -> Self {
+        PathLog {
+            synced_seq: None,
+            synced_hash: digest,
+            pending: Vec::new(),
+            head: digest,
+            early: BTreeMap::new(),
+            applied: BTreeSet::new(),
+        }
+    }
+
     /// Digest of the whole log: the path evidence for the next command.
     pub const fn head(&self) -> Digest32 {
         self.head

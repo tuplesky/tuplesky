@@ -113,6 +113,64 @@ impl CommandTable {
         }
     }
 
+    /// Rebuild a table from complete authoritative dependency rows
+    /// (design Section 4.7: derived indexes come from the records, never
+    /// from receipt order). The conflict index names, per key, the record
+    /// no other record of that key depends on; path logs resume at that
+    /// record's digest.
+    pub fn restore(
+        capacity: Option<usize>,
+        records: impl IntoIterator<Item = (CommandId, CommandRecord)>,
+    ) -> Self {
+        let mut table = CommandTable {
+            records: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            executed: BTreeSet::new(),
+            capacity,
+        };
+        for (c, r) in records {
+            table.records.insert(c, r);
+        }
+        let mut per_key: BTreeMap<Vec<u8>, Vec<CommandId>> = BTreeMap::new();
+        for (c, r) in &table.records {
+            if r.payload.is_none() {
+                continue;
+            }
+            for key in &r.keys {
+                per_key.entry(key.clone()).or_default().push(*c);
+            }
+        }
+        for (key, members) in per_key {
+            let depended: alloc::collections::BTreeSet<CommandId> = members
+                .iter()
+                .flat_map(|c| table.records[c].deps.iter().copied())
+                .collect();
+            let last = members
+                .iter()
+                .copied()
+                .filter(|c| !depended.contains(c))
+                .max();
+            let mut state = KeyState::default();
+            if let Some(last) = last {
+                let digest = table.records[&last]
+                    .paths
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, d)| *d)
+                    .unwrap_or_else(crate::graph::empty_path);
+                state.last = Some(last);
+                state.log = PathLog::resumed(digest);
+            }
+            table.keys.insert(key, state);
+        }
+        table
+    }
+
+    /// Every initialized record.
+    pub fn records(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
+        self.records.iter().filter(|(_, r)| r.payload.is_some())
+    }
+
     fn full(&self) -> bool {
         self.capacity.is_some_and(|c| self.records.len() >= c)
     }
