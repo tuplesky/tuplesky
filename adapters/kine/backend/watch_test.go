@@ -97,6 +97,20 @@ func TestWatchReplayToLiveHasNoGap(t *testing.T) {
 }
 
 // A future start delivers only revisions at or above it; a live (rev 0)
+// waitWatchers blocks until the domain has `n` open native watches, so a
+// test can write only once the watches it opened are anchored.
+func waitWatchers(t *testing.T, br *bridge, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if br.domain.Watchers() >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("only %d of %d watches opened", br.domain.Watchers(), n)
+}
+
 // watch starts right after the authoritative frontier.
 func TestWatchFutureAndLiveStart(t *testing.T) {
 	br := startBridge(t, bridgeOptions{})
@@ -106,6 +120,9 @@ func TestWatchFutureAndLiveStart(t *testing.T) {
 	defer cancel()
 	future := br.cli.Watch(ctx, key, clientv3.WithRev(5))
 	live := br.cli.Watch(ctx, key)
+	// A live watch is anchored at the frontier the bridge reads when the
+	// watch opens, so the writes below must not race that read.
+	waitWatchers(t, br, 2)
 	update(t, br.cli, key, "2", 2, 0) // 3
 	update(t, br.cli, key, "3", 3, 0) // 4
 	update(t, br.cli, key, "4", 4, 0) // 5
@@ -386,4 +403,86 @@ func TestSyncWaitTerminatesLaggardsAndCloseUnblocks(t *testing.T) {
 		t.Fatalf("watch after close: %v", err)
 	}
 	_ = server.HealthKey
+}
+
+// A watch that cannot synchronize must stay out of progress publication
+// until it is actually closed, not merely until its cancellation has
+// been requested. The domain publishes no processed marker, the watch's
+// key never moves while the domain's frontier advances to R, and the
+// terminated watch's teardown is deliberately delayed: neither the
+// bridge's per-watch progress timer nor its broadcast path may advertise
+// R to a watch that is still live and never delivered through it.
+func TestSynchronizationFailureWithholdsProgressUntilTheWatchIsActuallyClosed(t *testing.T) {
+	for _, broadcast := range []bool{false, true} {
+		name := "individual progress"
+		if broadcast {
+			name = "broadcast progress"
+		}
+		t.Run(name, func(t *testing.T) {
+			br := startBridge(t, bridgeOptions{
+				syncTimeout:    300 * time.Millisecond,
+				teardownDelay:  1200 * time.Millisecond,
+				notifyInterval: 150 * time.Millisecond,
+			})
+			// A source that never says it processed a revision: the
+			// watch's frontier can only move by delivering events.
+			br.domain.HoldProgress.Store(true)
+			ctx := ctxT(t)
+			wch := br.cli.Watch(ctx, "/registry/w",
+				clientv3.WithRev(1),
+				clientv3.WithProgressNotify(),
+				clientv3.WithCreatedNotify())
+			if created, ok := <-wch; !ok || !created.Created {
+				t.Fatalf("watch not created: %+v", created)
+			}
+			// The domain advances outside this watch's key: R is the
+			// frontier and this watch has delivered nothing through it.
+			started := time.Now()
+			resp := create(t, br.cli, "/registry/elsewhere", "v", 0)
+			target := resp.Header.Revision
+			if target <= 0 {
+				t.Fatalf("revision %d", target)
+			}
+			if broadcast {
+				// The API server asks for a broadcast progress report
+				// while the caches are syncing; the bridge answers it
+				// only when every watch is synced.
+				stop := make(chan struct{})
+				defer close(stop)
+				go func() {
+					for {
+						select {
+						case <-stop:
+							return
+						case <-time.After(50 * time.Millisecond):
+							_ = br.cli.RequestProgress(ctx)
+						}
+					}
+				}()
+			}
+			// The watch is terminated once it cannot synchronize; the
+			// stream ends with it. Nothing on it may advertise the
+			// frontier this watch never delivered through.
+			for answer := range wch {
+				if answer.Canceled {
+					continue
+				}
+				if len(answer.Events) > 0 {
+					t.Fatalf("events on a watch whose key never moved: %+v", answer.Events)
+				}
+				if answer.Header.Revision >= target {
+					t.Fatalf("progress advertised revision %d for a live watch that never delivered through %d",
+						answer.Header.Revision, target)
+				}
+			}
+			// The barrier is what held progress back: the wait could not
+			// return before the terminated watch's teardown finished.
+			if held := time.Since(started); held < 300*time.Millisecond+1200*time.Millisecond {
+				t.Fatalf("the watch ended after %v, before its teardown could finish", held)
+			}
+			if br.domain.Watchers() != 0 {
+				t.Fatal("the native watch outlived the terminated Kine watch")
+			}
+		})
+	}
 }

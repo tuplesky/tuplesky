@@ -248,6 +248,27 @@ func TestACredentialRefreshRollsTheSessionOverWithoutStrandingOldInvocations(t *
 	if _, _, err := be.Get(ctx, server.HealthKey, 0, false); err != nil {
 		t.Fatalf("read under the rolled-over session: %v", err)
 	}
+
+	// A lane opened for the first time after the refresh binds the
+	// rolled-over session as well: it is not refused for naming a
+	// session other than the one the first lane bound.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	result := be.Watch(watchCtx, "/registry/c", "", 0)
+	select {
+	case err := <-result.Errorc:
+		t.Fatalf("watch lane after the refresh: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if domain.Watchers() == 0 {
+		t.Fatal("the watch lane did not open after the refresh")
+	}
+	if session, ok := native.Session(); !ok || session != third {
+		t.Fatalf("the watch lane changed the session: %x", session)
+	}
+	if native.Rollovers != 2 {
+		t.Fatalf("the watch lane rolled the session over again: %d", native.Rollovers)
+	}
 }
 
 // A configured session pins the identity: an acknowledgement naming

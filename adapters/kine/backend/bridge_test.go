@@ -67,6 +67,11 @@ type bridgeOptions struct {
 	accountingPage  uint32
 	// syncTimeout bounds WaitForSyncTo.
 	syncTimeout time.Duration
+	// teardownDelay widens the window in which a terminated watch is
+	// cancelled but still live (fault injection).
+	teardownDelay time.Duration
+	// notifyInterval is the bridge's progress-report interval (default 5s).
+	notifyInterval time.Duration
 }
 
 func startDomain(t *testing.T) (*fakedomain.Server, *tls.Config) {
@@ -102,6 +107,7 @@ func startBridge(t *testing.T, opts bridgeOptions) *bridge {
 		AccountingPageLimit: opts.accountingPage,
 		AccountingMaxPages:  opts.accountingPages,
 		SyncTimeout:         opts.syncTimeout,
+		WatchTeardownDelay:  opts.teardownDelay,
 		Observer: func(e backend.Event) {
 			br.mu.Lock()
 			br.events = append(br.events, e)
@@ -126,7 +132,11 @@ func startBridge(t *testing.T, opts bridgeOptions) *bridge {
 		t.Fatal(err)
 	}
 	grpcServer := grpc.NewServer(ln.ServerOptions...)
-	server.New(be, ln.Scheme, 5*time.Second, "3.5.13").Register(grpcServer)
+	notify := opts.notifyInterval
+	if notify == 0 {
+		notify = 5 * time.Second
+	}
+	server.New(be, ln.Scheme, notify, "3.5.13").Register(grpcServer)
 	go func() { _ = grpcServer.Serve(ln) }()
 	t.Cleanup(grpcServer.Stop)
 	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{"unix://" + sock}, DialTimeout: 5 * time.Second})
