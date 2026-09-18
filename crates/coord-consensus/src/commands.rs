@@ -376,6 +376,17 @@ impl CommandTable {
         Ok(())
     }
 
+    /// Mark a command executed from durable evidence (its executed identity
+    /// row) without consulting the guards: the materializer already applied
+    /// it at its position. Unknown commands are ignored.
+    pub fn restore_executed(&mut self, command: &CommandId) {
+        if let Some(r) = self.records.get_mut(command)
+            && r.payload.is_some()
+        {
+            r.phase = Phase::Executed;
+        }
+    }
+
     /// Forget an executed command. Unresolved acceptance is never deleted
     /// for capacity. An executed command needs no successor to order after
     /// it (its effects are complete), so the conflict index stops naming

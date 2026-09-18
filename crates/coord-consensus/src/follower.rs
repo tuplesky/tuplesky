@@ -34,14 +34,19 @@ use coord_types::wire_v1::{MessageV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
+use crate::campaign::Campaign;
 use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::RecoveryReport;
+use crate::recovery::{RecoveryError, SyncDecision, SyncEntry};
+use crate::role::RecoveredState;
 use crate::rows::{PayloadRecordV1, PromiseRecordV1, dependency_update, payload_update};
+use crate::rows::{SyncRecordV1, promise_update, sync_update};
 use crate::summary::DurableLedger;
+use crate::summary::{MAX_PAGE_ENTRIES, PageError, paginate};
 use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
 
 /// Static configuration of a follower.
@@ -79,6 +84,15 @@ pub enum FollowerRejection {
     BatchFailed(CommandId),
     /// A proposal for another ballot or from a non-leader.
     ForeignProposal,
+    /// A Sync named a ballot at or below the synchronized one, or from
+    /// another epoch: the record never regresses.
+    SyncRegression(crate::ballot::SyncRejection),
+    /// The synchronized-ballot row of a Sync failed; nothing was
+    /// activated.
+    SyncNotDurable(Ballot),
+    /// A higher ballot was promised before the synchronized row became
+    /// durable; that cut supersedes this Sync.
+    SyncSuperseded(Ballot),
     /// A higher promise is in flight or durable, so the configured ballot
     /// no longer votes; the work belongs to the new leader.
     FencedByPromise {
@@ -94,7 +108,25 @@ pub enum FollowerRejection {
     /// A proposal of a ballot this replica no longer votes in.
     /// A payload response that does not rehash to its identity.
     PayloadIdentityMismatch(CommandId),
+    /// A report page was refused.
+    Page(PageError),
+    /// The campaign stopped: the selection failed with this evidence.
+    Campaign(RecoveryError),
+    /// A Sync for a ballot other than the promised one, or not from its
+    /// leader.
+    SyncRejected {
+        /// Sync ballot.
+        ballot: Ballot,
+        /// Promised ballot.
+        promised: Ballot,
+    },
+    /// A campaign was requested for a ballot this replica cannot lead.
+    CannotLead,
 }
+
+/// A report owed once every batch submitted before the cut is durable.
+/// A recovery report this replica owes a candidate.
+type ReportDue = crate::role::PendingReport;
 
 /// A leader proposal not yet adopted: held until the payload arrives and
 /// every dependency is at least ACCEPT.
@@ -143,6 +175,16 @@ pub struct Follower {
     served_payloads: alloc::collections::BTreeSet<CommandId>,
     ledger: DurableLedger,
     learner: Learner,
+    campaign: Option<Campaign>,
+    report_due: Option<ReportDue>,
+    sync_pending: BTreeMap<CommandId, SyncEntry>,
+    /// The Sync whose synchronized-ballot row is in flight: the new ballot
+    /// is activated only when that row is durable.
+    sync_barrier: Option<(BarrierId, SyncDecision)>,
+    won: Option<SyncDecision>,
+    /// Voting messages of the promised ballot that arrived before its Sync
+    /// (delivery is not ordered across peers); replayed once synchronized.
+    awaiting_sync: Vec<(ReplicaId, ProtocolMessage)>,
     rejections: Vec<FollowerRejection>,
 }
 
@@ -176,6 +218,7 @@ impl Follower {
             .collect();
         Follower {
             config,
+            sync_barrier: None,
             boot: None,
             alloc: None,
             outbox: None,
@@ -198,7 +241,469 @@ impl Follower {
             durable_payloads: BTreeMap::new(),
             ledger,
             learner: Learner::new(executed_through),
+            campaign: None,
+            report_due: None,
+            sync_pending: BTreeMap::new(),
+            won: None,
+            awaiting_sync: Vec::new(),
             rejections: Vec::new(),
+        }
+    }
+
+    /// Restore the durable execution frontier: the commands whose executed
+    /// identity rows exist are marked executed and the learner resumes
+    /// after `through`. Called before boot on a recovered follower; the
+    /// rows are the materializer's, written in the same batch as the
+    /// application rows (Section 6.5), so this never invents execution.
+    pub fn restore_execution(
+        mut self,
+        through: ExecutionPosition,
+        executed: impl IntoIterator<Item = CommandId>,
+    ) -> Self {
+        for c in executed {
+            self.table.restore_executed(&c);
+            self.adopted.entry(c).or_insert((u64::MAX, true));
+        }
+        self.learner = Learner::new(through);
+        self
+    }
+
+    /// A follower from state carried across a role change, under `quorum`.
+    pub fn from_recovered(state: RecoveredState, quorum: BallotConfiguration) -> Self {
+        Follower {
+            config: FollowerConfig {
+                identity: state.identity,
+                genesis: quorum.ballot(),
+                quorum,
+                frontend: state.frontend,
+                capacity: state.capacity,
+            },
+            boot: state.boot,
+            alloc: state.alloc,
+            outbox: state.outbox,
+            ballots: state.ballots,
+            table: state.table,
+            bindings: state.bindings,
+            held: BTreeMap::new(),
+            adopted: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            votes: BTreeMap::new(),
+            payloads: state.payloads,
+            durable_payloads: BTreeMap::new(),
+            served_payloads: state.served_payloads,
+            ledger: state.ledger,
+            learner: state.learner,
+            deferred: BTreeMap::new(),
+            campaign: None,
+            // A report owed to a candidate is an obligation of the replica,
+            // not of the role it held when the request arrived: dropping it
+            // would stall a candidate that needs this replica's majority.
+            report_due: state.report_due,
+            sync_pending: BTreeMap::new(),
+            sync_barrier: None,
+            won: None,
+            awaiting_sync: Vec::new(),
+            rejections: Vec::new(),
+        }
+    }
+
+    /// Give up the role: everything durable or learned, nothing
+    /// ballot-scoped.
+    pub fn into_recovered(self) -> RecoveredState {
+        RecoveredState {
+            identity: self.config.identity,
+            ballots: self.ballots,
+            table: self.table,
+            ledger: self.ledger,
+            payloads: self.payloads,
+            bindings: self.bindings,
+            served_payloads: self.served_payloads,
+            learner: self.learner,
+            boot: self.boot,
+            alloc: self.alloc,
+            outbox: self.outbox,
+            report_due: self.report_due,
+            frontend: self.config.frontend,
+            capacity: self.config.capacity,
+        }
+    }
+
+    /// The current ballot configuration.
+    pub const fn quorum(&self) -> &BallotConfiguration {
+        &self.config.quorum
+    }
+
+    /// The Sync this replica selected and activated as the new leader, if
+    /// its campaign won.
+    pub const fn won(&self) -> Option<&SyncDecision> {
+        self.won.as_ref()
+    }
+
+    /// The campaign in progress.
+    pub const fn campaign_state(&self) -> Option<&Campaign> {
+        self.campaign.as_ref()
+    }
+
+    /// Start a campaign for `ballot` (this replica must be its leader):
+    /// promise to itself durably, then ask every other voter.
+    pub fn campaign(&mut self, ballot: Ballot) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if ballot.leader != self.config.identity.replica {
+            self.rejections.push(FollowerRejection::CannotLead);
+            return Vec::new();
+        }
+        let Ok(config) = BallotConfiguration::c2_default(
+            self.config.identity.epoch,
+            ballot,
+            self.config.identity.voters.clone(),
+        ) else {
+            self.rejections.push(FollowerRejection::CannotLead);
+            return Vec::new();
+        };
+        let outstanding: Vec<BarrierId> = self.pending.keys().copied().collect();
+        let alloc = self.alloc.as_mut().expect("booted");
+        // A replica campaigning for itself: its own authenticated identity.
+        let me = PeerId {
+            replica: self.config.identity.replica,
+            incarnation: self.config.identity.incarnation,
+        };
+        let effects = match self
+            .ballots
+            .on_new_leader(me, ballot, boot, alloc, &outstanding)
+        {
+            Ok(e) => e,
+            Err(e) => {
+                self.rejections.push(FollowerRejection::Promise(e));
+                return Vec::new();
+            }
+        };
+        let Effect::Persist(batch) = &effects.persist else {
+            unreachable!("promise persists")
+        };
+        let promise_barrier = batch.barrier;
+        self.report_due = Some(ReportDue {
+            ballot,
+            to: PeerId {
+                replica: self.config.identity.replica,
+                incarnation: self.config.identity.incarnation,
+            },
+            requires: effects.reply.requires.clone(),
+        });
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut().expect("booted");
+        for voter in &self.config.identity.voters {
+            if *voter == self.config.identity.replica {
+                continue;
+            }
+            outbox.publish(PendingSend {
+                context,
+                requires: alloc::vec![promise_barrier],
+                to: PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: ProtocolMessage::NewLeader { ballot }.encode(),
+            });
+        }
+        self.campaign = Some(Campaign::new(config));
+        let mut out = alloc::vec![effects.persist];
+        out.extend(self.release());
+        out
+    }
+
+    /// Resume a campaign whose selection was durably bound before a crash:
+    /// the same decision is published again; nothing is reselected.
+    pub fn resume_campaign(&mut self, decision: SyncDecision) -> Vec<Effect> {
+        if decision.ballot.leader != self.config.identity.replica
+            || self.ballots.promised() != decision.ballot
+        {
+            self.rejections.push(FollowerRejection::CannotLead);
+            return Vec::new();
+        }
+        let Ok(config) = BallotConfiguration::c2_default(
+            self.config.identity.epoch,
+            decision.ballot,
+            self.config.identity.voters.clone(),
+        ) else {
+            self.rejections.push(FollowerRejection::CannotLead);
+            return Vec::new();
+        };
+        self.campaign = Some(Campaign::resumed(config, decision));
+        self.advance_campaign()
+    }
+
+    /// Deliver a report once every batch before its cut is durable: pages
+    /// to a candidate, or the own report to this replica's campaign.
+    fn deliver_due_report(&mut self) -> Vec<Effect> {
+        let Some(due) = self.report_due.clone() else {
+            return Vec::new();
+        };
+        let all_durable = self
+            .outbox
+            .as_ref()
+            .is_some_and(|o| due.requires.iter().all(|b| o.is_durable(b)));
+        if !all_durable {
+            return Vec::new();
+        }
+        self.report_due = None;
+        let report = self.report(due.ballot);
+        if due.to.replica == self.config.identity.replica {
+            if let Some(c) = self.campaign.as_mut()
+                && c.ballot() == due.ballot
+            {
+                c.own_report(report);
+            }
+            return self.advance_campaign();
+        }
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let context = self
+            .ballots
+            .context(boot, due.ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut().expect("booted");
+        for page in paginate(&report, MAX_PAGE_ENTRIES) {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: due.to,
+                frame: ProtocolMessage::ReportPage(page).encode(),
+            });
+        }
+        self.release()
+    }
+
+    /// Select once a majority of complete reports is in, bind the result
+    /// durably, then publish and activate it.
+    fn advance_campaign(&mut self) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let Some(campaign) = self.campaign.as_mut() else {
+            return Vec::new();
+        };
+        if campaign.decision().is_none() {
+            match campaign.try_select() {
+                Ok(None) => return Vec::new(),
+                Ok(Some(_)) => {}
+                Err(e) => {
+                    self.rejections.push(FollowerRejection::Campaign(e));
+                    self.campaign = None;
+                    return Vec::new();
+                }
+            }
+        }
+        if campaign.binding().is_none() && !campaign.is_durable() {
+            let decision = campaign.decision().expect("selected").clone();
+            let barrier = self.alloc.as_mut().expect("booted").allocate();
+            campaign.bound(barrier);
+            let update = sync_update(self.config.identity.epoch, &SyncRecordV1 { decision })
+                .expect("bounded");
+            return alloc::vec![Effect::Persist(PersistBatch {
+                barrier,
+                base: None,
+                updates: alloc::vec![update],
+            })];
+        }
+        if campaign.is_durable() && !campaign.is_published() {
+            let decision = campaign.decision().expect("selected").clone();
+            campaign.mark_published();
+            let context = self
+                .ballots
+                .context(boot, decision.ballot, LocalJournalSeq::ZERO);
+            let outbox = self.outbox.as_mut().expect("booted");
+            for voter in &self.config.identity.voters {
+                if *voter == self.config.identity.replica {
+                    continue;
+                }
+                outbox.publish(PendingSend {
+                    context,
+                    requires: Vec::new(),
+                    to: PeerId {
+                        replica: *voter,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: ProtocolMessage::Sync(decision.clone()).encode(),
+                });
+            }
+            let leader = decision.ballot.leader;
+            let mut out = self.on_sync(leader, decision.clone());
+            if self.ballots.synced() == decision.ballot {
+                // Becoming the leader is part of activating the ballot,
+                // which waits for the synchronized row (see `activate`).
+            } else {
+                // A higher ballot was promised while the row was becoming
+                // durable: the bound Sync is void here and the campaign is
+                // lost; the new ballot's leader recovers from the rows.
+                self.campaign = None;
+            }
+            out.extend(self.release());
+            return out;
+        }
+        Vec::new()
+    }
+
+    /// Whether a voting message belongs to the promised ballot whose Sync
+    /// has not arrived yet: it is held (bounded by the table capacity)
+    /// rather than rejected, since the leader publishes its re-proposals
+    /// right after the Sync and peers may deliver them first.
+    fn stash_until_sync(&self, message: &ProtocolMessage) -> bool {
+        let ballot = match message {
+            ProtocolMessage::Proposal(a) | ProtocolMessage::FastAck(a) => a.ballot,
+            ProtocolMessage::SlowAck(a) => a.ballot,
+            _ => return false,
+        };
+        ballot == self.ballots.promised()
+            && ballot != self.config.quorum.ballot()
+            && self.ballots.in_flight().is_none()
+            && self.awaiting_sync.len() < self.config.capacity
+    }
+
+    /// Replay the messages held for the ballot just synchronized.
+    fn replay_awaiting(&mut self) -> Vec<Effect> {
+        let held = core::mem::take(&mut self.awaiting_sync);
+        let mut effects = Vec::new();
+        for (from, message) in held {
+            effects.extend(match message {
+                ProtocolMessage::Proposal(p) => self.on_proposal(from, p),
+                ProtocolMessage::FastAck(a) => self.collect(from, Vote::Fast(a)),
+                ProtocolMessage::SlowAck(a) => self.collect(from, Vote::Slow(a)),
+                _ => Vec::new(),
+            });
+        }
+        effects
+    }
+
+    /// Adopt a Sync: only for the ballot this replica promised and from
+    /// its leader. The synchronized ballot is persisted, the entries are
+    /// installed under the guards (missing payloads are fetched first),
+    /// the ballot's fast set is activated and ballot-scoped votes reset.
+    pub fn on_sync(&mut self, from: ReplicaId, decision: SyncDecision) -> Vec<Effect> {
+        let promised = self.ballots.promised();
+        if decision.ballot != promised || from != decision.ballot.leader {
+            self.rejections.push(FollowerRejection::SyncRejected {
+                ballot: decision.ballot,
+                promised,
+            });
+            return Vec::new();
+        }
+        let already_synced = self.ballots.synced() == decision.ballot;
+        if already_synced && self.config.quorum.ballot() == decision.ballot {
+            // Duplicate Sync of the active ballot: converges without change.
+            return Vec::new();
+        }
+        if !already_synced {
+            // The synchronized ballot becomes a fact before anything of the
+            // new ballot happens: activating first would let adoption rows
+            // and acknowledgements of the new ballot become durable while
+            // the synchronized ballot exists only in memory, so a crash in
+            // that window would recover the old source state next to new
+            // ballot votes.
+            let record = match self.ballots.mark_synced(decision.ballot) {
+                Ok(record) => record,
+                Err(rejection) => {
+                    self.rejections
+                        .push(FollowerRejection::SyncRegression(rejection));
+                    return Vec::new();
+                }
+            };
+            let barrier = self.alloc.as_mut().expect("booted").allocate();
+            self.sync_barrier = Some((barrier, decision));
+            return alloc::vec![Effect::Persist(PersistBatch {
+                barrier,
+                base: None,
+                updates: alloc::vec![
+                    promise_update(self.config.identity.epoch, &record).expect("bounded")
+                ],
+            })];
+        }
+        // The promise row already records this synchronized ballot (a
+        // recovered replica, or the row just became durable): activating
+        // and installing are idempotent.
+        self.activate(decision)
+    }
+
+    /// Activate `decision`'s ballot: its fast set, its entries, and the
+    /// messages held while the cut was open. Called only once the
+    /// synchronized-ballot row is durable.
+    fn activate(&mut self, decision: SyncDecision) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        // The replica that selected this Sync leads the new ballot from
+        // here: the role changes only once the ballot is this replica's.
+        if decision.ballot.leader == self.config.identity.replica && self.campaign.is_some() {
+            self.won = Some(decision.clone());
+        }
+        self.config.quorum = BallotConfiguration::c2_default(
+            self.config.identity.epoch,
+            decision.ballot,
+            self.config.identity.voters.clone(),
+        )
+        .expect("valid ballot");
+        self.votes.clear();
+        self.held.clear();
+        self.adopted.clear();
+        for (c, e) in &decision.entries {
+            if self.table.phase_of(c).is_none() {
+                let _ = self.table.expect(*c);
+            }
+            self.sync_pending.insert(*c, e.clone());
+        }
+        effects.extend(self.advance_sync());
+        effects.extend(self.replay_awaiting());
+        effects
+    }
+
+    /// Install every Sync entry whose payload is known and whose
+    /// dependencies are at least ACCEPT; repeat while progress is made.
+    fn advance_sync(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        loop {
+            let ready: Vec<CommandId> = self
+                .sync_pending
+                .iter()
+                .filter(|(c, e)| {
+                    self.table.phase_of(c).is_some()
+                        && crate::phase::guard_accept(&e.deps, |d| self.table.phase_of(d)).is_ok()
+                })
+                .map(|(c, _)| *c)
+                .collect();
+            if ready.is_empty() {
+                self.learn();
+                return effects;
+            }
+            for command in ready {
+                let entry = self.sync_pending.remove(&command).expect("ready");
+                // The selected order replaces a local one that is merely
+                // accepted: an ACCEPT record from a lower synchronized
+                // ballot may legally disagree with the chosen entry, and
+                // keeping it would execute against another dependency
+                // graph than the replicas that installed the selection.
+                // Committed and executed records keep their dependencies.
+                if self.table.phase_of(&command) < Some(Phase::Commit)
+                    && self.table.accept(command, entry.deps.clone()).is_err()
+                {
+                    continue;
+                }
+                if entry.phase == Phase::Commit
+                    && self.table.phase_of(&command) < Some(Phase::Commit)
+                {
+                    let _ = self.table.commit(command);
+                }
+                let record = self.table.record(&command).expect("installed").clone();
+                let barrier = self.alloc.as_mut().expect("booted").allocate();
+                effects.push(Effect::Persist(PersistBatch {
+                    barrier,
+                    base: None,
+                    updates: alloc::vec![
+                        dependency_update(self.config.identity.epoch, &command, &record)
+                            .expect("bounded")
+                    ],
+                }));
+                self.pending.insert(barrier, Pending::Adoption(command));
+                self.ledger.stage(barrier, command, record);
+            }
         }
     }
 
@@ -221,11 +726,16 @@ impl Follower {
 
     /// Commands known by identity (a held proposal) without a payload.
     pub fn missing_payloads(&self) -> Vec<CommandId> {
-        self.held
+        let mut out: Vec<CommandId> = self
+            .held
             .keys()
+            .chain(self.sync_pending.keys())
             .filter(|c| self.table.phase_of(c).is_none())
             .copied()
-            .collect()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Ask `from` for the payloads this replica lacks; the request has no
@@ -507,8 +1017,9 @@ impl Follower {
             );
             self.publish_to_voters_and_frontend(barrier, ProtocolMessage::FastAck(ack));
         }
-        // A proposal that arrived before the payload can now be adopted
-        // (once its dependencies allow it).
+        // A proposal (or Sync entry) that arrived before the payload can now
+        // be adopted (once its dependencies allow it).
+        effects.extend(self.advance_sync());
         effects.extend(self.advance_pending());
         effects
     }
@@ -576,10 +1087,14 @@ impl Follower {
             }
             for command in ready {
                 let held = self.held.remove(&command).expect("ready");
-                if self
-                    .table
-                    .accept(command, held.proposal.deps.clone())
-                    .is_err()
+                // A command already learned or executed (installed from a
+                // Sync, or durable across a restart) keeps its phase: the
+                // re-proposal only supplies the new ballot's order.
+                if self.table.phase_of(&command) < Some(Phase::Commit)
+                    && self
+                        .table
+                        .accept(command, held.proposal.deps.clone())
+                        .is_err()
                 {
                     continue;
                 }
@@ -621,6 +1136,42 @@ impl Follower {
             outbox.observe(event);
         }
         self.ballots.on_storage(event);
+        // The synchronized-ballot row carries its own barrier, which is not
+        // one of the pending vote or adoption batches: the new ballot
+        // becomes this replica's only when that row is a fact.
+        if let Some(barrier) = event.barrier()
+            && self
+                .sync_barrier
+                .as_ref()
+                .is_some_and(|(b, _)| *b == barrier)
+        {
+            let (_, decision) = self.sync_barrier.take().expect("checked");
+            let mut out = match event {
+                StorageEvent::JournalDurable { .. } => {
+                    // Unless a higher ballot was promised while the row was
+                    // becoming durable: that cut supersedes this one and its
+                    // leader recovers from the rows.
+                    if self.ballots.promised() == decision.ballot {
+                        self.activate(decision)
+                    } else {
+                        self.rejections
+                            .push(FollowerRejection::SyncSuperseded(decision.ballot));
+                        Vec::new()
+                    }
+                }
+                StorageEvent::Failed { .. } => {
+                    self.rejections
+                        .push(FollowerRejection::SyncNotDurable(decision.ballot));
+                    Vec::new()
+                }
+                _ => {
+                    self.sync_barrier = Some((barrier, decision));
+                    Vec::new()
+                }
+            };
+            out.extend(self.release());
+            return out;
+        }
         if let Some(barrier) = event.barrier()
             && let Some(pending) = self.pending.get(&barrier).cloned()
         {
@@ -658,8 +1209,18 @@ impl Follower {
                 _ => {}
             }
         }
+        let mut out = Vec::new();
+        if let (Some(barrier), StorageEvent::JournalDurable { .. }) = (event.barrier(), event)
+            && let Some(c) = self.campaign.as_mut()
+            && c.binding() == Some(barrier)
+        {
+            c.on_durable(barrier);
+            out.extend(self.advance_campaign());
+        }
+        out.extend(self.deliver_due_report());
         self.learn();
-        self.release()
+        out.extend(self.release());
+        out
     }
 
     fn release(&mut self) -> Vec<Effect> {
@@ -686,6 +1247,12 @@ impl Follower {
                     .on_new_leader(from, ballot, boot, alloc, &outstanding)
                 {
                     Ok(effects) => {
+                        self.awaiting_sync.clear();
+                        self.report_due = Some(ReportDue {
+                            ballot,
+                            to: from,
+                            requires: effects.reply.requires.clone(),
+                        });
                         if let Some(outbox) = self.outbox.as_mut() {
                             outbox.publish(effects.reply);
                         }
@@ -699,6 +1266,35 @@ impl Follower {
                     }
                 }
             }
+            ProtocolMessage::Promise {
+                ballot, replica, ..
+            } => {
+                if let Some(c) = self.campaign.as_mut()
+                    && c.ballot() == ballot
+                    && replica == from.replica
+                {
+                    c.promise(replica);
+                }
+                self.advance_campaign()
+            }
+            ProtocolMessage::ReportPage(page) => {
+                if let Some(c) = self.campaign.as_mut()
+                    && let Err(e) = c.page(page)
+                {
+                    self.rejections.push(FollowerRejection::Page(e));
+                    return Vec::new();
+                }
+                self.advance_campaign()
+            }
+            ProtocolMessage::Sync(decision) => self.on_sync(from.replica, decision),
+            ProtocolMessage::Proposal(_)
+            | ProtocolMessage::FastAck(_)
+            | ProtocolMessage::SlowAck(_)
+                if self.stash_until_sync(&message) =>
+            {
+                self.awaiting_sync.push((from.replica, message));
+                Vec::new()
+            }
             ProtocolMessage::Proposal(p) => self.on_proposal(from.replica, p),
             ProtocolMessage::FastAck(ack) => self.collect(from.replica, Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => self.collect(from.replica, Vote::Slow(ack)),
@@ -708,9 +1304,7 @@ impl Follower {
             ProtocolMessage::PayloadResponse { command, payload } => {
                 self.on_payload(command, payload)
             }
-            ProtocolMessage::Promise { .. }
-            | ProtocolMessage::LeaderReply { .. }
-            | ProtocolMessage::ReportPage(_) => Vec::new(),
+            ProtocolMessage::LeaderReply { .. } => Vec::new(),
         }
     }
 
