@@ -92,6 +92,11 @@ type Config struct {
 	WatchReconnectAttempts int
 	// WatchReconnectBackoff is the base delay between reopen attempts.
 	WatchReconnectBackoff time.Duration
+	// WatchTeardownDelay pauses a terminated watch's teardown between the
+	// cancellation request and closing its delivery channel. It is a
+	// fault-injection hook for the cancellation barrier of WaitForSyncTo
+	// and is zero in production.
+	WatchTeardownDelay time.Duration
 }
 
 // Backend is the coord:// backend of one domain.
