@@ -183,13 +183,10 @@ impl FixtureStore {
         let mut v = ReadView::empty(base, NS, KvRevision::new(self.revision).unwrap());
         v.current = self.current.clone();
         v.compact_floor = KvRevision::new(self.floor).unwrap();
-        if let CanonicalOperation::Range(RangeOp {
-            revision: Some(r), ..
-        }) = op
-            && r.get() <= self.revision
-            && r.get() >= self.floor
-        {
-            v.historical = Some(self.historical(r.get()));
+        for r in coord_state::historical_revisions(op) {
+            if r.get() <= self.revision && r.get() >= self.floor {
+                v.historical.push(self.historical(r.get()));
+            }
         }
         v
     }

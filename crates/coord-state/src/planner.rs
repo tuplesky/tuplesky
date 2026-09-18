@@ -7,7 +7,7 @@ use coord_types::error::ValidationError;
 use coord_types::ids::{KvRevision, LeaseId};
 use coord_types::logical_v1::{
     BranchOp, CanonicalOperation, Compare, CompareOperand, CompareResult, CompareTarget,
-    DeleteRangeOp, KeyRange, LogicalRequest, PutOp, RangeOp,
+    DeleteRangeOp, KeyRange, LogicalRequest, PutOp, RangeOp, limits,
 };
 
 use crate::limits::PlanLimits;
@@ -93,6 +93,19 @@ fn response_cost(items: &[RangeItem]) -> usize {
         .sum()
 }
 
+/// Estimated encoded size of a complete outcome, transaction results
+/// included, so the response budget applies to the whole response and not
+/// only to each range result on its own.
+fn outcome_cost(outcome: &Outcome) -> usize {
+    match outcome {
+        Outcome::Put { prev } => prev.as_ref().map_or(0, |e| e.value.len() + 48),
+        Outcome::Delete { prev, .. } => response_cost(prev),
+        Outcome::Range { items, .. } => response_cost(items),
+        Outcome::Txn { results, .. } => results.iter().map(outcome_cost).sum(),
+        Outcome::Compacted | Outcome::ErrCompacted | Outcome::ErrFutureRevision => 0,
+    }
+}
+
 fn read(
     view: &ReadView,
     overlay: &Overlay<'_>,
@@ -112,11 +125,7 @@ fn read(
             if rev < view.compact_floor {
                 return Ok(Outcome::ErrCompacted);
             }
-            let hist = view
-                .historical
-                .as_ref()
-                .filter(|h| h.revision == rev)
-                .ok_or(PlanError::ViewIncomplete)?;
+            let hist = view.historical_at(rev).ok_or(PlanError::ViewIncomplete)?;
             let in_range = |k: &[u8]| match &r.range.range_end {
                 None => k == r.range.key.as_slice(),
                 Some(end) => k >= r.range.key.as_slice() && k < end.as_slice(),
@@ -139,8 +148,10 @@ fn read(
             more: false,
         });
     }
+    // Zero selects the schema maximum page (`RangeOp` contract), never an
+    // unbounded page.
     let limit = if r.limit == 0 {
-        usize::MAX
+        limits::MAX_PAGE_LIMIT as usize
     } else {
         r.limit as usize
     };
@@ -295,10 +306,10 @@ pub fn plan(
         .execution_position
         .checked_next()
         .map_err(|_| PlanError::CounterOverflow)?;
-    let next_revision = view
-        .kv_revision
-        .checked_next()
-        .map_err(|_| PlanError::CounterOverflow)?;
+    // The next KV revision is only needed by a branch that emits events;
+    // reads, compaction, empty deletes and read-only transactions still plan
+    // at `KvRevision::MAX` because they consume no revision.
+    let next_revision = view.kv_revision.checked_next().ok();
     let mut overlay = Overlay {
         view,
         changed: BTreeMap::new(),
@@ -311,7 +322,7 @@ pub fn plan(
             view,
             &mut overlay,
             p,
-            next_revision,
+            next_revision.ok_or(PlanError::CounterOverflow)?,
             &mut mutations,
             &mut events,
         )?,
@@ -329,7 +340,7 @@ pub fn plan(
                         view,
                         &mut overlay,
                         p,
-                        next_revision,
+                        next_revision.ok_or(PlanError::CounterOverflow)?,
                         &mut mutations,
                         &mut events,
                     )?,
@@ -355,7 +366,7 @@ pub fn plan(
     if events.len() > limits.max_events_per_revision {
         return Err(PlanError::TooManyEvents);
     }
-    let response_bytes: usize = events
+    let event_bytes: usize = events
         .iter()
         .map(|e| {
             e.key.len()
@@ -363,16 +374,18 @@ pub fn plan(
                 + e.prev.as_ref().map_or(0, |x| x.value.len())
         })
         .sum();
-    if response_bytes > limits.max_response_bytes {
+    // The budget covers the complete response: every transaction result
+    // plus the events, not each range result on its own.
+    if outcome_cost(&outcome).saturating_add(event_bytes) > limits.max_response_bytes {
         return Err(PlanError::ResponseTooLarge);
     }
     let mutates = !events.is_empty();
-    let revision = if mutates { Some(next_revision) } else { None };
-    let header = if mutates {
-        next_revision
+    let revision = if mutates {
+        Some(next_revision.ok_or(PlanError::CounterOverflow)?)
     } else {
-        view.kv_revision
+        None
     };
+    let header = revision.unwrap_or(view.kv_revision);
     Ok(ApplyPlan {
         base: view.base,
         position,

@@ -28,7 +28,7 @@ pub mod view;
 pub use limits::PlanLimits;
 pub use plan::{ApplyPlan, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
 pub use planner::{PlanError, plan};
-pub use view::{HistoricalView, KvEntry, ReadView};
+pub use view::{HistoricalView, KvEntry, ReadView, historical_revisions};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "core";
