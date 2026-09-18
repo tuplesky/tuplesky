@@ -20,7 +20,9 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout;
 
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
-use crate::frames::{FrameError, read_frame};
+use crate::frames::{
+    ControlStream, FrameError, KIND_PEER_EVIDENCE, PEER_EVIDENCE_VERSION, read_frame,
+};
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 
 /// Identity of one connection at this endpoint (never reused).
@@ -404,7 +406,7 @@ impl Transport {
         local_role: PeerRole,
         local_incarnation: Option<ReplicaIncarnation>,
         expected: &BoundIdentity,
-    ) -> Result<(BoundIdentity, RecvStream), CloseReason> {
+    ) -> Result<(BoundIdentity, ControlStream), CloseReason> {
         let shared = &self.shared;
         let certs = peer_certs(conn)?;
         // Bind the server's certificate to the identity we expect before
@@ -425,7 +427,7 @@ impl Transport {
         if bound.replica != expected.replica || bound.incarnation != expected.incarnation {
             return Err(CloseReason::Rejected("identity".into()));
         }
-        let (mut send, mut recv) = timeout(shared.limits.handshake_timeout, conn.open_bi())
+        let (mut send, recv) = timeout(shared.limits.handshake_timeout, conn.open_bi())
             .await
             .map_err(|_| CloseReason::Timeout)?
             .map_err(|e| CloseReason::Transport(e.to_string()))?;
@@ -442,7 +444,9 @@ impl Transport {
         send.write_all(&hello)
             .await
             .map_err(|e| CloseReason::Transport(e.to_string()))?;
-        let frame = read_frame(&mut recv, shared.limits.handshake_timeout, false)
+        let mut control = ControlStream::new(recv);
+        let frame = control
+            .next_frame(shared.limits.handshake_timeout)
             .await
             .map_err(frame_reason)?;
         match decode(&frame) {
@@ -453,7 +457,7 @@ impl Transport {
                     incarnation: bound.incarnation,
                     capabilities: ack.capabilities.as_slice().to_vec(),
                 },
-                recv,
+                control,
             )),
             Ok(MessageV1::Close(c)) => Err(CloseReason::PeerClosed { code: c.code }),
             Ok(_) => Err(CloseReason::Malformed("expected hello ack".into())),
@@ -486,14 +490,23 @@ impl Transport {
             .get(&id)
             .cloned()
             .ok_or(SendError::NotConnected)?;
-        let mut send = timeout(self.shared.limits.frame_timeout, peer.conn.open_uni())
-            .await
-            .map_err(|_| SendError::Timeout)?
-            .map_err(|e| SendError::Stream(e.to_string()))?;
-        send.write_all(&frame)
-            .await
-            .map_err(|e| SendError::Stream(e.to_string()))?;
-        send.finish().map_err(|e| SendError::Stream(e.to_string()))
+        // The deadline covers the whole frame, not only the open: a peer
+        // that stops granting flow-control credit completes the open and
+        // then leaves the write pending forever, which would hang a
+        // consensus sender despite the documented bound.
+        timeout(self.shared.limits.frame_timeout, async {
+            let mut send = peer
+                .conn
+                .open_uni()
+                .await
+                .map_err(|e| SendError::Stream(e.to_string()))?;
+            send.write_all(&frame)
+                .await
+                .map_err(|e| SendError::Stream(e.to_string()))?;
+            send.finish().map_err(|e| SendError::Stream(e.to_string()))
+        })
+        .await
+        .map_err(|_| SendError::Timeout)?
     }
 
     /// Close every connection and wait at most `deadline` for the
@@ -618,7 +631,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
     }
 }
 
-type Negotiated = (Class, BoundIdentity, RecvStream);
+type Negotiated = (Class, BoundIdentity, ControlStream);
 
 async fn negotiate_incoming(
     shared: &Shared,
@@ -626,13 +639,13 @@ async fn negotiate_incoming(
 ) -> Result<Negotiated, (CloseReason, Option<SendStream>)> {
     let class = negotiated_class(conn).map_err(|r| (r, None))?;
     let certs = peer_certs(conn).map_err(|r| (r, None))?;
-    let (mut send, mut recv) =
-        match timeout(shared.limits.handshake_timeout, conn.accept_bi()).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => return Err((CloseReason::Transport(e.to_string()), None)),
-            Err(_) => return Err((CloseReason::Timeout, None)),
-        };
-    let frame = match read_frame(&mut recv, shared.limits.handshake_timeout, false).await {
+    let (mut send, recv) = match timeout(shared.limits.handshake_timeout, conn.accept_bi()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err((CloseReason::Transport(e.to_string()), None)),
+        Err(_) => return Err((CloseReason::Timeout, None)),
+    };
+    let mut control = ControlStream::new(recv);
+    let frame = match control.next_frame(shared.limits.handshake_timeout).await {
         Ok(f) => f,
         Err(e) => return Err((frame_reason(e), Some(send))),
     };
@@ -693,7 +706,7 @@ async fn negotiate_incoming(
             incarnation: bound.incarnation,
             capabilities: granted,
         },
-        recv,
+        control,
     ))
 }
 
@@ -704,8 +717,8 @@ async fn park_control(send: SendStream, conn: quinn::Connection) {
 }
 
 /// Serve a negotiated connection until it closes.
-async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control_recv: RecvStream) {
-    tokio::spawn(watch_control(peer.clone(), control_recv));
+async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
+    tokio::spawn(watch_control(peer.clone(), control));
     let reason = loop {
         match peer.class {
             Class::Peer => match peer.conn.accept_uni().await {
@@ -740,9 +753,9 @@ async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control_recv: RecvStream) {
 }
 
 /// Watch the control stream for an orderly `Close`.
-async fn watch_control(peer: Arc<Peer>, mut recv: RecvStream) {
+async fn watch_control(peer: Arc<Peer>, mut control: ControlStream) {
     loop {
-        match read_frame(&mut recv, Duration::from_secs(3600), false).await {
+        match control.next_frame(Duration::from_secs(3600)).await {
             Ok(frame) => match decode(&frame) {
                 Ok(MessageV1::Close(c)) => {
                     *peer.close_reason.lock().unwrap() =
@@ -774,6 +787,20 @@ async fn watch_control(peer: Arc<Peer>, mut recv: RecvStream) {
 async fn read_uni(shared: Arc<Shared>, peer: Arc<Peer>, mut recv: RecvStream) {
     match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
         Ok(frame) => {
+            // The frame reader checks lengths and class limits, not what
+            // the frame is. A peer stream carries peer evidence of a
+            // version this build understands and nothing else; anything
+            // else is a protocol violation and closes the connection
+            // rather than reaching consensus as authenticated input.
+            if frame.kind != KIND_PEER_EVIDENCE || frame.version != PEER_EVIDENCE_VERSION {
+                let reason = CloseReason::Malformed(format!(
+                    "peer frame kind {:#06x} version {}",
+                    frame.kind, frame.version
+                ));
+                *peer.close_reason.lock().unwrap() = Some(reason.clone());
+                peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+                return;
+            }
             let (Some(replica), Some(incarnation)) =
                 (peer.identity.replica, peer.identity.incarnation)
             else {
@@ -798,6 +825,18 @@ async fn read_uni(shared: Arc<Shared>, peer: Arc<Peer>, mut recv: RecvStream) {
     }
 }
 
+/// Whether a client may open a request stream with this message. Replies
+/// and handshake messages never originate at a client.
+const fn client_request(message: &MessageV1) -> bool {
+    matches!(
+        message,
+        MessageV1::Request(_)
+            | MessageV1::ResolveRequest(_)
+            | MessageV1::WatchOpen(_)
+            | MessageV1::WatchClose(_)
+    )
+}
+
 async fn read_request(
     shared: Arc<Shared>,
     peer: Arc<Peer>,
@@ -806,6 +845,24 @@ async fn read_request(
 ) {
     match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
         Ok(frame) => {
+            // Decode here, at the boundary, and accept only what a client
+            // may open a request stream with. Emitting an undecodable
+            // frame, a server-origin message or a handshake message as an
+            // API request would make the malformed-frame contract the duty
+            // of every consumer downstream.
+            let reason = match decode(&frame) {
+                Ok(m) if client_request(&m) => None,
+                Ok(m) => Some(CloseReason::Malformed(format!(
+                    "api frame {:?} is not a request",
+                    m.kind()
+                ))),
+                Err(e) => Some(CloseReason::Malformed(format!("{e:?}"))),
+            };
+            if let Some(reason) = reason {
+                *peer.close_reason.lock().unwrap() = Some(reason.clone());
+                peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+                return;
+            }
             shared
                 .emit(TransportEvent::ApiRequest {
                     connection: peer.id,
