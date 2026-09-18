@@ -60,6 +60,11 @@
 //!   execution; retry admission and result resolution require an
 //!   executable session, so a retired or rule-invalidated session cannot
 //!   read cached outcomes.
+//! * Speculation (task-29): [`speculate`] computes a proposal's tentative
+//!   result over a disposable, bounded overlay of the durable view plus
+//!   the tentative plans of the leader's earlier proposals; the consensus
+//!   release gate releases it only once the whole prefix is learned, and
+//!   the applier's materialized outcome must agree or the replica halts.
 //! * Crash-recovery qualification (task-27): [`protocol::read_protocol`]
 //!   recovers the whole consensus role of an epoch (promise, dependency
 //!   rows, bound Sync selections, payloads, executed identities) from the
@@ -85,6 +90,7 @@ pub mod materialize;
 pub mod policy;
 pub mod protocol;
 pub mod retry;
+pub mod speculate;
 pub mod sync;
 pub mod view;
 pub mod views;
@@ -96,6 +102,7 @@ pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};
 pub use retry::{Admission, Resolution, RetryBinding};
+pub use speculate::{Overlay, SpeculationLimits, SpeculationRefused, speculable, speculate};
 pub use view::{GatedReader, GatedView, ViewError};
 pub use views::{
     ActiveLeasePage, StoredEvent, ViewBudget, ViewBuildError, active_leases, active_leases_page,

@@ -9,7 +9,10 @@ use coord_core::outbox::BarrierAllocator;
 use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_state::{Outcome, RejectionReason, Response};
 use coord_storage::policy::{bootstrap_session, rule_update};
-use coord_storage::{Applier, GroupLimits, StoreWorker, ViewBudget, WatchItem, WatchSpec};
+use coord_storage::{
+    Applier, GroupLimits, Overlay, SpeculationLimits, SpeculationRefused, StoreWorker, ViewBudget,
+    WatchItem, WatchSpec, speculate,
+};
 use coord_store_testkit::model::{CommitScript, ModelEngine};
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
@@ -274,4 +277,83 @@ fn a_view_too_large_to_build_is_a_rejection_and_never_blocks_successors() {
         again.position.get() + 1,
         "the rejection occupied exactly one position"
     );
+}
+
+/// A range read over `count` seeded keys: it mutates nothing and
+/// publishes no event, so only its response has any size.
+fn range_all() -> LogicalRequest {
+    req(CanonicalOperation::Range(RangeOp {
+        range: KeyRange::interval(vec![0u8], vec![0xffu8]),
+        revision: None,
+        limit: 0,
+        count_only: false,
+        keys_only: false,
+    }))
+}
+
+#[test]
+fn the_overlay_bound_is_checked_against_the_plan_it_would_hold() {
+    // The byte bound is on what the overlay holds *after* admitting a
+    // plan. Checking only what it held before let a single plan of any
+    // size in, and a range read — no mutations, no events — was charged
+    // nothing at all while its response carried every value it returned.
+    let mut applier = applier(ModelEngine::new());
+    seed_keys(&mut applier, 64);
+    let request = range_all();
+    let (command, record) = payload(1, &request);
+    let ask = coord_consensus::SpeculationRequest {
+        command,
+        prefix: vec![],
+        position: ExecutionPosition::new(
+            applier.worker().application_base().execution_position.get() + 1,
+        )
+        .unwrap(),
+    };
+    // Generous bound: the read is speculated, and the overlay is charged
+    // the response it holds, not zero.
+    let mut overlay = Overlay::new();
+    let outcome = speculate(
+        applier.worker(),
+        &mut overlay,
+        &SpeculationLimits {
+            max_commands: 8,
+            max_bytes: 1 << 20,
+        },
+        &ask,
+        &record,
+    )
+    .expect("speculated");
+    assert!(
+        outcome.response.len() > 64,
+        "the read returned the seeded rows: {} bytes",
+        outcome.response.len()
+    );
+    let charged = overlay.bytes();
+    assert!(
+        charged >= outcome.response.len(),
+        "the response is charged: {charged} < {}",
+        outcome.response.len()
+    );
+    // The same read under a bound smaller than its own response is
+    // refused, even though the overlay was empty.
+    let mut tight = Overlay::new();
+    let refused = speculate(
+        applier.worker(),
+        &mut tight,
+        &SpeculationLimits {
+            max_commands: 8,
+            max_bytes: charged - 1,
+        },
+        &ask,
+        &record,
+    );
+    assert!(
+        matches!(refused, Err(SpeculationRefused::OverBudget)),
+        "{refused:?}"
+    );
+    assert_eq!(tight.bytes(), 0, "a refusal leaves the overlay unchanged");
+    assert!(tight.is_empty());
+    // Retiring the plan returns exactly what admitting it took.
+    overlay.retire(&command);
+    assert_eq!(overlay.bytes(), 0);
 }

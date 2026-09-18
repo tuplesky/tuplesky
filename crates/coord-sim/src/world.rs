@@ -417,6 +417,10 @@ impl World {
                     let payload = format!("{result:?}");
                     self.record(b"established", node, payload.as_bytes());
                 }
+                Effect::Released(result) => {
+                    let payload = format!("{result:?}");
+                    self.record(b"released", node, payload.as_bytes());
+                }
                 Effect::RequestEntropy { request } => {
                     self.schedule
                         .insert_after(1, Pending::Entropy { node, request });
