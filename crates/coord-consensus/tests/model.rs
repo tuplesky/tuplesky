@@ -144,7 +144,7 @@ fn explore(
     let mut first_learned: Vec<Learned> = Vec::new();
     let perms = permutations(votes);
     for perm in &perms {
-        let mut set = VoteSet::new(cfg, c);
+        let mut set = VoteSet::new(cfg.clone(), c);
         let mut rejected = BTreeMap::new();
         let mut latched: Option<Learned> = None;
         for (label, v) in perm {

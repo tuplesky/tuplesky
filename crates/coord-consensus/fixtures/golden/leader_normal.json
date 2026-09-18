@@ -1,0 +1,32 @@
+{
+  "steps": [
+    [
+      "admit c1",
+      [
+        "persist b1 base=None [payload_v1:3652d2a1dfb24fcf167c2b6e3ace3f600833cc70ebaecd5b0fbfcf235448318a, protocol_v1:0000000000000001013652d2a1dfb24fcf167c2b6e3ace3f600833cc70ebaecd5b0fbfcf235448318a, protocol_v1:0000000000000001023652d2a1dfb24fcf167c2b6e3ace3f600833cc70ebaecd5b0fbfcf235448318a]"
+      ]
+    ],
+    [
+      "admit c2",
+      [
+        "persist b2 base=None [payload_v1:5806c24d55618aed5f5eeff9e035cd3b1e67c144043c91de37b457a14bb13520, protocol_v1:0000000000000001015806c24d55618aed5f5eeff9e035cd3b1e67c144043c91de37b457a14bb13520, protocol_v1:0000000000000001025806c24d55618aed5f5eeff9e035cd3b1e67c144043c91de37b457a14bb13520]"
+      ]
+    ],
+    [
+      "c2 durable",
+      [
+        "send proposal seq=1 deps=1 to 0101 requires [b2] ballot=0",
+        "send proposal seq=1 deps=1 to 0202 requires [b2] ballot=0",
+        "send leader-reply seq=1 deps=1 to f0f0 requires [b2] ballot=0"
+      ]
+    ],
+    [
+      "c1 durable",
+      [
+        "send proposal seq=0 deps=0 to 0101 requires [b1] ballot=0",
+        "send proposal seq=0 deps=0 to 0202 requires [b1] ballot=0",
+        "send leader-reply seq=0 deps=0 to f0f0 requires [b1] ballot=0"
+      ]
+    ]
+  ]
+}
