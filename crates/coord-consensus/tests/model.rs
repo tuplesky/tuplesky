@@ -120,12 +120,20 @@ fn fixture(name: &str, value: &impl Serialize) {
 struct LearningScenario {
     name: &'static str,
     permutations: usize,
+    /// The decision once every vote arrived (order-independent).
     learned: Option<Learned>,
+    /// The distinct decisions first authorized by some prefix of the
+    /// deliveries: the point at which a quorum first learns depends on the
+    /// order, and a slow decision may precede the fast one for the same
+    /// dependencies. Empty when nothing is ever learned.
+    first_learned: Vec<Learned>,
     rejected: BTreeMap<String, VoteError>,
 }
 
 /// Apply every permutation of `votes`; the counted/rejected sets and the
-/// learned decision must not depend on delivery order.
+/// final learned decision must not depend on delivery order. After each
+/// accepted vote the learning predicate is queried and the first decision
+/// latched, so the frozen model exposes what each order authorizes first.
 fn explore(
     name: &'static str,
     cfg: &BallotConfiguration,
@@ -133,37 +141,63 @@ fn explore(
     votes: &[(&'static str, Vote)],
 ) -> LearningScenario {
     let mut result: Option<(Option<Learned>, BTreeMap<String, VoteError>)> = None;
+    let mut first_learned: Vec<Learned> = Vec::new();
     let perms = permutations(votes);
     for perm in &perms {
         let mut set = VoteSet::new(cfg, c);
         let mut rejected = BTreeMap::new();
+        let mut latched: Option<Learned> = None;
         for (label, v) in perm {
-            if let Err(e) = set.add(v.clone()) {
-                // Which redelivered copy is "second" is a delivery artifact;
-                // record duplicates by replica and kind instead of label.
-                let key = if e == VoteError::Duplicate {
-                    let kind = match v {
-                        Vote::Fast(_) => "fast",
-                        Vote::Slow(_) => "slow",
+            match set.add(v.clone()) {
+                Ok(()) => {
+                    if latched.is_none() {
+                        latched = set.learned();
+                    }
+                }
+                Err(e) => {
+                    // Which redelivered copy is "second" is a delivery
+                    // artifact; record duplicates by replica and kind
+                    // instead of label.
+                    let key = if e == VoteError::Duplicate {
+                        let kind = match v {
+                            Vote::Fast(_) => "fast",
+                            Vote::Slow(_) => "slow",
+                        };
+                        format!("duplicate-{kind}-from-{:?}", v.replica())
+                    } else {
+                        (*label).to_owned()
                     };
-                    format!("duplicate-{kind}-from-{:?}", v.replica())
-                } else {
-                    (*label).to_owned()
-                };
-                rejected.insert(key, e);
+                    rejected.insert(key, e);
+                }
             }
         }
-        let outcome = (set.learned(), rejected);
+        let learned = set.learned();
+        // Once learned, a decision is never withdrawn by later votes and
+        // every decision carries the leader's dependencies.
+        if let Some(first) = &latched {
+            assert!(
+                learned.is_some(),
+                "{name}: a learned decision was withdrawn"
+            );
+            if !first_learned.contains(first) {
+                first_learned.push(first.clone());
+            }
+        } else {
+            assert!(learned.is_none(), "{name}: learned without a latch");
+        }
+        let outcome = (learned, rejected);
         match &result {
             None => result = Some(outcome),
             Some(first) => assert_eq!(first, &outcome, "{name}: order-dependent outcome"),
         }
     }
+    first_learned.sort_by_key(|l| format!("{l:?}"));
     let (learned, rejected) = result.unwrap();
     LearningScenario {
         name,
         permutations: perms.len(),
         learned,
+        first_learned,
         rejected,
     }
 }
@@ -207,11 +241,17 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("r2-slow", slow(2, b, c1)),
             ("r2-slow-redelivered", slow(2, b, c1)),
             ("leader-redelivered", fast(0, b, c1, &deps, 7, Some(0))),
+            ("leader-without-seqnum", fast(0, b, c1, &deps, 7, None)),
         ],
     );
     assert_eq!(
         forged.rejected["r1-forged-proposal"],
         VoteError::ForgedProposal
+    );
+    assert_eq!(
+        forged.rejected["leader-without-seqnum"],
+        VoteError::MissingSequence,
+        "the leader assigns the order; a proposal without it never counts"
     );
     assert_eq!(
         forged.rejected[&format!("duplicate-slow-from-{:?}", r(2))],
@@ -232,6 +272,26 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
         Some(Learned::Fast {
             deps: deps.to_vec()
         })
+    );
+    // Order-dependent first learning: when r2's adoption arrives before
+    // r1's fast acknowledgement the slow quorum decides first, with the
+    // same dependencies; the fast decision follows in the other orders.
+    assert_eq!(
+        fast_path.first_learned,
+        vec![
+            Learned::Fast {
+                deps: deps.to_vec()
+            },
+            Learned::Slow {
+                deps: deps.to_vec()
+            },
+        ]
+    );
+    assert_eq!(
+        forged.first_learned,
+        vec![Learned::Slow {
+            deps: deps.to_vec()
+        }]
     );
     assert_eq!(fast_path.rejected["observer-r9-fast"], VoteError::NotAVoter);
     assert_eq!(
@@ -293,6 +353,7 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
         ],
     );
     assert_eq!(no_leader.learned, None);
+    assert!(fastest.first_learned.is_empty() && no_leader.first_learned.is_empty());
 
     fixture(
         "learning_scenarios.json",
@@ -322,7 +383,13 @@ fn summarize(d: &coord_consensus::SyncDecision) -> SyncSummary {
 struct RecoveryScenario {
     name: &'static str,
     permutations: usize,
+    /// Selection over every report (order-independent).
     outcome: Result<SyncSummary, RecoveryError>,
+    /// The distinct selections made when the first majority of reports
+    /// arrived, over every arrival order: recovery proceeds on the first
+    /// majority, so a report arriving later than that majority never
+    /// takes part in it.
+    at_first_majority: Vec<Result<SyncSummary, RecoveryError>>,
     /// What a highest-phase-wins merge across all reports would have
     /// chosen (never used; recorded as the counterexample).
     highest_phase_wins: BTreeMap<String, (Phase, Vec<CommandId>)>,
@@ -373,13 +440,26 @@ fn explore_recovery(
 ) -> RecoveryScenario {
     let perms = permutations(reports);
     let first = select(cfg, &perms[0]);
-    for p in &perms[1..] {
+    let mut at_first_majority: Vec<Result<SyncSummary, RecoveryError>> = Vec::new();
+    for p in &perms {
         assert_eq!(select(cfg, p), first, "{name}: order-dependent selection");
+        // What a recovering leader decides the moment its first majority
+        // of reports is complete (the schedule the protocol actually runs).
+        let majority = &p[..cfg.slow_size().min(p.len())];
+        let decided = select(cfg, majority)
+            .as_ref()
+            .map(summarize)
+            .map_err(Clone::clone);
+        if !at_first_majority.contains(&decided) {
+            at_first_majority.push(decided);
+        }
     }
+    at_first_majority.sort_by_key(|d| format!("{d:?}"));
     RecoveryScenario {
         name,
         permutations: perms.len(),
         outcome: first.as_ref().map(summarize).map_err(Clone::clone),
+        at_first_majority,
         highest_phase_wins: naive_merge(reports),
     }
 }
@@ -438,7 +518,11 @@ fn recovery_selection_is_source_defined_and_order_independent() {
     );
 
     // Incompatible accepted candidates at the source ballot stop recovery
-    // with the evidence, in every order.
+    // with the evidence whenever the conflicting report is among the
+    // reports considered. Recovery runs on the first majority: in the
+    // orders where r4's report arrives after r1, r2 and r3 completed the
+    // majority, the selection has already been made from a consistent
+    // majority and r4 is a late report, never part of it.
     let mut incompatible = reports.clone();
     incompatible.push(report(4, 1, vec![entry(c2, Phase::Accept, &[])]));
     let bad = explore_recovery("incompatible-accepted-candidates", &cfg, &incompatible);
@@ -446,6 +530,23 @@ fn recovery_selection_is_source_defined_and_order_independent() {
         bad.outcome,
         Err(RecoveryError::IncompatibleAccepted { command, .. }) if command == c2
     ));
+    assert_eq!(
+        bad.at_first_majority.len(),
+        2,
+        "{:?}",
+        bad.at_first_majority
+    );
+    assert!(bad.at_first_majority.iter().any(|d| matches!(
+        d,
+        Err(RecoveryError::IncompatibleAccepted { command, .. }) if *command == c2
+    )));
+    assert!(
+        bad.at_first_majority
+            .iter()
+            .any(|d| d.as_ref() == Ok(&summarize(&decision))),
+        "a consistent first majority selects as without the late report"
+    );
+    assert_eq!(scenario.at_first_majority, vec![Ok(summarize(&decision))]);
 
     // A half-initialized entry (accepted without a durable payload) is
     // rejected rather than adopted as a no-op.
@@ -671,4 +772,34 @@ fn publication_obligations_follow_the_durability_table() {
         Publication::LeaderReply.requires(),
         &[DurableRecord::ProposalState]
     );
+}
+
+#[test]
+fn decoded_configurations_are_validated_like_constructed_ones() {
+    // A five-voter C2 configuration whose fast set is the leader alone
+    // would make a single acknowledgement a fast quorum; the constructor
+    // rejects it and so does decoding the same shape.
+    let voters: BTreeSet<ReplicaId> = (0..5).map(r).collect();
+    let leader_only: BTreeSet<ReplicaId> = BTreeSet::from([r(0)]);
+    assert_eq!(
+        BallotConfiguration::c2(
+            ConfigurationEpoch::new(1).unwrap(),
+            ballot(1, 0),
+            voters.clone(),
+            leader_only.clone(),
+        )
+        .unwrap_err(),
+        coord_consensus::ConfigurationError::FastSetNotMajority
+    );
+    let good = config(5, 0, &[0, 1, 2], 1);
+    let encoded = serde_json::to_value(&good).unwrap();
+    let decoded: BallotConfiguration = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, good);
+    let mut forged = encoded;
+    forged["fast_set"] = serde_json::to_value(&leader_only).unwrap();
+    let err = serde_json::from_value::<BallotConfiguration>(forged).unwrap_err();
+    assert!(err.to_string().contains("FastSetNotMajority"), "{err}");
+    let mut stranger = serde_json::to_value(&good).unwrap();
+    stranger["fast_set"] = serde_json::to_value(BTreeSet::from([r(0), r(1), r(9)])).unwrap();
+    assert!(serde_json::from_value::<BallotConfiguration>(stranger).is_err());
 }

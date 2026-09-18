@@ -107,6 +107,9 @@ pub enum VoteError {
     LeaderSlowAck,
     /// A non-leader vote carried a leader sequence number.
     ForgedProposal,
+    /// The leader proposal carried no sequence number; the leader assigns
+    /// the order, so nothing can be learned from it.
+    MissingSequence,
 }
 
 /// A learned decision for the command.
@@ -176,7 +179,7 @@ impl<'c> VoteSet<'c> {
         if vote.command() != self.command {
             return Err(VoteError::WrongCommand);
         }
-        if vote.ballot() != self.config.ballot {
+        if vote.ballot() != self.config.ballot() {
             return Err(VoteError::WrongBallot);
         }
         let replica = vote.replica();
@@ -187,6 +190,9 @@ impl<'c> VoteSet<'c> {
         match vote {
             Vote::Fast(ack) => {
                 if is_leader {
+                    if ack.seqnum.is_none() {
+                        return Err(VoteError::MissingSequence);
+                    }
                     if self.leader.is_some() {
                         return Err(VoteError::Duplicate);
                     }
