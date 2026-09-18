@@ -113,3 +113,17 @@ Close codes (in `CloseV1.code` and the QUIC application close): `0`
 orderly, `1` protocol violation (framing, unexpected frame), `2`
 negotiation rejected (origin, role class, version, identity), `3`
 deadline, `4` shutdown.
+
+Lanes (task-31): a `Hello` declares exactly one lane through a frozen
+capability identifier; the acceptor admits it only for the dialing role.
+
+| Capability | Lane | Roles |
+|---|---|---|
+| `0x0010` | control (negotiation, evidence, recovery pages) | Voter, Observer, Learner, Frontend, KineCollector |
+| `0x0011` | unary (requests and responses) | Frontend, KineCollector, Client |
+| `0x0012` | watch (long-lived event streams) | Frontend, KineCollector, Client |
+| `0x0013` | bulk (snapshots, replication) | Voter, Observer, Learner |
+
+Each lane is a separate connection with its own stream limits, windows and
+queues; a peer pair therefore holds at most one connection per admitted
+lane and direction.
