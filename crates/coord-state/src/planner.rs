@@ -99,7 +99,12 @@ fn check_permission(
 
 /// Require `action` over `interval` under the view's authorization.
 fn authorize(view: &ReadView, action: Action, interval: &KeyInterval) -> Result<(), Abort> {
-    check_permission(view.authorization.as_ref(), &view.namespace, action, interval)
+    check_permission(
+        view.authorization.as_ref(),
+        &view.namespace,
+        action,
+        interval,
+    )
 }
 
 /// The permissions one branch operation needs. An operation that returns
