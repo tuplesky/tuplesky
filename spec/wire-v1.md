@@ -85,3 +85,31 @@ above are reserved for them here.
 libFuzzer (nightly). The regular test suite replays the same harness over
 bit flips, truncations and length edits of every fixture frame so a decoder
 regression is caught without the nightly toolchain.
+
+## Transport negotiation (task-30)
+
+Two ALPNs, neither a registered standard, separate the planes:
+
+| ALPN | Class | Roles admitted in `Hello` |
+|---|---|---|
+| `coord-api/1` | native API | `Client`, `Frontend`, `KineCollector` |
+| `coord-peer/1` | internal peer plane | `Voter`, `Observer`, `Learner` (incarnation required) |
+
+The first frame on the first bidirectional stream (the control stream) is
+`Hello`; the acceptor answers `HelloAck` or closes. `Hello` must name the
+acceptor's cluster and domain, a role of the connection's class, and be
+bound to the TLS peer certificate by the runtime's identity binder. The
+control stream then carries only `Close`. Every other stream carries
+exactly one frame and ends: peer evidence on unidirectional streams, unary
+requests and their responses on bidirectional streams. Mutual TLS 1.3 with
+the explicit AWS-LC provider, no application early data, no server-side
+migration.
+
+| Kind | Value | Payload |
+|---|---|---|
+| PeerEvidence | `0x0300` | Opaque `coord-consensus` protocol message (postcard); protocol-evidence class limit |
+
+Close codes (in `CloseV1.code` and the QUIC application close): `0`
+orderly, `1` protocol violation (framing, unexpected frame), `2`
+negotiation rejected (origin, role class, version, identity), `3`
+deadline, `4` shutdown.

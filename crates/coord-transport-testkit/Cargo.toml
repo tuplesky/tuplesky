@@ -1,0 +1,19 @@
+[package]
+name = "coord-transport-testkit"
+description = "Isolated test certificate authority and identity binder for transport tests; never linked in production"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "test-only"
+
+[dependencies]
+coord-types.workspace = true
+coord-transport.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
