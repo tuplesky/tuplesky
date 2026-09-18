@@ -1,13 +1,19 @@
-//! Command descriptors with atomic initialization (design Section 4.7;
-//! prototype `getCmdDescSeq`, `getDepAndHashes`, `keyInfo`).
+//! Command descriptors with atomic initialization, path evidence, bounded
+//! capacity and closure traversal (tasks 20-21; design Section 4.7;
+//! prototype `getCmdDescSeq`, `getDepAndHashes`, `keyInfo`,
+//! `recordLeaderHash`).
 //!
 //! Installing a command's initialized state (payload binding, phase,
-//! dependencies) and exposing it through the conflict index is one
-//! transition of [`CommandTable::initialize`]. A descriptor created by
-//! early leader evidence ([`CommandTable::expect`]) is a placeholder: it
-//! is not in the conflict index and reports no phase, so a conflicting
-//! command initialized meanwhile cannot see it as processed state and the
-//! dependency-phase guards treat it as unknown.
+//! dependencies, per-key path digests) and exposing it through the
+//! conflict index is one transition of [`CommandTable::initialize`]. A
+//! descriptor created by early leader evidence ([`CommandTable::expect`])
+//! is a placeholder: it is not in the conflict index and reports no
+//! phase, so a conflicting command initialized meanwhile cannot see it as
+//! processed state and the dependency-phase guards treat it as unknown.
+//!
+//! Capacity bounds new work: when the table is full, initialization is
+//! refused with [`InitError::Backpressure`]; records in ACCEPT or COMMIT
+//! are never evicted to make room, only executed records can be retired.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -16,6 +22,7 @@ use coord_types::CommandId;
 use coord_types::identity::Digest32;
 use serde::{Deserialize, Serialize};
 
+use crate::graph::{ClosureCursor, ClosureProgress, PathLog, combined_path};
 use crate::phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 
 /// A command as this replica knows it.
@@ -29,6 +36,10 @@ pub struct CommandRecord {
     pub keys: Vec<Vec<u8>>,
     /// Digest of the bound payload (`None` for a placeholder).
     pub payload: Option<Digest32>,
+    /// Per-key path digests through this command at initialization.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Combined path evidence (what a fast acknowledgement carries).
+    pub path: Digest32,
 }
 
 /// Why initialization did not happen.
@@ -39,74 +50,130 @@ pub enum InitError {
     AlreadyInitialized,
     /// A different payload was presented for an initialized command.
     PayloadConflict,
+    /// The table is full; new work is refused, nothing is evicted.
+    Backpressure,
 }
 
-/// Per-key conflict information (prototype `lightKeyInfo`): the last
-/// command touching the key.
+/// Why a record was not retired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetireError {
+    /// Unknown command.
+    Unknown,
+    /// Only executed commands may be retired; unresolved acceptance is
+    /// never deleted.
+    NotExecuted(Phase),
+}
+
+/// What initialization produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Initialized {
+    /// Local direct dependencies.
+    pub deps: Vec<CommandId>,
+    /// Per-key path digests.
+    pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Combined path evidence.
+    pub path: Digest32,
+}
+
+/// Per-key conflict information (prototype `lightKeyInfo` plus `HashLog`).
 #[derive(Clone, Debug, Default)]
-struct KeyInfo {
+struct KeyState {
     last: Option<CommandId>,
+    log: PathLog,
 }
 
 /// The command table of one replica in one domain.
 #[derive(Clone, Debug, Default)]
 pub struct CommandTable {
     records: BTreeMap<CommandId, CommandRecord>,
-    keys: BTreeMap<Vec<u8>, KeyInfo>,
+    keys: BTreeMap<Vec<u8>, KeyState>,
+    capacity: Option<usize>,
 }
 
 impl CommandTable {
-    /// Empty table.
+    /// Unbounded table.
     pub const fn new() -> Self {
         CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
+            capacity: None,
         }
+    }
+
+    /// A table admitting at most `capacity` records (placeholders included).
+    pub const fn with_capacity(capacity: usize) -> Self {
+        CommandTable {
+            records: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            capacity: Some(capacity),
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.capacity.is_some_and(|c| self.records.len() >= c)
     }
 
     /// Create a placeholder for a command known by identity only (leader
     /// evidence arrived before the payload). Idempotent; never changes an
-    /// initialized record.
-    pub fn expect(&mut self, command: CommandId) {
-        self.records.entry(command).or_insert(CommandRecord {
-            phase: Phase::Start,
-            deps: Vec::new(),
-            keys: Vec::new(),
-            payload: None,
-        });
+    /// initialized record. Refused under backpressure.
+    pub fn expect(&mut self, command: CommandId) -> Result<(), InitError> {
+        if self.records.contains_key(&command) {
+            return Ok(());
+        }
+        if self.full() {
+            return Err(InitError::Backpressure);
+        }
+        self.records.insert(
+            command,
+            CommandRecord {
+                phase: Phase::Start,
+                deps: Vec::new(),
+                keys: Vec::new(),
+                payload: None,
+                paths: Vec::new(),
+                path: crate::graph::empty_path(),
+            },
+        );
+        Ok(())
     }
 
-    /// Bind the payload, compute the local dependencies from the conflict
-    /// index and publish the command in the index, atomically. Returns the
-    /// dependencies. A repeated initialization with the same payload is
+    /// Bind the payload, compute the local dependencies and path digests
+    /// from the conflict index and publish the command in the index,
+    /// atomically. A repeated initialization with the same payload is
     /// `AlreadyInitialized` and changes nothing.
     pub fn initialize(
         &mut self,
         command: CommandId,
         payload: Digest32,
         keys: Vec<Vec<u8>>,
-    ) -> Result<Vec<CommandId>, InitError> {
-        if let Some(existing) = self.records.get(&command)
-            && existing.payload.is_some()
-        {
-            return Err(if existing.payload == Some(payload) {
-                InitError::AlreadyInitialized
-            } else {
-                InitError::PayloadConflict
-            });
+    ) -> Result<Initialized, InitError> {
+        match self.records.get(&command) {
+            Some(existing) if existing.payload.is_some() => {
+                return Err(if existing.payload == Some(payload) {
+                    InitError::AlreadyInitialized
+                } else {
+                    InitError::PayloadConflict
+                });
+            }
+            Some(_) => {}
+            None if self.full() => return Err(InitError::Backpressure),
+            None => {}
         }
         let mut deps = Vec::new();
+        let mut paths = Vec::with_capacity(keys.len());
         for key in &keys {
-            if let Some(last) = self.keys.get(key).and_then(|k| k.last)
+            let state = self.keys.entry(key.clone()).or_default();
+            if let Some(last) = state.last
                 && last != command
                 && !deps.contains(&last)
             {
                 deps.push(last);
             }
+            state.last = Some(command);
+            let digest = state.log.append(command);
+            paths.push((key.clone(), digest));
         }
-        for key in &keys {
-            self.keys.entry(key.clone()).or_default().last = Some(command);
-        }
+        let path = combined_path(&paths);
         self.records.insert(
             command,
             CommandRecord {
@@ -114,9 +181,36 @@ impl CommandTable {
                 deps: deps.clone(),
                 keys,
                 payload: Some(payload),
+                paths: paths.clone(),
+                path,
             },
         );
-        Ok(deps)
+        Ok(Initialized { deps, paths, path })
+    }
+
+    /// The leader ordered `command` at `seqnum` with these per-key path
+    /// digests: align this replica's logs so later commands' paths follow
+    /// the leader's order (prototype `recordLeaderHash`/`updateLogs`).
+    pub fn record_leader_path(
+        &mut self,
+        command: CommandId,
+        seqnum: u64,
+        paths: &[(Vec<u8>, Digest32)],
+    ) {
+        for (key, digest) in paths {
+            self.keys
+                .entry(key.clone())
+                .or_default()
+                .log
+                .sync(command, seqnum, *digest);
+        }
+    }
+
+    /// Current path head of a key (evidence the next command would carry).
+    pub fn path_head(&self, key: &[u8]) -> Digest32 {
+        self.keys
+            .get(key)
+            .map_or_else(crate::graph::empty_path, |k| k.log.head())
     }
 
     /// The record, placeholder included.
@@ -190,6 +284,43 @@ impl CommandTable {
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
         Ok(())
+    }
+
+    /// Forget an executed command. Unresolved acceptance is never deleted
+    /// for capacity; the conflict index keeps the identity so later
+    /// commands still depend on it.
+    pub fn retire(&mut self, command: &CommandId) -> Result<(), RetireError> {
+        match self.records.get(command) {
+            None => Err(RetireError::Unknown),
+            Some(r) if r.phase != Phase::Executed => Err(RetireError::NotExecuted(r.phase)),
+            Some(_) => {
+                self.records.remove(command);
+                Ok(())
+            }
+        }
+    }
+
+    /// Start an exact closure traversal from an initialized command.
+    pub fn closure_start(&self, root: CommandId) -> Result<ClosureCursor, GuardViolation> {
+        let record = self.initialized(&root)?;
+        Ok(ClosureCursor::start(root, &record.deps))
+    }
+
+    /// Advance a traversal by at most `budget` visits; a placeholder or
+    /// unknown dependency stops it as `DependencyUnknown`.
+    pub fn closure_step(
+        &self,
+        cursor: ClosureCursor,
+        budget: usize,
+    ) -> Result<ClosureProgress, GuardViolation> {
+        cursor
+            .step(budget, |c| {
+                self.records
+                    .get(c)
+                    .filter(|r| r.payload.is_some())
+                    .map(|r| r.deps.clone())
+            })
+            .map_err(|dep| GuardViolation::DependencyUnknown { dep })
     }
 
     fn initialized(&self, command: &CommandId) -> Result<&CommandRecord, GuardViolation> {
