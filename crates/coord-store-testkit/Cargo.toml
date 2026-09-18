@@ -16,8 +16,11 @@ role = "test-only"
 coord-types.workspace = true
 coord-core.workspace = true
 coord-store-api.workspace = true
+coord-journal-api.workspace = true
+coord-consensus.workspace = true
 serde = { workspace = true, features = ["std"] }
 serde_json.workspace = true
+postcard.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
 blake3.workspace = true
