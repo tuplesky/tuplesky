@@ -1,0 +1,243 @@
+{
+  "schema": "wire_frames_v1",
+  "header": "u32_be length (excludes itself, includes kind+version) || u16_be kind || u16_be version || postcard",
+  "kinds": [
+    [
+      "Hello",
+      1
+    ],
+    [
+      "HelloAck",
+      2
+    ],
+    [
+      "Close",
+      3
+    ],
+    [
+      "Request",
+      256
+    ],
+    [
+      "Response",
+      257
+    ],
+    [
+      "ResolveRequest",
+      258
+    ],
+    [
+      "WatchOpen",
+      512
+    ],
+    [
+      "WatchEvents",
+      513
+    ],
+    [
+      "WatchProgress",
+      514
+    ],
+    [
+      "WatchClose",
+      515
+    ]
+  ],
+  "vectors": [
+    {
+      "name": "valid-hello-voter",
+      "frame_hex": "0000002b0001000103636c75737465722d3030303030303031646f6d61696e2d303030303030303031010303010207",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-hello-client",
+      "frame_hex": "000000270001000100636c75737465722d3030303030303031646f6d61696e2d3030303030303030310000",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-hello-ack",
+      "frame_hex": "0000000700020001010140",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-close",
+      "frame_hex": "0000000e000300010308647261696e696e67",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-request-put",
+      "frame_hex": "0000006101000001636c75737465722d3030303030303031646f6d61696e2d30303030303030303173657373696f6e2d3030303030303031636c69656e742d30303030303030303101190174656e616e742d30303030303030303101022f6b017600008827",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-response-ok",
+      "frame_hex": "0000002b01010001f2f63240844bfd3b44de8e97fd02cfdbe99ee3f157da9f3e7b1a51d8548565ed00010c03000102",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-response-err",
+      "frame_hex": "0000002d01010001f2f63240844bfd3b44de8e97fd02cfdbe99ee3f157da9f3e7b1a51d8548565ed01090664656e696564",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-response-pending",
+      "frame_hex": "0000002501010001f2f63240844bfd3b44de8e97fd02cfdbe99ee3f157da9f3e7b1a51d8548565ed02",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-response-unknown",
+      "frame_hex": "0000002501010001f2f63240844bfd3b44de8e97fd02cfdbe99ee3f157da9f3e7b1a51d8548565ed03",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-resolve",
+      "frame_hex": "0000006501020001636c75737465722d3030303030303031646f6d61696e2d30303030303030303173657373696f6e2d3030303030303031636c69656e742d30303030303030303101f2f63240844bfd3b44de8e97fd02cfdbe99ee3f157da9f3e7b1a51d8548565ed",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-watch-open",
+      "frame_hex": "00000020020000010174656e616e742d303030303030303031022f6101022f6201640101",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-watch-events",
+      "frame_hex": "000000230201000101650200042f612f3101786565010001042f612f320032650001036f6c6401",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-watch-progress",
+      "frame_hex": "0000000702020001019601",
+      "expect": "ok"
+    },
+    {
+      "name": "valid-watch-close",
+      "frame_hex": "00000009020300010101019601",
+      "expect": "ok"
+    },
+    {
+      "name": "invalid-truncated-at-1",
+      "frame_hex": "00",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-2",
+      "frame_hex": "0000",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-3",
+      "frame_hex": "000000",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-4",
+      "frame_hex": "0000000e",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-5",
+      "frame_hex": "0000000e00",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-6",
+      "frame_hex": "0000000e0003",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-7",
+      "frame_hex": "0000000e000300",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-8",
+      "frame_hex": "0000000e00030001",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-9",
+      "frame_hex": "0000000e0003000103",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-10",
+      "frame_hex": "0000000e000300010308",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-11",
+      "frame_hex": "0000000e00030001030864",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-12",
+      "frame_hex": "0000000e0003000103086472",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-13",
+      "frame_hex": "0000000e000300010308647261",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-14",
+      "frame_hex": "0000000e00030001030864726169",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-15",
+      "frame_hex": "0000000e000300010308647261696e",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-16",
+      "frame_hex": "0000000e000300010308647261696e69",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-truncated-at-17",
+      "frame_hex": "0000000e000300010308647261696e696e",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-length-below-minimum",
+      "frame_hex": "00000003000300010308647261696e696e67",
+      "expect": "LengthBelowMinimum"
+    },
+    {
+      "name": "invalid-length-above-class-limit",
+      "frame_hex": "00010001000300010308647261696e696e67",
+      "expect": "LengthAboveClassLimit"
+    },
+    {
+      "name": "invalid-trailing-stream-byte",
+      "frame_hex": "0000000e000300010308647261696e696e6700",
+      "expect": "IncompleteFrame"
+    },
+    {
+      "name": "invalid-trailing-payload-byte",
+      "frame_hex": "0000000f000300010308647261696e696e6700",
+      "expect": "TrailingPayloadBytes"
+    },
+    {
+      "name": "invalid-reserved-kind",
+      "frame_hex": "0000000e030000010308647261696e696e67",
+      "expect": "UnsupportedKind"
+    },
+    {
+      "name": "invalid-unsupported-version",
+      "frame_hex": "0000000e000300020308647261696e696e67",
+      "expect": "UnsupportedVersion"
+    },
+    {
+      "name": "invalid-u32-varint-overflow",
+      "frame_hex": "0000000b0002000100ffffffffff0f",
+      "expect": "MalformedPayload"
+    },
+    {
+      "name": "invalid-collection-over-bound",
+      "frame_hex": "000000050002000141",
+      "expect": "MalformedPayload"
+    }
+  ]
+}
