@@ -25,6 +25,9 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "OpenSSL",
+    # webpki-roots (the Mozilla root store data reqwest's selected
+    # `rustls-tls-webpki-roots-no-provider` feature bundles; task-35).
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 exceptions = []
