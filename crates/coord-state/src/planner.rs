@@ -519,9 +519,7 @@ fn plan_operation(
     let next_revision = || next_revision.ok_or(PlanError::CounterOverflow);
     Ok(match &request.operation {
         CanonicalOperation::Range(r) => read(view, overlay, r, limits)?,
-        CanonicalOperation::Put(p) => {
-            put(overlay, p, next_revision()?, limits, mutations, events)?
-        }
+        CanonicalOperation::Put(p) => put(overlay, p, next_revision()?, limits, mutations, events)?,
         CanonicalOperation::DeleteRange(d) => delete(overlay, d, limits, mutations, events)?,
         CanonicalOperation::Txn(t) => {
             let succeeded = t.compares.iter().all(|c| compare(overlay, c));

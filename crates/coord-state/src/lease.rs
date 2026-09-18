@@ -11,9 +11,20 @@
 use coord_types::ids::{LeaseGeneration, NamespaceId, PrincipalId};
 use serde::{Deserialize, Serialize};
 
-/// Fixed per-event overhead charged to a lease's deletion budget besides
-/// key and value bytes (metadata of the previous entry in the event).
-pub const ATTACHMENT_OVERHEAD: u64 = 48;
+/// Copies of the entry key one revocation materializes for an attached
+/// key. The current-row deletion, the history tombstone and the
+/// reverse-index deletion each carry the ordered-key escaping of the key,
+/// which at worst doubles it (three rows, six lengths); the event row
+/// carries it once more.
+pub const ATTACHMENT_KEY_COPIES: u64 = 7;
+
+/// Fixed bytes charged per attached key besides its key copies and value:
+/// the namespace and lease prefixes and revision suffixes of the four row
+/// keys, the previous entry's metadata inside the event row, the record
+/// framing of every value and the per-update overhead the storage worker
+/// charges. Deliberately above the exact sum so the bound stays valid when
+/// a codec grows a field.
+pub const ATTACHMENT_OVERHEAD: u64 = 512;
 
 /// What a lease record is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -66,7 +77,13 @@ impl LeaseRecord {
     }
 }
 
-/// Bytes charged to a lease for one attached key with `value`.
+/// Bytes charged to a lease for one attached key with `value`: an upper
+/// bound on what one revocation writes for that key (current deletion,
+/// history tombstone, reverse-index deletion and event row, as the worker
+/// sizes a batch), so a lease within [`PlanLimits::max_lease_bytes`] is
+/// always revocable in one batch below the worker's single-batch limit.
+///
+/// [`PlanLimits::max_lease_bytes`]: crate::PlanLimits::max_lease_bytes
 pub fn attachment_cost(key: &[u8], value: &[u8]) -> u64 {
-    key.len() as u64 + value.len() as u64 + ATTACHMENT_OVERHEAD
+    ATTACHMENT_KEY_COPIES * key.len() as u64 + value.len() as u64 + ATTACHMENT_OVERHEAD
 }

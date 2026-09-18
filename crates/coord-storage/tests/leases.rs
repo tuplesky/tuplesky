@@ -463,3 +463,64 @@ fn a_crash_during_revoke_leaves_all_attachments_or_none() {
         "the crash matrix covered both outcomes"
     );
 }
+
+#[test]
+fn a_lease_at_its_byte_quota_is_still_revocable_in_one_batch() {
+    // Worst case for the revoke batch: keys of the maximum length made of
+    // zero bytes (the ordered-key escaping doubles them in three row keys)
+    // holding values of the maximum length. The quota must admit exactly
+    // what one revocation can write below the worker's single-batch limit.
+    use coord_storage::lowering::batch_bytes;
+    use coord_types::logical_v1::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session();
+    d.run_as(ALICE, &grant(L1, 30));
+    let limits = PlanLimits::default();
+    let value = vec![0x5a; MAX_VALUE_BYTES];
+    let per_key = coord_state::attachment_cost(&vec![0; MAX_KEY_BYTES], &value);
+    let fits = limits.max_lease_bytes / per_key;
+    assert!(fits >= 2, "the default quota admits several maximal keys");
+    for i in 0..fits {
+        let mut key = vec![0u8; MAX_KEY_BYTES];
+        key[MAX_KEY_BYTES - 1] = i as u8;
+        assert_eq!(
+            d.run_as(ALICE, &put(&key, &value, Some(L1))),
+            Outcome::Put { prev: None }
+        );
+    }
+    let mut over = vec![0u8; MAX_KEY_BYTES];
+    over[MAX_KEY_BYTES - 1] = 0xff;
+    assert_eq!(
+        d.run_as(ALICE, &put(&over, &value, Some(L1))),
+        Outcome::ErrLeaseQuota
+    );
+    let record = d.lease(L1).unwrap();
+    assert_eq!(record.attached_bytes, fits * per_key);
+    assert!(record.attached_bytes <= limits.max_lease_bytes);
+    // The materialized revoke batch, retry binding included, stays under
+    // the worker's single-batch limit and applies.
+    let r = revoke(L1);
+    let bound = binding(7, &r);
+    let gated = d.worker.reader().snapshot().unwrap();
+    let view = build_read_view(&gated, NS, ALICE, &r, ViewBudget::default()).unwrap();
+    let planned = plan(&r, &view, &limits).unwrap();
+    drop(gated);
+    let batch =
+        coord_storage::plan_to_batch(d.alloc.allocate(), NS, &planned, Some(&bound)).unwrap();
+    let bytes = batch_bytes(&batch);
+    assert!(
+        bytes <= GroupLimits::default().max_single_batch_bytes,
+        "revoke batch of {bytes} bytes exceeds the single-batch limit"
+    );
+    assert!(
+        bytes as u64 <= record.attached_bytes + 64 * 1024,
+        "the quota bounds the batch: {bytes} bytes for {} charged",
+        record.attached_bytes
+    );
+    assert_eq!(
+        d.run_bound(ALICE, &r, Some(7)).1,
+        Outcome::LeaseRevoked { deleted: fits }
+    );
+    assert_eq!(d.lease(L1).unwrap().status, LeaseStatus::Revoked);
+    assert!(d.bindings(L1).is_empty());
+}
