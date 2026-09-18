@@ -25,21 +25,36 @@
 //! every write of an attached key. Lease errors are recorded outcomes
 //! (they advance execution and are retained for retries), not planner
 //! errors.
+//!
+//! Renewal and expiry (task-16; Sections 7.2-7.3): `LeaseKeepAlive` is a
+//! replicated renewal incrementing the record's renewal sequence, the
+//! [`internal::InternalCommand`]s establish the expiry authority epoch and
+//! expire a lease only when generation, renewal sequence and epoch all
+//! match, and [`expiry::LeaseScheduler`] arms conservative deadlines from
+//! observation ticks under documented clock assumptions without ever
+//! consulting a clock inside application.
 #![forbid(unsafe_code)]
 #![no_std]
 #![warn(missing_docs)]
 extern crate alloc;
 
+pub mod expiry;
+pub mod internal;
 pub mod lease;
 pub mod limits;
 pub mod plan;
 pub mod planner;
 pub mod view;
 
+pub use expiry::{
+    ClockAssumptions, ExpiryOutcome, LeaseObservation, LeaseScheduler, LeaseSnapshot,
+    RemainingEstimate, TimerRequest,
+};
+pub use internal::InternalCommand;
 pub use lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 pub use limits::PlanLimits;
 pub use plan::{ApplyPlan, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
-pub use planner::{PlanError, plan};
+pub use planner::{PlanError, plan, plan_internal};
 pub use view::{HistoricalView, KvEntry, ReadView};
 
 /// Crate role marker used by the dependency-policy check.

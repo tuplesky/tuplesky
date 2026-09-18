@@ -10,6 +10,7 @@ use coord_types::logical_v1::{
     DeleteRangeOp, KeyRange, LogicalRequest, PutOp, RangeOp,
 };
 
+use crate::internal::InternalCommand;
 use crate::lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 use crate::limits::PlanLimits;
 use crate::plan::{ApplyPlan, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response};
@@ -36,7 +37,7 @@ pub enum PlanError {
     ViewInconsistent,
     /// The domain revision or execution position cannot advance.
     CounterOverflow,
-    /// Replicated renewal is planned by task-16.
+    /// The operation is not planned by this planner.
     Unsupported,
 }
 
@@ -406,25 +407,14 @@ fn revoke(
     if record.owner != overlay.view.principal {
         return Err(Abort::Fail(Outcome::ErrLeasePermission));
     }
-    let keys = attached_keys(overlay.view, &lease_id, &record)?;
-    let mut deleted = 0u64;
-    for key in keys {
-        // Only a current attachment is deleted: an entry that no longer
-        // references this lease means the index and entries disagree.
-        let entry = overlay
-            .get(&key)
-            .filter(|e| e.lease == Some(lease_id))
-            .cloned()
-            .ok_or(Abort::Error(PlanError::ViewInconsistent))?;
-        delete_entry(overlay, key, entry, mutations, events)?;
-        deleted += 1;
-    }
-    let mut record = overlay.attached_lease(&lease_id)?;
-    if record.attached_keys != 0 || record.attached_bytes != 0 {
-        return Err(Abort::Error(PlanError::ViewInconsistent));
-    }
-    record.status = LeaseStatus::Revoked;
-    overlay.leases.insert(lease_id, record);
+    let deleted = end_lease(
+        overlay,
+        lease_id,
+        &record,
+        LeaseStatus::Revoked,
+        mutations,
+        events,
+    )?;
     Ok(Outcome::LeaseRevoked { deleted })
 }
 
@@ -526,8 +516,109 @@ fn plan_operation(
         CanonicalOperation::LeaseTimeToLive { lease_id, keys } => {
             time_to_live(overlay, *lease_id, *keys, limits)?
         }
-        CanonicalOperation::LeaseKeepAlive { .. } => return Err(PlanError::Unsupported.into()),
+        CanonicalOperation::LeaseKeepAlive { lease_id } => keep_alive(overlay, *lease_id)?,
     })
+}
+
+fn keep_alive(overlay: &mut Overlay<'_>, lease_id: LeaseId) -> Result<Outcome, Abort> {
+    let mut record = overlay.visible_lease(&lease_id)?;
+    if record.owner != overlay.view.principal {
+        return Err(Abort::Fail(Outcome::ErrLeasePermission));
+    }
+    record.renewal_sequence = record
+        .renewal_sequence
+        .checked_add(1)
+        .ok_or(Abort::Error(PlanError::CounterOverflow))?;
+    let outcome = Outcome::LeaseKeptAlive {
+        lease_id,
+        generation: record.generation,
+        renewal_sequence: record.renewal_sequence,
+        ttl_seconds: record.ttl_seconds,
+    };
+    overlay.leases.insert(lease_id, record);
+    Ok(outcome)
+}
+
+/// End a lease that matched its expiration conditions: delete exactly the
+/// current attachments and mark the record.
+fn end_lease(
+    overlay: &mut Overlay<'_>,
+    lease_id: LeaseId,
+    record: &LeaseRecord,
+    status: LeaseStatus,
+    mutations: &mut Vec<Mutation>,
+    events: &mut Vec<KvEvent>,
+) -> Result<u64, Abort> {
+    let keys = attached_keys(overlay.view, &lease_id, record)?;
+    let mut deleted = 0u64;
+    for key in keys {
+        // Only a current attachment is deleted: an entry that no longer
+        // references this lease means the index and entries disagree.
+        let entry = overlay
+            .get(&key)
+            .filter(|e| e.lease == Some(lease_id))
+            .cloned()
+            .ok_or(Abort::Error(PlanError::ViewInconsistent))?;
+        delete_entry(overlay, key, entry, mutations, events)?;
+        deleted += 1;
+    }
+    let mut record = overlay.attached_lease(&lease_id)?;
+    if record.attached_keys != 0 || record.attached_bytes != 0 {
+        return Err(Abort::Error(PlanError::ViewInconsistent));
+    }
+    record.status = status;
+    overlay.leases.insert(lease_id, record);
+    Ok(deleted)
+}
+
+fn plan_internal_command(
+    command: &InternalCommand,
+    overlay: &mut Overlay<'_>,
+    mutations: &mut Vec<Mutation>,
+    events: &mut Vec<KvEvent>,
+) -> Result<Outcome, Abort> {
+    let view = overlay.view;
+    match command {
+        InternalCommand::EstablishLeaseAuthority { epoch, .. } => {
+            if *epoch <= view.lease_authority {
+                return Err(Abort::Fail(Outcome::ErrStaleAuthority));
+            }
+            mutations.push(Mutation::LeaseAuthority { epoch: *epoch });
+            Ok(Outcome::LeaseAuthorityEstablished { epoch: *epoch })
+        }
+        InternalCommand::ExpireLease {
+            lease_id,
+            generation,
+            expected_renewal_sequence,
+            authority_epoch,
+            ..
+        } => {
+            if *authority_epoch != view.lease_authority {
+                return Err(Abort::Fail(Outcome::ErrStaleAuthority));
+            }
+            let record = match overlay.lease(lease_id) {
+                Some(r) if r.status == LeaseStatus::Active => r.clone(),
+                _ => return Err(Abort::Fail(Outcome::ExpireStale)),
+            };
+            if record.namespace != view.namespace {
+                return Err(Abort::Error(PlanError::NamespaceMismatch));
+            }
+            if record.generation != *generation
+                || record.renewal_sequence != *expected_renewal_sequence
+            {
+                return Err(Abort::Fail(Outcome::ExpireStale));
+            }
+            let deleted = end_lease(
+                overlay,
+                *lease_id,
+                &record,
+                LeaseStatus::Expired,
+                mutations,
+                events,
+            )?;
+            Ok(Outcome::LeaseExpired { deleted })
+        }
+    }
 }
 
 /// Plan `request` against `view` under `limits`.
@@ -545,6 +636,42 @@ pub fn plan(
     if request.namespace != view.namespace {
         return Err(PlanError::NamespaceMismatch);
     }
+    finish(view, limits, |overlay, next_revision, mutations, events| {
+        plan_operation(
+            request,
+            view,
+            limits,
+            overlay,
+            next_revision,
+            mutations,
+            events,
+        )
+    })
+}
+
+/// Plan an internal replicated command against `view`. Same contract as
+/// [`plan`]: a stale or mismatching command yields a recorded no-op
+/// outcome with no mutations.
+pub fn plan_internal(
+    command: &InternalCommand,
+    view: &ReadView,
+    limits: &PlanLimits,
+) -> Result<ApplyPlan, PlanError> {
+    if command.namespace() != view.namespace {
+        return Err(PlanError::NamespaceMismatch);
+    }
+    finish(view, limits, |overlay, _, mutations, events| {
+        plan_internal_command(command, overlay, mutations, events)
+    })
+}
+
+type Planned = Result<Outcome, Abort>;
+
+fn finish(
+    view: &ReadView,
+    limits: &PlanLimits,
+    body: impl FnOnce(&mut Overlay<'_>, KvRevision, &mut Vec<Mutation>, &mut Vec<KvEvent>) -> Planned,
+) -> Result<ApplyPlan, PlanError> {
     let position = view
         .base
         .execution_position
@@ -561,15 +688,7 @@ pub fn plan(
     };
     let mut mutations = Vec::new();
     let mut events = Vec::new();
-    let outcome = match plan_operation(
-        request,
-        view,
-        limits,
-        &mut overlay,
-        next_revision,
-        &mut mutations,
-        &mut events,
-    ) {
+    let outcome = match body(&mut overlay, next_revision, &mut mutations, &mut events) {
         Ok(outcome) => outcome,
         Err(Abort::Error(e)) => return Err(e),
         Err(Abort::Fail(outcome)) => {
@@ -639,6 +758,7 @@ pub fn apply_to_map(current: &mut BTreeMap<Vec<u8>, KvEntry>, plan: &ApplyPlan) 
             Mutation::LeaseAttach { .. }
             | Mutation::LeaseDetach { .. }
             | Mutation::LeaseWrite { .. }
+            | Mutation::LeaseAuthority { .. }
             | Mutation::CompactTo { .. } => {}
         }
     }

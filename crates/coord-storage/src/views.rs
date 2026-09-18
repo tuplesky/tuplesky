@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::ops::Bound;
 
-use coord_state::KvEvent;
+use coord_state::lease::{LeaseRecord, LeaseStatus};
 use coord_state::view::{HistoricalView, KvEntry, ReadView};
+use coord_state::{InternalCommand, KvEvent};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
 use coord_types::ids::{KvRevision, LeaseId, NamespaceId, PrincipalId};
@@ -216,6 +217,115 @@ fn history_bounds(namespace: &NamespaceId, touch: &Touch) -> (Vec<u8>, Bound<Vec
     }
 }
 
+/// Load the reverse index of `lease` in `namespace` and the current entries
+/// it points at into `read_view`.
+fn load_attachments<V: OrderedRead>(
+    view: &V,
+    namespace: NamespaceId,
+    lease: LeaseId,
+    read_view: &mut ReadView,
+    budget: &mut Budget,
+) -> Result<(), ViewBuildError> {
+    let prefix = codecs::lease_key_prefix(&lease, &namespace);
+    let upper = prefix_upper(&prefix);
+    let mut keys = BTreeSet::new();
+    for (row_key, _) in scan_all(view, Collection::LeaseKeysV1, prefix, upper, budget)? {
+        let (_, ns, key) = codecs::decode_lease_key_row(&row_key)?;
+        if ns != namespace {
+            continue;
+        }
+        if !read_view.current.contains_key(&key) {
+            let current = codecs::current_key(&namespace, &key);
+            if let Some(value) = view.get(Collection::KvCurrentV1.id(), &current)? {
+                budget.charge(1, current.len() + value.len())?;
+                read_view
+                    .current
+                    .insert(key.clone(), codecs::decode_current(&value)?);
+            }
+        }
+        keys.insert(key);
+    }
+    read_view.lease_keys.insert(lease, keys);
+    Ok(())
+}
+
+/// Load the records of `lease_ids` that exist into `read_view`.
+fn load_leases<V: OrderedRead>(
+    view: &V,
+    lease_ids: impl IntoIterator<Item = LeaseId>,
+    read_view: &mut ReadView,
+    budget: &mut Budget,
+) -> Result<(), ViewBuildError> {
+    for id in lease_ids {
+        let row = codecs::lease_row_key(&id);
+        if let Some(value) = view.get(Collection::LeaseV1.id(), &row)? {
+            budget.charge(1, row.len() + value.len())?;
+            read_view.leases.insert(id, codecs::decode_lease(&value)?);
+        }
+    }
+    Ok(())
+}
+
+/// Build the view an internal command needs: the authority epoch and, for
+/// an expiration, the lease record, its reverse index and the entries it
+/// points at.
+pub fn build_internal_view<V: OrderedRead>(
+    gated: &GatedView<V>,
+    command: &InternalCommand,
+    budget: ViewBudget,
+) -> Result<ReadView, ViewBuildError> {
+    let view = gated.view();
+    let mut budget = Budget {
+        rows: budget.max_rows,
+        bytes: budget.max_bytes,
+    };
+    let namespace = command.namespace();
+    let kv_revision = codecs::read_kv_revision(view)?;
+    let mut read_view = ReadView::empty(
+        gated.meta().frontier.as_base(),
+        namespace,
+        PrincipalId([0; 16]),
+        kv_revision,
+    );
+    read_view.compact_floor = codecs::read_retention_floor(view)?;
+    read_view.lease_authority = codecs::read_lease_authority(view)?;
+    if let Some(lease) = command.lease() {
+        load_attachments(view, namespace, lease, &mut read_view, &mut budget)?;
+        let mut ids: BTreeSet<LeaseId> = BTreeSet::from([lease]);
+        ids.extend(read_view.current.values().filter_map(|e| e.lease));
+        load_leases(view, ids, &mut read_view, &mut budget)?;
+    }
+    Ok(read_view)
+}
+
+/// Every active lease record (what a recovering scheduler arms), in lease
+/// id order. Scans the whole `lease_v1` collection under the budget.
+pub fn active_leases<V: OrderedRead>(
+    view: &V,
+    budget: ViewBudget,
+) -> Result<Vec<(LeaseId, LeaseRecord)>, ViewBuildError> {
+    let mut budget = Budget {
+        rows: budget.max_rows,
+        bytes: budget.max_bytes,
+    };
+    let mut out = Vec::new();
+    for (key, value) in scan_all(
+        view,
+        Collection::LeaseV1,
+        Vec::new(),
+        Bound::Unbounded,
+        &mut budget,
+    )? {
+        let id = LeaseId::from_slice(&key)
+            .map_err(|_| EngineError::new(ErrorClass::Corrupt, "lease row key"))?;
+        let record = codecs::decode_lease(&value)?;
+        if record.status == LeaseStatus::Active {
+            out.push((id, record));
+        }
+    }
+    Ok(out)
+}
+
 /// Build the owned view a request needs from a gated snapshot.
 ///
 /// Current entries cover every touched key/interval. When the request reads
@@ -247,6 +357,7 @@ pub fn build_read_view<V: OrderedRead>(
         kv_revision,
     );
     read_view.compact_floor = compact_floor;
+    read_view.lease_authority = codecs::read_lease_authority(view)?;
     let touched = touches(&request.operation);
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     for touch in &touched {
@@ -268,37 +379,12 @@ pub fn build_read_view<V: OrderedRead>(
     // Attached keys of a lease the request revokes or lists, and their
     // current entries (so a revocation deletes exactly what is attached).
     if let Some(lease) = needs_attachments(&request.operation) {
-        let prefix = codecs::lease_key_prefix(&lease, &namespace);
-        let upper = prefix_upper(&prefix);
-        let mut keys = BTreeSet::new();
-        for (row_key, _) in scan_all(view, Collection::LeaseKeysV1, prefix, upper, &mut budget)? {
-            let (_, ns, key) = codecs::decode_lease_key_row(&row_key)?;
-            if ns != namespace {
-                continue;
-            }
-            if !read_view.current.contains_key(&key) {
-                let current = codecs::current_key(&namespace, &key);
-                if let Some(value) = view.get(Collection::KvCurrentV1.id(), &current)? {
-                    budget.charge(1, current.len() + value.len())?;
-                    read_view
-                        .current
-                        .insert(key.clone(), codecs::decode_current(&value)?);
-                }
-            }
-            keys.insert(key);
-        }
-        read_view.lease_keys.insert(lease, keys);
+        load_attachments(view, namespace, lease, &mut read_view, &mut budget)?;
     }
     // Lease records: named by the request or referenced by loaded entries.
     let mut lease_ids: BTreeSet<LeaseId> = named_leases(&request.operation).into_iter().collect();
     lease_ids.extend(read_view.current.values().filter_map(|e| e.lease));
-    for id in lease_ids {
-        let row = codecs::lease_row_key(&id);
-        if let Some(value) = view.get(Collection::LeaseV1.id(), &row)? {
-            budget.charge(1, row.len() + value.len())?;
-            read_view.leases.insert(id, codecs::decode_lease(&value)?);
-        }
-    }
+    load_leases(view, lease_ids, &mut read_view, &mut budget)?;
     if let CanonicalOperation::Range(RangeOp {
         revision: Some(r),
         range,
