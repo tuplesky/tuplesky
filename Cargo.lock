@@ -854,6 +854,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-store-bench"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "clap",
+ "coord-consensus",
+ "coord-core",
+ "coord-redb-faultkit",
+ "coord-state",
+ "coord-storage",
+ "coord-storage-fjall",
+ "coord-storage-redb",
+ "coord-store-api",
+ "coord-store-testkit",
+ "coord-types",
+ "postcard",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "coord-store-testkit"
 version = "0.1.0"
 dependencies = [

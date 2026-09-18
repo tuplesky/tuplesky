@@ -1,0 +1,38 @@
+[package]
+name = "coord-store-bench"
+description = "Fresh local storage experiments: fixture replay, differential semantics and honestly labelled engine cost comparison (test-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# Measurement and replay harness (design Sections 17.12-17.14, 21, 22.3); the
+# dependency policy keeps it, and the experimental engine it drives, out of
+# every production, core and tool crate.
+role = "test-only"
+
+[dependencies]
+coord-types.workspace = true
+coord-core.workspace = true
+coord-state.workspace = true
+coord-consensus.workspace = true
+coord-storage.workspace = true
+coord-store-api.workspace = true
+coord-store-testkit.workspace = true
+coord-storage-redb.workspace = true
+coord-storage-fjall.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+postcard.workspace = true
+blake3.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+coord-redb-faultkit.workspace = true
+tempfile.workspace = true
+toml.workspace = true
