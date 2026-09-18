@@ -6,9 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coord_authn::{
-    AdmissionLog, ClockHealth, Decision, IssuerConfig, JwksLimits, KubernetesMode, MintError,
-    OidcVerifier, Registry, SubjectKind, TimeError, TokenReview, TrustRuleConfig, VerifyError,
-    WifVerifier, Workload, WorkloadKind, mint,
+    AdmissionLog, ClockHealth, ConfigError, Decision, IssuerConfig, JwksLimits, KubernetesMode,
+    MintError, OidcVerifier, Registry, SubjectKind, TimeError, TokenReview, TrustRuleConfig,
+    VerifyError, WifVerifier, Workload, WorkloadKind, mint,
 };
 use coord_state::policy::Action;
 use coord_types::ids::{PrincipalId, TrustRuleId};
@@ -754,4 +754,111 @@ fn workload_claims_map_through_rules_and_token_review_is_explicit() {
         VerifyError::NoWorkloadKind
     );
     let _: BTreeSet<String> = BTreeSet::new();
+}
+
+#[test]
+fn a_configuration_name_or_issuer_is_never_shared_by_two_issuers() {
+    // The name selects the key cache. Two configurations sharing one
+    // would share its keys however far apart their issuer strings and
+    // JWKS endpoints are, so a token naming issuer A would verify under
+    // B's key whenever the kid and algorithm matched.
+    let a = issuer("shared", "https://a.example", "k1");
+    let b = issuer("shared", "https://b.example", "k2");
+    let clash = Registry::new(
+        vec![config(&a, &[AUD]), config(&b, &[AUD])],
+        JwksLimits::default(),
+    );
+    assert!(matches!(clash.err(), Some(ConfigError::DuplicateName(n)) if n == "shared"));
+    // The same issuer string twice is refused too: the second would
+    // silently replace the first.
+    let c = issuer("other", "https://a.example", "k3");
+    let clash = Registry::new(
+        vec![config(&a, &[AUD]), config(&c, &[AUD])],
+        JwksLimits::default(),
+    );
+    assert!(
+        matches!(clash.err(), Some(ConfigError::DuplicateIssuer(i)) if i == "https://a.example")
+    );
+    // Distinct names and issuers are accepted.
+    let d = issuer("distinct", "https://d.example", "k4");
+    assert!(
+        Registry::new(
+            vec![config(&a, &[AUD]), config(&d, &[AUD])],
+            JwksLimits::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn plaintext_key_endpoints_are_admitted_only_for_a_real_loopback_host() {
+    // A prefix test is not a host check: the authority of
+    // `http://localhost@evil.example/keys` is `evil.example`, and
+    // `http://localhost.evil.example/keys` is a different host again, so
+    // both used to pass and let an attacker serve JWKS over plaintext.
+    for url in [
+        "http://localhost@evil.example/keys",
+        "http://localhost.evil.example/keys",
+        "http://127.0.0.1.evil.example/keys",
+        "http://user@127.0.0.1.evil.example/keys",
+        "http://evil.example/keys",
+        "http://[::1]@evil.example/keys",
+    ] {
+        assert!(
+            !coord_authn::secure_endpoint(url, true),
+            "{url} is not loopback"
+        );
+    }
+    for url in [
+        "http://localhost/keys",
+        "http://localhost:8080/keys",
+        "http://127.0.0.1:9000/keys",
+        "http://127.2.3.4/keys",
+        "http://[::1]:9000/keys",
+        "http://LocalHost/keys",
+    ] {
+        assert!(coord_authn::secure_endpoint(url, true), "{url} is loopback");
+    }
+    // Plaintext is refused outright unless the configuration asks for it,
+    // and HTTPS never needs the exception.
+    assert!(!coord_authn::secure_endpoint(
+        "http://localhost/keys",
+        false
+    ));
+    assert!(coord_authn::secure_endpoint(
+        "https://evil.example/keys",
+        false
+    ));
+}
+
+#[test]
+fn a_freshness_ceiling_is_not_satisfied_by_a_token_without_an_issue_time() {
+    // A maximum age cannot be enforced against a token that does not say
+    // when it was issued, so skipping the check for it let such a token
+    // bypass the ceiling entirely.
+    let clock = ClockHealth::healthy(10_000, 5);
+    assert_eq!(
+        clock.check(20_000, None, None, Some(3_600)),
+        Err(TimeError::IssuedAtMissing)
+    );
+    // Without a ceiling, a missing issue time is not by itself a denial.
+    assert_eq!(clock.check(20_000, None, None, None), Ok(()));
+    // The age is measured from the latest instant the reading may denote,
+    // so a token that may already be past the ceiling is refused.
+    assert_eq!(
+        clock.check(20_000, None, Some(10_000 - 3_600), Some(3_600)),
+        Err(TimeError::TooOld),
+        "now + uncertainty - iat is over the ceiling"
+    );
+    assert_eq!(
+        clock.check(20_000, None, Some(10_000 - 3_590), Some(3_600)),
+        Ok(())
+    );
+    // A freshly minted token is still accepted under an uncertain clock.
+    assert_eq!(clock.check(20_000, None, Some(10_000), Some(3_600)), Ok(()));
+    // An issue time beyond what the reading could denote is refused.
+    assert_eq!(
+        clock.check(20_000, None, Some(10_006), Some(3_600)),
+        Err(TimeError::IssuedInFuture)
+    );
 }

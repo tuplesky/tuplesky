@@ -18,6 +18,12 @@ pub enum ConfigError {
     InsecureEndpoint(String),
     /// Empty issuer or name.
     Empty,
+    /// Two configurations share a name, and the name selects the key
+    /// cache: they would share keys across issuer boundaries.
+    DuplicateName(String),
+    /// Two configurations claim the same `iss`; the second would silently
+    /// replace the first.
+    DuplicateIssuer(String),
 }
 
 /// One configured issuer.
@@ -52,12 +58,55 @@ pub const fn permitted(alg: Algorithm) -> bool {
 }
 
 /// Whether `url` is an acceptable key endpoint.
+///
+/// Plaintext is admitted only for a genuine loopback host, and only when
+/// the configuration asks for it. A prefix test is not enough: the
+/// authority of `http://localhost@evil.example/keys` is `evil.example`,
+/// and `http://localhost.evil.example/keys` is a different host again,
+/// so both would have passed one and let an attacker serve JWKS over
+/// plaintext.
 pub fn secure_endpoint(url: &str, allow_insecure_loopback: bool) -> bool {
     if url.starts_with("https://") {
         return true;
     }
-    allow_insecure_loopback
-        && (url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost"))
+    if !allow_insecure_loopback {
+        return false;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    // The authority ends at the first `/`, `?` or `#`; anything before an
+    // `@` inside it is userinfo, not the host.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
+    let host = match host_port.strip_prefix('[') {
+        // An IPv6 literal: everything up to the closing bracket.
+        Some(rest) => match rest.split_once(']') {
+            Some((inside, after)) => {
+                if !after.is_empty() && !after.starts_with(':') {
+                    return false;
+                }
+                inside
+            }
+            None => return false,
+        },
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    loopback_host(host)
+}
+
+/// Whether `host` names the loopback interface exactly.
+fn loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<core::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 impl IssuerConfig {
