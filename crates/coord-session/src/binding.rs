@@ -69,6 +69,9 @@ pub enum BindError {
         /// The session already bound.
         bound: SessionId,
     },
+    /// A rebind carried different immutable claims: a rebind refreshes
+    /// validity and never changes the authorization context.
+    ClaimsChanged,
 }
 
 fn hex_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
@@ -95,10 +98,21 @@ pub fn verify_bind(
     let claims = verify_service_token(token, &config.jwks, &config.issuer, &config.resource, clock)
         .map_err(BindError::Token)?;
     let session = SessionId(hex_bytes::<16>(&claims.sid).ok_or(BindError::Malformed)?);
-    if let Some(e) = existing
-        && e.session != session
-    {
-        return Err(BindError::SessionMismatch { bound: e.session });
+    if let Some(e) = existing {
+        if e.session != session {
+            return Err(BindError::SessionMismatch { bound: e.session });
+        }
+        // A rebind refreshes validity, nothing else. The claims that
+        // decide what the connection may do are part of its authorization
+        // context, so a same-session token carrying different ones would
+        // change that context rather than extend it, and a wider scope
+        // would widen every later admission.
+        if e.principal != claims.sub
+            || e.scope_ceiling != claims.scope
+            || e.rule_generation != claims.generation
+        {
+            return Err(BindError::ClaimsChanged);
+        }
     }
     Ok(Binding {
         session,
