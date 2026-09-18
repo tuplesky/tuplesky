@@ -418,7 +418,10 @@ fn admission_is_revalidated_atomically_with_the_application_batch() {
     let b = binding(1, &request);
     // Admit and plan from one snapshot.
     let gated = d.worker.reader().snapshot().unwrap();
-    assert_eq!(retry::admit(gated.view(), &b, |_| true).unwrap(), Admission::New);
+    assert_eq!(
+        retry::admit(gated.view(), &b, |_| true).unwrap(),
+        Admission::New
+    );
     let view = build_read_view(
         &gated,
         NS,

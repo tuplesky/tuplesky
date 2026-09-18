@@ -323,5 +323,8 @@ fn a_lost_permission_protects_the_retained_result_of_an_executed_request() {
     assert_eq!(d.run(S1, 2, &read).0, Admission::Unauthorized);
     assert_eq!(d.position(), 7, "nothing executed for the refused retry");
     // The retained write result (no value returned) is still replayed.
-    assert!(matches!(d.run(S1, 1, &put(b"a", b"secret")).0, Admission::Retry(_)));
+    assert!(matches!(
+        d.run(S1, 1, &put(b"a", b"secret")).0,
+        Admission::Retry(_)
+    ));
 }

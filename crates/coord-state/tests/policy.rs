@@ -439,7 +439,10 @@ fn returning_existing_values_needs_read_and_revocation_needs_delete() {
         Outcome::Put { prev: None }
     );
     // Kine update and delete return the entry they saw: a read as well.
-    for r in [kine_update(b"a", b"3", 1, 0, None), kine_delete(b"a", Some(1))] {
+    for r in [
+        kine_update(b"a", b"3", 1, 0, None),
+        kine_delete(b"a", Some(1)),
+    ] {
         assert_eq!(
             f.run_session(&S1, &r).response.outcome,
             Outcome::ErrPermissionDenied,
@@ -524,7 +527,10 @@ fn retained_results_are_reauthorized_under_current_policy() {
     let outcome = p.response.outcome.clone();
     assert!(matches!(outcome, Outcome::Range { .. }));
     let auth = |f: &Fixture| f.view_for_session(&S1).authorization.unwrap();
-    assert_eq!(authorize_retained(&auth(&f), &NS, &request, &outcome), Ok(()));
+    assert_eq!(
+        authorize_retained(&auth(&f), &NS, &request, &outcome),
+        Ok(())
+    );
     // Losing the read rule protects the retained result; the session is
     // still executable, so the denial is a permission denial.
     f.run_internal(&remove(1, ALICE));
@@ -568,7 +574,15 @@ fn retained_results_are_reauthorized_under_current_policy() {
         session: S1,
     });
     assert_eq!(
-        authorize_retained(&auth(&f), &NS, &txn, &Outcome::Txn { succeeded: true, results: vec![] }),
+        authorize_retained(
+            &auth(&f),
+            &NS,
+            &txn,
+            &Outcome::Txn {
+                succeeded: true,
+                results: vec![]
+            }
+        ),
         Err(Outcome::ErrSessionInvalid)
     );
 }
@@ -715,10 +729,8 @@ fn branch_op() -> impl Strategy<Value = BranchOp> {
             lease: l.then_some(L1),
             prev_kv
         })),
-        (range(), any::<bool>()).prop_map(|(r, prev_kv)| BranchOp::DeleteRange(DeleteRangeOp {
-            range: r,
-            prev_kv
-        })),
+        (range(), any::<bool>())
+            .prop_map(|(r, prev_kv)| BranchOp::DeleteRange(DeleteRangeOp { range: r, prev_kv })),
         range().prop_map(|r| BranchOp::Range(RangeOp {
             range: r,
             revision: None,
@@ -738,16 +750,17 @@ fn operation() -> impl Strategy<Value = CanonicalOperation> {
             keys_only: false,
             count_only: false
         })),
-        (key(), any::<bool>(), any::<bool>()).prop_map(|(k, l, prev_kv)| CanonicalOperation::Put(PutOp {
-            key: k,
-            value: b"v".to_vec(),
-            lease: l.then_some(L1),
-            prev_kv
-        })),
-        (range(), any::<bool>()).prop_map(|(r, prev_kv)| CanonicalOperation::DeleteRange(DeleteRangeOp {
-            range: r,
-            prev_kv
-        })),
+        (key(), any::<bool>(), any::<bool>()).prop_map(|(k, l, prev_kv)| CanonicalOperation::Put(
+            PutOp {
+                key: k,
+                value: b"v".to_vec(),
+                lease: l.then_some(L1),
+                prev_kv
+            }
+        )),
+        (range(), any::<bool>()).prop_map(|(r, prev_kv)| CanonicalOperation::DeleteRange(
+            DeleteRangeOp { range: r, prev_kv }
+        )),
         (
             prop::collection::vec((key(), 0u64..3), 0..2),
             prop::collection::vec(branch_op(), 0..3),
