@@ -37,10 +37,12 @@ use crate::learner::{AppliedOutcome, LearnError, Learner};
 use crate::messages::{PathAnchors, ProtocolMessage};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
+use crate::recovery::RecoveryReport;
 use crate::rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, dependency_update, payload_update,
     proposal_update,
 };
+use crate::summary::DurableLedger;
 use crate::vote::{FastAck, Vote, VoteError, VoteSet};
 
 /// The single conservative conflict key: every command in a domain
@@ -158,6 +160,7 @@ pub struct Leader {
     proposals: BTreeMap<CommandId, Proposal>,
     votes: BTreeMap<CommandId, VoteSet>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
+    ledger: DurableLedger,
     learner: Learner,
     seqnum: u64,
     rejections: Vec<Rejection>,
@@ -189,11 +192,23 @@ impl Leader {
             proposals: BTreeMap::new(),
             votes: BTreeMap::new(),
             payloads: BTreeMap::new(),
+            ledger: DurableLedger::new(),
             learner: Learner::new(executed_through),
             seqnum: 0,
             rejections: Vec::new(),
             fenced: None,
         }
+    }
+
+    /// The durable ledger (journal-durable records only).
+    pub const fn ledger(&self) -> &DurableLedger {
+        &self.ledger
+    }
+
+    /// The recovery report for `ballot` from durable state at this cut.
+    pub fn report(&self, ballot: Ballot) -> RecoveryReport {
+        self.ledger
+            .report(self.config.identity.replica, ballot, self.ballots.synced())
     }
 
     /// The next command to execute through the materializer, if any.
@@ -373,6 +388,9 @@ impl Leader {
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
         self.seqnum += 1;
+        // The durable row records the phase the command is actually in.
+        // The leader's own acceptance of its order is written separately,
+        // once the dependency guard passes (see `advance_pending`).
         let record = self
             .table
             .record(&command)
@@ -406,6 +424,7 @@ impl Leader {
             base: None,
             updates: updates.clone(),
         });
+        self.ledger.stage(barrier, command, record);
         let proposal = FastAck {
             replica: self.config.identity.replica,
             ballot,
@@ -470,6 +489,20 @@ impl Leader {
             outbox.observe(event);
         }
         self.ballots.on_storage(event);
+        // Ledger bookkeeping covers every batch this machine staged, not
+        // only the proposal batches: an acceptance row carries its own
+        // barrier and is what a recovery report must show.
+        if let Some(barrier) = event.barrier() {
+            match event {
+                StorageEvent::JournalDurable { journal_seq, .. } => {
+                    self.ledger.durable(barrier, *journal_seq);
+                }
+                StorageEvent::Failed { .. } => {
+                    self.ledger.failed(barrier);
+                }
+                _ => {}
+            }
+        }
         if let Some(barrier) = event.barrier()
             && let Some(command) = self
                 .proposals
@@ -493,9 +526,8 @@ impl Leader {
                     error: StorageError::DefinitelyNotCommitted,
                     ..
                 } => {
-                    let retry = self.retry_proposal(command);
-                    self.advance_pending();
-                    let mut effects = retry;
+                    let mut effects = self.retry_proposal(command);
+                    effects.extend(self.advance_pending());
                     effects.extend(self.release());
                     return effects;
                 }
@@ -508,9 +540,10 @@ impl Leader {
                 _ => {}
             }
         }
-        self.advance_pending();
+        let mut effects = self.advance_pending();
         self.learn();
-        self.release()
+        effects.extend(self.release());
+        effects
     }
 
     /// Present a definitely rejected proposal batch again, unchanged, under
@@ -585,7 +618,14 @@ impl Leader {
     /// Adopt the leader's own order for every durable proposal whose
     /// dependencies are all at least ACCEPT; repeat while progress is made
     /// so a chain advances in one turn (bounded by the table size).
-    fn advance_pending(&mut self) {
+    fn advance_pending(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        // A leader that no longer leads (a higher promise in flight or
+        // durable, or a fence) writes no new acceptance: that ballot's
+        // transitions end at the recovery cut.
+        if !self.is_leading() {
+            return effects;
+        }
         loop {
             let mut progressed = false;
             let candidates: Vec<(CommandId, Vec<CommandId>)> = self
@@ -597,10 +637,29 @@ impl Leader {
             for (command, deps) in candidates {
                 if self.table.accept(command, deps).is_ok() {
                     progressed = true;
+                    // The acceptance happened: record it durably now, not
+                    // when the command was merely proposed. A row claiming
+                    // ACCEPT before the guard passed would let recovery
+                    // restore an accepted command whose prerequisite never
+                    // was accepted.
+                    let epoch = self.config.identity.epoch;
+                    let record = self.table.record(&command).expect("accepted").clone();
+                    let Some(alloc) = self.alloc.as_mut() else {
+                        continue;
+                    };
+                    let barrier = alloc.allocate();
+                    self.ledger.stage(barrier, command, record.clone());
+                    effects.push(Effect::Persist(PersistBatch {
+                        barrier,
+                        base: None,
+                        updates: alloc::vec![
+                            dependency_update(epoch, &command, &record).expect("bounded")
+                        ],
+                    }));
                 }
             }
             if !progressed {
-                return;
+                return effects;
             }
         }
     }
@@ -648,10 +707,52 @@ impl Leader {
             }
             ProtocolMessage::FastAck(ack) => self.collect(from.replica, Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => self.collect(from.replica, Vote::Slow(ack)),
+            ProtocolMessage::PayloadRequest { commands } => {
+                self.serve_payloads(from.replica, &commands)
+            }
             ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
-            | ProtocolMessage::LeaderReply { .. } => Vec::new(),
+            | ProtocolMessage::LeaderReply { .. }
+            | ProtocolMessage::ReportPage(_)
+            | ProtocolMessage::PayloadResponse { .. } => Vec::new(),
         }
+    }
+
+    /// Serve durable payloads to a peer; a payload whose proposal batch is
+    /// not durable is not served.
+    fn serve_payloads(&mut self, to: ReplicaId, commands: &[CommandId]) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let context =
+            self.ballots
+                .context(boot, self.config.quorum.ballot(), LocalJournalSeq::ZERO);
+        let responses: Vec<ProtocolMessage> = commands
+            .iter()
+            .filter(|c| self.proposals.get(c).is_some_and(|p| p.durable))
+            .filter_map(|c| {
+                self.payloads
+                    .get(c)
+                    .map(|p| ProtocolMessage::PayloadResponse {
+                        command: *c,
+                        payload: p.clone(),
+                    })
+            })
+            .collect();
+        if let Some(outbox) = self.outbox.as_mut() {
+            for m in responses {
+                outbox.publish(PendingSend {
+                    context,
+                    requires: Vec::new(),
+                    to: PeerId {
+                        replica: to,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: m.encode(),
+                });
+            }
+        }
+        self.release()
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {

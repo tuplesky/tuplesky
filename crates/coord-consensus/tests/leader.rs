@@ -341,7 +341,9 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
         "c1 durable".into(),
         released.iter().map(summarize).collect(),
     ));
-    assert_eq!(released.len(), 3);
+    // Three sends plus the two acceptance rows: the leader's own ACCEPT
+    // is written when the dependency guard passes, not when it proposed.
+    assert_eq!(released.len(), 5);
     assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(leader.table().phase_of(&c2), Some(Phase::Accept));
     assert_eq!(leader.pending_sends(), 0);
@@ -601,8 +603,8 @@ fn a_higher_promise_stops_proposing_and_fences_unreleased_proposals() {
     assert_eq!(leader.pending_sends(), 0);
     assert_eq!(
         leader.table().phase_of(&c1),
-        Some(Phase::Accept),
-        "durable state is kept"
+        Some(Phase::PreAccept),
+        "the cut began before the guard passed: no acceptance is adopted"
     );
 }
 
