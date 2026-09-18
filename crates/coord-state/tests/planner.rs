@@ -14,6 +14,7 @@ use coord_types::ids::*;
 use coord_types::logical_v1::*;
 
 const NS: NamespaceId = NamespaceId([7; 16]);
+const ME: PrincipalId = PrincipalId([0xaa; 16]);
 
 fn base(pos: u64) -> ApplyBase {
     ApplyBase {
@@ -27,7 +28,7 @@ fn rev(n: u64) -> KvRevision {
 }
 
 fn view(current: &BTreeMap<Vec<u8>, KvEntry>, revision: u64, pos: u64) -> ReadView {
-    let mut v = ReadView::empty(base(pos), NS, rev(revision));
+    let mut v = ReadView::empty(base(pos), NS, ME, rev(revision));
     v.current = current.clone();
     v
 }
@@ -449,14 +450,18 @@ fn limits_fail_before_any_change() {
     let mut other = put(b"k", b"v");
     other.namespace = NamespaceId([8; 16]);
     assert_eq!(f.run(&other).unwrap_err(), PlanError::NamespaceMismatch);
-    // Unknown lease.
+    // Unknown lease: a recorded failure, not a planner error, and no change.
     let leased = req(CanonicalOperation::Put(PutOp {
         key: b"k".to_vec(),
         value: b"v".to_vec(),
         lease: Some(LeaseId([1; 16])),
         prev_kv: false,
     }));
-    assert_eq!(f.run(&leased).unwrap_err(), PlanError::LeaseNotFound);
+    let p = f.run(&leased).unwrap();
+    assert_eq!(p.response.outcome, Outcome::ErrLeaseNotFound);
+    assert_eq!(p.revision, None);
+    assert!(p.mutations.is_empty());
+    assert_eq!(f.current, snapshot);
     // Revision overflow stops.
     let mut v = view(&f.current, KvRevision::MAX.get(), 1);
     v.kv_revision = KvRevision::MAX;
@@ -466,12 +471,26 @@ fn limits_fail_before_any_change() {
     );
 }
 
+fn lease_record() -> coord_state::LeaseRecord {
+    coord_state::LeaseRecord {
+        namespace: NS,
+        generation: LeaseGeneration::new(1).unwrap(),
+        owner: ME,
+        ttl_seconds: 30,
+        renewal_sequence: 0,
+        purpose: coord_state::LeasePurpose::Native,
+        status: coord_state::LeaseStatus::Active,
+        attached_keys: 0,
+        attached_bytes: 0,
+    }
+}
+
 #[test]
 fn lease_attachment_produces_index_mutations() {
     let mut f = Fixture::new();
     let lease = LeaseId([3; 16]);
     let mut v = view(&f.current, 0, 0);
-    v.leases.insert(lease);
+    v.leases.insert(lease, lease_record());
     let leased = req(CanonicalOperation::Put(PutOp {
         key: b"k".to_vec(),
         value: b"v".to_vec(),
@@ -481,13 +500,22 @@ fn lease_attachment_produces_index_mutations() {
     let p = plan(&leased, &v, &PlanLimits::default()).unwrap();
     assert!(p.mutations.contains(&Mutation::LeaseAttach {
         lease,
-        key: b"k".to_vec()
+        key: b"k".to_vec(),
+        generation: LeaseGeneration::new(1).unwrap(),
+        mod_revision: rev(1),
     }));
     apply_to_map(&mut f.current, &p);
     assert_eq!(f.current[b"k".as_slice()].lease, Some(lease));
-    // Deleting a leased key detaches it.
+    let mut leases = BTreeMap::new();
+    coord_state::planner::apply_leases(&mut leases, &p);
+    assert_eq!(leases[&lease].attached_keys, 1);
+    assert_eq!(
+        leases[&lease].attached_bytes,
+        coord_state::attachment_cost(b"k", b"v")
+    );
+    // Deleting a leased key detaches it and returns the accounting.
     let mut v = view(&f.current, 1, 1);
-    v.leases.insert(lease);
+    v.leases = leases;
     let del = req(CanonicalOperation::DeleteRange(DeleteRangeOp {
         range: KeyRange::exact(b"k".to_vec()),
         prev_kv: false,
@@ -497,6 +525,10 @@ fn lease_attachment_produces_index_mutations() {
         lease,
         key: b"k".to_vec()
     }));
+    let mut leases = v.leases.clone();
+    coord_state::planner::apply_leases(&mut leases, &p);
+    assert_eq!(leases[&lease].attached_keys, 0);
+    assert_eq!(leases[&lease].attached_bytes, 0);
 }
 
 fn entry_at(value: &[u8], revision: u64) -> KvEntry {
