@@ -14,7 +14,10 @@
 
 use coord_consensus::{AppliedOutcome, PayloadRecordV1};
 use coord_core::outbox::BarrierAllocator;
-use coord_state::{PlanError, PlanLimits, authorize_retained, plan, rejection_plan};
+use coord_state::{
+    PlanError, PlanLimits, RejectionReason, authorize_retained, plan, rejection_plan,
+    rejection_plan_at,
+};
 use coord_store_api::engine::{EngineError, LocalEngine};
 use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::LogicalRequest;
@@ -181,21 +184,40 @@ impl<E: LocalEngine> Applier<E> {
                 }
                 other => return Err(ApplyError::NotAdmitted(other)),
             }
-            let view =
-                build_authorized_view(&gated, namespace, &session, request, ViewBudget::default())
-                    .map_err(ApplyError::View)?;
-            let planned = match plan(request, &view, &PlanLimits::default()) {
-                Ok(planned) => planned,
-                Err(e) => match e.terminal() {
-                    // A command already chosen to execute cannot be left
-                    // unexecuted because the request is impossible against
-                    // this state: retrying can only reject it again, and
-                    // every successor conflicts with it. The rejection is
-                    // its result, taking its execution position, durable
-                    // and retry-resolvable, changing nothing.
-                    Some(reason) => rejection_plan(&view, reason).map_err(ApplyError::Plan)?,
-                    None => return Err(ApplyError::Plan(e)),
+            // The budget here is the schema's, identical on every replica,
+            // never a local setting: a command that overruns it overruns
+            // it everywhere, so the rejection below is a replicated result
+            // and not this node's resource limit leaking into the history.
+            let built =
+                build_authorized_view(&gated, namespace, &session, request, ViewBudget::SCHEMA);
+            let planned = match built {
+                Ok(view) => match plan(request, &view, &PlanLimits::default()) {
+                    Ok(planned) => planned,
+                    Err(e) => match e.terminal() {
+                        // A command already chosen to execute cannot be
+                        // left unexecuted because the request is impossible
+                        // against this state: retrying can only reject it
+                        // again, and every successor conflicts with it. The
+                        // rejection is its result, taking its execution
+                        // position, durable and retry-resolvable, changing
+                        // nothing.
+                        Some(reason) => rejection_plan(&view, reason).map_err(ApplyError::Plan)?,
+                        None => return Err(ApplyError::Plan(e)),
+                    },
                 },
+                // The same argument covers a command whose view cannot be
+                // built at all: the state it would have to read is beyond
+                // the schema's budget, retrying reads the same state, and
+                // returning an error here would leave the command forever
+                // unexecuted with every successor waiting behind it.
+                Err(ViewBuildError::BudgetExceeded) => rejection_plan_at(
+                    self.worker.application_base(),
+                    crate::codecs::read_kv_revision(gated.view())?,
+                    RejectionReason::ViewTooLarge,
+                )
+                .map_err(ApplyError::Plan)?,
+                // An engine failure is this node's, not the request's.
+                Err(e) => return Err(ApplyError::View(e)),
             };
             drop(gated);
             let barrier = self.alloc.allocate();

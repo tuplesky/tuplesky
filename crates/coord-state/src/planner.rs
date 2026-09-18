@@ -5,6 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use coord_core::effect::ApplyBase;
 use coord_types::error::ValidationError;
 use coord_types::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId};
 use coord_types::logical_v1::{
@@ -76,19 +77,30 @@ impl PlanError {
 /// retry-resolvable result, and changes nothing. Without it a chosen
 /// command that no state can satisfy would block every successor.
 pub fn rejection_plan(view: &ReadView, reason: RejectionReason) -> Result<ApplyPlan, PlanError> {
-    let position = view
-        .base
+    rejection_plan_at(view.base, view.kv_revision, reason)
+}
+
+/// The same rejection built from the base and revision alone, for a
+/// command that cannot even be given a view: the state it would have to
+/// read exceeds the schema's budget, so there is nothing to plan against
+/// and the rejection is the whole result.
+pub fn rejection_plan_at(
+    base: ApplyBase,
+    kv_revision: KvRevision,
+    reason: RejectionReason,
+) -> Result<ApplyPlan, PlanError> {
+    let position = base
         .execution_position
         .checked_next()
         .map_err(|_| PlanError::CounterOverflow)?;
     Ok(ApplyPlan {
-        base: view.base,
+        base,
         position,
         revision: None,
         mutations: Vec::new(),
         events: Vec::new(),
         response: Response {
-            revision: view.kv_revision,
+            revision: kv_revision,
             outcome: Outcome::ErrRejected { reason },
         },
     })

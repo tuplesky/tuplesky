@@ -77,7 +77,9 @@ pub use plan::{
     ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, RejectionReason,
     Response,
 };
-pub use planner::{PlanError, authorize_retained, plan, plan_internal, rejection_plan};
+pub use planner::{
+    PlanError, authorize_retained, plan, plan_internal, rejection_plan, rejection_plan_at,
+};
 pub use policy::{
     Action, AdmissionReceiptV1, Authorization, GrantKind, GrantRecord, GrantState, KeyInterval,
     PolicyRule, SessionRecord, TrustRule,

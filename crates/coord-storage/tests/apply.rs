@@ -9,7 +9,7 @@ use coord_core::outbox::BarrierAllocator;
 use coord_state::policy::{Action, KeyInterval, PolicyRule};
 use coord_state::{Outcome, RejectionReason, Response};
 use coord_storage::policy::{bootstrap_session, rule_update};
-use coord_storage::{Applier, GroupLimits, StoreWorker, WatchItem, WatchSpec};
+use coord_storage::{Applier, GroupLimits, StoreWorker, ViewBudget, WatchItem, WatchSpec};
 use coord_store_testkit::model::{CommitScript, ModelEngine};
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
@@ -221,4 +221,57 @@ fn a_commit_established_by_reconciliation_still_reaches_open_watches() {
     }
     assert_eq!(seen, vec![r1, r2], "each revision once, in order");
     assert_eq!(applier.hub().published(), r2);
+}
+
+#[test]
+fn a_view_too_large_to_build_is_a_rejection_and_never_blocks_successors() {
+    // The view is built before the planner runs, so a request whose
+    // touched interval exceeds the schema's view budget never reached the
+    // terminal-rejection path: it returned an error with no executed
+    // identity and no position advance, and every successor waited behind
+    // a command that would fail again on every retry.
+    let mut applier = applier(ModelEngine::new());
+    let rows = ViewBudget::SCHEMA.max_rows + 1;
+    seed_keys(&mut applier, rows);
+    let before = applier.kv_revision().unwrap();
+    // A bounded read: the limit is one row, but the interval it is taken
+    // from is loaded first.
+    let doomed = req(CanonicalOperation::Range(RangeOp {
+        range: KeyRange::interval(vec![0], vec![0xff, 0xff, 0xff, 0xff]),
+        revision: None,
+        limit: 1,
+        count_only: false,
+        keys_only: false,
+    }));
+    let (command, record) = payload(1, &doomed);
+    let outcome = applier
+        .apply(command, &record)
+        .expect("a result, not an error");
+    assert_eq!(outcome.revision, None, "a read writes nothing");
+    assert_eq!(applier.kv_revision().unwrap(), before);
+    // Retry-resolvable at the same position, with the same result.
+    let again = applier.apply(command, &record).unwrap();
+    assert_eq!(again.position, outcome.position);
+    assert_eq!(again.result_digest, outcome.result_digest);
+    let gated = applier.worker().reader().snapshot().unwrap();
+    let stored = coord_storage::retry::lookup(gated.view(), &retry_key(1))
+        .unwrap()
+        .expect("retained");
+    drop(gated);
+    let response: Response = postcard::from_bytes(&stored.response).unwrap();
+    assert_eq!(
+        response.outcome,
+        Outcome::ErrRejected {
+            reason: RejectionReason::ViewTooLarge
+        }
+    );
+    // The write behind it proceeds.
+    let (command, record) = payload(2, &put(b"after", b"1"));
+    let outcome = applier.apply(command, &record).unwrap();
+    assert!(outcome.revision.is_some());
+    assert_eq!(
+        outcome.position.get(),
+        again.position.get() + 1,
+        "the rejection occupied exactly one position"
+    );
 }
