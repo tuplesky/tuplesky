@@ -60,6 +60,17 @@ pub enum HashDomain {
     DependencyPath,
     /// Admission receipt identities minted at the trusted boundary (task-33).
     AdmissionReceipt,
+    /// Certificate hash of a `GroupConfigurationV1` record (task-m01).
+    ConfigurationRecord,
+    /// Message an old quorum or the genesis admin signs to activate a
+    /// configuration (task-m01).
+    ConfigurationActivation,
+    /// Message the voters sign to bind a ballot's leader and fast set
+    /// (task-m01).
+    ConfigurationBallot,
+    /// Message a voter signs to attest an endpoint or observer catalog
+    /// (task-m01).
+    ConfigurationCatalog,
 }
 
 impl HashDomain {
@@ -75,6 +86,12 @@ impl HashDomain {
             HashDomain::AuthGrantCommitment => "tuplesky coord.v1 2026-09 auth-grant-commitment",
             HashDomain::DependencyPath => "tuplesky coord.v1 2026-09 dependency-path",
             HashDomain::AdmissionReceipt => "tuplesky coord.v1 2026-09 admission-receipt",
+            HashDomain::ConfigurationRecord => "tuplesky coord.v1 2026-09 configuration-record",
+            HashDomain::ConfigurationActivation => {
+                "tuplesky coord.v1 2026-09 configuration-activation"
+            }
+            HashDomain::ConfigurationBallot => "tuplesky coord.v1 2026-09 configuration-ballot",
+            HashDomain::ConfigurationCatalog => "tuplesky coord.v1 2026-09 configuration-catalog",
         }
     }
 
