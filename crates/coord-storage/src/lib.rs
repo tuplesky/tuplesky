@@ -42,6 +42,12 @@
 //!   budgeted history and event garbage collection keeps the newest version
 //!   or tombstone at or below that floor per key plus everything newer, and
 //!   persists its cursors so it resumes after a crash.
+//! * Native leases (task-15): [`codecs`] adds the `lease_v1` record and the
+//!   `lease_keys_v1` reverse-index row (generation and bound mod revision),
+//!   [`materialize`] lowers lease writes and bindings into the same atomic
+//!   batch as the entries they govern, and [`views`] loads the lease
+//!   records a request names or its entries reference plus, for a
+//!   revocation, the reverse index and the entries it points at.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

@@ -85,6 +85,12 @@ fixed_id!(
     /// Identity of an ordered read fence (Section 6.9); reserved, distinct from a command.
     ReadFenceId
 );
+fixed_id!(
+    /// Stable principal identity: the human `(issuer, subject)` or workload
+    /// identity a session executes as, hashed at the trusted boundary. Owns
+    /// leases; never a QUIC session, token or connection.
+    PrincipalId
+);
 
 macro_rules! checked_counter {
     ($(#[$doc:meta])* $name:ident, max = $max:expr) => {

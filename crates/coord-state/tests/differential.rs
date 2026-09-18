@@ -180,7 +180,12 @@ impl FixtureStore {
             configuration: ConfigurationEpoch::ZERO,
             execution_position: ExecutionPosition::new(self.position).unwrap(),
         };
-        let mut v = ReadView::empty(base, NS, KvRevision::new(self.revision).unwrap());
+        let mut v = ReadView::empty(
+            base,
+            NS,
+            PrincipalId([9; 16]),
+            KvRevision::new(self.revision).unwrap(),
+        );
         v.current = self.current.clone();
         v.compact_floor = KvRevision::new(self.floor).unwrap();
         for r in coord_state::historical_revisions(op) {
@@ -233,6 +238,7 @@ fn convert(outcome: &Outcome) -> OracleOutcome {
         Outcome::Compacted => OracleOutcome::Compacted,
         Outcome::ErrCompacted => OracleOutcome::ErrCompacted,
         Outcome::ErrFutureRevision => OracleOutcome::ErrFutureRevision,
+        other => panic!("the oracle model has no lease outcomes: {other:?}"),
     }
 }
 
