@@ -1,12 +1,15 @@
 //! Durable-barrier gating, boot fencing, timer generations and sealed
 //! capabilities.
 
-use coord_core::capability::{EstablishError, EstablishedResult, EstablishmentEvidence};
+use coord_core::capability::{
+    EstablishError, EstablishedRecord, EstablishedResult, EstablishmentEvidence,
+};
 use coord_core::effect::{BarrierId, BootId, Effect, EffectContext, PeerId, TimerId};
 use coord_core::event::{StorageError, StorageEvent};
 use coord_core::machine::ClockSnapshot;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend, ReleaseError, TimerTable};
-use coord_core::ports::{ClockSource, CountingEntropy, EntropySource, ManualClock};
+use coord_core::ports::{ClockSource, EntropySource};
+use coord_sim::ports::{CountingEntropy, ManualClock};
 use coord_types::CommandId;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
@@ -49,10 +52,11 @@ fn send(boot: BootId, ballot: Ballot, requires: Vec<BarrierId>) -> PendingSend {
     }
 }
 
+/// A completion whose reported sequence covers the cut `context` requires.
 fn durable(barrier: BarrierId) -> StorageEvent {
     StorageEvent::JournalDurable {
         barrier_id: barrier,
-        journal_seq: LocalJournalSeq::new(barrier.sequence).unwrap(),
+        journal_seq: LocalJournalSeq::new(5 + barrier.sequence).unwrap(),
     }
 }
 
@@ -84,6 +88,90 @@ fn two_barrier_effect_cannot_release_after_one() {
     assert!(outbox.pending().is_empty());
     // Releasing again sends nothing twice.
     assert!(outbox.release(&ballot(1, 1)).is_empty());
+}
+
+#[test]
+fn release_requires_the_context_journal_sequence() {
+    let mut alloc = BarrierAllocator::new(incarnation(), BOOT_A);
+    let b1 = alloc.allocate();
+    let mut outbox = Outbox::new(BOOT_A);
+    // The context requires the journal durable through sequence 5.
+    outbox.publish(send(BOOT_A, ballot(1, 1), vec![b1]));
+    // The barrier completes, but the reported sequence is below the cut.
+    assert!(outbox.observe(&StorageEvent::JournalDurable {
+        barrier_id: b1,
+        journal_seq: LocalJournalSeq::new(3).unwrap(),
+    }));
+    assert!(outbox.is_durable(&b1));
+    assert!(
+        outbox.release(&ballot(1, 1)).is_empty(),
+        "durable barrier below the required cut must not release"
+    );
+    // A later completion of another barrier carries the cut forward.
+    let b2 = alloc.allocate();
+    assert!(outbox.observe(&StorageEvent::JournalDurable {
+        barrier_id: b2,
+        journal_seq: LocalJournalSeq::new(5).unwrap(),
+    }));
+    assert_eq!(outbox.durable_through().get(), 5);
+    assert_eq!(outbox.release(&ballot(1, 1)).len(), 1);
+
+    // An effect naming no barrier still waits for the cut it names.
+    let mut outbox = Outbox::new(BOOT_A);
+    outbox.publish(send(BOOT_A, ballot(1, 1), vec![]));
+    assert!(outbox.release(&ballot(1, 1)).is_empty());
+    let b3 = alloc.allocate();
+    assert!(outbox.observe(&StorageEvent::JournalDurable {
+        barrier_id: b3,
+        journal_seq: LocalJournalSeq::new(4).unwrap(),
+    }));
+    assert!(outbox.release(&ballot(1, 1)).is_empty());
+    let b4 = alloc.allocate();
+    assert!(outbox.observe(&StorageEvent::JournalDurable {
+        barrier_id: b4,
+        journal_seq: LocalJournalSeq::new(6).unwrap(),
+    }));
+    assert_eq!(outbox.release(&ballot(1, 1)).len(), 1);
+    // A wrong-boot completion never moves the cut.
+    let mut outbox = Outbox::new(BOOT_A);
+    outbox.publish(send(BOOT_A, ballot(1, 1), vec![]));
+    let mut other = BarrierAllocator::new(incarnation(), BOOT_B);
+    let foreign = other.allocate();
+    assert!(!outbox.observe(&StorageEvent::JournalDurable {
+        barrier_id: foreign,
+        journal_seq: LocalJournalSeq::new(9).unwrap(),
+    }));
+    assert_eq!(outbox.durable_through(), LocalJournalSeq::ZERO);
+    assert!(outbox.release(&ballot(1, 1)).is_empty());
+}
+
+#[test]
+fn established_result_deserialization_revalidates() {
+    let record = EstablishedRecord {
+        command: CommandId(Digest32([1; 32])),
+        epoch: ConfigurationEpoch::new(1).unwrap(),
+        ballot: ballot(1, 3),
+        position: ExecutionPosition::new(9).unwrap(),
+        result_digest: Digest32([7; 32]),
+        revision: None,
+        fast_path: false,
+    };
+    let bytes = postcard::to_allocvec(&record).unwrap();
+    let restored: EstablishedResult = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.record(), record);
+    assert_eq!(postcard::to_allocvec(&restored).unwrap(), bytes);
+    let mut bad = record.clone();
+    bad.epoch = ConfigurationEpoch::new(2).unwrap();
+    let bytes = postcard::to_allocvec(&bad).unwrap();
+    assert!(postcard::from_bytes::<EstablishedResult>(&bytes).is_err());
+    assert_eq!(
+        EstablishedResult::restore(bad).unwrap_err(),
+        EstablishError::EpochMismatch
+    );
+    let mut bad = record;
+    bad.position = ExecutionPosition::ZERO;
+    let bytes = postcard::to_allocvec(&bad).unwrap();
+    assert!(postcard::from_bytes::<EstablishedResult>(&bytes).is_err());
 }
 
 #[test]

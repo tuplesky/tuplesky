@@ -5,7 +5,10 @@
 //! on four independent facts, each checked on every release:
 //!
 //! 1. every required barrier completed with `JournalDurable` (a two-barrier
-//!    effect cannot release after one);
+//!    effect cannot release after one), and the journal is durable through
+//!    the sequence the effect's context names (`required_journal_seq`): a
+//!    completion that reports a lower sequence, or an effect that names no
+//!    barrier at all, waits for the durable frontier to reach it;
 //! 2. every completion belongs to the current boot (a wrong-boot completion
 //!    is recorded as stale bookkeeping and never authorizes);
 //! 3. no required barrier failed (a failed effect is dropped, not retried);
@@ -18,7 +21,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use coord_types::ids::Ballot;
+use coord_types::ids::{Ballot, LocalJournalSeq};
 
 use crate::effect::{BarrierId, BootId, Effect, EffectContext, PeerId};
 use crate::event::{StorageError, StorageEvent};
@@ -48,10 +51,13 @@ pub enum ReleaseError {
 }
 
 /// The logical outbox of one domain actor.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Outbox {
     boot: Option<BootId>,
     durable: BTreeSet<BarrierId>,
+    /// Highest journal sequence any current-boot `JournalDurable` reported.
+    /// Journal durability is prefix-ordered, so this is the durable cut.
+    durable_through: LocalJournalSeq,
     failed: BTreeMap<BarrierId, StorageError>,
     /// Completions from other boots: bookkeeping only.
     stale_completions: u64,
@@ -65,7 +71,12 @@ impl Outbox {
     pub fn new(boot: BootId) -> Self {
         Outbox {
             boot: Some(boot),
-            ..Outbox::default()
+            durable: BTreeSet::new(),
+            durable_through: LocalJournalSeq::ZERO,
+            failed: BTreeMap::new(),
+            stale_completions: 0,
+            pending: Vec::new(),
+            dropped: Vec::new(),
         }
     }
 
@@ -94,7 +105,13 @@ impl Outbox {
             return false;
         }
         match event {
-            StorageEvent::JournalDurable { .. } => self.durable.insert(barrier),
+            StorageEvent::JournalDurable { journal_seq, .. } => {
+                let advanced = *journal_seq > self.durable_through;
+                if advanced {
+                    self.durable_through = *journal_seq;
+                }
+                self.durable.insert(barrier) || advanced
+            }
             StorageEvent::Materialized { .. } => false,
             StorageEvent::Failed { error, .. } => {
                 if self.failed.contains_key(&barrier) {
@@ -110,6 +127,11 @@ impl Outbox {
     /// Whether a barrier is durable in this boot.
     pub fn is_durable(&self, barrier: &BarrierId) -> bool {
         self.durable.contains(barrier)
+    }
+
+    /// Journal sequence the current boot has been reported durable through.
+    pub fn durable_through(&self) -> LocalJournalSeq {
+        self.durable_through
     }
 
     /// Number of completions ignored because they belonged to another boot.
@@ -138,7 +160,9 @@ impl Outbox {
                 self.dropped.push((send, ReleaseError::BarrierFailed(err)));
                 continue;
             }
-            if send.requires.iter().all(|b| self.durable.contains(b)) {
+            let barriers_durable = send.requires.iter().all(|b| self.durable.contains(b));
+            let cut_durable = send.context.required_journal_seq <= self.durable_through;
+            if barriers_durable && cut_durable {
                 released.push(Effect::SendWhenDurable {
                     context: send.context,
                     requires: send.requires,

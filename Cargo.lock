@@ -148,7 +148,9 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 name = "coord-core"
 version = "0.1.0"
 dependencies = [
+ "coord-sim",
  "coord-types",
+ "postcard",
  "serde",
 ]
 
@@ -156,6 +158,7 @@ dependencies = [
 name = "coord-sim"
 version = "0.1.0"
 dependencies = [
+ "coord-core",
  "coord-types",
 ]
 

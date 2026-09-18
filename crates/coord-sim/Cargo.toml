@@ -14,3 +14,4 @@ role = "test-only"
 
 [dependencies]
 coord-types.workspace = true
+coord-core.workspace = true

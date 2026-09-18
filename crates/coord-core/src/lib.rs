@@ -22,8 +22,9 @@
 //!   `JournalDurable`, `Materialized` and `LocalCheckpointPublished` are
 //!   storage facts; protocol establishment is a separate, privately
 //!   constructed value.
-//! * [`ports`]: test-only clock and entropy ports. Production ports live in
-//!   the runtime crate; this crate never reads the OS clock or entropy.
+//! * [`ports`]: the clock and entropy port traits. Production ports live in
+//!   the runtime crate and deterministic test ports in the test-only
+//!   `coord-sim` crate; this crate never reads the OS clock or entropy.
 //!
 //! Types support learning predicates but do not prove them (task-19+).
 #![forbid(unsafe_code)]
