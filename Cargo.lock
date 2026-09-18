@@ -418,6 +418,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-transport-sim"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "coord-core",
+ "coord-sim",
+ "coord-transport",
+ "coord-transport-testkit",
+ "coord-types",
+ "quinn-proto",
+ "rustls",
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "coord-transport-testkit"
 version = "0.1.0"
 dependencies = [
