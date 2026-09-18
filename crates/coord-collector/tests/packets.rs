@@ -80,14 +80,14 @@ fn submission() -> Vec<u8> {
         request_sequence: RequestSequence::new(1).unwrap(),
     };
     submit_frame(&SubmitV1 {
-        receipt: AdmissionReceipt::from_verifier(
+        receipt: coord_collector::AdmissionClaimsV1::of(&AdmissionReceipt::from_verifier(
             VerifierToken::for_boundary(),
             SessionId([3; 16]),
             1,
             u32::MAX,
             Digest32([6; 32]),
             0,
-        ),
+        )),
         request: RequestV1::new(key, &logical, 0).unwrap(),
     })
     .unwrap()
@@ -150,10 +150,12 @@ fn the_fan_out_reaches_every_voter_at_once_and_nobody_relays_it() {
     let frame = submission();
     let sent_at = w.ticks();
     for v in 0..3u8 {
-        w.send(3, r(v), inc(), Lane::Unary, frame.clone()).unwrap();
+        w.send(3, r(v), inc(), Lane::Unary, DOMAIN, frame.clone())
+            .unwrap();
     }
     // The client presents the same frame to voter 0.
-    w.send(4, r(0), inc(), Lane::Unary, frame.clone()).unwrap();
+    w.send(4, r(0), inc(), Lane::Unary, DOMAIN, frame.clone())
+        .unwrap();
 
     let mut arrivals: Vec<(usize, u64, Frame, PeerRole)> = Vec::new();
     let mut steps = 0;
@@ -216,7 +218,7 @@ fn the_fan_out_reaches_every_voter_at_once_and_nobody_relays_it() {
         assert!(
             w.sent(v).iter().all(|(_, f)| {
                 let mut reader = coord_types::wire_v1::FrameReader::new();
-                reader.push(f);
+                reader.push(f).expect("within the reader bound");
                 reader
                     .next_frame()
                     .unwrap()

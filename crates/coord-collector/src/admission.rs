@@ -7,10 +7,11 @@
 //! receipt is minted with the verifier token because this *is* the
 //! verifier code; state machines never mint one. Raw tokens never appear.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use coord_core::capability::{AdmissionReceipt, VerifierToken};
 use coord_core::event::AdmittedRequest;
+use coord_types::RetryKey;
 use coord_types::identity::HashDomain;
 use coord_types::ids::{ClusterId, DomainId, SessionId};
 use coord_types::wire_v1::{MessageV1, PeerRole, RequestV1};
@@ -70,7 +71,11 @@ pub struct Admission {
     cluster: ClusterId,
     domain: DomainId,
     limits: AdmissionLimits,
-    pending: BTreeMap<SessionId, usize>,
+    /// Unresolved requests per session, by identity. The bound counts
+    /// distinct requests, not admissions: a retry of a request that is
+    /// still unresolved is the same request, so it takes no second slot
+    /// and, since a request is settled once, cannot leak one either.
+    pending: BTreeMap<SessionId, BTreeSet<RetryKey>>,
     minted: u64,
 }
 
@@ -107,11 +112,19 @@ impl Admission {
         if key.session_id != caller.session {
             return Err(AdmissionRefusal::SessionMismatch);
         }
-        let pending = self.pending.entry(caller.session).or_insert(0);
-        if *pending >= self.limits.max_pending_per_session {
-            return Err(AdmissionRefusal::SessionBusy { pending: *pending });
+        let pending = self.pending.entry(caller.session).or_default();
+        // A retry of a request this session still has outstanding is that
+        // request again, not another one: it neither needs a free slot
+        // nor takes one. Counting every admission instead would refuse a
+        // client's first retry under a bound of one, and leave a session
+        // permanently busy once repeated retries outnumbered the single
+        // release that settles them.
+        if !pending.contains(key) && pending.len() >= self.limits.max_pending_per_session {
+            return Err(AdmissionRefusal::SessionBusy {
+                pending: pending.len(),
+            });
         }
-        *pending += 1;
+        pending.insert(*key);
         self.minted += 1;
         let receipt_id = HashDomain::AdmissionReceipt.digest(&[
             &key.canonical_bytes(),
@@ -133,19 +146,21 @@ impl Admission {
         Ok(AdmittedRequest { receipt, frame })
     }
 
-    /// A request of `session` settled (released, refused after admission
-    /// or resolved): its pending slot is free again.
-    pub fn settled(&mut self, session: &SessionId) {
-        if let Some(n) = self.pending.get_mut(session) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.pending.remove(session);
+    /// A request settled (released, refused after admission or
+    /// resolved): its slot is free again. Settling by identity is
+    /// idempotent, so a duplicate settlement cannot free someone else's
+    /// slot.
+    pub fn settled(&mut self, key: &RetryKey) {
+        if let Some(keys) = self.pending.get_mut(&key.session_id) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.pending.remove(&key.session_id);
             }
         }
     }
 
-    /// Requests pending for `session`.
+    /// Distinct unresolved requests of `session`.
     pub fn pending(&self, session: &SessionId) -> usize {
-        self.pending.get(session).copied().unwrap_or(0)
+        self.pending.get(session).map_or(0, BTreeSet::len)
     }
 }

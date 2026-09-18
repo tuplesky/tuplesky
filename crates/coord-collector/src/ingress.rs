@@ -8,7 +8,7 @@
 //! or voting access, and nothing that arrives on an API-class connection
 //! is ever treated as a vote (votes only exist on the peer plane).
 
-use coord_core::capability::ReleasedResult;
+use coord_core::capability::{AdmissionReceipt, ReleasedResult, VerifierToken};
 use coord_core::effect::{Effect, PeerId};
 use coord_core::event::AdmittedRequest;
 use coord_types::wire_v1::{Frame, MessageV1, PeerRole};
@@ -30,8 +30,11 @@ pub const fn is_collector(role: PeerRole) -> bool {
 }
 
 /// Turn a collector's `Submit` into the admitted request the consensus
-/// machines consume. The receipt travels sealed; the request frame is
-/// re-encoded from the exact request so identity is bit-preserved.
+/// machines consume. The claims travel as a record and the receipt is
+/// minted here, after the role check: this is the verifier boundary for
+/// a collector submission, and nothing that merely decodes a frame can
+/// produce a receipt. The request frame is re-encoded from the exact
+/// request so identity is bit-preserved.
 pub fn admitted_from_submit(
     role: PeerRole,
     frame: &Frame,
@@ -43,8 +46,16 @@ pub fn admitted_from_submit(
     let frame = MessageV1::Request(submit.request)
         .encode()
         .map_err(|_| IngressError::Wire(CollectorWireError::TooLarge))?;
+    let claims = submit.receipt;
     Ok(AdmittedRequest {
-        receipt: submit.receipt,
+        receipt: AdmissionReceipt::from_verifier(
+            VerifierToken::for_boundary(),
+            claims.session,
+            claims.rule_generation,
+            claims.scope_ceiling,
+            claims.receipt_id,
+            claims.admitted_at_ticks,
+        ),
         frame,
     })
 }
