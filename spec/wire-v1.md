@@ -168,3 +168,17 @@ same session: it refreshes validity, never identity or ceiling. Nothing
 is admitted before a binding, or after its validity ends; watches and
 results of already admitted work are released only through the fresh
 authorization barrier of `coord-session`.
+
+## Go mirror (task-44)
+
+`adapters/kine/wire` mirrors the frame codec and the postcard subset of
+the client-facing DTOs (Hello, HelloAck, Close, Request, Response,
+ResolveRequest and the four Watch frames) for the trusted Go collector.
+It owns no schema: the numeric kinds, versions and byte layout are this
+document's, and both sides are verified against the shared fixtures in
+`crates/coord-types/fixtures/wire_frames_v1.json` (every valid vector
+decodes and re-encodes to identical bytes; the malformed corpus is
+rejected by class within a bounded read). A schema change requires
+reviewed fixtures on both sides. No Serde reflection, cgo, protobuf or Go
+voting state machine is introduced; the collector and configuration
+evidence schemas are reserved for later client integration (task-m02).
