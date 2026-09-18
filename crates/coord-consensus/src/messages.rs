@@ -11,6 +11,7 @@ use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ReplicaId};
 use serde::{Deserialize, Serialize};
 
+use crate::recovery::SyncDecision;
 use crate::rows::PayloadRecordV1;
 use crate::summary::ReportPage;
 use crate::vote::{FastAck, SlowAck};
@@ -69,6 +70,9 @@ pub enum ProtocolMessage {
         /// Payload.
         payload: PayloadRecordV1,
     },
+    /// The new leader's selected recovery result (`MSync`), durably bound
+    /// before it is sent.
+    Sync(SyncDecision),
 }
 
 impl ProtocolMessage {

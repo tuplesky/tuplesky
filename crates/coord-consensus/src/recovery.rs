@@ -62,7 +62,7 @@ pub struct SyncEntry {
 }
 
 /// The selected recovery result (`MSync`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SyncDecision {
     /// New ballot.
     pub ballot: Ballot,

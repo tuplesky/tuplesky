@@ -72,6 +72,25 @@ impl BallotConfiguration {
         Ok(config)
     }
 
+    /// The default C2 fast set of a ballot until an operator quorum table
+    /// (task-m01) supplies one: the leader plus the next `N/2` voters in
+    /// identity order, wrapping. Deterministic on every replica.
+    pub fn c2_default(
+        epoch: ConfigurationEpoch,
+        ballot: Ballot,
+        voters: BTreeSet<ReplicaId>,
+    ) -> Result<Self, ConfigurationError> {
+        let ordered: alloc::vec::Vec<ReplicaId> = voters.iter().copied().collect();
+        let Some(start) = ordered.iter().position(|r| *r == ballot.leader) else {
+            return Err(ConfigurationError::LeaderNotVoter);
+        };
+        let size = ordered.len() / 2 + 1;
+        let fast_set: BTreeSet<ReplicaId> = (0..size)
+            .map(|i| ordered[(start + i) % ordered.len()])
+            .collect();
+        Self::c2(epoch, ballot, voters, fast_set)
+    }
+
     /// A C1 configuration: any more-than-three-quarters set that includes
     /// the leader is a fast quorum.
     pub fn c1(
