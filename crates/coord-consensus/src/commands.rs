@@ -36,8 +36,14 @@ pub struct CommandRecord {
     pub keys: Vec<Vec<u8>>,
     /// Digest of the bound payload (`None` for a placeholder).
     pub payload: Option<Digest32>,
-    /// Per-key path digests through this command at initialization.
+    /// Per-key path digests through this command: the local ones at
+    /// initialization, replaced by the leader's once its order is
+    /// recorded, so a record restored after a crash resumes its logs at
+    /// the synchronized anchor rather than a stale local digest.
     pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Leader sequence number the paths were synchronized at, if the
+    /// leader's order has been recorded for this command.
+    pub synced_seq: Option<u64>,
     /// Combined path evidence (what a fast acknowledgement carries).
     pub path: Digest32,
 }
@@ -193,6 +199,7 @@ impl CommandTable {
                 keys: Vec::new(),
                 payload: None,
                 paths: Vec::new(),
+                synced_seq: None,
                 path: crate::graph::empty_path(),
             },
         );
@@ -244,6 +251,7 @@ impl CommandTable {
                 keys,
                 payload: Some(payload),
                 paths: paths.clone(),
+                synced_seq: None,
                 path,
             },
         );
@@ -270,6 +278,20 @@ impl CommandTable {
                 .or_default()
                 .log
                 .sync(command, seqnum, *digest);
+        }
+        // Record the synchronized anchors so the durable row written when
+        // the order is adopted carries them: a restored log then resumes
+        // where the live one stands.
+        if let Some(record) = self.records.get_mut(&command)
+            && record.synced_seq.is_none_or(|s| seqnum >= s)
+        {
+            record.synced_seq = Some(seqnum);
+            for (key, digest) in paths {
+                match record.paths.iter_mut().find(|(k, _)| k == key) {
+                    Some(entry) => entry.1 = *digest,
+                    None => record.paths.push((key.clone(), *digest)),
+                }
+            }
         }
     }
 

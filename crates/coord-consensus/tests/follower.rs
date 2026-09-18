@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
-    FollowerConfig, FollowerRejection, Phase, ProtocolMessage, ReplicaRole, decode_dependency,
-    dependency_key,
+    FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole,
+    decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -399,7 +399,7 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
     assert_eq!(storage.crash(), 1);
     let rows = restore_rows(&storage);
     assert!(rows.is_empty());
-    let mut recovered = Follower::recover(config(1), None, rows);
+    let mut recovered = Follower::recover(config(1), None, rows, restore_payloads(&storage));
     recovered.step(boot_event());
     assert_eq!(
         recovered.pending_sends(),
@@ -431,7 +431,9 @@ fn a_crash_between_state_and_vote_preserves_the_learning_obligation() {
     storage.crash();
     let rows = restore_rows(&storage);
     assert_eq!(rows.len(), 1);
-    let mut recovered = Follower::recover(config(1), None, rows);
+    let payloads = restore_payloads(&storage);
+    assert_eq!(payloads.len(), 1, "the payload row carries the retry key");
+    let mut recovered = Follower::recover(config(1), None, rows, payloads);
     recovered.step(boot_event());
     assert_eq!(recovered.table().phase_of(&c1), Some(Phase::PreAccept));
     assert_eq!(
@@ -487,6 +489,22 @@ fn effects_barrier(effects: &[Effect]) -> coord_core::effect::BarrierId {
         Effect::Persist(b) => b.barrier,
         _ => panic!(),
     }
+}
+
+/// The durable payload rows: what recovery rebuilds retry-key bindings
+/// from.
+fn restore_payloads(storage: &StorageModel) -> Vec<(CommandId, PayloadRecordV1)> {
+    storage
+        .durable_rows()
+        .into_iter()
+        .filter(|(c, _, _)| *c == Collection::PayloadV1.id().0)
+        .map(|(_, k, v)| {
+            (
+                CommandId(Digest32(k[..].try_into().unwrap())),
+                decode_payload(&v).unwrap(),
+            )
+        })
+        .collect()
 }
 
 fn restore_rows(storage: &StorageModel) -> Vec<(CommandId, CommandRecord)> {
@@ -557,4 +575,232 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
         f.table().clone().accept(c2, vec![c9]),
         Err(coord_consensus::GuardViolation::DependencyUnknown { dep: c9 })
     );
+}
+
+#[test]
+fn an_adoption_acknowledgement_waits_for_the_payload_batch_too() {
+    // A proposal arrives before the payload. When the payload is admitted,
+    // the payload batch and the adoption batch are emitted together; the
+    // slow acknowledgement claims both, so completing the adoption batch
+    // alone must not release it.
+    let mut f = booted(2); // r2 is outside the fast set: it adopts
+    let (e1, c1) = admitted(1, 1, 1);
+    assert!(
+        f.step(peer(
+            0,
+            proposal(c1, vec![], 0, vec![], coord_consensus::empty_path())
+        ))
+        .is_empty(),
+        "held until the payload arrives"
+    );
+    let effects = f.step(e1);
+    let batches: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Persist(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches.len(), 2, "payload batch and adoption batch");
+    let (payload, adoption) = (batches[0].clone(), batches[1].clone());
+    assert_eq!(f.pending_sends(), 3, "the adoption acknowledgement waits");
+    // The adoption batch alone is not enough: the payload row is still
+    // volatile, so a crash now would leave an accepted dependency row
+    // without the payload it accepted.
+    let released = f.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: adoption.barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(
+        sends(&released).is_empty(),
+        "nothing leaves while the payload batch is volatile: {released:?}"
+    );
+    assert_eq!(f.pending_sends(), 3);
+    let released = f.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: payload.barrier,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert_eq!(
+        sends(&released).len(),
+        3,
+        "both batches durable: the acknowledgement goes out"
+    );
+    assert_eq!(f.pending_sends(), 0);
+}
+
+#[test]
+fn a_higher_promise_in_flight_fences_the_configured_ballot() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    // r2 campaigns for a higher ballot: the promise row is persisted and
+    // is still in flight.
+    let effects = f.step(peer(
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 2),
+        },
+    ));
+    assert!(matches!(effects.as_slice(), [Effect::Persist(_), ..]));
+    assert!(f.ballots().in_flight().is_some());
+    assert_eq!(
+        f.ballots().promised(),
+        ballot(0, 0),
+        "the old promise is still the durable one"
+    );
+    // Nothing of the old ballot is adopted or acknowledged after the cut,
+    // although the promise row is not durable yet and the old promise is
+    // what `release` still compares against.
+    assert!(f.step(e1).is_empty(), "no admission under the old ballot");
+    assert!(
+        f.step(peer(
+            0,
+            proposal(c1, vec![], 0, vec![], coord_consensus::empty_path())
+        ))
+        .is_empty(),
+        "no adoption of an old-ballot proposal"
+    );
+    assert_eq!(
+        f.take_rejections(),
+        vec![
+            FollowerRejection::FencedByPromise {
+                promised: ballot(0, 0)
+            },
+            FollowerRejection::FencedByPromise {
+                promised: ballot(0, 0)
+            }
+        ]
+    );
+    assert_eq!(f.table().phase_of(&c1), None, "nothing was initialized");
+    assert_eq!(f.pending_sends(), 1, "only the promise reply waits");
+}
+
+#[test]
+fn recovery_rebuilds_retry_key_bindings_from_durable_payloads() {
+    let mut f = booted(1);
+    let mut storage = StorageModel::default();
+    let (e1, c1) = admitted(1, 1, 1);
+    let effects = f.step(e1);
+    let Effect::Persist(batch) = effects[0].clone() else {
+        panic!()
+    };
+    storage.submit(batch);
+    storage.complete(effects_barrier(&effects)).unwrap();
+    f.step(durable_of(&effects, 1).remove(0));
+    storage.crash();
+    let payloads = restore_payloads(&storage);
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].0, c1);
+    let mut recovered = Follower::recover(config(1), None, restore_rows(&storage), payloads);
+    recovered.step(boot_event());
+    // The same retry key with other bytes derives another command; without
+    // the rebuilt binding it would be admitted as a second command.
+    let other = admitted_with_key(1, 9, 9);
+    assert!(recovered.step(other.0).is_empty());
+    assert_eq!(
+        recovered.take_rejections(),
+        vec![FollowerRejection::RequestIdentityConflict {
+            retry_key: retry_key(1),
+            bound: c1
+        }]
+    );
+    assert_eq!(recovered.table().phase_of(&other.1), None);
+    // The same bytes are the same command: a duplicate, not new work.
+    let (again, _) = admitted(1, 1, 1);
+    assert!(recovered.step(again).is_empty());
+    assert_eq!(
+        recovered.take_rejections(),
+        vec![FollowerRejection::Duplicate(c1)]
+    );
+}
+
+/// An admitted request reusing `seq`'s retry key with other payload bytes.
+fn admitted_with_key(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![key],
+            value: vec![value],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let command = CommandId::derive(&retry_key(seq), &request).unwrap();
+    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
+        .encode()
+        .unwrap();
+    let receipt = AdmissionReceipt::from_verifier(
+        VerifierToken::for_boundary(),
+        SessionId([3; 16]),
+        1,
+        u32::MAX,
+        Digest32([9; 32]),
+        0,
+    );
+    (Event::Admitted(AdmittedRequest { receipt, frame }), command)
+}
+
+#[test]
+fn the_synchronized_path_anchor_survives_a_crash() {
+    // The follower initializes c1 locally, then the leader's order arrives
+    // with a different anchor. A restored follower must resume its log at
+    // the leader's anchor, not the stale local digest, so the next command
+    // carries the same evidence as on the live follower.
+    let mut f = booted(1);
+    let mut storage = StorageModel::default();
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut batches = persisted(&f.step(e1));
+    let leader_anchor = Digest32([0x5a; 32]);
+    // The leader's order arrives and is adopted at once: its batch carries
+    // the record with the synchronized anchor.
+    batches.extend(persisted(&f.step(peer(
+        0,
+        proposal(
+            c1,
+            vec![],
+            7,
+            vec![(CONSERVATIVE_KEY.to_vec(), leader_anchor)],
+            leader_anchor,
+        ),
+    ))));
+    assert_eq!(f.table().path_head(CONSERVATIVE_KEY), leader_anchor);
+    let record = f.table().record(&c1).unwrap();
+    assert_eq!(record.synced_seq, Some(7));
+    assert_eq!(
+        record.paths,
+        vec![(CONSERVATIVE_KEY.to_vec(), leader_anchor)]
+    );
+    assert_eq!(batches.len(), 2, "payload batch and adoption batch");
+    for batch in batches {
+        let barrier = batch.barrier;
+        storage.submit(batch);
+        storage.complete(barrier).unwrap();
+    }
+    storage.crash();
+    let recovered = Follower::recover(
+        config(1),
+        None,
+        restore_rows(&storage),
+        restore_payloads(&storage),
+    );
+    assert_eq!(
+        recovered.table().record(&c1).unwrap().synced_seq,
+        Some(7),
+        "the synchronized sequence is durable"
+    );
+    assert_eq!(
+        recovered.table().path_head(CONSERVATIVE_KEY),
+        f.table().path_head(CONSERVATIVE_KEY),
+        "the restored log resumes at the leader's anchor"
+    );
+}
+
+/// The batches of a step, in order.
+fn persisted(effects: &[Effect]) -> Vec<coord_core::effect::PersistBatch> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Persist(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect()
 }
