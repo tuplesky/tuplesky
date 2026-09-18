@@ -207,7 +207,18 @@ impl KvModel {
                 let target = revision.get().min(self.revision);
                 if target > self.compact_floor {
                     self.compact_floor = target;
-                    self.history.retain(|(r, _), _| *r > target);
+                    // Keep the newest version (or tombstone) at or below the
+                    // floor for every key plus all newer versions, so a read
+                    // exactly at the floor stays answerable (Section 17.5).
+                    let mut newest: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+                    for (r, k) in self.history.keys() {
+                        if *r <= target {
+                            let e = newest.entry(k.clone()).or_insert(*r);
+                            *e = (*e).max(*r);
+                        }
+                    }
+                    self.history
+                        .retain(|(r, k), _| *r > target || newest.get(k) == Some(r));
                 }
                 ModelResponse {
                     revision: self.revision,

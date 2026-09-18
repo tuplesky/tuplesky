@@ -476,3 +476,60 @@ fn model_semantics_match_design_rules() {
         Outcome::Unsupported
     );
 }
+
+#[test]
+fn compaction_keeps_the_newest_version_at_the_floor() {
+    // Put a@1, compact to 1, delete a@2: a read at revision 1 must still see
+    // the version written at revision 1 (Section 17.5 retention).
+    let mut m = KvModel::default();
+    m.apply(&put(b"a", b"v"), None);
+    m.apply(
+        &CanonicalOperation::Compact {
+            revision: KvRevision::new(1).unwrap(),
+        },
+        None,
+    );
+    m.apply(
+        &CanonicalOperation::DeleteRange(DeleteRangeOp {
+            range: KeyRange::exact(b"a".to_vec()),
+            prev_kv: false,
+        }),
+        None,
+    );
+    let r = m.apply(&get_at(b"a", 1), None);
+    assert_eq!(r.revision, 2);
+    assert_eq!(
+        r.outcome,
+        Outcome::Range {
+            items: vec![RangeItem {
+                key: b"a".to_vec(),
+                entry: entry(b"v", 1, 1, 1)
+            }],
+            count: 1,
+            more: false
+        }
+    );
+    // Below the floor is still Compacted.
+    m.apply(&put(b"b", b"w"), None);
+    m.apply(
+        &CanonicalOperation::Compact {
+            revision: KvRevision::new(3).unwrap(),
+        },
+        None,
+    );
+    assert_eq!(
+        m.apply(&get_at(b"a", 2), None).outcome,
+        Outcome::ErrCompacted
+    );
+    assert_eq!(
+        m.apply(&get_at(b"b", 3), None).outcome.clone(),
+        Outcome::Range {
+            items: vec![RangeItem {
+                key: b"b".to_vec(),
+                entry: entry(b"w", 3, 3, 1)
+            }],
+            count: 1,
+            more: false
+        }
+    );
+}
