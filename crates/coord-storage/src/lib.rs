@@ -60,6 +60,11 @@
 //!   execution; retry admission and result resolution require an
 //!   executable session, so a retired or rule-invalidated session cannot
 //!   read cached outcomes.
+//! * Crash-recovery qualification (task-27): [`protocol::read_protocol`]
+//!   recovers the whole consensus role of an epoch (promise, dependency
+//!   rows, bound Sync selections, payloads, executed identities) from the
+//!   projection alone; the real-engine cluster tests drive restart, lost
+//!   leader, minority and deliberately omitted-row schedules against it.
 //! * Protocol rows (task-20): [`protocol`] reads the epoch's durable
 //!   promise row so a rebooted replica recovers its promise from the
 //!   projection.

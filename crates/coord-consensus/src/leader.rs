@@ -994,9 +994,12 @@ impl Leader {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
-        let context =
-            self.ballots
-                .context(boot, self.config.quorum.ballot(), LocalJournalSeq::ZERO);
+        // Payload transfer is not a voting transition: it is served under
+        // the promised ballot so a deposed leader still supplies the
+        // payloads a candidate recovers from.
+        let context = self
+            .ballots
+            .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
         let responses: Vec<ProtocolMessage> = commands
             .iter()
             .filter(|c| self.proposals.get(c).is_some_and(|p| p.durable))

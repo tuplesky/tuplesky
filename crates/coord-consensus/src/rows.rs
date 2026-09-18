@@ -23,17 +23,17 @@ pub const DEPENDENCY_KIND: u16 = 0x0002;
 /// Key tag of the promise row within an epoch.
 const PROMISE_TAG: u8 = 0x00;
 /// Key tag of command dependency rows within an epoch.
-const DEPENDENCY_TAG: u8 = 0x01;
+pub const DEPENDENCY_TAG: u8 = 0x01;
 /// Record kind of a leader proposal row.
 pub const PROPOSAL_KIND: u16 = 0x0003;
 /// Key tag of leader proposal rows within an epoch.
-const PROPOSAL_TAG: u8 = 0x02;
+pub const PROPOSAL_TAG: u8 = 0x02;
 /// Record kind of a payload row in `payload_v1`.
 pub const PAYLOAD_KIND: u16 = 0x0001;
 /// Record kind of a bound Sync selection row.
 pub const SYNC_KIND: u16 = 0x0004;
 /// Key tag of Sync rows within an epoch.
-const SYNC_TAG: u8 = 0x03;
+pub const SYNC_TAG: u8 = 0x03;
 
 /// The durable promise of one replica in one epoch: the highest ballot it
 /// promised (no lower ballot is voted after it) and the ballot it last
