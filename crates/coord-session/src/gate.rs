@@ -6,10 +6,9 @@
 use coord_state::Response;
 use coord_state::plan::Outcome;
 use coord_state::policy::{Action, Authorization, KeyInterval};
-use coord_storage::StoreWorker;
+use coord_storage::Persistence;
 use coord_storage::WatchBatch;
 use coord_storage::views::{ViewBudget, load_authorization};
-use coord_store_api::engine::LocalEngine;
 use coord_types::ids::{ExecutionPosition, NamespaceId, SessionId};
 
 /// Policy as of one ordered position, for one session in one namespace.
@@ -157,22 +156,28 @@ pub trait PolicySource {
     ) -> Result<AuthorizationBarrier, PolicyError>;
 }
 
-/// Barriers read from a store worker's durable snapshot.
-pub struct StorePolicySource<'a, E: LocalEngine> {
-    /// The worker.
-    pub worker: &'a StoreWorker<E>,
+/// Barriers read from a store's durable snapshot.
+///
+/// It reads and never writes, so it is over the persistence seam rather
+/// than over one coordinator: the same gate has to hold whether this
+/// node's record is its projection or a shared journal, and a second
+/// copy of it for the other path would be a second place for an
+/// authorization rule to go stale.
+pub struct StorePolicySource<'a, P: Persistence> {
+    /// Where this node's state is.
+    pub store: &'a P,
     /// Row and byte budget of one read.
     pub budget: ViewBudget,
 }
 
-impl<E: LocalEngine> PolicySource for StorePolicySource<'_, E> {
+impl<P: Persistence> PolicySource for StorePolicySource<'_, P> {
     fn barrier(
         &self,
         namespace: NamespaceId,
         session: &SessionId,
     ) -> Result<AuthorizationBarrier, PolicyError> {
         let gated = self
-            .worker
+            .store
             .reader()
             .snapshot()
             .map_err(|_| PolicyError::Unavailable)?;

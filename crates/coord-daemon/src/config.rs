@@ -149,6 +149,31 @@ fn one_shard() -> u16 {
     1
 }
 
+/// The security token service this domain's sessions are bound against.
+///
+/// A frontend verifies a client's token against these keys before the
+/// connection carries any work, so a node that had no answer for them
+/// could not admit anyone. They are named here rather than discovered,
+/// because discovery is itself something a caller could influence: a
+/// node that learned its issuer from the network could be told to trust
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StsConfig {
+    /// The issuer identifier tokens must name.
+    pub issuer: String,
+    /// This cluster's resource, which a token's audience must name.
+    pub resource: String,
+    /// Path to the issuer's published JWKS, read at startup.
+    ///
+    /// A file, not a URL: fetching keys over the network at startup
+    /// makes a node's ability to serve depend on a service being
+    /// reachable, and makes what it trusts depend on what answered.
+    /// Rotation replaces the file and is picked up by
+    /// `BoundFrontend::set_jwks`, out of band.
+    pub jwks: String,
+}
+
 /// Where this node's own credentials and trust anchors are.
 ///
 /// They are paths, not material: nothing here is a secret, and a
@@ -187,6 +212,12 @@ pub struct Config {
     pub journal: JournalConfig,
     /// Credentials and trust anchors.
     pub identity: IdentityConfig,
+    /// The token service sessions are bound against. A process that
+    /// serves clients needs one; a voter that serves only its peers does
+    /// not, and saying so is how a peer-only node avoids carrying a
+    /// dependency it never uses.
+    #[serde(default)]
+    pub sts: Option<StsConfig>,
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
@@ -246,6 +277,13 @@ pub enum ConfigError {
     EmptyPath(&'static str),
     /// A node must write at least one journal shard.
     NoJournalShards,
+    /// A role needs a section the configuration does not provide.
+    MissingSection {
+        /// Which section.
+        section: &'static str,
+        /// What needs it.
+        needed_by: &'static str,
+    },
 }
 
 /// Supported configuration schema version.
@@ -322,6 +360,16 @@ impl Config {
                 return Err(ConfigError::InvalidListener(name));
             }
         }
+        // A process that serves clients verifies their tokens, so it
+        // needs the keys to verify them against. Starting without them
+        // would mean a frontend that binds its listener and then refuses
+        // every caller, which reads as a client problem.
+        if roles.needs_api_listener() && self.sts.is_none() {
+            return Err(ConfigError::MissingSection {
+                section: "sts",
+                needed_by: "a process that serves clients",
+            });
+        }
         // An optional listener that is configured must still be usable.
         if let Some(address) = self.listen.admin_http.as_deref()
             && (address.trim().is_empty() || address.parse::<std::net::SocketAddr>().is_err())
@@ -354,7 +402,15 @@ impl Config {
             ("identity.trust_bundle", &self.identity.trust_bundle),
             ("identity.node_certificate", &self.identity.node_certificate),
             ("identity.node_key", &self.identity.node_key),
-        ] {
+        ]
+        .into_iter()
+        .chain(self.sts.iter().flat_map(|sts| {
+            [
+                ("sts.issuer", &sts.issuer),
+                ("sts.resource", &sts.resource),
+                ("sts.jwks", &sts.jwks),
+            ]
+        })) {
             if path.trim().is_empty() {
                 return Err(ConfigError::EmptyPath(name));
             }

@@ -161,9 +161,9 @@ impl Domain {
         assert!(!matches!(response.outcome, Outcome::ErrTrustRuleInvalid));
     }
 
-    fn policy(&self) -> StorePolicySource<'_, ModelEngine> {
+    fn policy(&self) -> StorePolicySource<'_, StoreWorker<ModelEngine>> {
         StorePolicySource {
-            worker: &self.worker,
+            store: &self.worker,
             budget: ViewBudget::default(),
         }
     }

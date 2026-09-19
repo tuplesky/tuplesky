@@ -43,6 +43,11 @@ shards = 1
 trust_bundle = "/etc/coord/roots.pem"
 node_certificate = "/etc/coord/node.pem"
 node_key = "/etc/coord/node.key"
+
+[sts]
+issuer = "https://sts.example"
+resource = "control-plane-a"
+jwks = "/etc/coord/sts-jwks.json"
 "#
     )
 }
@@ -118,6 +123,11 @@ root = "journal"
 trust_bundle = "/r.pem"
 node_certificate = "/n.pem"
 node_key = "/n.key"
+
+[sts]
+issuer = "https://sts.example"
+resource = "d"
+jwks = "/jwks.json"
 "#;
     assert_eq!(
         Config::parse(auth_only),
@@ -656,4 +666,95 @@ fn where_the_projection_lives_is_resolved_in_one_place() {
             .root_path(&nested.state_directory)
             .starts_with("/var/lib/coord/a")
     );
+}
+
+/// A process that serves clients verifies their tokens, so it is
+/// configured with the keys to verify them against or it does not start.
+///
+/// Starting without them would mean a frontend that binds its listener
+/// and then refuses every caller -- which reads as a client problem, and
+/// is the most expensive kind of misconfiguration to diagnose because
+/// the node looks healthy.
+///
+/// A process with no API listener needs none of it: the auth broker and
+/// the node issuer establish credentials rather than consume them, so
+/// requiring an issuer of them would be circular.
+#[test]
+fn a_process_that_serves_clients_is_configured_to_verify_them() {
+    let config = Config::parse(&base_config("")).unwrap();
+    let sts = config.sts.as_ref().expect("the fixture serves clients");
+    assert_eq!(sts.issuer, "https://sts.example");
+
+    let without = base_config("").replace(
+        "\n[sts]\nissuer = \"https://sts.example\"\nresource = \"control-plane-a\"\njwks = \"/etc/coord/sts-jwks.json\"\n",
+        "",
+    );
+    assert_ne!(without, base_config(""), "the fixture did not change");
+    assert_eq!(
+        Config::parse(&without),
+        Err(ConfigError::MissingSection {
+            section: "sts",
+            needed_by: "a process that serves clients",
+        })
+    );
+
+    // The auth broker issues the tokens; it does not verify them against
+    // an issuer of its own.
+    let broker = r#"config_version = 2
+role = "auth"
+cluster_manifest = "/g.json"
+domain = "d"
+state_directory = "/s"
+
+[listen]
+https = "127.0.0.1:8443"
+
+[capability]
+writer_queue_bytes = 16777216
+buffer_bytes_per_subscription = 8388608
+max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+
+[identity]
+trust_bundle = "/r.pem"
+node_certificate = "/n.pem"
+node_key = "/n.key"
+"#;
+    assert!(
+        Config::parse(broker).is_ok(),
+        "a process that issues credentials was made to consume them: {:?}",
+        Config::parse(broker)
+    );
+
+    // The paths it names are paths like any other: an empty one is the
+    // working directory, not a default.
+    for (find, replace, name) in [
+        (
+            "issuer = \"https://sts.example\"",
+            "issuer = \"\"",
+            "sts.issuer",
+        ),
+        (
+            "resource = \"control-plane-a\"",
+            "resource = \"  \"",
+            "sts.resource",
+        ),
+        (
+            "jwks = \"/etc/coord/sts-jwks.json\"",
+            "jwks = \"\"",
+            "sts.jwks",
+        ),
+    ] {
+        let text = base_config("").replace(find, replace);
+        assert_eq!(
+            Config::parse(&text),
+            Err(ConfigError::EmptyPath(name)),
+            "{name}"
+        );
+    }
 }

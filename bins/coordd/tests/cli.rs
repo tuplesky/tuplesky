@@ -195,6 +195,11 @@ shards = 1
 trust_bundle = "{root}/roots.pem"
 node_certificate = "{root}/node.pem"
 node_key = "{root}/node.key"
+
+[sts]
+issuer = "https://sts.test"
+resource = "control-plane-test"
+jwks = "{root}/sts-jwks.json"
 "#,
         root = dir.display()
     );
