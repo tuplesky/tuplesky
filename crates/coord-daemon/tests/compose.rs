@@ -12,6 +12,7 @@ use coord_daemon::{
     Config, ConfigError, Diagnostics, Lifecycle, Phase, Readiness, ReadyGate, Redacted,
     RestartBudget, Role, RoleSet, Supervisor,
 };
+use coord_daemon::{ListenConfig, bind_listeners};
 
 fn base_config(extra: &str) -> String {
     format!(
@@ -272,4 +273,90 @@ fn diagnostics_are_secret_safe() {
     assert_eq!(diag.worker_restarts, 2);
     let rendered = format!("{diag:?}");
     assert!(!rendered.contains("secret"));
+}
+
+#[test]
+fn a_required_listener_must_be_a_usable_address() {
+    // Presence was all that was checked, so an empty or unparseable
+    // address passed validation and failed later at bind, after the
+    // process had reported its configuration good.
+    for (address, ok) in [
+        ("127.0.0.1:7000", true),
+        ("[::]:7444", true),
+        ("", false),
+        ("   ", false),
+        ("not-an-address", false),
+        ("127.0.0.1", false),
+        ("127.0.0.1:99999", false),
+    ] {
+        let text = base_config("").replace(
+            "peer_quic = \"[::]:7444\"",
+            &format!("peer_quic = \"{address}\""),
+        );
+        let parsed = Config::parse(&text);
+        assert_eq!(
+            parsed.is_ok(),
+            ok,
+            "{address:?} should {}validate: {parsed:?}",
+            if ok { "" } else { "not " }
+        );
+        if !ok {
+            assert!(matches!(
+                parsed.unwrap_err(),
+                ConfigError::InvalidListener("peer_quic")
+            ));
+        }
+    }
+}
+
+#[test]
+fn a_process_is_live_only_once_its_listeners_are_bound() {
+    // Live means the listeners are up but the process is not serving.
+    // Reporting it before they were up said the opposite of the truth.
+    let roles = RoleSet::parse("voter").unwrap();
+    let mut lifecycle = Lifecycle::new(roles);
+    assert_eq!(lifecycle.phase(), Phase::Starting);
+    lifecycle.observe(Readiness {
+        storage_ready: true,
+        identity_ready: true,
+        ..Readiness::default()
+    });
+    assert_eq!(
+        lifecycle.phase(),
+        Phase::Starting,
+        "storage open, nothing bound: still starting"
+    );
+    lifecycle.observe(Readiness {
+        listeners_up: true,
+        storage_ready: true,
+        identity_ready: true,
+        ..Readiness::default()
+    });
+    assert_eq!(lifecycle.phase(), Phase::Live);
+
+    // Binding is real: a node holds the sockets it names, and what it
+    // reports is what it actually bound.
+    let listeners = bind_listeners(&ListenConfig {
+        api_quic: Some("127.0.0.1:0".into()),
+        peer_quic: Some("127.0.0.1:0".into()),
+        admin_http: Some("127.0.0.1:0".into()),
+        https: None,
+    })
+    .expect("loopback binds");
+    let bound = listeners.addresses();
+    assert_eq!(bound.len(), 3);
+    assert!(bound.iter().all(|(_, a)| a.port() != 0), "{bound:?}");
+    // A second bind of the same TCP address fails rather than being
+    // reported as up.
+    let (_, admin) = bound
+        .iter()
+        .find(|(name, _)| *name == "admin_http")
+        .expect("admin bound");
+    let clash = bind_listeners(&ListenConfig {
+        api_quic: None,
+        peer_quic: None,
+        admin_http: Some(admin.to_string()),
+        https: None,
+    });
+    assert!(clash.is_err(), "the address is already held");
 }
