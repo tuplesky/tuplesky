@@ -1,0 +1,222 @@
+//! Acceptance for loading this node's credentials (task-43).
+//!
+//! Each case here is one a process could otherwise start with and then
+//! fail at its first handshake, where the failure reads as a peer
+//! problem rather than as this node's own configuration.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+use coord_daemon::config::IdentityConfig;
+use coord_daemon::identity::{IdentityError, load};
+use coord_types::ids::{ClusterId, DomainId};
+
+const CLUSTER: ClusterId = ClusterId([1; 16]);
+const DOMAIN: DomainId = DomainId([2; 16]);
+
+fn dir() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "coord-identity-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&path).expect("temp dir");
+    path
+}
+
+fn write(dir: &std::path::Path, name: &str, bytes: &[u8], mode: u32) -> String {
+    let path = dir.join(name);
+    let mut file = std::fs::File::create(&path).expect("create");
+    file.write_all(bytes).expect("write");
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    let _ = mode;
+    path.to_string_lossy().into_owned()
+}
+
+fn pem(label: &str, der: &[u8]) -> Vec<u8> {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut body = String::new();
+    for chunk in der.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                body.push(A[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            } else {
+                body.push('=');
+            }
+        }
+    }
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for line in body.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ascii"));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out.into_bytes()
+}
+
+/// The error of a load, or `None` if it succeeded.
+///
+/// `LocalIdentity` is deliberately neither `Debug` nor `PartialEq`: it
+/// holds a private key, and a type that could print or compare one is a
+/// type that will eventually do so in a log line. So a test states what
+/// it means -- which refusal came back -- rather than comparing results.
+fn refusal(config: &IdentityConfig) -> Option<IdentityError> {
+    load(config, CLUSTER, DOMAIN, Vec::new()).err()
+}
+
+/// A real certificate and its key, so a good case is actually good
+/// rather than merely well-shaped.
+fn credentials() -> (Vec<u8>, Vec<u8>) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+    let mut params = rcgen::CertificateParams::new(vec!["node.local".into()]).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let certificate = params.self_signed(&key).expect("self-signed");
+    (
+        pem("CERTIFICATE", certificate.der()),
+        pem("PRIVATE KEY", &key.serialize_der()),
+    )
+}
+
+fn config(dir: &std::path::Path, key_mode: u32) -> IdentityConfig {
+    let (certificate, key) = credentials();
+    IdentityConfig {
+        trust_bundle: write(dir, "roots.pem", &certificate, 0o644),
+        node_certificate: write(dir, "node.pem", &certificate, 0o644),
+        node_key: write(dir, "node.key", &key, key_mode),
+    }
+}
+
+/// The ordinary case: three readable files, a key only this account can
+/// read, and an identity that names the cluster and domain it was given.
+#[test]
+fn credentials_this_account_holds_are_loaded() {
+    let dir = dir();
+    let identity =
+        load(&config(&dir, 0o600), CLUSTER, DOMAIN, vec![0x0011]).expect("the credentials load");
+    assert_eq!(identity.cluster, CLUSTER);
+    assert_eq!(identity.domain, DOMAIN);
+    assert_eq!(identity.capabilities, vec![0x0011]);
+    assert_eq!(identity.chain.len(), 1, "the chain is what was presented");
+    assert!(!identity.roots.is_empty(), "the roots are what was trusted");
+}
+
+/// A private key other accounts can read has already left this process's
+/// control. Reading it and carrying on would make the configuration's
+/// promise untrue and unremarked, so it is refused -- and the mode is
+/// reported, because the operator's next step is to change it.
+#[test]
+#[cfg(unix)]
+fn a_private_key_other_accounts_can_read_is_refused() {
+    let dir = dir();
+    for mode in [0o644, 0o640, 0o604, 0o666] {
+        let shared = config(&dir, mode);
+        assert_eq!(
+            refusal(&shared),
+            Some(IdentityError::KeyIsShared {
+                path: shared.node_key.clone(),
+                mode,
+            }),
+            "mode {mode:o} was accepted"
+        );
+    }
+    // The key itself is never in the message: the path and the mode are,
+    // and neither is material.
+    let shared = config(&dir, 0o644);
+    let message = refusal(&shared).expect("refused").to_string();
+    assert!(message.contains("node.key") && message.contains("644"));
+    assert!(!message.contains("PRIVATE KEY") && !message.contains("BEGIN"));
+
+    // Modes that keep the key to this account are accepted.
+    for mode in [0o600, 0o400, 0o700] {
+        assert_eq!(
+            refusal(&config(&dir, mode)),
+            None,
+            "mode {mode:o} was refused"
+        );
+    }
+}
+
+/// A trust bundle with no certificates is an empty root store, which
+/// trusts nothing: a process that started with one would accept no peer
+/// and report itself healthy while doing so.
+#[test]
+fn a_trust_bundle_that_trusts_nothing_is_refused() {
+    let dir = dir();
+    let mut config = config(&dir, 0o600);
+    config.trust_bundle = write(&dir, "empty-roots.pem", b"# nothing here\n", 0o644);
+    assert_eq!(
+        refusal(&config),
+        Some(IdentityError::Empty {
+            what: "trust bundle",
+            path: config.trust_bundle.clone(),
+        })
+    );
+}
+
+/// A chain with nothing to present fails every handshake, with no
+/// indication that the cause is this node's own configuration.
+#[test]
+fn a_certificate_chain_with_nothing_in_it_is_refused() {
+    let dir = dir();
+    let mut config = config(&dir, 0o600);
+    config.node_certificate = write(&dir, "empty-node.pem", b"", 0o644);
+    assert_eq!(
+        refusal(&config),
+        Some(IdentityError::Empty {
+            what: "node certificate",
+            path: config.node_certificate.clone(),
+        })
+    );
+}
+
+/// A file that is missing and a file that is the wrong kind are two
+/// different problems with two different next steps, and are reported as
+/// such rather than as one "bad credentials".
+#[test]
+fn a_missing_file_and_a_wrong_one_are_told_apart() {
+    let dir = dir();
+
+    let mut missing = config(&dir, 0o600);
+    missing.trust_bundle = dir.join("absent.pem").to_string_lossy().into_owned();
+    assert!(
+        matches!(
+            refusal(&missing),
+            Some(IdentityError::Unreadable {
+                what: "trust bundle",
+                ..
+            })
+        ),
+        "a missing bundle was not reported as unreadable"
+    );
+
+    // A key file that holds a certificate is present, readable and
+    // private -- and still not a key.
+    let mut wrong = config(&dir, 0o600);
+    let (certificate, _) = credentials();
+    wrong.node_key = write(&dir, "not-a-key.pem", &certificate, 0o600);
+    assert!(
+        matches!(
+            refusal(&wrong),
+            Some(IdentityError::Empty {
+                what: "node key",
+                ..
+            }) | Some(IdentityError::Malformed {
+                what: "node key",
+                ..
+            })
+        ),
+        "a certificate was accepted as a private key"
+    );
+}

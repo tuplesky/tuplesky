@@ -21,12 +21,15 @@ coord-consensus.workspace = true
 coord-core.workspace = true
 coord-session.workspace = true
 coord-storage.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde = { workspace = true, features = ["std"] }
 toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 coord-state.workspace = true
+rcgen.workspace = true
 coord-storage-redb.workspace = true
 coord-store-testkit.workspace = true
 coord-transport-testkit.workspace = true
