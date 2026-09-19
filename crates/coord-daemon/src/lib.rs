@@ -18,6 +18,10 @@
 //! * [`supervise`]: bounded supervised workers with restart budgets, so
 //!   a crashing worker is retried within a bound and then quarantines the
 //!   process rather than spinning.
+//! * [`identity`]: reading this node's own credentials, once, at
+//!   startup, and refusing there what would otherwise fail at the first
+//!   handshake -- an empty trust bundle, a chain with nothing to
+//!   present, a private key other accounts can read.
 //! * [`lifecycle`]: the process lifecycle. Readiness distinguishes
 //!   transport liveness from *fresh-quorum* consensus readiness: a voter
 //!   that only has cached leadership is not ready to serve. Disk
@@ -47,6 +51,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod fanout;
+pub mod identity;
 pub mod lifecycle;
 pub mod listen;
 pub mod node;
@@ -59,6 +64,7 @@ pub mod supervise;
 pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
 pub use fanout::{Dispatched, PeerFanOut, dispatch};
+pub use identity::{IdentityError, load as load_identity};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use node::{DriveError, Machine, Node, Outbound};
