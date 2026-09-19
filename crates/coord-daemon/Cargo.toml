@@ -17,6 +17,8 @@ coord-transport.workspace = true
 coord-membership.workspace = true
 coord-store-api.workspace = true
 coord-collector.workspace = true
+coord-consensus.workspace = true
+coord-core.workspace = true
 coord-session.workspace = true
 coord-storage.workspace = true
 serde = { workspace = true, features = ["std"] }
@@ -24,6 +26,7 @@ toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+coord-state.workspace = true
 coord-storage-redb.workspace = true
 coord-store-testkit.workspace = true
 coord-transport-testkit.workspace = true

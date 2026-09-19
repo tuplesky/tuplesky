@@ -25,6 +25,10 @@
 //! * [`fanout`]: sending a planned submission to every committed voter,
 //!   at the incarnation the configuration names rather than one the plan
 //!   carries.
+//! * [`node`]: driving one voter -- events into the protocol machine,
+//!   and the effects it returns carried out: batches persisted, sends
+//!   held until their barriers are durable and their boot still holds,
+//!   evidence and releases published to the trusted collector.
 //! * [`pending`]: the request streams held open while the collector
 //!   establishes their results, matched to deliveries by invocation and
 //!   by the connection that asked.
@@ -45,6 +49,7 @@ pub mod diagnostics;
 pub mod fanout;
 pub mod lifecycle;
 pub mod listen;
+pub mod node;
 pub mod pending;
 pub mod role;
 pub mod serve;
@@ -56,6 +61,7 @@ pub use diagnostics::{Diagnostics, Redacted};
 pub use fanout::{Dispatched, PeerFanOut, dispatch};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
+pub use node::{DriveError, Machine, Node, Outbound};
 pub use pending::{Pending, Undeliverable};
 pub use role::{Role, RoleSet};
 pub use serve::{Step, step};

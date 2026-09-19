@@ -661,8 +661,11 @@ name = "coord-daemon"
 version = "0.1.0"
 dependencies = [
  "coord-collector",
+ "coord-consensus",
+ "coord-core",
  "coord-membership",
  "coord-session",
+ "coord-state",
  "coord-storage",
  "coord-storage-redb",
  "coord-store-api",
