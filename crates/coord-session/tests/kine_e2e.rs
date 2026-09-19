@@ -77,7 +77,7 @@ fn service_token(ring: &KeyRing, session: SessionId) -> String {
 
 /// The real domain: a store with this session admitted and permitted
 /// every action in the namespace, behind the real applying path.
-fn domain() -> Applier<ModelEngine> {
+fn domain() -> Applier<StoreWorker<ModelEngine>> {
     let boot = coord_core::effect::BootId([1; 16]);
     let inc = ReplicaIncarnation::new(1).expect("positive");
     let mut worker =
@@ -170,7 +170,7 @@ async fn serve(mut transport: Transport, config: BindingConfig) {
                 .apply(command, &payload)
                 .ok()
                 .and_then(|_| {
-                    let gated = applier.worker().reader().snapshot().ok()?;
+                    let gated = applier.store().reader().snapshot().ok()?;
                     coord_storage::retry::lookup(gated.view(), &request.retry_key).ok()?
                 })
                 .map(|record| (record.revision, record.response))

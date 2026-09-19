@@ -182,3 +182,62 @@ indistinguishable from a voter that is partitioned or gone.
 The rule to keep is the distinction, not the list: an effect that names
 barriers is gated on them wherever it is addressed, and an effect that
 names none has already been gated somewhere else.
+
+## Two coordinators, one application path, and one completion rule
+
+**Where:** `coord-storage/src/persistence.rs`, `materialize.rs`
+(`prepare`/`submit`/`complete`), `coord-storage/tests/composed.rs`.
+Recorded against task-j08, which the plan gained for this work.
+
+**Expected:** task-j03 integrated the journal-first coordinator, so a
+serving daemon could be composed on it.
+
+**Actually:** `JournaledStore` and `StoreWorker` were parallel
+coordinators that nothing joined. `Applier` concretely owned a
+`StoreWorker`, so the only ways to serve were to bypass the journal or
+to write a second applier -- and a second applier is a second copy of
+planning, admission and retry resolution, one of which would fall
+behind. The plan named no task for the join.
+
+**Did:** one seam (`Persistence`) at exactly the width the application
+path needs, with the planner and `plan_to_batch` shared above it. The
+application path became prepare -> submit -> complete, so the runtime
+can hold a pending application rather than block inside a helper.
+
+The completion rule is the part worth remembering. Three weaker rules
+each look right and each publish a revision the next reader will not
+find:
+
+* a successful submission says only that the batch was taken;
+* a flush that did not fail says only that *something* was lowered --
+  the pipeline is shared, so a flush routinely carries other work's
+  events;
+* any event naming the barrier includes `JournalDurable`, which on the
+  journal-first path means the record is safe and the state is not yet
+  readable.
+
+Only the matching barrier's own `Materialized` completes an application.
+`JournalDurable` still satisfies a protocol send's durability
+prerequisite, which is why a vote does not wait for materialization.
+
+Two consequences were not obvious. A projection that refuses a
+materialization produces **no event at all** -- a durable journal record
+is never reported as a failed batch -- so "no event for my barrier and
+nothing queued" had to stop meaning "corrupt"; `Persistence` gained
+`unmaterialized()` so an owed materialization is distinguishable from
+nothing coming. And completion is bounded: a projection that keeps
+refusing yields to reconciliation rather than spinning, because the
+record is durable either way and the caller is owed an answer.
+
+The negative control needed care twice. Reverting the rule to "any event
+for the barrier" first passed, because the test had consumed the
+`JournalDurable` itself before calling `complete`; the test now lets
+`complete` do the lowering that journals the record. And the
+"unknown-outcome failure" branch is unreachable through either
+coordinator today -- both emit only `DefinitelyNotCommitted` -- so it is
+held against a stand-in implementation of the seam rather than left as
+an untested claim.
+
+**Revisit when:** task-j05 qualifies this under real filesystem and
+power-loss faults, which is where the composition's durability claims
+are actually established. This is integration evidence and not that.

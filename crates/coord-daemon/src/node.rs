@@ -35,8 +35,8 @@ use coord_core::effect::{Effect, PeerId, TimerId};
 use coord_core::event::{Event, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{Outbox, PendingSend};
-use coord_storage::Applier;
-use coord_store_api::engine::LocalEngine;
+use coord_storage::journaled::TransitionKind;
+use coord_storage::{Applier, Persistence};
 use coord_types::CommandId;
 use coord_types::ids::Ballot;
 
@@ -170,9 +170,14 @@ impl core::fmt::Display for DriveError {
 impl core::error::Error for DriveError {}
 
 /// One voter: its machine, its store and the sends it is holding.
-pub struct Node<E: LocalEngine> {
+///
+/// `P` is where this replica's batches become durable. A voter on the
+/// journal-first profile and one on the reference profile differ in that
+/// and in nothing else the driver can see, which is why it is a
+/// parameter rather than two drivers.
+pub struct Node<P: Persistence> {
     machine: Machine,
-    applier: Applier<E>,
+    applier: Applier<P>,
     outbox: Outbox,
     frontend: PeerId,
     /// Rounds of effects carried out since boot (diagnostic).
@@ -183,10 +188,10 @@ pub struct Node<E: LocalEngine> {
     withheld_evidence: u64,
 }
 
-impl<E: LocalEngine> Node<E> {
+impl<P: Persistence> Node<P> {
     /// A node over `machine` and `applier`, publishing to `frontend`.
-    pub fn new(machine: Machine, applier: Applier<E>, frontend: PeerId) -> Self {
-        let boot = applier.worker().boot();
+    pub fn new(machine: Machine, applier: Applier<P>, frontend: PeerId) -> Self {
+        let boot = applier.store().boot();
         Node {
             machine,
             applier,
@@ -205,12 +210,12 @@ impl<E: LocalEngine> Node<E> {
     }
 
     /// The applier (watch hub, reader, store).
-    pub const fn applier(&self) -> &Applier<E> {
+    pub const fn applier(&self) -> &Applier<P> {
         &self.applier
     }
 
     /// The applier, mutably.
-    pub const fn applier_mut(&mut self) -> &mut Applier<E> {
+    pub const fn applier_mut(&mut self) -> &mut Applier<P> {
         &mut self.applier
     }
 
@@ -299,10 +304,17 @@ impl<E: LocalEngine> Node<E> {
             }
             match effect {
                 Effect::Persist(batch) => {
+                    // Everything a protocol machine asks to persist is a
+                    // protocol transition: a ballot, a promise, a vote, a
+                    // bound selection. None of them carries an
+                    // application base or moves the execution frontier,
+                    // and the execution redo is not one of them -- that
+                    // comes from applying a command, which is where its
+                    // position, revision and result are known.
                     self.applier
-                        .worker_mut()
-                        .submit(batch)
-                        .map_err(|e| DriveError::Submit(format!("{e:?}")))?;
+                        .store_mut()
+                        .submit(batch, TransitionKind::Protocol)
+                        .map_err(|e| DriveError::Submit(e.to_string()))?;
                     persisted = true;
                 }
                 Effect::SendWhenDurable {
@@ -347,8 +359,8 @@ impl<E: LocalEngine> Node<E> {
         if persisted {
             let outcome = self
                 .applier
-                .worker_mut()
-                .flush()
+                .store_mut()
+                .lower()
                 .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
             // Indeterminate is not "failed": the group's outcome is
             // unknown, so the caller reconciles rather than assuming

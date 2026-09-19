@@ -23,6 +23,7 @@ postcard.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
+coord-journal-api.workspace = true
 coord-store-testkit.workspace = true
 coord-journal-raft-engine.workspace = true
 coord-storage-redb.workspace = true

@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.4.  
 **Date:** 2026-09-17.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 89 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j07`, `task-o01` through `task-o06`, `task-m01` through `task-m05` and `task-q01` suffixes and prerequisites are preserved. Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 90 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j08`, `task-o01` through `task-o06`, `task-m01` through `task-m05` and `task-q01` suffixes and prerequisites are preserved. Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -29,7 +29,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-49 through task-60 | Common checkpoints, semantic trimming, sealed handoff, restore and upgrades | G5 |
 | task-61 through task-66 | Operability, WAN measurements and release evidence | G6, extended by task-q01 |
 | task-s03 through task-s04 | Fresh isolated Fjall experiments and local comparison | Optional; not migration or second-engine production support |
-| task-j01 through task-j07 | Shared journal, materialization, local checkpoint and multi-group qualification | task-j06 separately optional |
+| task-j01 through task-j08 | Shared journal, materialization, local checkpoint, runtime composition and multi-group qualification | task-j06 separately optional |
 | task-o01 through task-o06 | Finalized streams, regional observers/relays, Kine watch/read integration | Capability-specific gates |
 | task-m01 through task-m05 | Authoritative discovery, full-client Kine and integrated membership | Operational production requirement |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
@@ -135,9 +135,10 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-j02](#task-j02) | Implement the pinned raft-engine journal and postcard codec | task-j01 |
 | [task-j03](#task-j03) | Integrate journal-first shared storage and atomic materialization | task-j02, task-08, task-11 |
 | [task-j04](#task-j04) | Publish local recovery checkpoints and reclaim journal prefixes | task-j03, task-09 |
-| [task-j05](#task-j05) | Qualify the real journal and composed persistence boundary | task-j02, task-j03, task-j04, task-09 |
+| [task-j05](#task-j05) | Qualify the real journal and composed persistence boundary | task-j02, task-j03, task-j04, task-j08, task-09 |
 | [task-j06](#task-j06) | Enable replay-backed working-state materialization, optional | task-j04, task-j05 |
 | [task-j07](#task-j07) | Validate multi-group batching and resource isolation | task-j03, task-j05, task-31 |
+| [task-j08](#task-j08) | Compose journal-backed application and serving storage | task-j03, task-43 |
 | [task-o01](#task-o01) | Specify finalized frames and observer capabilities | task-02, task-03, task-28, task-49 |
 | [task-o02](#task-o02) | Build MVCC observer install, catch-up and serving lifecycle | task-o01, task-j03, task-50 |
 | [task-o03](#task-o03) | Add regional relays, bounded fan-out and source failover | task-o02, task-31 |
@@ -149,7 +150,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-m03](#task-m03) | Connect observer staging to sealed handoff and activation | task-m01, task-o02, task-57, task-j04 |
 | [task-m04](#task-m04) | Implement conservative regional placement and quorum tuning | task-m03, task-m02 |
 | [task-m05](#task-m05) | Qualify client-aware membership under mixed failures | task-m02, task-m03, task-m04, task-58 |
-| [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-o06, task-m05, task-63, task-64 |
+| [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64 |
 
 ## Task specifications
 
@@ -1068,7 +1069,7 @@ Include the Section 21.5 five-voter 2-2-1 two-voter-region-loss schedules. Disti
 <a id="task-j05"></a>
 ### task-j05: Qualify the real journal and composed persistence boundary
 
-**Prerequisites:** task-j02, task-j03, task-j04, task-09.  
+**Prerequisites:** task-j02, task-j03, task-j04, task-j08, task-09.  
 **Design:** Sections 4.8, 17.15, 17.16.6, 21.4, 21.6.
 
 **Implement:** Pinned filesystem injection with audited unhooked/background operations; combine actual raft-engine/redb faults, subprocess death, ENOSPC/sync errors and recovery modes. Keep independent protocol/application/retry oracles.
@@ -1100,6 +1101,18 @@ Include the Section 21.5 five-voter 2-2-1 two-voter-region-loss schedules. Disti
 **Acceptance:** Reproducible low-load/saturation results retain within-domain ordering, bounded memory and no artificial idle wait. Shard failure blast radius explicit. Compare equivalent single-store reference, record whether writer pool helps or adds queueing.
 
 **Review boundary:** No universal throughput/latency assertion or consensus choice justified by one microbenchmark.
+
+<a id="task-j08"></a>
+### task-j08: Compose journal-backed application and serving storage
+
+**Prerequisites:** task-j03, task-43.  
+**Design:** Sections 4.7–4.8, 17.3.2–17.3.4, 22.1.
+
+**Implement:** Split the application path into shared preparation and completion around one persistence seam, so the planner, admission, retry resolution and `plan_to_batch` produce the exact immutable batch both drivers record. Route the serving profile's application *and* protocol transitions through the one shared `JournaledStore`, by domain-scoped handles that preserve cross-domain batching; keep `StoreWorker` as the explicitly named reference driver over the same application logic. Recover and attach before admitting work, and initialize watch state from the recovered frontier.
+
+**Acceptance:** The same failure-free workload through both drivers yields identical results, revisions, retry records and events. A journaled record whose projection is held is not an applied outcome and publishes nothing; another batch's or domain's completion never completes it; completion requires the matching barrier's own `Materialized` with its expected application metadata. A definite or indeterminate projection failure after journal success is reconciled or materialized, never a false definite failure or a replacement plan, and a persistently refused materialization yields to reconciliation rather than spinning. Protocol durability rests on `JournalDurable` and does not wait for materialization. Ballot recovery uses the authoritative recovery cut rather than a projection snapshot. A `coordd` request and restart smoke test shows the serving path using this composition.
+
+**Review boundary:** No second writer beside or beneath `JournaledStore` on the serving profile, and no duplicate application logic in a physical adapter. Journal durability alone is never an applied application outcome, and storage never manufactures establishment. Keeps `journaled-strict-v1`: no one-fsync claim and no enablement of optional task-j06. This is integration evidence and does not substitute for task-j05's filesystem and power-loss qualification.
 
 <a id="task-o01"></a>
 ### task-o01: Specify finalized frames and observer capabilities
@@ -1240,7 +1253,7 @@ A surviving three-voter majority progresses only after required leader recovery,
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report
 
-**Prerequisites:** task-j07, task-o06, task-m05, task-63, task-64.  
+**Prerequisites:** task-j07, task-j08, task-o06, task-m05, task-63, task-64.  
 **Design:** Sections 14.3, 21, 23.1.
 
 **Implement:** Fixed/changing membership, realistic Kine object churn, replicated native leases, current/historical reads, observer watches, snapshots and actual auth. Collect complete build/config/source identifiers, raw measurements, model/trace coverage, history checks, limits and supported deployments. Include all upstream-issue schedules and post-completion observer source failover.

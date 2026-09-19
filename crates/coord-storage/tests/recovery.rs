@@ -120,7 +120,7 @@ enum Role {
 
 struct Node {
     role: Option<Role>,
-    applier: Option<Applier<RedbEngine>>,
+    applier: Option<Applier<StoreWorker<RedbEngine>>>,
     shared: Arc<Shared>,
     /// The durable image while the node is down.
     image: Vec<u8>,
@@ -200,14 +200,14 @@ impl Node {
             Role::Follower(_) => None,
         }
     }
-    fn applier(&mut self) -> &mut Applier<RedbEngine> {
+    fn applier(&mut self) -> &mut Applier<StoreWorker<RedbEngine>> {
         self.applier.as_mut().unwrap()
     }
     fn view(&self) -> coord_storage::GatedView<coord_storage_redb::RedbView> {
         self.applier
             .as_ref()
             .unwrap()
-            .worker()
+            .store()
             .reader()
             .snapshot()
             .unwrap()
@@ -427,8 +427,8 @@ impl Cluster {
                         });
                     }
                     let node = &mut self.nodes[i];
-                    node.applier().worker_mut().submit(batch).unwrap();
-                    node.applier().worker_mut().flush().unwrap();
+                    node.applier().store_mut().submit(batch).unwrap();
+                    node.applier().store_mut().flush().unwrap();
                     if let Some(cp) = self.crash_due(i, false) {
                         self.fire(i, cp);
                         return;
@@ -496,7 +496,7 @@ impl Cluster {
             let payload = leader.payload(&request.command).expect("proposed").clone();
             let node = &mut self.nodes[i];
             let outcome = speculate(
-                node.applier.as_ref().unwrap().worker(),
+                node.applier.as_ref().unwrap().store(),
                 &mut node.overlay,
                 &SpeculationLimits::default(),
                 &request,
