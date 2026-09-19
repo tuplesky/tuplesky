@@ -618,3 +618,42 @@ fn the_configured_state_engine_names_are_the_engine_crates_own() {
     assert_eq!(STATE_ENGINE, ENGINE_NAME);
     assert_eq!(STATE_PROFILE, PROFILE_NAME);
 }
+
+/// A relative projection root is relative to the node's state
+/// directory; an absolute one is taken as given.
+///
+/// One setting moves a whole node, and a projection can still be put on
+/// its own device without moving anything else. Resolving it in one
+/// place is what stops two call sites disagreeing about which kind of
+/// path a given string was -- and a disagreement there means two
+/// generations of the same node's state, in two directories, both
+/// looking correct.
+#[test]
+fn where_the_projection_lives_is_resolved_in_one_place() {
+    let config = Config::parse(&base_config("")).unwrap();
+    assert_eq!(
+        config.state.root_path(&config.state_directory),
+        std::path::Path::new("/var/lib/coord/a/state")
+    );
+
+    let absolute = base_config("").replace(
+        "[state]\nroot = \"state\"",
+        "[state]\nroot = \"/mnt/fast/projection\"",
+    );
+    let absolute = Config::parse(&absolute).unwrap();
+    assert_eq!(
+        absolute.state.root_path(&absolute.state_directory),
+        std::path::Path::new("/mnt/fast/projection"),
+        "an absolute root is not joined onto the state directory"
+    );
+    // A nested relative root stays under the state directory rather than
+    // escaping it by accident.
+    let nested = base_config("").replace("root = \"state\"", "root = \"projection/current\"");
+    let nested = Config::parse(&nested).unwrap();
+    assert!(
+        nested
+            .state
+            .root_path(&nested.state_directory)
+            .starts_with("/var/lib/coord/a")
+    );
+}

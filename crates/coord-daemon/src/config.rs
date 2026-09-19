@@ -103,6 +103,23 @@ fn default_cache_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+impl StateConfig {
+    /// Where this node's projection actually lives.
+    ///
+    /// A relative root is relative to `state_directory`, so one setting
+    /// moves a whole node; an absolute one is taken as given, so a
+    /// projection can be put on its own device without moving anything
+    /// else. Resolving it here rather than at each use is what stops two
+    /// call sites disagreeing about which of those a given string was.
+    pub fn root_path(&self, state_directory: &str) -> std::path::PathBuf {
+        let root = std::path::Path::new(&self.root);
+        if root.is_absolute() {
+            return root.to_path_buf();
+        }
+        std::path::Path::new(state_directory).join(root)
+    }
+}
+
 /// The journal this node makes transitions durable in.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
