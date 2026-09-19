@@ -247,9 +247,16 @@ fn a_missing_store_stops_the_daemon_rather_than_being_created() {
     // And it says what to do, because the right answer differs: a
     // genuinely new node is initialized, an existing one is found.
     assert!(refused.err.contains("coordd init"));
+    // A failed start creates nothing at all -- not the projection, and
+    // not the journal that would be its authority. Either one left
+    // behind is a node that looks initialized to the next start.
     assert!(
         !dir.join("state").exists(),
-        "a failed start created a store anyway"
+        "a failed start created a projection anyway"
+    );
+    assert!(
+        !dir.join("journal").exists(),
+        "a failed start created a journal anyway"
     );
 }
 
@@ -443,5 +450,111 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
     assert!(
         !dir.join("state").exists(),
         "a foreign node initialized this domain's store"
+    );
+}
+
+/// Start `coordd` and read its startup report, then stop it.
+///
+/// A serving daemon does not exit, so the smoke test reads what it says
+/// about itself on the way up and then ends it. Reading is bounded: a
+/// daemon that never reaches `live` is a failure to report, not a test
+/// to hang.
+fn start_and_report(config: &Path) -> String {
+    use std::io::{BufRead, BufReader};
+
+    let mut child = Command::new(binary())
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("coordd started");
+    let stdout = child.stdout.take().expect("piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut report = String::new();
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let live = line.contains("phase=live");
+            report.push_str(&line);
+            report.push('\n');
+            if live {
+                break;
+            }
+        }
+        let _ = tx.send(report);
+    });
+    let report = rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            let _ = child.kill();
+            panic!("coordd did not reach a serving state within 30s")
+        });
+    let _ = child.kill();
+    let _ = child.wait();
+    report
+}
+
+/// The serving path opens the shared journal, attaches this domain's
+/// projection to it, and replays whatever the projection owed -- and a
+/// restart picks up exactly that state rather than a fresh one.
+///
+/// This is the composition's own evidence: attaching is where the
+/// journal's frontier and the projection's are checked against each
+/// other, so a daemon that reports a journaled frontier and nothing owed
+/// has actually been through it. It is integration evidence and not a
+/// durability qualification; task-j05 owns that, under real filesystem
+/// and power-loss faults.
+#[test]
+fn the_serving_path_opens_the_journal_and_survives_a_restart() {
+    let dir = workspace("restart");
+    let path = config(&dir);
+
+    let initialized = run(&path, &["init"]);
+    assert_eq!(initialized.code, Some(0), "{}", initialized.err);
+    assert!(
+        dir.join("journal").is_dir(),
+        "initialization made no journal: the serving profile has no authority"
+    );
+
+    let first = start_and_report(&path);
+    assert!(
+        first.contains("owed=0"),
+        "the projection was left owing the journal: {first}"
+    );
+    let frontier = |report: &str| {
+        report
+            .lines()
+            .find(|l| l.starts_with("storage "))
+            .and_then(|l| {
+                l.split("journaled_through=Some(")
+                    .nth(1)?
+                    .split(')')
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("no journal frontier reported: {report}"))
+    };
+    let before = frontier(&first);
+    assert!(before > 0, "the journal recorded nothing: {first}");
+
+    // The same node, started again. It opens what it had: the frontier
+    // does not go backwards, nothing is owed, and it did not quietly
+    // make itself a new store.
+    let second = start_and_report(&path);
+    let after = frontier(&second);
+    assert!(
+        after >= before,
+        "the journal frontier went backwards across a restart: {before} then {after}"
+    );
+    assert!(second.contains("owed=0"), "{second}");
+    assert!(
+        second.contains("gen-000001"),
+        "the restart did not reopen the generation it had: {second}"
+    );
+    assert!(
+        !dir.join("state").join("gen-000002").exists(),
+        "a restart created a second generation"
     );
 }

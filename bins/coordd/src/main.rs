@@ -91,7 +91,7 @@ fn main() -> ExitCode {
     );
 
     if let Some(Command::Init) = cli.command {
-        return match store::open(
+        return match store::open_storage(
             &config,
             store::Intent::Initialize,
             placed.membership.cluster(),
@@ -99,8 +99,8 @@ fn main() -> ExitCode {
             placed.replica,
             placed.incarnation,
         ) {
-            Ok(generation) => {
-                println!("initialized {}", generation.directory().display());
+            Ok(storage) => {
+                println!("initialized {}", storage.generation.display());
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -120,7 +120,7 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
-    let generation = match store::open(
+    let storage = match store::open_storage(
         &config,
         store::Intent::Serve,
         placed.membership.cluster(),
@@ -128,14 +128,30 @@ fn main() -> ExitCode {
         placed.replica,
         placed.incarnation,
     ) {
-        Ok(g) => g,
+        Ok(s) => s,
         Err(e) => {
             lifecycle.quarantine(QuarantineReason::Disk);
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
-    println!("store {}", generation.directory().display());
+    // Attaching is where the journal's frontier and the projection's are
+    // checked against each other and the journal's suffix is replayed
+    // into the projection. It has happened by now, which is what makes
+    // the next line true rather than hopeful.
+    println!(
+        "storage projection={} journaled_through={:?} owed={}",
+        storage.generation.display(),
+        storage
+            .domain
+            .store()
+            .frontiers(placed.membership.domain())
+            .map(|f| f.durable().get()),
+        storage
+            .domain
+            .store()
+            .unmaterialized(placed.membership.domain()),
+    );
     lifecycle.observe(Readiness {
         storage_ready: true,
         ..Readiness::default()
