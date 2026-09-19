@@ -1,0 +1,29 @@
+[package]
+name = "coord-membership"
+description = "Signed genesis manifest, durable initialization and the peer TLS identity binder: committed key, incarnation, role and exact voter identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+coord-transport.workspace = true
+coord-node-issuer.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+jsonwebtoken.workspace = true
+blake3.workspace = true
+x509-parser.workspace = true
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+coord-authn.workspace = true
+coord-sts.workspace = true
+rcgen.workspace = true
+time.workspace = true
