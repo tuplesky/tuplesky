@@ -166,19 +166,8 @@ pub struct Config {
     pub listen: ListenConfig,
     /// The logical-state projection.
     pub state: StateConfig,
-    /// The shared journal, when this node is configured for the
-    /// journal-first profile.
-    ///
-    /// It is optional because the profile is not one this build serves.
-    /// Journalling the authoritative transition first and then applying
-    /// it atomically (Section 17.3) is integrated by task-j03; until
-    /// then a node runs the reference-storage profile, where the
-    /// projection is itself the durable record. Naming a journal here is
-    /// therefore refused at startup rather than accepted and ignored: a
-    /// section that configures nothing is worse than no section, because
-    /// it reads as a durability guarantee that is not being kept.
-    #[serde(default)]
-    pub journal: Option<JournalConfig>,
+    /// The durable journal.
+    pub journal: JournalConfig,
     /// Credentials and trust anchors.
     pub identity: IdentityConfig,
     /// Semantic limits.
@@ -193,20 +182,6 @@ pub struct Config {
     /// false in a production graph).
     #[serde(default)]
     pub allow_test_bypasses: bool,
-}
-
-impl Config {
-    /// Whether this configuration asks for a profile this build does not
-    /// serve, and which.
-    ///
-    /// The refusal belongs to startup rather than to parsing: the
-    /// configuration is well-formed and will be correct again once
-    /// task-j03 lands, so what is wrong with it is this build, not it.
-    pub fn unserved_profile(&self) -> Option<&'static str> {
-        self.journal
-            .as_ref()
-            .map(|_| "the journal-first profile (task-j03) is not served by this build")
-    }
 }
 
 /// Why a configuration is refused.
@@ -344,18 +319,12 @@ impl Config {
         // been read, rather than as a surprise inside an engine.
         engine_named("state", &self.state.engine, STATE_ENGINE)?;
         engine_named("state.profile", &self.state.profile, STATE_PROFILE)?;
-        if let Some(journal) = &self.journal {
-            engine_named("journal", &journal.engine, JOURNAL_ENGINE)?;
-            engine_named("journal.profile", &journal.profile, JOURNAL_PROFILE)?;
-            // A node that journals nothing has no authoritative
-            // transition to apply from, so zero shards is a
-            // configuration that cannot serve.
-            if journal.shards == 0 {
-                return Err(ConfigError::NoJournalShards);
-            }
-            if journal.root.trim().is_empty() {
-                return Err(ConfigError::EmptyPath("journal.root"));
-            }
+        engine_named("journal", &self.journal.engine, JOURNAL_ENGINE)?;
+        engine_named("journal.profile", &self.journal.profile, JOURNAL_PROFILE)?;
+        // A node that journals nothing has no authoritative transition to
+        // apply from, so zero shards is a configuration that cannot serve.
+        if self.journal.shards == 0 {
+            return Err(ConfigError::NoJournalShards);
         }
         // An empty path is not a default: it resolves to the working
         // directory, which is where a process would silently create a
@@ -363,6 +332,7 @@ impl Config {
         for (name, path) in [
             ("state_directory", &self.state_directory),
             ("state.root", &self.state.root),
+            ("journal.root", &self.journal.root),
             ("cluster_manifest", &self.cluster_manifest),
             ("identity.trust_bundle", &self.identity.trust_bundle),
             ("identity.node_certificate", &self.identity.node_certificate),
