@@ -22,6 +22,9 @@
 //!   transport liveness from *fresh-quorum* consensus readiness: a voter
 //!   that only has cached leadership is not ready to serve. Disk
 //!   quarantine drains and stops rather than serving corrupt state.
+//! * [`pending`]: the request streams held open while the collector
+//!   establishes their results, matched to deliveries by invocation and
+//!   by the connection that asked.
 //! * [`startup`]: the startup sequence of Section 22.1 (Boot,
 //!   StorageValidated, IdentityValidated, MembershipChecked,
 //!   ProtocolRecovered), which no step may skip, and the production
@@ -35,6 +38,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod lifecycle;
 pub mod listen;
+pub mod pending;
 pub mod role;
 pub mod startup;
 pub mod supervise;
@@ -43,6 +47,7 @@ pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
+pub use pending::{Pending, Undeliverable};
 pub use role::{Role, RoleSet};
 pub use startup::{NodeJournal, Startup, StartupError, StartupPhase, StoreGenesis};
 pub use supervise::{RestartBudget, Supervisor, WorkerError, WorkerId};
