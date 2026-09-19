@@ -661,9 +661,12 @@ name = "coord-daemon"
 version = "0.1.0"
 dependencies = [
  "coord-membership",
+ "coord-store-api",
+ "coord-store-testkit",
  "coord-transport",
  "coord-types",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "toml",
 ]

@@ -22,6 +22,10 @@
 //!   transport liveness from *fresh-quorum* consensus readiness: a voter
 //!   that only has cached leadership is not ready to serve. Disk
 //!   quarantine drains and stops rather than serving corrupt state.
+//! * [`startup`]: the startup sequence of Section 22.1 (Boot,
+//!   StorageValidated, IdentityValidated, MembershipChecked,
+//!   ProtocolRecovered), which no step may skip, and the production
+//!   genesis store that pins the manifest digest in `meta_v1`.
 //! * [`diagnostics`]: a redacted diagnostics snapshot; tokens, keys and
 //!   user data never appear.
 #![forbid(unsafe_code)]
@@ -32,6 +36,7 @@ pub mod diagnostics;
 pub mod lifecycle;
 pub mod listen;
 pub mod role;
+pub mod startup;
 pub mod supervise;
 
 pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
@@ -39,6 +44,7 @@ pub use diagnostics::{Diagnostics, Redacted};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use role::{Role, RoleSet};
+pub use startup::{NodeJournal, Startup, StartupError, StartupPhase, StoreGenesis};
 pub use supervise::{RestartBudget, Supervisor, WorkerError, WorkerId};
 
 /// Crate role marker used by the dependency-policy check.

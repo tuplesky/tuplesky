@@ -155,6 +155,12 @@ pub mod meta_fields {
     pub const RETENTION_FLOOR: &[u8] = b"retention_floor";
     /// Replicated lease expiry authority epoch (Section 7.2).
     pub const LEASE_AUTHORITY: &[u8] = b"lease_authority";
+    /// Digest of the genesis manifest this node was initialized under.
+    /// It is pinned once, on the first boot that establishes the node's
+    /// journal, and every later boot must match it: a node handed
+    /// another manifest quarantines rather than reinitializing
+    /// (design Section 10.5).
+    pub const GENESIS_DIGEST: &[u8] = b"genesis_digest";
 }
 
 #[cfg(test)]

@@ -173,11 +173,9 @@ func TestCompactionEndsCompactedWatchesExplicitly(t *testing.T) {
 	if !ok || !resp.Canceled || resp.Err() != rpctypes.ErrCompacted {
 		t.Fatalf("compacted start: ok=%v %+v err=%v", ok, resp, resp.Err())
 	}
-	// Let the cancelled substream finish tearing down before another one
-	// shares the stream. The etcd client dispatches to substreams by id
-	// and closes a cancelled one's channel asynchronously, so leaving a
-	// half-closed substream behind is how a later dispatch ends up
-	// sending on a closed channel.
+	// Read the cancelled watch to the end before opening another on the
+	// same client, so this test's substreams are torn down in a known
+	// order rather than racing the client's close.
 	drain(t, wch)
 	// A watch at the floor is fine.
 	fine := br.cli.Watch(ctx, key, clientv3.WithRev(4))
