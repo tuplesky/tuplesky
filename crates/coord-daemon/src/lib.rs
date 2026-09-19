@@ -22,6 +22,9 @@
 //!   transport liveness from *fresh-quorum* consensus readiness: a voter
 //!   that only has cached leadership is not ready to serve. Disk
 //!   quarantine drains and stops rather than serving corrupt state.
+//! * [`fanout`]: sending a planned submission to every committed voter,
+//!   at the incarnation the configuration names rather than one the plan
+//!   carries.
 //! * [`pending`]: the request streams held open while the collector
 //!   establishes their results, matched to deliveries by invocation and
 //!   by the connection that asked.
@@ -36,6 +39,7 @@
 
 pub mod config;
 pub mod diagnostics;
+pub mod fanout;
 pub mod lifecycle;
 pub mod listen;
 pub mod pending;
@@ -45,6 +49,7 @@ pub mod supervise;
 
 pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
+pub use fanout::{Dispatched, PeerFanOut, dispatch};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use pending::{Pending, Undeliverable};
