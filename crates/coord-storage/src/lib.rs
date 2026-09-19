@@ -15,9 +15,10 @@
 //! * Bounded grouping: `flush` lowers up to `max_records`/`max_bytes` of
 //!   queued batches into one durable transaction (no idle timer), stamping
 //!   the projection with the store sequence and the group digest.
-//! * In this reference increment the durable commit is the only
+//! * In this reference coordinator the durable commit is the only
 //!   persistence, so a successful flush reports both `JournalDurable` and
-//!   `Materialized` with the same sequence. task-j03 splits them.
+//!   `Materialized` with the same sequence. The journal-first coordinator
+//!   ([`journaled::JournaledStore`], task-j03) separates them.
 //! * An indeterminate commit blocks further work until [`StoreWorker::reconcile`]
 //!   reads the semantic stamp back and decides presence or absence; byte
 //!   batches are never blindly retried.
@@ -73,6 +74,20 @@
 //! * Protocol rows (task-20): [`protocol`] reads the epoch's durable
 //!   promise row so a rebooted replica recovers its promise from the
 //!   projection.
+//! * Journal-first storage (task-j03): [`journaled::JournaledStore`] is the
+//!   `journaled-strict-v1` profile. It validates and sequences common
+//!   transitions, journals them first as immutable complete records through
+//!   a `coord-journal-api` engine (one bounded multi-domain group per synced
+//!   write, at most one uncompleted batch per stream), and only then applies
+//!   them to each domain's durable projection in journal order, rechecking
+//!   the recorded base inside the transaction and stamping the projection
+//!   with the materialized sequence and the record's digest. `JournalDurable`,
+//!   `Materialized` and establishment stay three distinct facts. Replay of
+//!   `(M, J]` at attach restores exact state, results and events from the
+//!   records alone; [`cut::RecoveryCut`] answers Section 4.8 by summarizing
+//!   journaled-but-unmaterialized obligations over the gated snapshot; and
+//!   [`journaled::JournaledStore::fence`] closes old-ballot admission in one
+//!   domain without any cross-domain barrier.
 //! * Ordered application (task-24): [`apply::Applier`] executes the
 //!   command the consensus learner selected: rehash the durable payload,
 //!   admit through the retry layer (a retained result is returned, never
@@ -85,6 +100,8 @@
 pub mod apply;
 pub mod codecs;
 pub mod compaction;
+pub mod cut;
+pub mod journaled;
 pub mod lowering;
 pub mod materialize;
 pub mod policy;
@@ -99,6 +116,11 @@ pub mod worker;
 
 pub use apply::{Applier, ApplyError};
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
+pub use cut::{CutOverlay, RecoveryCut};
+pub use journaled::{
+    CutError, DomainStatus, FlushReport, JournalLimits, JournaledError, JournaledStore, Submission,
+    SubmitRefused, TransitionKind,
+};
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};
 pub use retry::{Admission, Resolution, RetryBinding};
