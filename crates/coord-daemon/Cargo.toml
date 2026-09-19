@@ -28,6 +28,7 @@ toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+coord-journal-api.workspace = true
 coord-state.workspace = true
 rcgen.workspace = true
 coord-storage-redb.workspace = true
