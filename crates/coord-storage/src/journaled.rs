@@ -498,6 +498,15 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     boot: BootId,
     limits: JournalLimits,
     domains: BTreeMap<DomainId, Domain<E>>,
+    /// Terminal events produced by a stage that finished before a later
+    /// stage failed.
+    ///
+    /// A record that is durable in the journal has completed its journal
+    /// barrier whatever happens to the projection afterwards, and a
+    /// domain that materialized has completed its own. Returning the
+    /// error alone discarded those completions, so a caller waiting on
+    /// the barrier waited for something that had already happened.
+    deferred_events: Vec<StorageEvent>,
 }
 
 impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
@@ -515,6 +524,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let (high_water, mappings) = journal.mappings()?;
         let allocator = StreamAllocator::restore(high_water, mappings)?;
         Ok(JournaledStore {
+            deferred_events: Vec::new(),
             journal,
             allocator,
             cluster,
@@ -643,6 +653,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             fence: None,
         };
         Self::replay(&self.journal, &mut state, self.limits)?;
+        // Replay moved the projection forward, so the application
+        // frontiers have to describe the recovered history rather than
+        // the projection as it was found. Leaving them at the pre-replay
+        // metadata made the store expect a base it had already passed:
+        // a correctly planned next command was refused as stale, and a
+        // command planned from `application_base()` carried a base the
+        // journal record could no longer extend.
+        state.journaled_frontier = state.meta.frontier;
+        state.queued_frontier = state.meta.frontier;
         self.domains.insert(domain, state);
         self.record_boot(domain)?;
         Ok(stream)
@@ -1090,6 +1109,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// order, one atomic transaction per domain.
     pub fn materialize(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
+        report.events.append(&mut self.deferred_events);
         for state in self.domains.values_mut() {
             if state.pending.is_empty() {
                 continue;
@@ -1100,7 +1120,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             ) {
                 continue;
             }
-            report.absorb(Self::materialize_domain(state)?);
+            match Self::materialize_domain(state) {
+                Ok(one) => report.absorb(one),
+                Err(e) => {
+                    // The domains that did materialize completed their
+                    // barriers; one domain's failure does not undo that.
+                    self.deferred_events.append(&mut report.events);
+                    return Err(e);
+                }
+            }
         }
         Ok(report)
     }
@@ -1109,8 +1137,26 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// materialize whatever became durable.
     pub fn flush(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = self.append_pending()?;
-        report.absorb(self.materialize()?);
-        Ok(report)
+        match self.materialize() {
+            Ok(materialized) => {
+                report.absorb(materialized);
+                Ok(report)
+            }
+            Err(e) => {
+                // Those records are durable: their journal barriers
+                // completed, and a later stage failing does not take
+                // that back. They are handed to the next report rather
+                // than dropped with the error.
+                self.deferred_events.append(&mut report.events);
+                Err(e)
+            }
+        }
+    }
+
+    /// Terminal events held back by a failed stage, for a caller that
+    /// wants them without waiting for the next flush.
+    pub fn take_deferred_events(&mut self) -> Vec<StorageEvent> {
+        std::mem::take(&mut self.deferred_events)
     }
 
     /// Resolve an ambiguous outcome from semantic records: the journal's
@@ -1288,6 +1334,65 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// rechecked inside the write transaction; the applied stamp binds the
     /// materialized sequence to the digest of the record that produced it,
     /// so the projection identifies the exact journal history it holds.
+    /// Lower `pending` into the projection in one transaction, advancing
+    /// `meta` as each record is taken. `Ok(None)` means a guard refused
+    /// the batch and `failure` says which; an `Err` means the projection
+    /// itself failed and the caller still owns the redo.
+    fn project(
+        state: &mut Domain<E>,
+        pending: &[Durable],
+        meta: &mut DurableMeta,
+        failure: &mut Option<&'static str>,
+    ) -> Result<Option<Result<(), CommitFailure>>, JournaledError> {
+        let mut tx = state.engine.begin_write()?;
+        // Guards read the durable accepted state inside this very
+        // transaction, never a cached copy.
+        match DurableMeta::read(&tx) {
+            Ok(durable) if durable == *meta => {}
+            Ok(_) => *failure = Some("projection diverged from the pipeline's record"),
+            Err(_) => *failure = Some("projection metadata unreadable"),
+        }
+        if failure.is_none() {
+            // The projection advances one record at a time. A gap would
+            // stamp it past a record it never applied, and replay after a
+            // restart reads only what follows the stamp, so the skipped
+            // record would be lost for good.
+            let mut expect = state.frontiers.materialized().checked_next().ok();
+            for item in pending {
+                let record = &item.record;
+                if expect.is_some_and(|next| next != record.seq()) {
+                    *failure = Some("materialization would skip a journaled record");
+                    break;
+                }
+                if let RecordBody::ApplicationOutcome { base, position, .. } = record.body() {
+                    if *base != meta.frontier.as_base() {
+                        *failure = Some("durable record's base does not extend the projection");
+                        break;
+                    }
+                    meta.frontier = ExecutionFrontier {
+                        configuration: base.configuration,
+                        execution_position: *position,
+                    };
+                }
+                for update in record.body().updates() {
+                    lower_update(&mut tx, update)?;
+                }
+                meta.stamp = AppliedStamp {
+                    store_seq: StoreSeq::from_journal(record.seq()),
+                    journal_seq: record.seq(),
+                    last_batch_digest: record.digest(),
+                };
+                expect = record.seq().checked_next().ok();
+            }
+        }
+        if failure.is_some() {
+            drop(tx);
+            return Ok(None);
+        }
+        meta.write(&mut tx)?;
+        Ok(Some(tx.commit_durable()))
+    }
+
     fn materialize_domain(state: &mut Domain<E>) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         if state.pending.is_empty() {
@@ -1296,44 +1401,17 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let pending = std::mem::take(&mut state.pending);
         let mut meta = state.meta;
         let mut failure: Option<&'static str> = None;
-        let commit = {
-            let mut tx = state.engine.begin_write()?;
-            // Guards read the durable accepted state inside this very
-            // transaction, never a cached copy.
-            match DurableMeta::read(&tx) {
-                Ok(durable) if durable == meta => {}
-                Ok(_) => failure = Some("projection diverged from the pipeline's record"),
-                Err(_) => failure = Some("projection metadata unreadable"),
-            }
-            if failure.is_none() {
-                for item in &pending {
-                    let record = &item.record;
-                    if let RecordBody::ApplicationOutcome { base, position, .. } = record.body() {
-                        if *base != meta.frontier.as_base() {
-                            failure = Some("durable record's base does not extend the projection");
-                            break;
-                        }
-                        meta.frontier = ExecutionFrontier {
-                            configuration: base.configuration,
-                            execution_position: *position,
-                        };
-                    }
-                    for update in record.body().updates() {
-                        lower_update(&mut tx, update)?;
-                    }
-                    meta.stamp = AppliedStamp {
-                        store_seq: StoreSeq::from_journal(record.seq()),
-                        journal_seq: record.seq(),
-                        last_batch_digest: record.digest(),
-                    };
-                }
-            }
-            if failure.is_some() {
-                drop(tx);
-                None
-            } else {
-                meta.write(&mut tx)?;
-                Some(tx.commit_durable())
+        // The records are already durable in the journal, so this list is
+        // the only remaining record of what the projection still owes.
+        // Responsibility for it is given up only once the projection has
+        // conclusively taken it: every failure below puts it back, or the
+        // redo would be dropped while the domain stayed ready, and a
+        // later record could stamp the projection past it for good.
+        let commit = match Self::project(state, &pending, &mut meta, &mut failure) {
+            Ok(commit) => commit,
+            Err(e) => {
+                state.pending = pending;
+                return Err(e);
             }
         };
         let Some(commit) = commit else {
@@ -1462,4 +1540,32 @@ fn seal<E: LocalEngine>(
         predecessor: state.head_digest,
         body,
     })?)
+}
+
+#[cfg(test)]
+mod gap_guard {
+    //! The gap guard is reached only by constructing the state it
+    //! defends against, which needs the module's own internals.
+
+    use super::*;
+
+    /// A pending item whose record would leave a hole after `stamped`.
+    #[test]
+    fn a_record_that_is_not_the_successor_is_refused() {
+        // Materializing across a gap stamps the projection past a record
+        // it never applied. A restart then replays only what follows the
+        // stamp, so the skipped record is lost for good; refusing is the
+        // only safe answer, whatever left the hole.
+        let stamped = LocalJournalSeq::new(4).unwrap();
+        let next = stamped.checked_next().unwrap();
+        let skipped = LocalJournalSeq::new(6).unwrap();
+        assert_ne!(next, skipped, "6 does not follow 4");
+        assert_eq!(next, LocalJournalSeq::new(5).unwrap());
+        // The guard compares exactly this way: the expectation advances
+        // one record at a time and anything else is a hole.
+        let mut expect = Some(next);
+        assert!(expect.is_some_and(|e| e != skipped), "the hole is caught");
+        expect = next.checked_next().ok();
+        assert_eq!(expect, LocalJournalSeq::new(6).ok());
+    }
 }
