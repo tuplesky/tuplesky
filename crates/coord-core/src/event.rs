@@ -94,6 +94,30 @@ impl PeerProvenance {
             connection,
         }
     }
+    /// Construct for evidence a voter running in this very process
+    /// produced.
+    ///
+    /// It is the same proof for the same reason: the identity is not
+    /// asserted by a frame, it is the committed identity of the voter
+    /// instance the runtime is holding. What differs is only that the
+    /// bytes did not cross a connection, so there is no connection
+    /// identity to record.
+    ///
+    /// It is a *separate* constructor rather than `from_transport` with
+    /// a made-up connection so that the two sources stay distinguishable
+    /// in the source and each keeps its own reviewed allow list;
+    /// `cargo xtask check-deps` names both.
+    pub const fn from_local_voter(from: ReplicaId, incarnation: ReplicaIncarnation) -> Self {
+        PeerProvenance {
+            from,
+            incarnation,
+            // No connection carried it. Diagnostic only: every rule that
+            // matters -- deduplication, quorum counting -- is by voter
+            // identity, which is why local evidence can enter the same
+            // path without a special case.
+            connection: 0,
+        }
+    }
     /// Sender.
     pub const fn from(&self) -> ReplicaId {
         self.from

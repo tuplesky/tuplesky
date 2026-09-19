@@ -25,6 +25,7 @@ use coord_types::ids::{
     ClientInstanceId, ClusterId, DomainId, ReplicaId, ReplicaIncarnation, RequestSequence,
     SessionId,
 };
+use coord_types::wire_v1::PeerRole;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -304,8 +305,13 @@ fn a_plan_of_strangers_offers_nothing() {
 fn a_co_located_voter_is_delivered_to_without_a_network_hop() {
     let membership = membership();
     let peers = Peers::new(Vec::new());
-    let mine = Ingress::new(&membership, replica(1), IngressBudget::default())
-        .expect("replica 1 is a committed voter");
+    let mine = Ingress::new(
+        &membership,
+        replica(1),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("replica 1 is a committed voter");
     let route = mine.route();
     let plan = plan(vec![replica(1), replica(2), replica(3)]);
 
@@ -367,7 +373,13 @@ fn a_local_route_at_a_superseded_incarnation_is_not_used() {
 fn a_local_route_never_takes_another_voters_frame() {
     let membership = membership();
     let peers = Peers::new(Vec::new());
-    let mine = Ingress::new(&membership, replica(1), IngressBudget::default()).expect("voter");
+    let mine = Ingress::new(
+        &membership,
+        replica(1),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("voter");
     let route = mine.route();
     let plan = plan(vec![replica(2), replica(3)]);
 
@@ -431,6 +443,7 @@ fn a_full_local_ingress_does_not_hold_up_the_remote_voters() {
     let mine = Ingress::new(
         &membership,
         replica(1),
+        PeerRole::Frontend,
         IngressBudget {
             frames: 1,
             bytes: 1 << 20,

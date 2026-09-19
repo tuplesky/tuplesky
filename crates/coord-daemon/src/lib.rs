@@ -34,6 +34,12 @@
 //!   from the committed membership by the runtime that runs the voter,
 //!   so a co-located frontend can skip the network without skipping
 //!   anything the network established.
+//! * [`voter`]: the door in front of one voter: a submission from a
+//!   collector on the peer plane and one from a collector in this very
+//!   process are parsed by the same reader, admitted by the same
+//!   boundary and stepped through the same machine, and the voter's own
+//!   evidence reaches the collector as a frame with its committed
+//!   identity on it rather than as a local success.
 //! * [`node`]: driving one voter -- events into the protocol machine,
 //!   and the effects it returns carried out: batches persisted, sends
 //!   held until their barriers are durable and their boot still holds,
@@ -66,6 +72,7 @@ pub mod role;
 pub mod serve;
 pub mod startup;
 pub mod supervise;
+pub mod voter;
 
 pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
@@ -82,6 +89,7 @@ pub use role::{Role, RoleSet};
 pub use serve::{Step, step};
 pub use startup::{NodeJournal, Startup, StartupError, StartupPhase, StoreGenesis};
 pub use supervise::{RestartBudget, Supervisor, WorkerError, WorkerId};
+pub use voter::{Refused, Voter};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";

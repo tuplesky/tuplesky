@@ -35,12 +35,20 @@
 //! is no constructor that takes an incarnation, so a process cannot
 //! claim a generation of a node the configuration did not commit to, and
 //! a process that runs no voter simply never builds one.
+//!
+//! An ingress also names the role its submitter presents. On the wire
+//! that role comes from the peer's bound certificate and decides whether
+//! a `Submit` may be admitted at all; in this process it comes from the
+//! capabilities this node's own certificate carries, and it is checked
+//! here and again where the two routes converge. A role that may not
+//! submit on a client's behalf gets no ingress to offer to.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use coord_membership::membership::Membership;
 use coord_types::ids::{DomainId, ReplicaId, ReplicaIncarnation};
+use coord_types::wire_v1::PeerRole;
 
 use crate::fanout::{LocalIngress, Saturated};
 
@@ -109,11 +117,14 @@ pub struct Ingress {
     replica: ReplicaId,
     incarnation: ReplicaIncarnation,
     domain: DomainId,
+    submitter: PeerRole,
 }
 
 impl Ingress {
-    /// The ingress of `replica`, if the committed configuration names it
-    /// a voter of this domain.
+    /// The ingress of `replica`, for frames a local `submitter`
+    /// presents, if the committed configuration names `replica` a voter
+    /// of this domain and `submitter` is a role that may submit on a
+    /// client's behalf.
     ///
     /// The incarnation is looked up rather than supplied. A runtime
     /// cannot assert which generation of a node it is: the configuration
@@ -122,8 +133,12 @@ impl Ingress {
     pub fn new(
         membership: &Membership,
         replica: ReplicaId,
+        submitter: PeerRole,
         budget: IngressBudget,
     ) -> Option<Ingress> {
+        if !coord_collector::ingress::is_collector(submitter) {
+            return None;
+        }
         let incarnation = membership.voter_incarnation(&replica)?;
         Some(Ingress {
             shared: Arc::new(Shared {
@@ -138,6 +153,7 @@ impl Ingress {
             replica,
             incarnation,
             domain: membership.domain(),
+            submitter,
         })
     }
 
@@ -198,6 +214,11 @@ impl Ingress {
     /// The incarnation the committed configuration named for it.
     pub const fn incarnation(&self) -> ReplicaIncarnation {
         self.incarnation
+    }
+
+    /// The role a frame taken from here was submitted under.
+    pub const fn submitter(&self) -> PeerRole {
+        self.submitter
     }
 }
 

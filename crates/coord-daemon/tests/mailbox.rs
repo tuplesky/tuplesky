@@ -10,6 +10,7 @@ use coord_daemon::{LocalIngress, Saturated};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
 use coord_types::ids::{DomainId, ReplicaId, ReplicaIncarnation};
+use coord_types::wire_v1::PeerRole;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -69,10 +70,48 @@ fn an_ingress_exists_only_for_a_committed_voter() {
     let membership = membership();
 
     assert!(
-        Ingress::new(&membership, replica(9), IngressBudget::default()).is_none(),
+        Ingress::new(
+            &membership,
+            replica(9),
+            PeerRole::Frontend,
+            IngressBudget::default()
+        )
+        .is_none(),
         "a replica the configuration does not name as a voter has no ingress here"
     );
-    assert!(Ingress::new(&membership, replica(2), IngressBudget::default()).is_some());
+    assert!(
+        Ingress::new(
+            &membership,
+            replica(2),
+            PeerRole::Frontend,
+            IngressBudget::default()
+        )
+        .is_some()
+    );
+}
+
+/// An ingress also names the role its frames are submitted under, and
+/// that role must be one that may act on a client's behalf. A local
+/// route for an observer or another voter would be a second, weaker way
+/// into the protocol; there is none to hand out.
+#[test]
+fn an_ingress_exists_only_for_a_role_that_may_submit() {
+    let membership = membership();
+    let budget = IngressBudget::default();
+
+    assert!(Ingress::new(&membership, replica(1), PeerRole::Frontend, budget).is_some());
+    assert!(Ingress::new(&membership, replica(1), PeerRole::KineCollector, budget).is_some());
+    for role in [
+        PeerRole::Voter,
+        PeerRole::Observer,
+        PeerRole::Client,
+        PeerRole::Learner,
+    ] {
+        assert!(
+            Ingress::new(&membership, replica(1), role, budget).is_none(),
+            "{role:?} may not submit on a client's behalf, so it gets no local route"
+        );
+    }
 }
 
 /// The incarnation an ingress carries is the configuration's. There is
@@ -81,7 +120,13 @@ fn an_ingress_exists_only_for_a_committed_voter() {
 #[test]
 fn the_incarnation_is_the_configurations_not_the_runtimes() {
     let membership = membership();
-    let ingress = Ingress::new(&membership, replica(3), IngressBudget::default()).expect("voter");
+    let ingress = Ingress::new(
+        &membership,
+        replica(3),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("voter");
 
     assert_eq!(ingress.replica(), replica(3));
     assert_eq!(
@@ -101,6 +146,7 @@ fn a_local_ingress_refuses_by_frame_count_rather_than_growing() {
     let ingress = Ingress::new(
         &membership,
         replica(1),
+        PeerRole::Frontend,
         IngressBudget {
             frames: 2,
             bytes: 1 << 20,
@@ -125,6 +171,7 @@ fn a_local_ingress_refuses_by_bytes_as_well() {
     let ingress = Ingress::new(
         &membership,
         replica(1),
+        PeerRole::Frontend,
         IngressBudget {
             frames: 1024,
             bytes: 16,
@@ -145,6 +192,7 @@ fn a_local_ingress_refuses_by_bytes_as_well() {
     let empty = Ingress::new(
         &membership,
         replica(1),
+        PeerRole::Frontend,
         IngressBudget {
             frames: 1024,
             bytes: 16,
@@ -164,6 +212,7 @@ fn taking_frames_returns_them_in_order_and_frees_the_room() {
     let ingress = Ingress::new(
         &membership,
         replica(1),
+        PeerRole::Frontend,
         IngressBudget {
             frames: 2,
             bytes: 1 << 20,
@@ -190,7 +239,13 @@ fn taking_frames_returns_them_in_order_and_frees_the_room() {
 #[test]
 fn a_take_is_bounded_so_the_voter_can_do_its_own_work() {
     let membership = membership();
-    let ingress = Ingress::new(&membership, replica(1), IngressBudget::default()).expect("voter");
+    let ingress = Ingress::new(
+        &membership,
+        replica(1),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("voter");
     let route = ingress.route();
     for n in 0..10u8 {
         route.offer(&[n]).expect("room");
