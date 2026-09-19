@@ -462,7 +462,8 @@ func TestSyncWaitTerminatesLaggardsAndCloseUnblocks(t *testing.T) {
 // 685-688), and broadcastResponse meanwhile sends to every entry in the
 // map (watch.go:738-747) -- a send on a closed channel, which no select
 // case can skip. v3.6.14 carries the identical code, so a downgrade is
-// not a fix. The bridge's progress path keeps its coverage in
+// not a fix. It is etcd-io/etcd#21969, whose PR #22191 is open and
+// unmerged. The bridge's progress path keeps its coverage in
 // TestProgressNeverOvertakesEvents, whose watch is never cancelled.
 func TestSynchronizationFailureWithholdsProgressUntilTheWatchIsActuallyClosed(t *testing.T) {
 	const (

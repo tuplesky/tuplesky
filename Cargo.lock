@@ -664,10 +664,12 @@ dependencies = [
  "coord-store-api",
  "coord-store-testkit",
  "coord-transport",
+ "coord-transport-testkit",
  "coord-types",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "toml",
 ]
 

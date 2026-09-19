@@ -514,6 +514,24 @@ impl Transport {
         binder: Arc<dyn IdentityBinder>,
         limits: Limits,
     ) -> Result<Transport, TransportError> {
+        Transport::with_socket(std::net::UdpSocket::bind(addr)?, local, binder, limits)
+    }
+
+    /// Serve on a socket the caller already bound.
+    ///
+    /// A process decides whether it can serve at all by binding its
+    /// listeners, and that decision must be made once: binding here as
+    /// well would either fail with the caller's own socket still open, or
+    /// leave a window in which the port was free for someone else to
+    /// take. The daemon binds every listener up front (its `Live` phase
+    /// is defined by that) and hands the socket over here, so the address
+    /// the process reported is the address it serves on.
+    pub fn with_socket(
+        socket: std::net::UdpSocket,
+        local: LocalIdentity,
+        binder: Arc<dyn IdentityBinder>,
+        limits: Limits,
+    ) -> Result<Transport, TransportError> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         // One endpoint serves both ALPNs, and rustls decides client
         // authentication before the negotiated ALPN is visible to the
@@ -578,7 +596,14 @@ impl Transport {
         };
         let client_tls = [client_for(ALPN_API)?, client_for(ALPN_PEER)?];
 
-        let mut endpoint = quinn::Endpoint::server(server_config, addr)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TransportError::Tls("no async runtime for the endpoint".into()))?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )?;
         let mut default_client = quinn::ClientConfig::new(client_tls[1].clone());
         default_client.transport_config(lane_transport[Lane::Control.index()].clone());
         endpoint.set_default_client_config(default_client);
