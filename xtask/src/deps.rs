@@ -73,6 +73,11 @@ const FEATURE_AUDIT: &[(&str, &[&str])] = &[("raft-engine", &[]), ("fjall", &["l
 const BOUNDARY_CONSTRUCTORS: &[(&str, &[&str])] = &[
     ("VerifierToken::for_boundary", &["coord-collector"]),
     ("PeerProvenance::from_transport", &["coord-transport"]),
+    // Evidence from a voter running in the same process never crosses a
+    // connection, so the transport cannot be the one to prove where it
+    // came from. The voter runtime is, and it is the only crate that
+    // holds a voter instance and its committed identity together.
+    ("PeerProvenance::from_local_voter", &["coord-daemon"]),
 ];
 
 /// Crates that must not appear anywhere in the resolved graph.

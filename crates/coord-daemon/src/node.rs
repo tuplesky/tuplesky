@@ -121,7 +121,8 @@ pub struct Outbound {
 }
 
 impl Outbound {
-    fn absorb(&mut self, other: Outbound) {
+    /// Fold another round's requests into this one, keeping order.
+    pub fn absorb(&mut self, other: Outbound) {
         self.peer.extend(other.peer);
         self.frontend.extend(other.frontend);
         self.arm.extend(other.arm);
