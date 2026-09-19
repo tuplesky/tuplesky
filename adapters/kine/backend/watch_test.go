@@ -173,12 +173,42 @@ func TestCompactionEndsCompactedWatchesExplicitly(t *testing.T) {
 	if !ok || !resp.Canceled || resp.Err() != rpctypes.ErrCompacted {
 		t.Fatalf("compacted start: ok=%v %+v err=%v", ok, resp, resp.Err())
 	}
+	// Let the cancelled substream finish tearing down before another one
+	// shares the stream. The etcd client dispatches to substreams by id
+	// and closes a cancelled one's channel asynchronously, so leaving a
+	// half-closed substream behind is how a later dispatch ends up
+	// sending on a closed channel.
+	drain(t, wch)
 	// A watch at the floor is fine.
 	fine := br.cli.Watch(ctx, key, clientv3.WithRev(4))
-	update(t, br.cli, key, "4", 4, 0) // 5
-	got := expectEvents(t, fine, 2)
+	got := func() []*clientv3.Event {
+		defer func() {
+			cancel()
+			drain(t, fine)
+		}()
+		update(t, br.cli, key, "4", 4, 0) // 5
+		return expectEvents(t, fine, 2)
+	}()
 	if got[0].Kv.ModRevision != 4 || got[1].Kv.ModRevision != 5 {
 		t.Fatalf("watch at floor %d %d", got[0].Kv.ModRevision, got[1].Kv.ModRevision)
+	}
+}
+
+// drain reads `wch` until the client closes it, so the substream is gone
+// before the test moves on. A watch left half-torn-down outlives the
+// test and races whatever closes the client.
+func drain(t *testing.T, wch clientv3.WatchChan) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case _, ok := <-wch:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("watch did not close")
+		}
 	}
 }
 
