@@ -102,6 +102,8 @@ pub enum ConfigError {
     Role(String),
     /// A role needs a listener the configuration does not provide.
     MissingListener(&'static str),
+    /// A named listener is not a usable socket address.
+    InvalidListener(&'static str),
     /// The local capability does not cover an active semantic limit.
     CapabilityTooSmall(&'static str),
     /// Application 0-RTT is enabled; it must be disabled.
@@ -157,14 +159,38 @@ impl Config {
             return Err(ConfigError::TestBypassEnabled);
         }
         let roles = self.role_set()?;
-        if roles.needs_peer_listener() && self.listen.peer_quic.is_none() {
-            return Err(ConfigError::MissingListener("peer_quic"));
+        // A required listener has to be usable, not merely present: an
+        // empty or unparseable address passed validation and then failed
+        // at bind, after the process had reported its configuration good.
+        let required = [
+            (
+                roles.needs_peer_listener(),
+                "peer_quic",
+                &self.listen.peer_quic,
+            ),
+            (
+                roles.needs_api_listener(),
+                "api_quic",
+                &self.listen.api_quic,
+            ),
+            (roles.needs_https(), "https", &self.listen.https),
+        ];
+        for (needed, name, value) in required {
+            if !needed {
+                continue;
+            }
+            let Some(address) = value.as_deref() else {
+                return Err(ConfigError::MissingListener(name));
+            };
+            if address.trim().is_empty() || address.parse::<std::net::SocketAddr>().is_err() {
+                return Err(ConfigError::InvalidListener(name));
+            }
         }
-        if roles.needs_api_listener() && self.listen.api_quic.is_none() {
-            return Err(ConfigError::MissingListener("api_quic"));
-        }
-        if roles.needs_https() && self.listen.https.is_none() {
-            return Err(ConfigError::MissingListener("https"));
+        // An optional listener that is configured must still be usable.
+        if let Some(address) = self.listen.admin_http.as_deref()
+            && (address.trim().is_empty() || address.parse::<std::net::SocketAddr>().is_err())
+        {
+            return Err(ConfigError::InvalidListener("admin_http"));
         }
         capability_covers(&self.capability, &self.limits)?;
         Ok(())

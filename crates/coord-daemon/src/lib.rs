@@ -30,12 +30,14 @@
 pub mod config;
 pub mod diagnostics;
 pub mod lifecycle;
+pub mod listen;
 pub mod role;
 pub mod supervise;
 
 pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
+pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use role::{Role, RoleSet};
 pub use supervise::{RestartBudget, Supervisor, WorkerError, WorkerId};
 

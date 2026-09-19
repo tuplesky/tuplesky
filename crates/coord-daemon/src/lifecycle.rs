@@ -32,6 +32,8 @@ pub enum QuarantineReason {
     Worker,
     /// Genesis did not match (digest mismatch or lost journal).
     Genesis,
+    /// A configured listener could not be bound.
+    Listeners,
 }
 
 /// What makes a role's readiness.
@@ -128,10 +130,16 @@ impl Lifecycle {
             return;
         }
         self.readiness = readiness;
+        // Live means the listeners are up but the process is not serving
+        // yet. Reporting it before they are up said the opposite of the
+        // truth: a process still opening storage and binding sockets
+        // looked further along than a process that had failed to bind.
         self.phase = if self.gate.ready(&readiness) {
             Phase::Ready
-        } else {
+        } else if readiness.listeners_up {
             Phase::Live
+        } else {
+            Phase::Starting
         };
     }
 
