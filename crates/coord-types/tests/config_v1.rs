@@ -553,7 +553,7 @@ fn configuration_frames_round_trip_exactly() {
     ];
     let mut reader = FrameReader::new();
     for f in &frames {
-        reader.push(f).unwrap();
+        reader.push(f).expect("within the reader bound");
     }
     let decoded: Vec<_> = std::iter::from_fn(|| reader.next_frame().unwrap()).collect();
     reader.finish().unwrap();
