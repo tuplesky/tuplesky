@@ -241,3 +241,69 @@ async fn the_upstream_leg_verifies_tokens_and_applies_the_azp_policy() {
     ));
     let _: BTreeMap<String, String> = BTreeMap::new();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_loopback_lookalike_host_is_not_loopback() {
+    // The insecure exemption was a string prefix, so any host beginning
+    // with the loopback text carried it: plaintext discovery against an
+    // attacker's server, with the broker's client identifier on it.
+    let http = hardened_http_client(Duration::from_secs(3)).unwrap();
+    for issuer in [
+        "http://127.0.0.1.evil.example",
+        "http://localhost.evil.example",
+        "http://127.0.0.1@evil.example",
+    ] {
+        let mut c = config(issuer);
+        c.allow_insecure_loopback = true;
+        assert!(
+            matches!(
+                Upstream::discover(c, &http).await.err(),
+                Some(UpstreamError::Config(_))
+            ),
+            "{issuer} is not loopback"
+        );
+    }
+    // Real loopback still discovers when the exemption is on.
+    let (_, issuer) = fake_idp().await;
+    assert!(Upstream::discover(config(&issuer), &http).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_upstream_document_is_refused_unread() {
+    // The provider decides the body; without a bound it decided our
+    // memory too.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let issuer = format!("http://{addr}");
+    let doc = issuer.clone();
+    let app = Router::new().route(
+        "/.well-known/openid-configuration",
+        get(move || {
+            let issuer = doc.clone();
+            async move {
+                // Valid metadata, followed by padding past the bound.
+                let mut body = json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "jwks_uri": format!("{issuer}/jwks"),
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["ES256"],
+                })
+                .to_string();
+                body.push_str(&" ".repeat(coord_login::MAX_UPSTREAM_BODY_BYTES));
+                ([("content-type", "application/json")], body)
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let http = hardened_http_client(Duration::from_secs(3)).unwrap();
+    assert_eq!(
+        Upstream::discover(config(&issuer), &http).await.err(),
+        Some(UpstreamError::Discovery),
+        "the document passed the bound and was refused"
+    );
+}

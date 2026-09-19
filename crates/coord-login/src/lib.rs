@@ -32,7 +32,10 @@ pub use service::{
     Approved, LoginError, LoginLimits, RedeemRequest, Redeemed, Registration, ServiceLogin,
     StartRequest, Started, UpstreamIdentity, azp_policy,
 };
-pub use upstream::{Upstream, UpstreamConfig, UpstreamError, hardened_http_client};
+pub use upstream::{
+    BoundedHttpClient, HttpError, MAX_UPSTREAM_BODY_BYTES, Upstream, UpstreamConfig, UpstreamError,
+    hardened_http_client,
+};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";

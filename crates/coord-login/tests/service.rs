@@ -465,3 +465,76 @@ fn one_code_creates_at_most_one_session() {
     );
     assert_eq!(sts.issued, 1);
 }
+
+#[test]
+fn a_parameterized_callback_keeps_its_own_query_and_a_denial_reaches_the_client() {
+    let mut l = ServiceLogin::new(
+        LoginLimits::default(),
+        vec![Registration {
+            client_id: "coordctl".into(),
+            // A client whose loopback callback already carries a
+            // parameter of its own.
+            redirect_uris: vec!["http://127.0.0.1:4100/callback?tab=7".into()],
+            upstream: "idp".into(),
+        }],
+        [("idp".to_string(), "broker-at-idp".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let mut request = start(1, "http://127.0.0.1:4100/callback?tab=7");
+    request.state = "st".into();
+    let started = l.start(NOW, &request, &[1; 32]).unwrap();
+    let approved = l
+        .approve(
+            NOW,
+            &started.upstream_state,
+            identity(&["broker-at-idp"], None),
+            IDP,
+            &[2; 32],
+        )
+        .unwrap();
+    // The client's own parameter survives, and the response is appended.
+    assert!(
+        approved
+            .redirect
+            .starts_with("http://127.0.0.1:4100/callback?tab=7&"),
+        "{}",
+        approved.redirect
+    );
+    assert!(approved.redirect.contains("code="));
+    assert!(approved.redirect.contains("state=st"));
+
+    // An upstream refusal reaches the waiting client rather than only
+    // the browser.
+    let started = l
+        .start(
+            NOW,
+            &start(2, "http://127.0.0.1:4100/callback?tab=7"),
+            &[3; 32],
+        )
+        .unwrap();
+    let redirect = l
+        .upstream_denied(&started.upstream_state, "consent_required")
+        .unwrap();
+    assert!(redirect.starts_with("http://127.0.0.1:4100/callback?tab=7&"));
+    assert!(redirect.contains("error=access_denied"));
+    assert!(redirect.contains("error_description=consent_required"));
+    assert!(redirect.contains("state=tab-2"));
+    assert_eq!(l.denied, 1);
+    // The state is spent: a second callback for it decides nothing.
+    assert!(
+        l.upstream_denied(&started.upstream_state, "consent_required")
+            .is_err()
+    );
+    assert!(
+        l.approve(
+            NOW,
+            &started.upstream_state,
+            identity(&["broker-at-idp"], None),
+            IDP,
+            &[4; 32]
+        )
+        .is_err(),
+        "a refused login cannot then be approved"
+    );
+}

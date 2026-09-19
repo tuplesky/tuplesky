@@ -252,6 +252,8 @@ pub struct ServiceLogin {
     pub approved: u64,
     /// Codes redeemed.
     pub redeemed: u64,
+    /// Logins the upstream refused.
+    pub denied: u64,
 }
 
 impl ServiceLogin {
@@ -276,6 +278,7 @@ impl ServiceLogin {
             started: 0,
             approved: 0,
             redeemed: 0,
+            denied: 0,
         }
     }
 
@@ -368,6 +371,46 @@ impl ServiceLogin {
         Ok((txn, t.upstream_verifier.clone(), t.upstream.clone()))
     }
 
+    /// The upstream leg refused the login carrying `upstream_state`:
+    /// end the transaction and give the client's redirect with the
+    /// error.
+    ///
+    /// Without this the broker answered the browser and said nothing to
+    /// the waiting client, which sat until its own timeout with no idea
+    /// the login had been refused.
+    pub fn upstream_denied(
+        &mut self,
+        upstream_state: &str,
+        error: &str,
+    ) -> Result<String, LoginError> {
+        let txn = *self
+            .by_upstream_state
+            .get(upstream_state)
+            .ok_or(LoginError::UnknownTransaction)?;
+        let t = self
+            .pending
+            .get(&txn)
+            .ok_or(LoginError::UnknownTransaction)?;
+        if t.stage != Stage::Started {
+            return Err(LoginError::UnknownTransaction);
+        }
+        // The error is the upstream's, so it is reported as a refusal
+        // and never as anything the client may retry against this state.
+        let redirect = redirect_with(
+            &t.redirect_uri,
+            &[
+                ("error", "access_denied"),
+                ("error_description", error),
+                ("state", &t.state),
+            ],
+        );
+        // The upstream state and the transaction are both spent.
+        self.by_upstream_state.remove(upstream_state);
+        self.pending.remove(&txn);
+        self.denied += 1;
+        Ok(redirect)
+    }
+
     /// The upstream nonce of the transaction a callback state names.
     pub fn upstream_nonce(&self, upstream_state: &str) -> Option<String> {
         let txn = self.by_upstream_state.get(upstream_state)?;
@@ -411,12 +454,7 @@ impl ServiceLogin {
         t.commitment = Some(commitment);
         t.approved_at = now;
         // The upstream state is single use.
-        let redirect = format!(
-            "{}?code={}&state={}",
-            t.redirect_uri,
-            code,
-            urlencode(&t.state)
-        );
+        let redirect = redirect_with(&t.redirect_uri, &[("code", &code), ("state", &t.state)]);
         self.by_upstream_state.remove(upstream_state);
         self.codes.insert(commitment, txn);
         self.approved += 1;
@@ -494,6 +532,23 @@ impl ServiceLogin {
         }
         expired.len()
     }
+}
+
+/// Append `params` to `uri` as query parameters, keeping any the
+/// registered redirect already carries. Formatting a bare `?` clobbered
+/// them, which breaks a client whose callback is parameterized and
+/// silently changes where the response is delivered.
+fn redirect_with(uri: &str, params: &[(&str, &str)]) -> String {
+    let mut out = String::from(uri);
+    let mut separator = if uri.contains('?') { '&' } else { '?' };
+    for (key, value) in params {
+        out.push(separator);
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&urlencode(value));
+        separator = '&';
+    }
+    out
 }
 
 fn urlencode(s: &str) -> String {

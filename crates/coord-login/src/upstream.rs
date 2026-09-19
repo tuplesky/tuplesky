@@ -12,8 +12,8 @@ use openidconnect::core::{
 };
 use openidconnect::{
     AuthorizationCode, ClientId, CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet,
-    IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
-    TokenResponse,
+    HttpRequest, HttpResponse, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, TokenResponse,
 };
 
 use crate::service::{LoginError, UpstreamIdentity, azp_policy};
@@ -88,16 +88,25 @@ impl Upstream {
         config: UpstreamConfig,
         http: &reqwest::Client,
     ) -> Result<Self, UpstreamError> {
-        if !config.issuer.starts_with("https://")
-            && !(config.allow_insecure_loopback
-                && (config.issuer.starts_with("http://127.0.0.1")
-                    || config.issuer.starts_with("http://localhost")))
-        {
-            return Err(UpstreamError::Config("issuer must be https".into()));
-        }
         let issuer = IssuerUrl::new(config.issuer.clone())
             .map_err(|e| UpstreamError::Config(e.to_string()))?;
-        let metadata = CoreProviderMetadata::discover_async(issuer.clone(), http)
+        // The scheme and host are decided by parsing, never by a prefix
+        // of the string: `http://127.0.0.1.evil.example` starts with the
+        // loopback prefix and is not loopback at all.
+        let parsed = issuer.url();
+        let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "::1" | "localhost"));
+        let permitted = match parsed.scheme() {
+            "https" => true,
+            "http" => config.allow_insecure_loopback && loopback,
+            _ => false,
+        };
+        if !permitted {
+            return Err(UpstreamError::Config("issuer must be https".into()));
+        }
+        // Every upstream read is bounded: the provider decides the body
+        // and a hostile or broken one must not decide our memory.
+        let bounded = BoundedHttpClient::with_default_bound(http);
+        let metadata = CoreProviderMetadata::discover_async(issuer.clone(), &bounded)
             .await
             .map_err(|_| UpstreamError::Discovery)?;
         if metadata.issuer() != &issuer {
@@ -150,7 +159,7 @@ impl Upstream {
             .exchange_code(AuthorizationCode::new(code))
             .map_err(|_| UpstreamError::Exchange)?
             .set_pkce_verifier(PkceCodeVerifier::new(verifier))
-            .request_async(http)
+            .request_async(&BoundedHttpClient::with_default_bound(http))
             .await
             .map_err(|_| UpstreamError::Exchange)?;
         let _ = response.access_token();
@@ -178,5 +187,102 @@ impl Upstream {
         };
         azp_policy(&identity, &self.config.client_id).map_err(UpstreamError::Policy)?;
         Ok(identity)
+    }
+}
+
+/// How much of an upstream response is read before it is refused.
+///
+/// Discovery documents and token responses are small; a provider that
+/// is hostile, compromised or simply broken is not, and the client used
+/// to read whatever it sent into memory.
+pub const MAX_UPSTREAM_BODY_BYTES: usize = 256 * 1024;
+
+/// A `reqwest` client that reads at most `max_body_bytes` of a response.
+pub struct BoundedHttpClient<'a> {
+    inner: &'a reqwest::Client,
+    max_body_bytes: usize,
+}
+
+impl<'a> BoundedHttpClient<'a> {
+    /// Wrap `inner`, reading at most `max_body_bytes` per response.
+    pub const fn new(inner: &'a reqwest::Client, max_body_bytes: usize) -> Self {
+        BoundedHttpClient {
+            inner,
+            max_body_bytes,
+        }
+    }
+
+    /// Wrap `inner` with the default bound.
+    pub const fn with_default_bound(inner: &'a reqwest::Client) -> Self {
+        Self::new(inner, MAX_UPSTREAM_BODY_BYTES)
+    }
+}
+
+/// Why an upstream request produced no usable response.
+#[derive(Debug)]
+pub enum HttpError {
+    /// The request could not be made or the response could not be read.
+    Transport,
+    /// The response body passed the bound and was refused unread.
+    TooLarge {
+        /// The bound it passed.
+        limit: usize,
+    },
+    /// The request or response could not be represented.
+    Malformed,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpError::Transport => write!(f, "upstream request failed"),
+            HttpError::TooLarge { limit } => {
+                write!(f, "upstream response exceeds {limit} bytes")
+            }
+            HttpError::Malformed => write!(f, "upstream exchange malformed"),
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl<'c> openidconnect::AsyncHttpClient<'c> for BoundedHttpClient<'_> {
+    type Error = HttpError;
+    type Future =
+        std::pin::Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + Send + 'c>>;
+
+    fn call(&'c self, request: HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            let (parts, body) = request.into_parts();
+            let url =
+                reqwest::Url::parse(&parts.uri.to_string()).map_err(|_| HttpError::Malformed)?;
+            let mut builder = self.inner.request(parts.method, url);
+            for (name, value) in parts.headers.iter() {
+                builder = builder.header(name, value);
+            }
+            let mut response = builder
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| HttpError::Transport)?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            // Read in chunks so an unbounded body is refused as it
+            // arrives rather than after it has been buffered.
+            let mut collected: Vec<u8> = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| HttpError::Transport)? {
+                if collected.len() + chunk.len() > self.max_body_bytes {
+                    return Err(HttpError::TooLarge {
+                        limit: self.max_body_bytes,
+                    });
+                }
+                collected.extend_from_slice(&chunk);
+            }
+            let mut out = openidconnect::http::Response::builder().status(status);
+            for (name, value) in headers.iter() {
+                out = out.header(name, value);
+            }
+            out.body(collected).map_err(|_| HttpError::Malformed)
+        })
     }
 }
