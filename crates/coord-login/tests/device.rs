@@ -158,6 +158,12 @@ fn device_grants_are_bounded_single_use_and_approved_only_through_the_browser() 
         d.deny(NOW + 62, &a.user_code),
         Err(DeviceError::AlreadyDecided)
     );
+    d.publish_browser(NOW + 64, commitment).unwrap();
+    assert_eq!(
+        d.publish_browser(NOW + 65, commitment),
+        Err(DeviceError::UnknownTransaction),
+        "publication happens once"
+    );
     // Concurrent pollers: the first takes the grant, the second finds it
     // spent.
     match d.poll(NOW + 70, &a.device_code) {
@@ -194,4 +200,43 @@ fn device_grants_are_bounded_single_use_and_approved_only_through_the_browser() 
     assert_eq!(last, Poll::Expired, "polls are bounded");
     assert_eq!(d.pending(), 0);
     assert_eq!(d.issued, 4);
+}
+
+#[test]
+fn a_verified_login_is_published_only_once_its_grant_is_committed() {
+    // The browser leg used to publish approval before the grant was
+    // ordered, so a commit that failed still left a device able to
+    // redeem a session for a grant replicated state never accepted.
+    let mut d = device(DeviceLimits::default());
+    let a = d.authorize(NOW, "coordctl", &entropy(1)).unwrap();
+    let started = d.begin_browser(NOW, &a.user_code, &entropy(2)).unwrap();
+    let commitment = d
+        .complete_browser(NOW + 1, &started.upstream_state, identity(), IDP)
+        .unwrap();
+    // Verified, not approved: the device keeps waiting.
+    assert_eq!(d.poll(NOW + 2, &a.device_code), Ok(Poll::Pending));
+    assert_eq!(d.poll(NOW + 12, &a.device_code), Ok(Poll::Pending));
+    // Once committed, the next poll takes it.
+    d.publish_browser(NOW + 13, commitment).unwrap();
+    assert!(matches!(
+        d.poll(NOW + 23, &a.device_code),
+        Ok(Poll::Approved(_))
+    ));
+}
+
+#[test]
+fn an_upstream_refusal_answers_the_waiting_device() {
+    // The callback answered the browser and recorded nothing, so the
+    // device polled a grant that would never be decided until its code
+    // ran out.
+    let mut d = device(DeviceLimits::default());
+    let a = d.authorize(NOW, "coordctl", &entropy(1)).unwrap();
+    let started = d.begin_browser(NOW, &a.user_code, &entropy(2)).unwrap();
+    d.deny_upstream(NOW + 1, &started.upstream_state).unwrap();
+    assert_eq!(d.poll(NOW + 2, &a.device_code), Ok(Poll::Denied));
+    // The upstream state is spent either way.
+    assert_eq!(
+        d.deny_upstream(NOW + 3, &started.upstream_state),
+        Err(DeviceError::UnknownTransaction)
+    );
 }

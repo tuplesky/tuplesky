@@ -93,6 +93,7 @@ pub fn router(state: Arc<LoginState>) -> Router {
         .route("/login/redeem", post(redeem))
         .route("/device/authorize", post(device_authorize))
         .route("/device/verify", get(device_verify))
+        .route("/device/approve", post(device_approve))
         .route("/device/callback", get(device_callback))
         .route("/device/deny", post(device_deny))
         .route("/device/token", post(device_token))
@@ -389,9 +390,38 @@ struct UserCodeQuery {
     user_code: String,
 }
 
+/// Show what is being approved, and only then offer to proceed.
+///
+/// Redirecting upstream straight away asked the user to authenticate
+/// for a grant they had not been shown: they could not tell which
+/// client, or which cluster, their approval was for.
 async fn device_verify(
     State(state): State<Arc<LoginState>>,
     Query(q): Query<UserCodeQuery>,
+) -> Response {
+    let clock = state.clock.read();
+    let display = match state.device.lock().await.lookup(clock.now, &q.user_code) {
+        Ok(d) => d,
+        Err(e) => return device_error(&e),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "user_code": q.user_code,
+            "client_id": display.client_id,
+            "cluster": display.cluster,
+            "expires_in": display.expires_in,
+            "approve": "/device/approve",
+            "deny": "/device/deny",
+        })),
+    )
+        .into_response()
+}
+
+/// The user confirmed the grant they were shown: begin the upstream leg.
+async fn device_approve(
+    State(state): State<Arc<LoginState>>,
+    Form(q): Form<UserCodeQuery>,
 ) -> Response {
     let clock = state.clock.read();
     let entropy = state.entropy.fill();
@@ -411,11 +441,21 @@ async fn device_verify(
             "upstream",
         );
     };
-    redirect(&upstream.authorize_url(
+    // The device leg has its own callback: the browser must come back
+    // to an endpoint that knows about this grant.
+    match upstream.authorize_url_to(
+        Some(&upstream.config().device_redirect_uri),
         &started.upstream_state,
         &started.upstream_nonce,
         started.upstream_challenge,
-    ))
+    ) {
+        Ok(url) => redirect(&url),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "upstream",
+        ),
+    }
 }
 
 async fn device_callback(
@@ -430,6 +470,10 @@ async fn device_callback(
         );
     };
     let Some(code) = q.code else {
+        // The device is polling: record the refusal on the grant so the
+        // poll is answered, rather than leaving it to wait the code out.
+        let clock = state.clock.read();
+        let _ = state.device.lock().await.deny_upstream(clock.now, &q.state);
         return error(StatusCode::BAD_REQUEST, "access_denied", "upstream denied");
     };
     let clock = state.clock.read();
@@ -487,7 +531,19 @@ async fn device_callback(
         });
     match committed {
         Ok(r) if r.outcome == Outcome::GrantCommitted => {
-            (StatusCode::OK, Json(json!({ "approved": true }))).into_response()
+            // Only now is the approval published: until the grant is
+            // ordered there is nothing for a poll to redeem, and
+            // publishing first handed out a session for a grant
+            // replicated state had not accepted.
+            match state
+                .device
+                .lock()
+                .await
+                .publish_browser(clock.now, commitment)
+            {
+                Ok(()) => (StatusCode::OK, Json(json!({ "approved": true }))).into_response(),
+                Err(e) => device_error(&e),
+            }
         }
         _ => error(
             StatusCode::SERVICE_UNAVAILABLE,
