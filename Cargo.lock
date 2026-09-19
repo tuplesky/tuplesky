@@ -1075,8 +1075,14 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "coord-daemon",
+ "coord-membership",
+ "coord-node-issuer",
  "coord-storage-redb",
  "coord-types",
+ "rcgen",
+ "rustls-pki-types",
+ "serde_json",
+ "x509-parser",
 ]
 
 [[package]]

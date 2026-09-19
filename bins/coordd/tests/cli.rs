@@ -27,9 +27,124 @@ fn workspace(name: &str) -> PathBuf {
     path
 }
 
+const CLUSTER: [u8; 16] = [0x11; 16];
+const DOMAIN: [u8; 16] = [0x22; 16];
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn b64url(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+fn pem(label: &str, der: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut body = String::new();
+    for chunk in der.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                body.push(A[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+            } else {
+                body.push('=');
+            }
+        }
+    }
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for line in body.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ascii"));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
+}
+
+/// The genesis manifest this domain agrees on: three voters, of which
+/// the first is the node under test.
+fn genesis(dir: &Path) {
+    let voters: Vec<serde_json::Value> = (1u8..=3)
+        .map(|n| {
+            serde_json::json!({
+                "node": hex(&[n; 16]),
+                "incarnation": 1,
+                "public_key": b64url(&[n; 32]),
+            })
+        })
+        .collect();
+    let manifest = serde_json::json!({
+        "cluster": hex(&CLUSTER),
+        "domain": hex(&DOMAIN),
+        "epoch": 1,
+        "voters": voters,
+        "issuer_roots": [b64url(&[0xca; 8])],
+        "wif_rules": [{ "issuer": "test" }],
+        "admin": hex(&[0xa; 16]),
+        "protocol_version": 1,
+    });
+    std::fs::write(
+        dir.join("genesis.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest"),
+    )
+    .expect("write manifest");
+}
+
+/// This node's credentials: a certificate carrying the node-identity URI
+/// SAN the issuer binds, because that -- not a setting -- is what says
+/// which replica a process is.
+fn credentials(dir: &Path, replica: u8, role: coord_types::wire_v1::PeerRole) {
+    let identity = coord_node_issuer::NodeIdentity {
+        cluster: coord_types::ids::ClusterId(CLUSTER),
+        node: coord_types::ids::ReplicaId([replica; 16]),
+        incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+        role,
+    };
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.subject_alt_names = vec![rcgen::SanType::URI(
+        coord_node_issuer::node_uri(&identity)
+            .try_into()
+            .expect("uri"),
+    )];
+    let certificate = params.self_signed(&key).expect("self-signed");
+
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", certificate.der())).expect("cert");
+    std::fs::write(dir.join("roots.pem"), pem("CERTIFICATE", certificate.der())).expect("roots");
+    let key_path = dir.join("node.key");
+    std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).expect("key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+}
+
 /// A configuration whose listeners are ephemeral loopback ports, so the
 /// test never depends on a fixed port or on IPv6 being available.
 fn config(dir: &Path) -> PathBuf {
+    genesis(dir);
+    credentials(dir, 1, coord_types::wire_v1::PeerRole::Voter);
     let text = format!(
         r#"config_version = 2
 role = "voter-frontend-observer"
@@ -216,5 +331,117 @@ fn checking_a_configuration_touches_nothing() {
         !checked.out.contains("listening"),
         "--check bound a listener: {}",
         checked.out
+    );
+}
+
+/// A node's identity comes from its own certificate, not from a setting,
+/// and the committed configuration decides whether that identity may
+/// vote.
+///
+/// A node that could be told who it was could be told it was somebody
+/// else: two processes configured with the same replica identity would
+/// each open that replica's store, each vote under it, and between them
+/// break the one thing a replica promises. A certificate cannot be
+/// handed round that way, because the peers that matter check it.
+#[test]
+fn a_node_that_is_not_a_committed_voter_does_not_vote() {
+    let dir = workspace("stranger");
+    let path = config(&dir);
+
+    // The configured role votes, and the certificate names a replica the
+    // genesis does name: this is the node it claims to be.
+    assert_eq!(run(&path, &["--check"]).code, Some(0));
+
+    // Re-issued for a replica the committed configuration does not name.
+    credentials(&dir, 9, coord_types::wire_v1::PeerRole::Voter);
+    let refused = run(&path, &["--check"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("does not name"),
+        "the refusal did not say why: {}",
+        refused.err
+    );
+
+    // A process that does not vote needs only to be of this cluster, so
+    // the same certificate serves an observer.
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace(
+            "role = \"voter-frontend-observer\"",
+            "role = \"frontend-observer\"",
+        ),
+    )
+    .expect("write");
+    let observer = run(&path, &["--check"]);
+    assert_eq!(observer.code, Some(0), "{}{}", observer.out, observer.err);
+}
+
+/// A certificate that says nothing about which replica it is, is not an
+/// identity. The refusal happens before the store is opened, because a
+/// process that got that far would already have taken a replica's store
+/// under a name nothing vouched for.
+#[test]
+fn a_certificate_without_a_node_identity_is_not_an_identity() {
+    let dir = workspace("anonymous");
+    let path = config(&dir);
+
+    // A perfectly good certificate that simply carries no node URI.
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+    let mut params = rcgen::CertificateParams::new(vec!["node.local".to_string()]).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let anonymous = params.self_signed(&key).expect("self-signed");
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", anonymous.der())).expect("cert");
+
+    let refused = run(&path, &["--check"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("no node identity"),
+        "the refusal did not say what was missing: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a node with no identity opened a store"
+    );
+}
+
+/// A certificate of another cluster is refused here, not only at the
+/// first handshake: a node that got past this would open this domain's
+/// store under its own identity before any peer ever saw its
+/// certificate.
+#[test]
+fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
+    let dir = workspace("foreign");
+    let path = config(&dir);
+
+    // Same node identity shape, different cluster.
+    let identity = coord_node_issuer::NodeIdentity {
+        cluster: coord_types::ids::ClusterId([0x77; 16]),
+        node: coord_types::ids::ReplicaId([1; 16]),
+        incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+        role: coord_types::wire_v1::PeerRole::Voter,
+    };
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.subject_alt_names = vec![rcgen::SanType::URI(
+        coord_node_issuer::node_uri(&identity)
+            .try_into()
+            .expect("uri"),
+    )];
+    let foreign = params.self_signed(&key).expect("self-signed");
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", foreign.der())).expect("cert");
+
+    let refused = run(&path, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("another cluster"),
+        "the refusal did not name the mismatch: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists(),
+        "a foreign node initialized this domain's store"
     );
 }
