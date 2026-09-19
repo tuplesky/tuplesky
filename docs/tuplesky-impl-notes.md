@@ -145,3 +145,40 @@ the byte difference is named.
   fetch; the bans, licences, sources and role/isolation checks all still
   run. Use `cargo xtask check-deps --offline` to reproduce what the gate
   does.
+
+## Evidence is a send, and takes the durability gate with the rest
+
+**Where:** `coord-daemon/src/node.rs` (`Node::one_round`),
+`coord_collector::frontend_frame`.
+
+**Expected:** the daemon's node driver could route a voter's effects the
+way the existing composition test does: anything `frontend_frame` claims
+goes to the collector, everything else to the peer plane through the
+outbox.
+
+**Actually:** `frontend_frame` claims two different things. A
+`Released` result is the leader's release-gate output and rests on no
+barrier of its own -- the release rule has already decided it may be
+disclosed. Evidence is an `Effect::SendWhenDurable` addressed to the
+frontend, and it is a *vote*: "I have this and I will not forget it".
+Routing both the same way publishes the vote before the record behind it
+is durable, which is the one promise a replica may never break. The
+machines happen to gate most sends themselves, which is why the hole is
+invisible in a protocol test; the follower's evidence is the case where
+they do not, and it is described in the same round as its own batch.
+
+**Did:** every `SendWhenDurable` goes through the outbox, the frontend's
+included, and becomes an evidence frame only when that send is released.
+Only `Released` is published immediately.
+
+The negative control needed care. Reverting the fix still passed a test
+that asserted "some send was held", because the same round holds two
+peer sends. `Node::held_at_least_once` therefore counts evidence
+separately, which is also the count an operator wants: a voter whose
+disk is slow holds its votes, and from the collector's side that is
+indistinguishable from a voter that is partitioned or gone.
+
+**Revisit when:** a second kind of effect is addressed to the collector.
+The rule to keep is the distinction, not the list: an effect that names
+barriers is gated on them wherever it is addressed, and an effect that
+names none has already been gated somewhere else.
