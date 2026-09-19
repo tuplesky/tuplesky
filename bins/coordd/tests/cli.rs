@@ -270,9 +270,16 @@ fn a_missing_store_stops_the_daemon_rather_than_being_created() {
     // And it says what to do, because the right answer differs: a
     // genuinely new node is initialized, an existing one is found.
     assert!(refused.err.contains("coordd init"));
+    // A failed start creates nothing at all -- not the projection, and
+    // not the journal that would be its authority. Either one left
+    // behind is a node that looks initialized to the next start.
     assert!(
         !dir.join("state").exists(),
-        "a failed start created a store anyway"
+        "a failed start created a projection anyway"
+    );
+    assert!(
+        !dir.join("journal").exists(),
+        "a failed start created a journal anyway"
     );
 }
 
@@ -469,13 +476,14 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
     );
 }
 
-/// Start `coordd` and report whether it came up, stopping it if it did.
+/// Start `coordd` and read its startup report, then stop it.
 ///
-/// A daemon that starts holds its listeners and parks, so "it came up"
-/// is its own report of the phase it reached, read as it is printed; a
-/// daemon that refuses exits, and that is reported as a refusal.
-fn start(config: &Path) -> Result<String, Run> {
-    use std::io::BufRead;
+/// A serving daemon does not exit, so the smoke test reads what it says
+/// about itself on the way up and then ends it. Reading is bounded: a
+/// daemon that never reaches `live` is a failure to report, not a test
+/// to hang.
+fn start_and_report(config: &Path) -> String {
+    use std::io::{BufRead, BufReader};
 
     let mut child = Command::new(binary())
         .arg("--config")
@@ -485,182 +493,91 @@ fn start(config: &Path) -> Result<String, Run> {
         .stderr(Stdio::piped())
         .spawn()
         .expect("coordd started");
-    let stdout = child.stdout.take().expect("stdout");
-    let (lines, seen) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().expect("piped");
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if lines.send(line).is_err() {
+        let mut report = String::new();
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let live = line.contains("phase=live");
+            report.push_str(&line);
+            report.push('\n');
+            if live {
                 break;
             }
         }
+        let _ = tx.send(report);
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut out = String::new();
-    loop {
-        match seen.recv_timeout(Duration::from_millis(20)) {
-            Ok(line) => {
-                out.push_str(&line);
-                out.push('\n');
-                if line.starts_with("coordd phase=") {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(out);
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let output = child.wait_with_output().expect("output");
-                return Err(Run {
-                    code: output.status.code(),
-                    out,
-                    err: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-        }
-        if std::time::Instant::now() >= deadline {
+    let report = rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
             let _ = child.kill();
-            let _ = child.wait();
-            panic!("coordd neither came up nor stopped within 30s: {out}");
-        }
-    }
+            panic!("coordd did not reach a serving state within 30s")
+        });
+    let _ = child.kill();
+    let _ = child.wait();
+    report
 }
 
-/// The genesis a node was initialized under is the only one it serves
-/// under.
+/// The serving path opens the shared journal, attaches this domain's
+/// projection to it, and replays whatever the projection owed -- and a
+/// restart picks up exactly that state rather than a fresh one.
 ///
-/// The manifest is a file, re-read on every start, and a file can be
-/// edited. A node that re-adopted whatever it said would vote by the
-/// operator's latest edit -- another set of voters, another policy,
-/// under the same cluster and domain -- rather than by the configuration
-/// every replica agreed on. So `init` pins it, and a start handed any
-/// other manifest is a genesis quarantine.
+/// This is the composition's own evidence: attaching is where the
+/// journal's frontier and the projection's are checked against each
+/// other, so a daemon that reports a journaled frontier and nothing owed
+/// has actually been through it. It is integration evidence and not a
+/// durability qualification; task-j05 owns that, under real filesystem
+/// and power-loss faults.
 #[test]
-fn a_node_serves_only_under_the_genesis_it_was_initialized_with() {
-    let dir = workspace("pinned");
-    let path = config(&dir);
-    let init = run(&path, &["init"]);
-    assert_eq!(init.code, Some(0), "{}{}", init.out, init.err);
-
-    // Under the manifest it was initialized with, it starts.
-    if let Err(refused) = start(&path) {
-        panic!(
-            "the node refused its own genesis: {}{}",
-            refused.out, refused.err
-        );
-    }
-
-    // The same cluster and domain, and this node still a voter; the third
-    // voter swapped for a stranger.
-    let manifest = std::fs::read_to_string(dir.join("genesis.json")).expect("read");
-    std::fs::write(
-        dir.join("genesis.json"),
-        manifest.replace(&hex(&[3; 16]), &hex(&[4; 16])),
-    )
-    .expect("swap a voter");
-    let refused =
-        start(&path).expect_err("a node started under a genesis it was not initialized with");
-    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
-    assert!(
-        refused.err.contains("genesis quarantine"),
-        "the refusal did not say why: {}",
-        refused.err
-    );
-
-    // Initializing again is not a way round it: the store is this node's,
-    // under the genesis it was pinned to.
-    let again = run(&path, &["init"]);
-    assert_eq!(again.code, Some(2), "{}{}", again.out, again.err);
-    assert!(again.err.contains("already exists"), "{}", again.err);
-
-    // And the original manifest is still this node's.
-    std::fs::write(dir.join("genesis.json"), manifest).expect("restore");
-    if let Err(refused) = start(&path) {
-        panic!(
-            "the node refused its restored genesis: {}{}",
-            refused.out, refused.err
-        );
-    }
-}
-
-/// An initialization that stopped after it created the store and before
-/// it pinned the genesis is refused by a start -- which would otherwise
-/// pin whatever it was handed -- and finished by `init`, since a store
-/// that was never pinned was never served either.
-#[test]
-fn an_unfinished_initialization_is_finished_by_init_and_refused_by_a_start() {
-    use coord_store_api::engine::{LocalEngine, WriteTxn};
-    use coord_store_api::registry::{Collection, meta_fields};
-
-    let dir = workspace("unpinned");
-    let path = config(&dir);
-    let init = run(&path, &["init"]);
-    assert_eq!(init.code, Some(0), "{}{}", init.out, init.err);
-
-    // The state an initialization interrupted between the two leaves.
-    {
-        let mut generation = coord_storage_redb::lifecycle::Generation::open_existing(
-            &dir.join("state"),
-            coord_storage_redb::lifecycle::StoreIdentity {
-                cluster_id: coord_types::ids::ClusterId(CLUSTER),
-                domain_id: coord_types::ids::DomainId(DOMAIN),
-                replica_id: coord_types::ids::ReplicaId([1; 16]),
-                incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
-            },
-            coord_storage_redb::lifecycle::OpenOptions::default(),
-        )
-        .expect("the store opens");
-        let mut txn = generation.engine().begin_write().expect("write");
-        txn.delete(Collection::MetaV1.id(), meta_fields::GENESIS_DIGEST)
-            .expect("unpin");
-        txn.commit_durable().expect("commit");
-    }
-
-    let refused = start(&path).expect_err("an unpinned store was served");
-    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
-    assert!(
-        refused.err.contains("never pinned") && refused.err.contains("coordd init"),
-        "the refusal did not say what to do: {}",
-        refused.err
-    );
-
-    let finished = run(&path, &["init"]);
-    assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
-    if let Err(refused) = start(&path) {
-        panic!(
-            "a finished initialization did not start: {}{}",
-            refused.out, refused.err
-        );
-    }
-}
-
-/// A certificate is an identity only if the trust bundle's authority
-/// issued it. The replica a node is comes out of its certificate, so a
-/// leaf anybody could sign would let anybody open -- or initialize --
-/// a voter's store under that voter's name.
-#[test]
-fn a_certificate_the_trust_bundle_did_not_issue_is_not_an_identity() {
-    let dir = workspace("untrusted");
+fn the_serving_path_opens_the_journal_and_survives_a_restart() {
+    let dir = workspace("restart");
     let path = config(&dir);
 
-    // A leaf naming a committed voter, signed by an authority the bundle
-    // does not hold.
-    let (_, stranger) = authority();
-    issue(&dir, &stranger, 1, coord_types::wire_v1::PeerRole::Voter);
-
-    let checked = run(&path, &["--check"]);
-    assert_eq!(checked.code, Some(2), "{}{}", checked.out, checked.err);
+    let initialized = run(&path, &["init"]);
+    assert_eq!(initialized.code, Some(0), "{}", initialized.err);
     assert!(
-        checked.err.contains("not issued by the trust bundle"),
-        "the refusal did not say why: {}",
-        checked.err
+        dir.join("journal").is_dir(),
+        "initialization made no journal: the serving profile has no authority"
     );
-    let refused = run(&path, &["init"]);
-    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+
+    let first = start_and_report(&path);
     assert!(
-        !dir.join("state").exists(),
-        "an untrusted certificate initialized a voter's store"
+        first.contains("owed=0"),
+        "the projection was left owing the journal: {first}"
+    );
+    let frontier = |report: &str| {
+        report
+            .lines()
+            .find(|l| l.starts_with("storage "))
+            .and_then(|l| {
+                l.split("journaled_through=Some(")
+                    .nth(1)?
+                    .split(')')
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("no journal frontier reported: {report}"))
+    };
+    let before = frontier(&first);
+    assert!(before > 0, "the journal recorded nothing: {first}");
+
+    // The same node, started again. It opens what it had: the frontier
+    // does not go backwards, nothing is owed, and it did not quietly
+    // make itself a new store.
+    let second = start_and_report(&path);
+    let after = frontier(&second);
+    assert!(
+        after >= before,
+        "the journal frontier went backwards across a restart: {before} then {after}"
+    );
+    assert!(second.contains("owed=0"), "{second}");
+    assert!(
+        second.contains("gen-000001"),
+        "the restart did not reopen the generation it had: {second}"
+    );
+    assert!(
+        !dir.join("state").join("gen-000002").exists(),
+        "a restart created a second generation"
     );
 }

@@ -1074,9 +1074,13 @@ name = "coordd"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "coord-core",
  "coord-daemon",
+ "coord-journal-api",
+ "coord-journal-raft-engine",
  "coord-membership",
  "coord-node-issuer",
+ "coord-storage",
  "coord-storage-redb",
  "coord-store-api",
  "coord-types",
