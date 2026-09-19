@@ -329,3 +329,41 @@ fixture commits to the real key, and a separate case holds the refusal.
 node runs. The check is at startup because that is where the answer is
 knowable and cheap; a rotation that outlives the process is the
 membership handoff's business (task-57), not this.
+
+## The peer loop's open question: how a co-located voter receives a submission
+
+**Where:** `coord-daemon/src/fanout.rs`, `bins/coordd/src/serve.rs`.
+Not yet implemented; recorded so the decision is made deliberately.
+
+A frontend fans a submission out to every committed voter. In the
+reference preview the frontend and a voter are the same process, so one
+of those targets is this node itself, and there are two ways to reach
+it:
+
+* **Over the wire.** The process dials its own peer listener. Its own
+  certificate is a current committed voter, so the binder admits it, and
+  nothing else in the stack needs to know. It costs a connection, a
+  handshake and a copy of every submission, and it makes a node's
+  ability to vote depend on its own network stack.
+* **Locally.** `dispatch` recognises this node's replica and hands the
+  submission to the local `Node` as `Event::Admitted`, skipping the
+  wire.
+
+The design anticipates the co-location (Section 6: "Never count an
+identity twice, including when frontend and voter are colocated") and
+requires that "role readiness and budgets remain separate even when
+colocated" (Section 22). Neither settles the delivery path. What they do
+settle is the safety property either way: evidence is counted by voter
+identity, so a submission that reached a voter twice -- once locally and
+once over the wire -- still yields one vote.
+
+Local delivery looks right and is what the second sentence of Section 6
+implies is normal. It is written here rather than done because it
+changes what `Dispatched` reports (a target that was reached without
+being sent to) and because "the frontend can vote for itself without a
+network" is the kind of shortcut that should be a decision rather than
+an implementation detail someone finds later.
+
+**Revisit when:** the peer loop is built. Whichever is chosen, the test
+that matters is that one submission yields one vote from this node,
+under both paths, with the budgets separate.
