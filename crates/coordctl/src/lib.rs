@@ -27,8 +27,8 @@ pub mod store;
 pub use client::{BrokerClient, CliError, DeviceStart, PollOutcome, TokenResponse};
 pub use credentials::Credentials;
 pub use store::{
-    CredentialStore, KeyringStore, MemoryStore, StoreError, StoreKind, UpdateLock, open_store,
-    update,
+    CredentialStore, KeyringStore, MemoryStore, StoreError, StoreKind, UpdateGuard, UpdateLock,
+    begin_update, open_store, update,
 };
 
 /// Crate role marker used by the dependency-policy check.

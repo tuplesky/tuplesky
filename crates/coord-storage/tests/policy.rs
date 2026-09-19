@@ -72,6 +72,7 @@ fn receipt(id: u8, session: SessionId) -> AdmissionReceiptV1 {
         scope_ceiling: Action::FULL_CEILING,
         trust_rule: RULE,
         rule_generation: 1,
+        expires_at: u64::MAX,
     }
 }
 

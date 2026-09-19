@@ -42,6 +42,8 @@ pub fn bootstrap_session(
                 active,
                 window,
                 receipt_id: Digest32([0; 32]),
+                // A bootstrapped test session has no admission to end.
+                expires_at: u64::MAX,
             })?),
         },
     ])

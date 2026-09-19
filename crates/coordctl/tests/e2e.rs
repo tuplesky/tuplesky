@@ -218,6 +218,7 @@ async fn broker(issuer: &str) -> String {
             issuer: issuer.into(),
             client_id: "broker".into(),
             redirect_uri: "http://127.0.0.1:1/unused".into(),
+            device_redirect_uri: "http://127.0.0.1:1/unused-device".into(),
             allow_insecure_loopback: true,
         },
         &http,
@@ -329,6 +330,8 @@ async fn device_login_refresh_reuse_and_logout_through_the_cli() {
     // takes the grant.
     let start = client.device_authorize().await.unwrap();
     assert!(!format!("{start:?}").contains(&start.device_code));
+    // The user is shown what they are approving before anything is sent
+    // upstream: the client and the cluster, for this user code.
     let verify = browser
         .get(format!(
             "{broker_url}/device/verify?user_code={}",
@@ -337,9 +340,28 @@ async fn device_login_refresh_reuse_and_logout_through_the_cli() {
         .send()
         .await
         .unwrap();
-    assert_eq!(verify.status(), 302);
-    let to_idp = verify.headers()["location"].to_str().unwrap().to_string();
+    assert_eq!(verify.status(), 200);
+    let shown: serde_json::Value = verify.json().await.unwrap();
+    assert_eq!(shown["client_id"], "coordctl");
+    assert!(shown["cluster"].is_string());
+    assert!(shown["expires_in"].as_u64().unwrap() > 0);
+    // Only on confirmation does the upstream leg begin.
+    let approve = browser
+        .post(format!("{broker_url}/device/approve"))
+        .form(&[("user_code", start.user_code.clone())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), 302);
+    let to_idp = approve.headers()["location"].to_str().unwrap().to_string();
     assert!(to_idp.starts_with(&format!("{issuer}/authorize")));
+    // The device leg asks the upstream to come back to the device
+    // callback, not to the browser leg's.
+    assert_eq!(
+        query(&to_idp, "redirect_uri").as_deref(),
+        Some("http%3A%2F%2F127.0.0.1%3A1%2Funused-device"),
+        "{to_idp}"
+    );
     let state = query(&to_idp, "state").unwrap();
     *idp.nonce.lock().unwrap() = query(&to_idp, "nonce");
     let approved = browser
@@ -527,6 +549,7 @@ async fn broker_with_redirect(issuer: &str, redirect: &str) -> String {
             issuer: issuer.into(),
             client_id: "broker".into(),
             redirect_uri: "http://127.0.0.1:1/unused".into(),
+            device_redirect_uri: "http://127.0.0.1:1/unused-device".into(),
             allow_insecure_loopback: true,
         },
         &http,
