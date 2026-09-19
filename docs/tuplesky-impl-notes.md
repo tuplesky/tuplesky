@@ -241,3 +241,30 @@ an untested claim.
 **Revisit when:** task-j05 qualifies this under real filesystem and
 power-loss faults, which is where the composition's durability claims
 are actually established. This is integration evidence and not that.
+
+## The packet simulator is sensitive to machine load, not to its input
+
+**Where:** `coord-transport-sim/tests/packets.rs`,
+`loss_reorder_duplication_and_mtu_schedules_reproduce_and_keep_the_visible_outcome`
+(task-32).
+
+**Expected:** a deterministic packet-level simulation reproduces, so it
+either passes or fails on its input.
+
+**Actually:** it failed 3 times in about 8 full-workspace `nextest` runs
+while a `cargo xtask ci` build was running concurrently, and passed 6/6
+in isolation and 4/4 on an otherwise idle machine. The schedule is
+deterministic; the surrounding quinn endpoints are not, because they use
+real timers, and under enough concurrent CPU load a handshake or
+idle deadline elapses before the scheduled packets get there.
+
+**Did:** characterised it and left the test alone. It is not skipped,
+disabled or quarantined: it is a real test of real code and it passes
+when the machine is not saturated.
+
+**Revisit when:** it fails on CI. The fix is to give that test's
+endpoints deadlines proportional to the simulated schedule rather than
+to wall-clock defaults, so a slow machine slows the test instead of
+failing it. Re-running it is not the fix, and neither is a retry
+annotation: both hide the case where the sensitivity is a real
+regression in the transport's own timing.
