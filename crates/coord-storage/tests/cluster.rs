@@ -111,6 +111,7 @@ struct Node {
     applier: Applier<StoreWorker<ModelEngine>>,
     inbox: VecDeque<(ReplicaId, Vec<u8>)>,
     established: Vec<EstablishedResult>,
+    released: Vec<coord_core::capability::ReleasedResult>,
     executed: Vec<CommandId>,
 }
 
@@ -191,6 +192,7 @@ fn node(n: u8, me: u8) -> Node {
         applier,
         inbox: VecDeque::new(),
         established: Vec::new(),
+        released: Vec::new(),
         executed: Vec::new(),
     };
     node.machine.step(Event::Boot {
@@ -261,6 +263,15 @@ impl Cluster {
                     self.nodes[dest].inbox.push_back((from, frame));
                 }
                 Effect::Established(result) => self.nodes[i].established.push(result),
+                // The leader's final-path release: a command that was
+                // never speculated is disclosed once, after it has
+                // executed and become durable. These tests drive no
+                // speculation companion, so every release here is that
+                // one, and it is the leader's alone.
+                Effect::Released(released) => {
+                    assert!(!released.speculative());
+                    self.nodes[i].released.push(released);
+                }
                 other => panic!("unexpected effect {other:?}"),
             }
         }

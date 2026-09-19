@@ -49,6 +49,16 @@ pub struct AppliedOutcome {
     pub revision: Option<KvRevision>,
     /// Digest of the exact result.
     pub result_digest: Digest32,
+    /// The exact encoded result.
+    ///
+    /// The digest seals it; this is the bytes themselves, which the
+    /// leader needs to release a result that was never speculated. A
+    /// command the speculation companion declined -- one that is not
+    /// speculable, one over the overlay's budget, one whose view could
+    /// not be built -- has no tentative outcome to release, and without
+    /// this its caller would wait on a disclosure that could never be
+    /// assembled.
+    pub response: Vec<u8>,
 }
 
 /// Why an application outcome could not be established.

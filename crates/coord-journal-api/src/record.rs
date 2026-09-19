@@ -312,10 +312,12 @@ fn digest_of(
     ])
 }
 
-fn check_updates(updates: &[StoreUpdate]) -> Result<(), RecordError> {
-    if updates.is_empty() {
-        return Err(RecordError::EmptyUpdates);
-    }
+/// The bounds every record's updates are held to.
+///
+/// Emptiness is not one of them here, because whether an empty set is
+/// meaningful depends on what else the record carries; see
+/// [`check_updates`].
+fn check_update_sizes(updates: &[StoreUpdate]) -> Result<(), RecordError> {
     if updates.len() > MAX_RECORD_UPDATES {
         return Err(RecordError::TooManyUpdates);
     }
@@ -331,6 +333,26 @@ fn check_updates(updates: &[StoreUpdate]) -> Result<(), RecordError> {
         }
     }
     Ok(())
+}
+
+/// The bounds a record whose updates are its whole content is held to.
+///
+/// A protocol transition says what it says by writing rows: a ballot, a
+/// promise, a vote, a bound selection. One with no rows is a record of
+/// nothing, and accepting it would put an entry in the journal that
+/// replay must carry and cannot act on.
+///
+/// An application outcome is not like that, which is why it does not go
+/// through here. It carries an execution position, a revision and the
+/// digest of the exact result, and a command that legitimately changed
+/// no rows -- a rejection, a comparison that did not match -- still took
+/// its position. Losing that record would leave the position free for a
+/// successor and let two replicas disagree about which command holds it.
+fn check_updates(updates: &[StoreUpdate]) -> Result<(), RecordError> {
+    if updates.is_empty() {
+        return Err(RecordError::EmptyUpdates);
+    }
+    check_update_sizes(updates)
 }
 
 fn check_body(
@@ -386,7 +408,7 @@ fn check_body(
             if *position != next {
                 return Err(RecordError::PositionNotAfterBase);
             }
-            check_updates(updates)
+            check_update_sizes(updates)
         }
         RecordBody::PublishLocalCheckpoint(pointer) => {
             if pointer.format != LOCAL_CHECKPOINT_FORMAT_V1 {

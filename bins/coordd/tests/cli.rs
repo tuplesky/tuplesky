@@ -89,7 +89,17 @@ fn pem(label: &str, der: &[u8]) -> String {
 /// will accept it, which is the failure the committed configuration
 /// exists to cause.
 fn genesis(dir: &Path, voter_one_key: Option<&[u8]>) {
-    let voters: Vec<serde_json::Value> = (1u8..=3)
+    genesis_of(dir, 3, voter_one_key);
+}
+
+/// The same manifest with `count` committed voters.
+///
+/// One voter is a real configuration, not a shortcut: its quorum is
+/// itself, so a single process can carry a request all the way through
+/// consensus and back. Three is what says that one running voter is not
+/// a quorum -- the same code, a different agreement.
+fn genesis_of(dir: &Path, count: u8, voter_one_key: Option<&[u8]>) {
+    let voters: Vec<serde_json::Value> = (1u8..=count)
         .map(|n| {
             let key = match (n, voter_one_key) {
                 (1, Some(spki)) => b64url(spki),
@@ -754,104 +764,146 @@ fn start(config: &Path) -> Running {
     Running { child, api }
 }
 
-/// A caller binds a session against the running daemon, and the daemon
-/// answers from the composition it actually has.
+/// A caller with a bound session against a running daemon.
 ///
-/// This is the serving path's own evidence. Everything on it is real:
-/// the QUIC handshake against the certificate the daemon loaded from
-/// disk, the peer binder built from the committed membership, the
-/// session token verified against the keys the daemon read at startup,
-/// and the frontend reading policy through the journal-backed store it
-/// attached. None of it is stubbed, and each piece would fail the
-/// handshake or the binding on its own if it were not wired.
+/// Everything here is real: the QUIC handshake against the certificate
+/// the daemon loaded from disk, the peer binder built from the committed
+/// membership, and the session token verified against the keys the
+/// daemon read at startup. None of it is stubbed, and each piece would
+/// fail the handshake or the binding on its own if it were not wired.
 ///
-/// It stops at the binding rather than at a served request, because a
-/// request is fanned out to voters and this build has no peer loop to
-/// answer it: the stream would be held, correctly, for ever. That is the
-/// next piece, and saying so here is more use than a test that pretended
-/// otherwise.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_caller_binds_a_session_against_the_running_daemon() {
-    use coord_types::wire_v1::PeerRole;
+/// It dials with quinn directly rather than through `Transport`.
+/// `Transport::send` opens a bidirectional stream and drops the
+/// receiving half, so it cannot read a unary answer: it is the path a
+/// frontend uses to deliver *to* a node it dialed, not the path a caller
+/// uses to ask one a question. The caller's shape -- one stream, the
+/// request written, the answer read on it -- is what the Go client
+/// implements and what the daemon's responder answers on, so that is
+/// what this drives. Giving the Rust SDK that shape is its own task.
+struct Caller {
+    connection: quinn::Connection,
+    session: coord_types::ids::SessionId,
+    _endpoint: quinn::Endpoint,
+    // Kept alive: dropping the control stream ends the negotiation the
+    // daemon bound this connection under.
+    _control: quinn::SendStream,
+}
 
-    let dir = workspace("bind");
-    let ca = credentials(&dir, 1, PeerRole::Voter);
-    genesis(&dir, Some(&ca.node_spki));
-    let ring = sts_keys(&dir);
-    let path = config_only(&dir);
+impl Caller {
+    /// Dial `daemon`, negotiate as a client of this domain, and bind
+    /// `session` with a token the daemon's own keys verify.
+    async fn bind(daemon: &Running, ca: &Ca, ring: &coord_sts::KeyRing, session: [u8; 16]) -> Self {
+        use coord_types::wire_v1::PeerRole;
 
-    assert_eq!(run(&path, &["init"]).code, Some(0));
-    let daemon = start(&path);
+        let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls_pki_types::CertificateDer::from(
+                ca.certificate.der().to_vec(),
+            ))
+            .expect("ca root");
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("tls13")
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![rustls_pki_types::CertificateDer::from(
+                    certificate.der().to_vec(),
+                )],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .expect("client auth");
+        tls.alpn_protocols = vec![coord_transport::ALPN_API.to_vec()];
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback"))
+            .expect("client endpoint");
+        endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls"),
+        )));
+        let connection = endpoint
+            .connect(daemon.api, SERVER_NAME)
+            .expect("dialable")
+            .await
+            .expect("the caller reached the daemon");
 
-    // A client of this domain, issued under the same authority.
-    //
-    // This dials with quinn directly rather than through `Transport`.
-    // `Transport::send` opens a bidirectional stream and drops the
-    // receiving half, so it cannot read a unary answer: it is the path a
-    // frontend uses to deliver *to* a node it dialed, not the path a
-    // caller uses to ask one a question. The caller's shape -- one
-    // stream, the request written, the answer read on it -- is what the
-    // Go client implements and what the daemon's responder answers on,
-    // so that is what this drives.
-    let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(rustls_pki_types::CertificateDer::from(
-            ca.certificate.der().to_vec(),
-        ))
-        .expect("ca root");
-    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("tls13")
-        .with_root_certificates(roots)
-        .with_client_auth_cert(
-            vec![rustls_pki_types::CertificateDer::from(
-                certificate.der().to_vec(),
-            )],
-            rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        // Negotiation: the control stream carries the hello that
+        // declares what this caller is, which the daemon binds against
+        // its committed membership before anything else happens.
+        let (mut control, _control_recv) = connection.open_bi().await.expect("control stream");
+        let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
+            role: PeerRole::Client,
+            cluster_id: coord_types::ids::ClusterId(CLUSTER),
+            domain_id: coord_types::ids::DomainId(DOMAIN),
+            incarnation: None,
+            capabilities: coord_types::wire_v1::BoundedVec::new(vec![
+                coord_transport::Lane::Unary.capability(),
+            ])
+            .expect("bounded"),
+        })
+        .encode()
+        .expect("hello");
+        control.write_all(&hello).await.expect("hello written");
+
+        let token = service_token(ring, session);
+        let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+        let answer = ask(&connection, &bind)
+            .await
+            .expect("the daemon answered the binding within the bound");
+        let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
+        assert_eq!(
+            ack.session,
+            coord_types::ids::SessionId(session),
+            "the daemon bound a different session than the token named"
+        );
+        assert!(ack.expires_at > 0, "a binding with no validity");
+
+        Caller {
+            connection,
+            session: ack.session,
+            _endpoint: endpoint,
+            _control: control,
+        }
+    }
+
+    /// The retry key of this caller's `sequence`th invocation.
+    fn invocation(&self, sequence: u64) -> coord_types::RetryKey {
+        coord_types::RetryKey {
+            cluster_id: coord_types::ids::ClusterId(CLUSTER),
+            domain_id: coord_types::ids::DomainId(DOMAIN),
+            session_id: self.session,
+            client_instance_id: coord_types::ids::ClientInstanceId([0x0c; 16]),
+            request_sequence: coord_types::ids::RequestSequence::new(sequence).expect("nonzero"),
+        }
+    }
+
+    /// One `Put`, as a client would send it.
+    fn put(&self, sequence: u64, key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            coord_types::ids::NamespaceId([0x5e; 16]),
+            coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                lease: None,
+                prev_kv: false,
+            }),
+        );
+        logical.canonicalize();
+        coord_types::wire_v1::MessageV1::Request(
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0)
+                .expect("bounded"),
         )
-        .expect("client auth");
-    tls.alpn_protocols = vec![coord_transport::ALPN_API.to_vec()];
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
-    endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls"),
-    )));
-    let connection = endpoint
-        .connect(daemon.api, SERVER_NAME)
-        .expect("dialable")
-        .await
-        .expect("the caller reached the daemon");
+        .encode()
+        .expect("bounded")
+    }
+}
 
-    // Negotiation: the control stream carries the hello that declares
-    // what this caller is, which the daemon binds against its committed
-    // membership before anything else happens.
-    let (mut control, _control_recv) = connection.open_bi().await.expect("control stream");
-    let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
-        role: PeerRole::Client,
-        cluster_id: coord_types::ids::ClusterId(CLUSTER),
-        domain_id: coord_types::ids::DomainId(DOMAIN),
-        incarnation: None,
-        capabilities: coord_types::wire_v1::BoundedVec::new(vec![
-            coord_transport::Lane::Unary.capability(),
-        ])
-        .expect("bounded"),
-    })
-    .encode()
-    .expect("hello");
-    control.write_all(&hello).await.expect("hello written");
-
-    // Bind a session with a token the daemon's own keys verify, on the
-    // caller's own stream, and read the answer where the daemon writes
-    // it.
-    let token = service_token(&ring, [0x44; 16]);
-    let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+/// Write `frame` on a fresh stream and read the answer the daemon
+/// writes back on it, or `None` if it never comes.
+async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types::wire_v1::Frame> {
     let (mut send, mut recv) = connection.open_bi().await.expect("request stream");
-    send.write_all(&bind).await.expect("bind written");
-    send.finish().expect("bind finished");
-
-    let answer = tokio::time::timeout(Duration::from_secs(20), async {
+    send.write_all(frame).await.expect("written");
+    send.finish().expect("finished");
+    let bytes = tokio::time::timeout(Duration::from_secs(20), async {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 4096];
         while let Some(n) = recv.read(&mut buf).await.expect("readable") {
@@ -860,24 +912,133 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
         bytes
     })
     .await
-    .expect("the daemon answered the binding within the bound");
-    assert!(
-        !answer.is_empty(),
-        "the daemon closed the caller's stream without answering"
-    );
+    .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
     let mut reader = coord_types::wire_v1::FrameReader::new();
-    reader.push(&answer).expect("within the reader bound");
-    let answer = reader
-        .next_frame()
-        .expect("a frame")
-        .expect("one whole frame");
-    let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
-    assert_eq!(
-        ack.session,
-        coord_types::ids::SessionId([0x44; 16]),
-        "the daemon bound a different session than the token named"
+    reader.push(&bytes).expect("within the reader bound");
+    reader.next_frame().expect("a frame")
+}
+
+/// A caller binds a session against the running daemon, and the daemon
+/// answers from the composition it actually has.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_binds_a_session_against_the_running_daemon() {
+    let dir = workspace("bind");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis(&dir, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    assert_eq!(caller.session, coord_types::ids::SessionId([0x44; 16]));
+}
+
+/// A request is carried all the way through by the voter in this
+/// process, and the caller is answered on the stream it asked on.
+///
+/// This is the served-request gate, and it is a different claim from
+/// the binding above. A `Bind` is answered by the frontend alone; this
+/// is answered only if every stage happened: the frontend admitted it
+/// and planned a fan-out, the plan resolved to the voter running here
+/// and went into its ingress rather than onto a socket, the voter
+/// proposed it, the record became durable, the evidence reached the
+/// collector under this voter's committed identity and met the
+/// committed quorum rule, the command was executed and materialized,
+/// and the release was gated and written back.
+///
+/// The configuration commits one voter, so that quorum is this voter --
+/// a real agreement of a real configuration, not a bypass. The next test
+/// commits three and shows that one of them is not a quorum, with the
+/// same code.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
+    let dir = workspace("served");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("the daemon never answered the request");
+    let decoded = coord_types::wire_v1::decode(&answer).expect("a decodable answer");
+    let coord_types::wire_v1::MessageV1::Response(response) = decoded else {
+        panic!("the daemon answered a request with something else: {decoded:?}");
+    };
+    // The answer is about the command the caller asked for, which is
+    // the one identity the whole path is keyed by: the collector
+    // retained it under this retry key, the voter proposed and executed
+    // exactly it, and the release was matched back to the stream that
+    // is holding.
+    //
+    // Its *outcome* is whatever this cluster's committed policy says
+    // for a session with no rules written for it yet, and that is not
+    // what this test is about. What it holds is that an answer came
+    // back at all, addressed to this command, which it does only if
+    // every stage above happened.
+    let mut logical = coord_types::logical_v1::LogicalRequest::new(
+        coord_types::ids::NamespaceId([0x5e; 16]),
+        coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
     );
-    assert!(ack.expires_at > 0, "a binding with no validity");
+    logical.canonicalize();
+    assert_eq!(
+        response.command_id,
+        coord_types::CommandId::derive(&caller.invocation(1), &logical).expect("derivable"),
+        "the daemon answered with some other command's result"
+    );
+}
+
+/// One voter in this process is one voter, not a quorum.
+///
+/// The same request, the same code, the same local route -- and three
+/// committed voters instead of one. The frame reaches this node's voter
+/// without a network hop, the voter proposes it, and the collector
+/// counts exactly one contribution: its own. Nothing is released,
+/// because nothing has agreed.
+///
+/// A co-located voter that pre-counted itself, or that let the frontend
+/// treat a queued frame as an acknowledgement, would answer this caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_co_located_voter_is_not_a_quorum() {
+    let dir = workspace("noquorum");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 3, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+
+    let (mut send, mut recv) = caller.connection.open_bi().await.expect("request stream");
+    send.write_all(&caller.put(1, b"k", b"v"))
+        .await
+        .expect("written");
+    send.finish().expect("finished");
+
+    // Held, not answered and not closed. The caller is waiting on
+    // evidence from two voters that are not running, which is the
+    // correct thing for it to be waiting on.
+    let mut buf = [0u8; 4096];
+    let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
+    assert!(
+        early.is_err(),
+        "one voter answered for a quorum of three: {early:?}"
+    );
 }
 
 /// A certificate's SubjectPublicKeyInfo, as the binder reads it.

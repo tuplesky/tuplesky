@@ -73,6 +73,7 @@ struct Node {
     storage: StorageModel,
     inbox: VecDeque<(ReplicaId, Vec<u8>)>,
     established: Vec<EstablishedResult>,
+    released: Vec<coord_core::capability::ReleasedResult>,
     executed: Vec<CommandId>,
     alive: bool,
     boot: u8,
@@ -164,6 +165,7 @@ impl Cluster {
                 storage: StorageModel::default(),
                 inbox: VecDeque::new(),
                 established: Vec::new(),
+                released: Vec::new(),
                 executed: Vec::new(),
                 alive: true,
                 boot: 1,
@@ -223,6 +225,14 @@ impl Cluster {
                     self.nodes[dest as usize].inbox.push_back((from, frame));
                 }
                 Effect::Established(result) => self.nodes[i].established.push(result),
+                // The leader's final-path release: a command that was
+                // never speculated is disclosed once, after it has
+                // executed. These tests drive no speculation companion,
+                // so every release here is that one.
+                Effect::Released(released) => {
+                    assert!(!released.speculative());
+                    self.nodes[i].released.push(released);
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -298,6 +308,7 @@ impl Cluster {
                         position,
                         revision: None,
                         result_digest: Digest32(c.0.0),
+                        response: c.0.0.to_vec(),
                     };
                     let effects = self.nodes[i].applied(c, &outcome);
                     self.nodes[i].executed.push(c);
