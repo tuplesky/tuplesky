@@ -364,6 +364,115 @@ being sent to) and because "the frontend can vote for itself without a
 network" is the kind of shortcut that should be a decision rather than
 an implementation detail someone finds later.
 
-**Revisit when:** the peer loop is built. Whichever is chosen, the test
-that matters is that one submission yields one vote from this node,
-under both paths, with the budgets separate.
+**Resolved:** local in-process delivery, through the voter's normal
+bounded ingress (task-j08). The frontend cannot vote; a co-located voter
+can contribute its ordinary vote without a network hop, and requiring a
+QUIC connection to itself would make a node's ability to vote depend on
+its own network stack for no gain.
+
+The constraints that make it a transport optimization rather than a
+consensus shortcut are in the plan's task-j08 and hold in the code:
+
+* The local destination is a capability the voter runtime owns, bound to
+  the voter instance and its *committed* identity. `Ingress::new` exists
+  only for a replica the configuration names as a voter and takes its
+  incarnation from the configuration, so a process running no voter
+  never has one, and a request naming a replica id cannot conjure one.
+  `dispatch` re-checks on every submission, which is what makes a
+  superseded runtime fall back to the wire.
+* Both routes converge at `Voter::on_submission`, before anything
+  protocol-shaped happens: the same bounded `FrameReader` with the same
+  class limits, then the same `admitted_from_submit`, which mints the
+  receipt only after checking the submitting role.
+* The voter's evidence carries `PeerProvenance::from_local_voter`, built
+  from its committed identity, and enters the collector's ordinary
+  `on_evidence` path. There is no `self_vote` flag and no pre-counted
+  acknowledgement, which is why one co-located voter is not a quorum of
+  three.
+* Delivery is a bounded mailbox the voter drains on its own turn, not an
+  inline call. The remote fan-out happens before the local offer, so a
+  full local ingress cannot hold up the voters that could have taken the
+  frame.
+* `Dispatched` says `queued_local`, `queued_remote` and rejections by
+  reason. Nothing it reports implies a vote, durability or an applied
+  command.
+
+## Nothing writes the session row a command authorizes against
+
+`coordd` can now carry a request from a caller through consensus,
+materialization and back. The answer it gives is a *rejection*:
+`ErrRejected { reason: SessionInvalid }`.
+
+That is the correct fail-closed answer, and it is not a bug in the path.
+The session row execution authorizes against is replicated state, and
+the only things that write one are `coord-storage`'s test fixtures and
+the bench driver (`bootstrap_session`). No production path establishes a
+session, so no cluster this binary starts can execute a mutating
+command.
+
+It is separated out as **task-j09** rather than folded into task-j08,
+because it is a different question -- how a verified binding becomes a
+replicated session -- and because task-j08's own gate does not depend on
+the answer: a request that is carried all the way to a replicated
+refusal has been through every stage that matters here.
+
+Two things in the acceptance tests are limited by it, and say so where
+they are:
+
+* The served-request test asserts the shape of the answer and the
+  command it belongs to, not a mutation.
+* The restart test holds that the same invocation is answered the same
+  way by the next process. It does *not* hold retry resolution from the
+  durable record: a semantic admission refusal deliberately records
+  nothing under the retry key, so there is nothing retained to resolve
+  to, and the second trip re-derives the same refusal. Holding that
+  needs a command that executes.
+
+**Revisit when:** task-j09 lands. The tests above then become the ones
+the plan asks for: a revision, a retained result, and a retry that
+resolves rather than re-executes.
+
+## A command that was never speculated was never released
+
+Driving a real request through `coordd` found two places it could not
+get to an answer. Both were invisible to every test that stopped short
+of a whole request, and both are worth remembering for the shape of the
+mistake rather than the fix.
+
+**The release gate only released speculated outcomes.**
+`Leader::applied` emitted `Effect::Established`, which the driver
+deliberately does not publish (publishing it would disclose an outcome
+before the release rule had admitted it), plus `release_ready()`, which
+releases *tentative* outcomes from the speculation overlay. A comment in
+the driver said that without speculation "a result is released on the
+final path rather than the early one -- slower, never wrong". There was
+no final path. A command the speculation companion declines -- one that
+is not speculable, one over the overlay's budget, one whose authorized
+view cannot be built -- executed, became durable, and left its caller
+waiting for a disclosure nothing was going to assemble.
+
+The fix is a release from `applied` when the speculative one was not
+made, marked `speculative: false`. It rests on *more* evidence than the
+early release: the command is committed, its whole prefix has executed
+before it, and its result is materialized and durable. `AppliedOutcome`
+carries the response bytes for it -- the digest sealed the result, but
+the bytes are what a caller gets.
+
+The existing test asserted that a declined command was "never released
+early", which was true and also true of a command that was never
+released at all. It now asserts released exactly once, not speculative,
+not before execution, equal to what was established.
+
+**An application outcome that changed no rows could not be recorded.**
+The journal's `check_updates` refused an empty update set for every
+record body. A protocol transition with no rows really is a record of
+nothing, and is still refused. An application outcome is not: it carries
+the position the command took, and a command that legitimately changes
+nothing -- a rejection, a comparison that did not match -- still took
+one. Refusing it failed the whole replica with `EmptyUpdates`; accepting
+it without recording it would free the position for a successor and let
+two replicas disagree about which command holds it.
+
+The two faults compounded: the first request `coordd` ever served was a
+policy rejection, which is exactly the command that changes no rows and
+exactly the command the speculation companion cannot plan.

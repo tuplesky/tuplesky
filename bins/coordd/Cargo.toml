@@ -38,6 +38,8 @@ clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
+coord-state.workspace = true
+postcard.workspace = true
 coord-node-issuer.workspace = true
 coord-membership.workspace = true
 coord-session.workspace = true
