@@ -35,6 +35,16 @@ runs). Two things make a downgrade useless: `v3.6.14` carries the
 identical code, diffed function for function, and pinned Kine itself
 requires `v3.7.1`, so any pin below it needs a `replace` override anyway.
 
+It is known upstream, and independently diagnosed the same way:
+[etcd-io/etcd#21969](https://github.com/etcd-io/etcd/issues/21969)
+reports it against `main`, `v3.6.12`, `v3.7.0-rc.0` and `v3.8.0-alpha.0`,
+and says it is likelier "under high watch churn with progress notify
+enabled". [PR #22191](https://github.com/etcd-io/etcd/pull/22191) proposes
+the one-line fix -- delete the substream from `w.substreams` at cancel
+rather than leaving it for deferred cleanup. At the time of writing the
+PR is open, unmerged, waiting on a code-owner review, and `main` still
+carries the defect.
+
 **Did:** asserted the property on our own code instead. `WaitForSyncTo` is
 the barrier both of the bridge's progress paths rest on -- `ProgressIfSynced`
 per watch and `ProgressAll` broadcast each publish a revision only once it
@@ -48,12 +58,13 @@ the barrier; both reached the same one. The bridge's progress path keeps
 its coverage in `TestProgressNeverOvertakesEvents`, whose watch is never
 cancelled and so never meets the defect.
 
-**Revisit when:** a client release removes the stale map entry at cancel.
-The upstream fix is one line. Until then the defect is still real in
-production -- a watch cancel racing a progress notify, with a far smaller
-window than the test's injected teardown delay -- and if that ever matters
-the fix here is a `replace` directive onto a patched client, not a
-downgrade.
+**Revisit when:** #22191 (or its successor) merges and reaches a release
+we can pin. Then this test could go back through `clientv3` if that ever
+seems worth it, and the note here can be closed out. Until then the
+defect is still real in production -- a watch cancel racing a progress
+notify, with a far smaller window than the test's injected teardown
+delay -- and if that ever matters the fix here is a `replace` directive
+onto a patched client, not a downgrade.
 
 ## `Bind` is a raw kind the transport admits without decoding
 

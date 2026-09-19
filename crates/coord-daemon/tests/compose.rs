@@ -360,3 +360,72 @@ fn a_process_is_live_only_once_its_listeners_are_bound() {
     });
     assert!(clash.is_err(), "the address is already held");
 }
+
+/// The socket a process bound is the socket it serves on.
+///
+/// Binding is what decides whether a node can serve, and the `Live`
+/// phase is defined by it, so it has to happen once. Handing the bound
+/// socket to the QUIC endpoint is what makes the address an operator was
+/// told about the address that answers: re-binding from that address
+/// would either collide with the socket still held here, or leave the
+/// port free for another process in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_a_process_bound_is_the_socket_it_serves_on() {
+    use coord_transport::{Limits as TransportLimits, Transport};
+    use coord_transport_testkit::{TestBinder, TestCa};
+    use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
+    use coord_types::wire_v1::PeerRole;
+
+    const CLUSTER: ClusterId = ClusterId([0x11; 16]);
+    const DOMAIN: DomainId = DomainId([0x22; 16]);
+
+    // Port zero, so the bound address is only knowable after binding.
+    let mut bound = bind_listeners(&ListenConfig {
+        api_quic: Some("127.0.0.1:0".into()),
+        peer_quic: None,
+        admin_http: None,
+        https: None,
+    })
+    .expect("bind");
+    let reported = bound
+        .addresses()
+        .into_iter()
+        .find(|(name, _)| *name == "api_quic")
+        .expect("an api listener was bound")
+        .1;
+
+    let socket = bound.take_api().expect("the api socket is handed over");
+    assert!(
+        bound.take_api().is_none(),
+        "a socket is handed over once, not cloned"
+    );
+
+    let ca = TestCa::new();
+    let frontend = ca.issue(
+        "frontend.local",
+        ReplicaId([1; 16]),
+        ReplicaIncarnation::new(1).expect("positive"),
+        PeerRole::Frontend,
+    );
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    binder.register(&frontend);
+    let transport = Transport::with_socket(
+        socket,
+        frontend.local(&ca, CLUSTER, DOMAIN, vec![]),
+        std::sync::Arc::new(binder),
+        TransportLimits::default(),
+    )
+    .expect("serve on the handed-over socket");
+
+    assert_eq!(
+        transport.local_addr().expect("bound"),
+        reported,
+        "the endpoint serves on the address the process reported"
+    );
+    // And the port is not free in between: binding it again fails while
+    // the endpoint holds it.
+    assert!(
+        std::net::UdpSocket::bind(reported).is_err(),
+        "the port was released between binding and serving"
+    );
+}
