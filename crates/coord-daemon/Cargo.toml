@@ -15,8 +15,11 @@ role = "production"
 coord-types.workspace = true
 coord-transport.workspace = true
 coord-membership.workspace = true
+coord-store-api.workspace = true
 serde = { workspace = true, features = ["std"] }
 toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+coord-store-testkit.workspace = true
+serde_json.workspace = true
