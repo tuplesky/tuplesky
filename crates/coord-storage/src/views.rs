@@ -177,6 +177,48 @@ impl Budget {
 }
 
 /// Scan every row of `collection` in `[lower, upper)` within the budget.
+/// Every history row in `[lower, upper)`, read in bounded pages.
+///
+/// The work is local and the pages bound it; what the pages must not do
+/// is decide a replicated outcome, so nothing here is charged to the
+/// view budget. The range itself is bounded by the replicated retention
+/// floor, which is the same on every replica.
+fn scan_history<V: OrderedRead>(
+    view: &V,
+    lower: Vec<u8>,
+    upper: Bound<Vec<u8>>,
+) -> Result<RawRows, ViewBuildError> {
+    /// One page of history rows. Large enough for any schema-valid row.
+    const PAGE_BYTES: u32 = 16 * 1024 * 1024;
+    let mut out = Vec::new();
+    let mut request = ScanRequest {
+        lower: Bound::Included(lower),
+        upper,
+        direction: Direction::Forward,
+        resume_after: None,
+        max_rows: NonZeroU32::new(256).expect("nonzero"),
+        max_bytes: NonZeroU32::new(PAGE_BYTES).expect("nonzero"),
+    };
+    loop {
+        let page = view.scan_page(Collection::KvHistoryV1.id(), &request)?;
+        let last = page.rows.last().map(|r| r.key.clone());
+        out.extend(page.rows.into_iter().map(|r| (r.key, r.value)));
+        if page.exhausted {
+            return Ok(out);
+        }
+        match last {
+            Some(key) => request.resume_after = Some(key),
+            // A page that is neither exhausted nor advancing would loop.
+            None => {
+                return Err(ViewBuildError::Engine(EngineError::new(
+                    ErrorClass::Corrupt,
+                    "history scan made no progress",
+                )));
+            }
+        }
+    }
+}
+
 fn scan_all<V: OrderedRead>(
     view: &V,
     collection: Collection,
@@ -567,9 +609,17 @@ pub fn build_read_view<V: OrderedRead>(
         let mut chosen: BTreeMap<Vec<u8>, Option<KvEntry>> = BTreeMap::new();
         for touch in historical_touches(&request.operation, r) {
             let (lower, upper) = history_bounds(&namespace, &touch);
-            for (row_key, value) in
-                scan_all(view, Collection::KvHistoryV1, lower, upper, &mut budget)?
-            {
+            // Physical versions are not charged to the replicated budget.
+            // How many obsolete versions of a key are still on disk is a
+            // local matter: garbage collection runs at its own pace on
+            // each replica, so charging them made the budget, and the
+            // durable rejection that follows it, depend on local cleanup
+            // progress. Two replicas holding the same logical state at
+            // the same compaction floor could then disagree about the
+            // same chosen command, one executing it and one recording a
+            // rejection. The selection below is charged instead, and it
+            // is the same everywhere.
+            for (row_key, value) in scan_history(view, lower, upper)? {
                 let decoded = ordered_key::decode_history(&row_key)
                     .map_err(|_| EngineError::new(ErrorClass::Corrupt, "kv_history key"))?;
                 let version = decoded.revision.expect("history key carries a revision");
@@ -581,10 +631,15 @@ pub fn build_read_view<V: OrderedRead>(
                 chosen.insert(decoded.key, codecs::decode_history(&value)?.entry);
             }
         }
-        let entries = chosen
+        let entries: BTreeMap<Vec<u8>, KvEntry> = chosen
             .into_iter()
             .filter_map(|(k, e)| e.map(|e| (k, e)))
             .collect();
+        // What the request actually reads: one version per key, the same
+        // on every replica whatever each has collected.
+        for (key, entry) in &entries {
+            budget.charge(1, key.len() + entry.value.len())?;
+        }
         read_view.historical.push(HistoricalView {
             revision: r,
             entries,

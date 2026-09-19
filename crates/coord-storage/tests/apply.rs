@@ -357,3 +357,225 @@ fn the_overlay_bound_is_checked_against_the_plan_it_would_hold() {
     overlay.retire(&command);
     assert_eq!(overlay.bytes(), 0);
 }
+
+/// Put the domain's revision counter at `revision`.
+///
+/// Fixture construction: it lets the obsolete versions below be written
+/// at revisions genuinely below the current one, as a replica that has
+/// been running for a while would hold them.
+fn set_kv_revision(applier: &mut Applier<ModelEngine>, revision: u64) {
+    let base = applier.worker().application_base();
+    let barrier = applier.alloc().allocate();
+    applier
+        .worker_mut()
+        .submit(PersistBatch {
+            barrier,
+            base: Some(base),
+            updates: vec![coord_core::effect::StoreUpdate {
+                collection: coord_store_api::registry::Collection::MetaV1.id(),
+                key: coord_store_api::registry::meta_fields::KV_REVISION.to_vec(),
+                value: Some(coord_storage::codecs::encode_counter(revision).unwrap()),
+            }],
+        })
+        .unwrap();
+    applier.worker_mut().flush().unwrap();
+}
+
+/// Seed `versions` obsolete stored versions of `key`, every one strictly
+/// below `current`.
+///
+/// This is what a replica that has not collected them holds on disk; a
+/// replica that has collected them holds only the current entry. Nothing
+/// logical distinguishes the two.
+fn seed_obsolete_versions(
+    applier: &mut Applier<ModelEngine>,
+    key: &[u8],
+    versions: u32,
+    current: u64,
+) {
+    assert!(
+        current > u64::from(versions),
+        "the versions must be below it"
+    );
+    let updates: Vec<_> = (1..=versions)
+        .map(|v| {
+            let revision =
+                KvRevision::new(current - u64::from(versions) + u64::from(v) - 1).unwrap();
+            let entry = coord_state::KvEntry {
+                value: format!("obsolete-{v}").into_bytes(),
+                create_revision: KvRevision::new(1).unwrap(),
+                mod_revision: revision,
+                version: u64::from(v),
+                lease: None,
+                lease_generation: None,
+            };
+            coord_core::effect::StoreUpdate {
+                collection: coord_store_api::registry::Collection::KvHistoryV1.id(),
+                key: coord_storage::codecs::history_key(&NS, key, revision),
+                value: Some(
+                    coord_storage::codecs::encode_history(
+                        &coord_storage::codecs::HistoryRecordV1 { entry: Some(entry) },
+                    )
+                    .unwrap(),
+                ),
+            }
+        })
+        .collect();
+    let base = applier.worker().application_base();
+    let barrier = applier.alloc().allocate();
+    applier
+        .worker_mut()
+        .submit(PersistBatch {
+            barrier,
+            base: Some(base),
+            updates,
+        })
+        .unwrap();
+    applier.worker_mut().flush().unwrap();
+}
+
+#[test]
+fn local_garbage_collection_progress_never_changes_a_replicated_outcome() {
+    // The view budget was charged against physical rows scanned, and a
+    // historical read scans every stored version of the keys it covers.
+    // Garbage collection runs at its own pace on each replica, so two
+    // replicas holding the same logical state at the same compaction
+    // floor could disagree about the same chosen command: the collected
+    // one answered the read, the uncollected one exceeded the budget and
+    // durably recorded a rejection. That is a mutation on one replica
+    // and a rejection on another, not merely different timing.
+    let versions = ViewBudget::SCHEMA.max_rows + 16;
+    let start = u64::from(versions) + 1;
+    let mut churned = applier(ModelEngine::new());
+    let mut collected = applier(ModelEngine::new());
+    // Both reach the same logical state at the same revision.
+    for a in [&mut churned, &mut collected] {
+        set_kv_revision(a, start);
+        let (command, record) = payload(1, &put(b"hot", b"final"));
+        a.apply(command, &record).unwrap();
+    }
+    let revision = churned.kv_revision().unwrap();
+    assert_eq!(revision, collected.kv_revision().unwrap());
+    // One replica still holds every obsolete version below the current
+    // entry; the other has collected them. Nothing logical distinguishes
+    // the two, and their compaction floors are the same.
+    seed_obsolete_versions(&mut churned, b"hot", versions, revision.get());
+
+    let historical = req(CanonicalOperation::Range(RangeOp {
+        range: KeyRange::interval(b"h".to_vec(), b"i".to_vec()),
+        revision: Some(revision),
+        limit: 0,
+        count_only: false,
+        keys_only: false,
+    }));
+    let (command, record) = payload(2, &historical);
+    let churned_outcome = churned
+        .apply(command, &record)
+        .expect("a result, not a local failure");
+    let collected_outcome = collected.apply(command, &record).expect("a result");
+
+    let stored_response = |a: &mut Applier<ModelEngine>| {
+        let gated = a.worker().reader().snapshot().unwrap();
+        let record = coord_storage::retry::lookup(gated.view(), &retry_key(2))
+            .unwrap()
+            .expect("retained");
+        drop(gated);
+        postcard::from_bytes::<Response>(&record.response).unwrap()
+    };
+    let churned_response = stored_response(&mut churned);
+    let collected_response = stored_response(&mut collected);
+    assert!(
+        !matches!(
+            churned_response.outcome,
+            Outcome::ErrRejected {
+                reason: RejectionReason::ViewTooLarge
+            }
+        ),
+        "uncollected history is not a reason to reject: {:?}",
+        churned_response.outcome
+    );
+    // The same command against the same logical state gives the same
+    // answer, whatever each replica happens to have collected.
+    assert_eq!(
+        churned_response.outcome, collected_response.outcome,
+        "the outcome is the logical state's, not local cleanup progress"
+    );
+    assert_eq!(
+        churned_outcome.result_digest,
+        collected_outcome.result_digest
+    );
+    assert!(churned_outcome.revision.is_none() && collected_outcome.revision.is_none());
+}
+
+#[test]
+fn an_admission_refusal_finishes_the_command_it_refuses() {
+    // Retry admission could refuse a chosen command with no terminal
+    // outcome and no position advance: it failed again on every retry
+    // and every successor waited behind it for ever.
+    let mut applier = applier(ModelEngine::new());
+    // A request whose sequence is far beyond the session's window.
+    let beyond = 1u64 << 40;
+    let (command, record) = payload(beyond, &put(b"k", b"v"));
+    let outcome = applier
+        .apply(command, &record)
+        .expect("a result, not an error");
+    assert_eq!(outcome.revision, None, "a refusal writes nothing");
+    let gated = applier.worker().reader().snapshot().unwrap();
+    // The refusal writes no retry record: the key it names is not bound
+    // to it, so no other command's result can be overwritten.
+    assert!(
+        coord_storage::retry::lookup(gated.view(), &retry_key(beyond))
+            .unwrap()
+            .is_none(),
+        "an out-of-window sequence binds nothing"
+    );
+    drop(gated);
+    // The command behind it proceeds at the next position.
+    let (next, next_record) = payload(1, &put(b"after", b"1"));
+    let after = applier.apply(next, &next_record).unwrap();
+    assert!(after.revision.is_some());
+    assert_eq!(
+        after.position.get(),
+        outcome.position.get() + 1,
+        "the refusal occupied exactly one position"
+    );
+}
+
+#[test]
+fn a_planner_valid_response_always_fits_its_retry_record() {
+    // The planner allowed responses four times larger than the envelope
+    // that stores the retained result, so a response could plan and then
+    // fail to persist, leaving the chosen command unresolved. The limits
+    // are aligned now; this holds the behaviour at the boundary.
+    let mut applier = applier(ModelEngine::new());
+    // Three large values: comfortably inside the view budget, and over
+    // the retry envelope had the planner still allowed 8 MiB.
+    let value = vec![b'x'; 768 * 1024];
+    for (i, key) in [b"big-1", b"big-2", b"big-3"].iter().enumerate() {
+        let (command, record) = payload(i as u64 + 1, &put(key.as_slice(), &value));
+        applier.apply(command, &record).unwrap();
+    }
+    let (command, record) = payload(10, &range_all());
+    let outcome = applier
+        .apply(command, &record)
+        .expect("a result, not a storage error");
+    let gated = applier.worker().reader().snapshot().unwrap();
+    let stored = coord_storage::retry::lookup(gated.view(), &retry_key(10))
+        .unwrap()
+        .expect("the result is retained, whatever it is");
+    drop(gated);
+    let response: Response = postcard::from_bytes(&stored.response).unwrap();
+    // Either the values came back or the size was refused in an ordered
+    // way; what must not happen is an unresolved command.
+    match response.outcome {
+        Outcome::Range { .. } => {}
+        Outcome::ErrRejected {
+            reason: RejectionReason::ResponseTooLarge,
+        } => {}
+        other => panic!("{other:?}"),
+    }
+    // And the command behind it proceeds.
+    let (next, next_record) = payload(11, &put(b"after", b"1"));
+    let after = applier.apply(next, &next_record).unwrap();
+    assert_eq!(after.position.get(), outcome.position.get() + 1);
+}

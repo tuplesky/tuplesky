@@ -382,3 +382,21 @@ pub fn session_update(
         value: Some(codecs::encode_session(record)?),
     })
 }
+
+/// The semantic response limit must fit the envelope that stores the
+/// retained result, with room for the rest of the record.
+///
+/// `coord-state` sets the limit and cannot see the envelope; this is
+/// where both are visible, so this is where they are held together. A
+/// response the planner accepts and storage cannot persist leaves a
+/// chosen command unresolved, which is the failure this prevents.
+const _: () = {
+    // Command identity, execution position, optional revision, result
+    // digest and postcard framing, generously.
+    const RECORD_OVERHEAD: usize = 12 * 1024;
+    assert!(
+        coord_state::limits::MAX_RETAINED_RESPONSE_BYTES + RECORD_OVERHEAD
+            <= coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD,
+        "a planner-valid response must fit its retry envelope"
+    );
+};
