@@ -1462,6 +1462,12 @@ fn finish(
     if outcome_cost(&outcome).saturating_add(event_bytes) > limits.max_response_bytes {
         return Err(PlanError::ResponseTooLarge);
     }
+    // The response alone has to fit the envelope that retains it. The
+    // budget above is work, and events are stored in rows of their own;
+    // this is the durable representation of the result itself.
+    if outcome_cost(&outcome) > limits.max_retained_response_bytes {
+        return Err(PlanError::ResponseTooLarge);
+    }
     let mutates = !events.is_empty();
     let revision = if mutates {
         Some(next_revision.ok_or(PlanError::CounterOverflow)?)

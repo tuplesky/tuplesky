@@ -141,6 +141,21 @@ impl<E: LocalEngine> Applier<E> {
         self.apply_bound(&request, &binding)
     }
 
+    /// The terminal outcome of a semantic admission refusal.
+    fn admission_rejection_of(admission: &Admission) -> RejectionReason {
+        match admission {
+            Admission::Conflict { .. } => RejectionReason::RetryConflict,
+            Admission::TooOld { .. } => RejectionReason::RetryTooOld,
+            Admission::OutOfWindow { .. } => RejectionReason::RetryOutOfWindow,
+            Admission::UnknownSession | Admission::SessionRetired => {
+                RejectionReason::SessionInvalid
+            }
+            Admission::Unauthorized => RejectionReason::RetryUnauthorized,
+            // Handled above; never a refusal.
+            Admission::New | Admission::Retry(_) => RejectionReason::Invalid,
+        }
+    }
+
     fn apply_bound(
         &mut self,
         request: &LogicalRequest,
@@ -182,7 +197,41 @@ impl<E: LocalEngine> Applier<E> {
                         result_digest: record.result_digest,
                     });
                 }
-                other => return Err(ApplyError::NotAdmitted(other)),
+                // Every chosen command finishes. A semantic admission
+                // refusal is an outcome, not a reason to leave the
+                // command unexecuted: the position is already its own,
+                // every successor conflicts with it, and retrying can
+                // only refuse it again. The refusal takes the position
+                // and records nothing under the retry key, so the
+                // original binding stands and a retired request is not
+                // resurrected.
+                other => {
+                    let reason = Self::admission_rejection_of(&other);
+                    let planned = rejection_plan_at(
+                        self.worker.application_base(),
+                        crate::codecs::read_kv_revision(gated.view())?,
+                        reason,
+                    )
+                    .map_err(ApplyError::Plan)?;
+                    drop(gated);
+                    let barrier = self.alloc.allocate();
+                    match apply_plan(&mut self.worker, barrier, namespace, &planned, None)? {
+                        ApplyOutcome::Applied(_) => {
+                            let response = postcard::to_allocvec(&planned.response)
+                                .map_err(|_| ApplyError::MalformedPayload)?;
+                            return Ok(AppliedOutcome {
+                                position: planned.position,
+                                revision: None,
+                                result_digest: retry::result_digest(&response),
+                            });
+                        }
+                        ApplyOutcome::Replan => continue,
+                        ApplyOutcome::Indeterminate => {
+                            self.worker.reconcile()?;
+                            continue;
+                        }
+                    }
+                }
             }
             // The budget here is the schema's, identical on every replica,
             // never a local setting: a command that overruns it overruns

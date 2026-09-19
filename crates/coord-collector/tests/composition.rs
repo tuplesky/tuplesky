@@ -1287,7 +1287,11 @@ fn unary_and_finalized_watch_dispatch() {
     let admitted = Admission::new(CLUSTER, DOMAIN, AdmissionLimits::default())
         .admit(0, &caller(), &req)
         .unwrap();
-    let Submitted::FanOut(fan_out) = w.frontend.collector_mut().submit(0, &admitted).unwrap()
+    let Submitted::FanOut(fan_out) = w
+        .frontend
+        .collector_mut()
+        .submit(0, &admitted.request)
+        .unwrap()
     else {
         panic!()
     };
@@ -1472,4 +1476,52 @@ fn a_release_larger_than_an_api_frame_still_reaches_the_collector() {
     let frame = coord_collector::release_frame(&released).expect("a large result still frames");
     let decoded = decode_release(&frame_of(&frame)).expect("round trip");
     assert_eq!(decoded.response().len(), big.len());
+}
+
+#[test]
+fn a_conflicting_retry_never_frees_the_original_request_s_slot() {
+    // Admission counts distinct retry keys, so a re-presentation takes no
+    // slot - but refusing one released the slot the original still held.
+    // With a bound of one: submit A, submit a conflicting A, and B was
+    // then admitted while A was still outstanding.
+    let mut gate = Admission::new(
+        CLUSTER,
+        DOMAIN,
+        AdmissionLimits {
+            max_pending_per_session: 1,
+        },
+    );
+    let (_, first) = request(1, put(b"a", b"1"), 0);
+    let admitted = gate.admit(0, &caller(), &first).expect("admitted");
+    assert!(admitted.reserved, "the first presentation took the slot");
+    assert_eq!(gate.pending(&SESSION), 1);
+
+    // The same retry key with a different payload: the collector refuses
+    // it, and the refusal must not release the original's reservation.
+    let (_, conflicting) = request(1, put(b"a", b"different"), 0);
+    assert_eq!(conflicting.retry_key, first.retry_key);
+    let again = gate
+        .admit(0, &caller(), &conflicting)
+        .expect("admission is by identity; the conflict is the collector's to see");
+    assert!(
+        !again.reserved,
+        "a re-presentation of an outstanding key takes no slot"
+    );
+    gate.settled_reservation(&conflicting.retry_key, again.reserved);
+    assert_eq!(
+        gate.pending(&SESSION),
+        1,
+        "the original is still outstanding and still holds its slot"
+    );
+
+    // So a second request is still refused.
+    let (_, other) = request(2, put(b"b", b"2"), 0);
+    assert!(matches!(
+        gate.admit(0, &caller(), &other),
+        Err(AdmissionRefusal::SessionBusy { pending: 1 })
+    ));
+    // Settling the original frees it, as before.
+    gate.settled(&first.retry_key);
+    assert_eq!(gate.pending(&SESSION), 0);
+    gate.admit(0, &caller(), &other).expect("the slot is free");
 }

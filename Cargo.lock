@@ -620,6 +620,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-daemon"
+version = "0.1.0"
+dependencies = [
+ "coord-membership",
+ "coord-transport",
+ "coord-types",
+ "serde",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
 name = "coord-login"
 version = "0.1.0"
 dependencies = [
@@ -928,6 +940,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "zbus-secret-service-keyring-store",
+]
+
+[[package]]
+name = "coordd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "coord-daemon",
 ]
 
 [[package]]

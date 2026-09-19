@@ -112,6 +112,15 @@ pub struct StoreWorker<E: LocalEngine> {
     frontier: Arc<Frontier>,
     state: WorkerState,
     pending: Option<PendingGroup>,
+    /// Terminal events decided before a later step of the same group
+    /// failed.
+    ///
+    /// A batch rejected for a stale base is finished: it is not
+    /// requeued, so its event is the only thing that will ever complete
+    /// its barrier. Returning the error alone discarded it and the
+    /// waiter was left waiting for a batch that had already been
+    /// refused.
+    deferred_events: Vec<StorageEvent>,
 }
 
 impl<E: LocalEngine> StoreWorker<E> {
@@ -136,6 +145,7 @@ impl<E: LocalEngine> StoreWorker<E> {
             frontier,
             state: WorkerState::Ready,
             pending: None,
+            deferred_events: Vec::new(),
         })
     }
 
@@ -290,6 +300,7 @@ impl<E: LocalEngine> StoreWorker<E> {
         group: Vec<PersistBatch>,
     ) -> Result<FlushOutcome, (Vec<PersistBatch>, EngineError)> {
         let mut outcome = FlushOutcome::default();
+        outcome.events.append(&mut self.deferred_events);
         let mut accepted: Vec<PersistBatch> = Vec::new();
         let mut seqs: Vec<LocalJournalSeq> = Vec::new();
         let mut meta = self.meta;
@@ -357,18 +368,24 @@ impl<E: LocalEngine> StoreWorker<E> {
                     let mut requeue = accepted;
                     requeue.push(batch);
                     requeue.extend(remaining);
+                    // The rejections decided above stand: those batches
+                    // are refused, not requeued, so their events are all
+                    // that can complete their barriers.
+                    self.deferred_events.append(&mut outcome.events);
                     return Err((requeue, e));
                 }
                 accepted.push(batch);
             }
             if accepted.is_empty() {
                 if let Err(e) = tx.abort() {
+                    self.deferred_events.append(&mut outcome.events);
                     return Err((Vec::new(), e));
                 }
                 return Ok(outcome);
             }
             if let Err(e) = meta.write(&mut tx) {
                 drop(tx);
+                self.deferred_events.append(&mut outcome.events);
                 return Err((accepted, e));
             }
             tx.commit_durable()
