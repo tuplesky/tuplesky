@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use coordctl::{BrokerClient, CliError, Credentials, StoreKind, UpdateLock, open_store, update};
+use coordctl::{
+    BrokerClient, CliError, Credentials, StoreKind, UpdateLock, begin_update, open_store, update,
+};
 
 #[derive(Parser)]
 #[command(name = "coordctl", about = "TupleSky operator CLI")]
@@ -15,9 +17,10 @@ struct Cli {
     /// Registered client identifier.
     #[arg(long, default_value = "coordctl")]
     client_id: String,
-    /// Credential store. No file store exists; memory holds the
-    /// credentials for this process only.
-    #[arg(long, value_enum, default_value_t = Store::Memory)]
+    /// Credential store. The default is the platform's secret store, so
+    /// a login survives the process; `memory` keeps the credentials for
+    /// this process only and is an explicit choice.
+    #[arg(long, value_enum, default_value_t = Store::Platform)]
     store: Store,
     /// Lock file serializing shared-credential updates.
     #[arg(long, default_value = "/tmp/coordctl.lock")]
@@ -28,6 +31,8 @@ struct Cli {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Store {
+    /// The platform's own secret store.
+    Platform,
     Memory,
     Keychain,
     SecretService,
@@ -59,10 +64,22 @@ fn now() -> u64 {
 async fn main() {
     let cli = Cli::parse();
     let kind = match cli.store {
+        // Defaulting to memory meant a successful login was discarded
+        // when the process exited and every later command found nothing.
+        Store::Platform => {
+            if cfg!(target_os = "macos") {
+                StoreKind::Keychain
+            } else {
+                StoreKind::SecretService
+            }
+        }
         Store::Memory => StoreKind::Memory,
         Store::Keychain => StoreKind::Keychain,
         Store::SecretService => StoreKind::SecretService,
     };
+    if matches!(cli.store, Store::Memory) {
+        eprintln!("note: --store memory keeps credentials for this process only");
+    }
     let store = match open_store(kind, "coordctl", &cli.broker) {
         Ok(s) => s,
         Err(e) => {
@@ -99,27 +116,38 @@ async fn main() {
             })
         }
         Command::Refresh => {
-            let current = store.load().map_err(CliError::Store);
-            match current {
-                Ok(Some(c)) => match c.refresh_token.as_deref() {
-                    Some(t) => match client.refresh(t).await {
-                        Ok(r) => {
-                            let next =
-                                Credentials::from_response(&cli.broker, &cli.client_id, now(), &r);
-                            update(store.as_ref(), &lock, |_| Ok(Some(next)))
-                                .map(|_| ())
-                                .map_err(CliError::Store)
-                        }
-                        Err(CliError::FreshLoginRequired) => {
-                            let _ = update(store.as_ref(), &lock, |_| Ok(None));
-                            Err(CliError::FreshLoginRequired)
-                        }
-                        Err(e) => Err(e),
-                    },
-                    None => Err(CliError::NoRefreshToken),
-                },
-                Ok(None) => Err(CliError::NoRefreshToken),
+            // The whole rotation is one critical section: the secret is
+            // single use, so reading it, spending it and writing its
+            // replacement cannot be interleaved with another invocation.
+            let guard = begin_update(store.as_ref(), &lock).map_err(CliError::Store);
+            match guard {
                 Err(e) => Err(e),
+                Ok(guard) => {
+                    let current = guard.load().map_err(CliError::Store);
+                    match current {
+                        Ok(Some(c)) => match c.refresh_token.as_deref() {
+                            Some(t) => match client.refresh(t).await {
+                                Ok(r) => {
+                                    let next = Credentials::from_response(
+                                        &cli.broker,
+                                        &cli.client_id,
+                                        now(),
+                                        &r,
+                                    );
+                                    guard.save(&next).map_err(CliError::Store)
+                                }
+                                Err(CliError::FreshLoginRequired) => {
+                                    let _ = guard.clear();
+                                    Err(CliError::FreshLoginRequired)
+                                }
+                                Err(e) => Err(e),
+                            },
+                            None => Err(CliError::NoRefreshToken),
+                        },
+                        Ok(None) => Err(CliError::NoRefreshToken),
+                        Err(e) => Err(e),
+                    }
+                }
             }
         }
         Command::Logout => {

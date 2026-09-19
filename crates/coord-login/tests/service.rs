@@ -375,6 +375,7 @@ fn receipt(n: u8) -> AdmissionReceiptV1 {
         scope_ceiling: Action::Read.bit(),
         trust_rule: TrustRuleId([9; 16]),
         rule_generation: 3,
+        expires_at: NOW + 3600,
     }
 }
 

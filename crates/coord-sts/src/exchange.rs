@@ -415,9 +415,18 @@ impl Sts {
         if !clock.healthy {
             return Err(ExchangeError::Unavailable("clock health"));
         }
+        // A renewal signs a fresh token inside an existing session; it
+        // never extends the session. Without the session's own deadline
+        // a session admitted on a short-lived credential could be
+        // renewed indefinitely, outliving the credential that admitted
+        // it by any amount.
+        if record.expires_at <= clock.now {
+            return Err(ExchangeError::InvalidGrant("session expired"));
+        }
         let exp = clock
             .now
-            .saturating_add(self.config.max_token_lifetime_secs);
+            .saturating_add(self.config.max_token_lifetime_secs)
+            .min(record.expires_at);
         let claims = ServiceClaims {
             iss: self.config.issuer.clone(),
             sub: hex(&record.principal.0),

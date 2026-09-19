@@ -212,6 +212,58 @@ impl UpdateLock {
     }
 }
 
+/// The update lock, held: load and store while nobody else can.
+///
+/// A refresh secret is single use, so reading it, spending it on the
+/// network and writing the replacement have to be one critical section.
+/// Loading outside the lock let two invocations spend the same secret,
+/// and the family's reuse detection then revoked it for both.
+pub struct UpdateGuard<'a> {
+    store: &'a dyn CredentialStore,
+    file: Option<File>,
+    _process: std::sync::MutexGuard<'static, ()>,
+}
+
+impl UpdateGuard<'_> {
+    /// The credentials as they are now.
+    pub fn load(&self) -> Result<Option<Credentials>, StoreError> {
+        self.store.load()
+    }
+
+    /// Replace the stored credentials.
+    pub fn save(&self, credentials: &Credentials) -> Result<(), StoreError> {
+        self.store.save(credentials)
+    }
+
+    /// Remove the stored credentials.
+    pub fn clear(&self) -> Result<(), StoreError> {
+        self.store.clear()
+    }
+}
+
+impl Drop for UpdateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+        }
+    }
+}
+
+/// Take the update lock for a sequence that has to be atomic across an
+/// await, such as spending a refresh secret.
+pub fn begin_update<'a>(
+    store: &'a dyn CredentialStore,
+    lock: &UpdateLock,
+) -> Result<UpdateGuard<'a>, StoreError> {
+    let process = PROCESS_LOCK.lock().expect("process lock");
+    let file = lock.acquire()?;
+    Ok(UpdateGuard {
+        store,
+        file: Some(file),
+        _process: process,
+    })
+}
+
 /// Load, transform and store under the lock: `f` sees the current
 /// credentials and returns what to keep (`None` clears).
 pub fn update(

@@ -10,6 +10,10 @@ use coordctl::{
     Credentials, KeyringStore, MemoryStore, StoreError, StoreKind, UpdateLock, open_store, update,
 };
 
+/// `keyring_core`'s default store is process-global, so the tests that
+/// install or assert the absence of one cannot run at the same time.
+static KEYRING_DEFAULT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn credentials(n: u64) -> Credentials {
     Credentials {
         broker: "http://127.0.0.1:1".into(),
@@ -23,6 +27,7 @@ fn credentials(n: u64) -> Credentials {
 
 #[test]
 fn explicit_stores_only_and_redaction() {
+    let _global = KEYRING_DEFAULT.lock().unwrap_or_else(|e| e.into_inner());
     // Memory: works, not persistent.
     let store = open_store(StoreKind::Memory, "coordctl", "broker").unwrap();
     assert!(!store.persistent());
@@ -56,6 +61,7 @@ fn explicit_stores_only_and_redaction() {
 
 #[test]
 fn the_keyring_store_maps_locked_and_missing_and_round_trips() {
+    let _global = KEYRING_DEFAULT.lock().unwrap_or_else(|e| e.into_inner());
     let mock = keyring_core::mock::Store::new().unwrap();
     keyring_core::set_default_store(mock.clone());
     let store = KeyringStore::open("coordctl", "broker-a", "mock").unwrap();
@@ -117,4 +123,44 @@ fn shared_credential_updates_are_serialized() {
     // Clearing under the lock.
     assert_eq!(update(store.as_ref(), &lock, |_| Ok(None)).unwrap(), None);
     assert_eq!(store.load().unwrap(), None);
+}
+
+#[test]
+fn a_rotation_holds_the_lock_across_the_exchange() {
+    // The refresh secret is single use. Loading it outside the lock let
+    // two invocations read the same secret and spend it twice, and the
+    // family's reuse detection then revoked it for both.
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CredentialStore> = Arc::new(MemoryStore::new());
+    store.save(&credentials(1)).unwrap();
+
+    let spent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut handles = Vec::new();
+    for n in 2..6u64 {
+        let store = Arc::clone(&store);
+        let lock = UpdateLock::new(&dir.path().join("lock"));
+        let spent = Arc::clone(&spent);
+        handles.push(thread::spawn(move || {
+            let guard = coordctl::begin_update(store.as_ref(), &lock).unwrap();
+            let current = guard.load().unwrap().expect("credentials");
+            // Stand in for the network round trip that spends the
+            // secret: whatever each rotation reads must be distinct.
+            spent
+                .lock()
+                .unwrap()
+                .push(current.refresh_token.clone().expect("a refresh token"));
+            thread::sleep(std::time::Duration::from_millis(5));
+            guard.save(&credentials(n)).unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let spent = spent.lock().unwrap().clone();
+    let distinct: std::collections::BTreeSet<_> = spent.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        spent.len(),
+        "each rotation spent a secret of its own: {spent:?}"
+    );
 }
