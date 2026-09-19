@@ -882,12 +882,20 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
                 "mapping cluster differs from the journal identity",
             ));
         }
-        if let Some(existing) = inner.mappings.get(&mapping.stream)
-            && (existing.key != mapping.key || existing.shard != mapping.shard)
-        {
-            return Err(definite(
-                "mapping identity of an allocated stream cannot change",
-            ));
+        if let Some(existing) = inner.mappings.get(&mapping.stream) {
+            if existing.key != mapping.key || existing.shard != mapping.shard {
+                return Err(definite(
+                    "mapping identity of an allocated stream cannot change",
+                ));
+            }
+            // Retirement is permanent. Only the key and the shard were
+            // checked, so persisting a stream's own older, active
+            // mapping brought a retired stream back: nothing else says a
+            // retired stream stays retired, and after a reopen it would
+            // take work again.
+            if existing.retired && !mapping.retired {
+                return Err(definite("a retired stream cannot become active again"));
+            }
         }
         if inner
             .mappings
