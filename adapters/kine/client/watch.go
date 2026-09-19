@@ -40,7 +40,11 @@ func (c *Client) OpenWatch(ctx context.Context, open wire.WatchOpen) (*Watch, er
 		c.dropLane(LaneWatch, conn)
 		return nil, ErrWatchLost
 	}
-	if err := writeFrame(stream, frame); err != nil {
+	// The open is bounded like any other frame write: a peer that stops
+	// granting flow control must not hold the caller past its deadline.
+	openCtx, cancelOpen := context.WithTimeout(ctx, c.cfg.FrameTimeout)
+	defer cancelOpen()
+	if err := writeFrameWithin(openCtx, stream, frame); err != nil {
 		c.dropLane(LaneWatch, conn)
 		return nil, ErrWatchLost
 	}
@@ -136,7 +140,11 @@ func (w *Watch) Cancel() {
 	w.once.Do(func() {
 		close(w.done)
 		if frame, err := wire.Encode(wire.WatchClose{WatchID: w.id, Reason: wire.WatchCancelled}); err == nil {
-			_ = writeFrame(w.stream, frame)
+			// Cancelling must not block on a stalled peer: the watch is
+			// being torn down either way.
+			cancelCtx, done := context.WithTimeout(context.Background(), w.c.cfg.FrameTimeout)
+			_ = writeFrameWithin(cancelCtx, w.stream, frame)
+			done()
 		}
 		_ = w.stream.Close()
 		w.stream.CancelRead(0)
