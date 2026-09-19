@@ -11,8 +11,15 @@ import (
 
 const maxFrameBytes = 8*1024*1024 + 64*1024
 
-// writeFrame writes a complete framed message.
-func writeFrame(stream *quic.Stream, frame []byte) error {
+// writeFrameWithin writes one wire frame under `ctx`'s deadline.
+//
+// Only reads were bounded, so a peer that stopped granting flow control
+// could hold a write - and the pool slot the caller took for it - well
+// past the frame timeout the caller believed it had.
+func writeFrameWithin(ctx context.Context, stream *quic.Stream, frame []byte) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetWriteDeadline(deadline)
+	}
 	_, err := stream.Write(frame)
 	return err
 }
