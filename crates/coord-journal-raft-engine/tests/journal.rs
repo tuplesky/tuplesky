@@ -789,3 +789,50 @@ fn sync_failure_inside_a_write_panics_and_fail_stops_until_reopen() {
     }
     assert!(!reopened.is_fail_stopped());
 }
+
+#[test]
+fn a_retired_stream_never_becomes_active_again() {
+    // Only the key and the shard were compared, so persisting a stream's
+    // own older, active mapping brought a retired stream back. Nothing
+    // else says a retired stream stays retired, so after a reopen it
+    // would take work again.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (mut journal, allocator, streams) = create(&root, Arc::new(DefaultFileSystem), &[1, 2]);
+    let active = *allocator.usable(streams[0].id).unwrap();
+    assert!(!active.retired, "the stream starts active");
+
+    let retired = StreamMappingV1 {
+        retired: true,
+        ..active
+    };
+    journal
+        .persist_mapping(allocator.high_water(), &retired)
+        .expect("retiring a stream is allowed");
+
+    // The same mapping as before retirement: same key, same shard, and
+    // active. It is refused.
+    let err = journal
+        .persist_mapping(allocator.high_water(), &active)
+        .unwrap_err();
+    assert!(err.is_definite(), "{err:?}");
+    assert_eq!(err.error().class, JournalErrorClass::GuardRejected);
+    // Re-persisting the retirement is idempotent.
+    journal
+        .persist_mapping(allocator.high_water(), &retired)
+        .expect("retiring again changes nothing");
+
+    // And it stays retired across a reopen, where the refusal is applied
+    // against what was actually durable.
+    drop(journal);
+    let mut reopened = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
+    let (hw, mappings) = reopened.mappings().unwrap();
+    let recovered = mappings
+        .iter()
+        .find(|m| m.stream == active.stream)
+        .expect("the mapping survived");
+    assert!(recovered.retired, "retirement is durable");
+    let err = reopened.persist_mapping(hw, &active).unwrap_err();
+    assert!(err.is_definite(), "{err:?}");
+    assert_eq!(err.error().class, JournalErrorClass::GuardRejected);
+}
