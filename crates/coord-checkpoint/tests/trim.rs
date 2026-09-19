@@ -64,8 +64,33 @@ fn epoch(n: u64) -> ConfigurationEpoch {
     ConfigurationEpoch::new(n).unwrap()
 }
 
+/// A canonical request. Recovery rederives a payload row's identity from
+/// its bytes, so a command in these fixtures is the identity of a real
+/// request, not a tag.
+fn request_of(n: u8) -> coord_types::logical_v1::LogicalRequest {
+    use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
+    let mut r = LogicalRequest::new(
+        NS,
+        CanonicalOperation::Put(PutOp {
+            key: vec![n],
+            value: vec![7],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    r.canonicalize();
+    r
+}
+
+fn payload_of(n: u8) -> PayloadRecordV1 {
+    PayloadRecordV1 {
+        retry_key: retry_key(u64::from(n)),
+        logical: postcard::to_allocvec(&request_of(n)).unwrap(),
+    }
+}
+
 fn command(n: u8) -> CommandId {
-    CommandId(Digest32([n; 32]))
+    CommandId::derive(&retry_key(u64::from(n)), &request_of(n)).unwrap()
 }
 
 fn voters() -> BTreeSet<ReplicaId> {
@@ -148,6 +173,7 @@ fn record(phase: Phase, deps: &[u8]) -> CommandRecord {
         payload: Some(Digest32([0x11; 32])),
         paths: vec![(b"k".to_vec(), Digest32([0x22; 32]))],
         path: Digest32([0x33; 32]),
+        synced_seq: None,
     }
 }
 
@@ -191,22 +217,14 @@ fn common_rows() -> Vec<Row> {
         put(
             Collection::PayloadV1,
             payload_key(&command(n)),
-            encode_payload(&PayloadRecordV1 {
-                retry_key: retry_key(u64::from(n)),
-                logical: format!("payload-{n}").into_bytes(),
-            })
-            .unwrap(),
+            encode_payload(&payload_of(n)).unwrap(),
         );
     }
     for (n, position) in [(1u8, 1u64), (2, 2), (3, 3), (5, 4), (7, 1), (8, 2)] {
         put(
             Collection::PayloadV1,
             payload_key(&command(n)),
-            encode_payload(&PayloadRecordV1 {
-                retry_key: retry_key(u64::from(n)),
-                logical: format!("payload-{n}").into_bytes(),
-            })
-            .unwrap(),
+            encode_payload(&payload_of(n)).unwrap(),
         );
         put(
             Collection::ExecutedV1,
@@ -342,11 +360,7 @@ fn seed<E: LocalEngine>(engine: &mut E, rows: Vec<Row>) {
     }
     let seq = LocalJournalSeq::new(17).unwrap();
     DurableMeta {
-        stamp: AppliedStamp {
-            store_seq: StoreSeq::from_journal(seq),
-            journal_seq: seq,
-            last_batch_digest: Digest32([0xcd; 32]),
-        },
+        stamp: AppliedStamp::new(StoreSeq::from_journal(seq), Digest32([0xcd; 32])),
         frontier: ExecutionFrontier {
             configuration: epoch(EPOCH),
             execution_position: pos(4),

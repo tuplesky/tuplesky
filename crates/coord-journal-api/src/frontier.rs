@@ -186,20 +186,20 @@ impl AppliedFrontier {
     }
 
     /// The applied stamp persisted atomically with the projection update.
-    pub const fn stamp(&self) -> AppliedStamp {
-        AppliedStamp {
-            store_seq: self.store_seq(),
-            journal_seq: self.materialized,
-            last_batch_digest: self.last_digest,
-        }
+    ///
+    /// The stamp derives its journal sequence from the store sequence
+    /// rather than taking one: the two are one fact, and the constructor
+    /// is what keeps them so.
+    pub fn stamp(&self) -> AppliedStamp {
+        AppliedStamp::new(self.store_seq(), self.last_digest)
     }
 
     /// Rebuild from a decoded stamp (the one-to-one mapping was already
     /// verified by the stamp decoder).
     pub const fn from_stamp(stamp: &AppliedStamp) -> Self {
         AppliedFrontier {
-            materialized: stamp.journal_seq,
-            last_digest: stamp.last_batch_digest,
+            materialized: stamp.journal_seq(),
+            last_digest: stamp.last_batch_digest(),
         }
     }
 }
@@ -282,8 +282,8 @@ mod tests {
         };
         assert_eq!(f.store_seq(), StoreSeq::from_journal(seq(42)));
         let stamp = f.stamp();
-        assert_eq!(stamp.journal_seq, seq(42));
-        assert_eq!(stamp.store_seq.journal_seq(), seq(42));
+        assert_eq!(stamp.journal_seq(), seq(42));
+        assert_eq!(stamp.store_seq().journal_seq(), seq(42));
         let decoded = AppliedStamp::from_envelope(&stamp.to_envelope().unwrap()).unwrap();
         assert_eq!(AppliedFrontier::from_stamp(&decoded), f);
         assert_eq!(AppliedFrontier::INITIAL.store_seq(), StoreSeq::INITIAL);

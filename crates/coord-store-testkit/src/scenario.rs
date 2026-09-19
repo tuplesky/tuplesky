@@ -143,25 +143,48 @@ pub struct ReplayOutcome {
 const MAX_REPLAY_PAGES: u32 = 1 << 16;
 
 /// Rows an engine writes for itself and that no scenario step produces: the
-/// identity and profile records under `meta_v1` (design Section 17.4). Only
-/// these are outside the logical comparison; every other row of every
+/// shared identity and profile records under `meta_v1` (design Section
+/// 17.4), plus any identity record an adapter keeps for itself under its
+/// own engine name (`engine` is the value of [`meta_fields::ENGINE`], so
+/// an adapter that records a physical layout writes `<engine>_layout`).
+/// Only these are outside the logical comparison; every other row of every
 /// collection, referenced by the scenario or not, must match the oracle.
-fn is_engine_private(collection: u16, key: &[u8]) -> bool {
-    collection == Collection::MetaV1.id().0
-        && [
-            meta_fields::CLUSTER_ID,
-            meta_fields::DOMAIN_ID,
-            meta_fields::REPLICA_ID,
-            meta_fields::INCARNATION,
-            meta_fields::FORMAT_VERSION,
-            meta_fields::ENGINE,
-            meta_fields::PROFILE,
-        ]
-        .contains(&key)
+///
+/// The prefix is the adapter's own recorded name, not a name it may choose
+/// per row, so the exemption cannot be stretched to cover a logical row:
+/// logical rows live in the other collections, and a `meta_v1` field the
+/// coordinator reads (the applied stamp, the frontiers, the floors) is
+/// never written under an engine's name.
+fn is_engine_private(collection: u16, key: &[u8], engine: &[u8]) -> bool {
+    if collection != Collection::MetaV1.id().0 {
+        return false;
+    }
+    if [
+        meta_fields::CLUSTER_ID,
+        meta_fields::DOMAIN_ID,
+        meta_fields::REPLICA_ID,
+        meta_fields::INCARNATION,
+        meta_fields::FORMAT_VERSION,
+        meta_fields::ENGINE,
+        meta_fields::PROFILE,
+    ]
+    .contains(&key)
+    {
+        return true;
+    }
+    let mut prefix = engine.to_vec();
+    prefix.push(b'_');
+    !engine.is_empty() && key.starts_with(&prefix)
 }
 
 fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
     let view = engine.reader().snapshot().map_err(|e| e.to_string())?;
+    // The adapter's own name bounds what it may keep to itself; read it
+    // before the scan so the exemption is the recorded one.
+    let engine_name = view
+        .get(Collection::MetaV1.id(), meta_fields::ENGINE)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
     let mut out = Vec::new();
     for c in Collection::ALL {
         let mut request = ScanRequest::all(64, 1 << 20);
@@ -189,7 +212,7 @@ fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
                     ));
                 }
                 last_key = Some(r.key.clone());
-                if is_engine_private(c.id().0, &r.key) {
+                if is_engine_private(c.id().0, &r.key, &engine_name) {
                     continue;
                 }
                 out.push((c.id().0, r.key.clone(), r.value.clone()));
@@ -290,4 +313,44 @@ pub fn replay<E: LocalEngine>(
         matches_expected: scenario.expected_digest.map(|d| d == digest),
         commits,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exemption covers exactly the shared identity records and the
+    /// adapter's own name-prefixed ones. It is not a way to hide a row the
+    /// coordinator reads, a row of another collection, or a row named
+    /// after some other engine.
+    #[test]
+    fn only_an_adapters_own_identity_records_are_outside_the_comparison() {
+        let meta = Collection::MetaV1.id().0;
+        let kv = Collection::KvCurrentV1.id().0;
+        assert!(is_engine_private(meta, meta_fields::ENGINE, b"fjall"));
+        assert!(is_engine_private(meta, b"fjall_layout", b"fjall"));
+        // Another engine's name is not this engine's exemption.
+        assert!(!is_engine_private(meta, b"fjall_layout", b"redb"));
+        // Fields the coordinator reads stay in the comparison.
+        assert!(!is_engine_private(
+            meta,
+            meta_fields::APPLIED_STAMP,
+            b"fjall"
+        ));
+        assert!(!is_engine_private(
+            meta,
+            meta_fields::EXECUTION_FRONTIER,
+            b"fjall"
+        ));
+        assert!(!is_engine_private(meta, meta_fields::KV_REVISION, b"fjall"));
+        // The prefix needs its separator, and it is a prefix of the key,
+        // not a substring of it.
+        assert!(!is_engine_private(meta, b"fjallish", b"fjall"));
+        assert!(!is_engine_private(meta, b"x_fjall_layout", b"fjall"));
+        // No collection but meta_v1 has private rows at all, and an
+        // engine that records no name exempts nothing beyond the shared
+        // records.
+        assert!(!is_engine_private(kv, b"fjall_layout", b"fjall"));
+        assert!(!is_engine_private(meta, b"_layout", b""));
+    }
 }

@@ -101,6 +101,24 @@ impl KindRange {
     }
 }
 
+/// Session binding, client to frontend (`spec/wire-v1.md`, "API session
+/// binding"). It is a raw kind of the API range: its payload is
+/// `coord_session::BindV1`, which this crate does not know, so the frame
+/// is dispatched by kind at the session boundary instead of through
+/// [`decode`]. The constant lives here because the vocabulary is one
+/// registry even where the payload is not: the transport admits exactly
+/// this kind on a request stream and `coord-session` answers it, and
+/// neither may name a different number.
+pub const KIND_SESSION_BIND: u16 = 0x0105;
+
+/// Acknowledgement of [`KIND_SESSION_BIND`], frontend to client. Also a
+/// raw kind; the payload is `coord_session::BindAckV1`.
+pub const KIND_SESSION_BIND_ACK: u16 = 0x0106;
+
+/// The only schema version of the binding frames this build understands.
+/// A frame of any other version is refused at the boundary.
+pub const SESSION_BIND_VERSION: u16 = 1;
+
 /// Registered message kinds with frozen discriminants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]

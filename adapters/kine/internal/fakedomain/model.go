@@ -201,7 +201,16 @@ func kineKv(key string, e *Entry) *wire.KineKv {
 	if e == nil {
 		return nil
 	}
-	return &wire.KineKv{Key: []byte(key), Entry: toWire(e), TTLSeconds: e.TTLSeconds}
+	// A Kine-facing entry carries no lease identity: the private binding
+	// that backs the TTL never reaches a Kine caller.
+	return &wire.KineKv{
+		Key:            []byte(key),
+		Value:          e.Value,
+		CreateRevision: e.CreateRevision,
+		ModRevision:    e.ModRevision,
+		Version:        e.Version,
+		TTLSeconds:     e.TTLSeconds,
+	}
 }
 
 // Apply executes one logical request at one execution point and returns

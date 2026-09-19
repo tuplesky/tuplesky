@@ -188,40 +188,19 @@
                 47,
                 98
               ],
-              "entry": {
-                "value": [
-                  118,
-                  98
-                ],
-                "create_revision": 11,
-                "mod_revision": 11,
-                "version": 1,
-                "lease": [
-                  107,
-                  105,
-                  110,
-                  101,
-                  45,
-                  98,
-                  105,
-                  110,
-                  100,
-                  45,
-                  48,
-                  48,
-                  48,
-                  48,
-                  48,
-                  49
-                ],
-                "lease_generation": 1
-              },
+              "value": [
+                118,
+                98
+              ],
+              "create_revision": 11,
+              "mod_revision": 11,
+              "version": 1,
               "ttl_seconds": 30
             }
           }
         }
       },
-      "payload_hex": "0b1501010b2f72656769737472792f620276620b0b01016b696e652d62696e642d30303030303101011e"
+      "payload_hex": "0b1501010b2f72656769737472792f620276620b0b011e"
     },
     {
       "name": "kine-updated-mismatch",
@@ -244,23 +223,19 @@
                 47,
                 97
               ],
-              "entry": {
-                "value": [
-                  118,
-                  97
-                ],
-                "create_revision": 3,
-                "mod_revision": 7,
-                "version": 2,
-                "lease": null,
-                "lease_generation": null
-              },
+              "value": [
+                118,
+                97
+              ],
+              "create_revision": 3,
+              "mod_revision": 7,
+              "version": 2,
               "ttl_seconds": 0
             }
           }
         }
       },
-      "payload_hex": "071500010b2f72656769737472792f61027661030702000000"
+      "payload_hex": "071500010b2f72656769737472792f6102766103070200"
     },
     {
       "name": "kine-updated-absent",
@@ -309,40 +284,19 @@
                 47,
                 98
               ],
-              "entry": {
-                "value": [
-                  118,
-                  98
-                ],
-                "create_revision": 11,
-                "mod_revision": 11,
-                "version": 1,
-                "lease": [
-                  107,
-                  105,
-                  110,
-                  101,
-                  45,
-                  98,
-                  105,
-                  110,
-                  100,
-                  45,
-                  48,
-                  48,
-                  48,
-                  48,
-                  48,
-                  49
-                ],
-                "lease_generation": 1
-              },
+              "value": [
+                118,
+                98
+              ],
+              "create_revision": 11,
+              "mod_revision": 11,
+              "version": 1,
               "ttl_seconds": 30
             }
           }
         }
       },
-      "payload_hex": "071600010b2f72656769737472792f620276620b0b01016b696e652d62696e642d30303030303101011e"
+      "payload_hex": "071600010b2f72656769737472792f620276620b0b011e"
     },
     {
       "name": "kine-deleted-applied",
@@ -365,23 +319,19 @@
                 47,
                 97
               ],
-              "entry": {
-                "value": [
-                  118,
-                  97
-                ],
-                "create_revision": 3,
-                "mod_revision": 7,
-                "version": 2,
-                "lease": null,
-                "lease_generation": null
-              },
+              "value": [
+                118,
+                97
+              ],
+              "create_revision": 3,
+              "mod_revision": 7,
+              "version": 2,
               "ttl_seconds": 0
             }
           }
         }
       },
-      "payload_hex": "081601010b2f72656769737472792f61027661030702000000"
+      "payload_hex": "081601010b2f72656769737472792f6102766103070200"
     },
     {
       "name": "compacted",

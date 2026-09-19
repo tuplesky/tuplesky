@@ -18,7 +18,8 @@ use coord_transport::{
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedVec, CloseV1, HEADER_LEN, HelloV1, MessageV1, PeerRole, encode_frame,
+    BoundedVec, CloseV1, HEADER_LEN, HelloV1, KIND_SESSION_BIND, KIND_SESSION_BIND_ACK, MessageV1,
+    PeerRole, SESSION_BIND_VERSION, encode_frame,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::time::timeout;
@@ -919,6 +920,85 @@ async fn api_streams_carry_only_client_originated_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_session_binding_is_the_only_undecodable_kind_an_api_stream_may_carry() {
+    // The binding frame's payload belongs to `coord-session`, so this
+    // crate admits it by kind. That exception is enumerated: it covers
+    // exactly this kind at exactly this version, and no other kind the
+    // typed decoder does not know reaches a consumer.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    let (_client, conn, _control) = negotiated(
+        &f,
+        &f.ids[1],
+        ALPN_API,
+        &mut acceptor,
+        PeerRole::Frontend,
+        &[],
+    )
+    .await;
+
+    // The binding arrives as a request frame, undecoded.
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(
+        &encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, &[0x02, 0xaa, 0xbb]).unwrap(),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    loop {
+        match event(&mut acceptor).await {
+            TransportEvent::ApiRequest { frame, .. } => {
+                assert_eq!(frame.kind, KIND_SESSION_BIND);
+                assert_eq!(frame.version, SESSION_BIND_VERSION);
+                break;
+            }
+            TransportEvent::Closed { reason, .. } => panic!("binding refused: {reason:?}"),
+            _ => {}
+        }
+    }
+
+    // A binding of another version, the acknowledgement kind (which only
+    // the frontend may send), and a neighbouring unregistered kind are
+    // each refused. A refusal closes the connection, so each case gets
+    // its own.
+    for (kind, version) in [
+        (KIND_SESSION_BIND, SESSION_BIND_VERSION + 1),
+        (KIND_SESSION_BIND_ACK, SESSION_BIND_VERSION),
+        (KIND_SESSION_BIND + 0x10, SESSION_BIND_VERSION),
+    ] {
+        let (_client, conn, _control) = negotiated(
+            &f,
+            &f.ids[1],
+            ALPN_API,
+            &mut acceptor,
+            PeerRole::Frontend,
+            &[],
+        )
+        .await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&encode_frame(kind, version, &[0x02, 0xaa, 0xbb]).unwrap())
+            .await
+            .unwrap();
+        send.finish().unwrap();
+        loop {
+            match event(&mut acceptor).await {
+                TransportEvent::ApiRequest { .. } => {
+                    panic!("{kind:#06x} v{version} was dispatched as a request")
+                }
+                TransportEvent::Closed { reason, .. } => {
+                    assert!(
+                        matches!(reason, CloseReason::Malformed(_)),
+                        "{kind:#06x} v{version}: {reason:?}"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_close_pipelined_behind_the_hello_is_not_lost() {
     // One QUIC read can carry the hello and the close that follows it.
     // The reader holding those extra bytes lives with the control stream,
@@ -1151,6 +1231,8 @@ fn request_frame() -> Vec<u8> {
     MessageV1::Request(coord_types::wire_v1::RequestV1::new(retry_key, &request, 0).unwrap())
         .encode()
         .unwrap()
+}
+
 /// Open a raw QUIC connection to `acceptor` offering `alpn`, with a
 /// client certificate only when `identity` is given, and send `first` as
 /// the first control frame. Returns how the acceptor ended it.

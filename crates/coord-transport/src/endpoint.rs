@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, CloseV1, Frame, HelloAckV1, HelloV1, MessageV1, PeerRole, decode,
+    BoundedBytes, BoundedVec, CloseV1, Frame, HelloAckV1, HelloV1, KIND_SESSION_BIND, MessageV1,
+    PeerRole, SESSION_BIND_VERSION, decode,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{RecvStream, SendStream, VarInt};
@@ -1460,13 +1461,26 @@ async fn read_request(
             // frame, a server-origin message or a handshake message as an
             // API request would make the malformed-frame contract the duty
             // of every consumer downstream.
-            let reason = match decode(&frame) {
-                Ok(m) if client_request(&m) => None,
-                Ok(m) => Some(CloseReason::Malformed(format!(
-                    "api frame {:?} is not a request",
-                    m.kind()
-                ))),
-                Err(e) => Some(CloseReason::Malformed(format!("{e:?}"))),
+            //
+            // The session binding is the one exception, and an enumerated
+            // one: it is a raw kind whose payload belongs to
+            // `coord-session`, so this crate cannot decode it and checks
+            // the kind and version instead. Admitting it here is what lets
+            // a connection bind at all; everything else still has to
+            // decode to a client request.
+            let reason = if frame.kind == KIND_SESSION_BIND {
+                (frame.version != SESSION_BIND_VERSION).then(|| {
+                    CloseReason::Malformed(format!("bind frame version {}", frame.version))
+                })
+            } else {
+                match decode(&frame) {
+                    Ok(m) if client_request(&m) => None,
+                    Ok(m) => Some(CloseReason::Malformed(format!(
+                        "api frame {:?} is not a request",
+                        m.kind()
+                    ))),
+                    Err(e) => Some(CloseReason::Malformed(format!("{e:?}"))),
+                }
             };
             if let Some(reason) = reason {
                 *peer.close_reason.lock().unwrap() = Some(reason.clone());

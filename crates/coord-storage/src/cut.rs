@@ -115,7 +115,7 @@ impl<V: OrderedRead> RecoveryCut<V> {
 
     /// The materialized sequence the underlying snapshot proves (`M`).
     pub fn materialized(&self) -> LocalJournalSeq {
-        self.snapshot.meta().stamp.journal_seq
+        self.snapshot.meta().stamp.journal_seq()
     }
 
     /// The overlay the cut adds over the snapshot.

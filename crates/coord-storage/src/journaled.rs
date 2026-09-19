@@ -633,7 +633,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         }
         let frontiers = Frontiers::recovered(durable, applied.materialized, LocalJournalSeq::ZERO)?;
         let gate = Arc::new(Frontier::default());
-        gate.set_completed(meta.stamp.store_seq);
+        gate.set_completed(meta.stamp.store_seq());
         let mut state = Domain {
             origin,
             engine,
@@ -1225,10 +1225,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 let observed = DurableMeta::read(&state.engine.reader().snapshot()?)?;
                 if observed == expected {
                     state.meta = observed;
-                    state.gate.set_completed(observed.stamp.store_seq);
+                    state.gate.set_completed(observed.stamp.store_seq());
                     state
                         .frontiers
-                        .advance_materialized(observed.stamp.journal_seq)?;
+                        .advance_materialized(observed.stamp.journal_seq())?;
                     let applied = std::mem::take(&mut state.pending);
                     report.materialized = applied.len();
                     report.commits = 1;
@@ -1292,7 +1292,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let reader = GatedReader::new(state.engine.reader(), state.gate.clone());
         let snapshot = reader.snapshot().map_err(CutError::View)?;
         let durable = state.frontiers.durable();
-        let mut seq = snapshot.meta().stamp.journal_seq;
+        let mut seq = snapshot.meta().stamp.journal_seq();
         let mut overlay = CutOverlay::new();
         if seq < durable {
             let mut expect = RecordExpectation {
@@ -1300,7 +1300,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 seq: seq.checked_next().map_err(|_| {
                     CutError::Journal(JournaledError::Record(RecordError::Malformed))
                 })?,
-                predecessor: snapshot.meta().stamp.last_batch_digest,
+                predecessor: snapshot.meta().stamp.last_batch_digest(),
             };
             while seq < durable {
                 let page = self
@@ -1377,11 +1377,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 for update in record.body().updates() {
                     lower_update(&mut tx, update)?;
                 }
-                meta.stamp = AppliedStamp {
-                    store_seq: StoreSeq::from_journal(record.seq()),
-                    journal_seq: record.seq(),
-                    last_batch_digest: record.digest(),
-                };
+                // The journal sequence is derived from the store sequence
+                // by the constructor, never chosen alongside it.
+                meta.stamp =
+                    AppliedStamp::new(StoreSeq::from_journal(record.seq()), record.digest());
                 expect = record.seq().checked_next().ok();
             }
         }
@@ -1422,10 +1421,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         match commit {
             Ok(()) => {
                 state.meta = meta;
-                state.gate.set_completed(meta.stamp.store_seq);
+                state.gate.set_completed(meta.stamp.store_seq());
                 state
                     .frontiers
-                    .advance_materialized(meta.stamp.journal_seq)?;
+                    .advance_materialized(meta.stamp.journal_seq())?;
                 state.pending_meta = None;
                 state.status = DomainStatus::Ready;
                 report.commits = 1;

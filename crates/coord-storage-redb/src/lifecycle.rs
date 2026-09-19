@@ -592,7 +592,10 @@ impl InactiveGeneration {
         identity: StoreIdentity,
         options: OpenOptions,
     ) -> Result<InactiveGeneration, OpenError> {
-        let lock = RootLock::acquire(root)?;
+        // Staging may be a node's first state, so the root is created if
+        // it is not there: the contract above admits an uninitialized
+        // root, unlike opening an existing one.
+        let lock = RootLock::acquire(root, true)?;
         stage_with_lock(root, lock, identity, options)
     }
 

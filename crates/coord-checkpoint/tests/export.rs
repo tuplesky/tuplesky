@@ -361,11 +361,10 @@ fn seed<E: LocalEngine>(engine: &mut E, profile: Profile) {
     }
     let seq = LocalJournalSeq::new(profile.stamp.max(1)).unwrap();
     DurableMeta {
-        stamp: AppliedStamp {
-            store_seq: StoreSeq::from_journal(seq),
-            journal_seq: seq,
-            last_batch_digest: Digest32([profile.stamp as u8; 32]),
-        },
+        stamp: AppliedStamp::new(
+            StoreSeq::from_journal(seq),
+            Digest32([profile.stamp as u8; 32]),
+        ),
         frontier: ExecutionFrontier {
             configuration: ConfigurationEpoch::new(1).unwrap(),
             execution_position: pos(3),
@@ -758,8 +757,12 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
     );
     // Frames round trip.
     let mut reader = FrameReader::new();
-    reader.push(&cp.manifest.frame().unwrap());
-    reader.push(&cp.chunks[0].frame().unwrap());
+    reader
+        .push(&cp.manifest.frame().unwrap())
+        .expect("within the reader bound");
+    reader
+        .push(&cp.chunks[0].frame().unwrap())
+        .expect("within the reader bound");
     let f1 = reader.next_frame().unwrap().unwrap();
     let f2 = reader.next_frame().unwrap().unwrap();
     assert_eq!(f1.kind, kinds::MANIFEST);
@@ -776,7 +779,9 @@ fn chunks_are_bounded_verified_and_every_tampering_is_caught() {
     let many = with_descriptors(&cp.manifest, MAX_CHUNKS / 2, 0);
     assert!(many.encode().unwrap().len() > CHUNK_TARGET_BYTES / 4);
     let mut reader = FrameReader::new();
-    reader.push(&many.frame().unwrap());
+    reader
+        .push(&many.frame().unwrap())
+        .expect("within the reader bound");
     let framed = reader.next_frame().unwrap().unwrap();
     assert_eq!(framed.kind, kinds::MANIFEST);
     assert_eq!(SharedManifestV1::from_frame(&framed).unwrap(), many);
@@ -838,7 +843,9 @@ fn a_manifest_that_no_snapshot_frame_can_carry_is_neither_exported_nor_verified(
     let bytes = biggest.encode().unwrap();
     assert!(bytes.len() <= MAX_MANIFEST_BYTES, "{}", bytes.len());
     let mut reader = FrameReader::new();
-    reader.push(&biggest.frame().unwrap());
+    reader
+        .push(&biggest.frame().unwrap())
+        .expect("within the reader bound");
     let framed = reader.next_frame().unwrap().unwrap();
     assert_eq!(SharedManifestV1::from_frame(&framed).unwrap(), biggest);
     // Its chunks are synthetic, so verification stops at the sequence, not
@@ -940,13 +947,9 @@ impl<V: OrderedRead> OrderedRead for MutatingView<V> {
             tx.put(
                 Collection::MetaV1.id(),
                 meta_fields::APPLIED_STAMP,
-                &AppliedStamp {
-                    store_seq: StoreSeq::from_journal(seq),
-                    journal_seq: seq,
-                    last_batch_digest: Digest32([0xee; 32]),
-                }
-                .to_envelope()
-                .unwrap(),
+                &AppliedStamp::new(StoreSeq::from_journal(seq), Digest32([0xee; 32]))
+                    .to_envelope()
+                    .unwrap(),
             )
             .unwrap();
             tx.commit_durable().unwrap();

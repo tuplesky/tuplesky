@@ -22,9 +22,12 @@ type jsonEntry struct {
 }
 
 type jsonKineKv struct {
-	Key        []byte    `json:"key"`
-	Entry      jsonEntry `json:"entry"`
-	TTLSeconds uint32    `json:"ttl_seconds"`
+	Key            []byte `json:"key"`
+	Value          []byte `json:"value"`
+	CreateRevision uint64 `json:"create_revision"`
+	ModRevision    uint64 `json:"mod_revision"`
+	Version        uint64 `json:"version"`
+	TTLSeconds     uint32 `json:"ttl_seconds"`
 }
 
 type responseVector struct {
@@ -45,11 +48,18 @@ func (e jsonEntry) entry(t *testing.T) KvEntry {
 	return out
 }
 
-func (k *jsonKineKv) kv(t *testing.T) *KineKv {
+func (k *jsonKineKv) kv(*testing.T) *KineKv {
 	if k == nil {
 		return nil
 	}
-	return &KineKv{Key: k.Key, Entry: k.Entry.entry(t), TTLSeconds: k.TTLSeconds}
+	return &KineKv{
+		Key:            k.Key,
+		Value:          k.Value,
+		CreateRevision: k.CreateRevision,
+		ModRevision:    k.ModRevision,
+		Version:        k.Version,
+		TTLSeconds:     k.TTLSeconds,
+	}
 }
 
 var unitOutcomes = map[string]OutcomeKind{

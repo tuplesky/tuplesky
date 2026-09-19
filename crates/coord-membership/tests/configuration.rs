@@ -99,9 +99,19 @@ fn manifest(cluster: ClusterId, domain: DomainId, voters: &[&Node]) -> GenesisMa
             .map(|v| VoterSeed {
                 node: hex_id(&v.id.0),
                 incarnation: v.incarnation.get(),
+                // Genesis commits each voter's key, so a certificate the
+                // issuer signs for a committed node is not by itself
+                // that voter (task-42).
+                public_key: coord_membership::genesis::b64url(v.key.public_key_raw()),
             })
             .collect(),
         issuer_roots: vec!["cm9vdA".to_owned()],
+        wif_rules: vec![serde_json::json!({
+            "issuer": "k8s",
+            "namespace": "voters",
+            "serviceaccount": "voter",
+            "scope_ceiling": 7,
+        })],
         admin: hex_id(&[9; 16]),
         protocol_version: PROTOCOL,
     }
@@ -672,7 +682,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
         &[w.n(4), w.n(5), w.n(2)],
     );
     client.install_ballot(b2).unwrap();
-    assert_eq!(client.ballot().unwrap().ballot.number, 2);
+    assert_eq!(client.ballot().unwrap().ballot().number, 2);
     // A lower ballot is stale.
     let b0 = ballot_record(&e2, 1, leader, &[w.n(1), w.n(2), w.n(3)], &promisers);
     assert_eq!(client.install_ballot(b0), Err(BallotError::Stale));
@@ -839,7 +849,7 @@ fn a_ballot_certificate_of_one_domain_is_refused_by_another_that_shares_its_vote
         Err(BallotError::OriginMismatch)
     );
     // The domain the promises were made in still holds them.
-    assert_eq!(here.ballot().unwrap().ballot.number, 7);
+    assert_eq!(here.ballot().unwrap().ballot().number, 7);
     here.install_ballot(mine).unwrap();
 }
 
@@ -1008,6 +1018,6 @@ fn historical_evidence_verifies_without_an_issuer() {
     // An old epoch's ballot configuration verifies as history too.
     let b = ballot_record(&w.root, 4, w.n(1), &[w.n(1), w.n(2)], &[w.n(1), w.n(3)]);
     let config = chain.verify_ballot(&b).unwrap();
-    assert_eq!(config.epoch, epoch(1));
+    assert_eq!(config.epoch(), epoch(1));
     assert_eq!(config.fast_size(), 2);
 }
