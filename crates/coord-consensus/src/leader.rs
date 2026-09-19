@@ -21,6 +21,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use coord_core::capability::ReleasedResult;
 use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch, StoreUpdate};
 use coord_core::event::{Event, StorageError, StorageEvent};
 use coord_core::machine::DeterministicMachine;
@@ -495,9 +496,6 @@ impl Leader {
         command: CommandId,
         outcome: &AppliedOutcome,
     ) -> Result<Vec<Effect>, LearnError> {
-        self.speculation
-            .reconcile(command, outcome.position, outcome.result_digest)
-            .map_err(LearnError::Speculation)?;
         let result = self.learner.established(
             &mut self.table,
             command,
@@ -506,7 +504,33 @@ impl Leader {
             outcome,
         )?;
         self.learn();
-        let mut effects = alloc::vec![Effect::Established(result)];
+        // A command whose result was released speculatively is already
+        // disclosed; releasing it again would answer one caller twice.
+        // A command whose result was *not* is only disclosed here.
+        //
+        // This is the final path the speculative one is an optimization
+        // of, and without it a command the companion declined -- one
+        // that is not speculable, one over the overlay's budget, one
+        // whose authorized view could not be built -- would execute,
+        // become durable, and never be answered. Its caller would wait
+        // on a disclosure nothing was going to assemble.
+        //
+        // It rests on more evidence than the speculative release, not
+        // less: the command is committed, its whole prefix has executed
+        // before it, and its result is materialized and durable. That is
+        // why it carries `speculative: false`.
+        let released = self.speculation.released(&command);
+        self.speculation
+            .reconcile(command, outcome.position, outcome.result_digest)
+            .map_err(LearnError::Speculation)?;
+        let mut effects = alloc::vec![Effect::Established(result.clone())];
+        if self.is_leading() && !released {
+            effects.push(Effect::Released(ReleasedResult::from_gate(
+                result,
+                outcome.response.clone(),
+                false,
+            )));
+        }
         effects.extend(self.release_ready());
         Ok(effects)
     }

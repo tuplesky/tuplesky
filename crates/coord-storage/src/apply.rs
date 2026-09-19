@@ -232,6 +232,7 @@ impl<P: Persistence> Applier<P> {
                         position: record.position,
                         revision: record.revision,
                         result_digest: record.result_digest,
+                        response: record.response.clone(),
                     });
                 }
                 // Every chosen command finishes. A semantic admission
@@ -260,6 +261,7 @@ impl<P: Persistence> Applier<P> {
                                 position: planned.position,
                                 revision: None,
                                 result_digest: retry::result_digest(&response),
+                                response,
                             });
                         }
                         ApplyOutcome::Replan => continue,
@@ -330,6 +332,7 @@ impl<P: Persistence> Applier<P> {
                         position: planned.position,
                         revision: planned.revision,
                         result_digest: retry::result_digest(&response),
+                        response,
                     });
                 }
                 ApplyOutcome::Replan => continue,

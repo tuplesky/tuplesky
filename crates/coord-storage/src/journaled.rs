@@ -914,7 +914,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
             _ => return Err(SubmitRefused::BaseMismatchedKind),
         };
-        check_update_bounds(&submission.batch).map_err(SubmitRefused::Record)?;
+        check_update_bounds(&submission.batch, &submission.kind).map_err(SubmitRefused::Record)?;
         let bytes = batch_bytes(&submission.batch);
         if bytes.saturating_add(RECORD_HEADER_ALLOWANCE) > MAX_RECORD_BYTES {
             // Refused here rather than at sealing time, so a batch that
@@ -1482,8 +1482,14 @@ fn frontier_after(frontier: ExecutionFrontier, record: &JournalRecordV1) -> Exec
 
 /// The record bounds that do not depend on the stream position, checked at
 /// submission so a refusal costs no engine work.
-fn check_update_bounds(batch: &PersistBatch) -> Result<(), RecordError> {
-    if batch.updates.is_empty() {
+///
+/// A protocol transition with no updates is a record of nothing and is
+/// refused here. An application outcome is not: it carries the position
+/// the command took, and a command that legitimately changed no rows --
+/// a rejection, a comparison that did not match -- still took one, and
+/// losing that record would free the position for a successor.
+fn check_update_bounds(batch: &PersistBatch, kind: &TransitionKind) -> Result<(), RecordError> {
+    if batch.updates.is_empty() && matches!(kind, TransitionKind::Protocol) {
         return Err(RecordError::EmptyUpdates);
     }
     if batch.updates.len() > MAX_RECORD_UPDATES {
