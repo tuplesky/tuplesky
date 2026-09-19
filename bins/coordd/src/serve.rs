@@ -15,6 +15,7 @@
 
 use coord_authn::ClockHealth;
 use coord_collector::{Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher};
+use coord_daemon::mailbox::LocalRoute;
 use coord_daemon::pending::Pending;
 use coord_daemon::serve::{Step, step};
 use coord_daemon::{Config, fanout};
@@ -67,6 +68,10 @@ pub struct Frontend<P: Persistence> {
     applier: Applier<P>,
     membership: Membership,
     pending: Pending<Responder>,
+    /// The ingress of a voter running in this process, where there is
+    /// one. A frontend-only process has `None` here and reaches every
+    /// voter over the wire.
+    local: Option<LocalRoute>,
     /// What the loop has done, for the readiness report. Counts, not
     /// contents: a diagnostic that carried a caller's data would be a
     /// disclosure by another name.
@@ -74,13 +79,26 @@ pub struct Frontend<P: Persistence> {
 }
 
 /// What a serving loop has seen.
+///
+/// Every submission count below says an ingress accepted responsibility
+/// for a frame. None of them says a voter processed it, that anything
+/// became durable, or that a command was applied: evidence is counted by
+/// the collector, by voter identity, and nowhere else.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
-    /// Voters a submission reached.
-    pub reached: u64,
-    /// Voters a submission could not reach. Not a failure of the
+    /// Frames taken by a voter running in this process.
+    pub queued_local: u64,
+    /// Frames the transport admitted for a voter elsewhere.
+    pub queued_remote: u64,
+    /// Targets the committed configuration does not name as voters of
+    /// this domain: the plan and the configuration disagree.
+    pub not_a_voter: u64,
+    /// Destinations whose ingress was full. A live voter under load, not
+    /// an absent one.
+    pub saturated: u64,
+    /// Destinations there was no route to. Not a failure of the
     /// submission: only the quorum rule decides that.
-    pub unreachable: u64,
+    pub unavailable: u64,
     /// Watches opened.
     pub watches: u64,
     /// Frames this build has no loop for yet, counted rather than
@@ -90,10 +108,17 @@ pub struct Counts {
 
 impl<P: Persistence> Frontend<P> {
     /// Build the frontend this configuration describes.
+    ///
+    /// `local` is the ingress of a voter running in this process, where
+    /// there is one. It is a capability the voter's runtime hands over,
+    /// not something the frontend may decide it has; which target it
+    /// applies to is still the committed configuration's answer, checked
+    /// on every submission.
     pub fn new(
         config: &Config,
         membership: Membership,
         applier: Applier<P>,
+        local: Option<LocalRoute>,
     ) -> Result<Self, ServeError> {
         let sts = config.sts.as_ref().ok_or(ServeError::NoTokenService)?;
         let jwks = std::fs::read(&sts.jwks).map_err(|e| ServeError::Jwks {
@@ -153,6 +178,7 @@ impl<P: Persistence> Frontend<P> {
             applier,
             membership,
             pending: Pending::new(),
+            local,
             counts: Counts::default(),
         })
     }
@@ -248,9 +274,17 @@ impl<P: Persistence> Frontend<P> {
                 {
                     drop(displaced);
                 }
-                let sent = fanout::dispatch(&self.membership, transport, &plan);
-                self.counts.reached += sent.reached() as u64;
-                self.counts.unreachable += sent.unreachable.len() as u64;
+                let out = fanout::dispatch(
+                    &self.membership,
+                    transport,
+                    self.local.as_ref().map(|l| l as &dyn fanout::LocalIngress),
+                    &plan,
+                );
+                self.counts.queued_local += out.queued_local() as u64;
+                self.counts.queued_remote += out.queued_remote() as u64;
+                self.counts.not_a_voter += out.not_a_committed_voter() as u64;
+                self.counts.saturated += out.saturated() as u64;
+                self.counts.unavailable += out.unavailable() as u64;
             }
             Step::Watch { .. } => {
                 // The watch's own stream, held for its lifetime. Pumping
