@@ -19,6 +19,7 @@
 
 mod genesis;
 mod membership;
+mod serve;
 mod store;
 
 use std::process::ExitCode;
@@ -216,7 +217,34 @@ fn main() -> ExitCode {
         storage_ready: true,
         ..Readiness::default()
     });
-    let listeners = match bind_listeners(&config.listen) {
+    // The frontend is built before a listener exists. A process that
+    // bound first and then found it had no keys to verify callers with
+    // would accept connections and refuse every one of them, while
+    // reporting itself live throughout -- which reads as a client
+    // problem and is the most expensive kind of misconfiguration to
+    // find. This is the order that makes `live` mean it.
+    let boot = storage.boot;
+    let applier = match coord_storage::Applier::new(
+        storage.domain,
+        coord_core::outbox::BarrierAllocator::new(placed.incarnation, boot),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            lifecycle.quarantine(QuarantineReason::Disk);
+            eprintln!("cannot serve from this store: {e:?}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut frontend = match serve::Frontend::new(&config, placed.membership.clone(), applier) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!("frontend ready waiting={}", frontend.waiting());
+
+    let mut listeners = match bind_listeners(&config.listen) {
         Ok(l) => l,
         Err(e) => {
             lifecycle.quarantine(QuarantineReason::Listeners);
@@ -232,15 +260,56 @@ fn main() -> ExitCode {
     for (name, address) in listeners.addresses() {
         println!("listening {name}={address}");
     }
+
+    // Readiness is not liveness. The listeners are up and the frontend
+    // can decide, but a voter is ready only on fresh quorum evidence,
+    // which arrives with the peer loop; the process says `live` and not
+    // `ready`, which is the truth about it.
     let diagnostics = Diagnostics::snapshot(&roles, &lifecycle, 0);
     println!("coordd phase={}", diagnostics.phase);
-    // Consensus and serving arrive with the later integration tasks, so
-    // the process holds its listeners and reports Live rather than Ready:
-    // it is up, and it is honest that it is not yet serving.
-    eprintln!("reference preview: listeners bound; serving not enabled in this build");
-    loop {
-        std::thread::park();
-    }
+
+    // The socket is taken here, while the listeners are still this
+    // function's: the endpoint serves on the socket that was bound, not
+    // on the address it reported.
+    let api_socket = listeners.take_api();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot start the runtime: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    runtime.block_on(async move {
+        let Some(socket) = api_socket else {
+            eprintln!("this process serves clients but bound no api listener");
+            return ExitCode::from(2);
+        };
+        let mut transport = match serve::api_endpoint(&config, &placed.membership, socket) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        };
+        frontend.run(&mut transport, now_seconds).await;
+        let counts = frontend.counts();
+        eprintln!(
+            "the api plane ended: reached={} unreachable={} watches={} unserved={}",
+            counts.reached, counts.unreachable, counts.watches, counts.unserved
+        );
+        ExitCode::from(1)
+    })
+}
+
+/// Wall-clock seconds. A binding's validity is stated in them, so this
+/// is the one place the process reads the clock for that purpose.
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A short, stable rendering of an identity for an operator's eye. It is

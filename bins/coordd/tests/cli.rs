@@ -163,11 +163,30 @@ fn issue(
     }
 }
 
+/// The issuer's published keys, as a frontend reads them at startup.
+///
+/// A real key ring rather than a stub: the frontend parses these into
+/// the verifier it will hold, so a shape it would reject at runtime has
+/// to be rejected here too.
+fn sts_keys(dir: &Path) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("sts key");
+    let ring = coord_sts::KeyRing::new(
+        coord_sts::SigningKey::from_pkcs8_der("coordd-test-1", &key.serialize_der())
+            .expect("signing key"),
+    );
+    std::fs::write(
+        dir.join("sts-jwks.json"),
+        serde_json::to_vec_pretty(&ring.jwks()).expect("jwks"),
+    )
+    .expect("write jwks");
+}
+
 /// A configuration whose listeners are ephemeral loopback ports, so the
 /// test never depends on a fixed port or on IPv6 being available.
 fn config(dir: &Path) -> PathBuf {
     genesis(dir);
     credentials(dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    sts_keys(dir);
     let text = format!(
         r#"config_version = 2
 role = "voter-frontend-observer"
@@ -502,15 +521,19 @@ fn start_and_report(config: &Path) -> String {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut report = String::new();
+        let mut live = false;
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let live = line.contains("phase=live");
+            live = line.contains("phase=live");
             report.push_str(&line);
             report.push('\n');
             if live {
                 break;
             }
         }
-        let _ = tx.send(report);
+        // Reaching the end of its output is not reaching a serving
+        // state: a daemon that printed most of a startup report and then
+        // died would otherwise look like one that came up.
+        let _ = tx.send(live.then_some(report));
     });
     let report = rx
         .recv_timeout(Duration::from_secs(30))
@@ -519,8 +542,13 @@ fn start_and_report(config: &Path) -> String {
             panic!("coordd did not reach a serving state within 30s")
         });
     let _ = child.kill();
-    let _ = child.wait();
-    report
+    let output = child.wait_with_output().expect("output");
+    report.unwrap_or_else(|| {
+        panic!(
+            "coordd stopped before it was serving:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 /// The serving path opens the shared journal, attaches this domain's

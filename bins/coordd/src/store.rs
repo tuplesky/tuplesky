@@ -157,6 +157,12 @@ pub struct Storage {
     pub domain: JournaledDomain<RaftEngineJournal, RedbEngine>,
     /// Where the projection's generation lives, for diagnostics.
     pub generation: PathBuf,
+    /// The boot this storage was opened under.
+    ///
+    /// Everything of this run that allocates a barrier has to use it:
+    /// the boot fence refuses a batch of any other, so a component that
+    /// invented its own would have every write refused.
+    pub boot: BootId,
 }
 
 /// Open the journal and the projection, and attach the domain.
@@ -208,12 +214,13 @@ pub fn open_storage(
     let directory = generation.directory().to_path_buf();
     let (engine, _lock, _manifest) = generation.into_parts();
 
+    let boot = BootId(boot_of(replica, incarnation));
     let mut store = JournaledStore::open(
         journal,
         cluster,
         replica,
         incarnation,
-        BootId(boot_of(replica, incarnation)),
+        boot,
         JournalLimits::default(),
     )
     .map_err(|e| StoreError::Refused {
@@ -243,6 +250,7 @@ pub fn open_storage(
     Ok(Storage {
         domain,
         generation: directory,
+        boot,
     })
 }
 
