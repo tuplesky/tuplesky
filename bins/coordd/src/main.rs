@@ -175,22 +175,41 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut frontend = match serve::Frontend::new(
-        &config,
-        placed.membership.clone(),
-        applier,
-        // No voter runs in this process yet, so every voter --
-        // including this node, where it is one -- is reached over the
-        // wire. The local ingress is wired when the voter loop is.
-        None,
-    ) {
+    // A process that votes runs its voter here, over the same store the
+    // frontend reads. One writer, one domain: a second handle on this
+    // store would be a second writer's worth of opportunity, and the
+    // profile has exactly one.
+    let backing = if roles.votes() {
+        match voter(&placed, applier, boot) {
+            Ok(v) => serve::Backing::Voting(Box::new(v)),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        serve::Backing::Serving(Box::new(applier))
+    };
+    // The local route is the voter's to hand over, and it exists only
+    // because a voter is running here. A frontend-only process gets
+    // `None` and reaches every voter over the wire.
+    let local = match &backing {
+        serve::Backing::Voting(v) => Some(v.route()),
+        serve::Backing::Serving(_) => None,
+    };
+    let frontend = match serve::Frontend::new(&config, placed.membership.clone(), local) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
-    println!("frontend ready waiting={}", frontend.waiting());
+    let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default());
+    println!(
+        "frontend ready waiting={} voting={}",
+        domain.waiting(),
+        roles.votes()
+    );
 
     let mut listeners = match bind_listeners(&config.listen) {
         Ok(l) => l,
@@ -242,21 +261,103 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        frontend.run(&mut transport, now_seconds).await;
-        let counts = frontend.counts();
+        domain.run(&mut transport, now_seconds).await;
+        let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
-saturated={} unavailable={} watches={} unserved={}",
+saturated={} unavailable={} refused={} released={} watches={} unserved={}",
             counts.queued_local,
             counts.queued_remote,
             counts.not_a_voter,
             counts.saturated,
             counts.unavailable,
+            counts.refused,
+            counts.released,
             counts.watches,
             counts.unserved
         );
         ExitCode::from(1)
     })
+}
+
+/// This node's voter, booted, over the store it will write.
+///
+/// The role it takes is not a setting. The committed configuration says
+/// which ballot the epoch starts at and who leads it; this replica is
+/// that leader or it is a follower of it, and either way it recovers to
+/// the execution position its own store is already at rather than to
+/// zero -- a machine that started from zero would plan a command the
+/// storage frontier had already passed.
+fn voter(
+    placed: &membership::Placed,
+    applier: coord_storage::Applier<store::Persistence>,
+    boot: coord_core::effect::BootId,
+) -> Result<coord_daemon::Voter<store::Persistence>, String> {
+    use coord_consensus::{
+        ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
+        ReplicaRole,
+    };
+
+    let m = &placed.membership;
+    let collector = coord_daemon::voter::collector_peer(m)
+        .ok_or("a committed voter holds the identity reserved for this domain's collector")?;
+    let ballot = serve::genesis_ballot(m).map_err(|e| e.to_string())?;
+    let quorum = serve::quorum_of(m).map_err(|e| e.to_string())?;
+    let identity = ConfigurationIdentity {
+        cluster: m.cluster(),
+        domain: m.domain(),
+        epoch: m.epoch(),
+        voters: m.voters().map(|v| v.node).collect(),
+        replica: placed.replica,
+        incarnation: placed.incarnation,
+        role: ReplicaRole::Voter,
+    };
+    let executed_through = {
+        use coord_storage::Persistence;
+        applier.store().application_base().execution_position
+    };
+    let machine = if placed.replica == ballot.leader {
+        let mut leader = Leader::new(
+            LeaderConfig {
+                identity,
+                quorum,
+                genesis: ballot,
+                frontend: collector,
+                capacity: 64,
+            },
+            None,
+            executed_through,
+        );
+        leader.set_learning(LearningMode::Full);
+        coord_daemon::Machine::Leader(Box::new(leader))
+    } else {
+        let mut follower = Follower::new(FollowerConfig {
+            identity,
+            quorum,
+            genesis: ballot,
+            frontend: collector,
+            capacity: 64,
+        })
+        .restore_execution(executed_through, []);
+        follower.set_learning(LearningMode::Full);
+        coord_daemon::Machine::Follower(Box::new(follower))
+    };
+    let ingress = coord_daemon::Ingress::new(
+        m,
+        placed.replica,
+        coord_types::wire_v1::PeerRole::Frontend,
+        coord_daemon::IngressBudget::default(),
+    )
+    .ok_or("this process votes, but the committed configuration does not name it a voter")?;
+    let mut voter = coord_daemon::Voter::new(
+        coord_daemon::Node::new(machine, applier, collector),
+        ingress,
+        ballot,
+    );
+    voter
+        .boot(boot, placed.incarnation)
+        .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
+    Ok(voter)
 }
 
 /// Wall-clock seconds. A binding's validity is stated in them, so this

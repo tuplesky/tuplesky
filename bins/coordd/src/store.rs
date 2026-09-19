@@ -151,10 +151,14 @@ fn show(path: &Path) -> String {
 }
 
 /// This node's durable storage, open and ready to attach an applier to.
+/// This node's persistence: the journal is the record, `redb` the
+/// projection of it that answers reads.
+pub type Persistence = JournaledDomain<RaftEngineJournal, RedbEngine>;
+
 pub struct Storage {
     /// The journal-first coordinator: one shared journal, this node's
     /// domain attached to it.
-    pub domain: JournaledDomain<RaftEngineJournal, RedbEngine>,
+    pub domain: Persistence,
     /// Where the projection's generation lives, for diagnostics.
     pub generation: PathBuf,
     /// The boot this storage was opened under.
