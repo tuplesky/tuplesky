@@ -215,6 +215,19 @@ pub enum RejectionReason {
     /// local setting, so every replica reaches this rejection for the
     /// same command against the same state.
     ViewTooLarge,
+    /// The retry key was already bound to a different request. The
+    /// original binding stands; this command executes as a rejection and
+    /// never as the bound request.
+    RetryConflict,
+    /// The request's sequence is at or below its session's retired floor.
+    RetryTooOld,
+    /// The request's sequence is beyond the session's outstanding window.
+    RetryOutOfWindow,
+    /// The session is unknown or retired, so nothing executes under it.
+    SessionInvalid,
+    /// Current authorization no longer permits handing out the retained
+    /// result, and nothing re-executes.
+    RetryUnauthorized,
 }
 
 /// A Kine-facing entry: the entry's value and revisions plus the TTL of
