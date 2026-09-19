@@ -175,7 +175,10 @@ fn cold_enrollment_works_before_any_voter_and_binds_the_node_identity() {
     let issued = issuer
         .enroll(&request(&provider, csr_der, 1, 2, 300), &clock(NOW))
         .unwrap();
-    assert_eq!(issued.expires_at, NOW + 300);
+    // The certificate ends with the assertion that authorized it, read
+    // conservatively under the clock's uncertainty, rather than running
+    // for the policy's whole lifetime.
+    assert_eq!(issued.expires_at, NOW + 295);
     let identity = parse_node_uri(&issued.node_uri).unwrap();
     assert_eq!(identity.cluster, CLUSTER);
     assert_eq!(identity.node, node(1));
@@ -376,4 +379,34 @@ fn issuer_outage_and_bad_ca_fail_closed() {
         Some(CaError::KeyMismatch)
     );
     assert!(Ca::load(b"not a cert", &leaf_key.serialize_der(), NOW).is_err());
+}
+
+#[test]
+fn a_certificate_outlives_neither_its_assertion_nor_the_ca() {
+    // Validity used to be the policy's lifetime measured from now, so a
+    // node presenting a credential good for a minute walked away with a
+    // certificate good for the policy's whole lifetime, and a CA checked
+    // only at startup went on signing past its own expiry.
+    let provider = idp();
+    let mut issuer = issuer(&provider);
+    let (csr_der, _) = csr(vec![KeyUsagePurpose::DigitalSignature], IsCa::NoCa);
+    // A lifetime the policy allows, but longer than the assertion has
+    // left to live at this point.
+    let issued = issuer
+        .enroll(&request(&provider, csr_der, 1, 2, 300), &clock(NOW + 200))
+        .unwrap();
+    assert_eq!(
+        issued.expires_at,
+        NOW + 295,
+        "the assertion's conservative deadline decides"
+    );
+    // The leaf starts early enough for a peer whose clock reads behind
+    // this one to accept it.
+    let (_, x509) = x509_parser::parse_x509_certificate(&issued.certificate).unwrap();
+    assert_eq!(
+        x509.validity().not_before.timestamp(),
+        (NOW + 200 - 5) as i64,
+        "not_before allows for the clock's uncertainty"
+    );
+    assert_eq!(x509.validity().not_after.timestamp(), (NOW + 295) as i64);
 }

@@ -28,6 +28,7 @@ pub enum CaError {
 pub struct Ca {
     issuer: Issuer<'static, KeyPair>,
     cert_der: CertificateDer<'static>,
+    not_after: u64,
 }
 
 impl Ca {
@@ -60,17 +61,43 @@ impl Ca {
         if x509.public_key().raw != key.subject_public_key_info() {
             return Err(CaError::KeyMismatch);
         }
+        let not_after =
+            u64::try_from(validity.not_after.timestamp()).map_err(|_| CaError::Expired)?;
         let owned = CertificateDer::from(cert_der.to_vec());
         let issuer = Issuer::from_ca_cert_der(&owned, key).map_err(|_| CaError::BadCertificate)?;
         Ok(Ca {
             issuer,
             cert_der: owned,
+            not_after,
         })
     }
 
-    /// The issuer for signing.
-    pub const fn issuer(&self) -> &Issuer<'static, KeyPair> {
-        &self.issuer
+    /// When the CA certificate itself stops being valid. Nothing it
+    /// signs may outlive this: the leaf would be rejected anyway, and a
+    /// CA validated only at load would otherwise keep issuing past its
+    /// own expiry for as long as the process ran.
+    pub const fn not_after(&self) -> u64 {
+        self.not_after
+    }
+
+    /// Sign `params` for `key` as this CA, refusing once the CA's own
+    /// certificate has expired.
+    ///
+    /// The signing capability stays inside the CA: handing out the
+    /// `Issuer` let any holder sign anything at all, including another
+    /// CA, with no policy in the way.
+    pub(crate) fn sign<K: rcgen::PublicKeyData>(
+        &self,
+        params: rcgen::CertificateParams,
+        key: &K,
+        now: u64,
+    ) -> Result<rcgen::Certificate, CaError> {
+        if now >= self.not_after {
+            return Err(CaError::Expired);
+        }
+        params
+            .signed_by(key, &self.issuer)
+            .map_err(|_| CaError::BadCertificate)
     }
 
     /// The CA certificate DER (the trust anchor peers pin).
