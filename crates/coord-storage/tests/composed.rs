@@ -639,3 +639,260 @@ fn a_failure_of_unknown_outcome_is_reconciled_rather_than_replanned() {
         );
     }
 }
+
+/// A boot that ends after a command's record is durable, but before the
+/// projection has taken it, recovers the command -- not a hole where it
+/// was, and not a second execution of it.
+///
+/// This is the crash the journal-first profile exists to survive. The
+/// record is the authority, so the next boot replays what the projection
+/// owes and the command's own outcome comes back: the same position, the
+/// same revision, the same identity. A retry after that finds the
+/// retained result rather than planning a replacement.
+#[test]
+fn a_boot_that_ends_between_the_record_and_the_projection_recovers_the_command() {
+    let mut applier = journaled();
+    let request = put(b"survivor", b"v");
+    let (command, record) = payload(1, &request);
+
+    // The command is planned and its record journaled, but the
+    // projection is not allowed to take it.
+    let base = applier.store().application_base();
+    let barrier = applier.alloc().allocate();
+    let position = base.execution_position.checked_next().unwrap();
+    let pending = coord_storage::Pending {
+        barrier,
+        position,
+        revision: None,
+        result_digest: coord_types::identity::Digest32([7; 32]),
+    };
+    submit(
+        applier.store_mut(),
+        PersistBatch {
+            barrier,
+            base: Some(base),
+            updates: vec![
+                rule_update(
+                    &PolicyRuleId([0x5d; 16]),
+                    &PolicyRule {
+                        principal: ALICE,
+                        action: Action::Read,
+                        namespace: NS,
+                        interval: KeyInterval::all(),
+                    },
+                )
+                .unwrap(),
+            ],
+        },
+        TransitionKind::Application {
+            position,
+            revision: None,
+            result_digest: pending.result_digest,
+        },
+    )
+    .expect("submitted");
+    applier
+        .store_mut()
+        .store_mut()
+        .append_pending()
+        .expect("the record reaches the journal");
+    let owed = applier.store().store().unmaterialized(DOMAIN);
+    assert_eq!(owed, 1, "the projection should still owe the record");
+    let durable_before = applier
+        .store()
+        .store()
+        .frontiers(DOMAIN)
+        .expect("attached")
+        .durable();
+
+    // The boot ends here, with the record durable and the projection
+    // behind it.
+    let (journal, mut engines): (ModelJournal, Vec<(DomainId, ModelEngine)>) =
+        applier.into_store().into_store().into_parts();
+    let engine = engines.pop().expect("one domain").1;
+
+    // The next boot recovers from what is actually durable: attaching
+    // replays the suffix the projection owed.
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .expect("reopened");
+    next.attach(DOMAIN, ShardId::new(0).unwrap(), engine)
+        .expect("attached");
+    let recovered = next.frontiers(DOMAIN).expect("attached");
+    assert_eq!(
+        recovered.materialized(),
+        recovered.durable(),
+        "the projection did not catch up with the journal it had"
+    );
+    // The frontier advances by the boot's own lifecycle record -- the
+    // new boot records itself in the stream as it attaches -- but never
+    // goes backwards: everything the previous boot made durable is still
+    // there underneath it.
+    assert!(
+        recovered.durable() >= durable_before,
+        "the recovered journal lost what was durable: {durable_before:?} then {:?}",
+        recovered.durable()
+    );
+    assert_eq!(next.unmaterialized(DOMAIN), 0, "something is still owed");
+
+    // And the recovered node executes the command exactly once: the
+    // first application is a real one, and the retry after it resolves
+    // from the retained result.
+    let base = next.application_base(DOMAIN).expect("attached");
+    let domain = JournaledDomain::new(
+        next,
+        DOMAIN,
+        Ballot {
+            epoch: base.configuration,
+            number: 0,
+            leader: REPLICA,
+        },
+    )
+    .expect("attached");
+    let mut applier =
+        Applier::new(domain, BarrierAllocator::new(inc(), BootId([0x88; 16]))).expect("applier");
+
+    let first = applier.apply(command, &record).expect("applied");
+    let revision = applier.kv_revision().unwrap();
+    let retry = applier.apply(command, &record).expect("retried");
+    assert_eq!(first, retry, "the retry produced a different outcome");
+    assert_eq!(
+        applier.kv_revision().unwrap(),
+        revision,
+        "the retry executed the command a second time"
+    );
+}
+
+/// A higher promise closes admission without losing what is already
+/// durable, and a late completion from the ballot it fenced does not
+/// newly authorize anything.
+///
+/// Fencing is about what may still *enter* the record. Work that is
+/// already in the journal is an obligation this replica has taken on,
+/// and a new promise does not release it: the cut a recovering ballot
+/// takes has to keep summarizing it. What the fence does stop is a
+/// transition of the older ballot being admitted afterwards -- that
+/// would be this replica voting under a term it has already given up.
+#[test]
+fn a_higher_promise_fences_admission_without_discarding_durable_obligations() {
+    let mut applier = journaled();
+    let old = applier.store().ballot();
+
+    // An application of the current ballot reaches the journal, and the
+    // projection is behind it.
+    let base = applier.store().application_base();
+    let barrier = applier.alloc().allocate();
+    let position = base.execution_position.checked_next().unwrap();
+    submit(
+        applier.store_mut(),
+        PersistBatch {
+            barrier,
+            base: Some(base),
+            updates: vec![
+                rule_update(
+                    &PolicyRuleId([0x5e; 16]),
+                    &PolicyRule {
+                        principal: ALICE,
+                        action: Action::Read,
+                        namespace: NS,
+                        interval: KeyInterval::all(),
+                    },
+                )
+                .unwrap(),
+            ],
+        },
+        TransitionKind::Application {
+            position,
+            revision: None,
+            result_digest: coord_types::identity::Digest32([8; 32]),
+        },
+    )
+    .expect("submitted");
+    applier
+        .store_mut()
+        .store_mut()
+        .append_pending()
+        .expect("journaled");
+    let durable_before = applier
+        .store()
+        .store()
+        .frontiers(DOMAIN)
+        .expect("attached")
+        .durable();
+    assert_eq!(applier.store().store().unmaterialized(DOMAIN), 1);
+
+    // A higher promise arrives while the projection still lags.
+    let newer = Ballot {
+        epoch: old.epoch,
+        number: old.number + 1,
+        leader: REPLICA,
+    };
+    applier
+        .store_mut()
+        .store_mut()
+        .fence(DOMAIN, newer)
+        .expect("fenced");
+
+    // What was durable is still durable, and still owed: a promise does
+    // not release an obligation this replica already took on.
+    assert_eq!(
+        applier
+            .store()
+            .store()
+            .frontiers(DOMAIN)
+            .expect("attached")
+            .durable(),
+        durable_before,
+        "fencing discarded a durable record"
+    );
+    assert_eq!(applier.store().store().unmaterialized(DOMAIN), 1);
+
+    // A transition of the fenced ballot is refused rather than recorded:
+    // admitting it would be this replica acting under a term it gave up.
+    let stale = applier.alloc().allocate();
+    let refused = submit(
+        applier.store_mut(),
+        PersistBatch {
+            barrier: stale,
+            base: None,
+            updates: vec![
+                rule_update(
+                    &PolicyRuleId([0x5f; 16]),
+                    &PolicyRule {
+                        principal: ALICE,
+                        action: Action::Read,
+                        namespace: NS,
+                        interval: KeyInterval::all(),
+                    },
+                )
+                .unwrap(),
+            ],
+        },
+        TransitionKind::Protocol,
+    );
+    assert!(
+        refused.is_err(),
+        "a transition of the fenced ballot was admitted: {refused:?}"
+    );
+
+    // Under the new promise the domain serves again, and the record the
+    // old ballot left behind is materialized rather than dropped.
+    applier.store_mut().set_ballot(newer);
+    let settled = applier.store_mut().lower().expect("lowered");
+    assert!(
+        settled.events.iter().any(|e| matches!(
+            e,
+            coord_core::event::StorageEvent::Materialized { barrier_id, .. }
+                if *barrier_id == barrier
+        )),
+        "the fenced ballot's durable record was never materialized: {:?}",
+        settled.events
+    );
+    assert_eq!(applier.store().store().unmaterialized(DOMAIN), 0);
+}
