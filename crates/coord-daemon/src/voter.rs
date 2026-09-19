@@ -35,14 +35,43 @@
 //! from looking like a quorum.
 
 use coord_collector::{IngressError, admitted_from_submit};
-use coord_core::effect::BootId;
+use coord_core::effect::{BootId, PeerId};
 use coord_core::event::{AuthenticatedPeerMessage, Event, PeerProvenance};
+use coord_membership::membership::Membership;
 use coord_storage::Persistence;
-use coord_types::ids::Ballot;
+use coord_types::ids::{Ballot, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{FrameReader, WireError};
 
 use crate::mailbox::Ingress;
 use crate::node::{DriveError, Node, Outbound};
+
+/// The replica identity reserved for a domain's trusted collector.
+///
+/// A collector is not a node. It holds no replica identity, votes on
+/// nothing and appears in no configuration; the protocol machines need
+/// a [`PeerId`] only to say "this send is the collector's" rather than
+/// a peer's. This is that label.
+///
+/// It is reserved rather than derived because the property that matters
+/// is simply that no voter has it, and [`collector_peer`] checks
+/// exactly that against the committed configuration rather than
+/// trusting an identity space to stay disjoint.
+pub const COLLECTOR_LABEL: ReplicaId = ReplicaId([0xff; 16]);
+
+/// The peer identity this domain's voters address their collector as.
+///
+/// `None` when the committed configuration names a voter holding the
+/// reserved label, which would make a voter's evidence and a peer's
+/// send indistinguishable to the driver.
+pub fn collector_peer(membership: &Membership) -> Option<PeerId> {
+    if membership.voters().any(|v| v.node == COLLECTOR_LABEL) {
+        return None;
+    }
+    Some(PeerId {
+        replica: COLLECTOR_LABEL,
+        incarnation: ReplicaIncarnation::ZERO,
+    })
+}
 
 /// Why a frame offered to a voter was not admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]

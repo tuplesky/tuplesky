@@ -85,6 +85,34 @@ pub fn scope_string(bits: u32) -> String {
         .join(" ")
 }
 
+/// How many keys in `jwks` a token could actually be verified with.
+///
+/// [`verify_service_token`] needs a `keys` array whose entries carry a
+/// `kid` and an EC public point this build can decode. A document that
+/// is valid JSON and has none of those refuses every caller, so a
+/// process that treated "the file parsed" as "the verifier is
+/// configured" would come up, announce itself, and look -- from
+/// outside -- exactly like a client problem. This is the question worth
+/// asking at startup, and it is asked here so it stays the same
+/// question the verifier asks.
+pub fn usable_verification_keys(jwks: &Value) -> usize {
+    let Some(keys) = jwks.get("keys").and_then(Value::as_array) else {
+        return 0;
+    };
+    keys.iter()
+        .filter(|k| {
+            k.get("kid").and_then(Value::as_str).is_some()
+                && match (
+                    k.get("x").and_then(Value::as_str),
+                    k.get("y").and_then(Value::as_str),
+                ) {
+                    (Some(x), Some(y)) => DecodingKey::from_ec_components(x, y).is_ok(),
+                    _ => false,
+                }
+        })
+        .count()
+}
+
 /// Verify a service token against a published JWKS document, exact
 /// issuer and audience, at `clock`.
 pub fn verify_service_token(

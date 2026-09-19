@@ -43,7 +43,8 @@ pub use http::{
 };
 pub use keys::{KeyError, KeyRing, SigningKey};
 pub use token::{
-    ServiceClaims, TokenError, action_bit, scope_bits, scope_string, verify_service_token,
+    ServiceClaims, TokenError, action_bit, scope_bits, scope_string, usable_verification_keys,
+    verify_service_token,
 };
 
 /// Crate role marker used by the dependency-policy check.

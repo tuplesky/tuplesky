@@ -30,6 +30,10 @@ pub mod gate;
 pub mod wire;
 
 pub use binding::{BindError, Binding, BindingConfig, verify_bind};
+/// How many keys in a JWKS document a caller's token could actually be
+/// verified with. A frontend whose set has none refuses every caller,
+/// which is worth finding out at startup rather than at the first bind.
+pub use coord_sts::usable_verification_keys;
 pub use frontend::{BoundFrontend, Ingress};
 pub use gate::{
     AuthorizationBarrier, PolicyError, PolicySource, StorePolicySource, protected_keys,
