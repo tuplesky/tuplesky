@@ -1129,3 +1129,154 @@ fn a_batch_that_could_never_become_a_valid_record_is_refused_at_submission() {
     );
     assert_eq!(world.store.queued(A), 0);
 }
+
+#[test]
+fn a_projection_error_never_loses_durable_redo_or_its_completions() {
+    // The pending list is the only in-memory record of what the
+    // projection still owes for records that are already durable in the
+    // journal. Taking it and then failing a pre-commit step dropped that
+    // responsibility while the domain stayed ready, so a later record
+    // could stamp the projection past a record it had never applied, and
+    // a restart would replay only what followed the stamp.
+    for fault in ["begin_write", "lower_update", "meta_write"] {
+        let mut world = World::new();
+        // J1 is durable but not yet materialized. It carries a row of
+        // its own, so a record that is skipped leaves a hole that a
+        // later record cannot paper over.
+        let mut first_batch = promise(1);
+        first_batch.push(kv_update(b"row-from-j1", b"v"));
+        let first = world.protocol(A, ballot(1), first_batch);
+        let report = world.store.append_pending().unwrap();
+        assert!(
+            report.events.iter().any(|e| matches!(
+                e,
+                StorageEvent::JournalDurable { barrier_id, .. } if *barrier_id == first
+            )),
+            "{fault}: the record is durable"
+        );
+
+        let engine = world.store.projection(A).unwrap();
+        match fault {
+            "begin_write" => engine.inject_begin_write_error(),
+            // The first write of the transaction is the first lowered
+            // update; the projection metadata is written last.
+            "lower_update" => engine.inject_write_error_at(1),
+            // Two updates are lowered, then the metadata is written.
+            _ => engine.inject_write_error_at(3),
+        }
+        let failed = world.store.materialize();
+        assert!(failed.is_err(), "{fault}: the projection failed");
+
+        // The redo is still owed, and the domain has not silently moved
+        // on: the same records are applied when the fault clears.
+        world.store.projection(A).unwrap().clear_injected_faults();
+        let before = world.store.frontiers(A).unwrap();
+        assert!(
+            before.materialized() < before.durable(),
+            "{fault}: nothing was materialized"
+        );
+
+        // A later record must not be stamped over the unapplied one.
+        let mut second_batch = promise(2);
+        second_batch.push(kv_update(b"row-from-j2", b"v"));
+        world.protocol(A, ballot(2), second_batch);
+        world.store.flush().unwrap();
+        let after = world.store.frontiers(A).unwrap();
+        assert_eq!(
+            after.materialized(),
+            after.durable(),
+            "{fault}: both records were applied, in order"
+        );
+        // Both barriers completed, the first one included: its journal
+        // completion was produced before the failing stage and is not
+        // discarded with the error.
+        let rows = world.store.projection(A).unwrap().durable_rows();
+        for expected in [b"row-from-j1".as_slice(), b"row-from-j2".as_slice()] {
+            assert!(
+                rows.iter().any(|(_, key, _)| key.as_slice() == expected),
+                "{fault}: {} was applied, not dropped",
+                String::from_utf8_lossy(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_command_after_replay_continues_from_the_recovered_position() {
+    // attach() set the application frontiers from the projection as it
+    // was found, and replay never moved them. Recovered rows looked
+    // right while the store still expected the pre-crash base: the next
+    // correctly planned command was refused as stale, and a command
+    // planned from application_base() carried a base the journal record
+    // could no longer extend.
+    let mut world = World::new();
+    world.protocol(A, ballot(1), promise(1));
+    world.store.flush().unwrap();
+    // An application outcome is journaled but the projection never
+    // commits it: the ordinary crash cut.
+    world.application(A, 1, position(1), vec![kv_update(b"k", b"v1")]);
+    world.store.append_pending().unwrap();
+    let frontiers = world.store.frontiers(A).unwrap();
+    assert!(frontiers.materialized() < frontiers.durable());
+
+    let (journal, mut engines) = world.store.into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    next.attach(A, shard(), engine).unwrap();
+    assert_eq!(next.status(A), Some(DomainStatus::Ready));
+
+    // The recovered history, not the projection as it was found.
+    let base = next.application_base(A).expect("attached");
+    assert_eq!(
+        base.execution_position,
+        position(1),
+        "the replayed outcome is the base the next command extends"
+    );
+
+    // And the next command actually succeeds at the next position.
+    let barrier = BarrierId {
+        node_generation: inc(),
+        boot_id: BootId([0x88; 16]),
+        sequence: 9,
+    };
+    next.submit(Submission {
+        domain: A,
+        ballot: Ballot {
+            epoch: base.configuration,
+            number: 2,
+            leader: REPLICA,
+        },
+        kind: TransitionKind::Application {
+            position: position(2),
+            revision: None,
+            result_digest: Digest32([2; 32]),
+        },
+        batch: PersistBatch {
+            barrier,
+            base: Some(base),
+            updates: vec![kv_update(b"k", b"v2")],
+        },
+    })
+    .expect("the command extends the recovered history");
+    let report = next.flush().unwrap();
+    assert!(
+        report.events.iter().any(|e| matches!(
+            e,
+            StorageEvent::Materialized { barrier_id, .. } if *barrier_id == barrier
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(
+        next.application_base(A).unwrap().execution_position,
+        position(2)
+    );
+}

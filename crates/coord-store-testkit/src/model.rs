@@ -83,6 +83,12 @@ struct Shared {
     scripts: VecDeque<CommitScript>,
     /// Inject an iterator error after this many rows in the next scan.
     iterator_error_after: Option<usize>,
+    /// Fail the next `begin_write`.
+    fail_begin_write: bool,
+    /// Fail a write transaction's Nth `put`/`delete` (1 = the first).
+    fail_write_at: Option<usize>,
+    /// Writes seen since the current transaction opened.
+    writes_in_txn: usize,
     txn_counter: u64,
 }
 
@@ -122,6 +128,28 @@ impl ModelEngine {
     /// Inject an iterator error after `rows` rows in the next scan.
     pub fn inject_iterator_error(&self, rows: usize) {
         self.shared.lock().unwrap().iterator_error_after = Some(rows);
+    }
+
+    /// Fail the next attempt to open a write transaction.
+    pub fn inject_begin_write_error(&self) {
+        self.shared.lock().unwrap().fail_begin_write = true;
+    }
+
+    /// Fail the `nth` write (put or delete) of the next transaction,
+    /// counting from one. Lowering an update and writing the projection
+    /// metadata are both writes, so this reaches every pre-commit step.
+    pub fn inject_write_error_at(&self, nth: usize) {
+        let mut s = self.shared.lock().unwrap();
+        s.fail_write_at = Some(nth);
+        s.writes_in_txn = 0;
+    }
+
+    /// Stop injecting projection faults.
+    pub fn clear_injected_faults(&self) {
+        let mut s = self.shared.lock().unwrap();
+        s.fail_begin_write = false;
+        s.fail_write_at = None;
+        s.writes_in_txn = 0;
     }
 
     /// Crash and reopen: everything not durable is lost.
@@ -307,6 +335,17 @@ pub struct ModelWrite<'a> {
 }
 
 impl ModelWrite<'_> {
+    /// Whether this write is the one a test asked to fail.
+    fn injected_write_failure(&self) -> Result<(), EngineError> {
+        let mut s = self.engine.shared.lock().unwrap();
+        s.writes_in_txn += 1;
+        if s.fail_write_at == Some(s.writes_in_txn) {
+            s.fail_write_at = None;
+            return Err(EngineError::new(ErrorClass::Io, "injected: write"));
+        }
+        Ok(())
+    }
+
     fn merged(&self) -> Rows {
         let mut rows = self.engine.shared.lock().unwrap().visible.clone();
         for (k, v) in &self.pending {
@@ -355,6 +394,7 @@ impl WriteTxn for ModelWrite<'_> {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), EngineError> {
+        self.injected_write_failure()?;
         self.pending
             .insert((collection.0, key.to_vec()), Some(value.to_vec()));
         self.sync_pending();
@@ -362,6 +402,7 @@ impl WriteTxn for ModelWrite<'_> {
     }
 
     fn delete(&mut self, collection: CollectionId, key: &[u8]) -> Result<(), EngineError> {
+        self.injected_write_failure()?;
         self.pending.insert((collection.0, key.to_vec()), None);
         self.sync_pending();
         Ok(())
@@ -448,6 +489,14 @@ impl LocalEngine for ModelEngine {
     fn begin_write(&mut self) -> Result<ModelWrite<'_>, EngineError> {
         if self.writer_open {
             return Err(EngineError::new(ErrorClass::Busy, "writer already open"));
+        }
+        {
+            let mut s = self.shared.lock().unwrap();
+            if s.fail_begin_write {
+                s.fail_begin_write = false;
+                return Err(EngineError::new(ErrorClass::Io, "injected: begin_write"));
+            }
+            s.writes_in_txn = 0;
         }
         self.writer_open = true;
         if self
