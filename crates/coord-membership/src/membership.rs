@@ -37,7 +37,17 @@ pub struct Membership {
     cluster: ClusterId,
     domain: DomainId,
     epoch: ConfigurationEpoch,
-    voters: BTreeMap<ReplicaId, ReplicaIncarnation>,
+    voters: BTreeMap<ReplicaId, Voter>,
+}
+
+/// A committed voter: its key generation and the public key that
+/// generation stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Voter {
+    /// Committed key generation.
+    pub incarnation: ReplicaIncarnation,
+    /// Committed SubjectPublicKeyInfo DER.
+    pub public_key: Vec<u8>,
 }
 
 impl Membership {
@@ -48,9 +58,16 @@ impl Membership {
         let epoch = manifest.config_epoch().ok_or(MembershipError::BadVoter)?;
         let mut voters = BTreeMap::new();
         for seed in &manifest.voters {
-            let (node, incarnation) =
+            let (node, incarnation, public_key) =
                 GenesisManifest::voter(seed).ok_or(MembershipError::BadVoter)?;
-            if voters.insert(node, incarnation).is_some() {
+            if public_key.is_empty() {
+                return Err(MembershipError::BadVoter);
+            }
+            let voter = Voter {
+                incarnation,
+                public_key,
+            };
+            if voters.insert(node, voter).is_some() {
                 return Err(MembershipError::DuplicateVoter { node });
             }
         }
@@ -77,19 +94,32 @@ impl Membership {
 
     /// The committed voters, node order.
     pub fn voters(&self) -> impl Iterator<Item = VoterEntry> + '_ {
-        self.voters.iter().map(|(node, incarnation)| VoterEntry {
+        self.voters.iter().map(|(node, voter)| VoterEntry {
             node: *node,
-            incarnation: *incarnation,
+            incarnation: voter.incarnation,
         })
     }
 
     /// Whether `node` at `incarnation` is a committed voter now.
     pub fn is_current_voter(&self, node: &ReplicaId, incarnation: ReplicaIncarnation) -> bool {
-        self.voters.get(node) == Some(&incarnation)
+        self.voters.get(node).map(|v| v.incarnation) == Some(incarnation)
+    }
+
+    /// Whether `node` at `incarnation` is the current committed voter
+    /// *and* presents the key that generation committed to.
+    pub fn is_current_voter_key(
+        &self,
+        node: &ReplicaId,
+        incarnation: ReplicaIncarnation,
+        public_key: &[u8],
+    ) -> bool {
+        self.voters
+            .get(node)
+            .is_some_and(|v| v.incarnation == incarnation && v.public_key == public_key)
     }
 
     /// The committed incarnation of a voter node, if any.
     pub fn voter_incarnation(&self, node: &ReplicaId) -> Option<ReplicaIncarnation> {
-        self.voters.get(node).copied()
+        self.voters.get(node).map(|v| v.incarnation)
     }
 }

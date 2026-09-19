@@ -185,30 +185,41 @@ impl Issuer {
     }
 }
 
-fn manifest(issuer: &Issuer, admin: &AdminKey) -> GenesisManifest {
+/// The SubjectPublicKeyInfo a certificate carries, as genesis commits it.
+fn spki(cert_der: &[u8]) -> String {
+    let (_, x509) = x509_parser::parse_x509_certificate(cert_der).unwrap();
+    b64url(x509.public_key().raw)
+}
+
+/// A manifest committing the three founding voters by key, together with
+/// the certificates those keys belong to.
+fn manifest_with_voters(issuer: &mut Issuer, admin: &AdminKey) -> (GenesisManifest, Vec<Vec<u8>>) {
     let _ = admin;
-    GenesisManifest {
+    let certs: Vec<Vec<u8>> = (1u8..=3)
+        .map(|n| issuer.issue(n, 1, PeerRole::Voter, "voters", &format!("voter-{n}")))
+        .collect();
+    let manifest = GenesisManifest {
         cluster: hex(&CLUSTER.0),
         domain: hex(&DOMAIN.0),
         epoch: 1,
-        voters: vec![
-            VoterSeed {
-                node: hex(&[1; 16]),
+        voters: (1u8..=3)
+            .map(|n| VoterSeed {
+                node: hex(&[n; 16]),
                 incarnation: 1,
-            },
-            VoterSeed {
-                node: hex(&[2; 16]),
-                incarnation: 1,
-            },
-            VoterSeed {
-                node: hex(&[3; 16]),
-                incarnation: 1,
-            },
-        ],
+                public_key: spki(&certs[(n - 1) as usize]),
+            })
+            .collect(),
         issuer_roots: vec![b64url(&issuer.ca_der)],
+        wif_rules: vec![serde_json::json!({
+            "issuer": "k8s",
+            "namespace": "voters",
+            "serviceaccount": "voter-1",
+            "scope_ceiling": 7,
+        })],
         admin: hex(&PrincipalId([0xa; 16]).0),
         protocol_version: 1,
-    }
+    };
+    (manifest, certs)
 }
 
 fn hello(role: PeerRole, incarnation: Option<u64>) -> HelloV1 {
@@ -241,11 +252,14 @@ impl GenesisStore for Store {
     }
     fn pin(&mut self, digest: Digest32) -> Result<(), StoreFailure> {
         self.pinned = Some(digest);
-        self.journal = true;
         Ok(())
     }
     fn journal_intact(&self) -> Result<bool, StoreFailure> {
         Ok(self.journal)
+    }
+    fn establish_journal(&mut self) -> Result<(), StoreFailure> {
+        self.journal = true;
+        Ok(())
     }
 }
 
@@ -253,7 +267,7 @@ impl GenesisStore for Store {
 fn a_signed_genesis_initializes_pinned_membership() {
     let admin = admin_key();
     let mut issuer = build_issuer();
-    let manifest = manifest(&issuer, &admin);
+    let (manifest, voter_certs) = manifest_with_voters(&mut issuer, &admin);
     let signed = sign_genesis(&manifest, &admin.enc).unwrap();
     // Verified against the pinned key; a different key or a tampered
     // token is refused.
@@ -286,6 +300,7 @@ fn a_signed_genesis_initializes_pinned_membership() {
     other_manifest.voters.push(VoterSeed {
         node: hex(&[4; 16]),
         incarnation: 1,
+        public_key: spki(&voter_certs[0]),
     });
     let other_signed = sign_genesis(&other_manifest, &admin.enc).unwrap();
     let other_verified = verify_genesis(&other_signed, &pinned(&admin), 1).unwrap();
@@ -305,18 +320,30 @@ fn a_signed_genesis_initializes_pinned_membership() {
 fn the_binder_admits_current_voters_and_refuses_everything_else() {
     let admin = admin_key();
     let mut issuer = build_issuer();
-    let manifest = manifest(&issuer, &admin);
+    let (manifest, voter_certs) = manifest_with_voters(&mut issuer, &admin);
     let membership = Membership::from_genesis(&manifest).unwrap();
-    let binder = PeerBinder::new(CLUSTER, DOMAIN, membership);
+    let binder = PeerBinder::new(membership);
 
-    // A current voter binds.
-    let voter1 = issuer.issue(1, 1, PeerRole::Voter, "voters", "voter-1");
+    // A current voter binds: the committed node, generation and key.
+    let voter1 = voter_certs[0].clone();
     let bound = binder
         .bind(&[der(&voter1)], &hello(PeerRole::Voter, Some(1)))
         .unwrap();
     assert_eq!(bound.role, PeerRole::Voter);
     assert_eq!(bound.replica, Some(ReplicaId([1; 16])));
     assert_eq!(bound.incarnation, Some(ReplicaIncarnation::new(1).unwrap()));
+
+    // A freshly issued certificate for the same node and generation,
+    // with a different key, is not this voter. Without the committed
+    // key, an issuer that is compromised or merely tricked mints a peer
+    // of an existing cluster.
+    let reissued = issuer.issue(1, 1, PeerRole::Voter, "voters", "voter-1");
+    assert_ne!(reissued, voter1);
+    assert_eq!(
+        binder.bind(&[der(&reissued)], &hello(PeerRole::Voter, Some(1))),
+        Err(BindError::IncarnationMismatch),
+        "the committed key decides, not merely the committed name"
+    );
 
     // A stale generation (an old-disk clone returning) cannot vote.
     let stale = issuer.issue(1, 5, PeerRole::Voter, "voters", "voter-1");
@@ -386,39 +413,120 @@ fn the_binder_admits_current_voters_and_refuses_everything_else() {
 
     // A committed handoff (task-54+) swaps membership: voter-2 rolls its
     // key to generation 2; the new certificate binds, the old does not.
-    let voter2_g1 = issuer.issue(2, 1, PeerRole::Voter, "voters", "voter-2");
+    let voter2_g1 = voter_certs[1].clone();
     assert!(
         binder
             .bind(&[der(&voter2_g1)], &hello(PeerRole::Voter, Some(1)))
             .is_ok()
     );
+    let voter2_g2 = issuer.issue(2, 2, PeerRole::Voter, "voters", "voter-2");
     let next = Membership::from_genesis(&GenesisManifest {
         voters: vec![
             VoterSeed {
                 node: hex(&[1; 16]),
                 incarnation: 1,
+                public_key: spki(&voter_certs[0]),
             },
             VoterSeed {
                 node: hex(&[2; 16]),
                 incarnation: 2,
+                public_key: spki(&voter2_g2),
             },
             VoterSeed {
                 node: hex(&[3; 16]),
                 incarnation: 1,
+                public_key: spki(&voter_certs[2]),
             },
         ],
         ..manifest.clone()
     })
     .unwrap();
-    binder.install(next);
+    assert!(binder.install(next), "same cluster and domain");
     assert_eq!(
         binder.bind(&[der(&voter2_g1)], &hello(PeerRole::Voter, Some(1))),
         Err(BindError::IncarnationMismatch)
     );
-    let voter2_g2 = issuer.issue(2, 2, PeerRole::Voter, "voters", "voter-2");
     assert!(
         binder
             .bind(&[der(&voter2_g2)], &hello(PeerRole::Voter, Some(2)))
+            .is_ok()
+    );
+}
+
+#[test]
+fn first_boot_establishes_the_journal_before_pinning_the_manifest() {
+    // Pinning first and crashing left a pinned digest with no journal,
+    // and the returning-node path then read that as a lost journal:
+    // a node that had never run was quarantined and could not start.
+    #[derive(Default)]
+    struct CrashOnPin {
+        pinned: Option<Digest32>,
+        journal: bool,
+    }
+    impl GenesisStore for CrashOnPin {
+        fn pinned_digest(&self) -> Result<Option<Digest32>, StoreFailure> {
+            Ok(self.pinned)
+        }
+        fn pin(&mut self, _digest: Digest32) -> Result<(), StoreFailure> {
+            // The power goes out exactly here.
+            Err(StoreFailure)
+        }
+        fn journal_intact(&self) -> Result<bool, StoreFailure> {
+            Ok(self.journal)
+        }
+        fn establish_journal(&mut self) -> Result<(), StoreFailure> {
+            self.journal = true;
+            Ok(())
+        }
+    }
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _certs) = manifest_with_voters(&mut issuer, &admin);
+    let signed = sign_genesis(&manifest, &admin.enc).unwrap();
+    let verified = verify_genesis(&signed, &pinned(&admin), 1).unwrap();
+
+    let mut store = CrashOnPin::default();
+    assert_eq!(initialize(&verified, &mut store), Err(InitError::Store));
+    // Nothing was pinned, and the journal is there: the retry is an
+    // ordinary first boot, not a quarantine.
+    assert_eq!(store.pinned, None);
+    assert!(store.journal);
+
+    let mut retry = Store {
+        journal: store.journal,
+        ..Store::default()
+    };
+    let init = initialize(&verified, &mut retry).unwrap();
+    assert!(init.first_boot);
+}
+
+#[test]
+fn a_binder_takes_its_origin_from_the_membership_it_holds() {
+    // Cluster and domain used to be passed alongside the membership, so
+    // the binder could enforce an origin the committed membership did
+    // not agree with, and a handoff to another cluster's membership kept
+    // the old pair rather than being refused.
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, voter_certs) = manifest_with_voters(&mut issuer, &admin);
+    let membership = Membership::from_genesis(&manifest).unwrap();
+    let binder = PeerBinder::new(membership);
+    assert!(
+        binder
+            .bind(&[der(&voter_certs[0])], &hello(PeerRole::Voter, Some(1)))
+            .is_ok()
+    );
+    // A membership of another cluster is not a handoff of this one.
+    let foreign = Membership::from_genesis(&GenesisManifest {
+        cluster: hex(&[0xfe; 16]),
+        ..manifest.clone()
+    })
+    .unwrap();
+    assert!(!binder.install(foreign), "another cluster is refused");
+    // The binder still holds the membership it started from.
+    assert!(
+        binder
+            .bind(&[der(&voter_certs[0])], &hello(PeerRole::Voter, Some(1)))
             .is_ok()
     );
 }

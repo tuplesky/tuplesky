@@ -35,11 +35,16 @@ pub struct PeerBinder {
 }
 
 impl PeerBinder {
-    /// A binder for `cluster`/`domain` over `membership`.
-    pub fn new(cluster: ClusterId, domain: DomainId, membership: Membership) -> Self {
+    /// A binder over `membership`.
+    ///
+    /// The cluster and domain come from the membership itself: passing
+    /// them separately let the binder enforce an origin the committed
+    /// membership did not agree with, and a later handoff silently kept
+    /// the old pair.
+    pub fn new(membership: Membership) -> Self {
         PeerBinder {
-            cluster,
-            domain,
+            cluster: membership.cluster(),
+            domain: membership.domain(),
             membership: Arc::new(RwLock::new(membership)),
         }
     }
@@ -50,9 +55,24 @@ impl PeerBinder {
     }
 
     /// Install a new committed membership (a durably activated epoch).
-    pub fn install(&self, membership: Membership) {
+    ///
+    /// A membership of another cluster or domain is not a handoff of
+    /// this one and is refused: the binder's origin is fixed by the
+    /// genesis it started from.
+    pub fn install(&self, membership: Membership) -> bool {
+        if membership.cluster() != self.cluster || membership.domain() != self.domain {
+            return false;
+        }
         *self.membership.write().expect("membership lock") = membership;
+        true
     }
+}
+
+/// The certificate's SubjectPublicKeyInfo DER: what genesis commits to
+/// for a voter, and what the peer must present.
+fn spki_of(cert: &CertificateDer<'_>) -> Option<Vec<u8>> {
+    let (_, x509) = x509_parser::certificate::X509Certificate::from_der(cert).ok()?;
+    Some(x509.public_key().raw.to_vec())
 }
 
 fn node_uri_of(cert: &CertificateDer<'_>) -> Option<coord_node_issuer::NodeIdentity> {
@@ -95,8 +115,14 @@ impl IdentityBinder for PeerBinder {
         // exact node at the exact key generation. A stale generation or a
         // node that is not a committed voter is refused here.
         if identity.role == PeerRole::Voter {
+            // The committed key, not merely the committed name: without
+            // this, any certificate the issuer signs for that node at
+            // that incarnation is accepted as the voter, so an issuer
+            // that is compromised or merely tricked mints a peer of an
+            // existing cluster.
+            let presented = spki_of(leaf).ok_or(BindError::UnknownCertificate)?;
             let membership = self.membership.read().expect("membership lock");
-            if !membership.is_current_voter(&identity.node, identity.incarnation) {
+            if !membership.is_current_voter_key(&identity.node, identity.incarnation, &presented) {
                 return Err(BindError::IncarnationMismatch);
             }
         }
