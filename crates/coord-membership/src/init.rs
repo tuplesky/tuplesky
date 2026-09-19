@@ -18,6 +18,12 @@ pub trait GenesisStore {
     fn pin(&mut self, digest: Digest32) -> Result<(), StoreFailure>;
     /// Whether the node's own durable journal exists and is intact.
     fn journal_intact(&self) -> Result<bool, StoreFailure>;
+    /// Create the node's durable journal (first boot). It must be
+    /// established before the manifest is pinned: a node that pinned
+    /// first and crashed came back with a pinned digest and no journal,
+    /// and its own returning-node check then quarantined it although it
+    /// had never run.
+    fn establish_journal(&mut self) -> Result<(), StoreFailure>;
 }
 
 /// The store could not be read or written.
@@ -63,8 +69,12 @@ pub fn initialize(
     let digest = manifest.digest();
     match store.pinned_digest().map_err(|_| InitError::Store)? {
         None => {
-            // First boot: pin the manifest. No trust-on-first-use of a
-            // peer; the manifest itself came through deployment trust.
+            // First boot: establish the journal, then pin the manifest.
+            // No trust-on-first-use of a peer; the manifest itself came
+            // through deployment trust. The order matters: pinning
+            // first and crashing left a pinned digest with no journal,
+            // which the returning-node path reads as a lost journal.
+            store.establish_journal().map_err(|_| InitError::Store)?;
             store.pin(digest).map_err(|_| InitError::Store)?;
             Ok(Initialized {
                 membership,

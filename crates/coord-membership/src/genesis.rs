@@ -20,6 +20,14 @@ pub struct VoterSeed {
     pub node: String,
     /// Committed key generation / incarnation.
     pub incarnation: u64,
+    /// The voter's committed public key: base64url of the certificate's
+    /// SubjectPublicKeyInfo DER.
+    ///
+    /// Without this, genesis names only an identity, and any
+    /// certificate the issuer signs for that node at that incarnation is
+    /// accepted as the voter, so an issuer that is compromised or merely
+    /// tricked mints a peer of an existing cluster.
+    pub public_key: String,
 }
 
 /// The genesis manifest.
@@ -35,6 +43,14 @@ pub struct GenesisManifest {
     pub voters: Vec<VoterSeed>,
     /// Issuer trust anchors (base64url CA certificate DERs).
     pub issuer_roots: Vec<String>,
+    /// The workload-identity trust rules the cluster starts with, as the
+    /// admission policy serializes them.
+    ///
+    /// The rules decide which external credentials become sessions, so
+    /// leaving them out of genesis left the founding admission policy
+    /// outside the manifest's commitment: it could be set differently on
+    /// each node, and nothing in the pinned digest would notice.
+    pub wif_rules: Vec<Value>,
     /// Admin principal (lowercase hex).
     pub admin: String,
     /// Protocol/version policy identifier.
@@ -92,10 +108,11 @@ impl GenesisManifest {
         Some(PrincipalId(unhex(&self.admin)?))
     }
     /// A voter seed's replica identity and incarnation.
-    pub fn voter(seed: &VoterSeed) -> Option<(ReplicaId, ReplicaIncarnation)> {
+    pub fn voter(seed: &VoterSeed) -> Option<(ReplicaId, ReplicaIncarnation, Vec<u8>)> {
         Some((
             ReplicaId(unhex(&seed.node)?),
             ReplicaIncarnation::new(seed.incarnation).ok()?,
+            b64url_decode(&seed.public_key)?,
         ))
     }
 
@@ -112,6 +129,7 @@ impl GenesisManifest {
             || self.admin_principal().is_none()
             || self.voters.is_empty()
             || self.issuer_roots.is_empty()
+            || self.wif_rules.is_empty()
         {
             return Err(GenesisError::Invalid);
         }
