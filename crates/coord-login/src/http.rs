@@ -186,8 +186,14 @@ async fn callback(
             "busy",
         );
     };
-    if q.error.is_some() {
-        return error(StatusCode::BAD_REQUEST, "access_denied", "upstream denied");
+    if let Some(denial) = q.error.as_deref() {
+        // The client is waiting on its own callback: tell it, rather
+        // than answering only the browser and leaving it to time out.
+        let mut login = state.login.lock().await;
+        return match login.upstream_denied(&q.state, denial) {
+            Ok(location) => redirect(&location),
+            Err(_) => error(StatusCode::BAD_REQUEST, "access_denied", "upstream denied"),
+        };
     }
     let Some(code) = q.code else {
         return error(StatusCode::BAD_REQUEST, "invalid_request", "missing code");
