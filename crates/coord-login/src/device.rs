@@ -130,6 +130,11 @@ enum State {
         upstream_nonce: String,
         upstream_verifier: String,
     },
+    /// The upstream leg verified an identity, but the grant is not
+    /// ordered yet. A poll sees this as pending: publishing approval
+    /// before the grant is committed would hand out a session for a
+    /// grant that replicated state never accepted.
+    Verified(UpstreamIdentity),
     Approved(UpstreamIdentity),
     Denied,
     Taken,
@@ -409,9 +414,52 @@ impl DeviceLogin {
             .get(&g.upstream)
             .ok_or(DeviceError::UnknownTransaction)?;
         azp_policy(&identity, client).map_err(DeviceError::Policy)?;
-        g.state = State::Approved(identity);
+        // Verified, not approved: the poll keeps waiting until the grant
+        // is committed, so a failed commit leaves nothing to redeem.
+        g.state = State::Verified(identity);
         self.by_upstream_state.remove(upstream_state);
         Ok(id)
+    }
+
+    /// The grant `id` is committed in replicated state: publish the
+    /// approval so the device's next poll takes it.
+    pub fn publish_browser(&mut self, now: u64, id: Digest32) -> Result<(), DeviceError> {
+        self.prune(now);
+        let g = self
+            .grants
+            .get_mut(&id)
+            .ok_or(DeviceError::UnknownTransaction)?;
+        match std::mem::replace(&mut g.state, State::Denied) {
+            State::Verified(identity) => {
+                g.state = State::Approved(identity);
+                Ok(())
+            }
+            other => {
+                g.state = other;
+                Err(DeviceError::UnknownTransaction)
+            }
+        }
+    }
+
+    /// The upstream leg refused the login for `upstream_state`: the
+    /// grant is denied, so the device's poll learns of it instead of
+    /// waiting out the code's lifetime.
+    pub fn deny_upstream(&mut self, now: u64, upstream_state: &str) -> Result<(), DeviceError> {
+        self.prune(now);
+        let id = *self
+            .by_upstream_state
+            .get(upstream_state)
+            .ok_or(DeviceError::UnknownTransaction)?;
+        let g = self
+            .grants
+            .get_mut(&id)
+            .ok_or(DeviceError::UnknownTransaction)?;
+        if !matches!(g.state, State::Browser { .. }) {
+            return Err(DeviceError::UnknownTransaction);
+        }
+        g.state = State::Denied;
+        self.by_upstream_state.remove(upstream_state);
+        Ok(())
     }
 
     /// The user denied a typed user code.
@@ -459,7 +507,9 @@ impl DeviceLogin {
         }
         g.last_poll = Some(now);
         match &g.state {
-            State::Pending | State::Browser { .. } => Ok(Poll::Pending),
+            // Verified but not yet committed is still pending: the
+            // device learns of approval only once the grant is ordered.
+            State::Pending | State::Browser { .. } | State::Verified(_) => Ok(Poll::Pending),
             State::Denied => {
                 self.remove(id);
                 Ok(Poll::Denied)

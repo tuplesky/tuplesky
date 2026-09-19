@@ -132,6 +132,7 @@ fn config(issuer: &str) -> UpstreamConfig {
         issuer: issuer.into(),
         client_id: "broker".into(),
         redirect_uri: "https://broker.example/login/callback".into(),
+        device_redirect_uri: "https://broker.example/device/callback".into(),
         allow_insecure_loopback: true,
     }
 }
