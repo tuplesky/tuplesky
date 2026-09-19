@@ -37,6 +37,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A well-formed configuration can still name a profile this build
+    // does not serve. Accepting it and running the other one would read
+    // as a durability guarantee that is not being kept, so it is refused
+    // here -- under --check too, which is where an operator would want
+    // to find out.
+    if let Some(unserved) = config.unserved_profile() {
+        eprintln!("cannot serve this configuration: {unserved}");
+        return ExitCode::from(2);
+    }
     let roles = config.role_set().expect("validated");
     let lifecycle = Lifecycle::new(roles.clone());
     let diagnostics = Diagnostics::snapshot(&roles, &lifecycle, 0);
