@@ -166,13 +166,30 @@ impl NodeIssuer {
             ));
         }
         params.subject_alt_names = sans;
-        let expires_at = clock.now.saturating_add(policy.lifetime_secs);
-        params.not_before = OffsetDateTime::from_unix_timestamp(clock.now as i64)
+        // The certificate can outlive neither the assertion that
+        // authorized it nor the CA that signs it. Without the first, a
+        // node presenting a credential valid for a minute walked away
+        // with a certificate valid for the policy's whole lifetime.
+        let expires_at = clock
+            .now
+            .saturating_add(policy.lifetime_secs)
+            .min(clock.valid_until(identity.expires_at))
+            .min(self.ca.not_after());
+        if expires_at <= clock.now {
+            return Err(IssueError::Assertion);
+        }
+        // Validity is stated against clocks that disagree by up to the
+        // reading's uncertainty: start early enough that a peer reading
+        // behind this one still accepts the certificate, and never end
+        // later than the bounds above.
+        let not_before = clock.now.saturating_sub(clock.uncertainty);
+        params.not_before = OffsetDateTime::from_unix_timestamp(not_before as i64)
             .map_err(|_| IssueError::Signing)?;
         params.not_after = OffsetDateTime::from_unix_timestamp(expires_at as i64)
             .map_err(|_| IssueError::Signing)?;
-        let signed = params
-            .signed_by(&csr.public_key, self.ca.issuer())
+        let signed = self
+            .ca
+            .sign(params, &csr.public_key, clock.now)
             .map_err(|_| IssueError::Signing)?;
         self.issued += 1;
         Ok(Issued {
