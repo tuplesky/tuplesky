@@ -1055,3 +1055,110 @@ fn a_sync_row_of_the_previous_layout_still_decodes() {
         "an unknown version is refused"
     );
 }
+
+#[test]
+fn a_report_after_a_sync_never_omits_a_selected_command_it_still_owes() {
+    // A follower can accept Sync B durably and still lack the payload of
+    // a command B selected. The report came straight from the durable
+    // command ledger, which does not hold that command, while its
+    // `committed_ballot` announced B: a candidate reading the report as
+    // the source for B would conclude the command was never accepted and
+    // drop it. The selection is part of what this replica knows and the
+    // report has to say so.
+    let mut c = Cluster::new(3);
+    let new = ballot(1, 2);
+    let f = c.nodes[1].follower_mut();
+    let promise = f.step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    for event in durable_events(&promise) {
+        f.step(event);
+    }
+    // A command this replica has never seen the payload of.
+    let unseen = CommandId(coord_types::identity::Digest32([0x5c; 32]));
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            unseen,
+            coord_consensus::SyncEntry {
+                command: unseen,
+                phase: Phase::Accept,
+                deps: vec![],
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: 0,
+            },
+        )]),
+        reproposed: Default::default(),
+    };
+    let bound = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    for event in durable_events(&bound) {
+        f.step(event);
+    }
+    assert_eq!(f.ballots().synced(), new, "Sync B is durable");
+    assert!(
+        f.missing_payloads().contains(&unseen),
+        "the payload is still owed"
+    );
+
+    // Another election begins before the payload arrives.
+    let later = ballot(2, 0);
+    let _ = f.step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader { ballot: later },
+    ));
+    let report = f.report(later);
+    assert_eq!(
+        report.committed_ballot, new,
+        "it reports the ballot it synced"
+    );
+    let entry = report
+        .entries
+        .iter()
+        .find(|e| e.command == unseen)
+        .expect("the selected command is in the report, not silently absent");
+    assert_eq!(entry.phase, Phase::Accept);
+    assert!(
+        !entry.payload_present,
+        "and it says plainly that the payload is still outstanding"
+    );
+}
+
+#[test]
+fn one_reporter_without_a_payload_does_not_stop_a_recoverable_campaign() {
+    // The half-initialized guard was applied per report, so a replica
+    // reporting a durable selection whose payload transfer was still in
+    // flight failed the whole campaign — exactly when recovery is needed.
+    // The guard's purpose is that nothing selects accepted state nobody
+    // can supply, so it belongs across the report set.
+    let config = quorum(ballot(1, 0));
+    let command = CommandId(coord_types::identity::Digest32([0x77; 32]));
+    let entry = |payload_present| coord_consensus::ReportEntry {
+        command,
+        phase: Phase::Accept,
+        deps: vec![],
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        keys: Vec::new(),
+        payload_present,
+    };
+    let report = |replica, payload_present| coord_consensus::RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries: vec![entry(payload_present)],
+    };
+    // One reporter still owes the payload; another has it.
+    let mixed = [report(r(0), false), report(r(1), true)];
+    let decision = coord_consensus::select(&config, &mixed).expect("recoverable");
+    assert!(
+        decision.entries.contains_key(&command),
+        "the command is selected, not dropped"
+    );
+    // Nobody at all: still a dead end, as before.
+    let nobody = [report(r(0), false), report(r(1), false)];
+    assert!(matches!(
+        coord_consensus::select(&config, &nobody),
+        Err(coord_consensus::RecoveryError::HalfInitialized { .. })
+    ));
+}
