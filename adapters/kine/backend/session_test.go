@@ -159,12 +159,11 @@ func TestACredentialRefreshRollsTheSessionOverWithoutStrandingOldInvocations(t *
 
 	// An invocation whose outcome the domain never establishes: the
 	// backend resolves it by identity and then refuses it explicitly.
-	domain.PendingOnce.Store(true)
-	domain.ForgetAll.Store(true)
+	domain.PendingAlways.Store(true)
 	if _, err := be.Create(ctx, "/registry/ambiguous", []byte("v"), 0); err == nil {
 		t.Fatal("an unestablished outcome was reported as success")
 	}
-	domain.ForgetAll.Store(false)
+	domain.PendingAlways.Store(false)
 	ambiguous := make(map[[32]byte]bool)
 	for _, entry := range domain.Log() {
 		if entry.Session == first && entry.Sequence == 2 {
@@ -249,6 +248,27 @@ func TestACredentialRefreshRollsTheSessionOverWithoutStrandingOldInvocations(t *
 	if _, _, err := be.Get(ctx, server.HealthKey, 0, false); err != nil {
 		t.Fatalf("read under the rolled-over session: %v", err)
 	}
+
+	// A lane opened for the first time after the refresh binds the
+	// rolled-over session as well: it is not refused for naming a
+	// session other than the one the first lane bound.
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	result := be.Watch(watchCtx, "/registry/c", "", 0)
+	select {
+	case err := <-result.Errorc:
+		t.Fatalf("watch lane after the refresh: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if domain.Watchers() == 0 {
+		t.Fatal("the watch lane did not open after the refresh")
+	}
+	if session, ok := native.Session(); !ok || session != third {
+		t.Fatalf("the watch lane changed the session: %x", session)
+	}
+	if native.Rollovers != 2 {
+		t.Fatalf("the watch lane rolled the session over again: %d", native.Rollovers)
+	}
 }
 
 // A configured session pins the identity: an acknowledgement naming
@@ -285,5 +305,130 @@ func TestAPinnedSessionRefusesAnAcknowledgementNamingAnotherSession(t *testing.T
 	}
 	if _, ok := native.Session(); ok {
 		t.Fatal("a refused acknowledgement was remembered")
+	}
+}
+
+// A rollover started by one lane must not leave another lane bound to
+// the session before it.
+//
+// `adopt` replaced the client's binding and bumped its epoch, but the
+// connections already open kept the session they had bound. Opening the
+// watch lane on a fresh credential therefore rolled the client over to
+// S2 while the unary connection stayed on S1: the next request took its
+// retry key from S2 and travelled on the S1 connection, which the
+// frontend refuses — and refuses again on every retry, because the same
+// connection is selected each time.
+func TestARolloverOnOneLaneDoesNotStrandAnother(t *testing.T) {
+	clock := &testClock{now: time.Unix(1_700_000_000, 0)}
+	sts := startSts(t, clock)
+	cert, pool, err := fakedomain.SelfSigned("frontend.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	domain, err := fakedomain.Start(fakedomain.Config{
+		Cert: cert,
+		Admit: func(token string) ([16]byte, time.Time, bool) {
+			session, ok := sessionOf(token)
+			return session, clock.Now().Add(tokenLifetime), ok
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(domain.Close)
+
+	assertion := filepath.Join(t.TempDir(), "assertion")
+	if err := os.WriteFile(assertion, []byte("workload-assertion"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := client.NewProvider(client.ProviderConfig{
+		TokenFile:     assertion,
+		STSURL:        sts.URL,
+		Audience:      "cluster-resource",
+		HTTP:          sts.Client(),
+		RefreshMargin: refreshMargin,
+		Clock:         clock.Now,
+	})
+	native := client.New(domain.Addr(), client.Config{
+		TLS:          &tls.Config{RootCAs: pool, ServerName: "frontend.local", MinVersion: tls.VersionTLS13},
+		Tokens:       provider,
+		Cluster:      [16]byte{1},
+		Domain:       [16]byte{2},
+		FrameTimeout: 3 * time.Second,
+		// The credential is refreshed well before the binding lapses,
+		// which is the point of a refresh margin: at the moment of the
+		// rollover the old binding is still perfectly usable, so the
+		// expiry path does not drop the lanes and the rollover itself
+		// has to.
+		BindingMargin: time.Second,
+		Clock:         clock.Now,
+	})
+	be, err := backend.New(backend.Config{
+		Client:         native,
+		Cluster:        [16]byte{1},
+		Domain:         [16]byte{2},
+		Namespace:      [16]byte{3},
+		ClientInstance: [16]byte{4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := be.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	first, _ := sessionOf("svc-1")
+	if session, ok := native.Session(); !ok || session != first {
+		t.Fatalf("first binding: %x %v", session, ok)
+	}
+	// The unary lane is warm and bound to the first session.
+	if _, err := be.Create(ctx, "/registry/warm", []byte("v"), 0); err != nil {
+		t.Fatalf("warm the unary lane: %v", err)
+	}
+
+	// The credential's lifetime passes, and the *watch* lane is what
+	// exchanges next: it binds a fresh session and rolls the client over
+	// while the unary connection is still bound to the old one.
+	clock.advance(tokenLifetime - refreshMargin)
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	result := be.Watch(watchCtx, "/registry/warm", "", 0)
+	select {
+	case err := <-result.Errorc:
+		t.Fatalf("watch lane: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	second, _ := sessionOf("svc-2")
+	if session, ok := native.Session(); !ok || session != second {
+		t.Fatalf("the watch lane did not roll the session over: %x", session)
+	}
+	if native.Rollovers != 1 {
+		t.Fatalf("rollovers: %d", native.Rollovers)
+	}
+
+	// The next unary request must reach the domain under the session in
+	// force, on a connection bound to it.
+	if _, err := be.Create(ctx, "/registry/after", []byte("v"), 0); err != nil {
+		t.Fatalf("unary request after the rollover: %v", err)
+	}
+	if got := domain.CrossSessionRefusals.Load(); got != 0 {
+		t.Fatalf("a request travelled on a connection bound to another session: %d", got)
+	}
+	// And it is recorded under the rolled-over session.
+	var sawAfter bool
+	for _, entry := range domain.Log() {
+		if entry.Kind == "request" && entry.Session == second {
+			sawAfter = true
+		}
+	}
+	if !sawAfter {
+		t.Fatal("no unary work continued under the rolled-over session")
+	}
+	// A retry does not keep selecting the same stale connection.
+	if _, err := be.Create(ctx, "/registry/after2", []byte("v"), 0); err != nil {
+		t.Fatalf("a second unary request: %v", err)
+	}
+	if got := domain.CrossSessionRefusals.Load(); got != 0 {
+		t.Fatalf("the stale connection was selected again: %d", got)
 	}
 }

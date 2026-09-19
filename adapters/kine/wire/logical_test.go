@@ -124,6 +124,15 @@ func opFromVector(t *testing.T, ops map[string]json.RawMessage) (LogicalOp, bool
 		}
 		return op, true
 	}
+	if raw, ok := ops["Compact"]; ok {
+		var v struct {
+			Revision uint64 `json:"revision"`
+		}
+		if err := json.Unmarshal(raw, &v); err != nil {
+			t.Fatal(err)
+		}
+		return CompactOp{Revision: v.Revision}, true
+	}
 	if raw, ok := ops["KineDelete"]; ok {
 		var v struct {
 			Key                 []byte  `json:"key"`
@@ -166,7 +175,7 @@ func TestLogicalEncodingMatchesRustVectors(t *testing.T) {
 			t.Fatalf("%s: re-encode %x (%v), want %x", v.Name, again, err, want)
 		}
 	}
-	if seen < 4 {
+	if seen < 5 {
 		t.Fatalf("only %d Kine-subset vectors found", seen)
 	}
 }
@@ -207,6 +216,7 @@ func TestLogicalRejectsOutsideSubsetAndRuleViolations(t *testing.T) {
 		KineUpdateOp{Key: []byte("k"), ExpectedModRevision: 0},
 		KineDeleteOp{Key: []byte("k"), ExpectedModRevision: &zero},
 		KineDeleteOp{Key: make([]byte, MaxKeyBytes+1), ExpectedModRevision: &seven},
+		CompactOp{Revision: 0},
 	}
 	for i, op := range bad {
 		if _, err := (LogicalRequest{Namespace: ns, Op: op}).Encode(); !errors.Is(err, ErrInvalidLogical) {
