@@ -155,7 +155,8 @@ impl Dispatcher {
                         return self.respond(connection, key, command_of(&key), code, detail);
                     }
                 };
-                match self.collector.submit(now_ticks, &admitted) {
+                let reserved = admitted.reserved;
+                match self.collector.submit(now_ticks, &admitted.request) {
                     Ok(Submitted::FanOut(fan_out)) => {
                         self.attach(connection, key);
                         Action::FanOut(fan_out)
@@ -165,6 +166,8 @@ impl Dispatcher {
                         Action::Pending { command }
                     }
                     Ok(Submitted::Resolved(response)) => {
+                        // Resolved: the invocation is finished, so its
+                        // slot frees whoever presented it.
                         self.admission.settled(&key);
                         Action::Respond(Delivery {
                             connection,
@@ -173,7 +176,11 @@ impl Dispatcher {
                         })
                     }
                     Err(refusal) => {
-                        self.admission.settled(&key);
+                        // Only if this presentation took the slot. A
+                        // conflicting payload under a pending retry key
+                        // is refused while the original request is still
+                        // outstanding and still holds its reservation.
+                        self.admission.settled_reservation(&key, reserved);
                         let (code, detail) = match refusal {
                             SubmitRefusal::Malformed => (codes::MALFORMED_REQUEST, "malformed"),
                             SubmitRefusal::RequestIdentityConflict { .. } => (

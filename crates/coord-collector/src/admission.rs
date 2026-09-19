@@ -29,6 +29,19 @@ pub struct Caller {
     pub scope_ceiling: u32,
 }
 
+/// An admitted request and whether this presentation took the session's
+/// slot.
+///
+/// A retry of a request the session still has outstanding is that
+/// request again: it neither needs a slot nor takes one, and a refusal
+/// of it must not free the slot the original holds.
+pub struct Admitted {
+    /// What goes to the collector.
+    pub request: AdmittedRequest,
+    /// Whether this presentation acquired the slot.
+    pub reserved: bool,
+}
+
 /// Bounds of admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionLimits {
@@ -97,7 +110,7 @@ impl Admission {
         now_ticks: u64,
         caller: &Caller,
         request: &RequestV1,
-    ) -> Result<AdmittedRequest, AdmissionRefusal> {
+    ) -> Result<Admitted, AdmissionRefusal> {
         if caller.role != PeerRole::Client {
             return Err(AdmissionRefusal::RoleNotAdmitted(caller.role));
         }
@@ -119,12 +132,18 @@ impl Admission {
         // client's first retry under a bound of one, and leave a session
         // permanently busy once repeated retries outnumbered the single
         // release that settles them.
-        if !pending.contains(key) && pending.len() >= self.limits.max_pending_per_session {
+        let held = pending.contains(key);
+        if !held && pending.len() >= self.limits.max_pending_per_session {
             return Err(AdmissionRefusal::SessionBusy {
                 pending: pending.len(),
             });
         }
         pending.insert(*key);
+        // Whether this presentation is what took the slot. A refusal of
+        // a re-presentation must not release it: the request that holds
+        // it is still outstanding, and freeing its reservation would let
+        // the session exceed its bound.
+        let reserved = !held;
         self.minted += 1;
         let receipt_id = HashDomain::AdmissionReceipt.digest(&[
             &key.canonical_bytes(),
@@ -143,7 +162,18 @@ impl Admission {
         let frame = MessageV1::Request(request.clone())
             .encode()
             .map_err(|_| AdmissionRefusal::Malformed)?;
-        Ok(AdmittedRequest { receipt, frame })
+        Ok(Admitted {
+            request: AdmittedRequest { receipt, frame },
+            reserved,
+        })
+    }
+
+    /// Release `key`'s slot, but only when `reserved` says this
+    /// presentation is the one that took it.
+    pub fn settled_reservation(&mut self, key: &RetryKey, reserved: bool) {
+        if reserved {
+            self.settled(key);
+        }
     }
 
     /// A request settled (released, refused after admission or

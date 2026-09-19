@@ -545,3 +545,49 @@ fn partially_missing_durable_metadata_is_corruption() {
     };
     assert_eq!(err.class, coord_store_api::engine::ErrorClass::Corrupt);
 }
+
+#[test]
+fn a_rejection_decided_before_a_later_failure_is_not_lost_with_it() {
+    // A batch refused for a stale base is finished: it is not requeued,
+    // so its event is the only thing that will ever complete its
+    // barrier. Returning the error from a later step of the same group
+    // discarded that event, and the waiter was left waiting for a batch
+    // that had already been refused.
+    let engine = ModelEngine::new();
+    let mut worker = generic_fixtures(engine);
+    let mut alloc = BarrierAllocator::new(inc(), BOOT_A);
+
+    let stale = ApplyBase {
+        configuration: ConfigurationEpoch::ZERO,
+        execution_position: ExecutionPosition::ZERO,
+    };
+    let refused = alloc.allocate();
+    let doomed = alloc.allocate();
+    worker
+        .submit(app_batch(refused, stale, b"k-stale", b"x"))
+        .unwrap();
+    worker
+        .submit(app_batch(doomed, worker.application_base(), b"k-ok", b"y"))
+        .unwrap();
+    // The batch after the rejection fails while lowering.
+    worker.engine_mut().inject_write_error_at(1);
+    let failed = worker.flush();
+    assert!(failed.is_err(), "the group failed: {failed:?}");
+    worker.engine_mut().clear_injected_faults();
+
+    // The refusal still has to be reported: the next flush carries it,
+    // together with the batch that was requeued and now succeeds.
+    let o = worker.flush().unwrap();
+    assert!(
+        failed_of(&o)
+            .iter()
+            .any(|(b, e)| *b == refused && *e == StorageError::DefinitelyNotCommitted),
+        "the rejection decided before the failure: {:?}",
+        failed_of(&o)
+    );
+    assert!(
+        durable_of(&o).contains(&doomed),
+        "the requeued batch lands: {:?}",
+        durable_of(&o)
+    );
+}
