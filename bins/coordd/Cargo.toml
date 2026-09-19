@@ -32,13 +32,20 @@ coord-storage-redb.workspace = true
 rustls-pki-types.workspace = true
 serde_json.workspace = true
 x509-parser.workspace = true
+quinn.workspace = true
 coord-types.workspace = true
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 coord-node-issuer.workspace = true
+coord-membership.workspace = true
+coord-session.workspace = true
 coord-sts.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+x509-parser.workspace = true
 coord-types.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true

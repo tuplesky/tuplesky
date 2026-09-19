@@ -268,3 +268,64 @@ to wall-clock defaults, so a slow machine slows the test instead of
 failing it. Re-running it is not the fix, and neither is a retry
 annotation: both hide the case where the sensitivity is a real
 regression in the transport's own timing.
+
+## The Rust transport has no client-side unary request
+
+**Where:** `coord_transport::Transport::send` (the `Class::Api` arm of
+the sender loop), `Responder::respond`, `TransportEvent::ApiDelivery`.
+
+**Expected:** a smoke test could drive `coordd` with the Rust
+`Transport` as a client -- connect, send a request, read the answer.
+
+**Actually:** they do not compose. The sender opens a bidirectional
+stream and drops the receiving half
+(`peer.conn.open_bi().await.map(|(send, _recv)| send)`), while
+`Responder::respond` writes the answer on that same stream. The client
+therefore never sees it. `ApiDelivery` is not the missing half: it is
+read from streams the *peer* opens, which is how a frontend receives
+output on a connection it dialed -- server-to-server, not a caller
+asking a question.
+
+This is not a defect in either piece. `Transport` is the node's
+endpoint, and the caller's shape -- one stream, request written, answer
+read on it -- is implemented by the Go client
+(`adapters/kine/client`), which is the client surface the Kine edge
+needs. Nothing in Rust asks a node a question today: `coord-sdk` is
+lifecycle and pooling and does not dial.
+
+**Did:** the daemon's bind smoke test dials with quinn directly and
+speaks the caller's shape, which is what the daemon answers on. The test
+says so where it does it.
+
+**Revisit when:** something in Rust needs to be a client -- a control
+plane tool, a cross-domain relay, `coordctl` against a live node. The
+fix is a request method on `Transport` that keeps the receiving half and
+returns the answer, not a change to either existing path.
+
+## Genesis commits to a voter's key, and only a peer was checking
+
+**Where:** `bins/coordd/src/membership.rs` (`place`),
+`coord_membership::binder::PeerBinder`.
+
+**Expected:** a node that holds the right name and incarnation is the
+voter the configuration names.
+
+**Actually:** genesis commits to the *key* as well, and `PeerBinder`
+enforces it -- `is_current_voter_key` compares the presented
+SubjectPublicKeyInfo against the manifest. A node holding some other key
+starts perfectly well, because nothing it does alone checks it, and is
+then refused by every peer it meets. That reads as a network problem and
+is not one.
+
+It surfaced as a test fixture whose manifest committed to placeholder
+bytes. Every earlier test passed, because none of them connected
+anything to the daemon.
+
+**Did:** the daemon checks its own certificate against the committed key
+at startup, before storage is opened, and says which is wrong. The
+fixture commits to the real key, and a separate case holds the refusal.
+
+**Revisit when:** a key rotation makes the committed key change while a
+node runs. The check is at startup because that is where the answer is
+knowable and cheap; a rotation that outlives the process is the
+membership handoff's business (task-57), not this.
