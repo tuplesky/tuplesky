@@ -665,6 +665,12 @@ pub fn plan_trim<V: OrderedRead>(
 
     let mut candidates: Vec<(Vec<u8>, CommandId)> = Vec::new();
     let mut pins: BTreeSet<CommandId> = BTreeSet::new();
+    // Dependencies of every command seen, so a pin can be closed over
+    // them. Pinning only the direct dependencies of retained commands
+    // left a retained command U depending on executed B, whose own
+    // dependency A was deleted: closure traversal after a restart stops
+    // at the missing A.
+    let mut deps_of: BTreeMap<CommandId, Vec<CommandId>> = BTreeMap::new();
     let mut examined = 0u32;
     let mut retained = 0u32;
     let mut resume: Option<Vec<u8>> = None;
@@ -693,12 +699,32 @@ pub fn plan_trim<V: OrderedRead>(
                     retained += 1;
                     pins.extend(deps);
                 }
-                Verdict::Eligible(command) => candidates.push((row.key.clone(), command)),
+                Verdict::Eligible(command, deps) => {
+                    // An eligible row's own dependencies are recorded even
+                    // though it is a candidate: a command pinned later may
+                    // depend on it, and closure has to continue through it.
+                    deps_of.entry(command).or_insert(deps);
+                    candidates.push((row.key.clone(), command));
+                }
             }
         }
         match page.rows.last() {
             Some(last) if !page.exhausted => resume = Some(last.key.clone()),
             _ => break,
+        }
+    }
+
+    // Close the pins over the dependency graph: whatever a pinned command
+    // needs is needed too, however deep.
+    let mut frontier: Vec<CommandId> = pins.iter().copied().collect();
+    while let Some(command) = frontier.pop() {
+        let Some(deps) = deps_of.get(&command) else {
+            continue;
+        };
+        for dep in deps.clone() {
+            if pins.insert(dep) {
+                frontier.push(dep);
+            }
         }
     }
 
@@ -757,8 +783,10 @@ enum Verdict {
     RetainPinning(Vec<CommandId>),
     /// Keep it.
     Retain,
-    /// It belongs to a command executed at or below the floor.
-    Eligible(CommandId),
+    /// It belongs to a command executed at or below the floor, with the
+    /// dependencies that command records: closure runs through it even
+    /// though the row itself may go.
+    Eligible(CommandId, Vec<CommandId>),
 }
 
 /// Decide one `protocol_v1` row. Anything whose tag or key shape this build
@@ -781,7 +809,7 @@ fn classify<V: OrderedRead>(
             let command = command_of(key)?;
             let record = decode_dependency(value)?;
             if record.phase == Phase::Executed && executed_within(view, &command, boundary)? {
-                Ok(Verdict::Eligible(command))
+                Ok(Verdict::Eligible(command, record.deps))
             } else {
                 Ok(Verdict::RetainPinning(record.deps))
             }
@@ -790,10 +818,11 @@ fn classify<V: OrderedRead>(
         // resume a proposal that is not yet settled.
         PROPOSAL_TAG if key.len() == 41 => {
             let command = command_of(key)?;
+            let proposal_deps = decode_proposal(value)?.deps;
             if executed_within(view, &command, boundary)? {
-                Ok(Verdict::Eligible(command))
+                Ok(Verdict::Eligible(command, proposal_deps))
             } else {
-                Ok(Verdict::RetainPinning(decode_proposal(value)?.deps))
+                Ok(Verdict::RetainPinning(proposal_deps))
             }
         }
         // Promise rows (tag 0x00) and Sync rows: never trimmed. A forgotten

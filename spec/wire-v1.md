@@ -254,7 +254,6 @@ The receiver verifies root, digests, order, uniqueness, counts and bounds
 artifact carries no node identity, incarnation, boot, stamp or journal
 sequence and is not the local recovery checkpoint (task-j04).
 
-<<<<<<< HEAD
 The manifest is not paginated: one Manifest frame carries the whole
 descriptor list, so the encoded manifest is itself a supported-size bound
 of the artifact rather than a property of the transport. Export refuses a
@@ -264,7 +263,7 @@ always be framed. Chunk count alone does not decide it, since every
 descriptor also carries its chunk's first and last key; the derived count
 ceiling `MAX_CHUNKS` is only what the frame could describe if every
 boundary key were empty.
-=======
+
 The install (`coord_checkpoint::install_shared`, task-50) accepts chunks
 against their descriptors, so a missing, duplicated, truncated or altered
 chunk blocks it, and writes the verified rows into the engine of an
@@ -280,7 +279,6 @@ a common digest and grants no authority. No identity or `protocol_v1` row
 is written, so a learner inherits neither the donor's identity nor any
 promise or vote, and post-boundary commands and unresolved closure are
 transferred separately (task-25).
->>>>>>> d6e4c53 (task-50: install learner snapshots and reconcile catch-up state)
 
 Conservative all-voter trimming (`coord_checkpoint::trim`, task-51) adds
 two further node-private `checkpoint_v1` records. One acknowledgement per
