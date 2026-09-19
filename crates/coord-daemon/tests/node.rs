@@ -18,9 +18,12 @@ use coord_core::effect::{BootId, PeerId};
 use coord_core::event::Event;
 use coord_core::outbox::BarrierAllocator;
 use coord_daemon::node::{DriveError, Machine, Node};
+use coord_journal_api::stream::ShardId;
 use coord_state::policy::{Action as PolicyAction, KeyInterval, PolicyRule};
+use coord_storage::journaled::{JournalLimits, JournaledStore};
 use coord_storage::policy::{bootstrap_session, rule_update};
-use coord_storage::{Applier, GroupLimits, StoreWorker};
+use coord_storage::{Applier, GroupLimits, JournaledDomain, Persistence, StoreWorker};
+use coord_store_testkit::journal::ModelJournal;
 use coord_store_testkit::model::ModelEngine;
 use coord_types::RetryKey;
 use coord_types::identity::Digest32;
@@ -78,12 +81,9 @@ fn quorum() -> BallotConfiguration {
     BallotConfiguration::c2(epoch(), ballot(), (0..3).map(r).collect(), fast).unwrap()
 }
 
-/// A bootstrapped store: one session and the policy rules for it, made
-/// durable, so a request can be admitted and applied.
-fn store(boot: BootId) -> Applier<StoreWorker<ModelEngine>> {
-    let mut worker =
-        StoreWorker::open(ModelEngine::new(), boot, inc(), GroupLimits::default()).unwrap();
-    let mut alloc = BarrierAllocator::new(inc(), boot);
+/// One session and the policy rules for it: the same bootstrap for
+/// either coordinator.
+fn bootstrap_updates() -> Vec<coord_core::effect::StoreUpdate> {
     let mut updates = bootstrap_session(&SESSION, ALICE, 64, true).unwrap();
     for (i, action) in PolicyAction::ALL.iter().enumerate() {
         updates.push(
@@ -102,6 +102,16 @@ fn store(boot: BootId) -> Applier<StoreWorker<ModelEngine>> {
             .unwrap(),
         );
     }
+    updates
+}
+
+/// A bootstrapped store: one session and the policy rules for it, made
+/// durable, so a request can be admitted and applied.
+fn store(boot: BootId) -> Applier<StoreWorker<ModelEngine>> {
+    let mut worker =
+        StoreWorker::open(ModelEngine::new(), boot, inc(), GroupLimits::default()).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let updates = bootstrap_updates();
     let base = worker.application_base();
     worker
         .submit(coord_core::effect::PersistBatch {
@@ -146,6 +156,73 @@ fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
         ),
         frame: MessageV1::Request(request).encode().unwrap(),
     }
+}
+
+/// The same follower, but persisting through the shared journal: the
+/// serving profile, where a record reaches the journal before the
+/// projection.
+fn journaled_follower(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
+    let mut store = JournaledStore::open(
+        ModelJournal::new(),
+        CLUSTER,
+        r(1),
+        inc(),
+        boot,
+        JournalLimits::default(),
+    )
+    .unwrap();
+    store
+        .attach(DOMAIN, ShardId::new(0).unwrap(), ModelEngine::new())
+        .unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+
+    // The bootstrap goes through the journal like everything else: it is
+    // the profile's only writer.
+    let base = store.application_base(DOMAIN).unwrap();
+    store
+        .submit(coord_storage::journaled::Submission {
+            domain: DOMAIN,
+            ballot: Ballot {
+                epoch: base.configuration,
+                number: 0,
+                leader: r(0),
+            },
+            kind: coord_storage::journaled::TransitionKind::Application {
+                position: base.execution_position.checked_next().unwrap(),
+                revision: None,
+                result_digest: coord_types::identity::Digest32([0; 32]),
+            },
+            batch: coord_core::effect::PersistBatch {
+                barrier: alloc.allocate(),
+                base: Some(base),
+                updates: bootstrap_updates(),
+            },
+        })
+        .unwrap();
+    store.flush().unwrap();
+
+    let domain = JournaledDomain::new(
+        store,
+        DOMAIN,
+        Ballot {
+            epoch: base.configuration,
+            number: 0,
+            leader: r(0),
+        },
+    )
+    .expect("attached");
+    let applier = Applier::new(domain, alloc).unwrap();
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(),
+        genesis: ballot(),
+        frontend: FRONTEND,
+        capacity: 64,
+    })
+    .restore_execution(bootstrapped, []);
+    machine.set_learning(LearningMode::Full);
+    Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND)
 }
 
 fn follower(boot: BootId) -> Node<StoreWorker<ModelEngine>> {
@@ -395,4 +472,63 @@ fn a_followers_vote_is_held_until_its_own_record_is_durable() {
         "the vote went to the collector alongside its own record"
     );
     assert_eq!(follower.held(), 0, "and it was released, not stranded");
+}
+
+/// A vote waits for its record to be durable, not for the projection to
+/// have taken it.
+///
+/// These are two different facts on the journal-first path and the
+/// difference is the point of the profile. `JournalDurable` says the
+/// record survives a crash, which is exactly and entirely what a vote
+/// promises; `Materialized` says the state is readable, which a vote
+/// says nothing about. Making every vote wait for materialization would
+/// put the projection's latency into the consensus path for no safety
+/// the journal had not already given.
+#[test]
+fn a_vote_rests_on_the_record_being_durable_not_on_the_projection() {
+    let boot = BootId([8; 16]);
+    let mut follower = journaled_follower(boot);
+    follower
+        .on_event(
+            Event::Boot {
+                boot_id: boot,
+                incarnation: inc(),
+            },
+            &ballot(),
+        )
+        .expect("boot");
+
+    // The projection will not take anything from here on.
+    for _ in 0..64 {
+        follower
+            .applier_mut()
+            .store_mut()
+            .store_mut()
+            .projection(DOMAIN)
+            .unwrap()
+            .script_commit(coord_store_testkit::model::CommitScript::DefinitelyNotCommitted);
+    }
+
+    let out = follower
+        .on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("admitted");
+
+    // The evidence still went to the collector: the record is durable in
+    // the journal, and that is what the vote rests on.
+    assert!(
+        !out.frontend.is_empty(),
+        "a vote waited for the projection: the journal had already made \
+         its record durable"
+    );
+    // It was still held on the way -- the durability gate is doing its
+    // job, it is simply satisfied by journal durability.
+    let (_, evidence) = follower.held_at_least_once();
+    assert!(evidence > 0, "the vote was not held for its own record");
+
+    // And the projection really is behind, so this is the case it looks
+    // like: recorded, not yet readable.
+    assert!(
+        follower.applier().store().store().unmaterialized(DOMAIN) > 0,
+        "the projection was not actually behind"
+    );
 }
