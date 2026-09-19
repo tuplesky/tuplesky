@@ -22,6 +22,7 @@ toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+coord-storage-redb.workspace = true
 coord-store-testkit.workspace = true
 coord-transport-testkit.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
