@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coord_transport::{
-    ALPN_API, ALPN_PEER, BudgetLimits, Class, CloseReason, Destination, Lane, LaneLimits, Limits,
-    SendError, Transport, TransportError, TransportEvent, evidence_frame,
+    ALPN_API, ALPN_PEER, BudgetLimits, Class, CloseCode, CloseReason, Destination, Lane,
+    LaneLimits, Limits, SendError, Transport, TransportError, TransportEvent, evidence_frame,
 };
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
@@ -1376,4 +1376,125 @@ async fn a_client_certificate_outside_the_trust_anchors_is_refused_on_both_plane
             "an untrusted certificate negotiated: {reason:?}"
         );
     }
+}
+
+/// A watch is not a request with a long answer: the caller opens one
+/// stream and the frontend writes events, progress and finally a close
+/// onto it over the life of the subscription. A responder that could only
+/// write once and finish could not serve that shape at all.
+///
+/// Each frame is still admitted under both budgets. What differs from a
+/// unary reply is only how long the admitted bytes are held: a
+/// subscription outlives any one frame, so holding each frame's budget
+/// until the stream ends would let one slow consumer take the lane's
+/// whole allowance and never give it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_stream_carries_many_frames_and_ends_when_the_frontend_says_so() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    let client = raw_client(&f, &f.ids[1], ALPN_API);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut control, _control_recv) = conn.open_bi().await.unwrap();
+    control
+        .write_all(&hello_with(
+            PeerRole::Frontend,
+            CLUSTER,
+            None,
+            vec![Lane::Watch.capability()],
+        ))
+        .await
+        .unwrap();
+    match event(&mut acceptor).await {
+        TransportEvent::Connected { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&request_frame()).await.unwrap();
+    send.finish().unwrap();
+    let mut responder = match event(&mut acceptor).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+
+    let mut expected = Vec::new();
+    for round in 0..4u8 {
+        let frame = evidence_frame(&vec![round; 1024]).unwrap();
+        expected.extend_from_slice(&frame);
+        responder.push(&frame).await.unwrap();
+    }
+    responder.finish().unwrap();
+
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Some(n) = recv.read(&mut buf).await.unwrap() {
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        got, expected,
+        "every frame arrived, in order, and the stream ended"
+    );
+    // Each pushed frame was charged on its way out, like any other
+    // traffic: the peak covers at least one whole frame.
+    let (_, peak) = acceptor.node_budget();
+    assert!(peak >= 1024, "watch frames were never charged: peak {peak}");
+}
+
+/// A connection the runtime above refuses stops being served.
+///
+/// The transport refuses what it can judge alone -- framing, negotiation,
+/// lane -- but whether a bound session may still send is not one of those
+/// things. Without this the daemon could only ignore such a caller's
+/// frames, which is not the same as closing: the same frame can be sent
+/// again on the next stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_runtime_can_close_a_connection_the_transport_would_have_allowed() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    let client = raw_client(&f, &f.ids[1], ALPN_API);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut control, _control_recv) = conn.open_bi().await.unwrap();
+    control
+        .write_all(&hello_with(
+            PeerRole::Frontend,
+            CLUSTER,
+            None,
+            vec![Lane::Unary.capability()],
+        ))
+        .await
+        .unwrap();
+    let connection = match event(&mut acceptor).await {
+        TransportEvent::Connected { connection, .. } => connection,
+        other => panic!("{other:?}"),
+    };
+
+    assert!(acceptor.disconnect(connection, CloseCode::Rejected, "not bound"));
+    // The close this endpoint took is distinguishable afterwards from one
+    // the peer took: it carries this side's own reason.
+    match event(&mut acceptor).await {
+        TransportEvent::Closed { reason, .. } => {
+            assert_eq!(reason, CloseReason::Rejected("not bound".into()));
+        }
+        other => panic!("{other:?}"),
+    }
+    // And the peer really is gone, not merely unsubscribed.
+    assert!(conn.open_bi().await.is_err(), "the connection is closed");
+    for _ in 0..50 {
+        if acceptor.connections() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(acceptor.connections(), 0);
+
+    // A connection that is not open is reported as such rather than
+    // silently succeeding: the caller learns its close did nothing.
+    assert!(!acceptor.disconnect(connection, CloseCode::Rejected, "again"));
 }

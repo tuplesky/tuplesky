@@ -198,22 +198,7 @@ impl Responder {
     /// this lane exists to enforce.
     pub async fn respond(mut self, frame: Vec<u8>) -> Result<(), SendError> {
         let bytes = frame.len();
-        for budget in [&self.link.budget, self.node.as_ref()] {
-            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(self.lane, bytes) {
-                return Err(SendError::TooLarge { bytes, limit });
-            }
-        }
-        let dest = self
-            .link
-            .budget
-            .acquire(self.lane, bytes)
-            .await
-            .map_err(|_| SendError::NotConnected)?;
-        let node = self
-            .node
-            .acquire(self.lane, bytes)
-            .await
-            .map_err(|_| SendError::NotConnected)?;
+        let (dest, node) = self.admit(bytes).await?;
         timeout(self.deadline, async {
             self.send
                 .write_all(&frame)
@@ -232,6 +217,69 @@ impl Responder {
             let _ = stopped.await;
         });
         Ok(())
+    }
+
+    /// Write one frame and leave the stream open.
+    ///
+    /// A watch is not a request with a long answer: the caller opens one
+    /// stream and the frontend writes events, progress and finally a
+    /// close onto it over the life of the subscription. [`respond`] ends
+    /// the stream, so it can serve only the unary shape; this is the same
+    /// admission for a stream that continues.
+    ///
+    /// The difference is what the admitted bytes are held against. A
+    /// unary reply keeps its budget until the peer acknowledges it, which
+    /// bounds what one process can have in flight. A watch stream is
+    /// alive for as long as the subscription, so holding each frame's
+    /// budget until the stream ends would let one slow consumer consume
+    /// the lane's whole allowance and never return it. Here the budget is
+    /// held until the write completes, which is itself bounded: the write
+    /// does not complete until QUIC's flow control has room, so a
+    /// consumer that stops reading blocks this frame rather than
+    /// accumulating more.
+    ///
+    /// [`respond`]: Responder::respond
+    pub async fn push(&mut self, frame: &[u8]) -> Result<(), SendError> {
+        let (dest, node) = self.admit(frame.len()).await?;
+        let written = timeout(self.deadline, self.send.write_all(frame))
+            .await
+            .map_err(|_| SendError::Timeout)?;
+        drop((dest, node));
+        written.map_err(|e| SendError::Stream(e.to_string()))
+    }
+
+    /// End the stream, having written what there was to write.
+    ///
+    /// A stream that is dropped instead is reset, which a peer reads as a
+    /// failure rather than the orderly end of a subscription.
+    pub fn finish(mut self) -> Result<(), SendError> {
+        self.send
+            .finish()
+            .map_err(|e| SendError::Stream(e.to_string()))
+    }
+
+    /// Admit `bytes` under the destination and node budgets.
+    async fn admit(
+        &self,
+        bytes: usize,
+    ) -> Result<(crate::budget::BytesPermit, crate::budget::BytesPermit), SendError> {
+        for budget in [&self.link.budget, self.node.as_ref()] {
+            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(self.lane, bytes) {
+                return Err(SendError::TooLarge { bytes, limit });
+            }
+        }
+        let dest = self
+            .link
+            .budget
+            .acquire(self.lane, bytes)
+            .await
+            .map_err(|_| SendError::NotConnected)?;
+        let node = self
+            .node
+            .acquire(self.lane, bytes)
+            .await
+            .map_err(|_| SendError::NotConnected)?;
+        Ok((dest, node))
     }
 }
 
@@ -652,6 +700,37 @@ impl Transport {
     /// Negotiated connections currently open.
     pub fn connections(&self) -> usize {
         self.shared.peers.lock().unwrap().len()
+    }
+
+    /// Close `connection` with `code`, because the runtime above decided
+    /// it may not continue.
+    ///
+    /// The transport refuses what it can judge by itself -- framing,
+    /// negotiation, lane -- but whether a bound session may still send is
+    /// not one of those things, and a connection whose binding was
+    /// refused or has expired must stop being served rather than have its
+    /// frames quietly ignored. `reason` is a short fixed string; it
+    /// crosses the wire, so nothing derived from a caller's data belongs
+    /// in it.
+    ///
+    /// Returns whether a connection by that identifier was open.
+    pub fn disconnect(&self, connection: ConnectionId, code: CloseCode, reason: &str) -> bool {
+        let peer = self.shared.peers.lock().unwrap().get(&connection).cloned();
+        let Some(peer) = peer else {
+            return false;
+        };
+        // The recorded reason is this endpoint's own: it is what the
+        // `Closed` event will carry, so a close taken here is
+        // distinguishable afterwards from one the peer took.
+        *peer.close_reason.lock().unwrap() = Some(match code {
+            CloseCode::Rejected => CloseReason::Rejected(reason.to_owned()),
+            CloseCode::Timeout => CloseReason::Timeout,
+            CloseCode::Shutdown => CloseReason::Shutdown,
+            _ => CloseReason::Malformed(reason.to_owned()),
+        });
+        peer.conn
+            .close(VarInt::from_u32(code as u32), reason.as_bytes());
+        true
     }
 
     /// The next owned event, lanes in priority order (control first);
