@@ -1484,8 +1484,25 @@ async fn the_runtime_can_close_a_connection_the_transport_would_have_allowed() {
         }
         other => panic!("{other:?}"),
     }
-    // And the peer really is gone, not merely unsubscribed.
-    assert!(conn.open_bi().await.is_err(), "the connection is closed");
+    // And the peer really is gone, not merely unsubscribed: the client
+    // itself observes the close, carrying the code this side sent.
+    //
+    // This waits for the close rather than probing with `open_bi`.
+    // Opening a stream is a local act -- QUIC hands out a stream id
+    // without a round trip -- so it can still succeed for as long as the
+    // CONNECTION_CLOSE is in flight, which made that check fail about
+    // one run in three.
+    let ended = timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .expect("the client observed the close within the bound");
+    assert!(
+        matches!(
+            ended,
+            quinn::ConnectionError::ApplicationClosed(ref c)
+                if c.error_code == quinn::VarInt::from_u32(CloseCode::Rejected as u32)
+        ),
+        "the client saw a different ending: {ended:?}"
+    );
     for _ in 0..50 {
         if acceptor.connections() == 0 {
             break;

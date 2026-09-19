@@ -80,7 +80,7 @@ fn quorum() -> BallotConfiguration {
 
 /// A bootstrapped store: one session and the policy rules for it, made
 /// durable, so a request can be admitted and applied.
-fn store(boot: BootId) -> Applier<ModelEngine> {
+fn store(boot: BootId) -> Applier<StoreWorker<ModelEngine>> {
     let mut worker =
         StoreWorker::open(ModelEngine::new(), boot, inc(), GroupLimits::default()).unwrap();
     let mut alloc = BarrierAllocator::new(inc(), boot);
@@ -148,9 +148,9 @@ fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
     }
 }
 
-fn follower(boot: BootId) -> Node<ModelEngine> {
+fn follower(boot: BootId) -> Node<StoreWorker<ModelEngine>> {
     let applier = store(boot);
-    let bootstrapped = applier.worker().application_base().execution_position;
+    let bootstrapped = applier.store().application_base().execution_position;
     let mut machine = Follower::new(FollowerConfig {
         identity: identity(1),
         quorum: quorum(),
@@ -163,9 +163,9 @@ fn follower(boot: BootId) -> Node<ModelEngine> {
     Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND)
 }
 
-fn leader(boot: BootId) -> Node<ModelEngine> {
+fn leader(boot: BootId) -> Node<StoreWorker<ModelEngine>> {
     let applier = store(boot);
-    let bootstrapped = applier.worker().application_base().execution_position;
+    let bootstrapped = applier.store().application_base().execution_position;
     let mut machine = Leader::new(
         LeaderConfig {
             identity: identity(0),
@@ -246,7 +246,7 @@ fn a_replica_that_cannot_record_its_own_transition_says_so() {
     .expect("boot");
 
     node.applier_mut()
-        .worker_mut()
+        .store_mut()
         .engine_mut()
         .inject_begin_write_error();
     let failed = node.on_event(Event::Admitted(admitted(1)), &ballot());
@@ -287,7 +287,7 @@ fn work_prepared_under_another_boot_never_reaches_the_store_or_a_peer() {
     let refused = node.on_event(Event::Admitted(admitted(1)), &ballot());
     assert_eq!(
         refused,
-        Err(DriveError::Submit("WrongBoot".into())),
+        Err(DriveError::Submit("refused: WrongBoot".into())),
         "a batch from another boot was accepted"
     );
     assert_eq!(node.held(), 0, "nothing is waiting to be sent");

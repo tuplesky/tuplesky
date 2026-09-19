@@ -203,7 +203,7 @@ impl Machine {
 
 struct Node {
     machine: Machine,
-    applier: Applier<ModelEngine>,
+    applier: Applier<StoreWorker<ModelEngine>>,
     overlay: Overlay,
     executed: Vec<CommandId>,
 }
@@ -246,7 +246,7 @@ fn node(n: u8, me: u8) -> Node {
     // Execution positions are absolute: the ordered bootstrap batch
     // already occupies the first of them, so a machine starts from the
     // frontier the store is at, not from zero.
-    let bootstrapped = applier.worker().application_base().execution_position;
+    let bootstrapped = applier.store().application_base().execution_position;
     let mut machine = if me == 0 {
         Machine::Leader(Leader::new(
             LeaderConfig {
@@ -433,8 +433,8 @@ impl World {
                 Effect::Persist(batch) => {
                     let barrier = batch.barrier;
                     let node = &mut self.nodes[i];
-                    node.applier.worker_mut().submit(batch).unwrap();
-                    node.applier.worker_mut().flush().unwrap();
+                    node.applier.store_mut().submit(batch).unwrap();
+                    node.applier.store_mut().flush().unwrap();
                     let more = node
                         .machine
                         .step(Event::Storage(StorageEvent::JournalDurable {
@@ -527,7 +527,7 @@ impl World {
                 let payload = leader.payload(&request.command).unwrap().clone();
                 let node = &mut self.nodes[i];
                 let outcome = speculate(
-                    node.applier.worker(),
+                    node.applier.store(),
                     &mut node.overlay,
                     &SpeculationLimits::default(),
                     &request,
@@ -1175,7 +1175,7 @@ fn unary_and_finalized_watch_dispatch() {
         other => panic!("{other:?}"),
     };
     if let Some((from, through)) = registration.replay {
-        let gated = w.nodes[1].applier.worker().reader().snapshot().unwrap();
+        let gated = w.nodes[1].applier.store().reader().snapshot().unwrap();
         replay_from_view(&hub, gated.view(), registration.id, NS, from, through).unwrap();
     }
     hub.replay_complete(registration.id).unwrap();

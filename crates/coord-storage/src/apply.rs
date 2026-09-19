@@ -18,17 +18,17 @@ use coord_state::{
     PlanError, PlanLimits, RejectionReason, authorize_retained, plan, rejection_plan,
     rejection_plan_at,
 };
-use coord_store_api::engine::{EngineError, LocalEngine};
+use coord_store_api::engine::EngineError;
 use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::LogicalRequest;
 use coord_types::{CommandId, RetryKey};
 
 use crate::materialize::{ApplyOutcome, apply_plan};
+use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
 use crate::view::ViewError;
 use crate::views::{ViewBudget, ViewBuildError, build_authorized_view, load_authorization};
 use crate::watch::{PublishError, WatchHub};
-use crate::worker::StoreWorker;
 
 /// Why a command could not be applied.
 #[derive(Debug)]
@@ -71,19 +71,46 @@ impl From<ViewError> for ApplyError {
     }
 }
 
+/// The parts of an applied outcome a pending application already knows.
+///
+/// A command that has been planned and recorded knows what it did before
+/// anyone can read it: the position it took, the revision it produced
+/// and the digest of its exact result. Only the fact that it has
+/// happened is still outstanding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedOutcomeParts {
+    /// Execution position.
+    pub position: coord_types::ids::ExecutionPosition,
+    /// KV revision produced, if any.
+    pub revision: Option<coord_types::ids::KvRevision>,
+    /// Digest of the exact result bytes.
+    pub result_digest: coord_types::identity::Digest32,
+}
+
 /// The application side of one replica.
-pub struct Applier<E: LocalEngine> {
-    worker: StoreWorker<E>,
+///
+/// `P` is where its batches become durable: [`StoreWorker`] on the
+/// reference path, where the projection is itself the record, or
+/// [`JournaledDomain`] on the journal-first one, where the record
+/// reaches the shared journal before the projection. Planning,
+/// admission, retry resolution and the watch hub are the same either
+/// way, which is the point of the parameter: a second copy of them for
+/// the journal would be a second copy to keep correct.
+///
+/// [`StoreWorker`]: crate::worker::StoreWorker
+/// [`JournaledDomain`]: crate::persistence::JournaledDomain
+pub struct Applier<P: Persistence> {
+    store: P,
     alloc: BarrierAllocator,
     hub: WatchHub,
 }
 
-impl<E: LocalEngine> Applier<E> {
-    /// An applier over an opened worker; the watch hub starts at the
+impl<P: Persistence> Applier<P> {
+    /// An applier over an opened store; the watch hub starts at the
     /// durable KV revision.
-    pub fn new(worker: StoreWorker<E>, alloc: BarrierAllocator) -> Result<Self, EngineError> {
+    pub fn new(store: P, alloc: BarrierAllocator) -> Result<Self, EngineError> {
         let (published, floor) = {
-            let gated = worker.reader().snapshot().map_err(|_| {
+            let gated = store.reader().snapshot().map_err(|_| {
                 EngineError::new(coord_store_api::engine::ErrorClass::Busy, "no durable view")
             })?;
             (
@@ -92,7 +119,7 @@ impl<E: LocalEngine> Applier<E> {
             )
         };
         Ok(Applier {
-            worker,
+            store,
             alloc,
             hub: WatchHub::new(published, floor),
         })
@@ -103,14 +130,14 @@ impl<E: LocalEngine> Applier<E> {
         &self.hub
     }
 
-    /// The worker.
-    pub const fn worker(&self) -> &StoreWorker<E> {
-        &self.worker
+    /// Where its batches become durable.
+    pub const fn store(&self) -> &P {
+        &self.store
     }
 
-    /// The worker, mutably (administration batches).
-    pub const fn worker_mut(&mut self) -> &mut StoreWorker<E> {
-        &mut self.worker
+    /// The same, mutably (administration batches).
+    pub const fn store_mut(&mut self) -> &mut P {
+        &mut self.store
     }
 
     /// The barrier allocator.
@@ -164,7 +191,7 @@ impl<E: LocalEngine> Applier<E> {
         let namespace: NamespaceId = request.namespace;
         let session = binding.retry_key.session_id;
         for _ in 0..8 {
-            let gated = self.worker.reader().snapshot()?;
+            let gated = self.store.reader().snapshot()?;
             // A retained result is handed back only if the request would
             // still be authorized now: losing a permission protects what
             // it produced, exactly as it would a fresh execution.
@@ -208,14 +235,14 @@ impl<E: LocalEngine> Applier<E> {
                 other => {
                     let reason = Self::admission_rejection_of(&other);
                     let planned = rejection_plan_at(
-                        self.worker.application_base(),
+                        self.store.application_base(),
                         crate::codecs::read_kv_revision(gated.view())?,
                         reason,
                     )
                     .map_err(ApplyError::Plan)?;
                     drop(gated);
                     let barrier = self.alloc.allocate();
-                    match apply_plan(&mut self.worker, barrier, namespace, &planned, None)? {
+                    match apply_plan(&mut self.store, barrier, namespace, &planned, None)? {
                         ApplyOutcome::Applied(_) => {
                             let response = postcard::to_allocvec(&planned.response)
                                 .map_err(|_| ApplyError::MalformedPayload)?;
@@ -227,7 +254,7 @@ impl<E: LocalEngine> Applier<E> {
                         }
                         ApplyOutcome::Replan => continue,
                         ApplyOutcome::Indeterminate => {
-                            self.worker.reconcile()?;
+                            self.store.reconcile()?;
                             continue;
                         }
                     }
@@ -260,7 +287,7 @@ impl<E: LocalEngine> Applier<E> {
                 // returning an error here would leave the command forever
                 // unexecuted with every successor waiting behind it.
                 Err(ViewBuildError::BudgetExceeded) => rejection_plan_at(
-                    self.worker.application_base(),
+                    self.store.application_base(),
                     crate::codecs::read_kv_revision(gated.view())?,
                     RejectionReason::ViewTooLarge,
                 )
@@ -270,13 +297,7 @@ impl<E: LocalEngine> Applier<E> {
             };
             drop(gated);
             let barrier = self.alloc.allocate();
-            match apply_plan(
-                &mut self.worker,
-                barrier,
-                namespace,
-                &planned,
-                Some(binding),
-            )? {
+            match apply_plan(&mut self.store, barrier, namespace, &planned, Some(binding))? {
                 ApplyOutcome::Applied(_) => {
                     if let Some(revision) = planned.revision {
                         // Irrevocable now: the revision's complete event set
@@ -303,7 +324,7 @@ impl<E: LocalEngine> Applier<E> {
                 }
                 ApplyOutcome::Replan => continue,
                 ApplyOutcome::Indeterminate => {
-                    self.worker.reconcile()?;
+                    self.store.reconcile()?;
                 }
             }
         }
@@ -325,7 +346,7 @@ impl<E: LocalEngine> Applier<E> {
                 .checked_next()
                 .map_err(|_| ApplyError::Plan(PlanError::CounterOverflow))?;
             let stored = {
-                let gated = self.worker.reader().snapshot()?;
+                let gated = self.store.reader().snapshot()?;
                 crate::views::stored_events_at(gated.view(), next)?
             };
             let events = stored.unwrap_or_default();
@@ -341,7 +362,7 @@ impl<E: LocalEngine> Applier<E> {
 
     /// Durable KV revision.
     pub fn kv_revision(&self) -> Result<KvRevision, EngineError> {
-        let gated = self.worker.reader().snapshot().map_err(|_| {
+        let gated = self.store.reader().snapshot().map_err(|_| {
             EngineError::new(coord_store_api::engine::ErrorClass::Busy, "no durable view")
         })?;
         crate::codecs::read_kv_revision(gated.view())
