@@ -469,9 +469,8 @@ fn durable_state_is_only_opened_under_a_name_this_build_serves() {
     let config = Config::parse(&base_config("")).unwrap();
     assert_eq!(config.state.engine, STATE_ENGINE);
     assert_eq!(config.state.profile, STATE_PROFILE);
-    let journal = config.journal.as_ref().expect("the fixture names one");
-    assert_eq!(journal.engine, JOURNAL_ENGINE);
-    assert_eq!(journal.profile, JOURNAL_PROFILE);
+    assert_eq!(config.journal.engine, JOURNAL_ENGINE);
+    assert_eq!(config.journal.profile, JOURNAL_PROFILE);
     // Naming them explicitly is equally fine, and equally binding.
     let spelled = base_config("").replace(
         "[state]\nroot = \"state\"",
@@ -539,36 +538,6 @@ fn durable_state_is_only_opened_under_a_name_this_build_serves() {
     );
 }
 
-/// A configuration is well-formed and still names a profile this build
-/// does not serve. That refusal belongs to startup, not to parsing: what
-/// is wrong is this build, not the configuration, and it will be correct
-/// again once the journal-first path is integrated (task-j03).
-///
-/// It is refused rather than accepted and ignored, because a journal
-/// section that configures nothing reads as a durability guarantee that
-/// is not being kept.
-#[test]
-fn a_profile_this_build_does_not_serve_is_refused_at_startup_not_at_parsing() {
-    use coord_daemon::config::STATE_ENGINE;
-
-    let journalled = Config::parse(&base_config("")).expect("well-formed");
-    assert_eq!(
-        journalled.unserved_profile(),
-        Some("the journal-first profile (task-j03) is not served by this build")
-    );
-
-    // Without the section, this build serves what it says it serves: the
-    // reference-storage profile, where the projection is itself the
-    // durable record.
-    let reference = base_config("").replace("[journal]\nroot = \"journal\"\nshards = 1\n", "");
-    let reference = Config::parse(&reference).expect("well-formed");
-    assert_eq!(reference.unserved_profile(), None);
-    assert!(reference.journal.is_none());
-    // The state projection is configured either way: it is not the
-    // journal's substitute, it is what the journal would project into.
-    assert_eq!(reference.state.engine, STATE_ENGINE);
-}
-
 /// A node that journals nothing has no authoritative transition to apply
 /// from, and a path that is empty is not a default: it resolves to the
 /// working directory, which is where a process would quietly create a
@@ -579,14 +548,7 @@ fn a_configuration_that_could_not_find_its_own_state_is_refused() {
     assert_eq!(Config::parse(&no_shards), Err(ConfigError::NoJournalShards));
     // Omitting the count entirely is the single-shard node, not zero.
     let default_shards = base_config("").replace("shards = 1\n", "");
-    assert_eq!(
-        Config::parse(&default_shards)
-            .unwrap()
-            .journal
-            .expect("the fixture names one")
-            .shards,
-        1
-    );
+    assert_eq!(Config::parse(&default_shards).unwrap().journal.shards, 1);
 
     for (find, replace, name) in [
         (
