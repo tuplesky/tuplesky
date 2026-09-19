@@ -19,8 +19,9 @@ use coord_checkpoint::trim::{
 };
 use coord_consensus::recovery::SyncDecision;
 use coord_consensus::rows::{
-    PromiseRecordV1, ProposalRecordV1, SyncRecordV1, dependency_key, encode_dependency,
-    encode_promise, encode_proposal, encode_sync, promise_key, proposal_key, sync_key,
+    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SyncRecordV1, dependency_key,
+    encode_dependency, encode_payload, encode_promise, encode_proposal, encode_sync, payload_key,
+    promise_key, proposal_key, sync_key,
 };
 use coord_consensus::{CommandRecord, Phase};
 use coord_core::effect::StoreUpdate;
@@ -28,6 +29,8 @@ use coord_state::view::KvEntry;
 use coord_storage::codecs::{self, ExecutedRecordV1, HistoryRecordV1};
 use coord_storage::compaction::{GcBudget, RetentionHolds, plan_gc};
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
+use coord_storage::protocol::read_protocol;
+use coord_storage::views::ViewBudget;
 use coord_storage_redb::{Generation, OpenOptions, StoreIdentity};
 use coord_store_api::engine::{LocalEngine, OrderedRead, ScanRequest, SnapshotSource, WriteTxn};
 use coord_store_api::envelope::AppliedStamp;
@@ -127,6 +130,16 @@ fn entry(value: &[u8], create: u64, modified: u64, version: u64) -> KvEntry {
     }
 }
 
+fn retry_key(sequence: u64) -> coord_types::RetryKey {
+    coord_types::RetryKey {
+        cluster_id: CLUSTER,
+        domain_id: DOMAIN,
+        session_id: coord_types::ids::SessionId([9; 16]),
+        client_instance_id: coord_types::ids::ClientInstanceId([8; 16]),
+        request_sequence: coord_types::ids::RequestSequence::new(sequence).unwrap(),
+    }
+}
+
 fn record(phase: Phase, deps: &[u8]) -> CommandRecord {
     CommandRecord {
         phase,
@@ -171,11 +184,29 @@ fn common_rows() -> Vec<Row> {
     );
     // Commands 1..=3 are executed at or below the boundary; command 5 is
     // executed beyond it; commands 4 and 6 are not executed at all.
-    for (n, position) in [(1u8, 1u64), (2, 2), (3, 3), (5, 4)] {
+    // Commands with a dependency record but no execution still need a
+    // payload row: recovery treats a recovered command without one as
+    // corruption.
+    for n in [4u8, 6] {
         put(
             Collection::PayloadV1,
-            command(n).as_bytes().to_vec(),
-            format!("payload-{n}").into_bytes(),
+            payload_key(&command(n)),
+            encode_payload(&PayloadRecordV1 {
+                retry_key: retry_key(u64::from(n)),
+                logical: format!("payload-{n}").into_bytes(),
+            })
+            .unwrap(),
+        );
+    }
+    for (n, position) in [(1u8, 1u64), (2, 2), (3, 3), (5, 4), (7, 1), (8, 2)] {
+        put(
+            Collection::PayloadV1,
+            payload_key(&command(n)),
+            encode_payload(&PayloadRecordV1 {
+                retry_key: retry_key(u64::from(n)),
+                logical: format!("payload-{n}").into_bytes(),
+            })
+            .unwrap(),
         );
         put(
             Collection::ExecutedV1,
@@ -242,6 +273,18 @@ fn protocol_rows() -> Vec<Row> {
         put(
             proposal_key(e, &command(n)),
             encode_proposal(&proposal(deps)).unwrap(),
+        );
+    }
+    // Settled below the boundary and named by nothing: these are what a
+    // trim can actually reclaim once the chain above is pinned.
+    for n in [7u8, 8] {
+        put(
+            dependency_key(e, &command(n)),
+            encode_dependency(&record(Phase::Executed, &[])).unwrap(),
+        );
+        put(
+            proposal_key(e, &command(n)),
+            encode_proposal(&proposal(&[])).unwrap(),
         );
     }
     // Unresolved: accepted, never executed, and it names command 3.
@@ -594,23 +637,27 @@ fn trimming_deletes_only_settled_below_floor_protocol_rows_and_keeps_every_oblig
     let after = protocol_keys(&engine);
     let e = epoch(EPOCH);
 
-    // Commands 1 and 2 are executed at or below the boundary and nothing
-    // retained names them, so their dependency and proposal rows go.
-    for n in [1u8, 2] {
+    // Commands 7 and 8 are executed at or below the boundary and nothing
+    // retained can reach them, so their rows go.
+    for n in [7u8, 8] {
         assert!(
             !after.contains(&dependency_key(e, &command(n))),
-            "command {n} is settled below the floor"
+            "command {n} is settled below the floor and reachable from nothing"
         );
         assert!(!after.contains(&proposal_key(e, &command(n))));
     }
 
     // Everything else stays: the promise, the bound Sync, the accepted but
-    // unexecuted command, the settled command it still names, the command
-    // committed but not executed, the command executed beyond the boundary,
-    // and a command of an epoch above the floor's.
+    // unexecuted command, the settled commands it can reach through the
+    // chain, the command committed but not executed, the command executed
+    // beyond the boundary, and a command of an epoch above the floor's.
     for retained in [
         promise_key(e),
         sync_key(e, &ballot(3)),
+        dependency_key(e, &command(1)),
+        proposal_key(e, &command(1)),
+        dependency_key(e, &command(2)),
+        proposal_key(e, &command(2)),
         dependency_key(e, &command(3)),
         proposal_key(e, &command(3)),
         dependency_key(e, &command(4)),
@@ -639,18 +686,28 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
     let plan = step(&engine, &TrimLimits::default());
     let e = epoch(EPOCH);
 
-    // Command 4 is accepted and unexecuted and names command 3, so command
-    // 3's rows are held back although command 3 is settled below the floor.
+    // Command 4 is accepted and unexecuted and names command 3, so
+    // command 3's rows are held back although command 3 is settled below
+    // the floor - and so are command 2's and command 1's. The pin runs
+    // the whole chain: closure traversal after a restart walks 4 -> 3 ->
+    // 2 -> 1, and a deleted link stops it at a command it cannot resolve.
+    // Being settled below the floor is not on its own a reason to drop a
+    // row something unresolved still has to reach.
     assert_eq!(
-        plan.pinned, 2,
-        "the dependency and proposal rows of command 3"
+        plan.pinned, 6,
+        "the dependency and proposal rows of commands 1, 2 and 3"
     );
     let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| u.key.clone()).collect();
-    assert!(!deleted.contains(&dependency_key(e, &command(3))));
-    assert!(!deleted.contains(&proposal_key(e, &command(3))));
-    // The pin does not spread further than the closure needs: command 2 is
-    // named only by command 3, which is itself settled below the floor.
-    assert!(deleted.contains(&dependency_key(e, &command(2))));
+    for n in [1u8, 2, 3] {
+        assert!(
+            !deleted.contains(&dependency_key(e, &command(n))),
+            "command {n} is reachable from the unresolved command 4"
+        );
+        assert!(!deleted.contains(&proposal_key(e, &command(n))));
+    }
+    // What nothing unresolved can reach is still reclaimed.
+    assert!(deleted.contains(&dependency_key(e, &command(7))));
+    assert!(deleted.contains(&dependency_key(e, &command(8))));
 
     // Once the unresolved command executes at or below a later boundary,
     // the pin is gone and the rows become eligible.
@@ -1028,4 +1085,95 @@ fn an_acknowledgement_is_built_from_what_a_voter_verified_and_round_trips() {
     assert!(TrimmedFloorV1::decode(&encoded).is_err());
     assert!(CheckpointAckV1::decode(&published().encode().unwrap()).is_err());
     assert!(CheckpointAckV1::decode(&encoded[..encoded.len() - 1]).is_err());
+}
+
+#[test]
+fn recovery_after_a_trim_knows_how_far_the_store_executed() {
+    // The execution frontier was derived from the surviving dependency
+    // rows. Trimming removes those for executed commands while keeping
+    // the durable applied position, so a store whose executed prefix has
+    // been fully trimmed reported zero: the next command would be
+    // planned at a position the store had already used.
+    let mut engine = voter_store();
+    let before = {
+        let view = engine.reader().snapshot().unwrap();
+        read_protocol(&view, epoch(EPOCH), ViewBudget::default())
+            .unwrap()
+            .execution_frontier()
+    };
+    assert!(before.get() > 0, "the fixture has executed commands");
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    {
+        let view = engine.reader().snapshot().unwrap();
+        assert_eq!(
+            read_protocol(&view, epoch(EPOCH), ViewBudget::default())
+                .unwrap()
+                .execution_frontier(),
+            before,
+            "trimming rows does not move the execution frontier back"
+        );
+    }
+
+    // The case the derivation could not survive at all: every dependency
+    // row of the epoch gone, the durable position untouched.
+    let mut stripped = ModelEngine::new();
+    let rows: Vec<Row> = common_rows()
+        .into_iter()
+        .chain(identity_rows())
+        .chain(core::iter::once((
+            Collection::ProtocolV1,
+            promise_key(epoch(EPOCH)),
+            encode_promise(&PromiseRecordV1 {
+                promised: ballot(3),
+                synced: ballot(2),
+            })
+            .unwrap(),
+        )))
+        .collect();
+    seed(&mut stripped, rows);
+    let view = stripped.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, epoch(EPOCH), ViewBudget::default()).unwrap();
+    assert!(recovered.records.is_empty(), "no dependency rows survive");
+    assert_eq!(
+        recovered.executed_through(),
+        ExecutionPosition::ZERO,
+        "the surviving rows show nothing, and say so"
+    );
+    assert_eq!(
+        recovered.execution_frontier(),
+        pos(4),
+        "the durable baseline says how far the store executed"
+    );
+}
+
+#[test]
+fn a_trim_keeps_every_dependency_a_retained_command_can_reach() {
+    // Pinning only direct dependencies left a retained command able to
+    // reach an executed command whose own dependency had been deleted,
+    // so closure traversal after a restart stopped at a command it could
+    // not resolve. The chain in the fixture is 4 -> 3 -> 2 -> 1, with 4
+    // unresolved.
+    let mut engine = voter_store();
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    let remaining = protocol_keys(&engine);
+    let e = epoch(EPOCH);
+    for n in [1u8, 2, 3, 4] {
+        assert!(
+            remaining.contains(&dependency_key(e, &command(n))),
+            "command {n} is reachable from the unresolved command 4"
+        );
+    }
+    // Every dependency named by a surviving record has a record of its
+    // own: the graph a restart walks is closed.
+    let view = engine.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, epoch(EPOCH), ViewBudget::default()).unwrap();
+    let known: BTreeSet<_> = recovered.records.iter().map(|(c, _)| *c).collect();
+    for (command, record) in &recovered.records {
+        for dep in &record.deps {
+            assert!(
+                known.contains(dep),
+                "{command:?} names {dep:?}, which trimming removed"
+            );
+        }
+    }
 }
