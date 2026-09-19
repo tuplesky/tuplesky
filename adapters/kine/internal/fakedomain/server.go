@@ -86,6 +86,9 @@ type Server struct {
 	// PendingAlways answers every Request and ResolveRequest with Pending
 	// after the first execution (an endpoint that never establishes).
 	PendingAlways atomic.Bool
+	// CrossSessionRefusals counts requests refused because their retry
+	// key named a session other than the connection's binding.
+	CrossSessionRefusals atomic.Uint64
 	// Binds handled.
 	Binds atomic.Int64
 }
@@ -217,6 +220,12 @@ func (s *Server) record(l Logged) {
 }
 
 func (s *Server) serve(ctx context.Context, conn *quic.Conn) {
+	// The session this connection is bound to. The real frontend binds a
+	// session to the connection and authorizes work from that binding,
+	// so a request whose retry key names another session is refused
+	// there; modelling that is what makes a rolled-over client's stale
+	// lane visible here instead of silently accepted.
+	bound := &boundSession{}
 	first := true
 	for {
 		stream, err := conn.AcceptStream(ctx)
@@ -228,8 +237,32 @@ func (s *Server) serve(ctx context.Context, conn *quic.Conn) {
 			go s.negotiate(stream)
 			continue
 		}
-		go s.handle(stream)
+		go s.handle(stream, bound)
 	}
+}
+
+// boundSession is one connection's binding.
+type boundSession struct {
+	mu      sync.Mutex
+	session [16]byte
+	bound   bool
+}
+
+func (b *boundSession) set(session [16]byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.session, b.bound = session, true
+}
+
+// admits reports whether work under `session` may travel on this
+// connection. An unbound connection carries no session-scoped work.
+func (b *boundSession) admits(session [16]byte) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.bound {
+		return true
+	}
+	return b.session == session
 }
 
 // negotiate answers the Hello on the control stream and leaves it open,
@@ -266,7 +299,7 @@ func (s *Server) negotiate(stream *quic.Stream) {
 	_, _ = stream.Write(out)
 }
 
-func (s *Server) handle(stream *quic.Stream) {
+func (s *Server) handle(stream *quic.Stream, bound *boundSession) {
 	defer func() { _ = stream.Close() }()
 	frame, err := readFrame(stream)
 	if err != nil {
@@ -280,6 +313,7 @@ func (s *Server) handle(stream *quic.Stream) {
 		bind, err := wire.DecodeBind(frame)
 		session, expires, ok := s.admit(err, bind)
 		if ok {
+			bound.set(session)
 			out, _ = wire.EncodeBindAck(wire.BindAck{Session: session, ExpiresAt: uint64(expires.Unix()), Scope: 1, RuleGeneration: 1})
 		} else {
 			out, _ = wire.Encode(wire.Close{Code: 2, Reason: []byte("bind refused")})
@@ -291,6 +325,20 @@ func (s *Server) handle(stream *quic.Stream) {
 		}
 		switch m := msg.(type) {
 		case wire.Request:
+			if !bound.admits(m.RetryKey.SessionID) {
+				s.CrossSessionRefusals.Add(1)
+				s.record(Logged{
+					Kind:    "request",
+					Op:      "wrong-session",
+					Session: m.RetryKey.SessionID,
+				})
+				out = encodeResponse(wire.Response{
+					Tag:    wire.OutcomeErr,
+					Code:   0x0002,
+					Detail: []byte("request session is not the connection's"),
+				})
+				break
+			}
 			out = s.request(m)
 		case wire.ResolveRequest:
 			out = s.resolve(m)

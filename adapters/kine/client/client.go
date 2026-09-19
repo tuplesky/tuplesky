@@ -145,6 +145,12 @@ type Client struct {
 
 	mu    sync.Mutex
 	conns map[Lane]*quic.Conn
+	// The binding epoch each lane's connection was bound under. A
+	// connection is bound to the session it presented, so one from an
+	// earlier epoch cannot carry work allocated under the current one:
+	// the frontend rejects a request whose retry key names another
+	// session than the connection is bound to.
+	connEpoch map[Lane]uint64
 	// controls holds each lane's negotiation stream: it stays open for
 	// the connection's life because a Close frame travels on it.
 	controls map[Lane]*quic.Stream
@@ -165,10 +171,11 @@ func New(addr string, cfg Config) *Client {
 		tlsConf.NextProtos = []string{ALPNNativeAPI}
 	}
 	c := &Client{
-		cfg:      cfg,
-		sem:      make(chan struct{}, cfg.Limits.MaxStreams),
-		conns:    map[Lane]*quic.Conn{},
-		controls: map[Lane]*quic.Stream{},
+		cfg:       cfg,
+		sem:       make(chan struct{}, cfg.Limits.MaxStreams),
+		conns:     map[Lane]*quic.Conn{},
+		connEpoch: map[Lane]uint64{},
+		controls:  map[Lane]*quic.Stream{},
 	}
 	c.dialFn = func(ctx context.Context) (*quic.Conn, error) {
 		return quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
@@ -199,7 +206,7 @@ func withDefaults(cfg Config) Config {
 // newWithDialer is a test hook injecting a dialer (an in-process server).
 func newWithDialer(cfg Config, dial func(ctx context.Context) (*quic.Conn, error)) *Client {
 	cfg = withDefaults(cfg)
-	return &Client{cfg: cfg, dialFn: dial, sem: make(chan struct{}, cfg.Limits.MaxStreams), conns: map[Lane]*quic.Conn{}, controls: map[Lane]*quic.Stream{}}
+	return &Client{cfg: cfg, dialFn: dial, sem: make(chan struct{}, cfg.Limits.MaxStreams), conns: map[Lane]*quic.Conn{}, connEpoch: map[Lane]uint64{}, controls: map[Lane]*quic.Stream{}}
 }
 
 // connect returns the live unary-lane connection, dialing and binding
@@ -220,6 +227,12 @@ func (c *Client) connectLane(ctx context.Context, lane Lane) (*quic.Conn, error)
 	if stale {
 		c.dropAll()
 	}
+	// A rollover leaves lanes bound to the session before it. Handing one
+	// back would put a retry key allocated under the new session on a
+	// connection bound to the old one, which the frontend refuses - and
+	// refuses again on every retry, because the same connection is
+	// selected each time.
+	c.dropSupersededLanes()
 	c.mu.Lock()
 	if conn := c.conns[lane]; conn != nil {
 		c.mu.Unlock()
@@ -245,8 +258,42 @@ func (c *Client) connectLane(ctx context.Context, lane Lane) (*quic.Conn, error)
 		return existing, nil
 	}
 	c.conns[lane], c.controls[lane] = conn, control
+	if c.bound != nil {
+		c.connEpoch[lane] = c.bound.epoch
+	}
+	c.mu.Unlock()
+	// Binding this lane may itself have rolled the session over, which
+	// supersedes every other lane.
+	c.dropSupersededLanes()
+	c.mu.Lock()
+	if existing := c.conns[lane]; existing != nil {
+		c.mu.Unlock()
+		return existing, nil
+	}
 	c.mu.Unlock()
 	return conn, nil
+}
+
+// dropSupersededLanes closes the lanes bound under an earlier binding
+// epoch than the current one, so the next use of each redials and binds
+// the session in force.
+func (c *Client) dropSupersededLanes() {
+	c.mu.Lock()
+	if c.bound == nil {
+		c.mu.Unlock()
+		return
+	}
+	current := c.bound.epoch
+	var superseded []Lane
+	for lane := range c.conns {
+		if c.connEpoch[lane] != current {
+			superseded = append(superseded, lane)
+		}
+	}
+	c.mu.Unlock()
+	for _, lane := range superseded {
+		c.dropLane(lane, nil)
+	}
 }
 
 // Session is the replicated session the frontend acknowledged at the
@@ -318,7 +365,7 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn, lane Lane) (*quic.St
 	if err != nil {
 		return nil, ErrNotConnected
 	}
-	if err := writeFrame(stream, hello); err != nil {
+	if err := writeFrameWithin(helloCtx, stream, hello); err != nil {
 		return nil, ErrNotConnected
 	}
 	if err := readHelloAck(helloCtx, stream, lane); err != nil {
@@ -374,7 +421,7 @@ func (c *Client) bindSession(ctx context.Context, conn *quic.Conn, token string)
 	if err != nil {
 		return ErrNotConnected
 	}
-	if err := writeFrame(stream, frame); err != nil {
+	if err := writeFrameWithin(bindCtx, stream, frame); err != nil {
 		return ErrBindRejected
 	}
 	_ = stream.Close()
@@ -456,6 +503,7 @@ func (c *Client) dropLane(lane Lane, conn *quic.Conn) {
 	}
 	control := c.controls[lane]
 	delete(c.conns, lane)
+	delete(c.connEpoch, lane)
 	delete(c.controls, lane)
 	c.Reconnects++
 	c.mu.Unlock()
@@ -515,7 +563,7 @@ func (c *Client) Do(ctx context.Context, frame []byte) (Outcome, error) {
 		c.drop()
 		return Outcome{Unknown: true}, nil
 	}
-	if err := writeFrame(stream, frame); err != nil {
+	if err := writeFrameWithin(streamCtx, stream, frame); err != nil {
 		c.drop()
 		return Outcome{Unknown: true}, nil
 	}
