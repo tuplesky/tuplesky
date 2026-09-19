@@ -27,6 +27,9 @@ pub struct UpstreamConfig {
     pub issuer: String,
     /// The broker's client identifier at the provider.
     pub client_id: String,
+    /// The broker's callback for the device leg (exact). The upstream
+    /// must have it registered alongside the browser leg's.
+    pub device_redirect_uri: String,
     /// The broker's callback (exact).
     pub redirect_uri: String,
     /// Allow a loopback HTTP issuer (tests).
@@ -128,20 +131,46 @@ impl Upstream {
         &self.config
     }
 
-    /// The authorization URL for a started login.
+    /// The authorization URL for a started login on the browser leg.
     pub fn authorize_url(&self, state: &str, nonce: &str, challenge: PkceCodeChallenge) -> String {
+        self.authorize_url_to(None, state, nonce, challenge)
+            .expect("the configured redirect parses")
+    }
+
+    /// The authorization URL for a leg whose callback is `redirect_uri`,
+    /// or the configured one when it is `None`.
+    ///
+    /// The device leg has its own callback: sending it to the browser
+    /// leg's meant the upstream returned the browser to an endpoint that
+    /// knows nothing about the device grant, and the login could not
+    /// complete at all.
+    pub fn authorize_url_to(
+        &self,
+        redirect_uri: Option<&str>,
+        state: &str,
+        nonce: &str,
+        challenge: PkceCodeChallenge,
+    ) -> Result<String, UpstreamError> {
         let state = state.to_string();
         let nonce = nonce.to_string();
-        let (url, _, _) = self
+        let request = self
             .client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 move || CsrfToken::new(state),
                 move || Nonce::new(nonce),
             )
-            .set_pkce_challenge(challenge)
-            .url();
-        url.to_string()
+            .set_pkce_challenge(challenge);
+        let request = match redirect_uri {
+            None => request,
+            Some(uri) => {
+                let redirect = RedirectUrl::new(uri.to_string())
+                    .map_err(|e| UpstreamError::Config(e.to_string()))?;
+                request.set_redirect_uri(std::borrow::Cow::Owned(redirect))
+            }
+        };
+        let (url, _, _) = request.url();
+        Ok(url.to_string())
     }
 
     /// Exchange the upstream `code` with the broker's PKCE `verifier`,
