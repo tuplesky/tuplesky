@@ -133,6 +133,7 @@ to be resolved or re-justified before a production release.
 | Advisory | Crate | Nature | Why no upgrade | Why unreachable here |
 |---|---|---|---|---|
 | RUSTSEC-2024-0437 | protobuf 2.28.0 | stack overflow (denial of service) when skipping unknown group fields in untrusted input; patched in 3.7.2+ | the pinned raft-engine revision requires protobuf 2 directly and through prometheus 0.13; the 2.x line is unmaintained | raft-engine is a dependency of `tools/raft-engine-smoke` only, no daemon or library crate links it, and the engine decodes only its own on-disk log entries |
+| RUSTSEC-2023-0071 | rsa 0.9.10 | Marvin attack: timing side channel in RSA private-key operations that can leak the key to a network observer | no patched release exists (tracked upstream since 2023); openidconnect 4.0.1 requires the crate unconditionally | only openidconnect (coord-login) uses it, for public-key verification of upstream identity-provider signatures; no RSA private key is created, held or used in the workspace, and the broker signs with ES256 through aws-lc-rs
 
 ## Reproducing
 

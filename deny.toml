@@ -21,6 +21,13 @@ ignore = [
     # daemon or library crate links it, and raft-engine decodes only its own
     # on-disk log entries, never network input.
     { id = "RUSTSEC-2024-0437", reason = "protobuf 2 is pinned by raft-engine (smoke tool only); never parses untrusted input" },
+    # rsa 0.9.10: Marvin timing side channel in RSA private-key operations,
+    # with no patched release. It reaches the graph solely through
+    # openidconnect (coord-login), which uses it to verify upstream identity
+    # provider signatures: public-key operations only. No RSA private key is
+    # created, held or used anywhere in the workspace (the broker signs with
+    # ES256 through aws-lc-rs), so there is no private-key timing to observe.
+    { id = "RUSTSEC-2023-0071", reason = "rsa is used by openidconnect for public-key verification only; no RSA private keys exist in the workspace" },
 ]
 
 [licenses]
