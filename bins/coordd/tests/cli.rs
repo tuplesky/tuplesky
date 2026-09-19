@@ -82,13 +82,23 @@ fn pem(label: &str, der: &[u8]) -> String {
 
 /// The genesis manifest this domain agrees on: three voters, of which
 /// the first is the node under test.
-fn genesis(dir: &Path) {
+///
+/// `voter_one_key` is that node's actual public key, because genesis
+/// commits to the key and not merely to the name. Without it the node
+/// starts -- nothing it does alone checks the key -- and then no peer
+/// will accept it, which is the failure the committed configuration
+/// exists to cause.
+fn genesis(dir: &Path, voter_one_key: Option<&[u8]>) {
     let voters: Vec<serde_json::Value> = (1u8..=3)
         .map(|n| {
+            let key = match (n, voter_one_key) {
+                (1, Some(spki)) => b64url(spki),
+                _ => b64url(&[n; 32]),
+            };
             serde_json::json!({
                 "node": hex(&[n; 16]),
                 "incarnation": 1,
-                "public_key": b64url(&[n; 32]),
+                "public_key": key,
             })
         })
         .collect();
@@ -109,28 +119,97 @@ fn genesis(dir: &Path) {
     .expect("write manifest");
 }
 
-/// This node's credentials: a certificate carrying the node-identity URI
-/// SAN the issuer binds, because that -- not a setting -- is what says
-/// which replica a process is.
-fn credentials(dir: &Path, replica: u8, role: coord_types::wire_v1::PeerRole) {
-    let identity = coord_node_issuer::NodeIdentity {
-        cluster: coord_types::ids::ClusterId(CLUSTER),
-        node: coord_types::ids::ReplicaId([replica; 16]),
-        incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
-        role,
-    };
-    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params.subject_alt_names = vec![rcgen::SanType::URI(
-        coord_node_issuer::node_uri(&identity)
-            .try_into()
-            .expect("uri"),
-    )];
-    let certificate = params.self_signed(&key).expect("self-signed");
+/// The domain's certificate authority: one root, everything else issued
+/// under it, as a real deployment has it.
+///
+/// A self-signed leaf would do for the node's own startup checks and for
+/// nothing else: a caller cannot be issued a certificate the node
+/// trusts, so nothing could ever connect to it. A test that only ever
+/// started the daemon would not have noticed.
+pub struct Ca {
+    key: rcgen::KeyPair,
+    certificate: rcgen::Certificate,
+    /// The node certificate's SubjectPublicKeyInfo, which is what
+    /// genesis commits to for a voter.
+    node_spki: Vec<u8>,
+}
 
+impl Ca {
+    fn new() -> Self {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let certificate = params.self_signed(&key).expect("ca cert");
+        Ca {
+            key,
+            certificate,
+            node_spki: Vec::new(),
+        }
+    }
+
+    /// Issue a certificate carrying the node-identity URI SAN the issuer
+    /// binds, because that -- not a setting -- is what says which
+    /// replica a process is.
+    fn issue(
+        &self,
+        name: &str,
+        cluster: [u8; 16],
+        replica: u8,
+        role: coord_types::wire_v1::PeerRole,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let identity = coord_node_issuer::NodeIdentity {
+            cluster: coord_types::ids::ClusterId(cluster),
+            node: coord_types::ids::ReplicaId([replica; 16]),
+            incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            role,
+        };
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params =
+            rcgen::CertificateParams::new(vec![name.to_string()]).expect("leaf params");
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.subject_alt_names = vec![
+            rcgen::SanType::DnsName(name.try_into().expect("dns name")),
+            rcgen::SanType::URI(
+                coord_node_issuer::node_uri(&identity)
+                    .try_into()
+                    .expect("uri"),
+            ),
+        ];
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::from_params(&ca_params, &self.key);
+        let certificate = params.signed_by(&key, &issuer).expect("leaf cert");
+        (certificate, key)
+    }
+
+    fn root_pem(&self) -> String {
+        pem("CERTIFICATE", self.certificate.der())
+    }
+}
+
+/// This node's credentials, issued under the domain's authority.
+fn credentials(dir: &Path, replica: u8, role: coord_types::wire_v1::PeerRole) -> Ca {
+    credentials_of_cluster(dir, CLUSTER, replica, role)
+}
+
+fn credentials_of_cluster(
+    dir: &Path,
+    cluster: [u8; 16],
+    replica: u8,
+    role: coord_types::wire_v1::PeerRole,
+) -> Ca {
+    let mut ca = Ca::new();
+    let (certificate, key) = ca.issue(SERVER_NAME, cluster, replica, role);
+    ca.node_spki = spki_of(certificate.der());
     std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", certificate.der())).expect("cert");
-    std::fs::write(dir.join("roots.pem"), pem("CERTIFICATE", certificate.der())).expect("roots");
+    std::fs::write(dir.join("roots.pem"), ca.root_pem()).expect("roots");
     let key_path = dir.join("node.key");
     std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).expect("key");
     #[cfg(unix)]
@@ -138,14 +217,18 @@ fn credentials(dir: &Path, replica: u8, role: coord_types::wire_v1::PeerRole) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
+    ca
 }
+
+/// The name peers connect to this node by.
+const SERVER_NAME: &str = "node.coordd.test";
 
 /// The issuer's published keys, as a frontend reads them at startup.
 ///
 /// A real key ring rather than a stub: the frontend parses these into
 /// the verifier it will hold, so a shape it would reject at runtime has
 /// to be rejected here too.
-fn sts_keys(dir: &Path) {
+fn sts_keys(dir: &Path) -> coord_sts::KeyRing {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("sts key");
     let ring = coord_sts::KeyRing::new(
         coord_sts::SigningKey::from_pkcs8_der("coordd-test-1", &key.serialize_der())
@@ -156,14 +239,42 @@ fn sts_keys(dir: &Path) {
         serde_json::to_vec_pretty(&ring.jwks()).expect("jwks"),
     )
     .expect("write jwks");
+    ring
+}
+
+/// A token this domain's frontend will accept, signed by the keys it
+/// reads at startup.
+fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
+    let issued = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs();
+    ring.sign(&coord_sts::ServiceClaims {
+        iss: "https://sts.test".into(),
+        sub: hex(&[0xa; 16]),
+        aud: "control-plane-test".into(),
+        sid: hex(&session),
+        scope: 0xffff,
+        rule: hex(&session),
+        generation: 1,
+        jti: hex(&[2u8; 32]),
+        iat: issued,
+        exp: issued + 3600,
+    })
+    .expect("signing")
 }
 
 /// A configuration whose listeners are ephemeral loopback ports, so the
 /// test never depends on a fixed port or on IPv6 being available.
 fn config(dir: &Path) -> PathBuf {
-    genesis(dir);
-    credentials(dir, 1, coord_types::wire_v1::PeerRole::Voter);
-    sts_keys(dir);
+    let ca = credentials(dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis(dir, Some(&ca.node_spki));
+    let _ = sts_keys(dir);
+    config_only(dir)
+}
+
+/// Just the TOML, for a caller that wrote the fixture itself.
+fn config_only(dir: &Path) -> PathBuf {
     let text = format!(
         r#"config_version = 2
 role = "voter-frontend-observer"
@@ -590,4 +701,223 @@ fn the_serving_path_opens_the_journal_and_survives_a_restart() {
         !dir.join("state").join("gen-000002").exists(),
         "a restart created a second generation"
     );
+}
+
+/// A running daemon, with the address it is serving on, ended on drop.
+struct Running {
+    child: std::process::Child,
+    api: std::net::SocketAddr,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Start `coordd` and leave it serving.
+fn start(config: &Path) -> Running {
+    use std::io::{BufRead, BufReader};
+
+    let mut child = Command::new(binary())
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("coordd started");
+    let stdout = child.stdout.take().expect("piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut api = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(rest) = line.strip_prefix("listening api_quic=") {
+                api = rest.parse::<std::net::SocketAddr>().ok();
+            }
+            if line.contains("phase=live") {
+                break;
+            }
+        }
+        let _ = tx.send(api);
+    });
+    let api = rx
+        .recv_timeout(Duration::from_secs(30))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("coordd did not report a serving api listener within 30s")
+        });
+    Running { child, api }
+}
+
+/// A caller binds a session against the running daemon, and the daemon
+/// answers from the composition it actually has.
+///
+/// This is the serving path's own evidence. Everything on it is real:
+/// the QUIC handshake against the certificate the daemon loaded from
+/// disk, the peer binder built from the committed membership, the
+/// session token verified against the keys the daemon read at startup,
+/// and the frontend reading policy through the journal-backed store it
+/// attached. None of it is stubbed, and each piece would fail the
+/// handshake or the binding on its own if it were not wired.
+///
+/// It stops at the binding rather than at a served request, because a
+/// request is fanned out to voters and this build has no peer loop to
+/// answer it: the stream would be held, correctly, for ever. That is the
+/// next piece, and saying so here is more use than a test that pretended
+/// otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_binds_a_session_against_the_running_daemon() {
+    use coord_types::wire_v1::PeerRole;
+
+    let dir = workspace("bind");
+    let ca = credentials(&dir, 1, PeerRole::Voter);
+    genesis(&dir, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    // A client of this domain, issued under the same authority.
+    //
+    // This dials with quinn directly rather than through `Transport`.
+    // `Transport::send` opens a bidirectional stream and drops the
+    // receiving half, so it cannot read a unary answer: it is the path a
+    // frontend uses to deliver *to* a node it dialed, not the path a
+    // caller uses to ask one a question. The caller's shape -- one
+    // stream, the request written, the answer read on it -- is what the
+    // Go client implements and what the daemon's responder answers on,
+    // so that is what this drives.
+    let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(
+            ca.certificate.der().to_vec(),
+        ))
+        .expect("ca root");
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![rustls_pki_types::CertificateDer::from(
+                certificate.der().to_vec(),
+            )],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .expect("client auth");
+    tls.alpn_protocols = vec![coord_transport::ALPN_API.to_vec()];
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")).expect("client endpoint");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic tls"),
+    )));
+    let connection = endpoint
+        .connect(daemon.api, SERVER_NAME)
+        .expect("dialable")
+        .await
+        .expect("the caller reached the daemon");
+
+    // Negotiation: the control stream carries the hello that declares
+    // what this caller is, which the daemon binds against its committed
+    // membership before anything else happens.
+    let (mut control, _control_recv) = connection.open_bi().await.expect("control stream");
+    let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
+        role: PeerRole::Client,
+        cluster_id: coord_types::ids::ClusterId(CLUSTER),
+        domain_id: coord_types::ids::DomainId(DOMAIN),
+        incarnation: None,
+        capabilities: coord_types::wire_v1::BoundedVec::new(vec![
+            coord_transport::Lane::Unary.capability(),
+        ])
+        .expect("bounded"),
+    })
+    .encode()
+    .expect("hello");
+    control.write_all(&hello).await.expect("hello written");
+
+    // Bind a session with a token the daemon's own keys verify, on the
+    // caller's own stream, and read the answer where the daemon writes
+    // it.
+    let token = service_token(&ring, [0x44; 16]);
+    let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+    let (mut send, mut recv) = connection.open_bi().await.expect("request stream");
+    send.write_all(&bind).await.expect("bind written");
+    send.finish().expect("bind finished");
+
+    let answer = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Some(n) = recv.read(&mut buf).await.expect("readable") {
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        bytes
+    })
+    .await
+    .expect("the daemon answered the binding within the bound");
+    assert!(
+        !answer.is_empty(),
+        "the daemon closed the caller's stream without answering"
+    );
+    let mut reader = coord_types::wire_v1::FrameReader::new();
+    reader.push(&answer).expect("within the reader bound");
+    let answer = reader
+        .next_frame()
+        .expect("a frame")
+        .expect("one whole frame");
+    let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
+    assert_eq!(
+        ack.session,
+        coord_types::ids::SessionId([0x44; 16]),
+        "the daemon bound a different session than the token named"
+    );
+    assert!(ack.expires_at > 0, "a binding with no validity");
+}
+
+/// A certificate's SubjectPublicKeyInfo, as the binder reads it.
+fn spki_of(der: &[u8]) -> Vec<u8> {
+    use x509_parser::prelude::FromDer;
+    let (_, x509) =
+        x509_parser::certificate::X509Certificate::from_der(der).expect("a parseable certificate");
+    x509.public_key().raw.to_vec()
+}
+
+/// Genesis commits to a voter's key, not merely to its name, and a node
+/// holding some other key finds out at startup.
+///
+/// Without this it starts perfectly well -- nothing it does alone checks
+/// the key -- and is then refused by every peer it meets, which looks
+/// like a network problem. It is this node's own problem, it is knowable
+/// before anything is served, and the peers are right to refuse it.
+#[test]
+fn a_voter_whose_key_the_configuration_does_not_commit_to_stops_at_startup() {
+    let dir = workspace("wrongkey");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    let _ = sts_keys(&dir);
+    // The manifest names this node as a voter and commits to some other
+    // key.
+    genesis(&dir, None);
+    let path = config_only(&dir);
+
+    let refused = run(&path, &["--check"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("different key"),
+        "the refusal did not name the mismatch: {}",
+        refused.err
+    );
+    assert!(
+        !dir.join("state").exists() && !dir.join("journal").exists(),
+        "a node with an uncommitted key opened durable storage"
+    );
+
+    // The same node, with the manifest committing to the key it holds.
+    genesis(&dir, Some(&ca.node_spki));
+    let accepted = run(&path, &["--check"]);
+    assert_eq!(accepted.code, Some(0), "{}{}", accepted.out, accepted.err);
 }
