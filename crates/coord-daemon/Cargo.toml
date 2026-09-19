@@ -16,6 +16,7 @@ coord-types.workspace = true
 coord-transport.workspace = true
 coord-membership.workspace = true
 coord-store-api.workspace = true
+coord-collector.workspace = true
 serde = { workspace = true, features = ["std"] }
 toml.workspace = true
 thiserror.workspace = true

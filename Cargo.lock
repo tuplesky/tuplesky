@@ -660,6 +660,7 @@ dependencies = [
 name = "coord-daemon"
 version = "0.1.0"
 dependencies = [
+ "coord-collector",
  "coord-membership",
  "coord-store-api",
  "coord-store-testkit",
