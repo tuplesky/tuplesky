@@ -175,7 +175,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut frontend = match serve::Frontend::new(&config, placed.membership.clone(), applier) {
+    let mut frontend = match serve::Frontend::new(
+        &config,
+        placed.membership.clone(),
+        applier,
+        // No voter runs in this process yet, so every voter --
+        // including this node, where it is one -- is reached over the
+        // wire. The local ingress is wired when the voter loop is.
+        None,
+    ) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{e}");
@@ -237,8 +245,15 @@ fn main() -> ExitCode {
         frontend.run(&mut transport, now_seconds).await;
         let counts = frontend.counts();
         eprintln!(
-            "the api plane ended: reached={} unreachable={} watches={} unserved={}",
-            counts.reached, counts.unreachable, counts.watches, counts.unserved
+            "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
+saturated={} unavailable={} watches={} unserved={}",
+            counts.queued_local,
+            counts.queued_remote,
+            counts.not_a_voter,
+            counts.saturated,
+            counts.unavailable,
+            counts.watches,
+            counts.unserved
         );
         ExitCode::from(1)
     })
