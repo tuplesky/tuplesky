@@ -999,6 +999,147 @@ async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
         coord_types::CommandId::derive(&caller.invocation(1), &logical).expect("derivable"),
         "the daemon answered with some other command's result"
     );
+
+    // And it is the result the *replicated* execution produced, decoded
+    // here rather than taken on trust.
+    //
+    // It is a rejection, and the right one. Nothing in this build writes
+    // the session row a command's execution authorizes against: a
+    // session is established by a replicated command, and driving that
+    // from the bind is its own task (see the plan's task-j09). Until it
+    // exists, every command any cluster this binary starts can execute
+    // is refused at execution with `SessionInvalid` -- which is the
+    // correct fail-closed answer, and is still a full trip through the
+    // machinery above.
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+        panic!("the daemon answered with a transport-level error: {response:?}");
+    };
+    let executed: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+    assert_eq!(
+        executed.outcome,
+        coord_state::Outcome::ErrRejected {
+            reason: coord_state::RejectionReason::SessionInvalid
+        },
+        "the session row is not written by anything yet; see task-j09"
+    );
+}
+
+/// The same invocation is answered the same way after a restart.
+///
+/// The daemon stops, the process that held the collector's retained
+/// results and every in-memory command goes with it, and the next
+/// process comes up on the store the first one left: it recovers, it
+/// serves, and the same invocation gets the same answer.
+///
+/// What this does *not* yet hold is retry resolution from the durable
+/// record. The command here is refused at execution, and a semantic
+/// admission refusal deliberately records nothing under the retry key
+/// -- so there is nothing retained to resolve to, and the second trip
+/// re-derives the same refusal rather than finding it. Holding the
+/// resolution path needs a command that executes, which needs the
+/// session row nothing writes yet (task-j09). Saying so is more use
+/// than a test that named a property it does not check.
+///
+/// The restart is ordinary: the process is stopped and started again.
+/// That is integration evidence and not a durability qualification --
+/// what a torn write or a lost fsync does is task-j05's, and this says
+/// nothing about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
+    let dir = workspace("retry");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+        let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .expect("the daemon answered the request");
+        response_of(&answer)
+    };
+
+    // A different process, the same store, and the same invocation. The
+    // collector that retained this result in memory is gone with the
+    // process that held it; what answers now is the record the command
+    // left behind.
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("the daemon answered the retry");
+    let again = response_of(&answer);
+
+    assert_eq!(
+        again.command_id, first.command_id,
+        "the same invocation became a different command after a restart"
+    );
+    assert_eq!(
+        again.outcome, first.outcome,
+        "the same invocation was answered differently by the next process"
+    );
+}
+
+/// A process that cannot verify a caller does not come up saying it can.
+///
+/// A JWKS that is valid JSON and holds no key this build can verify with
+/// refuses every caller. A daemon that treated "the file parsed" as "the
+/// verifier is configured" would bind its listeners, report itself live,
+/// and reject every connection -- which from outside is indistinguishable
+/// from a client problem, and is the most expensive kind of
+/// misconfiguration to find.
+#[test]
+fn a_frontend_that_cannot_verify_a_caller_refuses_to_start() {
+    let dir = workspace("nokeys");
+    let path = config(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    // Valid JSON, a well-formed key set, and not one key in it.
+    std::fs::write(
+        dir.join("sts-jwks.json"),
+        serde_json::to_vec(&serde_json::json!({ "keys": [] })).expect("jwks"),
+    )
+    .expect("write");
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("verify a caller"),
+        "the refusal did not say what was unusable: {}",
+        refused.err
+    );
+    // And it stopped before it bound anything: a listener that came up
+    // is a listener something could connect to.
+    assert!(
+        !refused.out.contains("listening"),
+        "a daemon that could verify nobody bound a listener anyway: {}",
+        refused.out
+    );
+
+    // A key with a `kid` but no usable public point is no better, and
+    // fails for the same reason rather than by parsing differently.
+    std::fs::write(
+        dir.join("sts-jwks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "keys": [{ "kid": "one", "kty": "EC", "crv": "P-256" }]
+        }))
+        .expect("jwks"),
+    )
+    .expect("write");
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(refused.err.contains("verify a caller"), "{}", refused.err);
+}
+
+/// The response a frame carries.
+fn response_of(frame: &coord_types::wire_v1::Frame) -> coord_types::wire_v1::ResponseV1 {
+    match coord_types::wire_v1::decode(frame).expect("a decodable answer") {
+        coord_types::wire_v1::MessageV1::Response(r) => r,
+        other => panic!("the daemon answered a request with something else: {other:?}"),
+    }
 }
 
 /// One voter in this process is one voter, not a quorum.
