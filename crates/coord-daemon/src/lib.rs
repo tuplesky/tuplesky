@@ -28,6 +28,9 @@
 //! * [`pending`]: the request streams held open while the collector
 //!   establishes their results, matched to deliveries by invocation and
 //!   by the connection that asked.
+//! * [`serve`]: what the serving loop does with one ingress -- whether
+//!   the stream the frame arrived on is answered, held, held and fanned
+//!   out, kept as a watch's output, or closed.
 //! * [`startup`]: the startup sequence of Section 22.1 (Boot,
 //!   StorageValidated, IdentityValidated, MembershipChecked,
 //!   ProtocolRecovered), which no step may skip, and the production
@@ -44,6 +47,7 @@ pub mod lifecycle;
 pub mod listen;
 pub mod pending;
 pub mod role;
+pub mod serve;
 pub mod startup;
 pub mod supervise;
 
@@ -54,6 +58,7 @@ pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use pending::{Pending, Undeliverable};
 pub use role::{Role, RoleSet};
+pub use serve::{Step, step};
 pub use startup::{NodeJournal, Startup, StartupError, StartupPhase, StoreGenesis};
 pub use supervise::{RestartBudget, Supervisor, WorkerError, WorkerId};
 

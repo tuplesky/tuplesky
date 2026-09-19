@@ -662,6 +662,8 @@ version = "0.1.0"
 dependencies = [
  "coord-collector",
  "coord-membership",
+ "coord-session",
+ "coord-storage",
  "coord-storage-redb",
  "coord-store-api",
  "coord-store-testkit",
