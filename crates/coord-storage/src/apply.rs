@@ -140,6 +140,16 @@ impl<P: Persistence> Applier<P> {
         &mut self.store
     }
 
+    /// Give the store back; this boot's application side ends.
+    ///
+    /// The watch hub goes with it. A hub belongs to one boot's view of
+    /// the applied revision, and handing it to the next boot would let a
+    /// subscriber carry a position across a recovery that may not have
+    /// reached the same place.
+    pub fn into_store(self) -> P {
+        self.store
+    }
+
     /// The barrier allocator.
     pub const fn alloc(&mut self) -> &mut BarrierAllocator {
         &mut self.alloc
