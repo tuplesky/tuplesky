@@ -1227,6 +1227,7 @@ fn plan_internal_command(
                     active: true,
                     window: *window,
                     receipt_id: receipt.receipt_id,
+                    expires_at: receipt.expires_at,
                 }),
             });
             Ok(Outcome::SessionCreated {

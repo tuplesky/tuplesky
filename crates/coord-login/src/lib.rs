@@ -23,6 +23,11 @@
 //! bounded intervals and attempts, the user code alone grants nothing,
 //! and an approved grant is taken by exactly one poll.
 //!
+//! Sessions from these logins carry a refresh family ([`refresh`]):
+//! rotating secret commitments in replicated state, reuse of a retired
+//! secret revoking the family and retiring the session, and no recovery
+//! of a lost rotation response other than a fresh login.
+//!
 //! Upstream codes are never reused as service codes; pending logins are
 //! bounded broker-local state (a restart forces a fresh login); every
 //! secret is redacted from diagnostics.
@@ -31,12 +36,17 @@
 
 pub mod device;
 pub mod http;
+pub mod refresh;
 pub mod service;
 pub mod upstream;
 
 pub use device::{
     DeviceAuthorization, DeviceDisplay, DeviceError, DeviceLimits, DeviceLogin, Poll,
     normalize_user_code, user_code,
+};
+pub use refresh::{
+    RefreshError, SessionBackend, SessionReader, logout, new_family, parse_refresh_token, refresh,
+    refresh_token, secret_commitment,
 };
 pub use service::{
     Approved, LoginError, LoginLimits, RedeemRequest, Redeemed, Registration, ServiceLogin,

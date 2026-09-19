@@ -375,6 +375,7 @@ fn receipt(n: u8) -> AdmissionReceiptV1 {
         scope_ceiling: Action::Read.bit(),
         trust_rule: TrustRuleId([9; 16]),
         rule_generation: 3,
+        expires_at: NOW + 3600,
     }
 }
 
@@ -456,11 +457,27 @@ fn one_code_creates_at_most_one_session() {
     });
     let clock = ClockHealth::healthy(NOW, 5);
     let first = sts
-        .issue(&identity, Some(second), None, &clock, &[0x31; 32], &mut d)
+        .issue(
+            &identity,
+            Some(second),
+            None,
+            None,
+            &clock,
+            &[0x31; 32],
+            &mut d,
+        )
         .unwrap();
     assert_eq!(first.expires_in, 300);
     assert_eq!(
-        sts.issue(&identity, Some(second), None, &clock, &[0x32; 32], &mut d),
+        sts.issue(
+            &identity,
+            Some(second),
+            None,
+            None,
+            &clock,
+            &[0x32; 32],
+            &mut d
+        ),
         Err(ExchangeError::InvalidGrant("grant already consumed"))
     );
     assert_eq!(sts.issued, 1);
