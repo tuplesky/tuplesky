@@ -1075,6 +1075,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "coord-daemon",
+ "coord-storage-redb",
+ "coord-types",
 ]
 
 [[package]]

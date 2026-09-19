@@ -17,4 +17,6 @@ path = "src/main.rs"
 
 [dependencies]
 coord-daemon.workspace = true
+coord-storage-redb.workspace = true
+coord-types.workspace = true
 clap.workspace = true
