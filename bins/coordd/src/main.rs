@@ -11,6 +11,7 @@
 //! volume or a mistyped path into a fresh, empty, valid node -- which
 //! would then vote, having forgotten everything it had promised.
 
+mod membership;
 mod store;
 
 use std::process::ExitCode;
@@ -67,19 +68,36 @@ fn main() -> ExitCode {
         diagnostics.phase,
         roles.votes()
     );
-    // A node's identity: for the reference preview it comes from the
-    // configured domain, and the genesis manifest supplies the rest when
-    // membership is wired. Nothing here invents one.
-    let identity = preview_identity(&config);
+    // Who this node is, from the genesis manifest and from its own
+    // certificate. Nothing here invents an identity: a node that could
+    // be told who it was could be told it was somebody else.
+    let placed = match membership::place(
+        &config.cluster_manifest,
+        &config.identity.node_certificate,
+        roles.votes(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "node replica={} incarnation={} role={:?} voters={}",
+        short(&placed.replica.0),
+        placed.incarnation.get(),
+        placed.role,
+        placed.membership.voters().count()
+    );
 
     if let Some(Command::Init) = cli.command {
         return match store::open(
             &config,
             store::Intent::Initialize,
-            identity.0,
-            identity.1,
-            identity.2,
-            identity.3,
+            placed.membership.cluster(),
+            placed.membership.domain(),
+            placed.replica,
+            placed.incarnation,
         ) {
             Ok(generation) => {
                 println!("initialized {}", generation.directory().display());
@@ -105,10 +123,10 @@ fn main() -> ExitCode {
     let generation = match store::open(
         &config,
         store::Intent::Serve,
-        identity.0,
-        identity.1,
-        identity.2,
-        identity.3,
+        placed.membership.cluster(),
+        placed.membership.domain(),
+        placed.replica,
+        placed.incarnation,
     ) {
         Ok(g) => g,
         Err(e) => {
@@ -149,43 +167,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// The identity this preview node runs under.
-///
-/// Membership binds a node to a replica and an incarnation from the
-/// genesis manifest (task-42); until the daemon reads that manifest, the
-/// preview derives a stable identity from the configured domain so a
-/// node reopens its own store rather than a different one. It is derived,
-/// never random: a node that generated a fresh identity each start would
-/// fail to open the store it wrote last time, and the failure would look
-/// like corruption.
-fn preview_identity(
-    config: &Config,
-) -> (
-    coord_types::ids::ClusterId,
-    coord_types::ids::DomainId,
-    coord_types::ids::ReplicaId,
-    coord_types::ids::ReplicaIncarnation,
-) {
-    let domain = name_digest(config.domain.as_bytes());
-    let replica = name_digest(config.state_directory.as_bytes());
-    (
-        coord_types::ids::ClusterId(name_digest(config.cluster_manifest.as_bytes())),
-        coord_types::ids::DomainId(domain),
-        coord_types::ids::ReplicaId(replica),
-        coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
-    )
-}
-
-/// A stable 16-byte identity for a name. Not a security primitive: it
-/// exists so the same configuration reopens the same store.
-fn name_digest(name: &[u8]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    let mut state: u64 = 0xcbf2_9ce4_8422_2325;
-    for (i, byte) in name.iter().enumerate() {
-        state ^= u64::from(*byte);
-        state = state.wrapping_mul(0x0000_0100_0000_01b3);
-        out[i % 16] ^= (state >> 32) as u8;
-    }
-    out[0] |= 1;
-    out
+/// A short, stable rendering of an identity for an operator's eye. It is
+/// an identity, not a secret, and the full value is in the certificate.
+fn short(bytes: &[u8; 16]) -> String {
+    bytes[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
