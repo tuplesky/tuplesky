@@ -331,6 +331,19 @@ impl JournalEngine for ModelJournal {
         if high_water < self.high_water || mapping.stream.get() > high_water.get() {
             return Err(definite("high-water mark must cover the mapping"));
         }
+        if let Some(existing) = self.mappings.get(&mapping.stream) {
+            if existing.key != mapping.key || existing.shard != mapping.shard {
+                return Err(definite(
+                    "mapping identity of an allocated stream cannot change",
+                ));
+            }
+            // Retirement is permanent, here as in the real journal:
+            // persisting a stream's own older, active mapping must not
+            // bring it back.
+            if existing.retired && !mapping.retired {
+                return Err(definite("a retired stream cannot become active again"));
+            }
+        }
         self.high_water = high_water;
         self.mappings.insert(mapping.stream, *mapping);
         self.events.push(JournalEvent::MappingPersisted {
