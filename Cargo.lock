@@ -1075,18 +1075,25 @@ name = "coordd"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "coord-authn",
+ "coord-collector",
+ "coord-consensus",
  "coord-core",
  "coord-daemon",
  "coord-journal-api",
  "coord-journal-raft-engine",
  "coord-membership",
  "coord-node-issuer",
+ "coord-session",
  "coord-storage",
  "coord-storage-redb",
+ "coord-sts",
+ "coord-transport",
  "coord-types",
  "rcgen",
  "rustls-pki-types",
  "serde_json",
+ "tokio",
  "x509-parser",
 ]
 
