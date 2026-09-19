@@ -22,7 +22,7 @@
 //! here (task-24), and equal direct dependencies prove nothing by
 //! themselves.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch};
@@ -40,8 +40,8 @@ use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
-use crate::recovery::RecoveryReport;
 use crate::recovery::{RecoveryError, SyncDecision, SyncEntry};
+use crate::recovery::{RecoveryReport, ReportEntry};
 use crate::role::RecoveredState;
 use crate::rows::{PayloadRecordV1, PromiseRecordV1, dependency_update, payload_update};
 use crate::rows::{SyncRecordV1, promise_update, sync_update};
@@ -433,7 +433,7 @@ impl Follower {
             self.rejections.push(FollowerRejection::CannotLead);
             return Vec::new();
         };
-        let outstanding: Vec<BarrierId> = self.pending.keys().copied().collect();
+        let outstanding: Vec<BarrierId> = self.outstanding_for_cut();
         let alloc = self.alloc.as_mut().expect("booted");
         // A replica campaigning for itself: its own authenticated identity.
         let me = PeerId {
@@ -867,9 +867,59 @@ impl Follower {
     }
 
     /// The recovery report for `ballot` from durable state at this cut.
+    /// The barriers the report cut must wait for.
+    ///
+    /// The Sync persistence barrier belongs in it: the report states the
+    /// synchronized ballot, which that batch is what makes durable, so a
+    /// report published before it could claim a ballot this replica
+    /// would not have after a restart.
+    fn outstanding_for_cut(&self) -> Vec<BarrierId> {
+        self.pending
+            .keys()
+            .copied()
+            .chain(self.sync_barrier.as_ref().map(|(b, _)| *b))
+            .collect()
+    }
+
+    /// This replica's recovery report for `ballot`: its durable ledger,
+    /// plus any Sync selection it accepted durably and has not finished
+    /// installing.
     pub fn report(&self, ballot: Ballot) -> RecoveryReport {
-        self.ledger
-            .report(self.config.identity.replica, ballot, self.ballots.synced())
+        let mut report =
+            self.ledger
+                .report(self.config.identity.replica, ballot, self.ballots.synced());
+        // A Sync this replica accepted durably but has not finished
+        // installing is part of what it knows, and the report is taken at
+        // the synchronized ballot that Sync established. Reporting that
+        // ballot while omitting its selected commands said this replica
+        // had authoritative state for the ballot and that those commands
+        // were never accepted: a candidate reading it as the source could
+        // drop a selected command entirely. The entries are reported for
+        // what they are — selected, with their order, payload still
+        // outstanding — so the selection preserves them.
+        let known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+        for (command, entry) in &self.sync_pending {
+            if known.contains(command) {
+                continue;
+            }
+            report.entries.push(ReportEntry {
+                command: *command,
+                phase: entry.phase,
+                deps: entry.deps.clone(),
+                path: entry.path,
+                paths: entry.paths.clone(),
+                seqnum: entry.seqnum,
+                // The conflict keys come from the payload, which is
+                // exactly what has not arrived. The per-key digests the
+                // selection installed name the keys the selected order
+                // was recorded against, which is what a reader of this
+                // entry can rely on.
+                keys: entry.paths.iter().map(|(k, _)| k.clone()).collect(),
+                payload_present: false,
+            });
+        }
+        report.entries.sort_by_key(|e| e.command);
+        report
     }
 
     /// Commands known by identity (a held proposal) without a payload.
@@ -1408,7 +1458,12 @@ impl Follower {
                 let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
                     return Vec::new();
                 };
-                let outstanding: Vec<BarrierId> = self.pending.keys().copied().collect();
+                let outstanding: Vec<BarrierId> = self
+                    .pending
+                    .keys()
+                    .copied()
+                    .chain(self.sync_barrier.as_ref().map(|(b, _)| *b))
+                    .collect();
                 match self
                     .ballots
                     .on_new_leader(from, ballot, boot, alloc, &outstanding)

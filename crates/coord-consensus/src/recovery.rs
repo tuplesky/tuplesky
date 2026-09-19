@@ -180,14 +180,36 @@ pub fn select(
         if r.committed_ballot.epoch != config.epoch() {
             return Err(RecoveryError::EpochMismatch { replica: r.replica });
         }
+    }
+    // A command accepted at the cut whose payload no reporter holds is a
+    // dead end: the selection would order state nobody can execute. The
+    // check is per command across the whole set rather than per report,
+    // because a replica that holds a durable selection while its payload
+    // transfer is still in flight reports the selection honestly, and
+    // another reporter usually has the payload. Failing the campaign on
+    // that one report would stop recovery exactly when it is needed;
+    // omitting the entry would lose the selected command.
+    let mut accepted_somewhere: BTreeSet<CommandId> = BTreeSet::new();
+    let mut with_payload: BTreeSet<CommandId> = BTreeSet::new();
+    for r in reports {
         for e in &r.entries {
-            if e.phase >= Phase::Accept && !e.payload_present {
-                return Err(RecoveryError::HalfInitialized {
-                    replica: r.replica,
-                    command: e.command,
-                });
+            if e.phase >= Phase::Accept {
+                accepted_somewhere.insert(e.command);
+                if e.payload_present {
+                    with_payload.insert(e.command);
+                }
             }
         }
+    }
+    if let Some(command) = accepted_somewhere.difference(&with_payload).next() {
+        let replica = reports
+            .iter()
+            .find(|r| r.entries.iter().any(|e| e.command == *command))
+            .map_or(reports[0].replica, |r| r.replica);
+        return Err(RecoveryError::HalfInitialized {
+            replica,
+            command: *command,
+        });
     }
     if reports.len() < config.slow_size() {
         return Err(RecoveryError::InsufficientReports {
