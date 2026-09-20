@@ -857,3 +857,72 @@ QUIC and arrives, and every link is established before the request, so
 the composition holds; a cluster that loses a link mid-request does not
 recover until something re-dials it. `Outbound::arm` and `cancel` are
 counted as unserved, which is where that shows.
+
+## A node's journal grows until something local decides it should not
+
+The journal is the record, so nothing in the protocol ever tells a
+replica it may forget a prefix. `C <= M <= J` says what *may* be
+retired; what makes it happen is a node deciding to image its own
+storage, and that decision is not a replicated one. Two replicas of the
+same domain may publish at completely different rates, or one may never
+publish at all, and every replicated result is the same either way.
+
+So the trigger is a local setting -- `limits.checkpoint_after_records`,
+the number of durable records a domain may hold past its baseline --
+and the work happens between serving turns:
+
+* `Domain::maintain` runs every turn and is almost always one
+  comparison. `J - C` is a number the store already has; only crossing
+  the bound spends any I/O.
+* It is deliberately not counted as progress. A publication is not work
+  a caller is waiting for, and a loop that treated it as progress would
+  keep itself awake to do housekeeping.
+* Nothing in the cycle can fail the node. A failed export, a refused
+  pointer or a failed compaction leaves the previous baseline selected
+  and the journal holding more history than it needs, which is the safe
+  direction: the cost of not publishing is disk, and the cost of
+  publishing something unloadable would be the prefix that proved it.
+  Failures are counted and printed rather than swallowed -- a node whose
+  checkpoints have been failing for a week is a node whose disk is
+  filling.
+* A failure raises the gap the next attempt needs. Without that, a node
+  that cannot publish -- a full disk being the obvious way -- would
+  attempt a complete export on every turn for as long as the condition
+  lasted, which is the one shape of housekeeping that can make an
+  incident worse.
+
+`LocalBaseline` is the seam. Publishing needs the filesystem and the
+image format, and the storage coordinator is deliberately ignorant of
+both; the trait is implemented for `JournaledDomain` in
+`coord-checkpoint`, which is the one crate that can see all five steps.
+What it images is `M` and never `J`: a durable record the projection
+still owes is an obligation this node has taken on and does not yet
+hold, and an image claiming it would be a baseline missing what its own
+pointer promised.
+
+### The baseline is read before the projection is attached
+
+`open_storage` reads `recovery_baseline` from the journal and *loads*
+the image it names before attaching the domain, and refuses to start if
+that fails. Two reasons, and the second is the one that matters:
+
+* What the baseline answers is *which projection to attach* -- the live
+  one, or a fresh generation installed from the image. Asking after
+  attaching would be asking too late.
+* An image this node published and can no longer load is the loss of a
+  durable prefix. Discovering that at the moment a recovery needs it is
+  discovering it at the worst possible time, so it is a startup refusal
+  instead.
+
+A `.pending-` directory is not an image. Stopping a node mid-write
+leaves one, nothing selects it, and the next publication reclaims it
+along with the superseded images.
+
+**Still missing:** the export runs inline in the serving turn that
+triggered it, so a very large domain pays its whole image in one turn.
+Bounded, resumable export is task-j06's, and the trigger is a local
+setting precisely so an operator can keep the bound low until it exists.
+Installing a selected image into a fresh generation is written and
+tested (`install_local`), but nothing on the serving path chooses to do
+it yet: a node whose projection is intact attaches the live one, and
+recovery *from* the image is what task-j05 qualifies under real faults.

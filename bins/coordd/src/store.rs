@@ -159,6 +159,15 @@ pub struct Storage {
     /// The journal-first coordinator: one shared journal, this node's
     /// domain attached to it.
     pub domain: Persistence,
+    /// Where this node's local recovery checkpoints are published.
+    pub checkpoints: coord_checkpoint::LocalCheckpointStore,
+    /// The baseline the journal selects, if one was ever published.
+    ///
+    /// Read and validated at startup rather than when it is needed: an
+    /// image this node published and can no longer load is the loss of
+    /// a durable prefix, and finding that out at the moment it is
+    /// needed is finding it out too late.
+    pub baseline: Option<coord_journal_api::CheckpointPointerV1>,
     /// Where the projection's generation lives, for diagnostics.
     pub generation: PathBuf,
     /// The boot this storage was opened under.
@@ -231,6 +240,32 @@ pub fn open_storage(
         root: show(&journal_root),
         reason: format!("{e:?}"),
     })?;
+    // The local checkpoint directory, and what the journal says the
+    // baseline is. Both are read before the domain is attached: the
+    // baseline is a fact of the stream, not of the projection, and an
+    // image that no longer loads has to stop the node here rather than
+    // when a recovery needs it.
+    let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
+    let checkpoints =
+        coord_checkpoint::LocalCheckpointStore::open(&checkpoint_root).map_err(|e| {
+            StoreError::Refused {
+                root: show(&checkpoint_root),
+                reason: format!("the local checkpoint directory could not be opened: {e}"),
+            }
+        })?;
+    let baseline = store
+        .recovery_baseline(domain_id)
+        .map_err(|e| StoreError::Refused {
+            root: show(&journal_root),
+            reason: format!("the local recovery baseline could not be read: {e}"),
+        })?;
+    if let Some(pointer) = &baseline {
+        checkpoints.load(pointer).map_err(|e| StoreError::Refused {
+            root: show(&checkpoint_root),
+            reason: format!("{e}"),
+        })?;
+    }
+
     // Shard 0 for the single-domain preview; task-j07 is where a node
     // spreads domains over a shard set.
     let shard = ShardId::new(0).expect("shard zero");
@@ -253,6 +288,8 @@ pub fn open_storage(
     let domain = JournaledDomain::new(store, domain_id, ballot).expect("just attached");
     Ok(Storage {
         domain,
+        checkpoints,
+        baseline,
         generation: directory,
         boot,
     })

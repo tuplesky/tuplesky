@@ -65,6 +65,7 @@
 pub mod export;
 pub mod install;
 pub mod local;
+pub mod maintain;
 pub mod manifest;
 pub mod store;
 pub mod trim;
@@ -76,6 +77,7 @@ pub use local::{
     LocalManifestV1, LocalPin, export_local, install_local, verify_local,
 };
 
+pub use maintain::{BaselineError, LocalBaseline, Publication};
 pub use store::{LocalCheckpointStore, StoreError};
 
 pub use install::{

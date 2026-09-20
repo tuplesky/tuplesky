@@ -33,6 +33,21 @@ pub struct Limits {
     pub max_outstanding_per_session: usize,
     /// Concurrent watch subscriptions per process.
     pub max_live_subscriptions: usize,
+    /// Journal records a domain may hold beyond its published
+    /// checkpoint before the next one is published and the prefix
+    /// reclaimed. Zero never publishes.
+    ///
+    /// A local setting, and only a local one: what it decides is when
+    /// this node spends I/O on its own redo, and no replicated result
+    /// depends on the answer. Publishing more often costs exports and
+    /// keeps the journal small; publishing less often costs journal and
+    /// makes a restart replay further.
+    #[serde(default = "default_checkpoint_after")]
+    pub checkpoint_after_records: u64,
+}
+
+const fn default_checkpoint_after() -> u64 {
+    4096
 }
 
 impl Default for Limits {
@@ -42,6 +57,7 @@ impl Default for Limits {
             max_response_bytes: 8 * 1024 * 1024,
             max_outstanding_per_session: 256,
             max_live_subscriptions: 4096,
+            checkpoint_after_records: default_checkpoint_after(),
         }
     }
 }
@@ -89,6 +105,19 @@ pub struct StateConfig {
     /// Engine page cache.
     #[serde(default = "default_cache_bytes")]
     pub cache_bytes: usize,
+    /// Directory local recovery checkpoints are published into,
+    /// relative to `state_directory` unless absolute.
+    ///
+    /// Its own directory, not the projection's: a checkpoint is an
+    /// inactive image that must survive whatever happens to the
+    /// generation it was read from, and keeping the two together would
+    /// make losing one a way of losing both.
+    #[serde(default = "state_checkpoints")]
+    pub checkpoints: String,
+}
+
+fn state_checkpoints() -> String {
+    "checkpoints".to_owned()
 }
 
 fn state_engine() -> String {
