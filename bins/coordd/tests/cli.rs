@@ -1602,6 +1602,72 @@ fn response_of(frame: &coord_types::wire_v1::Frame) -> coord_types::wire_v1::Res
     }
 }
 
+/// A binding the daemon refuses establishes nothing.
+///
+/// The credential is well formed and signed -- by a key this cluster
+/// does not trust. The daemon refuses the binding and closes the
+/// connection, and no `ConsumeAdmission` is submitted: a caller whose
+/// credential does not verify cannot cause a session to exist, which a
+/// later *valid* binding of the same session shows by creating it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_the_daemon_refuses_establishes_nothing() {
+    let dir = workspace("refused");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    // Another signing key entirely: the same claims, an untrusted
+    // signature.
+    let stranger = {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+        coord_sts::KeyRing::new(
+            coord_sts::SigningKey::from_pkcs8_der("stranger-1", &key.serialize_der())
+                .expect("signing key"),
+        )
+    };
+    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
+    let token = service_token(&stranger, [0x44; 16]);
+    let (mut send, mut recv) = connection.open_bi().await.expect("bind stream");
+    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
+        .await
+        .expect("written");
+    send.finish().expect("finished");
+    // A refused binding is a statement about the connection, not about
+    // this stream: the daemon closes the peer rather than answering.
+    // Which of the two the caller sees first is a race between the
+    // close and the stream ending -- both are the refusal, and what
+    // must never arrive is an acknowledgement.
+    let mut buf = [0u8; 4096];
+    let read = tokio::time::timeout(Duration::from_secs(20), recv.read(&mut buf))
+        .await
+        .expect("the daemon decided within the bound");
+    match read {
+        Ok(None) => {}
+        Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(close))) => {
+            assert_eq!(close.error_code.into_inner(), 2, "{close:?}")
+        }
+        other => panic!("the daemon answered a binding it could not verify: {other:?}"),
+    }
+
+    // The session the refused credential named does not exist: a valid
+    // credential for it is still the one that creates it, and a caller
+    // whose first command executes proves the row is there.
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response_of(&answer).outcome else {
+        panic!("a transport-level error");
+    };
+    let executed: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+    assert_eq!(executed.outcome, coord_state::Outcome::Put { prev: None });
+}
+
 /// One voter in this process is one voter, not a quorum.
 ///
 /// The same code, the same local route -- and three committed voters
