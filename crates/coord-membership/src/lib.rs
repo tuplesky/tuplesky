@@ -46,7 +46,7 @@ pub use binder::PeerBinder;
 pub use configuration::{
     BallotError, BootstrapOutcome, CatalogError, ChainError, ClientConfiguration,
     ConfigurationChain, EvidenceError, GenesisAnchor, HintDecision, Installed, SignError,
-    VerifiedConfiguration, sign_message, verify_signature,
+    VerifiedConfiguration, VoterAuthority, sign_message, verify_endpoint_catalog, verify_signature,
 };
 pub use genesis::{
     GenesisError, GenesisManifest, SignedGenesis, VoterSeed, sign_genesis, verify_genesis,

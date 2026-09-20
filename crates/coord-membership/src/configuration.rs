@@ -266,6 +266,102 @@ pub enum CatalogError {
     Stale,
 }
 
+/// The committed voters of one epoch, and the key each of them signs
+/// with.
+///
+/// A catalog is attested by a voter, so verifying one needs exactly this
+/// and nothing else: who the voters are, which generation of each the
+/// cluster committed to, and what key that generation stands for.
+/// [`Configurations`] can answer it for any epoch of the chain;
+/// [`Membership`] can answer it for the one epoch it holds.
+///
+/// It exists so the answer is the same either way. A daemon that has a
+/// committed membership and no configuration chain should not need a
+/// second implementation of an evidence check -- a second implementation
+/// is a second set of rules, and the weaker one decides.
+///
+/// [`Membership`]: crate::membership::Membership
+pub trait VoterAuthority {
+    /// The cluster these voters belong to.
+    fn cluster(&self) -> ClusterId;
+    /// The domain.
+    fn domain(&self) -> DomainId;
+    /// The epoch they are the voters of.
+    fn epoch(&self) -> ConfigurationEpoch;
+    /// The committed incarnation and signing key of `node`, if it is a
+    /// voter of this epoch.
+    fn committed(&self, node: &ReplicaId) -> Option<(ReplicaIncarnation, &[u8])>;
+}
+
+impl VoterAuthority for VerifiedConfiguration {
+    fn cluster(&self) -> ClusterId {
+        self.record.cluster
+    }
+    fn domain(&self) -> DomainId {
+        self.record.domain
+    }
+    fn epoch(&self) -> ConfigurationEpoch {
+        self.record.epoch
+    }
+    fn committed(&self, node: &ReplicaId) -> Option<(ReplicaIncarnation, &[u8])> {
+        self.record
+            .voter(node)
+            .map(|v| (v.incarnation, v.public_key.as_slice()))
+    }
+}
+
+/// Verify an endpoint catalog against a committed voter set.
+///
+/// Three things are checked and no others. The catalog is of this
+/// cluster, domain and epoch. It is attested by a voter of that epoch,
+/// at that voter's committed incarnation, with the key the cluster
+/// committed to. And every endpoint it names is a voter of that epoch at
+/// its committed incarnation.
+///
+/// What it deliberately does not check is the addresses. An address is a
+/// hint about where to find a voter, never a claim about who that voter
+/// is: the connection's own binding decides that, from the certificate,
+/// against this same committed set. A catalog that sent a replica to the
+/// wrong address costs a failed handshake and nothing else.
+pub fn verify_endpoint_catalog(
+    authority: &impl VoterAuthority,
+    catalog: &EndpointCatalogV1,
+) -> Result<(), CatalogError> {
+    catalog.validate_shape().map_err(CatalogError::Shape)?;
+    if catalog.cluster != authority.cluster() || catalog.domain != authority.domain() {
+        return Err(CatalogError::OriginMismatch);
+    }
+    if catalog.epoch != authority.epoch() {
+        return Err(CatalogError::UnknownEpoch);
+    }
+    let s = &catalog.attestation;
+    let Some((incarnation, public_key)) = authority.committed(&s.node) else {
+        return Err(CatalogError::Evidence(EvidenceError::NotVoter {
+            node: s.node,
+        }));
+    };
+    if incarnation != s.incarnation {
+        return Err(CatalogError::Evidence(EvidenceError::WrongIncarnation {
+            node: s.node,
+        }));
+    }
+    if !verify_signature(public_key, &catalog.catalog_message(), &s.signature) {
+        return Err(CatalogError::Evidence(EvidenceError::Signature {
+            node: s.node,
+        }));
+    }
+    for e in &catalog.endpoints {
+        match authority.committed(&e.node) {
+            None => return Err(CatalogError::NotVoter { node: e.node }),
+            Some((inc, _)) if inc != e.incarnation => {
+                return Err(CatalogError::WrongIncarnation { node: e.node });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// A record the chain accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedConfiguration {
@@ -591,22 +687,15 @@ impl ConfigurationChain {
 
     /// Verify an endpoint catalog: attested by a voter of its epoch and
     /// naming only that epoch's voters at their committed incarnation.
+    ///
+    /// The chain's part is finding the epoch; the verification itself is
+    /// [`verify_endpoint_catalog`], which any committed voter set can
+    /// anchor. A daemon that holds one epoch's membership and no chain
+    /// gets the same answer from the same code.
     pub fn verify_endpoints(&self, catalog: &EndpointCatalogV1) -> Result<(), CatalogError> {
         catalog.validate_shape().map_err(CatalogError::Shape)?;
         let epoch = self.catalog_epoch(catalog.cluster, catalog.domain, catalog.epoch)?;
-        epoch
-            .verify_signer(&catalog.attestation, &catalog.catalog_message())
-            .map_err(CatalogError::Evidence)?;
-        for e in &catalog.endpoints {
-            match epoch.incarnation(&e.node) {
-                None => return Err(CatalogError::NotVoter { node: e.node }),
-                Some(inc) if inc != e.incarnation => {
-                    return Err(CatalogError::WrongIncarnation { node: e.node });
-                }
-                Some(_) => {}
-            }
-        }
-        Ok(())
+        verify_endpoint_catalog(epoch, catalog)
     }
 
     /// Verify an observer catalog: attested by a voter of its epoch and
