@@ -191,6 +191,12 @@ impl Ca {
         ];
         params.subject_alt_names = vec![
             rcgen::SanType::DnsName(name.try_into().expect("dns name")),
+            // Loopback as well, because a catalog lists addresses a
+            // process can actually dial and a test has no DNS. The name
+            // a certificate is valid for is not what says which voter
+            // presented it -- the node-identity URI above is -- so this
+            // adds a way to reach the node and no authority at all.
+            rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             rcgen::SanType::URI(
                 coord_node_issuer::node_uri(&identity)
                     .try_into()
@@ -780,6 +786,29 @@ fn the_serving_path_opens_the_journal_and_survives_a_restart() {
 struct Running {
     child: std::process::Child,
     api: std::net::SocketAddr,
+    /// What the daemon has said since it came up. Runtime diagnostics go
+    /// to stderr, and a test that wants to know whether a cluster formed
+    /// has to be able to read them.
+    said: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl Running {
+    /// Wait for the daemon to say something matching `needle`.
+    fn waits_to_say(&self, needle: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if self.said.lock().expect("not poisoned").contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Everything it has said so far.
+    fn said(&self) -> String {
+        self.said.lock().expect("not poisoned").clone()
+    }
 }
 
 impl Drop for Running {
@@ -805,15 +834,33 @@ fn start(config: &Path) -> Running {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut api = None;
+        let mut live = false;
+        // Reads to the end rather than stopping at `live`. A daemon that
+        // prints after it is live must not be killed by a reader that
+        // stopped listening, and a test that let that happen would be
+        // testing its own harness.
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some(rest) = line.strip_prefix("listening api_quic=") {
                 api = rest.parse::<std::net::SocketAddr>().ok();
             }
-            if line.contains("phase=live") {
-                break;
+            if !live && line.contains("phase=live") {
+                live = true;
+                let _ = tx.send(api);
             }
         }
-        let _ = tx.send(api);
+        if !live {
+            let _ = tx.send(None);
+        }
+    });
+    let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr = child.stderr.take().expect("piped");
+    let collected = std::sync::Arc::clone(&said);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let mut held = collected.lock().expect("not poisoned");
+            held.push_str(&line);
+            held.push('\n');
+        }
     });
     let api = rx
         .recv_timeout(Duration::from_secs(30))
@@ -823,7 +870,7 @@ fn start(config: &Path) -> Running {
             let _ = child.kill();
             panic!("coordd did not report a serving api listener within 30s")
         });
-    Running { child, api }
+    Running { child, api, said }
 }
 
 /// A caller with a bound session against a running daemon.
@@ -849,6 +896,7 @@ struct Caller {
     // Kept alive: dropping the control stream ends the negotiation the
     // daemon bound this connection under.
     _control: quinn::SendStream,
+    _control_recv: quinn::RecvStream,
 }
 
 impl Caller {
@@ -891,7 +939,7 @@ impl Caller {
         // Negotiation: the control stream carries the hello that
         // declares what this caller is, which the daemon binds against
         // its committed membership before anything else happens.
-        let (mut control, _control_recv) = connection.open_bi().await.expect("control stream");
+        let (mut control, mut control_recv) = connection.open_bi().await.expect("control stream");
         let hello = coord_types::wire_v1::MessageV1::Hello(coord_types::wire_v1::HelloV1 {
             role: PeerRole::Client,
             cluster_id: coord_types::ids::ClusterId(CLUSTER),
@@ -905,6 +953,38 @@ impl Caller {
         .encode()
         .expect("hello");
         control.write_all(&hello).await.expect("hello written");
+
+        // Wait for the acknowledgement before asking anything.
+        //
+        // Negotiation is per connection, and a request stream opened
+        // before the node has bound this caller arrives at a connection
+        // the node does not yet know. A real client waits, and a test
+        // that did not would pass or fail on how busy the node happened
+        // to be when it connected.
+        let ack = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut reader = coord_types::wire_v1::FrameReader::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = control_recv
+                    .read(&mut buf)
+                    .await
+                    .expect("readable")
+                    .expect("the node closed the control stream");
+                reader.push(&buf[..n]).expect("within the reader bound");
+                if let Some(frame) = reader.next_frame().expect("a frame") {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the node acknowledged the negotiation within the bound");
+        assert!(
+            matches!(
+                coord_types::wire_v1::decode(&ack),
+                Ok(coord_types::wire_v1::MessageV1::HelloAck(_))
+            ),
+            "the node answered the hello with something else: {ack:?}"
+        );
 
         let token = service_token(ring, session);
         let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
@@ -924,6 +1004,7 @@ impl Caller {
             session: ack.session,
             _endpoint: endpoint,
             _control: control,
+            _control_recv: control_recv,
         }
     }
 
@@ -1439,4 +1520,223 @@ fn a_voter_whose_key_the_configuration_does_not_commit_to_stops_at_startup() {
     genesis(&dir, Some(&ca.node_spki));
     let accepted = run(&path, &["--check"]);
     assert_eq!(accepted.code, Some(0), "{}{}", accepted.out, accepted.err);
+}
+
+/// A free loopback UDP port.
+///
+/// Bound, read and released: a test has to know the address before the
+/// daemon exists, because the endpoint catalog names it and a voter
+/// reads that before it binds anything. The window between here and the
+/// daemon's own bind is the standard cost of naming a port in advance.
+fn free_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("loopback")
+        .local_addr()
+        .expect("bound")
+        .port()
+}
+
+/// Three real daemons of one domain: one certificate authority, three
+/// node identities the genesis commits, one signed catalog naming where
+/// each of them listens.
+struct Cluster {
+    ca: Ca,
+    ring: coord_sts::KeyRing,
+    configs: Vec<PathBuf>,
+    api: Vec<u16>,
+}
+
+fn three_voters(dir: &Path) -> Cluster {
+    let ca = Ca::new();
+    let mut ca = ca;
+    let mut spki = Vec::new();
+    let mut keys = Vec::new();
+    let api: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let peer: Vec<u16> = (0..3).map(|_| free_port()).collect();
+
+    let ring = {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("sts key");
+        coord_sts::KeyRing::new(
+            coord_sts::SigningKey::from_pkcs8_der("coordd-test-1", &key.serialize_der())
+                .expect("signing key"),
+        )
+    };
+
+    for n in 1u8..=3 {
+        let node = dir.join(format!("n{n}"));
+        std::fs::create_dir_all(&node).expect("node dir");
+        let (certificate, key) = ca.issue(
+            SERVER_NAME,
+            CLUSTER,
+            n,
+            coord_types::wire_v1::PeerRole::Voter,
+        );
+        spki.push(spki_of(certificate.der()));
+        keys.push(key.serialize_der());
+        std::fs::write(node.join("node.pem"), pem("CERTIFICATE", certificate.der())).expect("cert");
+        std::fs::write(node.join("roots.pem"), ca.root_pem()).expect("roots");
+        let key_path = node.join("node.key");
+        std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).expect("key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+        }
+        std::fs::write(
+            node.join("sts-jwks.json"),
+            serde_json::to_vec_pretty(&ring.jwks()).expect("jwks"),
+        )
+        .expect("write jwks");
+    }
+
+    // Genesis commits all three keys, so each of them is a voter the
+    // others will accept and none of them can be impersonated.
+    let voters: Vec<serde_json::Value> = (1u8..=3)
+        .map(|n| {
+            serde_json::json!({
+                "node": hex(&[n; 16]),
+                "incarnation": 1,
+                "public_key": b64url(&spki[usize::from(n) - 1]),
+            })
+        })
+        .collect();
+    let manifest = serde_json::json!({
+        "cluster": hex(&CLUSTER),
+        "domain": hex(&DOMAIN),
+        "epoch": 1,
+        "voters": voters,
+        "issuer_roots": [b64url(&[0xca; 8])],
+        "wif_rules": [{ "issuer": "test" }],
+        "admin": hex(&[0xa; 16]),
+        "protocol_version": 1,
+    });
+    std::fs::write(
+        dir.join("genesis.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest"),
+    )
+    .expect("write manifest");
+
+    // One catalog, attested by voter 1, naming every voter's peer
+    // listener. The same file for all three: an address book is not
+    // per-node state.
+    ca.node_key = keys[0].clone();
+    endpoints(
+        dir,
+        &ca,
+        3,
+        &(1u8..=3)
+            .map(|n| (n, format!("127.0.0.1:{}", peer[usize::from(n) - 1])))
+            .collect::<Vec<_>>(),
+    );
+
+    let configs = (1u8..=3)
+        .map(|n| {
+            let node = dir.join(format!("n{n}"));
+            let i = usize::from(n) - 1;
+            let text = format!(
+                r#"config_version = 2
+role = "voter-frontend-observer"
+cluster_manifest = "{root}/genesis.json"
+cluster_endpoints = "{root}/endpoints.bin"
+domain = "control-plane-test"
+state_directory = "{node}"
+
+[listen]
+api_quic = "127.0.0.1:{api}"
+peer_quic = "127.0.0.1:{peer}"
+
+[capability]
+writer_queue_bytes = 16777216
+buffer_bytes_per_subscription = 8388608
+max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+shards = 1
+
+[identity]
+trust_bundle = "{node}/roots.pem"
+node_certificate = "{node}/node.pem"
+node_key = "{node}/node.key"
+
+[sts]
+issuer = "https://sts.test"
+resource = "control-plane-test"
+jwks = "{node}/sts-jwks.json"
+"#,
+                root = dir.display(),
+                node = node.display(),
+                api = api[i],
+                peer = peer[i],
+            );
+            let path = node.join("coordd.toml");
+            std::fs::write(&path, text).expect("write config");
+            path
+        })
+        .collect();
+
+    Cluster {
+        ca,
+        ring,
+        configs,
+        api,
+    }
+}
+
+/// Three real daemons of one domain form a mesh on committed
+/// identities.
+///
+/// Three processes, three certificates the genesis commits, three
+/// stores, and real QUIC between them. Each of them reads the same
+/// signed catalog, dials the two voters it names, and is accepted by
+/// them -- which happens only if the certificate on each end binds to a
+/// committed voter of this domain at its committed incarnation. A
+/// caller then binds against one of them, so the api plane is serving
+/// while the peer plane is up.
+///
+/// This is the composition the served-request gate needs and is not yet
+/// that gate. A submission still reaches only the voter in the process
+/// that received it: a collector reaches a remote voter over the *api*
+/// plane, as an API-class client of it, and a remote voter's evidence
+/// has to return to the collector that submitted rather than to its own
+/// process's. Neither is wired, so two thirds of a quorum are
+/// unreachable to a submission and nothing is released. Task-j08's
+/// three-voter served request lands with that routing.
+#[tokio::test(flavor = "multi_thread")]
+async fn three_voters_form_a_mesh_on_committed_identities() {
+    let dir = workspace("three");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(
+            run(config, &["init"]).code,
+            Some(0),
+            "each voter creates its own store"
+        );
+    }
+
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    assert_eq!(running[0].api.port(), cluster.api[0]);
+
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("peers connected=2 of 2"),
+            "voter {} did not reach both of its peers:\n{}",
+            n + 1,
+            node.said()
+        );
+        assert!(
+            !node.said().contains("cannot reach voter"),
+            "voter {} refused or was refused by a peer:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    // And the api plane is serving while the peer plane is up.
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
+    assert_eq!(caller.session, coord_types::ids::SessionId([0x44; 16]));
 }

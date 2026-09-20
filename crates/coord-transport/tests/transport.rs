@@ -1515,3 +1515,47 @@ async fn the_runtime_can_close_a_connection_the_transport_would_have_allowed() {
     // silently succeeding: the caller learns its close did nothing.
     assert!(!acceptor.disconnect(connection, CloseCode::Rejected, "again"));
 }
+
+/// An endpoint that grants several lanes still opens exactly one.
+///
+/// A node's endpoint grants the lanes its role may use -- a voter grants
+/// control and bulk, a collector grants three -- and a `Hello` declares
+/// the lane *being opened*. Announcing the endpoint's whole set would
+/// declare several lanes on one connection, which the acceptor refuses
+/// outright: a peer that saw two would have no way to tell which stream
+/// is which.
+///
+/// The transport's own tests granted capabilities that are not lanes, so
+/// nothing here dialled with more than one until a daemon did.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_granting_several_lanes_declares_only_the_one_it_opens() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let granted: Vec<u16> = coord_transport::role_lanes(PeerRole::Voter)
+        .iter()
+        .map(|lane| lane.capability())
+        .collect();
+    assert!(granted.len() > 1, "a voter grants more than one lane");
+
+    let a = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        f.ids[0].local(&f.ca, CLUSTER, DOMAIN, granted.clone()),
+        f.binder.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut b = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        f.ids[1].local(&f.ca, CLUSTER, DOMAIN, granted),
+        f.binder.clone(),
+        limits(),
+    )
+    .unwrap();
+
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+
+    let TransportEvent::Connected { lane, identity, .. } = event(&mut b).await else {
+        panic!("the acceptor refused a connection from an endpoint granting several lanes");
+    };
+    assert_eq!(lane, Lane::Control, "the lane the dialer opened");
+    assert_eq!(identity.replica, Some(r(0)));
+}

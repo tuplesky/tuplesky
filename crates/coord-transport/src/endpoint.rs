@@ -850,7 +850,20 @@ impl Transport {
             .await
             .map_err(|_| CloseReason::Timeout)?
             .map_err(|e| CloseReason::Transport(e.to_string()))?;
-        let mut capabilities = shared.capabilities.clone();
+        // Exactly one lane, and it is this connection's.
+        //
+        // The endpoint's own capabilities say which lanes it grants --
+        // a voter grants control and bulk, a collector grants three --
+        // but a `Hello` declares the lane *being opened*, and a peer
+        // that saw two would have no way to tell which stream is which.
+        // So the endpoint's other lanes are filtered out here rather
+        // than announced alongside.
+        let mut capabilities: Vec<u16> = shared
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|c| Lane::of_capability(*c).is_none())
+            .collect();
         capabilities.push(lane.capability());
         capabilities.sort_unstable();
         capabilities.dedup();
