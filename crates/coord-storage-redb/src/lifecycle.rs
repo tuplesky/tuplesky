@@ -485,6 +485,14 @@ impl Generation {
         &mut self.engine
     }
 
+    /// A pinned read view of this generation.
+    pub fn reader_snapshot(
+        &self,
+    ) -> Result<<<RedbEngine as coord_store_api::engine::LocalEngine>::Reader as coord_store_api::engine::SnapshotSource>::View, coord_store_api::engine::EngineError>{
+        use coord_store_api::engine::{LocalEngine, SnapshotSource};
+        self.engine.reader().snapshot()
+    }
+
     /// The verified manifest.
     pub fn manifest(&self) -> &StoreManifestV1 {
         &self.manifest
@@ -675,6 +683,23 @@ pub struct InactiveGeneration {
 }
 
 impl InactiveGeneration {
+    /// Stage a replacement generation for an offline schema migration
+    /// (task-60), carrying this node's protocol obligations forward.
+    ///
+    /// Deliberately not [`InactiveGeneration::stage`]: an install
+    /// refuses a selected generation that holds promises, and a
+    /// migration rewrites this node's own state and must keep them.
+    /// Nothing else differs -- same engine, same profile, same
+    /// identity, and `CURRENT` untouched until activation.
+    pub fn stage_migration(
+        root: &Path,
+        identity: StoreIdentity,
+        options: OpenOptions,
+    ) -> Result<InactiveGeneration, OpenError> {
+        let lock = RootLock::acquire(root, false)?;
+        stage_with_lock_for(root, lock, identity, options, Obligations::Carried)
+    }
+
     /// Stage the next generation of `root` for `identity`, acquiring the
     /// root lock.
     ///
@@ -805,13 +830,63 @@ fn activate_steps(
 }
 
 /// Stage the next generation under an already held root lock.
+/// The manifest of the generation `CURRENT` selects, without opening
+/// its engine (task-60).
+pub fn selected_manifest(root: &Path) -> Result<StoreManifestV1, OpenError> {
+    let bytes = std::fs::read(root.join(CURRENT)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            OpenError::NotInitialized
+        } else {
+            OpenError::Io(e)
+        }
+    })?;
+    let current = String::from_utf8(bytes)
+        .map_err(|_| OpenError::Corrupt("CURRENT is not UTF-8".into()))?
+        .trim()
+        .to_owned();
+    if current.is_empty() || current.contains('/') || current.contains("..") {
+        return Err(OpenError::Corrupt("CURRENT content invalid".into()));
+    }
+    let directory = root.join(&current);
+    if !directory.is_dir() {
+        return Err(OpenError::MissingGeneration(current));
+    }
+    Ok(StoreManifestV1::read(&directory.join(MANIFEST))?)
+}
+
 fn stage_with_lock(
     root: &Path,
     lock: RootLock,
     identity: StoreIdentity,
     options: OpenOptions,
 ) -> Result<InactiveGeneration, OpenError> {
-    let previous = read_selected(root, &identity, &options)?;
+    stage_with_lock_for(root, lock, identity, options, Obligations::Refused)
+}
+
+/// Whether a staging may replace a selected generation that holds
+/// protocol obligations.
+///
+/// An install never may: it replaces a learner's or observer's state,
+/// and a promise is not something to be replaced. An offline schema
+/// migration must, because it rewrites this node's *own* state and
+/// dropping its promises would be exactly the amnesia every other rule
+/// here exists to prevent (task-60).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Obligations {
+    /// A selected generation holding obligations is refused.
+    Refused,
+    /// Obligations are carried forward by the caller.
+    Carried,
+}
+
+fn stage_with_lock_for(
+    root: &Path,
+    lock: RootLock,
+    identity: StoreIdentity,
+    options: OpenOptions,
+    obligations: Obligations,
+) -> Result<InactiveGeneration, OpenError> {
+    let previous = read_selected_for(root, &identity, &options, obligations)?;
     let generation = generation_numbers(root)?
         .into_iter()
         .max()
@@ -837,10 +912,11 @@ fn stage_with_lock(
 /// The manifest of the generation `CURRENT` selects, verified as a legal
 /// predecessor of a staging for `identity`. `None` when the root holds no
 /// selection yet.
-fn read_selected(
+fn read_selected_for(
     root: &Path,
     identity: &StoreIdentity,
     options: &OpenOptions,
+    obligations: Obligations,
 ) -> Result<Option<StoreManifestV1>, OpenError> {
     let bytes = match std::fs::read(root.join(CURRENT)) {
         Ok(bytes) => bytes,
@@ -890,7 +966,11 @@ fn read_selected(
         return Err(OpenError::RootIdentityMismatch("incarnation"));
     }
     // The selected generation must hold no protocol obligations: promises and
-    // votes are never replaced or reset by an install.
+    // votes are never replaced or reset by an install. An offline migration
+    // says `Carried` and copies them forward itself (task-60).
+    if obligations == Obligations::Carried {
+        return Ok(Some(manifest));
+    }
     let db = redb::Database::builder()
         .set_cache_size(options.cache_bytes)
         .open(directory.join(DATABASE))

@@ -6,8 +6,8 @@ use coord_store_api::registry::Collection;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use serde::{Deserialize, Serialize};
 
-/// Current manifest format.
-pub const MANIFEST_FORMAT: u32 = 1;
+/// Current manifest format, from the frozen registry (task-60).
+pub const MANIFEST_FORMAT: u32 = coord_types::formats::Format::StoreSchema.current();
 /// Engine name recorded for this adapter.
 pub const ENGINE_NAME: &str = "redb";
 /// Durability profile of this reference adapter.
@@ -67,7 +67,11 @@ impl StoreManifestV1 {
         if !rest.is_empty() {
             return Err(ManifestError::Corrupt("trailing bytes in manifest body"));
         }
-        if manifest.format != MANIFEST_FORMAT {
+        // The decoder window, not equality (task-60): a release that
+        // widens the window reads its predecessor's manifests, and a
+        // manifest outside the window fails here, before admission,
+        // rather than being guessed at.
+        if !coord_types::formats::Format::StoreSchema.supports(manifest.format) {
             return Err(ManifestError::UnsupportedFormat(manifest.format));
         }
         Ok(manifest)

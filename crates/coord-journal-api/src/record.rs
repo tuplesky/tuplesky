@@ -32,7 +32,8 @@ use crate::stream::StorageStreamId;
 
 /// Durable record format version. Bumped only by a reviewed schema change;
 /// unrelated to any wire version.
-pub const JOURNAL_RECORD_FORMAT_V1: u16 = 1;
+pub const JOURNAL_RECORD_FORMAT_V1: u16 =
+    coord_types::formats::Format::JournalRecord.current() as u16;
 /// Largest encoded record admitted (the separately bounded large-record
 /// path; ordinary groups are far smaller).
 pub const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;

@@ -477,6 +477,24 @@ fn main() -> ExitCode {
     // Verifying a backup reads no store at all: an operator checks a
     // backup from anywhere, including from a machine whose own store is
     // the one that was lost.
+    // What this build is, before it opens anything (task-60). Formats
+    // are what it reads and writes; features are what the cluster may
+    // have turned on. An operator reconciling a mixed fleet reads this
+    // line on every node and compares it.
+    println!(
+        "build schema={} journal={} shared_checkpoint={} local_checkpoint={} backup={} features={}",
+        coord_types::formats::Format::StoreSchema.current(),
+        coord_types::formats::Format::JournalRecord.current(),
+        coord_types::formats::Format::SharedCheckpoint.current(),
+        coord_types::formats::Format::LocalCheckpoint.current(),
+        coord_types::formats::Format::Backup.current(),
+        coord_types::formats::Supported::features()
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+
     if let Some(Command::Verify { dir }) = &cli.command {
         return match backup::read(dir) {
             Ok(held) => {

@@ -329,6 +329,28 @@ pub fn open_storage_with(
         })?;
     }
 
+    // The rollback guard (task-60). A build started against a cluster
+    // that has activated something it cannot do refuses here, before
+    // the domain is attached and long before it could vote, and names
+    // the feature: the answer an operator needs is "this node is too
+    // old for this cluster", not a puzzling failure three steps later.
+    // A store with no activation admits every build, which is what lets
+    // compatible binaries coexist before activation.
+    {
+        use coord_store_api::engine::{LocalEngine, SnapshotSource};
+        let view = engine
+            .reader()
+            .snapshot()
+            .map_err(|e| StoreError::Refused {
+                root: show(&directory),
+                reason: format!("the activation record could not be read: {e}"),
+            })?;
+        coord_checkpoint::feature::admit(&view).map_err(|e| StoreError::Refused {
+            root: show(&directory),
+            reason: format!("{e}"),
+        })?;
+    }
+
     // An authorized replacement carries this node's stream forward with
     // the rest of its durable state (task-58). The stream is keyed by
     // the incarnation that allocated it, so a replaced node would

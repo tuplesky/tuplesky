@@ -1387,3 +1387,108 @@ take the addresses away; stop the nodes) and it says what a restore is
 not, in the same words the refusals use. A rehearsal that skips the
 isolation or restores in place is rehearsing something else -- and both
 are refused, so the rehearsal will say so.
+
+## A version is a local fact; a capability is not
+
+task-60 is upgrades, and the useful thing it forced was noticing that
+"what version is this" and "what can this cluster do" are two different
+questions with two different answers, and that running them together is
+how upgrade bugs happen.
+
+**A format is local.** A binary either reads some bytes or it does not,
+and nothing about that needs agreement. `coord_types::formats::Format`
+is the registry: nine independently versioned formats -- command
+identity, wire frame, journal record, journal metadata, store schema,
+the two checkpoints, backup, adapter -- each with a decoder window,
+which is the range this build reads and the one version it writes.
+
+The separateness is load-bearing rather than tidy. The pair that
+matters most is `Command` and `Wire`: an upgraded transport that changed
+a retry identity would silently re-execute callers' work, so they are
+two entries with two numbers and a test that asserts they are not the
+same one.
+
+What made the registry worth having rather than a document is that the
+constants elsewhere are now *defined from* it -- `MANIFEST_FORMAT`,
+`JOURNAL_RECORD_FORMAT_V1`, `SHARED_CHECKPOINT_FORMAT_V1`,
+`logical_v1::SCHEMA_VERSION` and the rest are `Format::X.current()`.
+A registry that was only checked by a test could drift for exactly as
+long as nobody ran the test; one that is the definition cannot drift at
+all.
+
+The window replaced an equality check. `StoreManifestV1::decode` used to
+require `format == MANIFEST_FORMAT`, which is right today and wrong the
+moment a release wants to read its predecessor's stores. Now it asks
+the window, and a version outside it is refused in the direction it is
+outside: below is a retired format, above is one something else wrote,
+and neither is guessed at.
+
+**A capability is not local.** A feature changes replicated behaviour or
+writes durable state every voter must interpret, so `coord_consensus::
+feature` activates one only when *every* configured voter has reported
+support -- not a majority.
+
+That asymmetry is the thing I would want a reader to take away. A
+majority is right for deciding something, as `floor::activate` does,
+because the minority can be caught up afterwards from what the majority
+holds. It is wrong for activating a capability, because the minority is
+not behind: it *cannot* do the thing, and no amount of catching up
+changes that. The same reasoning is why task-51's trim floor needs every
+voter.
+
+Three smaller rules fall out of it, each with its own control:
+
+* **Silence is never assent.** A voter that has not reported supports
+  nothing, because the silent voter is exactly the one that might be an
+  old binary.
+* **A report may grow and never shrink.** The only honest way to stop
+  supporting a feature is to stop being a voter; a cluster that let a
+  report shrink could activate something and then find a voter claiming
+  it never had it.
+* **An unknown active feature is a refusal, not a smaller set.** This is
+  the one with a real trap in it. `ActiveFeaturesV1::features` refuses
+  an identifier it does not recognize rather than skipping it, because
+  the value feeds the rollback guard: a build that quietly dropped the
+  feature it could not name would conclude it may serve precisely when
+  it may not.
+
+The guard itself is in `coordd`'s store opening, before the domain is
+attached and long before the node could vote, and it names the feature.
+"This node is too old for this cluster" is an answer an operator can
+act on; a failure three steps later is not.
+
+### The migration is the install lifecycle with one difference
+
+`coord_storage_redb::migrate` stages a replacement generation, rewrites
+every row into it through a declared `SchemaMigration`, and activates --
+and activation is the only step that writes `CURRENT`, so an
+interruption anywhere earlier leaves the previous generation selected
+with its rows intact. The test interrupts at each activation step and
+checks exactly that. The replaced generation stays on disk; reclaiming
+it is `prune_unselected`, deliberately separate, so an operator can
+still fall back by hand.
+
+The one difference from an install is obligations. `InactiveGeneration::
+stage` refuses a selected generation that holds `protocol_v1` rows,
+because an install replaces a learner's state and a promise is not
+something to be replaced. A migration rewrites this node's *own* state,
+so `stage_migration` permits them and the rewrite copies them forward;
+dropping them would be the amnesia every other rule in the system exists
+to prevent.
+
+`rewrite_into_new_generation` is public, which is worth explaining. The
+version gate in `migrate` has nothing to accept until a second schema
+version exists -- every window is one version wide today -- so a rewrite
+reachable only through the gate would be code that had never been
+executed. Exposing the mechanism lets the test drive the real path, with
+`migrate` as its gate rather than its only door.
+
+### What is deliberately impossible
+
+There is no downgrade anywhere in this task: nothing lowers a format,
+nothing deactivates a feature, nothing converts between engines, and
+nothing rolls a live voter back to a savepoint. Rollback before
+activation is running the old binary, which is what the coexistence
+half is for. Rollback after activation is a restore (task-59), with
+everything that costs -- which is the honest price of a one-way step,
+and stating it is better than a mechanism that pretends otherwise.
