@@ -14,6 +14,16 @@
 //! Capacity bounds new work: when the table is full, initialization is
 //! refused with [`InitError::Backpressure`]; records in ACCEPT or COMMIT
 //! are never evicted to make room, only executed records can be retired.
+//!
+//! "Only executed records can be retired" is a rule about what may be
+//! forgotten, not a reason to forget nothing. A table that never retired
+//! anything would make its capacity a bound on how many commands a
+//! replica may execute *in its lifetime* rather than on how much
+//! unresolved work it holds: the sixty-fifth command of a
+//! sixty-four-record table would be refused for ever, on an otherwise
+//! idle replica. So [`CommandTable::reclaim`] runs when the table is
+//! full and before anything is refused, and backpressure afterwards
+//! means what it says -- this much work really is outstanding.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -195,6 +205,42 @@ impl CommandTable {
         self.capacity.is_some_and(|c| self.records.len() >= c)
     }
 
+    /// Retire every executed record, and say how many went.
+    ///
+    /// This is the only thing that ever makes room. Nothing unresolved is
+    /// touched: a record in START, PRE-ACCEPT, ACCEPT or COMMIT is work
+    /// this replica still owes, and evicting one to serve a newer command
+    /// would lose an obligation rather than shed load.
+    ///
+    /// A live record that depended on a retired one keeps seeing it as
+    /// executed through the tombstone [`CommandTable::retire`] leaves, and
+    /// the tombstone goes with the last record that referenced it, so the
+    /// bookkeeping stays bounded by the live set rather than by history.
+    pub fn reclaim(&mut self) -> usize {
+        let executed: Vec<CommandId> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.phase == Phase::Executed)
+            .map(|(c, _)| *c)
+            .collect();
+        let mut retired = 0;
+        for command in executed {
+            if self.retire(&command).is_ok() {
+                retired += 1;
+            }
+        }
+        retired
+    }
+
+    /// Whether the table is full after reclaiming what it may.
+    fn full_after_reclaim(&mut self) -> bool {
+        if !self.full() {
+            return false;
+        }
+        self.reclaim();
+        self.full()
+    }
+
     /// Create a placeholder for a command known by identity only (leader
     /// evidence arrived before the payload). Idempotent; never changes an
     /// initialized record. Refused under backpressure.
@@ -202,7 +248,7 @@ impl CommandTable {
         if self.records.contains_key(&command) {
             return Ok(());
         }
-        if self.full() {
+        if self.full_after_reclaim() {
             return Err(InitError::Backpressure);
         }
         self.records.insert(
@@ -239,8 +285,11 @@ impl CommandTable {
                 });
             }
             Some(_) => {}
-            None if self.full() => return Err(InitError::Backpressure),
-            None => {}
+            None => {
+                if self.full_after_reclaim() {
+                    return Err(InitError::Backpressure);
+                }
+            }
         }
         let mut deps = Vec::new();
         let mut paths = Vec::with_capacity(keys.len());

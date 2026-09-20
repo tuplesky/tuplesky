@@ -2263,6 +2263,55 @@ async fn a_rust_caller_asks_through_the_sdk_and_reads_the_answer() {
     );
 }
 
+/// A caller that keeps asking is still answered.
+///
+/// The number is not arbitrary: the leader's command table is created
+/// with a capacity, and a table that never forgets an executed command
+/// would make that capacity a *lifetime* bound rather than a bound on
+/// outstanding work. A voter that answered its first sixty-four callers
+/// and then silently stopped would pass every test this project had,
+/// because nothing before this one ever asked it a hundred questions in
+/// a row. A Kubernetes API server asks it that many while it is still
+/// booting.
+///
+/// Sequential on purpose: one request is in flight at a time, so
+/// nothing here is a concurrency bound being reached. Each request is a
+/// distinct key, so nothing is deduplicated either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_that_keeps_asking_is_still_answered() {
+    let dir = workspace("sustained");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let mut caller = SdkCaller::bind(&dir, &daemon, &ca, &ring, [0x44; 16]).await;
+
+    // Comfortably past the table's capacity, which is 64.
+    const ASKS: usize = 200;
+    for n in 0..ASKS {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            coord_types::ids::NamespaceId([0x5e; 16]),
+            coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+                key: format!("k{n:04}").into_bytes(),
+                value: b"v".to_vec(),
+                lease: None,
+                prev_kv: false,
+            }),
+        );
+        logical.canonicalize();
+        let completion = caller.ask(n as u64 + 1, &logical).await;
+        let coord_sdk::Outcome::Established { .. } = &completion.outcome else {
+            panic!(
+                "request {n} of {ASKS} was not established: {:?}\n{}",
+                completion.outcome,
+                daemon.said()
+            );
+        };
+    }
+}
+
 /// A deadline that passes makes the outcome unknown, not failed, and the
 /// invocation stays resolvable by its identity.
 ///

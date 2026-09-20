@@ -467,6 +467,41 @@ fn sync_rows(storage: &StorageModel) -> Vec<SyncDecision> {
         .collect()
 }
 
+/// A cluster keeps serving past its command table's capacity.
+///
+/// The capacity bounds *unresolved* work: how many commands a replica
+/// may be holding at once, none of which it may forget. It is not a
+/// bound on how many commands the replica may ever execute, and a table
+/// that never retired an executed record would make it one -- the
+/// thirty-third command here would be refused for ever, on a cluster
+/// with nothing outstanding and nothing wrong with it.
+///
+/// Eighty commands through a table of thirty-two, each settled before
+/// the next is admitted, so nothing is ever outstanding when the next
+/// arrives. Every one of them executes, in order, on every voter.
+#[test]
+fn a_cluster_serves_past_its_table_capacity() {
+    let mut cluster = Cluster::new(9);
+    let mut submitted = Vec::new();
+    for n in 0..80u8 {
+        submitted.push(cluster.admit(u64::from(n) + 1, n));
+        cluster.settle();
+    }
+    for i in 0..3 {
+        assert_eq!(
+            cluster.nodes[i].executed, submitted,
+            "replica {i} did not execute every command in order"
+        );
+    }
+    // And the table did not grow to hold them: what it keeps is the
+    // live set, not the history.
+    assert!(
+        cluster.nodes[1].follower().table().records().count() <= 32,
+        "the table kept {} records for eighty executed commands",
+        cluster.nodes[1].follower().table().records().count()
+    );
+}
+
 #[test]
 fn learned_outcomes_survive_a_lost_leader_and_lost_commit_notifications() {
     let mut cluster = Cluster::new(1);

@@ -254,11 +254,19 @@ impl Caller {
             .request(self.connection, frame.clone(), deadline)
             .await
         else {
+            // An unknown outcome leaves the invocation resolvable by
+            // identity, which is right for a client and wrong for a load
+            // generator: holding every unanswered invocation would fill
+            // the client's own bound and turn one deadline into a run
+            // full of refusals that came from this process. The run
+            // reports the unknown and lets the invocation go.
+            self.client.forget(id);
             return Answer::Unknown;
         };
         let Ok(bytes) =
             coord_types::wire_v1::encode_frame(answer.kind, answer.version, &answer.payload)
         else {
+            self.client.forget(id);
             return Answer::Refused("unframeable".into());
         };
         if self
@@ -266,10 +274,12 @@ impl Caller {
             .on_frame(now, coord_sdk::ConnectionId(self.connection.0), &bytes)
             .is_err()
         {
+            self.client.forget(id);
             return Answer::Refused("undecodable".into());
         }
         let completions = self.client.take_completions();
         let Some(completion) = completions.iter().find(|c| c.request == id) else {
+            self.client.forget(id);
             return Answer::Unknown;
         };
         // Release the invocation. The SDK retains a completed request so

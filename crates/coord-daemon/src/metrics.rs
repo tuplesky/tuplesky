@@ -527,17 +527,37 @@ impl Recorder {
     }
 
     /// The accounting of one stage as it stands.
+    ///
+    /// The counters are separate atomics, so a snapshot taken while work
+    /// is running is not an instant -- it is several instants, and which
+    /// one each counter belongs to is the reader's to arrange. The rule
+    /// is to read in the opposite order to the writer: a writer counts
+    /// an entry, then a completion, then the sample behind it, so a
+    /// reader takes the sample first and the entry last. Every counter
+    /// is then read no earlier than the one it can never exceed, and a
+    /// snapshot cannot report more completions than entries or more
+    /// samples than completions.
+    ///
+    /// Reading the other way round produces exactly that: `entered` from
+    /// before an operation started and `completed` from after it
+    /// finished. It is a small lie and a bad one, because an operator
+    /// reading "more finished than arrived" has no way to tell a
+    /// reporting artefact from a double count.
     pub fn stage(&self, stage: Stage) -> StageMetrics {
         let cells = self.cells(stage);
         let samples = cells.samples.load(Ordering::Relaxed);
+        let total = Duration::from_nanos(cells.total_nanos.load(Ordering::Relaxed));
+        let max = Duration::from_nanos(cells.max_nanos.load(Ordering::Relaxed));
+        let completed = cells.completed.load(Ordering::Relaxed);
+        let refused = cells.refused.load(Ordering::Relaxed);
         StageMetrics {
             entered: cells.entered.load(Ordering::Relaxed),
-            completed: cells.completed.load(Ordering::Relaxed),
-            refused: cells.refused.load(Ordering::Relaxed),
+            completed,
+            refused,
             latency: Latency {
                 count: samples,
-                total: Duration::from_nanos(cells.total_nanos.load(Ordering::Relaxed)),
-                max: Duration::from_nanos(cells.max_nanos.load(Ordering::Relaxed)),
+                total,
+                max,
             },
         }
     }
