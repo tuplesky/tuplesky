@@ -11,9 +11,13 @@ These are proposed engineering work, not implemented or verified features. The d
 The workspace is locked to exact toolchains and dependency versions; see
 [docs/build/toolchain.md](docs/build/toolchain.md) for the pins and the
 dependency audit and [docs/build/ci.md](docs/build/ci.md) for CI routing.
-Operator procedures live under `docs/operations/`; see
+Operator procedures live under `docs/operations/`: see
 [disaster recovery](docs/operations/disaster-recovery.md) for isolating a
-cluster and restoring from a backup.
+cluster and restoring from a backup,
+[Kubernetes certification](docs/operations/kubernetes-certification.md) for
+the storage profile qualification and what it currently reports, and
+[WAN benchmarks](docs/operations/wan-benchmarks.md) for the measured matrix
+and how to read one of its runs.
 
 ```text
 cargo xtask check-tools --install   # pinned cargo-deny, cargo-nextest, mermaid-cli

@@ -1,0 +1,43 @@
+[package]
+name = "coord-harness"
+description = "Provision and run a real TupleSky domain outside cargo test: credentials, genesis, endpoint catalog, issuer and daemon configuration (test-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# Qualification harness (design Sections 3.1, 6.8.4, 22.3, 23 G4). It issues
+# fixture credentials and signs service tokens without an identity provider,
+# so the dependency policy keeps it out of every production, core and tool
+# crate.
+role = "test-only"
+
+[lib]
+name = "coord_harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coord-harness"
+path = "src/bin/coord-harness.rs"
+
+[dependencies]
+coord-types.workspace = true
+coord-membership.workspace = true
+coord-node-issuer.workspace = true
+coord-sts.workspace = true
+clap.workspace = true
+jsonwebtoken.workspace = true
+postcard.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+coord-authn.workspace = true
