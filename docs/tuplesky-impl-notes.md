@@ -476,3 +476,66 @@ two replicas disagree about which command holds it.
 The two faults compounded: the first request `coordd` ever served was a
 policy rejection, which is exactly the command that changes no rows and
 exactly the command the speculation companion cannot plan.
+
+## A `Hello` declares the lane it opens, not the lanes the endpoint has
+
+The first code in this repository to dial a peer from a real node found
+that it could not: every dial was refused with `lane NotExactlyOne`.
+
+`negotiate_outgoing` built its `Hello` from the endpoint's own
+capabilities plus the lane being opened. That is right for an endpoint
+whose granted capabilities are not lanes, and wrong for every real node:
+a voter's endpoint grants control *and* bulk, a collector's grants
+three, and a `Hello` carrying two lane capabilities is refused outright,
+because a peer that saw two would have no way to tell which stream is
+which.
+
+It had never shown. The transport's own tests grant `[1, 2]`, which are
+not lane capabilities, and the daemon's api endpoint only ever accepts.
+Dialling is what exposed it.
+
+The endpoint's other lanes are now filtered out of the outgoing `Hello`.
+The regression test grants a voter's real lane set and requires the dial
+to be accepted.
+
+## Two planes, two connection-identity spaces
+
+A `ConnectionId` is allocated per `Transport`. A node that serves an api
+plane and a peer plane has two of them, so an api connection and a peer
+connection can share a number.
+
+One handler for both looked reasonable and was not: a peer link closing
+at id 1 made the frontend forget a caller's binding at id 1, and a
+caller's close was swallowed as a peer's. The planes have separate
+handlers now, and which plane an event arrived on is carried from the
+`select!` arm that produced it rather than inferred.
+
+## What the three-voter served request still needs
+
+`coordd` forms a real mesh: three processes, three committed
+certificates, real QUIC, each accepted by the other two. A submission
+still reaches only the voter in the process that received it, and the
+reason is worth writing down because it is two pieces of wiring rather
+than one.
+
+* **A collector reaches a remote voter over the *api* plane**, as an
+  API-class client of it -- the peer plane is voter-to-voter protocol
+  traffic, and a `Submit` is not that. So a frontend has to dial each
+  voter's api listener as `PeerRole::Frontend`, which nothing does yet,
+  and `fan_out` finds no link.
+* **A remote voter's evidence has to return to the collector that
+  submitted.** The mechanism exists: the `Submit` arrives on an
+  API-class connection, and `Destination::Connection` addresses exactly
+  that connection, with the collector seeing it as `ApiDelivery`. What
+  is missing is the attribution -- the voter recording which connection
+  a command was admitted from, so its evidence goes back there instead
+  of to its own process's collector, which is where `Domain::carry`
+  sends every frontend frame today.
+
+One smaller question sits underneath: `EndpointV1::addresses` is a
+single list, and a node has two listeners. A catalog that says where a
+voter is has to say where each of its planes is, or a convention has to
+decide which address is which.
+
+**Revisit when:** the three-voter served request is built. It is the one
+closing test of task-j08 that has no evidence yet; the other six do.
