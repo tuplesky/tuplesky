@@ -369,6 +369,27 @@ pub struct TerminalCertificate {
 }
 
 impl TerminalCertificate {
+    /// Rehydrate a certificate from a record this node made durable.
+    ///
+    /// Not a way to certify: the only thing that certifies is
+    /// [`select_terminal`], and what makes this safe is that the record
+    /// being read back was written from one of its results. Naming it
+    /// `recovered` rather than `new` is the point -- it reconstructs a
+    /// conclusion, it does not reach one.
+    pub const fn recovered(
+        transition: Transition,
+        terminal_root: Digest32,
+        successor: BTreeSet<ReplicaId>,
+        signers: BTreeSet<ReplicaId>,
+    ) -> Self {
+        TerminalCertificate {
+            transition,
+            terminal_root,
+            successor,
+            signers,
+        }
+    }
+
     /// The transition it settles.
     pub const fn transition(&self) -> Transition {
         self.transition
@@ -465,6 +486,21 @@ pub struct ActivationCertificate {
 }
 
 impl ActivationCertificate {
+    /// Rehydrate an activation from a record this node made durable.
+    /// See [`TerminalCertificate::recovered`]: it reconstructs a
+    /// conclusion, it does not reach one.
+    pub const fn recovered(
+        transition: Transition,
+        terminal_root: Digest32,
+        installers: BTreeSet<ReplicaId>,
+    ) -> Self {
+        ActivationCertificate {
+            transition,
+            terminal_root,
+            installers,
+        }
+    }
+
     /// The transition it completes.
     pub const fn transition(&self) -> Transition {
         self.transition
