@@ -35,6 +35,14 @@ pub const PAYLOAD_KIND: u16 = 0x0001;
 pub const SYNC_KIND: u16 = 0x0004;
 /// Key tag of Sync rows within an epoch.
 pub const SYNC_TAG: u8 = 0x03;
+/// Record kind of the old-configuration seal row (task-55).
+pub const SEAL_KIND: u16 = 0x0005;
+/// Key tag of the seal row within an epoch.
+///
+/// After the Sync tag on purpose: trimming surveys an epoch's rows up to
+/// and excluding this tag, so a seal is outside every trim step's range
+/// by construction rather than by a rule someone has to remember.
+pub const SEAL_TAG: u8 = 0x04;
 
 /// The durable promise of one replica in one epoch: the highest ballot it
 /// promised (no lower ballot is voted after it) and the ballot it last
@@ -364,6 +372,58 @@ struct SyncDecisionV1 {
 #[derive(Clone, Debug, Deserialize)]
 struct SyncRecordV1Legacy {
     decision: SyncDecisionV1,
+}
+
+/// The durable seal of one replica on one configuration (design
+/// Section 10.3.2).
+///
+/// Written once, never rewritten and never removed. While it is there
+/// this replica admits no ordinary voting transition of that
+/// configuration under any ballot: not a promise for a higher ballot,
+/// not a vote, not an adoption. Terminal recovery of what the
+/// configuration already did stays possible -- that is the point of
+/// sealing rather than shutting down -- and it is the only thing that
+/// does.
+///
+/// `at` is the ballot this replica had promised when it sealed. It is
+/// evidence for the report, never an authorization: a seal fences every
+/// ballot of the configuration, including ones nobody has proposed yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SealRecordV1 {
+    /// The transition this replica sealed for.
+    pub transition: crate::handoff::Transition,
+    /// The ballot promised when the seal was written.
+    pub at: Ballot,
+}
+
+/// `protocol_v1` key of the seal row of an epoch.
+pub fn seal_key(epoch: ConfigurationEpoch) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.push(SEAL_TAG);
+    out
+}
+
+/// Encode the seal row.
+pub fn encode_seal(record: &SealRecordV1) -> Result<Vec<u8>, EngineError> {
+    envelope(SEAL_KIND, record, "seal encode")
+}
+
+/// Decode the seal row.
+pub fn decode_seal(bytes: &[u8]) -> Result<SealRecordV1, EngineError> {
+    unwrap(SEAL_KIND, bytes, "seal record")
+}
+
+/// The update writing this replica's seal.
+pub fn seal_update(
+    epoch: ConfigurationEpoch,
+    record: &SealRecordV1,
+) -> Result<StoreUpdate, EngineError> {
+    Ok(StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: seal_key(epoch),
+        value: Some(encode_seal(record)?),
+    })
 }
 
 /// Encode a Sync row.

@@ -90,6 +90,16 @@
 //!   promised before any certificate existed and keeps the promise
 //!   whether or not it ever saw one. Nothing here consults a ballot: a floor belongs to a
 //!   configuration and outlives every term in it.
+//! * [`ballot::BallotState::seal`], [`rows::SealRecordV1`] (task-55):
+//!   the durable old-configuration seal. While the row is there this
+//!   replica admits no ordinary voting transition of that
+//!   configuration under any ballot -- a higher ballot is not an
+//!   exception to a fence, it is what a fence is for -- and a restart
+//!   comes back sealed because it reads the row, not because it
+//!   remembers anything. Terminal recovery of what the configuration
+//!   already did stays possible; the seal report is published
+//!   requiring the row and every batch submitted before the cut, so
+//!   work learned immediately before sealing is inside it.
 //! * [`handoff`] (task-54): the sealed membership handoff. A voter
 //!   records one stance per transition and never reverses it, so a seal
 //!   and a cancellation can never both certify and no retry clears a
@@ -128,7 +138,7 @@ pub mod vote;
 
 pub use ballot::{
     BallotState, ConfigurationIdentity, PromiseEffects, PromiseInFlight, PromiseOutcome,
-    PromiseRejection, ReplicaRole, SyncRejection,
+    PromiseRejection, ReplicaRole, SealEffects, SealRejection, SyncRejection,
 };
 pub use campaign::Campaign;
 pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
@@ -157,10 +167,11 @@ pub use recovery::{RecoveryError, RecoveryReport, ReportEntry, SyncDecision, Syn
 pub use role::{PendingReport, RecoveredState};
 pub use rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,
-    SyncRecordV1, decode_dependency, decode_payload, decode_promise, decode_proposal, decode_sync,
-    dependency_key, dependency_update, encode_dependency, encode_payload, encode_promise,
-    encode_proposal, encode_sync, payload_key, payload_update, promise_key, promise_update,
-    proposal_key, proposal_update, sync_key, sync_update,
+    SealRecordV1, SyncRecordV1, decode_dependency, decode_payload, decode_promise, decode_proposal,
+    decode_seal, decode_sync, dependency_key, dependency_update, encode_dependency, encode_payload,
+    encode_promise, encode_proposal, encode_seal, encode_sync, payload_key, payload_update,
+    promise_key, promise_update, proposal_key, proposal_update, seal_key, seal_update, sync_key,
+    sync_update,
 };
 pub use speculation::{
     DEFAULT_SPECULATION_BOUND, ReleaseGate, Speculation, SpeculationMismatch, SpeculationRequest,

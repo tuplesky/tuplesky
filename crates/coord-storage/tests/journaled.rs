@@ -9,7 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use coord_consensus::rows::{PromiseRecordV1, dependency_update, payload_update, promise_update};
+use coord_consensus::rows::{
+    PromiseRecordV1, SealRecordV1, dependency_update, payload_update, promise_update, seal_update,
+};
 use coord_consensus::{CommandRecord, PayloadRecordV1, Phase};
 use coord_core::effect::{
     ApplyBase, BarrierId, BootId, EffectContext, PeerId, PersistBatch, StoreUpdate,
@@ -1297,5 +1299,93 @@ fn a_command_after_replay_continues_from_the_recovered_position() {
     assert_eq!(
         next.application_base(A).unwrap().execution_position,
         position(2)
+    );
+}
+
+/// The seal of a configuration is recovered from its row, and the
+/// authoritative cut sees it before the projection does (task-55).
+///
+/// This is what makes "a restart cannot resume old service" a property
+/// of the store rather than of anything a process remembers: the seal
+/// travels the same path as a promise -- durable in the journal, then
+/// materialized -- and a recovery read at the cut includes it while the
+/// projection still lags. A replica that read only the projection would
+/// come back unsealed with a durable fence in its own journal.
+#[test]
+fn a_seal_is_recovered_from_its_row_and_the_cut_sees_it_before_the_projection() {
+    let mut world = World::new();
+    world.protocol(A, ballot(7), promise(7));
+    world.store.flush().unwrap();
+
+    let transition = coord_consensus::handoff::Transition {
+        from: epoch(),
+        to: ConfigurationEpoch::new(epoch().get() + 1).unwrap(),
+        subject: Digest32([0xa1; 32]),
+    };
+    let record = SealRecordV1 {
+        transition,
+        at: ballot(7),
+    };
+    world.protocol(A, ballot(7), vec![seal_update(epoch(), &record).unwrap()]);
+    world.store.append_pending().unwrap();
+
+    // Durable, unmaterialized: the projection has not seen the fence.
+    let gated = world.store.reader(A).unwrap().snapshot().unwrap();
+    assert_eq!(
+        read_protocol(gated.view(), epoch(), ViewBudget::default())
+            .unwrap()
+            .seal,
+        None
+    );
+    // The cut has.
+    let cut = world.store.recovery_cut(A).unwrap();
+    assert_eq!(
+        read_protocol(&cut, epoch(), ViewBudget::default())
+            .unwrap()
+            .seal,
+        Some(record)
+    );
+
+    // And materializing the suffix produces the same answer.
+    world.store.materialize().unwrap();
+    let gated = world.store.reader(A).unwrap().snapshot().unwrap();
+    let recovered = read_protocol(gated.view(), epoch(), ViewBudget::default()).unwrap();
+    assert_eq!(recovered.seal, Some(record));
+    assert_eq!(
+        recovered.promise.as_ref().map(|p| p.promised),
+        Some(ballot(7)),
+        "a seal does not disturb the promise it was written beside"
+    );
+
+    // A replica that recovers it refuses every ballot of the epoch.
+    let identity = coord_consensus::ConfigurationIdentity {
+        cluster: ClusterId([1; 16]),
+        domain: A,
+        epoch: epoch(),
+        voters: (0..3).map(|i| ReplicaId([i; 16])).collect(),
+        replica: ReplicaId([0; 16]),
+        incarnation: ReplicaIncarnation::new(1).unwrap(),
+        role: coord_consensus::ReplicaRole::Voter,
+    };
+    let mut state = coord_consensus::BallotState::recover_sealed(
+        identity,
+        ballot(0),
+        recovered.promise.clone(),
+        recovered.seal,
+    );
+    assert!(state.is_sealed());
+    let mut alloc = BarrierAllocator::new(ReplicaIncarnation::new(1).unwrap(), BootId([9; 16]));
+    assert_eq!(
+        state.on_new_leader(
+            coord_core::effect::PeerId {
+                replica: ReplicaId([2; 16]),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+            },
+            ballot(9),
+            BootId([9; 16]),
+            &mut alloc,
+            &[],
+        ),
+        Err(coord_consensus::PromiseRejection::Sealed { transition })
     );
 }

@@ -100,6 +100,8 @@ pub enum Rejection {
     Promise(PromiseRejection),
     /// A peer frame did not decode.
     MalformedPeerMessage,
+    /// A `SealRequest` was rejected (task-55).
+    Seal(crate::ballot::SealRejection),
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -189,8 +191,27 @@ impl Leader {
         durable_promise: Option<PromiseRecordV1>,
         executed_through: ExecutionPosition,
     ) -> Self {
-        let ballots =
-            BallotState::recover(config.identity.clone(), config.genesis, durable_promise);
+        Leader::new_sealed(config, durable_promise, None, executed_through)
+    }
+
+    /// A leader that also recovers the durable seal of its
+    /// configuration (task-55).
+    ///
+    /// Leading is a role within a configuration and the fence is the
+    /// configuration's, so a leader of a sealed epoch is as fenced as
+    /// any other voter: it admits no promise and proposes nothing new.
+    pub fn new_sealed(
+        config: LeaderConfig,
+        durable_promise: Option<PromiseRecordV1>,
+        durable_seal: Option<crate::rows::SealRecordV1>,
+        executed_through: ExecutionPosition,
+    ) -> Self {
+        let ballots = BallotState::recover_sealed(
+            config.identity.clone(),
+            config.genesis,
+            durable_promise,
+            durable_seal,
+        );
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
             config,
@@ -1096,7 +1117,39 @@ impl Leader {
                 }
                 Vec::new()
             }
-            ProtocolMessage::Proposal(_)
+            // Sealing the old configuration (task-55). A leader seals
+            // like any other voter: leading is a role within a
+            // configuration, and the fence is the configuration's.
+            ProtocolMessage::SealRequest { transition } => {
+                let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
+                    return Vec::new();
+                };
+                let outstanding = self
+                    .proposals
+                    .values()
+                    .filter(|p| !p.durable)
+                    .map(|p| p.barrier)
+                    .collect::<Vec<_>>();
+                match self
+                    .ballots
+                    .seal(transition, from, boot, alloc, &outstanding)
+                {
+                    Ok(effects) => {
+                        if let Some(outbox) = self.outbox.as_mut() {
+                            outbox.publish(effects.report);
+                        }
+                        let mut out = alloc::vec![effects.persist];
+                        out.extend(self.release());
+                        out
+                    }
+                    Err(e) => {
+                        self.rejections.push(Rejection::Seal(e));
+                        Vec::new()
+                    }
+                }
+            }
+            ProtocolMessage::Sealed { .. }
+            | ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::ReportPage(_)

@@ -7,8 +7,8 @@
 use std::ops::Bound;
 
 use coord_consensus::rows::{
-    DEPENDENCY_TAG, PromiseRecordV1, SYNC_TAG, decode_dependency, decode_payload, decode_promise,
-    decode_sync, payload_key, promise_key,
+    DEPENDENCY_TAG, PromiseRecordV1, SYNC_TAG, SealRecordV1, decode_dependency, decode_payload,
+    decode_promise, decode_seal, decode_sync, payload_key, promise_key, seal_key,
 };
 use coord_consensus::{CommandRecord, PayloadRecordV1, SyncDecision};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
@@ -41,6 +41,15 @@ pub fn read_promise<V: OrderedRead>(
 pub struct RecoveredProtocol {
     /// Promised and synchronized ballots.
     pub promise: Option<PromiseRecordV1>,
+    /// The durable seal of this configuration, if this replica wrote
+    /// one (task-55).
+    ///
+    /// Read here rather than inferred anywhere, because it is the only
+    /// thing that makes "a restart cannot resume old service" true: a
+    /// replica comes back sealed because its row says so. Its absence
+    /// says this replica has no seal, never that the transition was
+    /// cancelled -- that is a quorum's fact, not one replica's.
+    pub seal: Option<SealRecordV1>,
     /// Dependency rows, keyed by command.
     pub records: Vec<(CommandId, CommandRecord)>,
     /// Bound Sync selections, in key (ballot number, leader) order.
@@ -62,6 +71,7 @@ impl Default for RecoveredProtocol {
     fn default() -> Self {
         RecoveredProtocol {
             promise: None,
+            seal: None,
             records: Vec::new(),
             syncs: Vec::new(),
             payloads: Vec::new(),
@@ -138,6 +148,10 @@ pub fn read_protocol<V: OrderedRead>(
     budget: ViewBudget,
 ) -> Result<RecoveredProtocol, EngineError> {
     let promise = read_promise(view, epoch)?;
+    let seal = match view.get(Collection::ProtocolV1.id(), &seal_key(epoch))? {
+        None => None,
+        Some(bytes) => Some(decode_seal(&bytes)?),
+    };
     let mut lower = epoch.to_be_bytes().to_vec();
     let mut upper = lower.clone();
     lower.push(DEPENDENCY_TAG);
@@ -242,6 +256,7 @@ pub fn read_protocol<V: OrderedRead>(
         .execution_position;
     Ok(RecoveredProtocol {
         promise,
+        seal,
         records,
         syncs,
         payloads,

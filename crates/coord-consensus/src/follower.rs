@@ -113,6 +113,8 @@ pub enum FollowerRejection {
     },
     /// A `NewLeader` was rejected.
     Promise(PromiseRejection),
+    /// A `SealRequest` was rejected (task-55).
+    Seal(crate::ballot::SealRejection),
     /// A peer frame did not decode.
     MalformedPeerMessage,
     /// A proposal of a ballot this replica no longer votes in.
@@ -211,6 +213,12 @@ impl Follower {
     /// `executed_through` is the application's durable execution
     /// position: the learner resumes from it, so the next command it
     /// establishes is the one the applier will plan, not position one.
+    ///
+    /// Recovers *unsealed*: a replica whose configuration may have been
+    /// sealed comes back through [`Follower::recover_with_syncs`], which
+    /// takes the seal row. The two are separate so that recovering a
+    /// sealed configuration is something a caller writes down rather
+    /// than something it gets by default (task-55).
     pub fn recover(
         config: FollowerConfig,
         durable_promise: Option<PromiseRecordV1>,
@@ -221,6 +229,7 @@ impl Follower {
         Follower::recover_with_syncs(
             config,
             durable_promise,
+            None,
             rows,
             payloads,
             core::iter::empty(),
@@ -236,14 +245,19 @@ impl Follower {
     pub fn recover_with_syncs(
         config: FollowerConfig,
         durable_promise: Option<PromiseRecordV1>,
+        durable_seal: Option<crate::rows::SealRecordV1>,
         rows: impl IntoIterator<Item = (CommandId, CommandRecord)>,
         payloads: impl IntoIterator<Item = (CommandId, PayloadRecordV1)>,
         syncs: impl IntoIterator<Item = (Ballot, SyncDecision)>,
         executed_through: ExecutionPosition,
     ) -> Self {
         let payloads: BTreeMap<CommandId, PayloadRecordV1> = payloads.into_iter().collect();
-        let ballots =
-            BallotState::recover(config.identity.clone(), config.genesis, durable_promise);
+        let ballots = BallotState::recover_sealed(
+            config.identity.clone(),
+            config.genesis,
+            durable_promise,
+            durable_seal,
+        );
         let resumed: Option<SyncDecision> = syncs
             .into_iter()
             .find(|(b, _)| *b == ballots.synced())
@@ -1527,6 +1541,43 @@ impl Follower {
                     }
                 }
             }
+            // Sealing the old configuration (task-55). The row and the
+            // report follow the promise's rule exactly: the report is
+            // published requiring the row and every batch submitted
+            // before the cut, so work this replica learned immediately
+            // before sealing is inside it even if the report is
+            // delayed.
+            ProtocolMessage::SealRequest { transition } => {
+                let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
+                    return Vec::new();
+                };
+                let outstanding: Vec<BarrierId> = self
+                    .pending
+                    .keys()
+                    .copied()
+                    .chain(self.sync_barrier.as_ref().map(|(b, _)| *b))
+                    .collect();
+                match self
+                    .ballots
+                    .seal(transition, from, boot, alloc, &outstanding)
+                {
+                    Ok(effects) => {
+                        if let Some(outbox) = self.outbox.as_mut() {
+                            outbox.publish(effects.report);
+                        }
+                        let mut out = alloc::vec![effects.persist];
+                        out.extend(self.release());
+                        out
+                    }
+                    Err(e) => {
+                        self.rejections.push(FollowerRejection::Seal(e));
+                        Vec::new()
+                    }
+                }
+            }
+            // A seal report is a coordinator's to count, never a
+            // voter's to act on.
+            ProtocolMessage::Sealed { .. } => Vec::new(),
             ProtocolMessage::Promise {
                 ballot, replica, ..
             } => {

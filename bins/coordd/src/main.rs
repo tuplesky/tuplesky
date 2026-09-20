@@ -524,7 +524,7 @@ fn voter(
         executed_through.get(),
     );
     let machine = if placed.replica == ballot.leader {
-        let mut leader = Leader::new(
+        let mut leader = Leader::new_sealed(
             LeaderConfig {
                 identity,
                 quorum,
@@ -533,12 +533,16 @@ fn voter(
                 capacity: 64,
             },
             recovered.promise.clone(),
+            // A replica comes back sealed because its row says so
+            // (task-55). Passing it here is what makes a restart unable
+            // to resume old service.
+            recovered.seal,
             executed_through,
         );
         leader.set_learning(LearningMode::Full);
         coord_daemon::Machine::Leader(Box::new(leader))
     } else {
-        let mut follower = Follower::recover(
+        let mut follower = Follower::recover_with_syncs(
             FollowerConfig {
                 identity,
                 quorum,
@@ -547,8 +551,10 @@ fn voter(
                 capacity: 64,
             },
             recovered.promise.clone(),
+            recovered.seal,
             recovered.records.clone(),
             recovered.payloads.clone(),
+            recovered.syncs.clone(),
             executed_through,
         )
         .restore_execution(executed_through, recovered.executed.iter().map(|(c, _)| *c))
