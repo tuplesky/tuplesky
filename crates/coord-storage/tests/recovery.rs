@@ -1916,5 +1916,6 @@ fn payload_of(seq: u64) -> coord_consensus::PayloadRecordV1 {
     coord_consensus::PayloadRecordV1 {
         retry_key: retry_key(seq),
         logical: postcard::to_allocvec(&request_of(seq)).unwrap(),
+        admission: None,
     }
 }

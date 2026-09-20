@@ -165,6 +165,7 @@ async fn serve(mut transport: Transport, config: BindingConfig) {
             let payload = PayloadRecordV1 {
                 retry_key: request.retry_key,
                 logical: request.logical.as_slice().to_vec(),
+                admission: None,
             };
             applier
                 .apply(command, &payload)

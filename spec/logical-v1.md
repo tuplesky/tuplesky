@@ -40,8 +40,8 @@ at the end of an enum. Anything else is `logical_v2`.
 
 Variant order of `CanonicalOperation`: `Range`, `Put`, `DeleteRange`, `Txn`,
 `LeaseGrant`, `LeaseKeepAlive`, `LeaseRevoke`, `LeaseTimeToLive`, `Compact`,
-then the appended Kine primitives `KineCreate`, `KineUpdate`, `KineDelete`
-(design Section 6.6): one logical operation each, returning every revision
+then the appended Kine primitives `KineCreate`, `KineUpdate`, `KineDelete`,
+then `ConsumeAdmission` (design Section 6.6): one logical operation each, returning every revision
 and conflict fact from one execution point. A Kine TTL is `ttl_seconds`
 plus a hidden binding identity derived from the stable request, present
 exactly when the TTL is positive; it is never a native lease ID. The
@@ -52,6 +52,20 @@ bytes (task-46). It depends on the retry key alone, so a transport retry
 reproduces it, the next sequence names a fresh identity (spent identities
 are never reused), and the payload that carries it does not feed back
 into its own derivation.
+
+`ConsumeAdmission` carries nothing. It selects one action -- consume the
+admission this command was accepted under and create the session it
+attests -- and everything about that session (principal, trust rule,
+generation, scope ceiling, credential deadline) comes from the admission
+record beside the payload, never from the payload. A caller controls the
+payload, so a payload that could name a principal would let a caller name
+its own. It is also not a general internal-command variant: naming one
+narrow action keeps a client request from reaching policy administration,
+trust-rule or lease-authority operations that share an internal encoding.
+Which planner runs is chosen by the accepted admission's purpose, not by
+the operation: an establishing admission under any other operation, and
+this operation under any other admission, are both the replicated
+rejection `AdmissionMismatch`.
 
 Normalization: transaction comparisons form a conjunction, so they are
 sorted and de-duplicated before encoding; a non-canonical transaction is

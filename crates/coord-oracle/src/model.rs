@@ -249,7 +249,11 @@ impl KvModel {
             | CanonicalOperation::LeaseTimeToLive { .. }
             | CanonicalOperation::KineCreate(_)
             | CanonicalOperation::KineUpdate(_)
-            | CanonicalOperation::KineDelete(_) => ModelResponse {
+            | CanonicalOperation::KineDelete(_)
+            // Session establishment is not KV history: the oracle models
+            // the key-value semantics a client sees, and this operation
+            // writes none of it.
+            | CanonicalOperation::ConsumeAdmission => ModelResponse {
                 revision: self.revision,
                 outcome: Outcome::Unsupported,
             },

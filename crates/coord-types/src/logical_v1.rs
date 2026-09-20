@@ -293,6 +293,22 @@ pub enum CanonicalOperation {
     KineUpdate(KineUpdateOp),
     /// Kine conditional delete (discriminant 11).
     KineDelete(KineDeleteOp),
+    /// Consume the admission this command was submitted with, creating
+    /// the session it attests (discriminant 12).
+    ///
+    /// It carries nothing. That is the point: everything about the
+    /// session -- who the principal is, under which trust rule, at what
+    /// generation, within what ceiling, until when -- comes from the
+    /// admission receipt minted at the authentication boundary and
+    /// travelling beside this payload, never from the payload itself. A
+    /// payload is what a caller controls, and a caller must not be able
+    /// to name its own principal.
+    ///
+    /// It is also deliberately not a general internal-command variant:
+    /// naming one narrow action keeps a client's request from reaching
+    /// policy administration, trust-rule or lease-authority operations
+    /// that happen to share an internal encoding.
+    ConsumeAdmission,
 }
 
 /// A canonical logical request: domain-scoped tenant plus operation.
@@ -472,6 +488,8 @@ impl CanonicalOperation {
                 }
                 cost += d.key.len();
             }
+            // Nothing to validate: there is nothing in it.
+            CanonicalOperation::ConsumeAdmission => {}
         }
         if cost > limits::MAX_REQUEST_BYTES {
             return Err(ValidationError::RequestTooLarge);

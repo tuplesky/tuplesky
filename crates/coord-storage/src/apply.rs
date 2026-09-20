@@ -13,21 +13,25 @@
 //! application is irrevocable, and no watch event precedes it.
 
 use coord_consensus::{AppliedOutcome, PayloadRecordV1};
+use coord_core::capability::{AdmissionFacts, AdmissionPurpose};
 use coord_core::outbox::BarrierAllocator;
 use coord_state::{
-    PlanError, PlanLimits, RejectionReason, authorize_retained, plan, rejection_plan,
+    AdmissionReceiptV1, InternalCommand, PlanError, PlanLimits, RejectionReason,
+    SESSION_RETRY_WINDOW, authorize_retained, plan, plan_internal, rejection_plan,
     rejection_plan_at,
 };
 use coord_store_api::engine::EngineError;
 use coord_types::ids::{KvRevision, NamespaceId};
-use coord_types::logical_v1::LogicalRequest;
+use coord_types::logical_v1::{CanonicalOperation, LogicalRequest};
 use coord_types::{CommandId, RetryKey};
 
 use crate::materialize::{ApplyOutcome, apply_plan};
 use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
 use crate::view::ViewError;
-use crate::views::{ViewBudget, ViewBuildError, build_authorized_view, load_authorization};
+use crate::views::{
+    ViewBudget, ViewBuildError, build_authorized_view, build_internal_view, load_authorization,
+};
 use crate::watch::{PublishError, WatchHub};
 
 /// Why a command could not be applied.
@@ -175,7 +179,181 @@ impl<P: Persistence> Applier<P> {
             retry_key: payload.retry_key,
             command_id: command,
         };
-        self.apply_bound(&request, &binding)
+        // Which planner runs is decided by the admission the command was
+        // *accepted* under, never by the operation alone.
+        //
+        // The operation is the caller's; the admission is the
+        // verifier's, bound into the accepted command and recovered here
+        // from its own durable record. Reading the operation first and
+        // trusting it to say "this creates a session" would let a
+        // payload select the path that reads a principal. Reading the
+        // admission first means an establishing receipt authorizes
+        // exactly one action, and that action exists for nothing else.
+        match (&request.operation, payload.admission) {
+            (CanonicalOperation::ConsumeAdmission, Some(facts))
+                if facts.purpose() == AdmissionPurpose::Establish =>
+            {
+                self.apply_establishment(&request, &binding, &facts)
+            }
+            // An establishing admission with any other operation, and
+            // the establishing operation under anything else: neither
+            // authorizes the other.
+            (CanonicalOperation::ConsumeAdmission, _) => {
+                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
+            }
+            (_, Some(facts)) if facts.purpose() == AdmissionPurpose::Establish => {
+                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
+            }
+            // An ordinary submission. The receipt attests that the caller
+            // is bound to the session the retry key names; a receipt
+            // naming another session admits nothing under this one.
+            (_, Some(facts)) if facts.attested.session != payload.retry_key.session_id => {
+                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
+            }
+            _ => self.apply_bound(&request, &binding),
+        }
+    }
+
+    /// Create the session an accepted establishment receipt attests.
+    ///
+    /// This is the whole of session establishment: consuming the
+    /// receipt, writing the session row and binding the outcome to the
+    /// retry key happen in one batch, so a crash leaves either all of it
+    /// or none of it, and the caller's credential is released only after
+    /// that batch is durable.
+    ///
+    /// Nothing here consults a clock. The credential deadline the
+    /// receipt carries was checked once, at admission; a replica
+    /// applying the command -- now, or on a replay years later --
+    /// decides only what current replicated policy says, which is what
+    /// [`plan_internal`] rechecks.
+    fn apply_establishment(
+        &mut self,
+        request: &LogicalRequest,
+        binding: &RetryBinding,
+        facts: &AdmissionFacts,
+    ) -> Result<AppliedOutcome, ApplyError> {
+        let namespace = request.namespace;
+        // The receipt names the session it creates and the retry key
+        // names the session its record belongs to. They must be the same
+        // session, or the command would establish one identity while
+        // recording its outcome under another.
+        let Some(receipt) = AdmissionReceiptV1::of(facts) else {
+            return self.apply_refusal(namespace, RejectionReason::AdmissionMismatch);
+        };
+        if receipt.session != binding.retry_key.session_id {
+            return self.apply_refusal(namespace, RejectionReason::AdmissionMismatch);
+        }
+        let internal = InternalCommand::ConsumeAdmission {
+            namespace,
+            receipt,
+            // Login grants are consumed by the exchange that issues the
+            // credential, not by the binding that presents it.
+            code: None,
+            refresh_family: None,
+            window: SESSION_RETRY_WINDOW,
+        };
+        for _ in 0..8 {
+            let gated = self.store.reader().snapshot()?;
+            // A second delivery of this same command returns what the
+            // first established. The ordinary admission path cannot
+            // answer this one: it asks the session whether the command
+            // may run, and this is the command that creates it.
+            match retry::lookup(gated.view(), &binding.retry_key)? {
+                Some(record) if record.command_id == binding.command_id => {
+                    if let Some(revision) = record.revision {
+                        self.publish_through(revision)?;
+                    }
+                    return Ok(AppliedOutcome {
+                        position: record.position,
+                        revision: record.revision,
+                        result_digest: record.result_digest,
+                        response: record.response.clone(),
+                    });
+                }
+                Some(_) => {
+                    drop(gated);
+                    return self.apply_refusal(namespace, RejectionReason::RetryConflict);
+                }
+                None => {}
+            }
+            let planned = match build_internal_view(&gated, &internal, ViewBudget::SCHEMA) {
+                Ok(view) => match plan_internal(&internal, &view, &PlanLimits::default()) {
+                    Ok(planned) => planned,
+                    Err(e) => match e.terminal() {
+                        Some(reason) => rejection_plan(&view, reason).map_err(ApplyError::Plan)?,
+                        None => return Err(ApplyError::Plan(e)),
+                    },
+                },
+                Err(ViewBuildError::BudgetExceeded) => rejection_plan_at(
+                    self.store.application_base(),
+                    crate::codecs::read_kv_revision(gated.view())?,
+                    RejectionReason::ViewTooLarge,
+                )
+                .map_err(ApplyError::Plan)?,
+                Err(e) => return Err(ApplyError::View(e)),
+            };
+            drop(gated);
+            let barrier = self.alloc.allocate();
+            // The retry binding rides in the same batch as the session
+            // row and the consumed receipt: the outcome is recoverable
+            // exactly when the session exists.
+            match apply_plan(&mut self.store, barrier, namespace, &planned, Some(binding))? {
+                ApplyOutcome::Applied(_) => {
+                    let response = postcard::to_allocvec(&planned.response)
+                        .map_err(|_| ApplyError::MalformedPayload)?;
+                    return Ok(AppliedOutcome {
+                        position: planned.position,
+                        revision: planned.revision,
+                        result_digest: retry::result_digest(&response),
+                        response,
+                    });
+                }
+                ApplyOutcome::Replan => continue,
+                ApplyOutcome::Indeterminate => {
+                    self.store.reconcile()?;
+                }
+            }
+        }
+        Err(ApplyError::Diverged)
+    }
+
+    /// Execute `reason` as this command's whole result: it takes the
+    /// position that is already its own, records nothing under the retry
+    /// key, and changes nothing else.
+    fn apply_refusal(
+        &mut self,
+        namespace: NamespaceId,
+        reason: RejectionReason,
+    ) -> Result<AppliedOutcome, ApplyError> {
+        for _ in 0..8 {
+            let gated = self.store.reader().snapshot()?;
+            let planned = rejection_plan_at(
+                self.store.application_base(),
+                crate::codecs::read_kv_revision(gated.view())?,
+                reason,
+            )
+            .map_err(ApplyError::Plan)?;
+            drop(gated);
+            let barrier = self.alloc.allocate();
+            match apply_plan(&mut self.store, barrier, namespace, &planned, None)? {
+                ApplyOutcome::Applied(_) => {
+                    let response = postcard::to_allocvec(&planned.response)
+                        .map_err(|_| ApplyError::MalformedPayload)?;
+                    return Ok(AppliedOutcome {
+                        position: planned.position,
+                        revision: None,
+                        result_digest: retry::result_digest(&response),
+                        response,
+                    });
+                }
+                ApplyOutcome::Replan => continue,
+                ApplyOutcome::Indeterminate => {
+                    self.store.reconcile()?;
+                }
+            }
+        }
+        Err(ApplyError::Diverged)
     }
 
     /// The terminal outcome of a semantic admission refusal.

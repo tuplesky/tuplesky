@@ -61,3 +61,18 @@ impl Default for PlanLimits {
         }
     }
 }
+
+/// Outstanding retry window a session established from an admission
+/// receipt is created with.
+///
+/// Replicated, not configured: the window is written into the session
+/// row by the command that creates it, and every replica plans that
+/// command from the same receipt. A per-node setting here would make
+/// the row -- and therefore every later admission decision against it --
+/// depend on which node happened to plan the establishment.
+///
+/// It matches `coord-storage`'s default window, which is what a session
+/// that never named one is admitted under, so establishing a session
+/// explicitly does not silently change what its clients may have
+/// outstanding.
+pub const SESSION_RETRY_WINDOW: u32 = 1024;

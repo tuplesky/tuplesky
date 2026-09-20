@@ -235,6 +235,11 @@ fn request_permissions(
             vec![(Action::LeaseInspect, KeyInterval::all())]
         }
         CanonicalOperation::LeaseKeepAlive { .. } => vec![(Action::LeaseRenew, KeyInterval::all())],
+        // It touches no key, so there is no interval to permit. What
+        // authorizes it is the purpose of the admission it was
+        // submitted with, which is not a permission and is checked
+        // where admissions are.
+        CanonicalOperation::ConsumeAdmission => Vec::new(),
         CanonicalOperation::KineCreate(c) => vec![(Action::Write, KeyInterval::exact(&c.key))],
         CanonicalOperation::KineUpdate(u) => vec![
             (Action::Write, KeyInterval::exact(&u.key)),
@@ -800,6 +805,19 @@ fn plan_operation(
         return Err(fail(Outcome::ErrSessionInvalid));
     }
     Ok(match &request.operation {
+        // A client's request asking to consume an admission. Reaching
+        // here means the admission it was submitted with was for
+        // submitting under an existing session, not for establishing
+        // one: the payload named the action and the authority to take
+        // it was never attested. It is refused, and the session it
+        // hoped to create is not created.
+        //
+        // An establishment reaches execution through its own path,
+        // selected by the *receipt's* purpose rather than by anything
+        // the payload says.
+        CanonicalOperation::ConsumeAdmission => {
+            return Err(fail(Outcome::ErrPermissionDenied));
+        }
         CanonicalOperation::Range(r) => {
             authorize(view, Action::Read, &interval_of(&r.range))?;
             read(view, overlay, r, limits)?

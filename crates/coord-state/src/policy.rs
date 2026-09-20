@@ -12,6 +12,7 @@
 
 use alloc::vec::Vec;
 
+use coord_core::capability::AdmissionFacts;
 use coord_types::identity::Digest32;
 use coord_types::ids::{NamespaceId, PrincipalId, SessionId, TrustRuleId};
 use serde::{Deserialize, Serialize};
@@ -172,6 +173,38 @@ pub struct AdmissionReceiptV1 {
     /// Absolute deadline the admitted credential allows: the session
     /// created from this receipt ends here, whatever it is renewed to.
     pub expires_at: u64,
+}
+
+impl AdmissionReceiptV1 {
+    /// The replicated form of what a verifier attested, when what it
+    /// attested establishes a session.
+    ///
+    /// `None` for facts that merely admit work under a session that
+    /// already exists: they carry no principal, no trust rule and no
+    /// credential deadline, so there is nothing here to create a session
+    /// from. That is the point of their being a separate shape.
+    ///
+    /// This is a change of representation and nothing more. It confers
+    /// no authority: what may be done with the result is decided by who
+    /// could obtain the facts, which is the admission boundary (through
+    /// an [`AdmissionReceipt`] capability) or an accepted command's own
+    /// durable record.
+    ///
+    /// [`AdmissionReceipt`]: coord_core::capability::AdmissionReceipt
+    pub const fn of(facts: &AdmissionFacts) -> Option<Self> {
+        let Some(establishing) = facts.establishing else {
+            return None;
+        };
+        Some(AdmissionReceiptV1 {
+            receipt_id: facts.attested.receipt_id,
+            session: facts.attested.session,
+            principal: establishing.principal,
+            scope_ceiling: facts.attested.scope_ceiling,
+            trust_rule: establishing.trust_rule,
+            rule_generation: facts.attested.rule_generation,
+            expires_at: establishing.credential_valid_until.0,
+        })
+    }
 }
 
 /// What a grant commitment stands for.

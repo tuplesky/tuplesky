@@ -77,6 +77,7 @@ fn payload(seq: u64, request: &LogicalRequest) -> (CommandId, PayloadRecordV1) {
         PayloadRecordV1 {
             retry_key: retry_key(seq),
             logical: postcard::to_allocvec(request).unwrap(),
+            admission: None,
         },
     )
 }

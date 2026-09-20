@@ -630,6 +630,11 @@ fn votes_are_collected_but_never_learned_here() {
     leader.step(durable(&effects, 1).remove(0));
     let path = leader.proposal(&c1).unwrap().path;
     let paths = leader.proposal(&c1).unwrap().paths.clone();
+    let admitted_under = leader
+        .table()
+        .record(&c1)
+        .and_then(|r| r.payload)
+        .expect("initialized");
     let ack = |replica: u8| FastAck {
         replica: r(replica),
         ballot: ballot(0, 0),
@@ -637,6 +642,7 @@ fn votes_are_collected_but_never_learned_here() {
         deps: vec![],
         paths: paths.clone(),
         path,
+        admission: admitted_under,
         seqnum: None,
     };
     // r1 (fast set) agrees on the path; r2 adopts; an observer is refused;
@@ -653,7 +659,8 @@ fn votes_are_collected_but_never_learned_here() {
                 ProtocolMessage::SlowAck(SlowAck {
                     replica: r(2),
                     ballot: ballot(0, 0),
-                    command: c1
+                    command: c1,
+                    admission: admitted_under,
                 })
             ))
             .is_empty()
