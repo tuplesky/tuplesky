@@ -1563,3 +1563,94 @@ activation is running the old binary, which is what the coexistence
 half is for. Rollback after activation is a restore (task-59), with
 everything that costs -- which is the honest price of a one-way step,
 and stating it is better than a mechanism that pretends otherwise.
+
+## A metric that says nothing is better than one that says zero
+
+task-61 is the observability surface, and the interesting part was not
+what to measure — design Section 22.3 lists the stages — but what to do
+about everything a given node does not measure.
+
+The default answer in most systems is zero, and zero is a lie an
+operator acts on. A dashboard showing zero commit latency during a
+storage outage reads as "everything is fast". Zero headroom against an
+unconfigured bound reads as "full", which is exactly backwards. Zero
+fan-out latency on a frontend reads as a healthy voter, on a node that
+does not vote.
+
+So every reading in `coord_daemon::metrics` is a `Measure`, and an
+absent one carries the reason:
+
+* `NotThisRole` — a frontend has no journal, an observer casts no vote.
+* `NoSamples` — instrumented, nothing observed yet. A stage nothing has
+  passed through is not a fast stage.
+* `Quarantined` — any reading would describe state the node has stopped
+  trusting.
+* `NoBound` — there is no configured bound to have headroom against.
+
+Those four call for four different operator responses, and none of them
+is the response to a zero. Writing them down turned out to also settle
+an ambiguity in the snapshot: a stage a role *has* but has not exercised
+reports honest zero counts with an unavailable latency. "Nothing has
+happened here" and "this does not exist here" are different statements,
+and now they look different.
+
+### Bounded labels have to be bounded by the type
+
+The rule is "no keys, tokens or unbounded IDs as labels", and the
+tempting implementation is a `HashMap<String, String>` plus a
+convention. A convention is one careless `format!` away from a
+cardinality explosion and a data leak in the same line.
+
+So there is no string map anywhere in the module. A series is broken
+down by `Stage`, `Lane` or `ShardIndex` and by nothing else, each a
+frozen enum or a checked integer. `ShardIndex::new` refuses an index at
+or beyond `MAX_REPORTED_SHARDS`, so a node with more shards than that
+aggregates rather than growing a series per shard.
+
+The domain identity is deliberately *not* a label, which is worth
+stating because it is the one that looks safe. A per-domain series on a
+multi-tenant node grows with the tenants, and it also discloses which
+domains exist — Section 13's point that a scalar revision leaks
+aggregate activity applies to the label set too.
+
+The same reasoning is why the snapshot needs no redaction pass. Every
+field is a number or a frozen enum, so the secret scan finds nothing —
+not because something filtered it, but because nothing of that kind was
+ever recorded. The test asserts that directly: no credential-shaped
+substrings, and no alphanumeric run longer than twenty characters,
+which is what an identity, digest or key smuggled in as a label would
+look like. The `coordd` test runs the same scan over the real startup
+line, and its negative control — formatting the domain identity onto the
+end of that line — trips it immediately.
+
+### Three numbers that a single "write latency" would destroy
+
+`Durability` keeps `sync`, `commit_return` and `backpressure` apart, and
+the test shows why with a device that is fine and a queue that is not: a
+fast sync with a slow commit-return means the queue is the problem, and
+a slow sync with little backpressure means the device is. One combined
+figure answers neither question, and would blame the disk in the first
+case.
+
+Backpressure especially is not slowness. It is the system declining
+work, and a node that declines work is behaving correctly — folding it
+into a latency makes correct behaviour look like a fault.
+
+`Frontiers` splits the same way: `J`, `M` and `C` are three positions,
+and `unmaterialized` (`J - M`) and `unreclaimed` (`M - C`) are the
+derived numbers that say whether a node is keeping up with its own
+durable log and what a reclamation would still have to replay. A single
+"storage position" hides both.
+
+### What the concurrency test does and does not prove
+
+`Recorder` is atomics only. What guarantees that a diagnostics reader
+cannot stall a voter is that there is no lock in the type — nothing to
+take, so nothing to hold.
+
+The test cannot prove the absence of a lock; a `Mutex`-based recorder
+would pass it. What it shows is the behaviour that absence produces: a
+reader taking two thousand snapshots never starves a concurrent writer
+and never observes more completions than entries. The test's doc comment
+says exactly that rather than claiming the stronger thing, because a
+test that overclaims is worse than one that is honest about its reach.

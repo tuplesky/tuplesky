@@ -618,6 +618,70 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
+    /// A bounded, secret-free metrics snapshot of this node (task-61).
+    ///
+    /// Assembled from what the store and the transport already measure,
+    /// rather than from a parallel set of counters: a second accounting
+    /// of the same work is a second thing that can be wrong, and the
+    /// one an operator reads would be the one nobody validates.
+    ///
+    /// Everything this node does not have reports *why*, never zero. A
+    /// gap in a dashboard is a question; a zero is an answer, and a
+    /// wrong one.
+    pub fn metrics(
+        &self,
+        roles: &coord_daemon::role::RoleSet,
+        recorder: &coord_daemon::metrics::Recorder,
+    ) -> coord_daemon::metrics::MetricsSnapshot {
+        use coord_daemon::metrics::{
+            Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, ShardIndex, ShardReading,
+            Unavailable,
+        };
+
+        let frontiers = match self.backing.applier().store().frontiers() {
+            Some((journal, materialized, checkpoint)) => Measure::Observed(Frontiers {
+                journal,
+                materialized,
+                checkpoint,
+            }),
+            None => Measure::Unavailable(Unavailable::Quarantined),
+        };
+        // A lane this node has never used has no waits to report, and
+        // saying "no samples" is the honest reading: a lane nothing has
+        // travelled is not a fast lane.
+        let lanes = Lane::ALL
+            .iter()
+            .map(|lane| LaneReading {
+                lane: *lane,
+                queue_wait: Measure::Unavailable(Unavailable::NoSamples),
+                credit_wait: Measure::Unavailable(Unavailable::NoSamples),
+                frames: 0,
+                refused: 0,
+                headroom: Measure::Unavailable(Unavailable::NoBound),
+            })
+            .collect();
+        // Shard zero for the single-domain preview; task-j07 is where a
+        // node spreads domains over a shard set and reports each.
+        let shards = ShardIndex::new(0)
+            .map(|shard| {
+                vec![ShardReading {
+                    shard,
+                    headroom: Measure::Unavailable(Unavailable::NoBound),
+                    pressure_permille: Measure::Unavailable(Unavailable::NoBound),
+                }]
+            })
+            .unwrap_or_default();
+        MetricsSnapshot {
+            stages: recorder.snapshot_stages(roles),
+            lanes,
+            shards,
+            durability: Measure::Unavailable(Unavailable::NoSamples),
+            frontiers,
+            view_age: Measure::Unavailable(Unavailable::NoSamples),
+            engine_pressure: Measure::Unavailable(Unavailable::NoBound),
+        }
+    }
+
     /// Publish this node's recovery baseline into `images` once the
     /// journal has run `after` records past the last one.
     pub fn with_checkpoints(mut self, images: LocalCheckpointStore, after: u64) -> Self {

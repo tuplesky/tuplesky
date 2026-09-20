@@ -130,6 +130,16 @@ pub trait LocalBaseline {
     /// I/O.
     fn unreclaimed(&self) -> u64;
 
+    /// This domain's three durable frontiers `(J, M, C)`, or `None`
+    /// where the projection is not attached (task-61).
+    ///
+    /// Reported as three numbers rather than one position because they
+    /// are three different facts: `J - M` says whether this node is
+    /// keeping up with its own durable log, and `M - C` says what a
+    /// reclamation would still have to replay. A single "storage
+    /// position" would hide both.
+    fn frontiers(&self) -> Option<(u64, u64, u64)>;
+
     /// Run the publication cycle once.
     ///
     /// `Ok(None)` when there is nothing new to represent: the baseline
@@ -146,6 +156,16 @@ impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E> {
     fn unreclaimed(&self) -> u64 {
         self.store().frontiers(self.domain()).map_or(0, |f| {
             f.durable().get().saturating_sub(f.checkpoint().get())
+        })
+    }
+
+    fn frontiers(&self) -> Option<(u64, u64, u64)> {
+        self.store().frontiers(self.domain()).map(|f| {
+            (
+                f.durable().get(),
+                f.materialized().get(),
+                f.checkpoint().get(),
+            )
         })
     }
 
