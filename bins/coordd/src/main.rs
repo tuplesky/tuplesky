@@ -569,6 +569,7 @@ fn voter(
     let mut voter = coord_daemon::Voter::new(
         coord_daemon::Node::new(machine, applier, collector),
         ingress,
+        (m.cluster(), m.domain()),
         ballot,
     );
     voter

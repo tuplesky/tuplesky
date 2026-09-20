@@ -151,13 +151,22 @@ impl Admission {
             &now_ticks.to_be_bytes(),
             &self.minted.to_be_bytes(),
         ]);
-        let receipt = AdmissionReceipt::from_verifier(
+        // A submission under a session the cluster already agreed on.
+        // Nothing here attests a principal or a trust rule: this
+        // boundary verified a *binding*, not a credential, and a
+        // receipt that could carry an identity would make every
+        // frontend an identity issuer by accident.
+        let receipt = AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
-            caller.session,
-            caller.rule_generation,
-            caller.scope_ceiling,
-            receipt_id,
-            now_ticks,
+            coord_core::AttestedAdmission {
+                cluster: self.cluster,
+                domain: self.domain,
+                session: caller.session,
+                rule_generation: caller.rule_generation,
+                scope_ceiling: caller.scope_ceiling,
+                receipt_id,
+                admitted_at_ticks: now_ticks,
+            },
         );
         let frame = MessageV1::Request(request.clone())
             .encode()
