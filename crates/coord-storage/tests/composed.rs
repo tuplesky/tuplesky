@@ -589,6 +589,14 @@ fn a_failure_of_unknown_outcome_is_reconciled_rather_than_replanned() {
         fn submit(&mut self, _: PersistBatch, _: TransitionKind) -> Result<(), Refused> {
             unreachable!("nothing is submitted here")
         }
+        fn recovered(
+            &self,
+            _: coord_types::ids::ConfigurationEpoch,
+            _: coord_storage::views::ViewBudget,
+        ) -> Result<coord_storage::protocol::RecoveredProtocol, coord_store_api::engine::EngineError>
+        {
+            unreachable!("completion recovers nothing")
+        }
         fn lower(&mut self) -> Result<Lowered, coord_store_api::engine::EngineError> {
             self.2 = true;
             Ok(Lowered {
@@ -895,4 +903,83 @@ fn a_higher_promise_fences_admission_without_discarding_durable_obligations() {
         settled.events
     );
     assert_eq!(applier.store().store().unmaterialized(DOMAIN), 0);
+}
+
+/// A replica recovers what the *journal* holds, not what the projection
+/// has caught up with.
+///
+/// This is the trap the persistence seam exists to close. On the
+/// journal-first profile a promise is durable the moment the journal has
+/// it, and the projection may be behind by any number of records. A
+/// replica that rebuilt its ballot state from the projection would come
+/// back not knowing about a promise it had already made -- and would
+/// then be free to accept a ballot it had promised not to.
+///
+/// `Persistence::recovered` is the only way through the seam, and on
+/// this coordinator it reads the authoritative cut. Swapping it for the
+/// projection snapshot fails here.
+#[test]
+fn a_replica_recovers_a_promise_the_projection_has_not_caught_up_with() {
+    use coord_consensus::rows::{PromiseRecordV1, promise_update};
+    use coord_storage::protocol::read_protocol;
+    use coord_storage::views::ViewBudget;
+
+    let mut applier = journaled();
+    let epoch = applier.store().application_base().configuration;
+    let promised = Ballot {
+        epoch,
+        number: 9,
+        leader: REPLICA,
+    };
+
+    // A promise, journaled and deliberately left unmaterialized.
+    let barrier = applier.alloc().allocate();
+    applier
+        .store_mut()
+        .submit(
+            PersistBatch {
+                barrier,
+                base: None,
+                updates: vec![
+                    promise_update(
+                        epoch,
+                        &PromiseRecordV1 {
+                            promised,
+                            synced: promised,
+                        },
+                    )
+                    .unwrap(),
+                ],
+            },
+            TransitionKind::Protocol,
+        )
+        .expect("accepted");
+    applier
+        .store_mut()
+        .store_mut()
+        .append_pending()
+        .expect("journaled");
+
+    // The projection alone does not have it, and would say this replica
+    // promised nothing.
+    let gated = applier.store().reader().snapshot().expect("snapshot");
+    assert!(
+        read_protocol(gated.view(), epoch, ViewBudget::default())
+            .expect("readable")
+            .promise
+            .is_none(),
+        "the projection caught up on its own; this test is no longer about a lagging one"
+    );
+    drop(gated);
+
+    // The seam does, without waiting for materialization.
+    let recovered = applier
+        .store()
+        .recovered(epoch, ViewBudget::default())
+        .expect("recoverable");
+    assert_eq!(
+        recovered.promise.expect("the promise is durable").promised,
+        promised,
+        "recovery forgot a promise the journal already held"
+    );
 }
