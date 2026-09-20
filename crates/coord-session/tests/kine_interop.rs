@@ -217,6 +217,8 @@ async fn the_registered_go_driver_negotiates_binds_and_requests_against_the_nati
         issuer: ISSUER.into(),
         resource: RESOURCE.into(),
         jwks: ring.jwks(),
+        cluster: CLUSTER,
+        domain: DOMAIN,
     };
     let frontend_task = tokio::spawn(serve(transport, config));
 

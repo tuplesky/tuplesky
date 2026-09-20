@@ -38,6 +38,15 @@ impl AuthorizationBarrier {
         self.position
     }
 
+    /// The replicated session record, if the cluster has one.
+    ///
+    /// Its absence is the answer a binding needs before it can serve:
+    /// no row means no session, and a credential that names one is
+    /// describing a session that has still to be established.
+    pub const fn session_record(&self) -> Option<&coord_state::policy::SessionRecord> {
+        self.authorization.session.as_ref()
+    }
+
     /// Whether the session is still active under its rule generation.
     pub fn session_valid(&self) -> bool {
         self.authorization.valid_session().is_some()

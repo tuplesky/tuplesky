@@ -18,13 +18,15 @@ use std::collections::{BTreeMap, VecDeque};
 
 use coord_authn::ClockHealth;
 use coord_collector::{Action, Delivery, Dispatcher, codes};
+use coord_core::event::AdmittedRequest;
 use coord_state::Response;
+use coord_state::plan::Outcome;
 use coord_state::policy::{Action as PolicyAction, KeyInterval};
 use coord_storage::WatchHub;
 use coord_types::RetryKey;
 use coord_types::ids::NamespaceId;
 use coord_types::logical_v1::{BranchOp, CanonicalOperation, LogicalRequest};
-use coord_types::wire_v1::{Frame, MessageV1, OutcomeV1, decode, decode_stream};
+use coord_types::wire_v1::{Frame, MessageV1, OutcomeV1, RequestV1, decode, decode_stream};
 
 use crate::binding::{BindError, Binding, BindingConfig, verify_bind};
 use crate::gate::{PolicySource, carries_previous, is_read_output, protected_keys};
@@ -42,6 +44,11 @@ pub enum Ingress {
     /// The binding's validity ended: close with code `2`; admitted work
     /// stays resolvable under the session.
     Expired,
+    /// The credential was verified and the session it names does not
+    /// exist yet: send this plan to the voters and hold the bind stream
+    /// under its invocation. The acknowledgement is written when the
+    /// establishment's outcome comes back, never before.
+    Establishing(Box<coord_collector::FanOut>),
     /// The dispatcher's action (already gated where it discloses data).
     Action(Action),
 }
@@ -60,11 +67,41 @@ struct RequestInfo {
     intervals: Vec<KeyInterval>,
 }
 
+/// A binding waiting for the session it named to be established.
+#[derive(Clone, Debug)]
+struct Establishing {
+    /// Connection whose bind stream is held.
+    connection: u64,
+    /// What the verified credential said.
+    binding: Binding,
+    /// The acknowledgement to write once the session exists.
+    ack: Vec<u8>,
+}
+
+/// What a delivery becomes for the caller waiting on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivered {
+    /// Write this frame on the caller's stream.
+    Answer(Delivery),
+    /// The establishment this connection was waiting for did not
+    /// happen. Release its stream with no answer: an unbound caller is
+    /// told that it has no session, and nothing further.
+    Unbound {
+        /// Connection whose bind stream was held.
+        connection: u64,
+        /// Invocation the stream was held under.
+        retry_key: RetryKey,
+        /// Why, for this node's own record.
+        reason: BindError,
+    },
+}
+
 /// The frontend of one domain with session binding and output gating.
 pub struct BoundFrontend {
     dispatcher: Dispatcher,
     config: BindingConfig,
     bindings: BTreeMap<u64, Binding>,
+    establishing: BTreeMap<RetryKey, Establishing>,
     watches: BTreeMap<(u64, u64), NamespaceId>,
     requests: BTreeMap<RetryKey, RequestInfo>,
     order: VecDeque<RetryKey>,
@@ -72,6 +109,10 @@ pub struct BoundFrontend {
     pump_bound: usize,
     /// Barriers read so far (one per gated delivery or bounded pump).
     pub barriers_read: u64,
+    /// Replicated session states read while binding. Counted apart from
+    /// `barriers_read`, which is the disclosure gate's: this one asks
+    /// whether a session exists, not whether output may be shown.
+    pub sessions_checked: u64,
     /// Disclosures denied by a barrier.
     pub denied: u64,
 }
@@ -89,12 +130,14 @@ impl BoundFrontend {
             dispatcher,
             config,
             bindings: BTreeMap::new(),
+            establishing: BTreeMap::new(),
             watches: BTreeMap::new(),
             requests: BTreeMap::new(),
             order: VecDeque::new(),
             max_requests,
             pump_bound: pump_bound.max(1),
             barriers_read: 0,
+            sessions_checked: 0,
             denied: 0,
         }
     }
@@ -129,7 +172,7 @@ impl BoundFrontend {
         policy: &dyn PolicySource,
     ) -> Ingress {
         if frame.kind == KIND_BIND {
-            return self.bind(clock, connection, frame);
+            return self.bind(clock, connection, frame, policy);
         }
         let Some(binding) = self.bindings.get(&connection) else {
             return Ingress::NotBound;
@@ -185,25 +228,176 @@ impl BoundFrontend {
         Ingress::Action(action)
     }
 
-    fn bind(&mut self, clock: &ClockHealth, connection: u64, frame: &Frame) -> Ingress {
+    /// Bind `connection` to the session its credential names, first
+    /// establishing that session if the cluster does not have it yet.
+    ///
+    /// Verifying the credential is not the same as the session
+    /// existing. A caller's first command executes against a replicated
+    /// session row, so the row has to be there -- written by an ordered
+    /// command every replica agreed on, not by this node because this
+    /// node happened to serve the bind. So:
+    ///
+    /// * the session exists and describes this credential: bind now;
+    /// * the session exists and describes something else, or was
+    ///   retired: refuse. A session's principal and ceiling are
+    ///   immutable and its retirement permanent, so there is nothing a
+    ///   credential could say that would change either;
+    /// * no session yet: submit the establishment and hold this stream.
+    ///   The acknowledgement is written when the command's outcome
+    ///   comes back, so nothing the caller can do with the session
+    ///   precedes the session.
+    fn bind(
+        &mut self,
+        clock: &ClockHealth,
+        connection: u64,
+        frame: &Frame,
+        policy: &dyn PolicySource,
+    ) -> Ingress {
         let bind = match decode_bind(frame) {
             Ok(b) => b,
             Err(_) => return Ingress::Rejected(BindError::Malformed),
         };
         let existing = self.bindings.get(&connection);
-        match verify_bind(&self.config, bind.token.as_slice(), clock, existing) {
-            Ok(binding) => {
-                let ack = BindAckV1 {
-                    session: binding.session,
-                    expires_at: binding.expires_at,
-                    scope: binding.scope_ceiling,
-                    rule_generation: binding.rule_generation,
-                };
+        let binding = match verify_bind(&self.config, bind.token.as_slice(), clock, existing) {
+            Ok(b) => b,
+            Err(e) => return Ingress::Rejected(e),
+        };
+        let ack = bind_ack_frame(&BindAckV1 {
+            session: binding.session,
+            expires_at: binding.expires_at,
+            scope: binding.scope_ceiling,
+            rule_generation: binding.rule_generation,
+        })
+        .expect("bounded");
+        self.sessions_checked += 1;
+        let barrier = match policy.barrier(self.config.namespace(), &binding.session) {
+            Ok(b) => b,
+            // Replicated policy cannot be read, so whether the session
+            // exists is not known. Nothing is bound on a guess.
+            Err(_) => return Ingress::Rejected(BindError::Unavailable),
+        };
+        match barrier.session_record() {
+            Some(record) if binding.agrees_with(record) => {
                 self.bindings.insert(connection, binding);
-                Ingress::Bound(bind_ack_frame(&ack).expect("bounded"))
+                Ingress::Bound(ack)
             }
-            Err(e) => Ingress::Rejected(e),
+            Some(_) => Ingress::Rejected(BindError::SessionDisagrees),
+            None => self.establish(clock, connection, binding, ack),
         }
+    }
+
+    /// Submit the command that creates `binding`'s session and hold the
+    /// bind stream until it resolves.
+    fn establish(
+        &mut self,
+        clock: &ClockHealth,
+        connection: u64,
+        binding: Binding,
+        ack: Vec<u8>,
+    ) -> Ingress {
+        let retry_key = binding.establishment_key(&self.config);
+        // The operation carries nothing. Everything about the session
+        // is in the receipt, which travels beside the payload and is
+        // what every voter binds into the command it accepts.
+        let logical = LogicalRequest::new(
+            self.config.namespace(),
+            coord_types::logical_v1::CanonicalOperation::ConsumeAdmission,
+        );
+        let Ok(request) = RequestV1::new(retry_key, &logical, 0) else {
+            return Ingress::Rejected(BindError::Malformed);
+        };
+        let Ok(frame) = MessageV1::Request(request).encode() else {
+            return Ingress::Rejected(BindError::Malformed);
+        };
+        let admitted = AdmittedRequest {
+            receipt: binding.establishment(&self.config, clock.now),
+            frame,
+        };
+        match self
+            .dispatcher
+            .establish(clock.now, connection, &admitted, retry_key)
+        {
+            Ok(Action::FanOut(plan)) => {
+                self.establishing.insert(
+                    retry_key,
+                    Establishing {
+                        connection,
+                        binding,
+                        ack,
+                    },
+                );
+                Ingress::Establishing(Box::new(plan))
+            }
+            // Another connection is already establishing this very
+            // command. Its outcome is this one's too, but only one
+            // stream is attached to an invocation, so this caller is
+            // told to present its credential again rather than left
+            // waiting for an answer addressed elsewhere.
+            Ok(_) | Err(_) => Ingress::Rejected(BindError::Unavailable),
+        }
+    }
+
+    /// Settle a held bind stream from the establishment's outcome.
+    fn settle(
+        &mut self,
+        waiting: Establishing,
+        delivery: Delivery,
+        policy: &dyn PolicySource,
+    ) -> Delivered {
+        let Establishing {
+            connection,
+            binding,
+            ack,
+        } = waiting;
+        let outcome = match decode_stream(&delivery.frame).as_deref() {
+            Ok([MessageV1::Response(r)]) => match &r.outcome {
+                OutcomeV1::Ok { result, .. } => postcard::from_bytes::<Response>(result.as_slice())
+                    .ok()
+                    .map(|r| r.outcome),
+                _ => None,
+            },
+            _ => None,
+        };
+        let established = match outcome {
+            // The command this caller submitted created the session.
+            Some(Outcome::SessionCreated { session }) => session == binding.session,
+            // Somebody else's command got there first: the receipt or
+            // the session identity was already consumed. That is
+            // convergence, not failure -- but only if the row that
+            // exists is the session this credential describes, which
+            // current replicated state answers and this node does not.
+            Some(Outcome::ErrReceiptConsumed) => {
+                self.barrier_agrees(policy, &binding).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !established {
+            return Delivered::Unbound {
+                connection,
+                retry_key: delivery.retry_key,
+                reason: BindError::Unavailable,
+            };
+        }
+        self.bindings.insert(connection, binding);
+        Delivered::Answer(Delivery {
+            connection,
+            retry_key: delivery.retry_key,
+            frame: ack,
+        })
+    }
+
+    /// Whether current replicated state holds a session this binding may
+    /// be admitted under.
+    fn barrier_agrees(&mut self, policy: &dyn PolicySource, binding: &Binding) -> Option<bool> {
+        self.sessions_checked += 1;
+        let barrier = policy
+            .barrier(self.config.namespace(), &binding.session)
+            .ok()?;
+        Some(
+            barrier
+                .session_record()
+                .is_some_and(|r| binding.agrees_with(r)),
+        )
     }
 
     /// Bind the disclosure metadata of `key` to the command it was
@@ -237,15 +431,21 @@ impl BoundFrontend {
 
     /// Gate a delivery for `connection`'s session (a release, a retained
     /// result or a resolution) against a fresh barrier.
-    pub fn deliver(&mut self, delivery: Delivery, policy: &dyn PolicySource) -> Delivery {
+    pub fn deliver(&mut self, delivery: Delivery, policy: &dyn PolicySource) -> Delivered {
+        // An establishment's outcome is not output to gate: the caller
+        // it answers has no session yet, and what it gets back is the
+        // acknowledgement of the one this command created.
+        if let Some(waiting) = self.establishing.remove(&delivery.retry_key) {
+            return self.settle(waiting, delivery, policy);
+        }
         let Some((session, scope)) = self
             .bindings
             .get(&delivery.connection)
             .map(|b| (b.session, b.scope_ceiling))
         else {
-            return delivery;
+            return Delivered::Answer(delivery);
         };
-        self.gate(delivery, session, scope, policy)
+        Delivered::Answer(self.gate(delivery, session, scope, policy))
     }
 
     fn gate(
