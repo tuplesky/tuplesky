@@ -1126,3 +1126,43 @@ request to a quorum, counts the reports into a `SealCertificate`, or
 does anything with the terminal state afterwards. Selecting the terminal
 certificate is task-56 and activating the successor is task-57; task-54
 already says what each of those may conclude.
+
+## Make the disagreement impossible rather than detectable
+
+The terminal certificate binds everything the successor inherits into
+one root: the closed boundary, the shared checkpoint root of the common
+state, a digest of the selection at the seal cut, the floor lineage, and
+the exact successor incarnations. That last one is the interesting
+choice, and it is what the acceptance criterion "racing successor sets
+cannot both obtain authority" turns into.
+
+The alternative design is a certificate that names the successor beside
+the state and a rule that checks the two candidates agree. That rule has
+to live somewhere, be called on every path, and be right about what
+"agree" means. Binding the successor into the root instead means two
+coordinators proposing different successors produce different 32-byte
+roots, so the old voters' reports simply do not form a majority for
+either -- `MixedTerminal`, from the same code that rejects a disagreement
+about the KV boundary. There is no successor-comparison rule to forget
+to call.
+
+The same reasoning covers the rest of the acceptance list. "Partial or
+mixed-root evidence rejected" is not a check on partiality; it is what
+happens when a majority cannot be found for one root. "Latent old
+completion remains represented" is not a scan for stragglers; the
+closure digest covers the selection, so a terminal state that dropped a
+command chosen immediately before the fence is a different terminal
+state and no majority reports it.
+
+### Stability across a restart is a property of the row
+
+`publish_certificate` accepts the identical certificate and refuses any
+other for the same transition. That is the whole of "selection stable
+across restart": a replacement coordinator that recomputes -- from a
+different subset of reports, or at a different moment -- writes the same
+bytes or is refused. It cannot produce a second destination, and it does
+not need to know whether it is the first coordinator or the fifth.
+
+**Still missing:** nothing asks the old voters for their
+`TerminalStateV1`s and nothing gives the successor the state the root
+names. The certificate is the decision; carrying it out is task-57.
