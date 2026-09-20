@@ -386,7 +386,7 @@ fn main() -> ExitCode {
     // into the projection. It has happened by now, which is what makes
     // the next line true rather than hopeful.
     println!(
-        "storage projection={} journaled_through={:?} owed={}",
+        "storage projection={} journaled_through={:?} owed={} baseline={}",
         storage.generation.display(),
         storage
             .domain
@@ -397,6 +397,9 @@ fn main() -> ExitCode {
             .domain
             .store()
             .unmaterialized(placed.membership.domain()),
+        // What this node would recover from, and that it loads: the
+        // image was opened above, before the domain was attached.
+        storage.baseline.as_ref().map_or(0, |p| p.represented.get()),
     );
     lifecycle.observe(Readiness {
         storage_ready: true,
@@ -409,6 +412,7 @@ fn main() -> ExitCode {
     // problem and is the most expensive kind of misconfiguration to
     // find. This is the order that makes `live` mean it.
     let boot = storage.boot;
+    let checkpoints = storage.checkpoints;
     let applier = match coord_storage::Applier::new(
         storage.domain,
         coord_core::outbox::BarrierAllocator::new(placed.incarnation, boot),
@@ -499,7 +503,11 @@ fn main() -> ExitCode {
     } else {
         Vec::new()
     };
-    let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default());
+    let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default())
+        // Where this node keeps its own recovery images, and how much
+        // unrepresented journal it tolerates before making one. Local
+        // to this node: no replicated result depends on the answer.
+        .with_checkpoints(checkpoints, config.limits.checkpoint_after_records);
     println!(
         "frontend ready waiting={} voting={}",
         domain.waiting(),
@@ -591,6 +599,8 @@ fn main() -> ExitCode {
             domain.reachable(),
             domain.submittable(&transport)
         );
+        let (published, failed) = domain.checkpoints();
+        eprintln!("checkpoints published={published} failed={failed}");
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \

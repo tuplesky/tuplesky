@@ -1049,6 +1049,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             .collect()
     }
 
+    /// The record origin of a domain: the exact incarnation and stream
+    /// its records are sealed under.
+    ///
+    /// An image this node writes carries it, and a pointer of any other
+    /// origin is refused at publication -- so whoever builds one asks
+    /// here rather than assembling it from configuration, where a
+    /// stale incarnation would be indistinguishable from the current
+    /// one.
+    pub fn origin(&self, domain: DomainId) -> Option<RecordOrigin> {
+        self.domains.get(&domain).map(|d| d.origin)
+    }
+
     /// State of a domain's pipeline.
     pub fn status(&self, domain: DomainId) -> Option<DomainStatus> {
         self.domains.get(&domain).map(|d| d.status)
