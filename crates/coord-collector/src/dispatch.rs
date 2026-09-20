@@ -116,6 +116,43 @@ impl Dispatcher {
         &self.admission
     }
 
+    /// Submit an establishment the binding boundary admitted itself.
+    ///
+    /// It does not pass through the admission gate, and that is the
+    /// point: the gate asks what a caller's session admits, and this is
+    /// the command that creates the session. Asking it here would
+    /// require the very session being established. What authorizes the
+    /// submission is the receipt, minted by the boundary that verified
+    /// the credential; what decides whether the session exists is
+    /// replicated execution.
+    ///
+    /// The connection is attached to the invocation exactly as an
+    /// ordinary request is, so the outcome comes back on the stream
+    /// that asked for it.
+    pub fn establish(
+        &mut self,
+        now_ticks: u64,
+        connection: u64,
+        admitted: &coord_core::event::AdmittedRequest,
+        retry_key: RetryKey,
+    ) -> Result<Action, SubmitRefusal> {
+        match self.collector.submit(now_ticks, admitted)? {
+            Submitted::FanOut(fan_out) => {
+                self.attach(connection, retry_key);
+                Ok(Action::FanOut(fan_out))
+            }
+            Submitted::Attached { command } => {
+                self.attach(connection, retry_key);
+                Ok(Action::Pending { command })
+            }
+            Submitted::Resolved(response) => Ok(Action::Respond(Delivery {
+                connection,
+                retry_key,
+                frame: MessageV1::Response(response).encode().expect("bounded"),
+            })),
+        }
+    }
+
     /// Dispatch one frame of `connection` from `caller`.
     pub fn on_frame(
         &mut self,

@@ -51,6 +51,90 @@ enum Command {
     Init,
 }
 
+/// Write the domain's genesis policy: the trust rule its configured
+/// issuer signs under, and the permissions its genesis grants.
+///
+/// Part of initializing the domain, not of serving it. Permission is
+/// allow-only and a session exists only under a trust rule replicated
+/// policy holds enabled, so a domain initialized without these could
+/// establish no session and authorize no command -- and the command
+/// that would write them would itself need a session to be authorized.
+/// Every replica writes the same rows from the same configuration, as
+/// it does the genesis membership.
+///
+/// It is not an execution: the batch carries no application base and
+/// takes no execution position. Everything after genesis goes through
+/// ordered replicated commands.
+fn write_genesis_policy(
+    config: &Config,
+    storage: &mut store::Storage,
+    incarnation: coord_types::ids::ReplicaIncarnation,
+) -> Result<(), String> {
+    use coord_storage::Persistence;
+
+    let mut updates = Vec::new();
+    if let Some(sts) = &config.sts {
+        let rule = coord_daemon::config::identity_bytes(&sts.trust_rule)
+            .ok_or("sts.trust_rule is not an identity")?;
+        updates.push(
+            coord_storage::policy::bootstrap_trust_rule(&coord_types::ids::TrustRuleId(rule))
+                .map_err(|e| format!("the trust rule could not be encoded: {e:?}"))?,
+        );
+    }
+    for grant in &config.grant {
+        let principal = coord_daemon::config::identity_bytes(&grant.principal)
+            .ok_or("grant.principal is not an identity")?;
+        let namespace = coord_daemon::config::identity_bytes(&grant.namespace)
+            .ok_or("grant.namespace is not an identity")?;
+        updates.extend(
+            coord_storage::policy::bootstrap_grant(
+                coord_types::ids::PrincipalId(principal),
+                coord_types::ids::NamespaceId(namespace),
+            )
+            .map_err(|e| format!("a genesis grant could not be encoded: {e:?}"))?,
+        );
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let rows = updates.len();
+    let mut alloc = coord_core::outbox::BarrierAllocator::new(incarnation, storage.boot);
+    storage
+        .domain
+        .submit(
+            coord_core::effect::PersistBatch {
+                barrier: alloc.allocate(),
+                base: None,
+                updates,
+            },
+            coord_storage::journaled::TransitionKind::Protocol,
+        )
+        .map_err(|e| format!("the genesis policy was refused: {e:?}"))?;
+    // Durable before `init` reports success: a store that said it was
+    // initialized and was not would serve a domain that trusts nothing,
+    // and nothing later writes these rows.
+    for _ in 0..8 {
+        if storage.domain.queued() == 0 && storage.domain.unmaterialized() == 0 {
+            break;
+        }
+        let lowered = storage
+            .domain
+            .lower()
+            .map_err(|e| format!("the genesis policy could not be made durable: {e:?}"))?;
+        if lowered.indeterminate {
+            storage
+                .domain
+                .reconcile()
+                .map_err(|e| format!("the genesis policy could not be resolved: {e:?}"))?;
+        }
+    }
+    if storage.domain.queued() > 0 || storage.domain.unmaterialized() > 0 {
+        return Err("the genesis policy did not become durable".into());
+    }
+    println!("genesis policy rows={rows}");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
@@ -173,7 +257,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         return match opened.attach() {
-            Ok(storage) => {
+            Ok(mut storage) => {
+                if let Err(e) = write_genesis_policy(&config, &mut storage, placed.incarnation) {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
                 println!("initialized {}", storage.generation.display());
                 ExitCode::SUCCESS
             }

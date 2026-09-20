@@ -76,6 +76,10 @@ pub enum HashDomain {
     /// Message a voter signs to attest an endpoint or observer catalog
     /// (task-m01).
     ConfigurationCatalog,
+    /// Identity of a permission rule derived from what it permits, so a
+    /// rule a domain's genesis grants is the same row on every replica
+    /// (task-j09).
+    PolicyRuleIdentity,
 }
 
 impl HashDomain {
@@ -96,6 +100,7 @@ impl HashDomain {
             HashDomain::AdmissionReceipt => "tuplesky coord.v1 2026-09 admission-receipt",
             HashDomain::KineBinding => "tuplesky coord.v1 2026-09 kine-binding",
             HashDomain::ConfigurationRecord => "tuplesky coord.v1 2026-09 configuration-record",
+            HashDomain::PolicyRuleIdentity => "tuplesky coord.v1 2026-09 policy-rule-identity",
             HashDomain::ConfigurationActivation => {
                 "tuplesky coord.v1 2026-09 configuration-activation"
             }

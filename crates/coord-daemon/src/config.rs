@@ -172,6 +172,35 @@ pub struct StsConfig {
     /// Rotation replaces the file and is picked up by
     /// `BoundFrontend::set_jwks`, out of band.
     pub jwks: String,
+    /// The trust rule this issuer's service tokens name, as 32 lowercase
+    /// hex characters.
+    ///
+    /// A session is established under a trust rule that replicated
+    /// policy holds enabled at the generation the credential names, and
+    /// a domain that trusted nothing could establish no session -- the
+    /// first session cannot be the one that authorizes writing the rule
+    /// that would admit it. So the rule is written when the domain's
+    /// store is initialized, from this, and every replica writes the
+    /// same row. Disabling or regenerating it afterwards is ordinary
+    /// replicated administration, and invalidates the sessions admitted
+    /// under the old generation.
+    pub trust_rule: String,
+}
+
+/// A permission this domain's genesis grants.
+///
+/// Permission is allow-only and a fresh domain allows nothing, so
+/// without an initial grant the first administrative command would
+/// itself be unauthorized. Each grant gives one principal every action
+/// over the whole of one namespace; narrowing it, and granting anyone
+/// else, is replicated administration afterwards.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantConfig {
+    /// Principal, as 32 lowercase hex characters.
+    pub principal: String,
+    /// Namespace, as 32 lowercase hex characters.
+    pub namespace: String,
 }
 
 /// Where this node's own credentials and trust anchors are.
@@ -250,6 +279,9 @@ pub struct Config {
     /// dependency it never uses.
     #[serde(default)]
     pub sts: Option<StsConfig>,
+    /// Permissions this domain's genesis grants (see [`GrantConfig`]).
+    #[serde(default)]
+    pub grant: Vec<GrantConfig>,
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
@@ -286,6 +318,9 @@ pub enum ConfigError {
     ZeroRttEnabled,
     /// The production graph would include test keys or bypasses.
     TestBypassEnabled,
+    /// A field that must be an identity is not 32 lowercase hex
+    /// characters.
+    NotAnIdentity(&'static str),
     /// An engine or profile this build does not serve. A node never opens
     /// durable state under a name it does not implement: the manifest is
     /// what says what the bytes are, and a mismatch is a different store,
@@ -339,6 +374,27 @@ pub fn capability_covers(capability: &Capability, limits: &Limits) -> Result<(),
     Ok(())
 }
 
+/// The sixteen bytes `hex` names, or `None` if it is not exactly 32
+/// lowercase hex characters.
+///
+/// Lowercase only, and exactly the full width: an identity written two
+/// ways is two spellings of one row key waiting to be compared as
+/// strings somewhere.
+pub fn identity_bytes(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32
+        || hex
+            .chars()
+            .any(|c| !c.is_ascii_hexdigit() || c.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(core::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
 impl Config {
     /// Parse and validate a configuration from TOML text.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -363,6 +419,19 @@ impl Config {
         }
         if self.allow_test_bypasses {
             return Err(ConfigError::TestBypassEnabled);
+        }
+        if let Some(sts) = &self.sts
+            && identity_bytes(&sts.trust_rule).is_none()
+        {
+            return Err(ConfigError::NotAnIdentity("sts.trust_rule"));
+        }
+        for grant in &self.grant {
+            if identity_bytes(&grant.principal).is_none() {
+                return Err(ConfigError::NotAnIdentity("grant.principal"));
+            }
+            if identity_bytes(&grant.namespace).is_none() {
+                return Err(ConfigError::NotAnIdentity("grant.namespace"));
+            }
         }
         let roles = self.role_set()?;
         // A required listener has to be usable, not merely present: an

@@ -48,6 +48,7 @@ node_key = "/etc/coord/node.key"
 issuer = "https://sts.example"
 resource = "control-plane-a"
 jwks = "/etc/coord/sts-jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
 "#
     )
 }
@@ -128,6 +129,7 @@ node_key = "/n.key"
 issuer = "https://sts.example"
 resource = "d"
 jwks = "/jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
 "#;
     assert_eq!(
         Config::parse(auth_only),
@@ -686,7 +688,7 @@ fn a_process_that_serves_clients_is_configured_to_verify_them() {
     assert_eq!(sts.issuer, "https://sts.example");
 
     let without = base_config("").replace(
-        "\n[sts]\nissuer = \"https://sts.example\"\nresource = \"control-plane-a\"\njwks = \"/etc/coord/sts-jwks.json\"\n",
+        "\n[sts]\nissuer = \"https://sts.example\"\nresource = \"control-plane-a\"\njwks = \"/etc/coord/sts-jwks.json\"\ntrust_rule = \"7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c\"\n",
         "",
     );
     assert_ne!(without, base_config(""), "the fixture did not change");

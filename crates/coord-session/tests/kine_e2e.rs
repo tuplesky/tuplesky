@@ -247,6 +247,8 @@ async fn the_kubernetes_storage_edge_runs_against_the_real_domain() {
         issuer: ISSUER.into(),
         resource: RESOURCE.into(),
         jwks: ring.jwks(),
+        cluster: CLUSTER,
+        domain: DOMAIN,
     };
     let frontend_task = tokio::spawn(serve(transport, config));
 
