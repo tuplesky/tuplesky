@@ -950,6 +950,8 @@ pub enum TrimError {
         /// The offering replica.
         replica: ReplicaId,
     },
+    /// The handoff rules refused the evidence (task-56).
+    Handoff(coord_consensus::handoff::HandoffError),
 }
 
 impl fmt::Display for TrimError {

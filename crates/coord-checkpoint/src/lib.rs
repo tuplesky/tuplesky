@@ -64,6 +64,7 @@
 
 pub mod export;
 pub mod floor;
+pub mod handoff;
 pub mod install;
 pub mod local;
 pub mod maintain;
@@ -81,6 +82,10 @@ pub use local::{
 pub use floor::{
     ActivatedFloorV1, CheckpointReadinessV1, RecoveryObligation, activate_floor,
     publish_activation, read_readiness, record_readiness, recovery_obligation,
+};
+pub use handoff::{
+    TerminalCertificateV1, TerminalStateV1, publish_certificate, published_certificate,
+    select_certificate,
 };
 pub use maintain::{BaselineError, LocalBaseline, Publication};
 pub use store::{LocalCheckpointStore, StoreError};
