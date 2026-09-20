@@ -119,6 +119,24 @@ pub const KIND_SESSION_BIND_ACK: u16 = 0x0106;
 /// A frame of any other version is refused at the boundary.
 pub const SESSION_BIND_VERSION: u16 = 1;
 
+/// A trusted collector's submission to one voter (`spec/wire-v1.md`,
+/// "Collector frames"). Another raw kind of the API range, for the same
+/// reason as the binding above: its payload is
+/// `coord_collector::wire::SubmitV1`, which carries admission claims
+/// this crate does not know, so it is dispatched by kind at the
+/// collector boundary rather than through [`decode`].
+///
+/// The number lives here because the vocabulary is one registry: the
+/// transport admits exactly this kind on a request stream, from exactly
+/// a role that [`PeerRole::may_submit_for_clients`], and the collector
+/// boundary is what mints a receipt from it. Neither may name a
+/// different number, and a second registry is how they would come to.
+pub const KIND_COLLECTOR_SUBMIT: u16 = 0x0103;
+
+/// The only schema version of a collector submission this build
+/// understands.
+pub const COLLECTOR_SUBMIT_VERSION: u16 = 1;
+
 /// Registered message kinds with frozen discriminants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
@@ -624,6 +642,22 @@ pub enum PeerRole {
     Observer,
     /// Staging learner.
     Learner,
+}
+
+impl PeerRole {
+    /// Whether this role may make a submission on a client's behalf.
+    ///
+    /// The one definition of it. A collector submits work a client
+    /// asked for, carrying admission claims minted for that client's
+    /// session, so the authority to do it is the authority to speak for
+    /// somebody else -- and a voter, an observer or a client itself has
+    /// no such authority. The transport admits a submission stream on
+    /// this answer and the collector boundary mints the receipt on it;
+    /// two answers to the same question would be two doors, and a
+    /// cluster with two doors has the properties of the weaker one.
+    pub const fn may_submit_for_clients(self) -> bool {
+        matches!(self, PeerRole::Frontend | PeerRole::KineCollector)
+    }
 }
 
 /// First frame on a connection.

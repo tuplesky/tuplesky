@@ -188,6 +188,25 @@ pub struct IdentityConfig {
     pub node_certificate: String,
     /// Its private key.
     pub node_key: String,
+    /// The certificate this process presents when it acts as this
+    /// domain's trusted collector toward another voter's API plane.
+    ///
+    /// A node certificate binds exactly one role. A process that runs a
+    /// voter *and* that domain's frontend is two principals, and the
+    /// submission it makes on a client's behalf is the collector's, not
+    /// the voter's -- so it presents the collector's credential for it.
+    /// Without one such a process can still serve callers and still
+    /// deliver to a voter in its own process; it simply cannot submit
+    /// to a voter anywhere else, and is refused at startup for saying
+    /// so, rather than at the first request.
+    ///
+    /// Optional: a process with no frontend never submits, and a
+    /// single-voter domain has nobody to submit to.
+    #[serde(default)]
+    pub collector_certificate: Option<String>,
+    /// Its private key.
+    #[serde(default)]
+    pub collector_key: Option<String>,
 }
 
 /// The daemon configuration.

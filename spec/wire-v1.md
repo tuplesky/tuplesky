@@ -160,9 +160,23 @@ kind at the collector boundary, like peer evidence.
 | Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
 
 A voter admits `Submit` only from a connection bound to a collector role
-(`Frontend`, `KineCollector`); `Evidence` and `Release` are only ever
-sent by voters, and nothing received on an API-class connection is a
-vote. Frozen error codes of `ResponseV1::Err` are `wire_v1::codes` in
+(`Frontend`, `KineCollector`). That is checked twice, from one rule
+(`PeerRole::may_submit_for_clients`): the transport admits the stream
+only from such a role, before the frame is read, and the collector
+boundary mints the receipt only after checking it again. `Submit` is
+therefore the one raw kind whose admission depends on who is asking --
+its payload carries admission claims minted for another principal's
+session, so a client may not open the stream at all. `Evidence` and
+`Release` are only ever sent by voters, and nothing received on an
+API-class connection is a vote.
+
+A collector submits over an API-class connection it dialled, and a
+voter's evidence returns on that same connection, as output addressed to
+the collector that submitted -- not to whichever collector shares the
+voter's process. A process that runs both a voter and its domain's
+collector presents a collector credential when it dials, because a node
+certificate binds one role and the role that may act for other
+principals is not the voter's. Frozen error codes of `ResponseV1::Err` are `wire_v1::codes` in
 `coord-types` (`0x0001` request identity conflict, `0x0002`
 backpressure, `0x0003` malformed request, `0x0004` not admitted, `0x0005`
 result too large; append-only); pending and unknown outcomes use

@@ -39,6 +39,7 @@ use coord_core::effect::{BootId, PeerId};
 use coord_core::event::{AuthenticatedPeerMessage, Event, PeerProvenance};
 use coord_membership::membership::Membership;
 use coord_storage::Persistence;
+use coord_types::CommandId;
 use coord_types::ids::{Ballot, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{FrameReader, WireError};
 
@@ -73,6 +74,29 @@ pub fn collector_peer(membership: &Membership) -> Option<PeerId> {
     })
 }
 
+/// Where a submission came from, and therefore where its evidence goes.
+///
+/// A voter's evidence belongs to the collector that submitted the
+/// command, not to whichever collector happens to share its process. In
+/// a deployment where every node runs a frontend, sending it to the
+/// local one would give the caller's collector nothing to count and
+/// would hand a second collector evidence for a request it never made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// A collector in this process, through the voter's own ingress.
+    Local,
+    /// A collector on the other end of an API-class connection.
+    Connection(u64),
+}
+
+/// How many commands a voter remembers a collector for.
+///
+/// Bounded, because a collector that submitted and vanished must not
+/// cost this replica memory for ever. Falling out of the bound costs a
+/// caller its evidence and nothing else: the command is committed and
+/// durable either way, and the caller resolves it by identity.
+const ORIGINS: usize = 4096;
+
 /// Why a frame offered to a voter was not admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -89,6 +113,7 @@ pub struct Voter<P: Persistence> {
     ingress: Ingress,
     ballot: Ballot,
     provenance: PeerProvenance,
+    origins: alloc_map::Origins,
     /// Local submissions admitted since boot (diagnostic).
     pub admitted: u64,
     /// Local submissions refused at the door since boot (diagnostic).
@@ -110,6 +135,7 @@ impl<P: Persistence> Voter<P> {
             ingress,
             ballot,
             provenance,
+            origins: alloc_map::Origins::new(ORIGINS),
             admitted: 0,
             refused: 0,
         }
@@ -183,22 +209,37 @@ impl<P: Persistence> Voter<P> {
         )
     }
 
-    /// A submission a collector on the peer plane made.
+    /// A submission a collector made, from `origin`.
     ///
     /// The local route below uses this same function: past the door
-    /// there is one path.
+    /// there is one path. `origin` is not part of that path -- it never
+    /// reaches a machine and cannot change what a command is -- it only
+    /// says where this command's evidence is owed.
     pub fn on_submission(
         &mut self,
         submitter: coord_types::wire_v1::PeerRole,
         frame: &coord_types::wire_v1::Frame,
+        origin: Origin,
     ) -> Result<Result<Outbound, Refused>, DriveError> {
         let admitted = match admitted_from_submit(submitter, frame) {
             Ok(a) => a,
             Err(e) => return Ok(Err(Refused::NotAdmissible(e))),
         };
+        // The identity the machine will derive, derived the same way. A
+        // retry rebinds it: the same command submitted again through
+        // another collector is owed to that one, and a collector that
+        // went away is not owed anything.
+        if let Some(command) = command_of(&admitted.frame) {
+            self.origins.remember(command, origin);
+        }
         self.node
             .on_event(Event::Admitted(admitted), &self.ballot)
             .map(Ok)
+    }
+
+    /// Where this command's evidence is owed, if this voter admitted it.
+    pub fn origin_of(&self, command: &CommandId) -> Option<Origin> {
+        self.origins.get(command)
     }
 
     /// Take up to `budget` local submissions and give the voter its turn
@@ -223,16 +264,18 @@ impl<P: Persistence> Voter<P> {
                     self.refused += 1;
                     refused.push(Refused::Malformed(e));
                 }
-                Ok(frame) => match self.on_submission(self.ingress.submitter(), &frame)? {
-                    Ok(round) => {
-                        self.admitted += 1;
-                        out.absorb(round);
+                Ok(frame) => {
+                    match self.on_submission(self.ingress.submitter(), &frame, Origin::Local)? {
+                        Ok(round) => {
+                            self.admitted += 1;
+                            out.absorb(round);
+                        }
+                        Err(why) => {
+                            self.refused += 1;
+                            refused.push(why);
+                        }
                     }
-                    Err(why) => {
-                        self.refused += 1;
-                        refused.push(why);
-                    }
-                },
+                }
             }
         }
         Ok((out, refused))
@@ -241,6 +284,65 @@ impl<P: Persistence> Voter<P> {
     /// Apply every command whose turn has come.
     pub fn execute(&mut self) -> Result<Outbound, DriveError> {
         self.node.execute(&self.ballot)
+    }
+}
+
+/// The command a request frame is the submission of.
+///
+/// Derived from the request's own identity, exactly as the machine
+/// derives it, so the two cannot disagree about which command a frame
+/// became.
+fn command_of(frame: &[u8]) -> Option<CommandId> {
+    let coord_types::wire_v1::MessageV1::Request(request) =
+        coord_types::wire_v1::decode(&parse(frame).ok()?).ok()?
+    else {
+        return None;
+    };
+    let logical = request.logical().ok()?;
+    CommandId::derive(&request.retry_key, &logical).ok()
+}
+
+/// A bounded map of command to collector.
+mod alloc_map {
+    use std::collections::{BTreeMap, VecDeque};
+
+    use coord_types::CommandId;
+
+    use super::Origin;
+
+    /// Commands this voter admitted, and where each one's evidence is
+    /// owed, oldest forgotten first.
+    #[derive(Debug)]
+    pub struct Origins {
+        by_command: BTreeMap<CommandId, Origin>,
+        order: VecDeque<CommandId>,
+        bound: usize,
+    }
+
+    impl Origins {
+        pub fn new(bound: usize) -> Self {
+            Origins {
+                by_command: BTreeMap::new(),
+                order: VecDeque::new(),
+                bound: bound.max(1),
+            }
+        }
+
+        /// Bind `command` to `origin`, replacing any earlier binding.
+        pub fn remember(&mut self, command: CommandId, origin: Origin) {
+            if self.by_command.insert(command, origin).is_none() {
+                self.order.push_back(command);
+            }
+            while self.order.len() > self.bound {
+                if let Some(old) = self.order.pop_front() {
+                    self.by_command.remove(&old);
+                }
+            }
+        }
+
+        pub fn get(&self, command: &CommandId) -> Option<Origin> {
+            self.by_command.get(command).copied()
+        }
     }
 }
 

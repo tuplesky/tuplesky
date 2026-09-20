@@ -239,7 +239,38 @@ fn credentials_of_cluster(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
+    collector_credential(dir, &ca, replica);
     ca
+}
+
+/// The credential this process presents when it submits to another
+/// voter on a client's behalf.
+///
+/// A different certificate from the node's, because it is a different
+/// principal: a node certificate binds one role, and the role that may
+/// submit on a client's behalf is the collector's, not the voter's. It
+/// names the same node, so an operator can still see which process it
+/// is, and the genesis commits nothing about it -- what it proves is
+/// that this domain's issuer said this process may act as a collector.
+fn collector_credential(dir: &Path, ca: &Ca, replica: u8) {
+    let (certificate, key) = ca.issue(
+        SERVER_NAME,
+        CLUSTER,
+        replica,
+        coord_types::wire_v1::PeerRole::Frontend,
+    );
+    std::fs::write(
+        dir.join("collector.pem"),
+        pem("CERTIFICATE", certificate.der()),
+    )
+    .expect("collector cert");
+    let key_path = dir.join("collector.key");
+    std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).expect("collector key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
 }
 
 /// A signed endpoint catalog naming where each committed voter is.
@@ -249,26 +280,26 @@ fn credentials_of_cluster(
 /// this domain's because one of its committed voters signed it, and an
 /// address list nobody signed is nobody's.
 ///
-/// `addresses` gives voter n's `host:port`; the voters it omits are
-/// listed at an address nothing answers on, which is what makes them
-/// unreachable rather than unknown.
-fn endpoints(dir: &Path, ca: &Ca, count: u8, addresses: &[(u8, String)]) {
+/// `addresses` gives voter n's `host:port` list -- a node has two
+/// listeners and a catalog entry is one list, because which of them
+/// serves which plane is settled by dialling rather than declared. The
+/// voters it omits are listed at an address nothing answers on, which
+/// is what makes them unreachable rather than unknown.
+fn endpoints(dir: &Path, ca: &Ca, count: u8, addresses: &[(u8, Vec<String>)]) {
     use coord_types::config_v1::{EndpointCatalogV1, EndpointV1, VoterSignatureV1};
 
     let endpoints: Vec<EndpointV1> = (1u8..=count)
         .map(|n| EndpointV1 {
             node: coord_types::ids::ReplicaId([n; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("nonzero"),
-            addresses: vec![
-                addresses
-                    .iter()
-                    .find(|(who, _)| *who == n)
-                    .map(|(_, a)| a.clone())
-                    // Port 1 on loopback: a real address that resolves
-                    // and that nothing is listening on, so this voter is
-                    // unreachable rather than unknown.
-                    .unwrap_or_else(|| "127.0.0.1:1".to_owned()),
-            ],
+            addresses: addresses
+                .iter()
+                .find(|(who, _)| *who == n)
+                .map(|(_, a)| a.clone())
+                // Port 1 on loopback: a real address that resolves
+                // and that nothing is listening on, so this voter is
+                // unreachable rather than unknown.
+                .unwrap_or_else(|| vec!["127.0.0.1:1".to_owned()]),
             certificate_fingerprint: None,
         })
         .collect();
@@ -380,6 +411,8 @@ shards = 1
 trust_bundle = "{root}/roots.pem"
 node_certificate = "{root}/node.pem"
 node_key = "{root}/node.key"
+collector_certificate = "{root}/collector.pem"
+collector_key = "{root}/collector.key"
 
 [sts]
 issuer = "https://sts.test"
@@ -1582,6 +1615,7 @@ fn three_voters(dir: &Path) -> Cluster {
             std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod");
         }
+        collector_credential(&node, &ca, n);
         std::fs::write(
             node.join("sts-jwks.json"),
             serde_json::to_vec_pretty(&ring.jwks()).expect("jwks"),
@@ -1625,7 +1659,20 @@ fn three_voters(dir: &Path) -> Cluster {
         &ca,
         3,
         &(1u8..=3)
-            .map(|n| (n, format!("127.0.0.1:{}", peer[usize::from(n) - 1])))
+            .map(|n| {
+                let i = usize::from(n) - 1;
+                // Both of this node's listeners, in one entry. A voter
+                // dialling the peer plane and a collector dialling the
+                // api plane offer different ALPNs, so each one's wrong
+                // address fails to negotiate and the other is tried.
+                (
+                    n,
+                    vec![
+                        format!("127.0.0.1:{}", peer[i]),
+                        format!("127.0.0.1:{}", api[i]),
+                    ],
+                )
+            })
             .collect::<Vec<_>>(),
     );
 
@@ -1661,6 +1708,8 @@ shards = 1
 trust_bundle = "{node}/roots.pem"
 node_certificate = "{node}/node.pem"
 node_key = "{node}/node.key"
+collector_certificate = "{node}/collector.pem"
+collector_key = "{node}/collector.key"
 
 [sts]
 issuer = "https://sts.test"
@@ -1686,25 +1735,103 @@ jwks = "{node}/sts-jwks.json"
     }
 }
 
+/// A request is established by three separate processes agreeing.
+///
+/// This is the three-voter served-request gate, and it is a different
+/// claim from the single-voter one. There, the quorum was the one voter
+/// in the process that received the request, so every stage happened in
+/// one address space. Here the committed quorum is two of three, and
+/// the process the caller reached holds one vote: an answer comes back
+/// only if this node's frontend submitted to the other two as this
+/// domain's *collector* -- over the api plane, presenting the collector
+/// credential, because a node certificate binds one role and the role
+/// that may submit on a client's behalf is not the voter's -- and only
+/// if those voters' evidence came back to the collector that submitted
+/// rather than to the one sharing each of their processes, and met the
+/// committed quorum rule under their own committed identities.
+///
+/// None of that is a shortcut for a co-located voter. The frontend's
+/// own voter is reached through its bounded ingress instead of a
+/// socket, and contributes exactly one voter's evidence through the
+/// same collector validation as the other two.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_is_established_by_three_voters_agreeing() {
+    let dir = workspace("quorum");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0), "each store is made");
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "voter {} cannot submit to the other two:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
+    let Some(answer) = ask(&caller.connection, &caller.put(1, b"k", b"v")).await else {
+        panic!(
+            "three voters never established the request\n-- voter 1 --\n{}\n             -- voter 2 --\n{}\n-- voter 3 --\n{}",
+            running[0].said(),
+            running[1].said(),
+            running[2].said()
+        );
+    };
+    let response = response_of(&answer);
+
+    // The answer is about the command the caller asked for.
+    let mut logical = coord_types::logical_v1::LogicalRequest::new(
+        coord_types::ids::NamespaceId([0x5e; 16]),
+        coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    logical.canonicalize();
+    assert_eq!(
+        response.command_id,
+        coord_types::CommandId::derive(&caller.invocation(1), &logical).expect("derivable"),
+        "three voters answered with some other command's result"
+    );
+
+    // And it is the replicated execution's own result, decoded here.
+    // Its outcome is the fail-closed one every command gets until the
+    // session row exists (task-j09); what this test holds is that three
+    // processes agreed on it.
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+        panic!("the cluster answered with a transport-level error: {response:?}");
+    };
+    let executed: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+    assert_eq!(
+        executed.outcome,
+        coord_state::Outcome::ErrRejected {
+            reason: coord_state::RejectionReason::SessionInvalid
+        },
+        "the session row is not written by anything yet; see task-j09"
+    );
+}
+
 /// Three real daemons of one domain form a mesh on committed
-/// identities.
+/// identities, on both of their planes.
 ///
 /// Three processes, three certificates the genesis commits, three
-/// stores, and real QUIC between them. Each of them reads the same
-/// signed catalog, dials the two voters it names, and is accepted by
-/// them -- which happens only if the certificate on each end binds to a
-/// committed voter of this domain at its committed incarnation. A
-/// caller then binds against one of them, so the api plane is serving
-/// while the peer plane is up.
+/// stores, and real QUIC between them. Each reads the same signed
+/// catalog, which names both of every node's addresses without saying
+/// which is which, and ends up holding two kinds of link to each of the
+/// other two: a peer link it votes over, and an api link its own
+/// collector submits over. Each is established only if the certificate
+/// on the far end binds to a committed voter of this domain at its
+/// committed incarnation -- and, for the api link, only if the dialling
+/// side presented a collector credential rather than its voter one.
 ///
-/// This is the composition the served-request gate needs and is not yet
-/// that gate. A submission still reaches only the voter in the process
-/// that received it: a collector reaches a remote voter over the *api*
-/// plane, as an API-class client of it, and a remote voter's evidence
-/// has to return to the collector that submitted rather than to its own
-/// process's. Neither is wired, so two thirds of a quorum are
-/// unreachable to a submission and nothing is released. Task-j08's
-/// three-voter served request lands with that routing.
+/// A caller then binds against one of them, so the api plane is serving
+/// callers while it is also submitting to peers.
 #[tokio::test(flavor = "multi_thread")]
 async fn three_voters_form_a_mesh_on_committed_identities() {
     let dir = workspace("three");
@@ -1723,13 +1850,25 @@ async fn three_voters_form_a_mesh_on_committed_identities() {
     for (n, node) in running.iter().enumerate() {
         assert!(
             node.waits_to_say("peers connected=2 of 2"),
-            "voter {} did not reach both of its peers:\n{}",
+            "voter {} does not hold a peer link to both of its peers:\n{}",
             n + 1,
             node.said()
         );
         assert!(
-            !node.said().contains("cannot reach voter"),
-            "voter {} refused or was refused by a peer:\n{}",
+            node.waits_to_say("voters submittable=2 of 2"),
+            "voter {} cannot submit to both of its peers:\n{}",
+            n + 1,
+            node.said()
+        );
+        // A dial that found nothing listening yet, or found the node's
+        // other plane, is ordinary: an address is a hint, the two planes
+        // negotiate different ALPNs, and in a full mesh the peer's own
+        // dial establishes the link either way. What must not appear is
+        // an *identity* refusal -- a certificate this domain's committed
+        // configuration does not accept, on either end.
+        assert!(
+            !node.said().contains("Rejected(Rejected("),
+            "voter {} refused a peer's identity or had its own refused:\n{}",
             n + 1,
             node.said()
         );

@@ -24,7 +24,7 @@ use coord_core::outbox::BarrierAllocator;
 use coord_daemon::LocalIngress;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node};
-use coord_daemon::voter::{Refused, Voter};
+use coord_daemon::voter::{Origin, Refused, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
 use coord_state::policy::{Action as PolicyAction, KeyInterval, PolicyRule};
@@ -284,7 +284,7 @@ fn a_local_submission_and_a_wire_submission_produce_the_same_round() {
 
     let mut wire = leader(boot, IngressBudget::default());
     let over_the_wire = wire
-        .on_submission(PeerRole::Frontend, &frame(&bytes))
+        .on_submission(PeerRole::Frontend, &frame(&bytes), Origin::Connection(7))
         .expect("driven")
         .expect("admitted");
 
@@ -309,7 +309,7 @@ fn a_submitter_that_may_not_act_for_clients_is_refused_at_the_door() {
 
     for role in [PeerRole::Client, PeerRole::Voter, PeerRole::Observer] {
         let refused = voter
-            .on_submission(role, &frame(&submission(1)))
+            .on_submission(role, &frame(&submission(1)), Origin::Connection(7))
             .expect("driven")
             .expect_err("a non-collector may not submit for a client");
         assert!(
@@ -429,6 +429,82 @@ fn the_same_submission_twice_is_still_one_command() {
         second.peer.is_empty(),
         "the retry produced no second proposal: {second:?}"
     );
+}
+
+/// A voter remembers which collector submitted each command, so its
+/// evidence can go back to the one that is waiting for it.
+///
+/// In a deployment where every node runs a frontend, a voter that sent
+/// its evidence to whichever collector shares its process would give the
+/// caller's collector nothing to count -- and would hand a second
+/// collector evidence for a request it never made.
+///
+/// The binding is not part of the protocol: it never reaches a machine
+/// and cannot change what a command is. It is bounded, and a retry
+/// rebinds it, because the collector waiting now is the one that
+/// submitted last.
+#[test]
+fn a_voter_remembers_which_collector_is_owed_each_commands_evidence() {
+    let boot = BootId([7; 16]);
+    let mut voter = leader(boot, IngressBudget::default());
+
+    // One submitted locally, one over a connection.
+    voter.route().offer(&submission(1)).expect("room");
+    voter.serve_local(8).expect("served");
+    voter
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(2)),
+            Origin::Connection(9),
+        )
+        .expect("driven")
+        .expect("admitted");
+
+    let one = command_of(1);
+    let two = command_of(2);
+    assert_ne!(one, two, "different invocations are different commands");
+    assert_eq!(voter.origin_of(&one), Some(Origin::Local));
+    assert_eq!(voter.origin_of(&two), Some(Origin::Connection(9)));
+
+    // A command this voter never admitted is owed to nobody.
+    assert_eq!(voter.origin_of(&command_of(3)), None);
+
+    // A retry through another collector rebinds it: the one waiting now
+    // is the one that submitted last.
+    voter
+        .on_submission(
+            PeerRole::Frontend,
+            &frame(&submission(1)),
+            Origin::Connection(4),
+        )
+        .expect("driven")
+        .expect("admitted");
+    assert_eq!(voter.origin_of(&one), Some(Origin::Connection(4)));
+}
+
+/// The command identity `submission(sequence)` becomes.
+fn command_of(sequence: u64) -> coord_types::CommandId {
+    let mut logical = LogicalRequest::new(
+        NS,
+        CanonicalOperation::Put(PutOp {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    logical.canonicalize();
+    coord_types::CommandId::derive(
+        &RetryKey {
+            cluster_id: CLUSTER,
+            domain_id: DOMAIN,
+            session_id: SESSION,
+            client_instance_id: ClientInstanceId([4; 16]),
+            request_sequence: RequestSequence::new(sequence).unwrap(),
+        },
+        &logical,
+    )
+    .expect("derivable")
 }
 
 /// The short path is short in one way only. A submission that arrived

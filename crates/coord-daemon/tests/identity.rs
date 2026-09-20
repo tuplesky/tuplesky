@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use coord_daemon::config::IdentityConfig;
 use coord_daemon::identity::{IdentityError, load};
+use coord_transport::Class;
 use coord_types::ids::{ClusterId, DomainId};
 
 const CLUSTER: ClusterId = ClusterId([1; 16]);
@@ -73,7 +74,7 @@ fn pem(label: &str, der: &[u8]) -> Vec<u8> {
 /// type that will eventually do so in a log line. So a test states what
 /// it means -- which refusal came back -- rather than comparing results.
 fn refusal(config: &IdentityConfig) -> Option<IdentityError> {
-    load(config, CLUSTER, DOMAIN, Vec::new()).err()
+    load(config, CLUSTER, DOMAIN, Vec::new(), Class::Peer, None).err()
 }
 
 /// A real certificate and its key, so a good case is actually good
@@ -95,6 +96,8 @@ fn config(dir: &std::path::Path, key_mode: u32) -> IdentityConfig {
         trust_bundle: write(dir, "roots.pem", &certificate, 0o644),
         node_certificate: write(dir, "node.pem", &certificate, 0o644),
         node_key: write(dir, "node.key", &key, key_mode),
+        collector_certificate: None,
+        collector_key: None,
     }
 }
 
@@ -103,13 +106,102 @@ fn config(dir: &std::path::Path, key_mode: u32) -> IdentityConfig {
 #[test]
 fn credentials_this_account_holds_are_loaded() {
     let dir = dir();
-    let identity =
-        load(&config(&dir, 0o600), CLUSTER, DOMAIN, vec![0x0011]).expect("the credentials load");
+    let identity = load(
+        &config(&dir, 0o600),
+        CLUSTER,
+        DOMAIN,
+        vec![0x0011],
+        Class::Peer,
+        None,
+    )
+    .expect("the credentials load");
     assert_eq!(identity.cluster, CLUSTER);
     assert_eq!(identity.domain, DOMAIN);
     assert_eq!(identity.capabilities, vec![0x0011]);
     assert_eq!(identity.chain.len(), 1, "the chain is what was presented");
     assert!(!identity.roots.is_empty(), "the roots are what was trusted");
+}
+
+/// A process that is more than one principal presents more than one
+/// credential.
+///
+/// A node certificate binds exactly one role, and a process that runs a
+/// voter and that domain's collector acts as both. The collector's
+/// credential is what it presents when it dials another voter to submit
+/// on a client's behalf; what it *serves* as is unchanged, which is why
+/// this is a separate chain rather than a replacement for the node's.
+#[test]
+fn a_collector_credential_is_loaded_beside_the_nodes() {
+    let dir = dir();
+    let (certificate, key) = credentials();
+    let mut both = config(&dir, 0o600);
+    both.collector_certificate = Some(write(&dir, "collector.pem", &certificate, 0o644));
+    both.collector_key = Some(write(&dir, "collector.key", &key, 0o600));
+
+    let identity = load(&both, CLUSTER, DOMAIN, Vec::new(), Class::Api, None).expect("both load");
+
+    assert!(
+        identity.api_client.is_some(),
+        "the collector credential was named and not loaded"
+    );
+    assert!(
+        load(
+            &config(&dir, 0o600),
+            CLUSTER,
+            DOMAIN,
+            Vec::new(),
+            Class::Api,
+            None
+        )
+        .expect("the node alone loads")
+        .api_client
+        .is_none(),
+        "a process that named no collector credential acquired one"
+    );
+}
+
+/// Half a credential is not a credential.
+///
+/// A certificate with no key cannot be presented and a key with no
+/// certificate names nobody. Either way the process would fall back to
+/// presenting the node's certificate -- a different principal, with a
+/// different role -- so it is refused at startup instead.
+#[test]
+fn half_a_collector_credential_is_refused() {
+    let dir = dir();
+    let (certificate, key) = credentials();
+
+    let mut certificate_only = config(&dir, 0o600);
+    certificate_only.collector_certificate = Some(write(&dir, "c.pem", &certificate, 0o644));
+    assert_eq!(
+        refusal(&certificate_only),
+        Some(IdentityError::HalfACollectorCredential)
+    );
+
+    let mut key_only = config(&dir, 0o600);
+    key_only.collector_key = Some(write(&dir, "c.key", &key, 0o600));
+    assert_eq!(
+        refusal(&key_only),
+        Some(IdentityError::HalfACollectorCredential)
+    );
+}
+
+/// The collector's key is held to the same rule as the node's: a key
+/// other accounts can read is a key that has already left this process.
+#[test]
+#[cfg(unix)]
+fn a_collector_key_other_accounts_can_read_is_refused() {
+    let dir = dir();
+    let (certificate, key) = credentials();
+    let mut shared = config(&dir, 0o600);
+    shared.collector_certificate = Some(write(&dir, "collector.pem", &certificate, 0o644));
+    let path = write(&dir, "collector.key", &key, 0o644);
+    shared.collector_key = Some(path.clone());
+
+    assert_eq!(
+        refusal(&shared),
+        Some(IdentityError::KeyIsShared { path, mode: 0o644 })
+    );
 }
 
 /// A private key other accounts can read has already left this process's

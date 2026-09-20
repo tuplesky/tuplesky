@@ -65,6 +65,15 @@ impl TestIdentity {
             key: self.key.clone_key(),
             roots: ca.roots(),
             capabilities,
+            // One certificate, one principal: a test endpoint dials as
+            // whatever it serves as.
+            api_client: None,
+            // And one endpoint is both planes here, so it offers both
+            // ALPNs; a deployment's two listeners each offer their own.
+            serves: None,
+            // The identity this fixture's certificate names, so a test
+            // mesh settles a dial collision the way a deployment does.
+            replica: Some(self.replica),
         }
     }
 

@@ -218,12 +218,38 @@ fn main() -> ExitCode {
         peers.len(),
         placed.membership.voters().count().saturating_sub(1)
     );
+    // A frontend submits on a client's behalf, and that is the
+    // collector's authority, not the node's. A node certificate binds
+    // one role, so a process that serves callers and has other voters
+    // to submit to needs the collector credential as well -- and is
+    // refused here, before a listener exists, rather than at the first
+    // request it could admit and then not deliver.
+    if roles.needs_api_listener()
+        && !peers.is_empty()
+        && config.identity.collector_certificate.is_none()
+    {
+        eprintln!(
+            "this process serves clients and submits to {} other voter(s), \
+             and names no collector credential to submit as",
+            peers.len()
+        );
+        return ExitCode::from(2);
+    }
     let frontend = match serve::Frontend::new(&config, placed.membership.clone(), local) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
+    };
+    // The voters this process's own collector submits to. The same
+    // voters the peer plane dials, reached on their other listener as
+    // an API-class client: a submission is a collector's frame and a
+    // vote is a voter's, and they are not the same conversation.
+    let links = if roles.needs_api_listener() {
+        peers.clone()
+    } else {
+        Vec::new()
     };
     let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default());
     println!(
@@ -292,23 +318,33 @@ fn main() -> ExitCode {
                 eprintln!("this node votes alongside peers but bound no peer listener");
                 return ExitCode::from(2);
             };
-            let plane = match serve::peer_endpoint(&config, &placed.membership, socket) {
-                Ok(t) => {
-                    serve::PeerPlane::new(t, placed.membership.domain(), placed.incarnation, peers)
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::from(2);
-                }
-            };
+            let plane =
+                match serve::peer_endpoint(&config, &placed.membership, socket, placed.replica) {
+                    Ok(t) => serve::PeerPlane::new(
+                        t,
+                        placed.membership.domain(),
+                        placed.incarnation,
+                        peers,
+                    ),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                };
             domain = domain.with_peers(plane);
         }
+        domain = domain.with_links(serve::CollectorLinks::new(links));
         domain.run(&mut transport, now_seconds).await;
-        eprintln!("peers connected={}", domain.reachable());
+        eprintln!(
+            "peers connected={} submittable={}",
+            domain.reachable(),
+            domain.submittable(&transport)
+        );
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
-saturated={} unavailable={} refused={} released={} watches={} unserved={}",
+saturated={} unavailable={} refused={} released={} returned={} unreturnable={} \
+watches={} unserved={}",
             counts.queued_local,
             counts.queued_remote,
             counts.not_a_voter,
@@ -316,6 +352,8 @@ saturated={} unavailable={} refused={} released={} watches={} unserved={}",
             counts.unavailable,
             counts.refused,
             counts.released,
+            counts.returned,
+            counts.unreturnable,
             counts.watches,
             counts.unserved
         );

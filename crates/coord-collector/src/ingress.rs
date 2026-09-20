@@ -25,8 +25,12 @@ pub enum IngressError {
 }
 
 /// Whether `role` is an authorized collector.
+///
+/// The role vocabulary's own answer, not a second copy of it: the
+/// transport admits a submission stream on exactly this rule, and a
+/// rule that was written down twice would eventually be two rules.
 pub const fn is_collector(role: PeerRole) -> bool {
-    matches!(role, PeerRole::Frontend | PeerRole::KineCollector)
+    role.may_submit_for_clients()
 }
 
 /// Turn a collector's `Submit` into the admitted request the consensus
