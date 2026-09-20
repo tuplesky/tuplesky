@@ -926,3 +926,61 @@ Installing a selected image into a fresh generation is written and
 tested (`install_local`), but nothing on the serving path chooses to do
 it yet: a node whose projection is intact attaches the live one, and
 recovery *from* the image is what task-j05 qualifies under real faults.
+
+## A promise is not a copy, and that is the whole floor protocol
+
+Task-51 trims when every configured voter has acknowledged the same
+checkpoint. Task-53 trims when a majority has *promised* about it, and
+the difference between those two verbs is where all the difficulty is.
+
+`CheckpointAckV1` says "I have these bytes". It was always documented as
+possession and never as authority, and that turned out to be exactly
+right: a certificate built from possession binds nobody. The holder
+crashes, comes back with its old baseline, and votes from history the
+cluster has already agreed to forget -- and every other voter's
+acknowledgement was correct throughout. `CheckpointReadinessV1` says "I
+have these bytes, and I will never again vote from below this boundary",
+and it is durable before it is told to anybody, because a promise that is
+not durable is not a promise.
+
+Two rules make the rest work, and neither is obvious from the outside.
+
+**A voter never promises about two checkpoints at one boundary.** That
+single refusal, in one voter's own ledger, is what makes at most one
+subject per boundary certifiable anywhere: two certificates would need
+two majorities, and two majorities of one voter set intersect in a voter
+that would have had to promise twice at one position. Without it the
+bounded model finds two majorities certifying different state at the
+same executed prefix in a three-voter configuration.
+
+**A recovery reads promises, not certificates.** A signer promised before
+any certificate existed and keeps the promise whether or not it ever saw
+one, so the promises are the evidence that is actually guaranteed to be
+there. `recovery_obligation` therefore refuses to answer from fewer than
+a majority of distinct voters: that refusal is the protocol, not caution.
+A narrower read can miss the highest floor entirely, and the replica that
+missed it would vote from a discarded baseline while believing itself
+current.
+
+### What is deliberately *not* part of a floor
+
+A ballot, and its leader. A floor belongs to a configuration and outlives
+every term in it; requiring the leader would bind a durable cross-ballot
+fact to a leadership that changes underneath it, and it would buy
+nothing, because the intersection that makes discovery work is between
+two majorities of the same voter set and those intersect whoever leads.
+
+### What task-51 keeps
+
+Everything after the floor exists. `ActivatedFloorV1::trim_floor` yields
+the same `TrimmedFloorV1` the all-voter path publishes, so the fence, the
+bounded survey, the pinning rules and the deletions are one
+implementation with two ways of authorizing it. The all-voter path is
+untouched and still available; what a deployment chooses between them is
+an availability decision, not a correctness one.
+
+**Still missing:** nothing proposes candidates or collects promises over
+the wire yet, so a floor is certified from readiness a caller already
+has. Wiring the prepare round into the peer plane, and fetching the
+checkpoint a `RecoveryObligation::Install` names, are the parts task-57
+and the membership workstream need and are not yet built.

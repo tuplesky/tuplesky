@@ -35,9 +35,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use coord_consensus::floor::{
-    ActivationError, FenceVerdict, FloorCandidate, FloorInstall, FloorLedger, FloorVoters,
-    Readiness, ReadinessError, ReadinessLedger, activate, discover,
+    ActivationError, FenceVerdict, FloorCandidate, FloorInstall, FloorLedger, Readiness,
+    ReadinessError, ReadinessLedger, activate, discover,
 };
+use coord_consensus::quorum::EpochVoters;
 use coord_types::identity::Digest32;
 use coord_types::ids::{ConfigurationEpoch, ExecutionPosition, ReplicaId};
 use serde::Serialize;
@@ -58,8 +59,8 @@ fn at(position: u64, subject: u8) -> FloorCandidate {
     }
 }
 
-fn voters(n: u8) -> FloorVoters {
-    FloorVoters::new(epoch(), (0..n).map(r).collect()).unwrap()
+fn voters(n: u8) -> EpochVoters {
+    EpochVoters::new(epoch(), (0..n).map(r).collect()).unwrap()
 }
 
 fn fixture(name: &str, value: &impl Serialize) {

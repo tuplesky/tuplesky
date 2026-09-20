@@ -146,7 +146,7 @@ impl CheckpointAckV1 {
     }
 
     /// What must be identical across voters: the checkpoint itself.
-    fn subject(&self) -> (ConfigurationEpoch, CheckpointBoundary, Digest32) {
+    pub(crate) fn subject(&self) -> (ConfigurationEpoch, CheckpointBoundary, Digest32) {
         (self.configuration, self.boundary, self.root)
     }
 
@@ -543,11 +543,11 @@ impl TrimLimits {
         Ok(())
     }
 
-    fn page_rows(&self) -> std::num::NonZeroU32 {
+    pub(crate) fn page_rows(&self) -> std::num::NonZeroU32 {
         std::num::NonZeroU32::new(self.page_rows.max(1)).expect("non-zero")
     }
 
-    fn page_bytes(&self) -> std::num::NonZeroU32 {
+    pub(crate) fn page_bytes(&self) -> std::num::NonZeroU32 {
         std::num::NonZeroU32::new(self.page_bytes.max(1)).expect("non-zero")
     }
 }
@@ -914,6 +914,38 @@ pub enum TrimError {
     /// Limits that would make a step unbounded, or that allow the store to
     /// outgrow one survey.
     InvalidLimits,
+    /// Fewer than a majority of the configuration's voters (task-53).
+    ///
+    /// On certification it means the floor is not certified yet; on
+    /// recovery it means the reports were read too narrowly to be
+    /// trusted, which is a refusal rather than an absence -- a narrower
+    /// read can miss the highest floor entirely.
+    NoQuorum {
+        /// Distinct voters offered or reporting.
+        have: usize,
+        /// A majority of the configuration.
+        need: usize,
+    },
+    /// A voter was asked to promise about a boundary below the one it
+    /// already promised. Promises only move up (task-53).
+    ReadinessRegressed {
+        /// What it already holds.
+        held: ExecutionPosition,
+        /// What it was offered.
+        offered: ExecutionPosition,
+    },
+    /// A voter was asked to promise about a second checkpoint at a
+    /// boundary it is already ready for. Refusing this, once, is what
+    /// makes at most one subject per boundary certifiable (task-53).
+    ReadinessCompeting {
+        /// The contested boundary.
+        position: ExecutionPosition,
+    },
+    /// A replica outside the configured voter set offered readiness.
+    NonVoterReadiness {
+        /// The offering replica.
+        replica: ReplicaId,
+    },
 }
 
 impl fmt::Display for TrimError {
@@ -933,11 +965,11 @@ impl From<EngineError> for TrimError {
     }
 }
 
-fn corrupt(what: &'static str) -> EngineError {
+pub(crate) fn corrupt(what: &'static str) -> EngineError {
     EngineError::new(ErrorClass::Corrupt, what)
 }
 
-fn encode_record<T: Serialize>(
+pub(crate) fn encode_record<T: Serialize>(
     kind: u16,
     value: &T,
     what: &'static str,
@@ -952,7 +984,7 @@ fn encode_record<T: Serialize>(
     .encode()
 }
 
-fn decode_record<T: for<'de> Deserialize<'de>>(
+pub(crate) fn decode_record<T: for<'de> Deserialize<'de>>(
     kind: u16,
     bytes: &[u8],
     what: &'static str,
