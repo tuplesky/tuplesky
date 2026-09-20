@@ -85,6 +85,28 @@ impl ProtocolMessage {
         postcard::to_allocvec(self).expect("bounded message")
     }
 
+    /// The command this message is evidence about, where it is evidence.
+    ///
+    /// A runtime that has to say which caller's submission a frame
+    /// belongs to needs this: in a deployment with more than one
+    /// collector, a voter's evidence goes back to the collector that
+    /// submitted, and the command is what says which one that was. It is
+    /// `None` for everything that is about a ballot or a replica rather
+    /// than about one command.
+    pub const fn command(&self) -> Option<CommandId> {
+        match self {
+            ProtocolMessage::Proposal(a) | ProtocolMessage::FastAck(a) => Some(a.command),
+            ProtocolMessage::SlowAck(a) => Some(a.command),
+            ProtocolMessage::LeaderReply { command, .. }
+            | ProtocolMessage::PayloadResponse { command, .. } => Some(*command),
+            ProtocolMessage::NewLeader { .. }
+            | ProtocolMessage::Promise { .. }
+            | ProtocolMessage::ReportPage(_)
+            | ProtocolMessage::PayloadRequest { .. }
+            | ProtocolMessage::Sync(_) => None,
+        }
+    }
+
     /// Decode exactly one message.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let (m, rest): (ProtocolMessage, &[u8]) =

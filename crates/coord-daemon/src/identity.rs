@@ -25,8 +25,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use coord_transport::LocalIdentity;
-use coord_types::ids::{ClusterId, DomainId};
+use coord_transport::{Class, ClientIdentity, LocalIdentity};
+use coord_types::ids::{ClusterId, DomainId, ReplicaId};
 use rustls::RootCertStore;
 use rustls::server::WebPkiClientVerifier;
 use rustls::sign::CertifiedKey;
@@ -66,6 +66,12 @@ pub enum IdentityError {
         /// The path, as configured.
         path: String,
     },
+    /// One half of the collector credential is named and the other is
+    /// not. A certificate without its key cannot be presented, and a
+    /// key without its certificate names nobody; either way the process
+    /// would silently fall back to submitting as the node, which is a
+    /// different principal.
+    HalfACollectorCredential,
     /// The private key is readable by someone other than this process's
     /// own account.
     KeyIsShared {
@@ -104,6 +110,10 @@ impl core::fmt::Display for IdentityError {
             IdentityError::UntrustedRoot { path } => {
                 write!(f, "a root in the bundle at {path} is not usable as one")
             }
+            IdentityError::HalfACollectorCredential => f.write_str(
+                "a collector credential needs both its certificate and its key, \
+                 and this configuration names one of the two",
+            ),
             IdentityError::KeyIsShared { path, mode } => write!(
                 f,
                 "the private key at {path} is readable beyond this account (mode {mode:o})"
@@ -124,17 +134,21 @@ impl core::error::Error for IdentityError {}
 
 /// Read the credentials `config` names and build the local identity.
 ///
-/// `capabilities` are the lane capabilities this endpoint grants; they
-/// come from the role, not from a file.
+/// `capabilities` are the lane capabilities this endpoint grants and
+/// `serves` is the plane it listens on; both come from the role, not
+/// from a file. `replica` is this node's own identity where it has one,
+/// which the endpoint uses only to settle a dial collision with a peer.
 pub fn load(
     config: &IdentityConfig,
     cluster: ClusterId,
     domain: DomainId,
     capabilities: Vec<u16>,
+    serves: Class,
+    replica: Option<ReplicaId>,
 ) -> Result<LocalIdentity, IdentityError> {
     let roots = read_certificates("trust bundle", &config.trust_bundle)?;
     let chain = read_certificates("node certificate", &config.node_certificate)?;
-    private_key_is_this_accounts(&config.node_key)?;
+    private_key_is_this_accounts("node key", &config.node_key)?;
     let key = PrivateKeyDer::from_pem_file(&config.node_key)
         .map_err(|e| pem_error("node key", &config.node_key, &e))?;
 
@@ -152,50 +166,28 @@ pub fn load(
         key,
         roots: Arc::new(store),
         capabilities,
+        api_client: collector_credential(config)?,
+        serves: Some(serves),
+        replica,
     })
 }
 
-/// Check that `identity` is one this domain vouches for: its leaf chains
-/// to its own trust bundle, and its private key is the leaf's.
+/// The credential this process presents when it dials another voter as
+/// this domain's collector.
 ///
-/// The node's replica and incarnation are read out of its certificate,
-/// so the certificate is only an identity once something trusted issued
-/// it. A self-signed leaf that merely claims a voter's node URI would
-/// otherwise open, or initialize, that voter's store before any peer ever
-/// saw the handshake that would have refused it; and a leaf whose key
-/// this process does not hold would pass every local check and fail only
-/// at the first handshake, where it reads as a peer problem. `config`
-/// names the files, for the refusal.
-pub fn verify(identity: &LocalIdentity, config: &IdentityConfig) -> Result<(), IdentityError> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let not_issued = |reason: String| IdentityError::NotIssuedByTrustBundle {
-        path: config.node_certificate.clone(),
-        reason,
+/// Read here, at startup, with the same key-permission rule as the
+/// node's own: a credential this process would present is a credential
+/// this process must hold alone.
+fn collector_credential(config: &IdentityConfig) -> Result<Option<ClientIdentity>, IdentityError> {
+    let (certificate, key) = match (&config.collector_certificate, &config.collector_key) {
+        (Some(c), Some(k)) => (c, k),
+        (None, None) => return Ok(None),
+        _ => return Err(IdentityError::HalfACollectorCredential),
     };
-    let (leaf, intermediates) = identity.chain.split_first().ok_or(IdentityError::Empty {
-        what: "node certificate",
-        path: config.node_certificate.clone(),
-    })?;
-    // The same verifier the transport authenticates peers with, so a
-    // certificate this accepts is one every peer holding the same bundle
-    // accepts too.
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(identity.roots.clone(), provider.clone())
-            .build()
-            .map_err(|e| not_issued(e.to_string()))?;
-    verifier
-        .verify_client_cert(leaf, intermediates, UnixTime::now())
-        .map_err(|e| not_issued(e.to_string()))?;
-    let mismatch = || IdentityError::KeyDoesNotMatchCertificate {
-        path: config.node_key.clone(),
-    };
-    let certified =
-        CertifiedKey::from_der(identity.chain.clone(), identity.key.clone_key(), &provider)
-            .map_err(|_| mismatch())?;
-    // `from_der` lets through a key whose public half it cannot derive;
-    // here that is a question that must be answered, so an unknown is a
-    // refusal too.
-    certified.keys_match().map_err(|_| mismatch())
+    let chain = read_certificates("collector certificate", certificate)?;
+    private_key_is_this_accounts("collector key", key)?;
+    let key = PrivateKeyDer::from_pem_file(key).map_err(|e| pem_error("collector key", key, &e))?;
+    Ok(Some(ClientIdentity { chain, key }))
 }
 
 /// Every certificate in a PEM file, refusing a file that holds none.
@@ -246,11 +238,11 @@ fn pem_error(
 /// before the key is read: a key that has already been disclosed is not
 /// made safer by this process parsing it successfully.
 #[cfg(unix)]
-fn private_key_is_this_accounts(path: &str) -> Result<(), IdentityError> {
+fn private_key_is_this_accounts(what: &'static str, path: &str) -> Result<(), IdentityError> {
     use std::os::unix::fs::PermissionsExt;
 
     let metadata = std::fs::metadata(Path::new(path)).map_err(|e| IdentityError::Unreadable {
-        what: "node key",
+        what,
         path: path.to_owned(),
         reason: e.to_string(),
     })?;
@@ -265,13 +257,13 @@ fn private_key_is_this_accounts(path: &str) -> Result<(), IdentityError> {
 }
 
 #[cfg(not(unix))]
-fn private_key_is_this_accounts(path: &str) -> Result<(), IdentityError> {
+fn private_key_is_this_accounts(what: &'static str, path: &str) -> Result<(), IdentityError> {
     // Elsewhere the file's reachability is all that can be checked here;
     // the platform's own access control is what holds the key.
     std::fs::metadata(Path::new(path))
         .map(|_| ())
         .map_err(|e| IdentityError::Unreadable {
-            what: "node key",
+            what,
             path: path.to_owned(),
             reason: e.to_string(),
         })

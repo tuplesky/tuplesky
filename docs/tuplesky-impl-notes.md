@@ -510,32 +510,197 @@ caller's close was swallowed as a peer's. The planes have separate
 handlers now, and which plane an event arrived on is carried from the
 `select!` arm that produced it rather than inferred.
 
-## What the three-voter served request still needs
+## A process that serves clients and votes is two principals
 
-`coordd` forms a real mesh: three processes, three committed
-certificates, real QUIC, each accepted by the other two. A submission
-still reaches only the voter in the process that received it, and the
-reason is worth writing down because it is two pieces of wiring rather
-than one.
+**Where:** `coord-transport/src/config.rs` (`ClientIdentity`),
+`coord-daemon/src/identity.rs`, `bins/coordd/src/serve.rs`.
+
+A node certificate binds exactly one role: `PeerBinder` refuses a
+`Hello` that declares any role other than the certificate's own
+node-identity URI. So a `coordd` running `role = "voter-frontend-..."`
+holds a voter certificate and, with only that, cannot present itself as
+a collector to anybody.
+
+That matters because a submission is the *collector's*, not the
+voter's. It carries admission claims minted for a client's session, and
+`admitted_from_submit` admits it only from a role that may act for other
+principals. Two ways out were available and only one of them is a
+design:
+
+* Let a voter submit on a client's behalf. That would give every voter
+  the authority to mint admission claims for any session -- a second,
+  weaker way into the protocol, which is exactly what the co-located
+  route was written to avoid.
+* Let the process present the credential of the principal it is acting
+  as. A node certificate when it votes; a collector certificate when it
+  submits. What it *serves* as is the node either way, because a caller
+  validating this node's server certificate is talking to the node.
+
+The second. `LocalIdentity::api_client` carries the credential the
+endpoint presents when it *dials* an API-class peer, which the endpoint
+already had the shape for: `client_tls[0]` and `client_tls[1]` were
+always separate, one per class. The configuration names it as
+`identity.collector_certificate` and `identity.collector_key`; naming
+one of the two, or neither where the process serves clients and has
+other voters to submit to, is refused at startup rather than at the
+first request it could admit and then not deliver.
+
+Nothing commits the collector certificate the way genesis commits a
+voter's key. It does not need to: what it proves is that this domain's
+issuer said this process may act as a collector, and the receipt is
+still minted at the collector boundary on the role the certificate
+carries.
+
+## One listener, one plane, one ALPN
+
+**Where:** `coord-transport/src/endpoint.rs`, `LocalIdentity::serves`.
+
+Every endpoint advertised both ALPNs. The design says an address is a
+hint and the planes negotiate different protocols, so a dialler that
+guessed the wrong one of a node's two addresses fails to negotiate and
+tries the next -- but with both advertised everywhere, it *succeeds* on
+the wrong listener instead.
+
+That is not a routing inconvenience. The two planes' events are read in
+different places: `Domain::on_transport` serves the api plane and
+`Domain::on_peer_plane` the peer plane, and each counts the other's
+events as unserved. A submission that negotiated on the peer listener is
+accepted, framed, delivered -- and then dropped, while its sender waits
+out a deadline for an answer nobody will give.
+
+A listener now offers only its own plane's ALPN, which is what lets
+`EndpointV1::addresses` stay one unlabelled list. That answers the
+smaller question left open by the previous note: the catalog does not
+have to say which address is which plane, because dialling settles it.
+
+## A collector's submission is a raw kind whose admission depends on who is asking
+
+**Where:** `coord-types/src/wire_v1.rs`, `coord-transport/src/endpoint.rs`.
+
+`Submit` is `0x0103`, in the API kind range, and its payload belongs to
+`coord-collector` -- so `wire_v1::decode` does not know it, and
+`read_request` closed the connection as malformed. The daemon's
+`frame.kind == KIND_SUBMIT` branch could never be reached; the three
+voters' links were up and every submission over them killed the link it
+arrived on.
+
+The session binding had the same shape and was already handled: an
+enumerated raw kind, admitted by kind and version. A submission is the
+second, with one difference. A binding may be opened by anyone -- it is
+how a connection becomes authorized at all. A submission carries claims
+minted for somebody else's session, so the stream is open only to a role
+that may act for other principals, checked against the *bound*
+certificate before the frame is read.
+
+That rule now lives once, as `PeerRole::may_submit_for_clients`, with
+`coord_collector::ingress::is_collector` delegating to it. Two copies of
+"who may submit" is how the transport and the collector boundary come to
+disagree, and the disagreement would be in the permissive direction at
+whichever of them was updated last.
+
+## A sender never asserts a receiver's incarnation
+
+**Where:** `bins/coordd/src/serve.rs` (`addressed`).
+
+`PendingSend.to` is a `PeerId`, and the machines fill its incarnation
+with `ReplicaIncarnation::ZERO`. That is deliberate and documented on
+the field: a sender does not know which generation of another node is
+current, and what binds an incarnation is the receiver's own
+certificate, checked when the link was bound.
+
+`Transport::send` keys links by `(replica, incarnation)`, so passing the
+open value through addressed a generation that exists nowhere and every
+protocol frame came back `NotConnected`. The three voters held their
+links, admitted submissions, produced evidence -- and no proposal, vote
+or adoption ever left any of them.
+
+The runtime resolves it against the committed configuration on the way
+out, which is the same rule `fanout::dispatch` follows for a
+submission's targets, and refuses to send to a generation the
+configuration has replaced.
+
+## A peer frame is framed by the transport, not by the machine
+
+**Where:** `bins/coordd/src/serve.rs`.
+
+`PendingSend.frame` is the consensus message's own encoding;
+`KIND_PEER_EVIDENCE` is the transport's wrapper around it, and
+`read_uni` refuses anything else. The daemon sent the bare message
+(refused at the far end) and, on receipt, re-framed the payload before
+handing it to the machine (`ProtocolMessage::decode` then failed on the
+header). Two mirror-image mistakes that cancelled out in every test that
+did not actually run two processes.
+
+## Both ends of a peer pair dial, and both have to keep the same connection
+
+**Where:** `coord-transport/src/endpoint.rs` (`Shared::survivor`).
+
+A lane holds one connection. When a second arrives for the same link,
+`register` displaced the incumbent and closed it -- "a redial replaces",
+which is right for a client that reconnects and wrong for a mesh.
+
+In a full mesh both ends dial, so each pair produces two connections and
+each end sees one of them as an incumbent and the other as a newcomer --
+*opposite* ones. Newcomer-wins is symmetric only in appearance: each end
+closes the connection the other kept, both connections die, and both
+sides go on believing they are connected because their own dial
+succeeded.
+
+It presented as a flaky three-voter test: whichever pairs happened to
+collide lost their link, so a request sometimes found a quorum and
+sometimes did not. The transport's own tests never saw it because they
+dial one way, or one after the other -- with a gap, the second end has
+no incumbent to choose against and there is no choice to get wrong.
+
+The surviving connection is now the one whose *dialler* has the lower
+replica identity. Both ends compute it from the same two identities, so
+exactly one connection is closed. `LocalIdentity::replica` exists for
+this and for nothing else: it is not an authority over anything, and an
+endpoint without one keeps the replace-on-redial behaviour, which is
+what an API endpoint (whose links are per-connection and never collide)
+wants.
+
+A consequence worth knowing: the dial that loses is closed, so its
+caller sees an error for a link it now holds. "Reachable" therefore has
+to mean *a connection is holding the lane* (`Transport::linked`), not
+*my dial succeeded* -- otherwise a node reports a link it no longer has
+and misses one it has only because the peer dialled.
+
+## What the three-voter served request needed
+
+Three processes, three committed certificates, real QUIC, and a request
+the caller sends to one of them established by all three. It took two
+pieces of routing and five defects, each of which is its own note above.
+
+The routing:
 
 * **A collector reaches a remote voter over the *api* plane**, as an
   API-class client of it -- the peer plane is voter-to-voter protocol
-  traffic, and a `Submit` is not that. So a frontend has to dial each
-  voter's api listener as `PeerRole::Frontend`, which nothing does yet,
-  and `fan_out` finds no link.
-* **A remote voter's evidence has to return to the collector that
-  submitted.** The mechanism exists: the `Submit` arrives on an
-  API-class connection, and `Destination::Connection` addresses exactly
-  that connection, with the collector seeing it as `ApiDelivery`. What
-  is missing is the attribution -- the voter recording which connection
-  a command was admitted from, so its evidence goes back there instead
-  of to its own process's collector, which is where `Domain::carry`
-  sends every frontend frame today.
+  traffic, and a `Submit` is not that. `CollectorLinks` dials each
+  voter's api listener as `PeerRole::Frontend` on the unary lane, which
+  is what gives `fanout::dispatch` a link to find. It shares the api
+  endpoint rather than having its own, because a connection's direction
+  already says which kind of peer is on it: a stream a caller opens is a
+  request to serve, and a stream a voter opens on a link this process
+  dialled is that voter's evidence.
+* **A remote voter's evidence returns to the collector that
+  submitted.** `Voter::origin_of` remembers which connection each
+  command was admitted from -- bounded, oldest forgotten first, because
+  a collector that submitted and vanished must not cost a replica memory
+  for ever -- and `Domain::hand_to_collector` reads the command out of
+  the evidence frame and sends it back there. Falling out of the bound
+  costs a caller its evidence and nothing else: the command is
+  established and durable by the quorum rule either way.
 
-One smaller question sits underneath: `EndpointV1::addresses` is a
-single list, and a node has two listeners. A catalog that says where a
-voter is has to say where each of its planes is, or a convention has to
-decide which address is which.
+Not a shortcut for the co-located voter: it is reached through its
+bounded ingress instead of a socket, and contributes exactly one voter's
+evidence through the same collector validation. The three-voter test is
+what says so -- one process holding one vote of three cannot answer a
+caller by itself.
 
-**Revisit when:** the three-voter served request is built. It is the one
-closing test of task-j08 that has no evidence yet; the other six do.
+**Still missing:** there is no timer loop, so nothing retransmits and
+nothing re-dials a link that dropped. Every message here is carried by
+QUIC and arrives, and every link is established before the request, so
+the composition holds; a cluster that loses a link mid-request does not
+recover until something re-dials it. `Outbound::arm` and `cancel` are
+counted as unserved, which is where that shows.

@@ -32,10 +32,17 @@ pub struct Peer {
     pub replica: ReplicaId,
     /// The incarnation the committed configuration names for it.
     pub incarnation: ReplicaIncarnation,
-    /// Where to try.
-    pub address: SocketAddr,
-    /// The name its certificate must be valid for.
-    pub server_name: String,
+    /// Where to try, in the order the catalog listed them.
+    ///
+    /// A node has more than one listener -- an api plane for collectors
+    /// and clients, a peer plane for voters -- and a catalog entry is
+    /// one list of addresses. Which of them serves which plane is
+    /// settled by dialling: the two planes negotiate different ALPNs, so
+    /// an address that is the wrong one for the plane a caller wants
+    /// fails to negotiate and the next is tried. That is the same rule
+    /// as for an address that has simply moved, and it keeps an address
+    /// a hint rather than a claim.
+    pub addresses: Vec<(SocketAddr, String)>,
 }
 
 /// Why this process cannot say where its peers are.
@@ -160,33 +167,35 @@ pub fn resolve(
             .iter()
             .find(|e| e.node == replica)
             .ok_or(PeerError::Missing { replica })?;
-        // The first address that resolves. A catalog may list several --
-        // a node with more than one interface, or a rename in flight --
-        // and any of them reaches the same voter, because which voter
-        // answered is decided by its certificate and not by the address
+        // Every address the catalog listed, in order. A node with more
+        // than one interface, a rename in flight, and the node's two
+        // planes all look the same here: somewhere to try. Which voter
+        // answered is decided by its certificate, not by the address
         // that found it.
-        let listed = entry
-            .addresses
-            .first()
-            .ok_or(PeerError::Missing { replica })?;
-        let address = listed
-            .to_socket_addrs()
-            .map_err(|e| PeerError::Unresolvable {
-                replica,
-                address: listed.clone(),
-                reason: e.to_string(),
-            })?
-            .next()
-            .ok_or_else(|| PeerError::Unresolvable {
-                replica,
-                address: listed.clone(),
-                reason: "resolved to no address".into(),
-            })?;
+        if entry.addresses.is_empty() {
+            return Err(PeerError::Missing { replica });
+        }
+        let mut addresses = Vec::with_capacity(entry.addresses.len());
+        for listed in &entry.addresses {
+            let resolved = listed
+                .to_socket_addrs()
+                .map_err(|e| PeerError::Unresolvable {
+                    replica,
+                    address: listed.clone(),
+                    reason: e.to_string(),
+                })?
+                .next()
+                .ok_or_else(|| PeerError::Unresolvable {
+                    replica,
+                    address: listed.clone(),
+                    reason: "resolved to no address".into(),
+                })?;
+            addresses.push((resolved, server_name(listed)));
+        }
         peers.push(Peer {
             replica,
             incarnation: entry.incarnation,
-            address,
-            server_name: server_name(listed),
+            addresses,
         });
     }
     Ok(peers)

@@ -204,6 +204,12 @@ Control, commands, watches and bulk traffic have separately bounded queues/conne
 
 Handshakes bind role, domain scope, node generation and capabilities. An observer cannot vote. Collector credentials permit only needed evidence for the authorized domain. The exporter is a role, not another consensus leader: multiple eligible sources can resume the same established prefix, but source selection grants no authority and never gates ordinary write completion.
 
+Each listener serves one plane and offers only that plane's ALPN. The two planes' events are consumed in different places, so a frame admitted on the wrong listener is not merely misrouted: it is never served, and its sender waits for an answer nobody will give. A node's published addresses are consequently an unlabelled list -- a dialler tries them in order and the ALPN settles which listener it reached -- so a wrong address costs a handshake and nothing else.
+
+A process that holds more than one role is more than one principal, and presents the credential of the principal it is acting as. A node certificate binds exactly one role, so a process running a voter and that domain's collector presents the node credential when it votes and the collector credential when it submits on a client's behalf; what it *serves* as is the node in both cases. Naming half such a credential, or none where the process must submit to a voter elsewhere, is refused at startup rather than at the first request. A submission stream is opened only by a role that may act for other principals: the transport checks the bound certificate's role before the frame is read, and the collector boundary checks it again where the receipt is minted. The two checks answer the same question from one rule, never two.
+
+A machine addresses a peer by replica and leaves the generation open; the runtime resolves it against the committed configuration on the way out, exactly as a submission's fan-out does, and refuses a generation the configuration has replaced. A sender never asserts a receiver's incarnation -- what binds one is the receiver's own certificate, checked when the link was bound.
+
 <a id="s4"></a>
 ## 4. SwiftPaxos integration
 
@@ -1887,11 +1893,20 @@ bulk_bytes_per_second = 16777216
 issuer_config = "/etc/coord/node-issuer.toml"
 workload_token_file = "/run/identity/coord-node.jwt"
 trust_bundle = "/etc/coord/trust.pem"
+node_certificate = "/etc/coord/node.pem"
+node_key = "/run/identity/node.key"
+# Presented when this process acts as this domain's collector toward
+# another voter. Required where the process serves clients and has other
+# voters to submit to; absent for a process that is only one principal.
+collector_certificate = "/etc/coord/collector.pem"
+collector_key = "/run/identity/collector.key"
 ```
 
 Examples are starting measurements, not capacity promises/firewall defaults. Root/profile/format must match manifests. A valid record beyond ready-batch target uses a bounded large-record path; a request beyond hard limits rejects before responsibility. Observer quotas are not protocol-count caps. Discovery/health is not authority.
 
 Issuer/broker HTTPS has separate keys/trust; development HTTP is loopback test-only. Startup: Boot→StorageValidated→IdentityValidated→MembershipChecked→ProtocolRecovered→Serving. Learners cannot vote before durable activation. Readiness distinguishes process, local view, credentials and fresh-quorum ability; cached leader is insufficient.
+
+Role readiness reports the planes separately: the peers this node has reached and the voters its own collector can submit to are different links to different listeners, and a node that has one and not the other is not ready to carry a request. Dialling is best effort and never a precondition for serving; an unreachable voter contributes nothing and changes no quorum rule.
 
 Orderly shutdown stops admission, drains bounded durable work, stops usable output and closes channels. Crash reconstructs selected checkpoint+journal, validates frontiers/obligations and performs recovery before service. Unavailable/corrupt/mismatched storage quarantines instead of creating or rolling back. Role readiness and budgets remain separate even when colocated.
 

@@ -46,7 +46,7 @@ pub mod lane;
 pub mod sched;
 
 pub use budget::{Budget, BudgetError, BudgetLimits};
-pub use config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
+pub use config::{ALPN_API, ALPN_PEER, Class, ClientIdentity, Limits, LocalIdentity, TlsProfile};
 pub use endpoint::{
     CloseCode, CloseReason, ConnectionId, Destination, Responder, SendError, Transport,
     TransportError, TransportEvent,
