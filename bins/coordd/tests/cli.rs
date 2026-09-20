@@ -142,6 +142,10 @@ pub struct Ca {
     /// The node certificate's SubjectPublicKeyInfo, which is what
     /// genesis commits to for a voter.
     node_spki: Vec<u8>,
+    /// The node's own key, PKCS#8 DER. A committed voter attests the
+    /// endpoint catalog with it, which is the only way a catalog becomes
+    /// this domain's rather than anybody's.
+    node_key: Vec<u8>,
 }
 
 impl Ca {
@@ -158,6 +162,7 @@ impl Ca {
             key,
             certificate,
             node_spki: Vec::new(),
+            node_key: Vec::new(),
         }
     }
 
@@ -218,6 +223,7 @@ fn credentials_of_cluster(
     let mut ca = Ca::new();
     let (certificate, key) = ca.issue(SERVER_NAME, cluster, replica, role);
     ca.node_spki = spki_of(certificate.der());
+    ca.node_key = key.serialize_der();
     std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", certificate.der())).expect("cert");
     std::fs::write(dir.join("roots.pem"), ca.root_pem()).expect("roots");
     let key_path = dir.join("node.key");
@@ -228,6 +234,60 @@ fn credentials_of_cluster(
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
     ca
+}
+
+/// A signed endpoint catalog naming where each committed voter is.
+///
+/// Attested by voter 1, which is the node under test and the only one
+/// whose key this fixture holds. That is exactly the rule: a catalog is
+/// this domain's because one of its committed voters signed it, and an
+/// address list nobody signed is nobody's.
+///
+/// `addresses` gives voter n's `host:port`; the voters it omits are
+/// listed at an address nothing answers on, which is what makes them
+/// unreachable rather than unknown.
+fn endpoints(dir: &Path, ca: &Ca, count: u8, addresses: &[(u8, String)]) {
+    use coord_types::config_v1::{EndpointCatalogV1, EndpointV1, VoterSignatureV1};
+
+    let endpoints: Vec<EndpointV1> = (1u8..=count)
+        .map(|n| EndpointV1 {
+            node: coord_types::ids::ReplicaId([n; 16]),
+            incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("nonzero"),
+            addresses: vec![
+                addresses
+                    .iter()
+                    .find(|(who, _)| *who == n)
+                    .map(|(_, a)| a.clone())
+                    // Port 1 on loopback: a real address that resolves
+                    // and that nothing is listening on, so this voter is
+                    // unreachable rather than unknown.
+                    .unwrap_or_else(|| "127.0.0.1:1".to_owned()),
+            ],
+            certificate_fingerprint: None,
+        })
+        .collect();
+    let mut catalog = EndpointCatalogV1 {
+        cluster: coord_types::ids::ClusterId(CLUSTER),
+        domain: coord_types::ids::DomainId(DOMAIN),
+        epoch: coord_types::ids::ConfigurationEpoch::new(1).expect("nonzero"),
+        generation: coord_types::ids::EndpointGeneration::new(1).expect("nonzero"),
+        endpoints,
+        attestation: VoterSignatureV1 {
+            node: coord_types::ids::ReplicaId([1; 16]),
+            incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("nonzero"),
+            signature: vec![0; 64],
+        },
+    };
+    catalog.attestation.signature = coord_membership::configuration::sign_message(
+        &jsonwebtoken::EncodingKey::from_ec_der(&ca.node_key),
+        &catalog.catalog_message(),
+    )
+    .expect("attestation");
+    std::fs::write(
+        dir.join("endpoints.bin"),
+        postcard::to_allocvec(&catalog).expect("catalog"),
+    )
+    .expect("write catalog");
 }
 
 /// The name peers connect to this node by.
@@ -279,6 +339,7 @@ fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
 fn config(dir: &Path) -> PathBuf {
     let ca = credentials(dir, 1, coord_types::wire_v1::PeerRole::Voter);
     genesis(dir, Some(&ca.node_spki));
+    endpoints(dir, &ca, 3, &[]);
     let _ = sts_keys(dir);
     config_only(dir)
 }
@@ -289,6 +350,7 @@ fn config_only(dir: &Path) -> PathBuf {
         r#"config_version = 2
 role = "voter-frontend-observer"
 cluster_manifest = "{root}/genesis.json"
+cluster_endpoints = "{root}/endpoints.bin"
 domain = "control-plane-test"
 state_directory = "{root}"
 
@@ -927,6 +989,7 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
     let dir = workspace("bind");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
     genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
     let ring = sts_keys(&dir);
     let path = config_only(&dir);
 
@@ -1151,6 +1214,91 @@ async fn a_restarted_replica_recovers_what_it_already_owed() {
     assert_eq!(field("executed"), 0, "{line}");
 }
 
+/// A voter that cannot say where its peers are does not come up.
+///
+/// Addresses are not committed configuration -- the manifest says who
+/// the voters are and what key each proves with, and deliberately not
+/// where any of them is. They come from a catalog a committed voter
+/// attested, and a voter that has peers and no usable catalog would
+/// serve requests it could never establish: from outside that looks
+/// like a slow cluster rather than a misconfigured node.
+///
+/// The catalog is an address book and nothing more. It cannot introduce
+/// a voter or re-incarnate one, and whoever answers at an address still
+/// has to prove from its certificate that it is the voter the committed
+/// configuration names.
+#[test]
+fn a_voter_that_cannot_find_its_peers_refuses_to_start() {
+    let dir = workspace("peers");
+    let path = config(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let catalog = dir.join("endpoints.bin");
+
+    // Named and missing.
+    std::fs::remove_file(&catalog).expect("remove");
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("cannot read the endpoint catalog"),
+        "the refusal did not say what was missing: {}",
+        refused.err
+    );
+    assert!(
+        !refused.out.contains("listening"),
+        "a voter that cannot reach its peers bound a listener anyway: {}",
+        refused.out
+    );
+
+    // Present and not attested by a voter of this domain.
+    let stranger = Ca::new();
+    let (certificate, key) = stranger.issue(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+    );
+    let _ = certificate;
+    let mut theirs = stranger;
+    theirs.node_key = key.serialize_der();
+    endpoints(&dir, &theirs, 3, &[]);
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("not this domain's committed voters'"),
+        "an unattested catalog was accepted: {}",
+        refused.err
+    );
+
+    // Not named at all, with peers to reach.
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.lines()
+            .filter(|l| !l.starts_with("cluster_endpoints"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write");
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("names no cluster_endpoints"),
+        "a voter with peers started without an address for any of them: {}",
+        refused.err
+    );
+
+    // And with the catalog back, it starts and says what it found.
+    std::fs::write(&path, text).expect("restore");
+    let report = start_and_report(&path);
+    assert!(
+        report.contains("peers reachable=2 of 2"),
+        "the daemon did not report the peers it resolved:\n{report}"
+    );
+}
+
 /// A process that cannot verify a caller does not come up saying it can.
 ///
 /// A JWKS that is valid JSON and holds no key this build can verify with
@@ -1224,6 +1372,7 @@ async fn one_co_located_voter_is_not_a_quorum() {
     let dir = workspace("noquorum");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
     genesis_of(&dir, 3, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
     let ring = sts_keys(&dir);
     let path = config_only(&dir);
 

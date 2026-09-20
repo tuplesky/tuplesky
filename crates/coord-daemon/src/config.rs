@@ -200,6 +200,19 @@ pub struct Config {
     pub role: String,
     /// Genesis manifest path.
     pub cluster_manifest: String,
+    /// A signed endpoint catalog naming where this epoch's voters are.
+    ///
+    /// Addresses are not committed configuration: the manifest says who
+    /// the voters are and what key each proves with, and deliberately
+    /// not where any of them is. A catalog carries the where, attested
+    /// by a voter, and cannot introduce a voter or re-incarnate one.
+    ///
+    /// Optional because a process that does not vote never dials a peer,
+    /// and because a single-voter domain has none to dial. A voter with
+    /// peers and no catalog is refused at startup rather than left to
+    /// discover it has nobody to talk to.
+    #[serde(default)]
+    pub cluster_endpoints: Option<String>,
     /// Domain name.
     pub domain: String,
     /// State directory.
