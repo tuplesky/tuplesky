@@ -122,7 +122,16 @@ impl IdentityBinder for PeerBinder {
             // existing cluster.
             let presented = spki_of(leaf).ok_or(BindError::UnknownCertificate)?;
             let membership = self.membership.read().expect("membership lock");
-            if !membership.is_current_voter_key(&identity.node, identity.incarnation, &presented) {
+            // One rule, named cases (task-58). A renewal binds: it is
+            // the committed generation presenting the committed key,
+            // and a node renews continuously. Everything else does not,
+            // and the peer learns only that -- which distinction it was
+            // is the node operator's business, reported by `coordd
+            // inspect` on the node itself, not something to tell
+            // whoever just failed to bind.
+            if membership.classify_credential(&identity.node, identity.incarnation, &presented)
+                != crate::membership::CredentialChange::Renewal
+            {
                 return Err(BindError::IncarnationMismatch);
             }
         }
@@ -132,5 +141,19 @@ impl IdentityBinder for PeerBinder {
             incarnation: peer.then_some(identity.incarnation),
             capabilities: hello.capabilities.as_slice().to_vec(),
         })
+    }
+
+    /// The leaf's `notAfter`, which is when a connection authenticated
+    /// by it stops being authenticated (task-58).
+    ///
+    /// The transport closes at this instant. Certificate validation
+    /// happens once, at the handshake; a connection that outlived its
+    /// credential would be running on a check nobody repeated, which is
+    /// precisely what renewal, rotation and revocation are meant to
+    /// reach.
+    fn expires_at(&self, certs: &[CertificateDer<'_>]) -> Option<u64> {
+        let leaf = certs.first()?;
+        let (_, x509) = x509_parser::certificate::X509Certificate::from_der(leaf).ok()?;
+        u64::try_from(x509.validity().not_after.timestamp()).ok()
     }
 }

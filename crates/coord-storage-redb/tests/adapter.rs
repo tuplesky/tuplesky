@@ -424,3 +424,79 @@ fn staging_refuses_a_selected_generation_that_open_would_refuse() {
         coord_storage_redb::InactiveGeneration::stage(dir.path(), identity(), options()).unwrap();
     assert_eq!(staged.generation(), 2);
 }
+
+/// An authorized key replacement adopts this node's own durable state,
+/// and a root that has moved past the presented generation does not
+/// (task-58; design Section 20.4).
+#[test]
+fn an_authorized_replacement_adopts_the_state_and_a_stale_one_is_fenced() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut generation = Generation::create(dir.path(), identity(), options()).unwrap();
+        let mut txn = generation.engine().begin_write().unwrap();
+        txn.put(Collection::KvCurrentV1.id(), b"k", b"v").unwrap();
+        txn.commit_durable().unwrap();
+    }
+
+    let mut replaced = identity();
+    replaced.incarnation = ReplicaIncarnation::new(2).unwrap();
+    // Before adoption the root is still the old generation's, and the
+    // new credential does not simply open it: the stamp is a real
+    // fence, not decoration.
+    assert!(matches!(
+        Generation::open_existing(dir.path(), replaced, options()),
+        Err(OpenError::IdentityMismatch("incarnation"))
+    ));
+    assert_eq!(
+        Generation::adopt(dir.path(), replaced).unwrap(),
+        Some(ReplicaIncarnation::new(1).unwrap()),
+        "the replacement did not adopt anything, or did not say what from"
+    );
+    // Idempotent: a restart after an adoption adopts nothing further.
+    assert_eq!(Generation::adopt(dir.path(), replaced).unwrap(), None);
+
+    // And the state is the node's own, not a fresh root.
+    let mut generation = Generation::open_existing(dir.path(), replaced, options()).unwrap();
+    assert_eq!(generation.manifest().generation, 1, "a generation was lost");
+    let snapshot = generation.engine().reader().snapshot().unwrap();
+    assert_eq!(
+        snapshot.get(Collection::KvCurrentV1.id(), b"k").unwrap(),
+        Some(b"v".to_vec()),
+        "an authorized replacement lost this node's durable state"
+    );
+    drop(generation);
+
+    // The old credential cannot come back: this is the cloned-disk case,
+    // and adopting backwards would let a replaced node serve as the
+    // voter it no longer is.
+    assert!(matches!(
+        Generation::adopt(dir.path(), identity()),
+        Err(OpenError::IdentityMismatch("incarnation"))
+    ));
+    assert!(matches!(
+        Generation::open_existing(dir.path(), identity(), options()),
+        Err(OpenError::IdentityMismatch("incarnation"))
+    ));
+
+    // Nor may adoption paper over a different replica or origin: a
+    // replacement changes the key generation and nothing else.
+    for wrong in [
+        StoreIdentity {
+            cluster_id: ClusterId([9; 16]),
+            ..replaced
+        },
+        StoreIdentity {
+            domain_id: DomainId([9; 16]),
+            ..replaced
+        },
+        StoreIdentity {
+            replica_id: ReplicaId([9; 16]),
+            ..replaced
+        },
+    ] {
+        assert!(
+            Generation::adopt(dir.path(), wrong).is_err(),
+            "adoption accepted a root belonging to somebody else"
+        );
+    }
+}

@@ -322,6 +322,86 @@ impl Generation {
         })
     }
 
+    /// Adopt the selected generation under a newly committed incarnation
+    /// of the same replica (task-58; design Section 20.4).
+    ///
+    /// A node whose voting key is replaced keeps its durable state. The
+    /// replacement is a committed configuration transition, not a new
+    /// replica: the journal, its checkpoints and the epoch metadata are
+    /// this node's own and are exactly what the new generation has to
+    /// come back on. Refusing to open them would make an authorized
+    /// replacement a restore from nothing.
+    ///
+    /// Only forwards. A manifest *ahead* of `identity` is the fencing
+    /// case this stamp exists for -- a disk cloned or restored from
+    /// before a replacement -- and stays refused, so an old credential
+    /// can never re-adopt a root that has moved past it. The caller must
+    /// already have established that `identity.incarnation` is the
+    /// *committed* one; this decides nothing about membership and is not
+    /// a way to acquire a generation by asserting a number.
+    ///
+    /// Only the manifest is written, and it is written atomically, so
+    /// adoption is one step with nothing to interrupt halfway. The
+    /// projection database is deliberately untouched: a write here
+    /// would commit whatever the last run left uncommitted in it, and
+    /// the journal-first invariant is that the materialized frontier
+    /// never runs ahead of the journal's durable head. The identity
+    /// record inside the database therefore keeps naming the generation
+    /// the database was created under, and [`Generation::open_existing`]
+    /// accepts a record that lags the manifest -- never one that leads
+    /// it.
+    ///
+    /// Returns the generation the root was stamped with, where it was
+    /// behind -- which is what the caller needs to carry this node's
+    /// journal stream forward with it.
+    pub fn adopt(
+        root: &Path,
+        identity: StoreIdentity,
+    ) -> Result<Option<ReplicaIncarnation>, OpenError> {
+        let _lock = RootLock::acquire(root, false)?;
+        let current = match std::fs::read(root.join(CURRENT)) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .map_err(|_| OpenError::Corrupt("CURRENT is not UTF-8".into()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(OpenError::NotInitialized);
+            }
+            Err(e) => return Err(OpenError::Io(e)),
+        };
+        let current = current.trim();
+        if current.is_empty() || current.contains('/') || current.contains("..") {
+            return Err(OpenError::Corrupt("CURRENT content invalid".into()));
+        }
+        let directory = root.join(current);
+        if !directory.is_dir() {
+            return Err(OpenError::MissingGeneration(current.to_owned()));
+        }
+        let manifest = StoreManifestV1::read(&directory.join(MANIFEST))?;
+        // The replica and its origin are not what a replacement changes,
+        // so nothing here may paper over a different one.
+        if manifest.cluster_id != identity.cluster_id {
+            return Err(OpenError::IdentityMismatch("cluster_id"));
+        }
+        if manifest.domain_id != identity.domain_id {
+            return Err(OpenError::IdentityMismatch("domain_id"));
+        }
+        if manifest.replica_id != identity.replica_id {
+            return Err(OpenError::IdentityMismatch("replica_id"));
+        }
+        if manifest.incarnation > identity.incarnation {
+            return Err(OpenError::IdentityMismatch("incarnation"));
+        }
+        if manifest.incarnation == identity.incarnation {
+            return Ok(None);
+        }
+        let previous = manifest.incarnation;
+        let adopted = StoreManifestV1 {
+            incarnation: identity.incarnation,
+            ..manifest
+        };
+        adopted.write(&directory.join(MANIFEST))?;
+        Ok(Some(previous))
+    }
+
     /// The engine.
     pub fn engine(&mut self) -> &mut RedbEngine {
         &mut self.engine
@@ -523,11 +603,29 @@ fn open_verified_database(
             meta_fields::REPLICA_ID,
             &manifest.replica_id.0,
         )?;
-        check(
-            "incarnation",
-            meta_fields::INCARNATION,
-            &manifest.incarnation.to_be_bytes(),
-        )?;
+        // The record's generation may lag the manifest's, and only
+        // that way round (task-58). The record says which key
+        // generation this database was created under; the manifest
+        // says which one the node is committed at now, and an
+        // authorized replacement advances the manifest alone --
+        // writing to the projection outside the journal-first path
+        // would make its last non-durable commits durable and push
+        // the materialized frontier past the journal's head. A
+        // record *ahead* of the manifest is still a database that
+        // does not belong under it.
+        {
+            let value = meta_table
+                .get(meta_fields::INCARNATION)
+                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+            let recorded = value
+                .as_ref()
+                .map(|v| ReplicaIncarnation::from_be_slice(v.value()))
+                .and_then(Result::ok)
+                .ok_or(OpenError::IdentityRecordMismatch("incarnation"))?;
+            if recorded > manifest.incarnation {
+                return Err(OpenError::IdentityRecordMismatch("incarnation"));
+            }
+        }
         check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
         check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
     }

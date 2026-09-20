@@ -52,7 +52,7 @@ pub use genesis::{
     GenesisError, GenesisManifest, SignedGenesis, VoterSeed, sign_genesis, verify_genesis,
 };
 pub use init::{GenesisStore, InitError, Initialized, initialize};
-pub use membership::{Membership, MembershipError, VoterEntry};
+pub use membership::{CredentialChange, Membership, MembershipError, VoterEntry};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";

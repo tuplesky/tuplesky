@@ -1218,3 +1218,125 @@ replica to install. Every durable decision of the handoff now exists and
 is recoverable; driving it between nodes is the membership workstream's
 (task-m03), and task-58 onwards is what the successor's credentials have
 to look like for any of it to be safe in the field.
+
+## A credential's end has to reach the connection it opened
+
+task-58 is the node-credential lifecycle: proactive renewal with
+jitter, bounded overlap during a rotation, warm-session expiry, staged
+CA rotation, the committed key/generation replacement, and the
+operator-facing `coordd inspect`. Most of it is arithmetic in
+`coord-node-issuer::lifecycle`, and the arithmetic is uninteresting
+except for what it refuses to have: there is no `Renewal` variant that
+means "serve anyway". Availability during an issuer outage is bought by
+turning due at two thirds of the lifetime, not by softening the
+deadline, and `an_issuer_outage_is_survivable_until_the_deadline_and_never_past_it`
+walks the whole outage hour by hour to show the window is real and that
+it closes.
+
+The part that needed building rather than computing is the connection.
+Certificate validation happens once, at the handshake. A connection left
+alone outlives the credential that made it, and then renewal, rotation
+and revocation all stop reaching the peer that already got in -- the one
+peer they most need to reach. So `IdentityBinder` gained
+`expires_at(certs)` and `Limits` gained `max_connection_age`, and the
+transport closes a connection at the earlier of the two with
+`CloseReason::Expired`.
+
+Asking the *binder* rather than parsing the certificate in the transport
+is the deliberate part: the component that decides a credential is
+acceptable is the one that says how long it stays so, and a second
+implementation of "when does this end" would be a second set of rules
+with the weaker one deciding. The default returns `None`, which leaves
+the age cap -- a weaker bound, never an absent one.
+
+Expiry is not a refusal. Both ends hold the same deadline, so which one
+closes first is a race; what is not a race is that the peer reconnects
+immediately under whatever it holds now and is admitted on that. A
+transport test asserts exactly that, because a close that fenced the
+node would be a much worse bug than one that did not happen.
+
+### One rule for "is this credential the voter's", named cases
+
+`Membership::classify_credential` replaced an open-coded pair of checks
+in the peer binder. It returns `Renewal`, `UncommittedKey`,
+`RequiresCommit`, `Stale` or `NotAVoter`, and the binder binds exactly
+`Renewal`.
+
+The distinctions do not go on the wire. A refused peer learns that it
+was refused, which is the right amount to tell it: "your key is not the
+committed one" and "the configuration moved past you" are facts about
+this cluster's membership, and a caller that could enumerate them could
+map the fleet. They surface instead on the node itself, through `coordd
+inspect`, because replacing a node is done there.
+
+That placement had a bug worth recording. `inspect` was first wired
+*after* `membership::place`, which refuses to continue when the
+committed configuration does not name this certificate as a voter --
+which is precisely the state an operator runs `inspect` to understand.
+The operator-facing answer to "why is this node not voting" has to be
+available exactly when the node cannot serve, so `inspect` now runs
+before placement and starts nothing: the test asserts no store and no
+journal are created, because a node whose credential is wrong must be
+inspectable without first being repaired.
+
+### An authorized replacement keeps the disk, and that took three layers
+
+"Preserve journal shard/checkpoint and epoch metadata across authorized
+replacement" is one line of the acceptance criteria and was the whole
+cost of the task. A voting-key replacement is a committed configuration
+transition for the *same* replica: its projection, its journal and its
+checkpoints are what the new generation has to come back on, and
+refusing them would make every authorized replacement a restore from
+nothing. Three separate fences were each keyed on the incarnation.
+
+**The store manifest.** `Generation::adopt` advances the stamp under the
+root lock, forwards only; a root stamped *past* the presented generation
+is the cloned- or restored-disk case and stays refused, which is the
+same stamp read in the other direction.
+
+The first version also wrote the new stamp into the projection
+database's identity record, and that was wrong in a way worth keeping a
+note about: a redb write transaction commits whatever the previous run
+left uncommitted, so the materialized frontier jumped past the journal's
+durable head and `attach` quarantined the domain -- the exact shape of a
+lost prefix, produced by an operation meant to preserve one. Nothing may
+write to the projection outside the journal-first path. The record
+therefore keeps naming the generation the database was created under,
+and `open_existing` accepts a record that *lags* the manifest and never
+one that leads it.
+
+**The journal stream.** `StreamKey` carries the incarnation, and
+task-j01's rule was "a new incarnation gets a new stream". That rule is
+right for a replica that arrives without durable state and wrong for one
+that keeps it: a fresh stream leaves the projection materialized past a
+journal head of zero. `StreamAllocator::adopt` re-keys the existing
+mapping -- same identifier, same shard, same domain, strictly later
+generation, only onto a key that owns no stream -- and
+`JournaledStore::adopt_stream` persists it before use. Design Section
+17.3.1 now states this; it is an extension of j01's rule, not a
+contradiction of it, and the high-water mark never moves because nothing
+is allocated.
+
+**The record guards.** A carried-forward stream holds a prefix written
+at the old generation and a suffix at the new one, which three guards
+rejected. They now agree on one rule: the *mapping* says which
+generation the stream currently serves, so appends are verified against
+that (not against the stream's first record), and read and replay
+verification accept a non-decreasing generation bounded above by it. A
+record from a *later* generation than the mapping is still refused --
+that is a stream that has moved past this node.
+
+The provenance is not blurred by any of this. Every record carries the
+incarnation that wrote it; what changed is that a stream may contain
+more than one, which is exactly what "the same replica, re-keyed" means.
+
+Each of the three layers has its own negative control, and each
+reproduces a distinct failure: remove the manifest fence and the
+cloned-disk assertion fails; pin the append guard to the stream's first
+record and attach fails with `IncarnationMismatch`; pin read
+verification and the recovery baseline fails to load; pin replay and the
+owed suffix is refused. The end-to-end `coordd` test runs a node,
+replaces its key, and asserts the same invocation gets the same command
+identifier and the same outcome afterwards -- and then puts the retired
+credential back and asserts the node refuses to start and `inspect`
+names it `state=stale committed=2 presented=1`.

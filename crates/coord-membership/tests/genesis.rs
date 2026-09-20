@@ -530,3 +530,179 @@ fn a_binder_takes_its_origin_from_the_membership_it_holds() {
             .is_ok()
     );
 }
+
+// ---------------------------------------------------------------------
+// task-58: the credential lifecycle. What a renewal is, what it is not,
+// and what a node that has one of the other things is told.
+// ---------------------------------------------------------------------
+
+/// A renewal is the committed generation presenting the committed key,
+/// and it changes nothing about membership.
+///
+/// Everything else -- a new key at the same generation, a later
+/// generation, an earlier one -- is a named refusal rather than a bool,
+/// because the interesting cases *are* the refusals and an operator who
+/// cannot tell a stale clone from an early replacement cannot act on
+/// either.
+#[test]
+fn a_renewal_keeps_the_committed_key_and_everything_else_is_named() {
+    use coord_membership::CredentialChange;
+
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, certs) = manifest_with_voters(&mut issuer, &admin);
+    let membership = Membership::from_genesis(&manifest).unwrap();
+    let node = ReplicaId([1; 16]);
+    let one = ReplicaIncarnation::new(1).unwrap();
+    let two = ReplicaIncarnation::new(2).unwrap();
+    let committed_key = {
+        let (_, x509) = x509_parser::parse_x509_certificate(&certs[0]).unwrap();
+        x509.public_key().raw.to_vec()
+    };
+
+    // The committed generation with the committed key.
+    assert_eq!(
+        membership.classify_credential(&node, one, &committed_key),
+        CredentialChange::Renewal
+    );
+
+    // A fresh leaf at the same generation carries a fresh key, because
+    // the CSR does. That is not a renewal: a key change is a generation
+    // change, and a generation change is committed. Without this an
+    // issuer that was compromised or merely tricked mints a second key
+    // for an existing voter's current generation.
+    let refreshed = issuer.issue(1, 1, PeerRole::Voter, "voters", "voter-1");
+    let (_, x509) = x509_parser::parse_x509_certificate(&refreshed).unwrap();
+    let other_key = x509.public_key().raw.to_vec();
+    assert_ne!(other_key, committed_key);
+    assert_eq!(
+        membership.classify_credential(&node, one, &other_key),
+        CredentialChange::UncommittedKey
+    );
+
+    // A later generation: a replacement in progress. The certificate
+    // may be perfectly valid; what is missing is the committed
+    // configuration that makes this generation the voter.
+    assert_eq!(
+        membership.classify_credential(&node, two, &other_key),
+        CredentialChange::RequiresCommit {
+            committed: one,
+            presented: two,
+        }
+    );
+
+    // An earlier one: a credential from before a replacement, or a disk
+    // cloned from before one.
+    let later = {
+        let mut manifest = manifest.clone();
+        manifest.voters[0].incarnation = 2;
+        manifest.voters[0].public_key = spki(&refreshed);
+        Membership::from_genesis(&manifest).unwrap()
+    };
+    assert_eq!(
+        later.classify_credential(&node, one, &committed_key),
+        CredentialChange::Stale {
+            committed: two,
+            presented: one,
+        }
+    );
+    // And once the replacement is committed, the same credential that
+    // required a commit is an ordinary renewal.
+    assert_eq!(
+        later.classify_credential(&node, two, &other_key),
+        CredentialChange::Renewal
+    );
+
+    // A node that is not a voter of this epoch at all.
+    assert_eq!(
+        membership.classify_credential(&ReplicaId([9; 16]), one, &committed_key),
+        CredentialChange::NotAVoter
+    );
+}
+
+/// The binder binds a renewal and refuses every other credential state,
+/// telling the peer only that it was refused.
+#[test]
+fn the_binder_binds_a_renewal_and_tells_a_refused_peer_nothing_else() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, certs) = manifest_with_voters(&mut issuer, &admin);
+    let membership = Membership::from_genesis(&manifest).unwrap();
+    let binder = PeerBinder::new(membership);
+
+    // The committed key binds.
+    let bound = binder
+        .bind(&[der(&certs[0])], &hello(PeerRole::Voter, Some(1)))
+        .expect("the committed voter binds");
+    assert_eq!(bound.replica, Some(ReplicaId([1; 16])));
+
+    // A fresh leaf at the same generation does not, and neither does a
+    // later generation, and neither does an earlier one. All three are
+    // the same answer on the wire: which distinction it was is the node
+    // operator's business, not the caller's.
+    for (what, cert, incarnation) in [
+        (
+            "a new key at the committed generation",
+            issuer.issue(1, 1, PeerRole::Voter, "voters", "voter-1"),
+            1u64,
+        ),
+        (
+            "a generation nothing committed",
+            issuer.issue(1, 2, PeerRole::Voter, "voters", "voter-1"),
+            2,
+        ),
+    ] {
+        assert_eq!(
+            binder.bind(&[der(&cert)], &hello(PeerRole::Voter, Some(incarnation))),
+            Err(BindError::IncarnationMismatch),
+            "{what} bound as the voter"
+        );
+    }
+
+    // A non-voter role never binds as a voter, however current its
+    // credential: an observer or a collector holds catch-up state and
+    // submissions, not voting entitlement.
+    for role in [PeerRole::Observer, PeerRole::Frontend, PeerRole::Learner] {
+        let cert = issuer.issue(1, 1, PeerRole::Voter, "voters", "voter-1");
+        assert_eq!(
+            binder.bind(&[der(&cert)], &hello(role, Some(1))),
+            Err(BindError::RoleNotAuthorized),
+            "{role:?} bound against a voter certificate"
+        );
+    }
+}
+
+/// The binder says when the credential it admitted stops being valid, so
+/// the transport can end the connection with it (task-58).
+///
+/// Certificate validation happens once, at the handshake. Without an
+/// answer here a connection would outlive the credential that made it,
+/// and renewal, rotation and revocation would all stop reaching the peer
+/// that already got in.
+#[test]
+fn the_binder_reports_when_the_credential_it_admitted_ends() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, certs) = manifest_with_voters(&mut issuer, &admin);
+    let binder = PeerBinder::new(Membership::from_genesis(&manifest).unwrap());
+
+    let chain = [der(&certs[0])];
+    let expires_at = binder
+        .expires_at(&chain)
+        .expect("the binder knows when this leaf ends");
+    use x509_parser::prelude::FromDer as _;
+    let (_, leaf) = x509_parser::certificate::X509Certificate::from_der(chain[0].as_ref()).unwrap();
+    assert_eq!(
+        expires_at,
+        u64::try_from(leaf.validity().not_after.timestamp()).unwrap(),
+        "the reported deadline is not the leaf's own"
+    );
+    assert!(
+        expires_at > NOW,
+        "a certificate this fixture just issued reports an expiry in the past"
+    );
+
+    // Nothing to report about nothing: an anonymous client presents no
+    // chain, and the connection is then bounded by the age cap alone.
+    assert_eq!(binder.expires_at(&[]), None);
+}

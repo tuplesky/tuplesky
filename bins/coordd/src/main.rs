@@ -49,6 +49,14 @@ enum Command {
     /// Deliberate and separate: nothing else creates a store, so a
     /// missing one is always reported rather than repaired.
     Init,
+    /// Report what this node's credential is against committed
+    /// membership, and when it has to be renewed. Starts nothing.
+    ///
+    /// The operator-facing answer to "why is this node not voting". A
+    /// peer that refuses a binding tells the node only that it was
+    /// refused, which is the right amount to tell it; replacing a node
+    /// is done here, so the distinctions have to be available here.
+    Inspect,
 }
 
 /// Write the domain's genesis policy: the trust rule its configured
@@ -209,6 +217,41 @@ fn finish_initialization(
     Ok(directory)
 }
 
+/// How an inspection reports a credential. Bounded words, never keys.
+fn credential_state(change: &coord_membership::CredentialChange) -> String {
+    use coord_membership::CredentialChange as C;
+    match change {
+        C::Renewal => "renewal".into(),
+        C::UncommittedKey => "uncommitted-key".into(),
+        C::RequiresCommit {
+            committed,
+            presented,
+        } => format!(
+            "requires-commit committed={} presented={}",
+            committed.get(),
+            presented.get()
+        ),
+        C::Stale {
+            committed,
+            presented,
+        } => format!(
+            "stale committed={} presented={}",
+            committed.get(),
+            presented.get()
+        ),
+        C::NotAVoter => "not-a-voter".into(),
+    }
+}
+
+/// How an inspection reports a renewal decision.
+fn renewal_state(renewal: &coord_node_issuer::Renewal) -> String {
+    match renewal {
+        coord_node_issuer::Renewal::Wait { until } => format!("wait until={until}"),
+        coord_node_issuer::Renewal::Due => "due".into(),
+        coord_node_issuer::Renewal::Expired => "expired".into(),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
@@ -235,6 +278,42 @@ fn main() -> ExitCode {
         diagnostics.phase,
         roles.votes()
     );
+    // Inspecting comes before placement. `place` refuses to continue
+    // when the committed configuration does not name this certificate as
+    // a voter -- which is exactly the state an operator runs `inspect`
+    // to understand. The operator-facing answer to "why is this node not
+    // voting" has to be available precisely when the node cannot serve.
+    if let Some(Command::Inspect) = cli.command {
+        let policy = coord_node_issuer::RenewalPolicy::default();
+        return match membership::inspect(
+            &config.cluster_manifest,
+            &config.identity.node_certificate,
+            now_seconds(),
+            &policy,
+        ) {
+            Ok(report) => {
+                println!(
+                    "credential replica={} incarnation={} role={:?} state={}",
+                    short(&report.replica.0),
+                    report.incarnation.get(),
+                    report.role,
+                    credential_state(&report.credential),
+                );
+                println!(
+                    "leaf issued_at={} expires_at={} renewal={}",
+                    report.leaf.issued_at,
+                    report.leaf.expires_at,
+                    renewal_state(&report.renewal),
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
     // Who this node is, from the genesis manifest and from its own
     // certificate. Nothing here invents an identity: a node that could
     // be told who it was could be told it was somebody else.

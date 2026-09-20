@@ -72,6 +72,20 @@ fn fixture(roles: &[PeerRole]) -> Fixture {
     }
 }
 
+/// The same, with a binder that reports a credential deadline (task-58).
+fn fixture_expiring(roles: &[PeerRole], expires_at: Option<u64>) -> Fixture {
+    let mut f = fixture(roles);
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    for id in &f.ids {
+        binder.register(id);
+    }
+    if let Some(at) = expires_at {
+        binder = binder.expiring_at(at);
+    }
+    f.binder = Arc::new(binder);
+    f
+}
+
 fn bind_with(f: &Fixture, i: usize, limits: Limits) -> Transport {
     let local = f.ids[i].local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]);
     Transport::bind(
@@ -2063,4 +2077,184 @@ async fn an_endpoint_granting_several_lanes_declares_only_the_one_it_opens() {
     };
     assert_eq!(lane, Lane::Control, "the lane the dialer opened");
     assert_eq!(identity.replica, Some(r(0)));
+}
+
+/// A warm connection ends when the credential that authenticated it
+/// does (task-58; design Sections 10.4, 20.4).
+///
+/// Certificate validation happens once, at the handshake. A connection
+/// left alone outlives the credential that made it, and then renewal,
+/// rotation and revocation all stop reaching it: the peer whose
+/// certificate was rotated away from still holds the link it already
+/// had. So the credential's end is the connection's end, and a peer
+/// that wants to keep talking reconnects under whatever it holds now.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_warm_connection_ends_with_the_credential_that_authenticated_it() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let f = fixture_expiring(&[PeerRole::Voter, PeerRole::Voter], Some(now + 2));
+    let mut a = bind(&f, 0);
+    let mut b = bind(&f, 1);
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    assert!(
+        matches!(event(&mut a).await, TransportEvent::Connected { .. }),
+        "the connection did not negotiate"
+    );
+    assert!(
+        matches!(event(&mut b).await, TransportEvent::Connected { .. }),
+        "the connection did not negotiate"
+    );
+
+    // Both ends hold the same deadline and both enforce it, so which of
+    // them closes first is a race; what is not a race is that the
+    // connection is gone, and that it went for the credential rather
+    // than for a fault.
+    for end in [&mut a, &mut b] {
+        match event(end).await {
+            TransportEvent::Closed { reason, .. } => assert!(
+                reason == CloseReason::Expired
+                    || reason
+                        == CloseReason::PeerClosed {
+                            code: CloseCode::Expired as u16
+                        },
+                "the connection ended for {reason:?} rather than its credential"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(a.connections(), 0, "an expired connection was kept");
+    assert_eq!(b.connections(), 0, "an expired connection was kept");
+
+    // And it is not a refusal: the same peers reconnect immediately.
+    // Expiry ends a connection, it does not fence a node.
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    assert!(
+        matches!(event(&mut a).await, TransportEvent::Connected { .. }),
+        "a peer whose connection expired could not reconnect"
+    );
+}
+
+/// A credential with no stated end is still bounded: the age cap closes
+/// the connection whatever the binder says (task-58).
+///
+/// The cap is the part that does not depend on anybody answering. A
+/// binder that cannot say when a credential ends -- or one that says an
+/// end years away -- must not produce a connection nobody ever
+/// re-decides.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_age_cap_bounds_a_connection_whose_credential_states_no_end() {
+    let f = fixture_expiring(&[PeerRole::Voter, PeerRole::Voter], None);
+    let capped = Limits {
+        max_connection_age: Duration::from_secs(2),
+        ..limits()
+    };
+    let mut a = bind_with(&f, 0, capped);
+    let mut b = bind_with(&f, 1, capped);
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+    assert!(matches!(
+        event(&mut a).await,
+        TransportEvent::Connected { .. }
+    ));
+    assert!(matches!(
+        event(&mut b).await,
+        TransportEvent::Connected { .. }
+    ));
+    match event(&mut a).await {
+        TransportEvent::Closed { reason, .. } => assert!(
+            reason == CloseReason::Expired
+                || reason
+                    == CloseReason::PeerClosed {
+                        code: CloseCode::Expired as u16
+                    },
+            "the cap did not bound the connection: {reason:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A staged CA rotation: while both roots are trusted a leaf under
+/// either is accepted, and once the old root is dropped a leaf under it
+/// is not (task-58; design Section 10.4).
+///
+/// The staging is the whole point. A fleet cannot reissue every leaf and
+/// swap every trust bundle at one instant, so there has to be a window
+/// in which the two overlap -- and the window has to *end*, or the root
+/// being retired is retired only in the paperwork.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_ca_rotation_trusts_both_roots_and_then_only_the_new_one() {
+    let old = TestCa::new();
+    let new = TestCa::new();
+    let outgoing = old.issue("node-old", r(0), inc(1), PeerRole::Voter);
+    let incoming = new.issue("node-new", r(1), inc(1), PeerRole::Voter);
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    binder.register(&outgoing);
+    binder.register(&incoming);
+    let binder = Arc::new(binder);
+
+    // Partway through: both ends trust both roots. The node still
+    // holding an old leaf and the node already holding a new one talk.
+    let both = coord_transport_testkit::roots_of(&[&old, &new]);
+    let listener = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        incoming.local_trusting(both.clone(), CLUSTER, DOMAIN, vec![1, 2]),
+        binder.clone(),
+        limits(),
+    )
+    .unwrap();
+    let dialer = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        outgoing.local_trusting(both, CLUSTER, DOMAIN, vec![1, 2]),
+        binder.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut listener = listener;
+    dialer
+        .connect(
+            listener.local_addr().unwrap(),
+            &incoming.name,
+            PeerRole::Voter,
+            Some(inc(1)),
+            Lane::Control,
+            incoming.expected(),
+        )
+        .await
+        .expect("a leaf under the outgoing root is still trusted");
+    match event(&mut listener).await {
+        TransportEvent::Connected { identity, .. } => {
+            assert_eq!(identity.replica, Some(r(0)));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // And afterwards: the old root is dropped, and the leaf under it is
+    // refused like any other untrusted certificate. Nothing about the
+    // node changed -- its certificate is perfectly valid and its
+    // identity is the committed one -- but the root that vouches for it
+    // is no longer trusted, which is what retiring a CA has to mean.
+    let only_new = coord_transport_testkit::roots_of(&[&new]);
+    let rotated = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        incoming.local_trusting(only_new, CLUSTER, DOMAIN, vec![1, 2]),
+        binder,
+        limits(),
+    )
+    .unwrap();
+    let refused = dialer
+        .connect(
+            rotated.local_addr().unwrap(),
+            &incoming.name,
+            PeerRole::Voter,
+            Some(inc(1)),
+            Lane::Control,
+            incoming.expected(),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a leaf under the retired root was still admitted"
+    );
+    assert_eq!(rotated.connections(), 0);
 }

@@ -1579,3 +1579,68 @@ fn a_seal_is_recovered_from_its_row_and_the_cut_sees_it_before_the_projection() 
         Err(coord_consensus::PromiseRejection::Sealed { transition })
     );
 }
+
+/// An authorized replacement carries the stream forward, and the suffix
+/// the previous generation wrote replays into the projection under the
+/// new one (task-58; design Sections 10.4, 20.4).
+///
+/// The generation that wrote a record is provenance carried on the
+/// record, not a property of the stream: the prefix below the cut keeps
+/// the generation that wrote it and everything after the adoption
+/// carries the new one. A replay that insisted on one value for the
+/// whole stream would reject this node's own history, and the node would
+/// come back having lost exactly what the replacement was meant to
+/// preserve.
+#[test]
+fn a_replaced_node_replays_the_suffix_its_previous_generation_wrote() {
+    let mut world = World::new();
+    // Durable in the journal, deliberately not materialized: this is the
+    // suffix `(M, J]` the next boot owes.
+    for step in 1..=3u64 {
+        world.protocol(A, ballot(1), promise(step));
+        world.store.append_pending().unwrap();
+    }
+    let before = world.store.frontiers(A).unwrap();
+    assert!(
+        before.materialized() < before.durable(),
+        "nothing was owed, so this test would prove nothing"
+    );
+
+    let (journal, mut engines) = world.store.into_parts();
+    let engine = engines.pop().expect("one domain").1;
+
+    // The node's key was replaced. Its durable state -- projection and
+    // journal alike -- is the same state.
+    let replaced = ReplicaIncarnation::new(inc().get() + 1).unwrap();
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        replaced,
+        BootId([0x89; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    assert!(
+        next.adopt_stream(A, inc()).unwrap().is_some(),
+        "the replacement did not carry this domain's stream forward"
+    );
+    next.attach(A, shard(), engine).unwrap();
+    let recovered = next.frontiers(A).unwrap();
+    assert!(
+        recovered.materialized() >= before.durable(),
+        "the suffix the previous generation wrote was not replayed: {:?} < {:?}",
+        recovered.materialized(),
+        before.durable()
+    );
+    assert!(
+        recovered.materialized() > before.materialized(),
+        "nothing was replayed at all"
+    );
+    assert_eq!(next.status(A), Some(DomainStatus::Ready));
+
+    // Idempotent, and never backwards: a second boot at the same
+    // generation carries nothing, and the generation that was replaced
+    // cannot take the stream back.
+    assert_eq!(next.adopt_stream(A, inc()).unwrap(), None);
+}

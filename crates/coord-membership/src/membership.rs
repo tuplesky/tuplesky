@@ -31,6 +31,48 @@ pub enum MembershipError {
     },
 }
 
+/// What a presented node credential is, against committed membership
+/// (task-58; design Sections 10.4, 20.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialChange {
+    /// The committed generation, presenting the committed key: a
+    /// renewal. It authorizes exactly what the old leaf did, and it
+    /// changes no membership.
+    Renewal,
+    /// The committed generation, presenting another key.
+    ///
+    /// Not a renewal and not authorized: a key change *is* a generation
+    /// change, and a generation change is committed. Without this case
+    /// an issuer that was compromised or merely tricked could mint a
+    /// second key for an existing voter's current generation and have
+    /// it accepted as that voter.
+    UncommittedKey,
+    /// A later generation than the committed one.
+    ///
+    /// A replacement in progress, and not yet authorized here. The
+    /// certificate may be perfectly valid; what is missing is the
+    /// committed configuration that makes this generation the voter.
+    RequiresCommit {
+        /// The committed generation.
+        committed: ReplicaIncarnation,
+        /// What was presented.
+        presented: ReplicaIncarnation,
+    },
+    /// An earlier generation than the committed one.
+    ///
+    /// A credential from before a replacement, or a disk cloned from
+    /// before one. Either way it is not the voter now, and treating it
+    /// as one is how a replaced node votes twice.
+    Stale {
+        /// The committed generation.
+        committed: ReplicaIncarnation,
+        /// What was presented.
+        presented: ReplicaIncarnation,
+    },
+    /// This node is not a committed voter of this epoch at all.
+    NotAVoter,
+}
+
 /// The committed configuration of one epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Membership {
@@ -139,6 +181,41 @@ impl Membership {
     /// The committed incarnation of a voter node, if any.
     pub fn voter_incarnation(&self, node: &ReplicaId) -> Option<ReplicaIncarnation> {
         self.voters.get(node).map(|v| v.incarnation)
+    }
+
+    /// What the credential a node presents *is*, against what this
+    /// configuration committed (task-58).
+    ///
+    /// The distinctions here are the whole of "renewal is not
+    /// membership". A node renews its leaf continuously and none of
+    /// those renewals may move a voter; a key or generation change may,
+    /// and only a committed configuration can say so. Naming each case
+    /// rather than returning a bool is deliberate: the interesting ones
+    /// are the refusals, and a caller that cannot tell a stale clone
+    /// from an early replacement cannot report either usefully.
+    pub fn classify_credential(
+        &self,
+        node: &ReplicaId,
+        incarnation: ReplicaIncarnation,
+        public_key: &[u8],
+    ) -> CredentialChange {
+        let Some(voter) = self.voters.get(node) else {
+            return CredentialChange::NotAVoter;
+        };
+        match incarnation.cmp(&voter.incarnation) {
+            core::cmp::Ordering::Equal if voter.public_key == public_key => {
+                CredentialChange::Renewal
+            }
+            core::cmp::Ordering::Equal => CredentialChange::UncommittedKey,
+            core::cmp::Ordering::Greater => CredentialChange::RequiresCommit {
+                committed: voter.incarnation,
+                presented: incarnation,
+            },
+            core::cmp::Ordering::Less => CredentialChange::Stale {
+                committed: voter.incarnation,
+                presented: incarnation,
+            },
+        }
     }
 
     /// Verify an endpoint catalog against this committed configuration.

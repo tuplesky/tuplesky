@@ -88,7 +88,9 @@ pub struct StreamKey {
     pub cluster: ClusterId,
     /// Domain.
     pub domain: DomainId,
-    /// Replica incarnation; a new incarnation gets a new stream.
+    /// Replica incarnation. A new incarnation gets a new stream, unless
+    /// it inherited the previous one's durable state through an
+    /// authorized replacement -- see [`StreamAllocator::adopt`].
     pub incarnation: ReplicaIncarnation,
 }
 
@@ -127,6 +129,27 @@ pub struct StreamMappingV1 {
     pub shard: ShardId,
     /// Whether the stream was retired (files may still exist; never reuse).
     pub retired: bool,
+}
+
+impl StreamMappingV1 {
+    /// Whether `next` is this same stream carried forward to a later
+    /// incarnation of the same replica (task-58).
+    ///
+    /// A stream's identity is otherwise fixed: a mapping that could be
+    /// rewritten could make an existing stream's records belong to
+    /// somebody else. The one change that is not that is an authorized
+    /// key replacement, where the node keeps its durable state and the
+    /// stream is part of it -- same identifier, same cluster, same
+    /// domain, same shard, same retirement, and a strictly later
+    /// generation. Monotone, so nothing can be walked back.
+    pub fn adopts(&self, next: &StreamMappingV1) -> bool {
+        self.stream == next.stream
+            && self.shard == next.shard
+            && self.retired == next.retired
+            && self.key.cluster == next.key.cluster
+            && self.key.domain == next.key.domain
+            && next.key.incarnation > self.key.incarnation
+    }
 }
 
 /// Lifecycle state of an allocated stream.
@@ -337,6 +360,53 @@ impl StreamAllocator {
         }
     }
 
+    /// Carry a durable mapping forward to a later incarnation of the
+    /// same replica (task-58; design Sections 10.4, 20.4).
+    ///
+    /// "A new incarnation gets a new stream" is the rule for a replica
+    /// that arrives without durable state. A replica whose *key* was
+    /// replaced keeps its state, and its stream is part of that state:
+    /// a fresh stream would leave the projection materialized past a
+    /// journal head of zero, which is the shape of a lost prefix and is
+    /// refused on attach. So the identifier and its records stay and
+    /// the mapping records which generation it now serves.
+    ///
+    /// Only forwards, only within one cluster and domain, and never
+    /// onto a key that already owns a stream: an identifier is never
+    /// reused and two identities never share one. The caller is
+    /// responsible for having established that the later incarnation is
+    /// the committed one -- this moves a mapping, it decides nothing
+    /// about membership. The returned mapping must be persisted before
+    /// the stream is used again.
+    pub fn adopt(
+        &mut self,
+        from: StreamKey,
+        to: StreamKey,
+    ) -> Result<StreamMappingV1, StreamError> {
+        if from.cluster != to.cluster || from.domain != to.domain {
+            return Err(StreamError::Unknown);
+        }
+        if to.incarnation <= from.incarnation {
+            return Err(StreamError::Unknown);
+        }
+        if let Some(stream) = self.by_key.get(&to) {
+            return Err(StreamError::KeyAlreadyMapped { stream: *stream });
+        }
+        let stream = *self.by_key.get(&from).ok_or(StreamError::Unknown)?;
+        match self.streams.get_mut(&stream) {
+            None => Err(StreamError::Unknown),
+            Some((_, StreamState::Reserved)) => Err(StreamError::MappingNotDurable),
+            Some((_, StreamState::Retired)) => Err(StreamError::Retired),
+            Some((mapping, StreamState::Durable)) => {
+                mapping.key = to;
+                let mapping = *mapping;
+                self.by_key.remove(&from);
+                self.by_key.insert(to, stream);
+                Ok(mapping)
+            }
+        }
+    }
+
     /// State of a stream, if allocated.
     pub fn state(&self, stream: StorageStreamId) -> Option<StreamState> {
         self.streams.get(&stream).map(|(_, s)| *s)
@@ -363,6 +433,49 @@ mod tests {
             domain: DomainId([domain; 16]),
             incarnation: ReplicaIncarnation::new(incarnation).unwrap(),
         }
+    }
+
+    /// An authorized replacement carries the stream forward, and only
+    /// forwards, within one domain, and only onto a free key (task-58).
+    #[test]
+    fn a_stream_is_carried_forward_to_a_later_generation_and_never_anywhere_else() {
+        let mut a = StreamAllocator::new();
+        let shard = ShardId::new(0).unwrap();
+        let stream = a.allocate(key(1, 1), shard).unwrap().stream;
+        let other = a.allocate(key(2, 1), shard).unwrap().stream;
+        a.mapping_durable(stream).unwrap();
+        a.mapping_durable(other).unwrap();
+
+        // The mapping moves; the identifier and the high-water mark do
+        // not, because nothing new was allocated.
+        let carried = a.adopt(key(1, 1), key(1, 2)).unwrap();
+        assert_eq!(carried.stream, stream);
+        assert_eq!(carried.key, key(1, 2));
+        assert_eq!(a.high_water(), StreamHighWater(2));
+        assert_eq!(a.lookup(&key(1, 2)), Some(stream));
+        assert_eq!(
+            a.lookup(&key(1, 1)),
+            None,
+            "the old generation still owns the stream"
+        );
+
+        // Backwards is how a replaced node would take its stream back.
+        assert!(a.adopt(key(1, 2), key(1, 1)).is_err());
+        // Sideways is how one domain would take another's records.
+        assert!(a.adopt(key(2, 1), key(1, 3)).is_err());
+        // Onto a key that already owns a stream is how one identity
+        // would come to own two.
+        let taken = a.allocate(key(1, 3), shard).unwrap().stream;
+        a.mapping_durable(taken).unwrap();
+        assert!(matches!(
+            a.adopt(key(1, 2), key(1, 3)),
+            Err(StreamError::KeyAlreadyMapped { .. })
+        ));
+        // And a retired stream stays retired.
+        let retired = a.allocate(key(3, 1), shard).unwrap().stream;
+        a.mapping_durable(retired).unwrap();
+        a.retire(retired).unwrap();
+        assert_eq!(a.adopt(key(3, 1), key(3, 2)), Err(StreamError::Retired));
     }
 
     #[test]
