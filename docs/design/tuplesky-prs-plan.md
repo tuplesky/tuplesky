@@ -824,7 +824,11 @@ Against the same store task-51's own tests use: two promises of three certify th
 
 Model pre-seal cancellation, partial durable sealing, indeterminate writes and outstanding/stale sealing attempts explicitly; the recovery branch must be justified by authoritative evidence, not the coordinator label or a missing local record.
 
+`coord_consensus::handoff` is the vocabulary and the predicates. An old voter records one stance per transition and never reverses it, so a seal and a cancellation cannot both certify and no retry clears a fence. A terminal certificate is selected only after the seal, from a majority of the old voters agreeing on one root and one successor; before the fence an old voter can still accept work, so what it calls terminal is not. The successor activates only once a majority of it has durably installed that exact root. `resume` takes durable records and nothing else -- `Evidence` has no lifecycle label and deliberately no place to put one -- and has no path from a fence back to `Stable`; a fence another transition left is `FencedByAnother`, because the domain permits one transition and a fence belongs to the configuration.
+
 **Acceptance:** Explicit intersection/fencing obligations reject two successors, old-generation vote resurrection and minority recreation. An applied KV view or admission shutdown alone never defines terminal state.
+
+Every assignment of a stance script to each of three old voters, crossed with how far the coordinator got before it died: no fence is ever cleared, no voter ever records both stances for one transition, a terminal certificate always names the transition's successor and always follows a seal, an activation always implies a majority of the successor installed the certificate's exact root, and accumulating evidence never moves the stage backwards. Five rules removed one at a time, each with the counterexample it exists for, frozen under `fixtures/counterexamples`.
 
 Cancellation and seal completion cannot both authorize conflicting continuations. Partial/unknown seal state never clears persistent fences or enters terminal recovery without an authorized old-quorum seal.
 

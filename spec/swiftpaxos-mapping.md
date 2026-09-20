@@ -276,6 +276,28 @@ certificate, and the `TrimmedFloorV1` it yields is task-51's floor
 unchanged -- so the fence, the bounded trimming and the deletions are the
 same code on both paths.
 
+## Sealed membership handoff (task-54)
+
+Also outside the paper: SwiftPaxos is fixed-membership, and the prototype
+has no configuration change at all. Modeled here because the composition
+it has to be safe against is the one the paper's recovery already
+handles -- a coordinator that dies mid-operation and is replaced -- and
+because the failure mode is losing obligations, not availability.
+
+| Item | Status | Where |
+|---|---|---|
+| `Transition`: the configuration left, the one entered, and a subject binding the domain and the exact successor incarnations | `[EXT]` | Section 10.3.2 |
+| `Stance` and `StanceLedger`: one old voter, one stance per transition, never reversed | `[EXT]` | the rule a seal and a cancellation not both certifying rests on |
+| `SealCertificate`: a majority of the old voters have fenced ordinary voting for the whole old configuration, across ballots | `[EXT]` | Section 10.3.2; handoff-only recovery stays possible |
+| `CancellationCertificate`: a majority refused instead, available only before any seal | `[EXT]` | Section 10.3.2 |
+| `TerminalCertificate`: selected only after the seal, from a majority agreeing on one root and one successor | `[EXT]` | Section 4.8, 10.3.2; mixed roots refused, never merged |
+| `ActivationCertificate`: a majority of the *successor* installed that exact root | `[EXT]` | Section 10.3.2 |
+| `resume`: the stage a replacement coordinator continues from, chosen from durable records alone | `[EXT]` | Section 10.3.2: not the last in-memory lifecycle label |
+| `HandoffError::FencedByAnother`: a fence another transition left is still a fence | `[EXT]` | one transition per domain |
+| A lifecycle label, a timeout or a missing local record as evidence | `[EXT]` rejected | Section 10.3.2 |
+| An applied KV view or a closed frontend as terminal state | `[EXT]` rejected | Section 10.3.2, and the frozen counterexample |
+| Raft joint consensus | out of scope | Section 10.3.2: stop-and-transfer, explicitly modeled |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the
@@ -311,6 +333,22 @@ and every majority read of them.
   report instead of a majority (it misses the floor), and possession
   counted as readiness (a signer crashes and votes from a baseline the
   cluster has forgotten below).
+
+`crates/coord-consensus/tests/handoff.rs` (task-54) runs the transition
+to every point at which a coordinator can die -- every assignment of a
+stance script to each of three old voters, crossed with how much the
+coordinator made durable -- and asks `resume` where to carry on.
+
+* `handoff_scenarios.json`: the worlds explored, how many resumed at
+  each stage, the worlds in which a fence was cleared (none) and the
+  worlds in which a seal and a cancellation both certified (none);
+* `handoff_counterexamples.json`: five rules removed one at a time -- a
+  voter reversing its stance (a fence cleared by a retry), a terminal
+  certificate selected before the fence (binding a state the old
+  configuration can still move past), mixed terminal roots merged (a
+  history nobody agreed on), a minority of the successor activating (a
+  successor serving while most of it holds nothing), and an
+  installation of another root counting.
 
 ## Not claimed
 
