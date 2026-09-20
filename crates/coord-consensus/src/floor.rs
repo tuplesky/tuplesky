@@ -43,11 +43,14 @@
 //!
 //! **A floor is not a ballot artifact.** It belongs to a configuration
 //! and outlives every term in it, so nothing here consults a ballot or
-//! its leader. Requiring the leader would bind a durable cross-ballot
-//! fact to a leadership that changes underneath it, and it would buy
-//! nothing: the intersection that makes discovery work is between two
-//! majorities of the *same voter set*, and those intersect whoever
-//! leads.
+//! its leader -- which is why the voters come as an [`EpochVoters`] and
+//! not a [`BallotConfiguration`]. Requiring the leader would bind a
+//! durable cross-ballot fact to a leadership that changes underneath
+//! it, and it would buy nothing: the intersection that makes discovery
+//! work is between two majorities of the *same voter set*, and those
+//! intersect whoever leads.
+//!
+//! [`BallotConfiguration`]: crate::quorum::BallotConfiguration
 //!
 //! **Copying a snapshot to a majority is not activation.** What is
 //! counted is the durable promise, not possession. A voter that holds
@@ -62,54 +65,10 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use crate::quorum::EpochVoters;
 use coord_types::identity::Digest32;
 use coord_types::ids::{ConfigurationEpoch, ExecutionPosition, ReplicaId};
 use serde::{Deserialize, Serialize};
-
-/// The voters one floor is certified by: exactly the configuration's.
-///
-/// Held separately from [`BallotConfiguration`] on purpose. That type
-/// describes one term -- it has a ballot, a leader and a fast set --
-/// and a floor has none of those. Sharing it would invite a rule that
-/// depended on who happened to be leading when the floor was certified.
-///
-/// [`BallotConfiguration`]: crate::quorum::BallotConfiguration
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct FloorVoters {
-    epoch: ConfigurationEpoch,
-    voters: BTreeSet<ReplicaId>,
-}
-
-impl FloorVoters {
-    /// The voters of `epoch`. Refused when empty: a floor certified by
-    /// nobody is not a weaker floor, it is no floor.
-    pub fn new(epoch: ConfigurationEpoch, voters: BTreeSet<ReplicaId>) -> Option<Self> {
-        if voters.is_empty() {
-            return None;
-        }
-        Some(FloorVoters { epoch, voters })
-    }
-
-    /// The configuration epoch.
-    pub const fn epoch(&self) -> ConfigurationEpoch {
-        self.epoch
-    }
-
-    /// The exact voters.
-    pub const fn voters(&self) -> &BTreeSet<ReplicaId> {
-        &self.voters
-    }
-
-    /// Whether `replica` votes in this epoch.
-    pub fn is_voter(&self, replica: &ReplicaId) -> bool {
-        self.voters.contains(replica)
-    }
-
-    /// Signatures a certificate needs: a majority (`N/2 + 1`).
-    pub fn majority(&self) -> usize {
-        self.voters.len() / 2 + 1
-    }
-}
 
 /// What one floor names.
 ///
@@ -218,7 +177,7 @@ impl ReadinessLedger {
     /// lost reply safe.
     pub fn record(
         &mut self,
-        voters: &FloorVoters,
+        voters: &EpochVoters,
         candidate: FloorCandidate,
     ) -> Result<Readiness, ReadinessError> {
         if candidate.epoch != self.epoch || voters.epoch() != self.epoch {
@@ -351,7 +310,7 @@ pub enum FenceVerdict {
 /// come from a voter of it; duplicates from one voter count once. A
 /// majority certifies.
 pub fn activate(
-    voters: &FloorVoters,
+    voters: &EpochVoters,
     ready: &[Readiness],
 ) -> Result<ActivatedFloor, ActivationError> {
     let Some(first) = ready.first() else {

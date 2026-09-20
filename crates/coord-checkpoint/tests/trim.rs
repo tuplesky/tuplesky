@@ -11,12 +11,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coord_checkpoint::export::{CheckpointOrigin, ExportLimits, export_shared};
+use coord_checkpoint::floor::{
+    ACTIVATION_KEY, CheckpointReadinessV1, READINESS_KEY_PREFIX, RecoveryObligation,
+    activate_floor, publish_activation, published_activation, read_readiness, readiness_key,
+    record_readiness, recovery_obligation,
+};
 use coord_checkpoint::manifest::{CheckpointBoundary, SharedManifestV1};
 use coord_checkpoint::trim::{
     ACK_KEY_PREFIX, CheckpointAckV1, FLOOR_KEY, FenceDecision, TrimError, TrimFence, TrimFloor,
     TrimLimits, TrimPlan, TrimmedFloorV1, ack_key, ack_update, establish_floor, plan_trim,
     publish_floor, publish_floor_in, published_floor, read_acks, trim_backpressure,
 };
+use coord_consensus::quorum::EpochVoters;
 use coord_consensus::recovery::SyncDecision;
 use coord_consensus::rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SyncRecordV1, dependency_key,
@@ -1346,4 +1352,504 @@ fn a_floor_publication_planned_from_a_stale_snapshot_cannot_lower_the_floor() {
     tx.abort().unwrap();
     let view = engine.reader().snapshot().unwrap();
     assert_eq!(published_floor(&view).unwrap(), Some(newer.published()));
+}
+
+// ---------------------------------------------------------------------
+// task-53: the quorum-certified floor, over the same store and the same
+// trimming. Everything below the floor is unchanged; what changes is how
+// the floor comes to exist and what a recovery owes because of it.
+// ---------------------------------------------------------------------
+
+fn floor_voters() -> EpochVoters {
+    EpochVoters::new(epoch(EPOCH), voters()).unwrap()
+}
+
+fn readiness(voter: ReplicaId) -> CheckpointReadinessV1 {
+    CheckpointReadinessV1 {
+        voter,
+        cluster: CLUSTER,
+        domain: DOMAIN,
+        configuration: epoch(EPOCH),
+        boundary: boundary(),
+        root: root(),
+    }
+}
+
+/// The store with `who` having durably promised.
+fn store_with_readiness(who: &[ReplicaId]) -> ModelEngine {
+    let mut engine = voter_store();
+    for voter in who {
+        let view = engine.reader().snapshot().unwrap();
+        let update = record_readiness(&view, &floor_voters(), &readiness(*voter)).unwrap();
+        drop(view);
+        apply(&mut engine, &[update]);
+    }
+    engine
+}
+
+/// A permanently absent voter no longer stops semantic forgetting.
+///
+/// This is the whole of what task-53 buys over task-51, and the shape of
+/// the test says why it is safe rather than merely convenient: the same
+/// store, the same protocol rows, the same deletions -- only the floor
+/// arrives with two promises out of three instead of three out of three.
+#[test]
+fn a_majority_of_promises_certifies_the_floor_a_missing_voter_would_have_blocked() {
+    let mut engine = store_with_readiness(&[SELF, PEER]);
+    let view = engine.reader().snapshot().unwrap();
+
+    // Task-51's rule still says no, and says exactly who is missing.
+    let acks: Vec<CheckpointAckV1> = [SELF, PEER].into_iter().map(ack).collect();
+    assert_eq!(
+        establish_floor(&acks, &voters(), CLUSTER, DOMAIN),
+        Err(TrimError::MissingAcknowledgements {
+            missing: vec![LAGGARD]
+        })
+    );
+
+    let promises = read_readiness(&view, &TrimLimits::default()).unwrap();
+    let certified = activate_floor(&promises, &floor_voters(), CLUSTER, DOMAIN).unwrap();
+    assert_eq!(certified.signers, BTreeSet::from([SELF, PEER]));
+    assert_eq!(certified.boundary, boundary());
+    // The certificate yields the floor the all-voter path would have,
+    // so everything after it is the same code. The one difference is
+    // the one that matters: it is published on two promises, not three.
+    let yielded = certified.trim_floor().published();
+    assert_eq!(yielded.boundary, published().boundary);
+    assert_eq!(yielded.root, published().root);
+    assert_eq!(yielded.configuration, published().configuration);
+    assert_eq!(yielded.voters, 2);
+    drop(view);
+
+    // Publish the certificate and the floor in one durable batch, then
+    // trim. What survives is what task-51's own test asserts survives.
+    let view = engine.reader().snapshot().unwrap();
+    let batch = vec![
+        publish_activation(&certified, published_activation(&view).unwrap().as_ref()).unwrap(),
+        publish_floor(
+            &certified.trim_floor(),
+            published_floor(&view).unwrap().as_ref(),
+        )
+        .unwrap(),
+    ];
+    drop(view);
+    apply(&mut engine, &batch);
+    let before = protocol_keys(&engine);
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    let after = protocol_keys(&engine);
+    assert!(
+        after.len() < before.len(),
+        "a certified floor authorized no deletion at all"
+    );
+    // The promise row itself is not protocol state and is never trimmed:
+    // it is what a recovery reads.
+    let view = engine.reader().snapshot().unwrap();
+    assert_eq!(
+        read_readiness(&view, &TrimLimits::default()).unwrap().len(),
+        2
+    );
+}
+
+/// A minority certifies nothing, and possession is not a promise.
+#[test]
+fn possession_without_a_promise_certifies_nothing_and_neither_does_a_minority() {
+    // One promise of three voters.
+    let engine = store_with_readiness(&[SELF]);
+    let view = engine.reader().snapshot().unwrap();
+    let promises = read_readiness(&view, &TrimLimits::default()).unwrap();
+    assert_eq!(
+        activate_floor(&promises, &floor_voters(), CLUSTER, DOMAIN),
+        Err(TrimError::NoQuorum { have: 1, need: 2 })
+    );
+
+    // Two voters hold the checkpoint -- their acknowledgements are
+    // durable -- and neither promised. Possession is visible and
+    // certifies nothing: there is no readiness row to certify from.
+    let mut holders = voter_store();
+    let updates: Vec<StoreUpdate> = [SELF, PEER]
+        .into_iter()
+        .map(|v| ack_update(&ack(v)).unwrap())
+        .collect();
+    apply(&mut holders, &updates);
+    let view = holders.reader().snapshot().unwrap();
+    assert_eq!(read_acks(&view, &TrimLimits::default()).unwrap().len(), 2);
+    assert!(
+        read_readiness(&view, &TrimLimits::default())
+            .unwrap()
+            .is_empty(),
+        "an acknowledgement was read back as a promise"
+    );
+}
+
+/// A promise moves up and never down, and never holds two checkpoints at
+/// one boundary.
+///
+/// The second rule is the one at most one subject per boundary rests on:
+/// two certificates would need two majorities, and those intersect in a
+/// voter that would have had to promise twice at one position.
+#[test]
+fn a_promise_moves_up_never_down_and_never_holds_two_checkpoints_at_one_boundary() {
+    let mut engine = store_with_readiness(&[SELF]);
+
+    // The same promise again is the same promise.
+    let view = engine.reader().snapshot().unwrap();
+    record_readiness(&view, &floor_voters(), &readiness(SELF)).expect("idempotent");
+
+    // Another checkpoint at the same boundary is refused.
+    let mut competing = readiness(SELF);
+    competing.root = Digest32([0xff; 32]);
+    assert_eq!(
+        record_readiness(&view, &floor_voters(), &competing),
+        Err(TrimError::ReadinessCompeting {
+            position: pos(FLOOR_POSITION)
+        })
+    );
+    drop(view);
+
+    // A later boundary is accepted and becomes what is held.
+    let mut later = readiness(SELF);
+    later.boundary.execution_position = pos(FLOOR_POSITION + 1);
+    later.root = Digest32([0x7b; 32]);
+    let view = engine.reader().snapshot().unwrap();
+    let update = record_readiness(&view, &floor_voters(), &later).unwrap();
+    drop(view);
+    apply(&mut engine, &[update]);
+
+    // And the earlier one can never come back.
+    let view = engine.reader().snapshot().unwrap();
+    assert_eq!(
+        record_readiness(&view, &floor_voters(), &readiness(SELF)),
+        Err(TrimError::ReadinessRegressed {
+            held: pos(FLOOR_POSITION + 1),
+            offered: pos(FLOOR_POSITION)
+        })
+    );
+    let held = read_readiness(&view, &TrimLimits::default()).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].boundary.execution_position, pos(FLOOR_POSITION + 1));
+}
+
+/// An observer or a foreign checkpoint supplies no signature.
+#[test]
+fn an_observer_or_a_foreign_promise_is_refused_rather_than_counted() {
+    let voters = floor_voters();
+    let mut observer = readiness(OBSERVER);
+    observer.voter = OBSERVER;
+    assert_eq!(
+        activate_floor(
+            &[readiness(SELF), readiness(PEER), observer],
+            &voters,
+            CLUSTER,
+            DOMAIN
+        ),
+        Err(TrimError::NonVoterReadiness { replica: OBSERVER })
+    );
+    let engine = voter_store();
+    let view = engine.reader().snapshot().unwrap();
+    assert_eq!(
+        record_readiness(&view, &voters, &observer),
+        Err(TrimError::NonVoterReadiness { replica: OBSERVER })
+    );
+
+    for (field, mutate) in [
+        (
+            "cluster",
+            (|r: &mut CheckpointReadinessV1| r.cluster = ClusterId([0xee; 16]))
+                as fn(&mut CheckpointReadinessV1),
+        ),
+        ("domain", |r: &mut CheckpointReadinessV1| {
+            r.domain = DomainId([0xee; 16])
+        }),
+    ] {
+        let mut stranger = readiness(PEER);
+        mutate(&mut stranger);
+        assert_eq!(
+            activate_floor(&[readiness(SELF), stranger], &voters, CLUSTER, DOMAIN),
+            Err(TrimError::OriginMismatch { voter: PEER, field })
+        );
+    }
+}
+
+/// A recovery reads a majority, honours the highest floor it finds, and
+/// refuses to answer from a narrower read.
+#[test]
+fn a_recovery_honours_the_highest_floor_a_majority_reports_and_refuses_a_narrower_read() {
+    let voters = floor_voters();
+    let promises = vec![readiness(SELF), readiness(PEER)];
+
+    // A lagging replica must obtain the checkpoint before voting.
+    let behind = pos(FLOOR_POSITION - 1);
+    let obligation = recovery_obligation(&voters, &promises, behind).unwrap();
+    assert_eq!(
+        obligation,
+        RecoveryObligation::Install {
+            position: pos(FLOOR_POSITION),
+            subject: readiness(SELF).subject(),
+        }
+    );
+
+    // One that is already at or beyond the floor owes nothing.
+    assert_eq!(
+        recovery_obligation(&voters, &promises, pos(FLOOR_POSITION)).unwrap(),
+        RecoveryObligation::None
+    );
+
+    // The narrower read is refused rather than answered. This is the
+    // counterexample task-52 froze: a recovery that answered from one
+    // report could miss the highest floor entirely, and the replica
+    // that missed it would vote from a baseline the cluster forgot
+    // below. One report is one report whatever it says.
+    assert_eq!(
+        recovery_obligation(&voters, &[readiness(LAGGARD)], behind),
+        Err(TrimError::NoQuorum { have: 1, need: 2 })
+    );
+    assert_eq!(
+        recovery_obligation(&voters, &[], behind),
+        Err(TrimError::NoQuorum { have: 0, need: 2 })
+    );
+    assert_eq!(
+        recovery_obligation(&voters, &[readiness(SELF)], behind),
+        Err(TrimError::NoQuorum { have: 1, need: 2 })
+    );
+
+    // Every majority of the voters intersects the signers, so every one
+    // of them discovers the floor.
+    let certified = activate_floor(&promises, &voters, CLUSTER, DOMAIN).unwrap();
+    for majority in [
+        BTreeSet::from([SELF, PEER]),
+        BTreeSet::from([SELF, LAGGARD]),
+        BTreeSet::from([PEER, LAGGARD]),
+        voters.voters().clone(),
+    ] {
+        let reports: Vec<CheckpointReadinessV1> = promises
+            .iter()
+            .filter(|p| majority.contains(&p.voter))
+            .copied()
+            .collect();
+        // The laggard promised nothing, so a majority containing it
+        // reports one promise -- but it is still a majority of voters
+        // reporting, which is what the rule requires.
+        let reporting: Vec<CheckpointReadinessV1> = majority
+            .iter()
+            .map(|v| {
+                reports
+                    .iter()
+                    .find(|p| &p.voter == v)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        // A voter that promised nothing reports its
+                        // absence of a promise; modelled here as a
+                        // promise at the zero boundary, which is what a
+                        // fresh replica would report.
+                        let mut nothing = readiness(*v);
+                        nothing.boundary.execution_position = ExecutionPosition::ZERO;
+                        nothing
+                    })
+            })
+            .collect();
+        let discovered = recovery_obligation(&voters, &reporting, behind).unwrap();
+        assert_eq!(
+            discovered,
+            RecoveryObligation::Install {
+                position: certified.boundary.execution_position,
+                subject: readiness(SELF).subject(),
+            },
+            "a majority containing a signer discovered less than the floor"
+        );
+    }
+}
+
+/// The published certificate never moves backwards, and a disagreement
+/// at one boundary stops rather than choosing.
+#[test]
+fn the_published_certificate_never_moves_backwards() {
+    let voters = floor_voters();
+    let certified = activate_floor(
+        &[readiness(SELF), readiness(PEER)],
+        &voters,
+        CLUSTER,
+        DOMAIN,
+    )
+    .unwrap();
+
+    let mut earlier = certified.clone();
+    earlier.boundary.execution_position = pos(FLOOR_POSITION - 1);
+    assert_eq!(
+        publish_activation(&earlier, Some(&certified)),
+        Err(TrimError::FloorRegressed {
+            published: pos(FLOOR_POSITION),
+            offered: pos(FLOOR_POSITION - 1)
+        })
+    );
+
+    let mut other_root = certified.clone();
+    other_root.root = Digest32([0xff; 32]);
+    assert_eq!(
+        publish_activation(&other_root, Some(&certified)),
+        Err(TrimError::FloorConflict)
+    );
+
+    let mut elsewhere = certified.clone();
+    elsewhere.domain = DomainId([0xee; 16]);
+    assert_eq!(
+        publish_activation(&elsewhere, Some(&certified)),
+        Err(TrimError::FloorOriginMismatch { field: "domain" })
+    );
+
+    // Republishing the same certificate is not a regression.
+    publish_activation(&certified, Some(&certified)).expect("idempotent");
+}
+
+/// A crash between the certificate and the floor deletes nothing, and
+/// the next attempt is the same attempt.
+///
+/// The order is the safety: the certificate is evidence, the floor is
+/// the authorization, and the deletions come last. Stopping anywhere in
+/// between leaves a store that still holds everything it held.
+#[test]
+fn a_crash_between_the_certificate_and_the_floor_deletes_nothing() {
+    let mut engine = store_with_readiness(&[SELF, PEER]);
+    let before = protocol_keys(&engine);
+
+    let view = engine.reader().snapshot().unwrap();
+    let promises = read_readiness(&view, &TrimLimits::default()).unwrap();
+    let certified = activate_floor(&promises, &floor_voters(), CLUSTER, DOMAIN).unwrap();
+    let cert_update =
+        publish_activation(&certified, published_activation(&view).unwrap().as_ref()).unwrap();
+    drop(view);
+    apply(&mut engine, &[cert_update]);
+
+    // The certificate is durable and nothing is authorized yet.
+    let view = engine.reader().snapshot().unwrap();
+    assert_eq!(
+        published_activation(&view).unwrap(),
+        Some(certified.clone())
+    );
+    assert_eq!(published_floor(&view).unwrap(), None);
+    drop(view);
+    assert_eq!(protocol_keys(&engine), before);
+
+    // The next attempt recomputes the same certificate from the same
+    // promises and publishes the floor.
+    let view = engine.reader().snapshot().unwrap();
+    let again = activate_floor(
+        &read_readiness(&view, &TrimLimits::default()).unwrap(),
+        &floor_voters(),
+        CLUSTER,
+        DOMAIN,
+    )
+    .unwrap();
+    assert_eq!(again, certified);
+    let floor_update = publish_floor(
+        &again.trim_floor(),
+        published_floor(&view).unwrap().as_ref(),
+    )
+    .unwrap();
+    drop(view);
+    apply(&mut engine, &[floor_update]);
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    assert!(protocol_keys(&engine).len() < before.len());
+}
+
+/// Promise rows are read back from durable state and never confused with
+/// the other `checkpoint_v1` records.
+#[test]
+fn promises_are_read_back_from_durable_rows_and_not_confused_with_other_records() {
+    let mut engine = store_with_readiness(&[SELF, PEER, LAGGARD]);
+    // An acknowledgement, a published floor and a certificate all live
+    // in the same collection and none of them is a promise.
+    let view = engine.reader().snapshot().unwrap();
+    let certified = activate_floor(
+        &read_readiness(&view, &TrimLimits::default()).unwrap(),
+        &floor_voters(),
+        CLUSTER,
+        DOMAIN,
+    )
+    .unwrap();
+    let batch = vec![
+        ack_update(&ack(SELF)).unwrap(),
+        publish_activation(&certified, None).unwrap(),
+        publish_floor(&certified.trim_floor(), None).unwrap(),
+    ];
+    drop(view);
+    apply(&mut engine, &batch);
+
+    let view = engine.reader().snapshot().unwrap();
+    let promises = read_readiness(&view, &TrimLimits::default()).unwrap();
+    assert_eq!(
+        promises.iter().map(|p| p.voter).collect::<BTreeSet<_>>(),
+        voters()
+    );
+    // Keys of the four record families are distinct and ordered, which
+    // is what lets one prefix scan end at the next family.
+    assert!(readiness_key(&SELF).starts_with(READINESS_KEY_PREFIX));
+    assert!(ack_key(&SELF).starts_with(ACK_KEY_PREFIX));
+    assert!(ACK_KEY_PREFIX < ACTIVATION_KEY);
+    assert!(ACTIVATION_KEY < READINESS_KEY_PREFIX);
+    assert!(READINESS_KEY_PREFIX < FLOOR_KEY);
+
+    // A promise row whose value is another record is corruption, not an
+    // absent promise.
+    apply(
+        &mut engine,
+        &[StoreUpdate {
+            collection: Collection::CheckpointV1.id(),
+            key: readiness_key(&PEER),
+            value: Some(ack(PEER).encode().unwrap()),
+        }],
+    );
+    let view = engine.reader().snapshot().unwrap();
+    assert!(read_readiness(&view, &TrimLimits::default()).is_err());
+}
+
+/// A promise binds the boundary, not the moment: it round-trips through
+/// the store and through the manifest a voter verified.
+#[test]
+fn a_promise_is_built_from_what_a_voter_verified_and_round_trips() {
+    let engine = voter_store();
+    let view = engine.reader().snapshot().unwrap();
+    let manifest = export_shared(
+        &view,
+        CheckpointOrigin {
+            cluster: CLUSTER,
+            domain: DOMAIN,
+        },
+        &ExportLimits::default(),
+    )
+    .unwrap()
+    .manifest;
+    let promise = CheckpointReadinessV1::for_manifest(SELF, &manifest);
+    assert_eq!(promise.root, manifest.root);
+    assert_eq!(promise.boundary, manifest.boundary);
+    let encoded = promise.encode().unwrap();
+    assert_eq!(CheckpointReadinessV1::decode(&encoded).unwrap(), promise);
+    // A promise and an acknowledgement about the same checkpoint are
+    // different records, so neither decodes as the other.
+    assert!(CheckpointAckV1::decode(&encoded).is_err());
+    assert!(CheckpointReadinessV1::decode(&ack(SELF).encode().unwrap()).is_err());
+    // The subject is the whole checkpoint identity: changing any part of
+    // it changes the subject.
+    let base = promise.subject();
+    for mutate in [
+        (|p: &mut CheckpointReadinessV1| p.cluster = ClusterId([0xee; 16]))
+            as fn(&mut CheckpointReadinessV1),
+        |p: &mut CheckpointReadinessV1| p.domain = DomainId([0xee; 16]),
+        |p: &mut CheckpointReadinessV1| p.configuration = epoch(EPOCH + 1),
+        |p: &mut CheckpointReadinessV1| p.boundary.execution_position = pos(99),
+        |p: &mut CheckpointReadinessV1| p.boundary.kv_revision = rev(99),
+        |p: &mut CheckpointReadinessV1| p.boundary.retention_floor = rev(1),
+        |p: &mut CheckpointReadinessV1| {
+            p.boundary.lease_authority = LeaseAuthorityEpoch::new(9).unwrap()
+        },
+        |p: &mut CheckpointReadinessV1| p.root = Digest32([0xff; 32]),
+    ] {
+        let mut changed = promise;
+        mutate(&mut changed);
+        assert_ne!(changed.subject(), base);
+    }
+    // The voter is not part of the subject: signers agree on a
+    // checkpoint, not on each other.
+    let mut other_voter = promise;
+    other_voter.voter = PEER;
+    assert_eq!(other_voter.subject(), base);
 }
