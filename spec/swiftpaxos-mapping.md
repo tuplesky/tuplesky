@@ -362,6 +362,23 @@ second way to be a voter.
 | Writing the new generation into the projection database | `[EXT]` rejected | it commits the previous run's uncommitted work and pushes `M` past `J` |
 | A credential that bypasses expiry for availability | `[EXT]` rejected | Section 10.4 |
 
+Backup and restore is task-59, and it is the furthest from the paper of
+anything here: the paper's replica set is fixed and its history is never
+rewound.
+
+| Item | Status | Where |
+|---|---|---|
+| `BackupManifestV1` binds the artifact root it names | `[EXT]` | Section 17.16; a repointed backup index fails verification |
+| `plan_restore`: only a `SharedCheckpointV1` | `[EXT]` | Section 17.16.1; the three artifacts are not interchangeable |
+| A successor cluster identity, never the source's | `[EXT]` | Section 5.4; a rewound history behind a name callers hold promises from |
+| `FencingAttestationV1` bound to abandoned, successor and backup | `[EXT]` | Section 7.4; a record of an out-of-band action, not the action |
+| `config_v1` and `policy_v1` not carried | `[EXT]` | Section 5.4: never reuse stale voting authority |
+| Sessions and grants invalidated, leases revoked, attachments detached | `[EXT]` | Section 5.4 |
+| Retries and floors restored at the boundary | `[EXT]` | dropping a retained result turns a retry into a second execution |
+| The successor's own configuration epoch in the execution frontier | `[EXT]` | the donor's epoch belongs to a configuration this store does not hold |
+| An automatic minority force-new-cluster preserving identity | `[EXT]` rejected | Section 5.4 |
+| A zero-loss promise beyond the backup's RPO | `[EXT]` rejected | Section 5.4; the plan states the recovery point |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the

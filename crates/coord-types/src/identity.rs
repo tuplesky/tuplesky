@@ -90,6 +90,13 @@ pub enum HashDomain {
     /// source-defined selection over the reports at the seal cut
     /// (task-56).
     HandoffClosure,
+    /// Root of a backup manifest: which snapshot was taken, from which
+    /// cluster and domain, at which boundary and when (task-59).
+    BackupManifest,
+    /// The subject of an operator's fencing attestation: the cluster
+    /// being abandoned, the cluster replacing it and the backup the
+    /// restore is from (task-59).
+    FencingAttestation,
 }
 
 impl HashDomain {
@@ -116,6 +123,8 @@ impl HashDomain {
             }
             HashDomain::HandoffTerminalRoot => "tuplesky coord.v1 2026-09 handoff-terminal-root",
             HashDomain::HandoffClosure => "tuplesky coord.v1 2026-09 handoff-closure",
+            HashDomain::BackupManifest => "tuplesky coord.v1 2026-09 backup-manifest",
+            HashDomain::FencingAttestation => "tuplesky coord.v1 2026-09 fencing-attestation",
             HashDomain::ConfigurationActivation => {
                 "tuplesky coord.v1 2026-09 configuration-activation"
             }

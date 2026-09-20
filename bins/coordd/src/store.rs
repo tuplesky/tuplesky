@@ -260,6 +260,34 @@ pub fn open_storage(
     replica: ReplicaId,
     incarnation: ReplicaIncarnation,
 ) -> Result<Opened, StoreError> {
+    open_storage_with(
+        config,
+        intent,
+        cluster,
+        domain_id,
+        replica,
+        incarnation,
+        |_| Ok(()),
+    )
+}
+
+/// The same, running `before_attach` against the new generation's engine
+/// after it is created and before it is attached to the journal.
+///
+/// That window is the install lifecycle's (task-50) and the restore's
+/// (task-59): a whole store's worth of rows is written directly, which
+/// is admissible precisely because nothing has attached the projection
+/// to the journal yet and therefore no frontier exists to violate.
+/// Every other write to a projection goes through the journal.
+pub fn open_storage_with(
+    config: &Config,
+    intent: Intent,
+    cluster: ClusterId,
+    domain_id: DomainId,
+    replica: ReplicaId,
+    incarnation: ReplicaIncarnation,
+    before_attach: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
+) -> Result<Opened, StoreError> {
     let journal_root = root_path(&config.state_directory, &config.journal.root);
     let identity = JournalIdentity { cluster, replica };
     let options = JournalOptions::default();
@@ -320,7 +348,9 @@ pub fn open_storage(
         reason: format!("{e:?}"),
     })?;
 
-    let (generation, pending) = open(config, intent, cluster, domain_id, replica, incarnation)?;
+    let (mut generation, pending) =
+        open(config, intent, cluster, domain_id, replica, incarnation)?;
+    before_attach(generation.engine())?;
     let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
     let adoption = pending.map(|previous| Adoption {
         previous,
