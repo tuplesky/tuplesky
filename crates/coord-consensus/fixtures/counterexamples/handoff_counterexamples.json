@@ -1,0 +1,32 @@
+[
+  {
+    "name": "a_voter_may_reverse_its_stance",
+    "rule_removed": "StanceLedger refuses the opposite stance for a transition it decided",
+    "witness": "voters 0 and 2 cancel a transition voters 0 and 1 already sealed: a fence cleared by a retry, and the old configuration serving again",
+    "refused": "Reversal { held: Sealed }"
+  },
+  {
+    "name": "terminal_state_without_a_seal",
+    "rule_removed": "select_terminal takes a SealCertificate, so there is no selection before the fence",
+    "witness": "two unsealed voters report root 77 as terminal while the old configuration can still accept work",
+    "refused": "NoQuorum { have: 0, need: 2 }"
+  },
+  {
+    "name": "mixed_terminal_roots_merged",
+    "rule_removed": "select_terminal refuses reports that disagree about the terminal state",
+    "witness": "voters 0 and 1 report roots 77 and 88 for one transition; taking either would bind a terminal state the other never had",
+    "refused": "MixedTerminal"
+  },
+  {
+    "name": "a_minority_of_the_successor_activates",
+    "rule_removed": "activate requires a majority of the successor to have installed the root",
+    "witness": "replica 3 alone installs and the successor serves; a later majority of it holds no copy of the terminal state",
+    "refused": "NoQuorum { have: 1, need: 2 }"
+  },
+  {
+    "name": "an_installation_of_another_root_counts",
+    "rule_removed": "activate refuses an installation naming a root other than the certificate's",
+    "witness": "the whole successor installs root 99 and activates under a certificate binding another state",
+    "refused": "WrongTerminalRoot"
+  }
+]

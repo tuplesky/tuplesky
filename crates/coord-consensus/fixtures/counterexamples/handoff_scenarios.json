@@ -1,0 +1,20 @@
+{
+  "worlds": 1715,
+  "stages": {
+    "Activating": 108,
+    "FencedByAnother": 608,
+    "Installing": 108,
+    "Preparing": 35,
+    "Sealing": 405,
+    "Served": 135,
+    "Stable": 100,
+    "TerminalRecovery": 216
+  },
+  "fence_cleared": 0,
+  "sealed_and_cancelled": 0,
+  "refusals": [
+    "Reversal { held: Cancelled }",
+    "Reversal { held: Sealed }",
+    "Sealed { held: Transition { from: ConfigurationEpoch(4), to: ConfigurationEpoch(5), subject: Digest32(a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1) } }"
+  ]
+}
