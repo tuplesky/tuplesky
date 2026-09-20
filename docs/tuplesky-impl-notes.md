@@ -1673,6 +1673,22 @@ and never observes more completions than entries. The test's doc comment
 says exactly that rather than claiming the stronger thing, because a
 test that overclaims is worse than one that is honest about its reach.
 
+It also found something. The second half of that claim was not true when
+it was written: the reader loaded `entered` before `completed`, so it
+could take an entry count from before an operation started and a
+completion count from after it finished, and report more completions
+than entries. The counters are separate atomics, so a snapshot taken
+under load is several instants rather than one, and which instant each
+counter belongs to is the reader's to arrange. The rule is to read in
+the opposite order to the writer -- the writer counts an entry, then a
+completion, then the sample behind it, so the reader takes the sample
+first and the entry last. Every counter is then read no earlier than the
+one it can never exceed.
+
+It is a small lie and a bad one. An operator who reads "more finished
+than arrived" cannot tell a reporting artefact from a double count, and
+the whole point of this module is that a reading means what it says.
+
 ## A domain that only one client ever talked to
 
 Recorded against task-48 and task-62. The deliverable was a Kubernetes
@@ -1745,20 +1761,60 @@ repetition, with a two-second deadline and with a thirty-second one, so
 it is an exhaustion and not a slowdown -- a slow domain would have
 finished the eightieth request eventually.
 
-Sixty-four is where to look. `LaneLimits::UNARY` admits 64 concurrent
-bidirectional streams per connection, and a caller that never has two
-requests outstanding can only reach a *concurrency* bound if something
-per request is not being released when the request finishes. Adding a
-second caller makes it much worse rather than twice as good -- 7 of 20
-complete -- which says the same thing from the other side.
+The bound is the leader's command table. `coordd` builds it with
+`capacity: 64`, `CommandTable::initialize` refuses with `Backpressure`
+when the table is full, and nothing ever retired an executed record from
+it. `retire` exists, is documented, is tested, and has no caller. So the
+capacity was not a bound on unresolved work, which is what it reads as;
+it was a bound on how many commands a replica could execute for as long
+as it ran. The sixty-fifth caller waited out its deadline against an
+idle, healthy cluster, and `Rejection::Backpressure` went into a vector
+nobody drains.
 
-This had been invisible for a structural reason worth stating. The Kine
-backend holds one session and issues one invocation at a time, and the
-Go suite's etcd-level rows spend fewer requests than the bound before the
-watch row stops the domain for the other reason. Every Rust integration
-test builds one caller and asks it a handful of questions. Nothing in the
-project had ever asked the composition a hundred questions in a row. A
-Kubernetes API server asks it that many while it is still booting.
+A full table now reclaims what it has executed before it refuses
+anything. That is what the module's own documentation already said the
+rule was -- "records in ACCEPT or COMMIT are never evicted to make room,
+only executed records can be retired" -- read as permission to retire
+rather than as permission to forget nothing.
+
+Two things the fix had to keep straight. Nothing unresolved is ever
+touched: a record in START, PRE-ACCEPT, ACCEPT or COMMIT is an
+obligation, and evicting one to serve a newer command would lose it
+rather than shed load. And a retired record has to go on looking
+executed to anything that depends on it, which is what `retire`'s
+tombstones are for -- they are dropped with the last record that
+references them, so the bookkeeping stays bounded by the live set
+instead of by history.
+
+The leader also had to stop asking the table whether a command executed.
+`unexecuted_in_order` filtered on `phase_of(c) < Some(Phase::Executed)`,
+and a reclaimed record reports no phase at all -- which sorts *below*
+`Executed`, so a command that executed long ago would read as
+outstanding, be speculated over, and have its result released a second
+time to a caller that already had it. The proposal now carries the fact
+itself.
+
+**Concurrent callers are still not served across a quorum.** With the
+table fixed, a single caller sustains 200 requests against three voters
+and 500 against one. Two callers against three voters complete 13 of
+100. The same two callers against a *single* voter complete 100 of 100.
+So it is not the client, not the volume, and not the number of sessions:
+it is two commands in flight at once across a real quorum.
+
+Every command is initialized with one conservative conflict key, so the
+dependency chain over all commands is total -- each is ordered after the
+one before it whatever keys it touches, and sequential callers satisfy
+that for free. That is the first thing to look at. It is not yet a
+diagnosis, and this note does not promote it to one.
+
+All three had been invisible for a structural reason worth stating. The
+Kine backend holds one session and issues one invocation at a time, and
+the Go suite's etcd-level rows spend fewer requests than the old bound
+before the watch row stops the domain for its own reason. Every Rust
+integration test builds one caller and asks it a handful of questions.
+Nothing in the project had ever asked the composition a hundred
+questions in a row, or two at once. A Kubernetes API server does both
+while it is still booting.
 
 ### What the benchmark harness had to get right to find that
 
@@ -1770,12 +1826,18 @@ throughput curve.
 `crates/coord-wan-bench` schedules arrivals against absolute instants
 from one start, and separates the wait before an operation started from
 the operation itself and from the whole thing. That is what made the
-second finding legible rather than mysterious. A closed-loop harness
-would have reported "throughput fell and latency rose", which is the
-shape of a slow system. What the open-loop run showed instead was a
-fixed count of fast completions followed by nothing at all, identical on
-every repetition and unchanged by a fifteen-fold longer deadline. A count
-that does not move when the deadline moves is a resource that ran out.
+findings legible rather than mysterious. A closed-loop harness would
+have reported "throughput fell and latency rose", which is the shape of
+a slow system. What the open-loop run showed instead was a fixed count
+of fast completions followed by nothing at all, identical on every
+repetition and unchanged by a fifteen-fold longer deadline. A count that
+does not move when the deadline moves is a resource that ran out.
+
+The same separation is what distinguishes the remaining finding from
+that one. Adding a second caller does not move a count; it collapses the
+completion rate while the service times of the few that get through stay
+ordinary. That is a different shape, and it is why the two are written
+up as two things rather than as "it gets slow under load".
 
 The three-distribution split is not decoration. `queue` says whether the
 harness was the bottleneck, `service` says what the operation cost once

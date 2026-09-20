@@ -138,6 +138,15 @@ pub struct Proposal {
     pub updates: Vec<StoreUpdate>,
     /// Persistence attempts made for this proposal.
     pub attempts: u32,
+    /// Whether this command has executed.
+    ///
+    /// Recorded here rather than read from the command table, because
+    /// the table is allowed to forget an executed record to make room
+    /// and a forgotten record reports no phase at all. A proposal that
+    /// asked the table would then read "not executed yet" for a command
+    /// that executed long ago -- and would be speculated over, and its
+    /// result released a second time to a caller that already has it.
+    pub executed: bool,
 }
 
 /// Why the leader stopped leading. A fenced leader admits nothing and
@@ -450,6 +459,7 @@ impl Leader {
                 durable: false,
                 updates: updates.clone(),
                 attempts: 1,
+                executed: false,
             },
         );
         alloc::vec![Effect::Persist(PersistBatch {
@@ -553,6 +563,9 @@ impl Leader {
         self.speculation
             .reconcile(command, outcome.position, outcome.result_digest)
             .map_err(LearnError::Speculation)?;
+        if let Some(proposal) = self.proposals.get_mut(&command) {
+            proposal.executed = true;
+        }
         let mut effects = alloc::vec![Effect::Established(result.clone())];
         if self.is_leading() && !released {
             effects.push(Effect::Released(ReleasedResult::from_gate(
@@ -574,7 +587,7 @@ impl Leader {
         let mut ordered: Vec<(u64, CommandId)> = self
             .proposals
             .values()
-            .filter(|p| self.table.phase_of(&p.command) < Some(Phase::Executed))
+            .filter(|p| !p.executed && self.table.phase_of(&p.command) < Some(Phase::Executed))
             .map(|p| (p.seqnum, p.command))
             .collect();
         ordered.sort();
@@ -898,6 +911,7 @@ impl Leader {
                 durable: false,
                 updates,
                 attempts: 1,
+                executed: false,
             },
         );
         alloc::vec![persist]

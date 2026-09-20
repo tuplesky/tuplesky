@@ -134,21 +134,36 @@ compatibility labeling.
    than a missing feature: the hub keeps the registration, nothing drains it,
    and the domain stops answering anything afterwards. Everything downstream
    of the watch test in a suite run therefore fails for this one reason.
-2. **A connection stops being answered after about sixty requests.** With one
-   caller issuing one request at a time against a three-voter domain, exactly
-   61 of 100 complete and the rest reach their deadline; the number is the
-   same on every repetition, with a two-second deadline and with a
-   thirty-second one, so it is an exhaustion and not a slowdown. The unary
-   lane admits 64 concurrent bidirectional streams per connection
-   (`LaneLimits::UNARY`), and a strictly sequential caller can only reach that
-   bound if something the frontend holds is not released when a request
-   finishes. Concurrency makes it worse rather than causing it: two callers on
-   one frontend complete 7 of 20.
+2. **Concurrent callers are not served across a quorum.** Two callers
+   issuing one request each at a time against a three-voter domain
+   complete 13 of 100 operations within a five-second deadline. The same
+   two callers against a *single* voter complete 100 of 100, and a single
+   caller against the three-voter domain completes 200 of 200 -- so it is
+   neither the client nor the volume, it is two commands in flight at
+   once across a real quorum.
 
-   The Kine backend never exposed this because the certification suite's
-   etcd-level rows spend fewer requests than that before the watch row stops
-   the domain for the other reason. A Kubernetes API server spends them in
-   the first seconds of bootstrap, so this blocks the k3s run outright.
+   Every command is initialized with one conservative conflict key
+   (`CONSERVATIVE_KEY` in `Leader::on_admitted`), so the dependency chain
+   over all commands is total: each one is ordered after the one before
+   it, whatever keys they actually touch. Sequential callers satisfy that
+   for free. That is the mechanism to look at first; this document does
+   not claim it is the whole cause, because what has been measured is the
+   shape and not the proof.
+
+   A Kubernetes API server is concurrent from its first second, so this
+   blocks the k3s run outright.
+
+A third, now fixed: a connection used to stop being answered after
+exactly 61 requests. The leader's command table is created with a
+capacity, and nothing ever retired an executed record from it, so the
+capacity was a bound on how many commands a replica could execute in its
+lifetime rather than on how much unresolved work it held. A full table
+now reclaims what it has executed before it refuses anything, and a
+single caller sustains 200 requests against three voters and 500 against
+one. The regression tests are
+`bins/coordd/tests/cli.rs::a_caller_that_keeps_asking_is_still_answered`
+and
+`crates/coord-consensus/tests/activation.rs::a_cluster_serves_past_its_table_capacity`.
 
 Until both are closed, this document's answer to "is this etcd-compatible" is
 no, for stated reasons, in a named profile. That is the point of certifying
