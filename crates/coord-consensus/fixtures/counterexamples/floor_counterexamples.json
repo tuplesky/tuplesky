@@ -1,0 +1,23 @@
+[
+  {
+    "name": "competing_subjects_allowed",
+    "rule_removed": "ReadinessLedger refuses a second subject at a position it is ready for",
+    "voters": 5,
+    "witness": "position 4 certified for subjects a1 and b2 by overlapping majorities",
+    "refused": "Competing { held: FloorCandidate { epoch: ConfigurationEpoch(7), position: ExecutionPosition(4), subject: Digest32(a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1) } }"
+  },
+  {
+    "name": "recovery_reads_one_voter",
+    "rule_removed": "a recovery discovers the floor from a majority of reports",
+    "voters": 3,
+    "witness": "floor certified at position 9 discovered as None by the one voter that never promised",
+    "refused": "a majority of two, one of them a signer, discovers position 9"
+  },
+  {
+    "name": "possession_counted_as_readiness",
+    "rule_removed": "readiness is a durable promise, recorded before it is counted",
+    "voters": 3,
+    "witness": "floor certified at position 9 by holders that recorded nothing; after a crash a majority read discovers None and admits a baseline of 8",
+    "refused": "a promise survives the crash that loses the bytes' owner's memory, so the same majority read discovers the floor"
+  }
+]
