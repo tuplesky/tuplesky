@@ -138,9 +138,18 @@ impl ModelJournal {
     }
 
     fn expectation(&self, stream: StorageStreamId, first: &JournalRecordV1) -> RecordExpectation {
+        // The mapping says which generation the stream currently serves,
+        // and the real journal decides the same way (task-58): they
+        // differ only where an authorized replacement carried the stream
+        // forward, and there the appends that follow carry the new
+        // generation while the prefix keeps the one that wrote it.
+        let serving = self.mappings.get(&stream).map(|m| m.key.incarnation);
         match self.streams.get(&stream).and_then(|s| s.records.last()) {
             Some(last) => RecordExpectation {
-                origin: *last.origin(),
+                origin: coord_journal_api::record::RecordOrigin {
+                    incarnation: serving.unwrap_or(last.origin().incarnation),
+                    ..*last.origin()
+                },
                 seq: last.seq().checked_next().expect("model head below maximum"),
                 predecessor: last.digest(),
             },
@@ -318,7 +327,10 @@ impl JournalEngine for ModelJournal {
             return Err(definite("high-water mark must cover the mapping"));
         }
         if let Some(existing) = self.mappings.get(&mapping.stream) {
-            if existing.key != mapping.key || existing.shard != mapping.shard {
+            // An authorized replacement carries the stream forward with
+            // the rest of the node's durable state (task-58); nothing
+            // else may move a mapping.
+            if existing.key != mapping.key && !existing.adopts(mapping) {
                 return Err(definite(
                     "mapping identity of an allocated stream cannot change",
                 ));

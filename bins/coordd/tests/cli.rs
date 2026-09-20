@@ -176,10 +176,23 @@ impl Ca {
         replica: u8,
         role: coord_types::wire_v1::PeerRole,
     ) -> (rcgen::Certificate, rcgen::KeyPair) {
+        self.issue_at(name, cluster, replica, role, 1)
+    }
+
+    /// The same, at a chosen key generation: what a replacement looks
+    /// like before the configuration commits it (task-58).
+    fn issue_at(
+        &self,
+        name: &str,
+        cluster: [u8; 16],
+        replica: u8,
+        role: coord_types::wire_v1::PeerRole,
+        incarnation: u64,
+    ) -> (rcgen::Certificate, rcgen::KeyPair) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(cluster),
             node: coord_types::ids::ReplicaId([replica; 16]),
-            incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            incarnation: coord_types::ids::ReplicaIncarnation::new(incarnation).expect("positive"),
             role,
         };
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
@@ -939,7 +952,8 @@ fn start(config: &Path) -> Running {
         .flatten()
         .unwrap_or_else(|| {
             let _ = child.kill();
-            panic!("coordd did not report a serving api listener within 30s")
+            let said = said.lock().expect("not poisoned").clone();
+            panic!("coordd did not report a serving api listener within 30s:\n{said}")
         });
     Running { child, api, said }
 }
@@ -2480,4 +2494,221 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
         again.outcome, first.outcome,
         "the node answered differently once its journal prefix was reclaimed"
     );
+}
+
+/// `coordd inspect` says what this node's credential is, and starts
+/// nothing (task-58).
+///
+/// The operator-facing half of the credential lifecycle. A peer that
+/// refuses a binding tells this node only that it was refused, which is
+/// the right amount to tell it; replacing a node is done here, so the
+/// distinctions have to be readable here -- "requires-commit
+/// committed=1 presented=2" instead of a handshake that fails for
+/// reasons the node cannot see.
+#[test]
+fn inspect_reports_the_credential_against_committed_membership_and_starts_nothing() {
+    let dir = workspace("inspect");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    // The committed generation presenting the committed key: a renewal,
+    // which is what a node running normally always is.
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report.out.contains("state=renewal"),
+        "expected a renewal:\n{}",
+        report.out
+    );
+    assert!(
+        report.out.contains("renewal=wait") || report.out.contains("renewal=due"),
+        "expected a renewal decision:\n{}",
+        report.out
+    );
+    // Inspecting is not starting: nothing was created, and a node whose
+    // credential is wrong must be inspectable without first being
+    // repaired.
+    assert!(!dir.join("state").exists(), "inspect created a store");
+    assert!(!dir.join("journal").exists(), "inspect created a journal");
+
+    // A leaf at the next generation. The certificate is perfectly
+    // valid; what is missing is the committed configuration that makes
+    // this generation the voter.
+    let (next, key) = ca.issue_at(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+        2,
+    );
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
+    std::fs::write(
+        dir.join("node.key"),
+        pem("PRIVATE KEY", &key.serialize_der()),
+    )
+    .expect("key");
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report
+            .out
+            .contains("state=requires-commit committed=1 presented=2"),
+        "expected a replacement awaiting its commit:\n{}",
+        report.out
+    );
+    // And the daemon refuses to serve under it rather than starting as
+    // a voter nothing committed.
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+
+    // The other direction: the configuration moved on and this disk did
+    // not. A clone restored from before a replacement is exactly this,
+    // and it is the case where serving anyway means a replaced node
+    // voting twice.
+    genesis_of_incarnation(&dir, &ca.node_spki, 2);
+    let stale = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of_incarnation(&dir, &stale.node_spki, 2);
+    let report = run(&path, &["inspect"]);
+    assert_eq!(report.code, Some(0), "{}", report.err);
+    assert!(
+        report.out.contains("state=stale committed=2 presented=1"),
+        "expected a stale credential:\n{}",
+        report.out
+    );
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+}
+
+/// A genesis committing voter one at `incarnation`.
+fn genesis_of_incarnation(dir: &Path, voter_one_key: &[u8], incarnation: u64) {
+    let manifest = serde_json::json!({
+        "cluster": hex(&CLUSTER),
+        "domain": hex(&DOMAIN),
+        "epoch": 1,
+        "voters": [{
+            "node": hex(&[1u8; 16]),
+            "incarnation": incarnation,
+            "public_key": b64url(voter_one_key),
+        }],
+        "issuer_roots": [b64url(&[0xca; 8])],
+        "wif_rules": [{ "issuer": "test" }],
+        "admin": hex(&[0xa; 16]),
+        "protocol_version": 1,
+    });
+    std::fs::write(
+        dir.join("genesis.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest"),
+    )
+    .expect("write manifest");
+}
+
+/// An authorized key replacement keeps this node's durable state, and a
+/// disk that was left behind by one does not come back (task-58; design
+/// Sections 10.4, 20.4).
+///
+/// The two halves are the same stamp read in the two directions. A node
+/// whose voting key is replaced is the same replica: its journal, the
+/// checkpoints it published and its epoch metadata are what the new
+/// generation has to serve from, and refusing them would make every
+/// authorized replacement a restore from nothing. A node whose disk was
+/// cloned or restored from *before* a replacement is not the current
+/// replica at all, and serving from it is a replaced voter voting.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_not() {
+    let dir = workspace("replace");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    checkpoint_after(&path, 1);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x58; 16]).await;
+        let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+        response_of(&answer)
+    };
+
+    // Keep the credential this node held, so the other direction can be
+    // tried with it afterwards.
+    let retired = std::fs::read(dir.join("node.pem")).expect("cert");
+    let retired_key = std::fs::read(dir.join("node.key")).expect("key");
+
+    // The replacement: a new leaf at the next generation, and a
+    // configuration that commits it. Both are needed -- a certificate
+    // nothing committed is refused, and a commitment to a key this node
+    // does not hold is refused too.
+    let (next, key) = ca.issue_at(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+        2,
+    );
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
+    write_key(&dir.join("node.key"), &key.serialize_der());
+    genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+
+    // It comes back on its own state, and says so: the adoption is a
+    // durable step and an operator replacing a node has to be able to
+    // see that it happened.
+    let report = start_and_report(&path);
+    assert!(
+        report.contains("adopted this node's durable state from incarnation 1 under 2"),
+        "the replacement did not adopt this node's state:\n{report}"
+    );
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x58; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the daemon answered the retry\n{}", daemon.said()));
+    let again = response_of(&answer);
+    assert_eq!(
+        again.command_id, first.command_id,
+        "the same invocation became a different command after an authorized replacement"
+    );
+    assert_eq!(
+        again.outcome, first.outcome,
+        "the node answered differently after an authorized replacement"
+    );
+    drop(daemon);
+
+    // And the other direction. The retired credential is perfectly
+    // valid and names this very replica; what it does not name is the
+    // committed generation, and the root has moved past it. The node
+    // refuses to start rather than serving as the voter it no longer
+    // is.
+    std::fs::write(dir.join("node.pem"), &retired).expect("cert");
+    write_key(&dir.join("node.key"), &retired_key);
+    let refused = run(&path, &[]);
+    assert_eq!(
+        refused.code,
+        Some(2),
+        "a replaced node started on its old credential:\n{}{}",
+        refused.out,
+        refused.err
+    );
+    // Told as what it is, so an operator does not read a fenced disk as
+    // a broken one.
+    let report = run(&path, &["inspect"]);
+    assert!(
+        report.out.contains("state=stale committed=2 presented=1"),
+        "inspect did not name the left-behind credential:\n{}",
+        report.out
+    );
+}
+
+/// Write a private key with the permissions the daemon insists on.
+fn write_key(path: &Path, der: &[u8]) {
+    std::fs::write(path, pem("PRIVATE KEY", der)).expect("key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
 }

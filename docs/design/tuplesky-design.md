@@ -841,6 +841,8 @@ Renew proactively with overlap/jitter and reconnect before enforced expiry. Rota
 
 Expired credentials cannot be bypassed for availability. Deploy issuer across failure domains and test full cold start after prolonged outage. Suspected voter compromise needs a valid configuration fence, not just credential revocation, before assuming it cannot affect consensus. This does not add Byzantine tolerance.
 
+The connection lifetime bound is the earlier of an explicit age cap and the end of the credential the connection was authenticated under, as the identity binder reports it; the binder is asked because the component that decides a credential is acceptable is the one that says how long it stays so. A binder that cannot answer leaves the age cap, which is a weaker bound and never an absent one. Reaching either deadline is an ordinary close, not a refusal: the peer reconnects under whatever it holds now and is admitted on that.
+
 <a id="s10-5"></a>
 ### 10.5 Client-aware configuration and discovery
 
@@ -1265,6 +1267,8 @@ Pinned engine snapshots are local consistency, not linearizability. Read results
 #### 17.3.1 Streams and sequence identities
 
 Durably allocate `StorageStreamId: u64` for each local `(cluster, domain, replica_incarnation)`; journal mapping and allocator high-water before use. Do not hash arbitrary IDs into collision-prone u64 or recycle while old files/evidence exist. A small bounded shard set shares disks across domains and defines real failure blast radius.
+
+An authorized voting-key/incarnation replacement (Section 20.4) does not allocate a new stream. The node keeps its durable state and its stream is part of that state: re-key the existing mapping to the new incarnation, monotonically, within the same cluster and domain, and only onto a key that owns no stream. A fresh stream would leave the projection materialized past a journal head of zero, which is indistinguishable from a lost prefix and must stay refused. Records carry the incarnation that wrote them, so a re-keyed stream holds a prefix at the old generation and a suffix at the new one; append guards take the generation from the current mapping, and read and replay verification accepts a non-decreasing generation bounded by it.
 
 Within a stream LocalJournalSeq is strictly increasing and becomes the engine entry index. It is not execution position, KV revision, ballot, fencing token or cross-replica sequence. StoreSeq is the same semantic stamp or a documented one-to-one mapping, not another uncorrelated counter. Append descriptions of state transitions; election never invokes Raft-style suffix overwrites.
 
@@ -1752,6 +1756,10 @@ Reference issuer has protected mounted PKCS#8 CA key, restrictive permissions, e
 Use rcgen to verify CSR proof-of-possession. Independently check configured CA/key match and CA/key-usage constraints at startup; signing alone does not validate those. Build SAN/subject/EKU/constraints from verified role policy, never blindly copy CSR extensions. Reject CA requests, bad algorithms/critical extensions, overlong lifetime and unauthorized names. x509-parser extracts; rustls validates paths/handshake. [I6, I14]
 
 Bind cluster/node/generation/role SANs plus normal endpoint DNS. Current committed key/incarnation authorizes votes, not merely certificate validity. Keep normal rustls validation; no permissive URI workaround. Same-key/generation renewal is not membership; voting-key/generation replacement is a committed lifecycle transition. Expiry affects warm sessions. Cloned identity cannot count twice and requires orchestration/storage fencing.
+
+One rule classifies a presented credential against committed membership: the committed generation presenting the committed key is a renewal and binds; a new key at the committed generation, a generation nothing committed, a generation the configuration has moved past, and a node that is not a voter of this epoch do not. A refused peer learns only that it was refused; the distinctions are reported on the node itself, where a replacement is actually performed, and must be readable precisely when the node cannot serve.
+
+An authorized replacement preserves the node's durable state. The store manifest's incarnation stamp advances under the root lock, and only forwards: a root stamped past the presented generation is the cloned- or restored-disk case and stays refused. Nothing writes to the projection database to record the advance, because that would commit whatever the previous run left uncommitted and push the materialized frontier past the journal's durable head; the in-database identity record therefore keeps the generation the database was created under and may lag the manifest, never lead it. The journal stream is carried forward with the manifest (Section 17.3.1).
 
 <a id="s20-5"></a>
 ### 20.5 Production security gate

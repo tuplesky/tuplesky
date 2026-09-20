@@ -22,6 +22,11 @@
 //! * [`identity`]: the node identity SAN encoding (`tuplesky:` URI) that
 //!   the transport binder reads.
 //! * [`http`]: the bounded signer endpoint on its own narrow port.
+//! * [`lifecycle`] (task-58): when a holder renews, how long a replaced
+//!   leaf stays accepted, and what a warm session's deadline is. An
+//!   expired leaf has no "serve anyway" outcome, the overlap during a
+//!   rotation is bounded at both ends, and a renewal never extends a
+//!   session bound under the leaf it replaced.
 //!
 //! Root credentials never enter quorum data; an HSM or KMS signer can
 //! replace the reference CA without membership changes.
@@ -32,12 +37,14 @@ pub mod ca;
 pub mod http;
 pub mod identity;
 pub mod issuer;
+pub mod lifecycle;
 pub mod policy;
 
 pub use ca::{Ca, CaError};
 pub use http::{IssuerState, SignClock, SystemSignClock, router};
 pub use identity::{NodeIdentity, node_uri, parse_node_uri};
 pub use issuer::{IssueError, Issued, NodeIssuer, NodeRequest};
+pub use lifecycle::{Leaf, Renewal, RenewalPolicy};
 pub use policy::{NodePolicy, PolicyError, RolePolicy};
 
 /// Crate role marker used by the dependency-policy check.

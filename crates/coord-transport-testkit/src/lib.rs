@@ -58,12 +58,29 @@ impl TestIdentity {
         domain: DomainId,
         capabilities: Vec<u16>,
     ) -> LocalIdentity {
+        self.local_trusting(ca.roots(), cluster, domain, capabilities)
+    }
+
+    /// The same, against trust anchors chosen by the caller.
+    ///
+    /// A staged CA rotation is exactly this: for a while an endpoint
+    /// trusts both the outgoing and the incoming root, so leaves signed
+    /// by either are accepted and nothing has to be restarted in
+    /// lockstep; afterwards the old root is dropped and leaves under it
+    /// stop being accepted (task-58).
+    pub fn local_trusting(
+        &self,
+        roots: Arc<rustls::RootCertStore>,
+        cluster: ClusterId,
+        domain: DomainId,
+        capabilities: Vec<u16>,
+    ) -> LocalIdentity {
         LocalIdentity {
             cluster,
             domain,
             chain: self.chain.clone(),
             key: self.key.clone_key(),
-            roots: ca.roots(),
+            roots,
             capabilities,
             // One certificate, one principal: a test endpoint dials as
             // whatever it serves as.
@@ -153,11 +170,29 @@ impl TestCa {
     }
 }
 
+/// Trust anchors containing every CA in `cas`.
+///
+/// What an endpoint holds partway through a staged CA rotation: both
+/// the root being retired and the one replacing it, so leaves under
+/// either are accepted while the fleet reissues.
+pub fn roots_of(cas: &[&TestCa]) -> Arc<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in cas {
+        roots.add(ca.certificate_der().clone()).expect("ca root");
+    }
+    Arc::new(roots)
+}
+
 /// Binds issued certificates to the identities they were issued for.
 pub struct TestBinder {
     cluster: ClusterId,
     domain: DomainId,
     known: HashMap<Vec<u8>, (ReplicaId, ReplicaIncarnation, PeerRole)>,
+    /// When the credentials this binder admits stop being valid, in
+    /// unix seconds (task-58). `None` leaves the connection bounded by
+    /// the age cap alone, which is what every test that is not about
+    /// credential expiry wants.
+    expires_at: Option<u64>,
 }
 
 impl TestBinder {
@@ -167,7 +202,18 @@ impl TestBinder {
             cluster,
             domain,
             known: HashMap::new(),
+            expires_at: None,
         }
+    }
+
+    /// Make every credential this binder admits end at `unix_seconds`.
+    ///
+    /// A real binder reads the leaf's `notAfter`; a test that had to
+    /// mint a certificate expiring seconds from now would be a test
+    /// about rcgen's clock. This says the same thing to the transport.
+    pub const fn expiring_at(mut self, unix_seconds: u64) -> Self {
+        self.expires_at = Some(unix_seconds);
+        self
     }
 
     /// Register an issued identity.
@@ -209,5 +255,9 @@ impl IdentityBinder for TestBinder {
             incarnation: peer.then_some(*incarnation),
             capabilities: hello.capabilities.as_slice().to_vec(),
         })
+    }
+
+    fn expires_at(&self, _certs: &[CertificateDer<'_>]) -> Option<u64> {
+        self.expires_at
     }
 }

@@ -601,8 +601,18 @@ impl<F: FileSystem> Inner<F> {
             .copied()
             .unwrap_or(StreamState::EMPTY);
         match state.origin {
+            // The mapping, not the stream's first record, says which
+            // generation this stream currently serves. They differ only
+            // where an authorized replacement carried the stream forward
+            // (task-58), and there the appends that follow legitimately
+            // carry the new generation while the prefix keeps the one
+            // that wrote it. The mapping only ever moves forward, so
+            // this is never a way to write under an older generation.
             Some(origin) => Ok(RecordExpectation {
-                origin,
+                origin: RecordOrigin {
+                    incarnation: mapping.key.incarnation,
+                    ..origin
+                },
                 seq: state
                     .durable
                     .checked_next()
@@ -811,13 +821,37 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
                 "entries without a recovered origin",
             ));
         };
+        // The generation is read from the records rather than fixed for
+        // the stream (task-58). Where an authorized replacement carried
+        // the stream forward, the prefix keeps the generation that wrote
+        // it and the records after the adoption carry the new one, so a
+        // single value for the whole stream would reject one half or the
+        // other. It is still bounded: never below the record before it,
+        // and never above the generation the mapping currently serves.
+        let ceiling = inner
+            .mappings
+            .get(&stream)
+            .map_or(origin.incarnation, |m| m.key.incarnation);
         let mut expect = RecordExpectation {
-            origin,
+            origin: RecordOrigin {
+                incarnation: first.origin().incarnation,
+                ..origin
+            },
             seq: LocalJournalSeq::new(begin)
                 .map_err(|_| JournalError::new(JournalErrorClass::Corrupt, "sequence"))?,
             predecessor: first.predecessor(),
         };
+        if expect.origin.incarnation > ceiling {
+            return Err(JournalError::new(
+                JournalErrorClass::Corrupt,
+                "suffix record written under a generation past this stream's",
+            ));
+        }
         for record in &records {
+            let written_at = record.origin().incarnation;
+            if written_at >= expect.origin.incarnation && written_at <= ceiling {
+                expect.origin.incarnation = written_at;
+            }
             record.verify(&expect).map_err(|e| {
                 JournalError::new(JournalErrorClass::Corrupt, format!("suffix record: {e}"))
             })?;
@@ -896,7 +930,10 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
             ));
         }
         if let Some(existing) = inner.mappings.get(&mapping.stream) {
-            if existing.key != mapping.key || existing.shard != mapping.shard {
+            // An authorized replacement carries the stream forward with
+            // the rest of the node's durable state (task-58); nothing
+            // else may move a mapping.
+            if existing.key != mapping.key && !existing.adopts(mapping) {
                 return Err(definite(
                     "mapping identity of an allocated stream cannot change",
                 ));

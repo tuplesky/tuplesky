@@ -101,7 +101,7 @@ pub fn open(
     domain: DomainId,
     replica: ReplicaId,
     incarnation: ReplicaIncarnation,
-) -> Result<Generation, StoreError> {
+) -> Result<(Generation, Option<ReplicaIncarnation>), StoreError> {
     let root = config.state.root_path(&config.state_directory);
     let identity = StoreIdentity {
         cluster_id: cluster,
@@ -124,25 +124,59 @@ pub fn open(
                     reason: e.to_string(),
                 })?;
             }
-            Generation::create(&root, identity, options).map_err(|e| match e {
-                OpenError::AlreadyInitialized => {
-                    StoreError::AlreadyInitialized { root: show(&root) }
+            Generation::create(&root, identity, options)
+                .map_err(|e| match e {
+                    OpenError::AlreadyInitialized => {
+                        StoreError::AlreadyInitialized { root: show(&root) }
+                    }
+                    other => StoreError::Refused {
+                        root: show(&root),
+                        reason: format!("{other:?}"),
+                    },
+                })
+                .map(|g| (g, None))
+        }
+        Intent::Serve => {
+            // An authorized replacement keeps this node's durable state
+            // (task-58). `place` has already established that this
+            // certificate's generation is the *committed* voter's, so a
+            // root stamped with an earlier one belongs to this same
+            // replica before its key was replaced -- its journal,
+            // checkpoints and epoch metadata are exactly what the new
+            // generation comes back on. A root stamped *later* is the
+            // fencing case and `adopt` refuses it, so a clone restored
+            // from before a replacement still cannot serve.
+            let adopted = Generation::adopt(&root, identity).map_err(|e| match e {
+                OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
+                    StoreError::NotInitialized { root: show(&root) }
                 }
                 other => StoreError::Refused {
                     root: show(&root),
                     reason: format!("{other:?}"),
                 },
-            })
-        }
-        Intent::Serve => Generation::open_existing(&root, identity, options).map_err(|e| match e {
-            OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
-                StoreError::NotInitialized { root: show(&root) }
+            })?;
+            if let Some(previous) = adopted {
+                // On stdout, with the rest of the startup report: an
+                // adoption is a durable, one-way step and the operator
+                // who replaced the node is the one who has to see it.
+                println!(
+                    "adopted this node's durable state from incarnation {} under {}",
+                    previous.get(),
+                    incarnation.get()
+                );
             }
-            other => StoreError::Refused {
-                root: show(&root),
-                reason: format!("{other:?}"),
-            },
-        }),
+            let generation =
+                Generation::open_existing(&root, identity, options).map_err(|e| match e {
+                    OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
+                        StoreError::NotInitialized { root: show(&root) }
+                    }
+                    other => StoreError::Refused {
+                        root: show(&root),
+                        reason: format!("{other:?}"),
+                    },
+                })?;
+            Ok((generation, adopted))
+        }
     }
 }
 
@@ -223,7 +257,7 @@ pub fn open_storage(
         },
     })?;
 
-    let generation = open(config, intent, cluster, domain_id, replica, incarnation)?;
+    let (generation, adopted) = open(config, intent, cluster, domain_id, replica, incarnation)?;
     let directory = generation.directory().to_path_buf();
     let (engine, _lock, _manifest) = generation.into_parts();
 
@@ -264,6 +298,23 @@ pub fn open_storage(
             root: show(&checkpoint_root),
             reason: format!("{e}"),
         })?;
+    }
+
+    // An authorized replacement carries this node's stream forward with
+    // the rest of its durable state (task-58). The stream is keyed by
+    // the incarnation that allocated it, so a replaced node would
+    // otherwise attach to a fresh stream whose durable head is zero
+    // while its projection is materialized far past that -- the shape
+    // of a lost prefix, which `attach` refuses. Its records each carry
+    // the incarnation that wrote them, so nothing about provenance is
+    // blurred by keeping the stream.
+    if let Some(previous) = adopted {
+        store
+            .adopt_stream(domain_id, previous)
+            .map_err(|e| StoreError::Refused {
+                root: show(&journal_root),
+                reason: format!("this node's journal stream could not be carried forward: {e:?}"),
+            })?;
     }
 
     // Shard 0 for the single-domain preview; task-j07 is where a node

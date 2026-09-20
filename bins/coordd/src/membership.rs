@@ -185,6 +185,91 @@ pub fn place(
     })
 }
 
+/// What this node's credential is against committed membership, and
+/// when it has to be renewed (task-58).
+///
+/// The operator-facing answer to "why is this node not voting". A peer
+/// learns only that a binding was refused -- which is the right amount
+/// to tell it -- so the distinctions have to be available here, on the
+/// node itself, where replacing one is actually done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inspected {
+    /// The replica the certificate names.
+    pub replica: ReplicaId,
+    /// The generation it names.
+    pub incarnation: ReplicaIncarnation,
+    /// The role it binds.
+    pub role: PeerRole,
+    /// What the credential is against committed membership.
+    pub credential: coord_membership::CredentialChange,
+    /// The leaf's validity window.
+    pub leaf: coord_node_issuer::Leaf,
+    /// What to do about the leaf at the given instant.
+    pub renewal: coord_node_issuer::Renewal,
+}
+
+/// Inspect this node's credential at `now`, without starting anything.
+///
+/// Deliberately separate from [`place`]: `place` decides whether this
+/// process may serve and refuses when it may not, which is what a
+/// daemon needs. An operator replacing a node needs the opposite -- a
+/// report that is useful *because* the node cannot serve yet.
+pub fn inspect(
+    manifest_path: &str,
+    certificate_path: &str,
+    now: u64,
+    policy: &coord_node_issuer::RenewalPolicy,
+) -> Result<Inspected, IdentityError> {
+    let text = std::fs::read(manifest_path).map_err(|e| IdentityError::Manifest {
+        path: manifest_path.to_owned(),
+        reason: e.to_string(),
+    })?;
+    let manifest: GenesisManifest =
+        serde_json::from_slice(&text).map_err(|e| IdentityError::Manifest {
+            path: manifest_path.to_owned(),
+            reason: e.to_string(),
+        })?;
+    let membership =
+        Membership::from_genesis(&manifest).map_err(|e| IdentityError::Membership {
+            reason: format!("{e:?}"),
+        })?;
+    let (identity, leaf) = leaf_identity(certificate_path)?;
+    if identity.cluster != membership.cluster() {
+        return Err(IdentityError::ForeignCluster {
+            path: certificate_path.to_owned(),
+        });
+    }
+    let credential =
+        membership.classify_credential(&identity.node, identity.incarnation, &spki(&leaf));
+    let leaf = validity(&leaf);
+    // The jitter seed is this node's own identity, so the report is the
+    // same report every time it is run rather than a different deadline
+    // on each invocation.
+    let seed = u64::from_be_bytes(identity.node.as_bytes()[..8].try_into().expect("16 bytes"));
+    Ok(Inspected {
+        replica: identity.node,
+        incarnation: identity.incarnation,
+        role: identity.role,
+        credential,
+        leaf,
+        renewal: policy.decide(&leaf, now, seed),
+    })
+}
+
+/// The leaf's validity window in unix seconds.
+fn validity(leaf: &CertificateDer<'_>) -> coord_node_issuer::Leaf {
+    x509_parser::certificate::X509Certificate::from_der(leaf).map_or(
+        coord_node_issuer::Leaf {
+            issued_at: 0,
+            expires_at: 0,
+        },
+        |(_, x509)| coord_node_issuer::Leaf {
+            issued_at: x509.validity().not_before.timestamp().max(0) as u64,
+            expires_at: x509.validity().not_after.timestamp().max(0) as u64,
+        },
+    )
+}
+
 /// A certificate's SubjectPublicKeyInfo, which is what genesis commits
 /// to for a voter and what a peer compares against.
 fn spki(leaf: &CertificateDer<'_>) -> Vec<u8> {

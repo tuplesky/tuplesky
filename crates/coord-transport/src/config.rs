@@ -61,6 +61,15 @@ pub struct Limits {
     pub frame_timeout: Duration,
     /// QUIC idle timeout.
     pub idle_timeout: Duration,
+    /// The longest an authenticated connection may live, whatever its
+    /// credential's expiry (task-58; design Section 10.4).
+    ///
+    /// A cap and not the only bound: a connection also ends when the
+    /// credential it was bound under does, where the binder says so.
+    /// Whichever comes first ends it, because a warm connection is
+    /// authentication that has already happened and a long-lived one is
+    /// a decision nobody re-made.
+    pub max_connection_age: Duration,
     /// Keep-alive interval (liveness only; never a lease or membership).
     pub keep_alive: Duration,
     /// Depth of each lane's owned event queue; that lane's readers wait
@@ -83,6 +92,7 @@ impl Default for Limits {
             handshake_timeout: Duration::from_secs(5),
             frame_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
+            max_connection_age: Duration::from_secs(12 * 3600),
             keep_alive: Duration::from_secs(5),
             event_queue: 1024,
             max_inflight: 64,

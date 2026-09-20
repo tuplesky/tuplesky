@@ -342,6 +342,26 @@ Activation is task-57, in the same module:
 | `LocalEvidence`: what one store answers, combined with gathered stances | `[EXT]` | Section 10.3.2; `resume` decides, from records |
 | A coordinator's assurance that a replica installed | `[EXT]` rejected | Section 17.6 |
 
+The credential lifecycle underneath all of it is task-58. The paper has
+a fixed replica set with no credentials at all, so every row is an
+extension; what they share is that none of them is allowed to become a
+second way to be a voter.
+
+| Item | Status | Where |
+|---|---|---|
+| `RenewalPolicy::decide`: `Wait`, `Due`, `Expired`, and no fourth answer | `[EXT]` | Section 10.4; an outage is survived by the window, never by the deadline |
+| `due_at` jitter derived from the node's own identity | `[EXT]` | a re-derived jitter would move a node's deadline across a restart |
+| `retire_at`: the earlier of the replaced leaf's expiry and a bounded overlap | `[EXT]` | Section 10.4; a key rotated away from is not usable for its natural life |
+| `session_deadline` from the credential a session was *bound* under | `[EXT]` | Section 20.4: a renewal does not extend a warm session |
+| `IdentityBinder::expires_at` plus `Limits::max_connection_age` | `[EXT]` | Section 10.4; the binder says how long what it admitted stays admissible |
+| `Membership::classify_credential`: one rule, five named cases | `[EXT]` | Section 20.4; the binder binds `Renewal` and nothing else |
+| The refusal a peer sees is undifferentiated; `coordd inspect` names it | `[EXT]` | Section 20.4; the distinctions are the node operator's, not a caller's |
+| `Generation::adopt`: the manifest stamp advances forwards only | `[EXT]` | Section 20.4; a root stamped past the credential is the cloned-disk fence |
+| `StreamAllocator::adopt`: the stream is carried forward, not reallocated | `[EXT]` | Section 17.3.1; a fresh stream would look like a lost prefix |
+| Append, read and replay take the generation from the current mapping | `[EXT]` | Section 17.3.1; a carried stream holds two generations of records |
+| Writing the new generation into the projection database | `[EXT]` rejected | it commits the previous run's uncommitted work and pushes `M` past `J` |
+| A credential that bypasses expiry for availability | `[EXT]` rejected | Section 10.4 |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the
