@@ -1583,3 +1583,143 @@ reader taking two thousand snapshots never starves a concurrent writer
 and never observes more completions than entries. The test's doc comment
 says exactly that rather than claiming the stronger thing, because a
 test that overclaims is worse than one that is honest about its reach.
+
+## A domain that only one client ever talked to
+
+Recorded against task-48 and task-62. The deliverable was a Kubernetes
+certification workflow and a WAN benchmark harness; the finding was that
+neither could be run yet, and why.
+
+### Why the fixtures had to leave the test binary
+
+Every fixture the project had lived inside a test binary. That is right
+for a test and useless to a certification run: an API server, a Go Kine
+build and a benchmark that runs for minutes all need a domain that
+outlives one `cargo test` process, and none of them can construct one.
+
+So `crates/coord-harness` writes a real domain into a directory —
+authority, per-node voter and collector credentials, a genesis that
+commits the key each node will present, one signed endpoint catalog, the
+issuer's published keys and a strict `coordd.toml` per node — and then
+starts every committed voter, waiting until each is actually serving.
+Every committed voter, because a three-voter genesis with two processes
+running is a quorum the domain does not have, and a suite that ran
+against it would be measuring something nobody deploys.
+
+The daemons are unchanged and unhelped. They run the production startup
+checks against this material and refuse it the moment it stops agreeing
+with itself, which is what makes a harness bug look like a harness bug
+instead of like a result.
+
+### The one place the harness is not the real thing, and why it says so
+
+The credential endpoint signs a real ES256 service token with the
+domain's configured issuer key on presentation of any non-empty
+assertion. It is not an identity provider and its own documentation says
+so in the first paragraph.
+
+The reasoning is about what a failure would mean. What task-48 certifies
+is the storage edge; the token exchange is task-35 and task-36's, and it
+has its own tests. A real identity provider in the certification run
+would add a second thing that can fail without testing the edge any
+better, and a red run whose cause is ambiguous is worth less than a red
+run whose cause is named. What is *not* weakened is the verifying side:
+`coordd` runs exactly the verification it runs in production, against a
+credential of exactly the shape it will see. The endpoint refuses to bind
+anything but loopback, and the `test-only` crate role keeps all of it out
+of every production artifact.
+
+### Two findings, and neither was findable before
+
+The suite passed the whole storage-edge security matrix, create, read,
+compare-and-swap, delete, paging and the compaction floor. Then it found
+two things.
+
+**A watch does not merely fail — it wedges the domain.** `Step::Watch` in
+`bins/coordd/src/serve.rs` counts the watch and drops the responder, with
+a comment saying pumping it is the next piece of the loop. That reads
+like a missing feature. It is worse than one: the collector has already
+registered the watch with the hub, nothing ever drains it, and every
+operation after it goes unanswered. In a suite run this looks like three
+separate failures in three later tests, and it is one.
+
+The machinery to fix it is already there — `Dispatcher::open_watch`,
+`pump_watch`, the `WatchHub` and the close reasons all exist and are
+tested. What is missing is the daemon holding the stream open and draining
+the hub onto it, which `Responder::respond` cannot do because it consumes
+itself and finishes the stream.
+
+**A connection stops being answered after about sixty requests.** One
+caller, one request in flight at a time, three voters: exactly 61 of 100
+complete and the remaining 39 reach their deadline. Exactly 61 on every
+repetition, with a two-second deadline and with a thirty-second one, so
+it is an exhaustion and not a slowdown -- a slow domain would have
+finished the eightieth request eventually.
+
+Sixty-four is where to look. `LaneLimits::UNARY` admits 64 concurrent
+bidirectional streams per connection, and a caller that never has two
+requests outstanding can only reach a *concurrency* bound if something
+per request is not being released when the request finishes. Adding a
+second caller makes it much worse rather than twice as good -- 7 of 20
+complete -- which says the same thing from the other side.
+
+This had been invisible for a structural reason worth stating. The Kine
+backend holds one session and issues one invocation at a time, and the
+Go suite's etcd-level rows spend fewer requests than the bound before the
+watch row stops the domain for the other reason. Every Rust integration
+test builds one caller and asks it a handful of questions. Nothing in the
+project had ever asked the composition a hundred questions in a row. A
+Kubernetes API server asks it that many while it is still booting.
+
+### What the benchmark harness had to get right to find that
+
+A closed-loop benchmark would not have found it. It sends the next
+request when the previous one returns, so a domain that serializes work
+looks like a domain with a long service time and a perfectly respectable
+throughput curve.
+
+`crates/coord-wan-bench` schedules arrivals against absolute instants
+from one start, and separates the wait before an operation started from
+the operation itself and from the whole thing. That is what made the
+second finding legible rather than mysterious. A closed-loop harness
+would have reported "throughput fell and latency rose", which is the
+shape of a slow system. What the open-loop run showed instead was a
+fixed count of fast completions followed by nothing at all, identical on
+every repetition and unchanged by a fifteen-fold longer deadline. A count
+that does not move when the deadline moves is a resource that ran out.
+
+The three-distribution split is not decoration. `queue` says whether the
+harness was the bottleneck, `service` says what the operation cost once
+it started, and `whole` — scheduled arrival to answer — is the only one a
+headline may quote. A run that reported only the middle one would have
+reported this defect as good news.
+
+### Two rules the report inherits rather than invents
+
+Every metric the harness did not read is absent *with a reason*, never
+zero, exactly as `coord_daemon::metrics` does it. The daemon renders its
+stage, synchronization, commit-return and frontier metrics on its own
+startup and shutdown report and not on a socket a benchmark can poll, so
+the report says `NoEndpoint` rather than estimating. Journal
+synchronization and commit-return stay separate fields, because they are
+separate things and neither stands in for the other.
+
+And `--durability` is required. A latency figure without the durability
+it was obtained under is not a slow result or a fast one; it is not a
+result.
+
+### What the impairment script actually is
+
+`scripts/bench/wan-topology.sh` puts kernel delay, loss and asymmetry on
+the exact UDP port pairs that cross a region boundary, and can drop a
+region's traffic entirely while its voters keep running — which is the
+Section 21.5 region loss, and is a different experiment from killing the
+processes, because a partitioned voter still holds what it promised and
+rejoins.
+
+It is one host with netem on loopback. That gives real queues, real
+reordering and real timer behaviour, and it does not give a shared
+physical link, competing traffic or a route change. The script prints the
+`--impairment` line for the run that follows rather than letting the
+benchmark infer one, and a run that states no impairment says exactly
+that instead of implying there was none.

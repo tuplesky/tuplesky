@@ -1,0 +1,44 @@
+[package]
+name = "coord-wan-bench"
+description = "Matched native WAN benchmark harness: scheduled arrivals, achieved load, whole-operation paths and honestly stated absences (test-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# Measurement harness (design Sections 14.1, 14.3, 21.5, 22.3). It drives
+# a provisioned domain over the real client path and reports what it
+# measured; the dependency policy keeps it out of every production, core
+# and tool crate.
+role = "test-only"
+
+[lib]
+name = "coord_wan_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coord-wan-bench"
+path = "src/bin/coord-wan-bench.rs"
+
+[dependencies]
+coord-types.workspace = true
+coord-harness.workspace = true
+coord-membership.workspace = true
+coord-sdk.workspace = true
+coord-session.workspace = true
+coord-store-bench.workspace = true
+coord-transport.workspace = true
+clap.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

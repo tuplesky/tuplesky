@@ -1,0 +1,137 @@
+# Kubernetes storage-profile certification (task-48; design Sections 3.1,
+# 6.6, 6.8.4, 23 G4).
+#
+# This is the G4 qualification run, not a pull-request check. It stands a
+# real three-voter domain up, serves the etcd edge in front of it with
+# `kine-coord`, and then certifies the profile twice over: once with the
+# API server's own client library against the edge, and once with a real
+# Kubernetes control plane on top of it.
+#
+# It is deliberately not part of `CI`. A qualification run reports what
+# the composition can and cannot do today, and a run that is red because
+# a named capability is missing is doing its job; making it a required
+# check would turn that report into pressure to weaken the suite. Its
+# results are read, not merged around. `docs/operations/kubernetes-certification.md`
+# records the current profile, including what does not pass yet.
+name: kubernetes-certification
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, after the Monday qualification run in `CI`.
+    - cron: "43 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kubernetes-certification-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  edge:
+    name: storage edge (etcd client and security matrix)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: adapters/kine/go.mod
+          cache-dependency-path: adapters/kine/go.sum
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: certification
+      - name: Build the daemon, the harness and the Kine build
+        run: |
+          cargo build --locked --release -p coordd -p coord-harness
+          (cd adapters/kine && go build -o ../../target/release/kine-coord ./cmd/kine-coord)
+      - name: Stand the domain and the storage edge up
+        env:
+          EDGE_PORT: "0"
+        run: scripts/e2e/start.sh "$RUNNER_TEMP/run"
+      - name: Certify the profile through the API server's client library
+        env:
+          COORD_CERTIFY_HARNESS: ${{ runner.temp }}/run/harness.json
+        working-directory: adapters/kine
+        run: go test ./certify/ -count=1 -v -timeout 20m
+      - name: Lose a voter and certify again
+        # Regional failover: a committed voter goes away and the domain
+        # still answers, because two of three is the quorum. The prefix
+        # changes so this is a fresh key space rather than a re-read of
+        # what the first pass wrote.
+        env:
+          COORD_CERTIFY_HARNESS: ${{ runner.temp }}/run/harness.json
+          COORD_CERTIFY_PREFIX: after-failover
+        run: |
+          tail -n 1 "$RUNNER_TEMP/run/harness.pids" | xargs -r kill -9
+          sleep 5
+          (cd adapters/kine && go test ./certify/ -count=1 -v -timeout 20m)
+      - name: Collect what everything said
+        if: always()
+        run: scripts/e2e/stop.sh "$RUNNER_TEMP/run" || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: edge-certification-logs
+          path: |
+            ${{ runner.temp }}/run/*.log
+            ${{ runner.temp }}/run/n*/coordd.log
+            ${{ runner.temp }}/run/harness.json
+          retention-days: 14
+
+  k3s:
+    name: kubernetes control plane on the storage edge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: adapters/kine/go.mod
+          cache-dependency-path: adapters/kine/go.sum
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: certification
+      - name: Build the daemon, the harness and the Kine build
+        run: |
+          cargo build --locked --release -p coordd -p coord-harness
+          (cd adapters/kine && go build -o ../../target/release/kine-coord ./cmd/kine-coord)
+      - name: Stand the domain and the storage edge up
+        env:
+          # The API server's configuration names the port, so it is
+          # pinned rather than chosen.
+          EDGE_PORT: "2379"
+        run: scripts/e2e/start.sh "$RUNNER_TEMP/run"
+      - name: Run a Kubernetes control plane on it
+        run: scripts/e2e/k3s.sh "$RUNNER_TEMP/run"
+      - name: Certify the profile through the API server
+        run: scripts/e2e/kubernetes-profile.sh "$RUNNER_TEMP/run"
+      - name: Collect what everything said
+        if: always()
+        run: |
+          sudo journalctl -u k3s --no-pager -n 2000 > "$RUNNER_TEMP/run/k3s.log" 2>&1 || true
+          sudo chmod -R a+r "$RUNNER_TEMP/run" || true
+          scripts/e2e/stop.sh "$RUNNER_TEMP/run" || true
+          sudo /usr/local/bin/k3s-uninstall.sh || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: k3s-certification-logs
+          path: |
+            ${{ runner.temp }}/run/*.log
+            ${{ runner.temp }}/run/n*/coordd.log
+            ${{ runner.temp }}/run/harness.json
+          retention-days: 14
