@@ -78,7 +78,9 @@ use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch};
 use coord_core::event::{StorageError, StorageEvent};
 use coord_journal_api::engine::{JournalEngine, ReadBudget};
 use coord_journal_api::failure::{JournalError, JournalFailure};
-use coord_journal_api::frontier::{AppliedFrontier, FrontierError, Frontiers};
+use coord_journal_api::frontier::{
+    AppliedFrontier, CheckpointPointerV1, FrontierError, Frontiers, select_recovery_pointer,
+};
 use coord_journal_api::group::{GroupEntry, GroupError, GroupLimits, GroupWrite};
 use coord_journal_api::head::{HeadError, HeadState, Reconciled, StreamHead, WrittenBytes};
 use coord_journal_api::record::{
@@ -111,6 +113,10 @@ pub const PROFILE: &str = "journaled-strict-v1";
 /// allocate this one and a lifecycle completion is never mistaken for a
 /// machine's barrier.
 const LIFECYCLE_SEQUENCE: u64 = 0;
+/// Barrier sequence of a checkpoint publication. Like the lifecycle
+/// sequence it is the runtime's own and completes no actor's barrier:
+/// nothing is waiting on it, and it must not collide with one that is.
+const CHECKPOINT_SEQUENCE: u64 = 1;
 
 /// Bytes reserved for everything a record carries beside its updates:
 /// format, origin, sequence, both digests, the effect context and an
@@ -406,6 +412,24 @@ impl FlushReport {
         self.appends += other.appends;
         self.commits += other.commits;
     }
+}
+
+/// What a checkpoint publication did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Published {
+    /// Sequence the published checkpoint represents (`C`).
+    pub published: LocalJournalSeq,
+    /// Whether the journal prefix through it was retired as well.
+    ///
+    /// `false` is not a failure: the pointer is durable and the
+    /// baseline is authoritative, and the prefix is still there to be
+    /// retired on a later attempt. It is reported rather than retried
+    /// here so the caller decides when to spend the I/O.
+    pub retired: bool,
+}
+
+fn alloc_one(record: JournalRecordV1) -> Vec<JournalRecordV1> {
+    vec![record]
 }
 
 /// A record that is durable in the journal and waiting to be materialized,
@@ -808,6 +832,195 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 Err(JournaledError::Journal(failure))
             }
         }
+    }
+
+    /// Steps 3 and 4 of the publication order (design Section 17.16.3):
+    /// make `pointer` durable in the stream, then retire the journal
+    /// entries it represents.
+    ///
+    /// The caller has already done steps 1 and 2 -- pinned a snapshot
+    /// and written a complete inactive image -- and does step 5,
+    /// reclaiming superseded images, afterwards. Those are filesystem
+    /// work; this is the part that has to be in the journal, because the
+    /// durable pointer is what selects recovery state and only the
+    /// journal can retire its own prefix.
+    ///
+    /// The order is the whole of the safety. The pointer becomes durable
+    /// *before* anything is retired, so a crash between them leaves a
+    /// new baseline and a journal that still holds the prefix: the
+    /// replay overlaps and applies the same records again, which is
+    /// exactly what the records are for. A retirement that ran first
+    /// would leave a baseline that does not exist and a journal that no
+    /// longer proves what it represented.
+    ///
+    /// The publication record is itself newer than `C` and stays in the
+    /// suffix until a later checkpoint covers it, so the recovered
+    /// stream always contains the evidence of its own baseline.
+    ///
+    /// Retiring is not a condition of the publication. When the append
+    /// succeeded and the compaction did not, the pointer stands and the
+    /// prefix is simply still there; the caller learns that the
+    /// reclamation is owed rather than that the checkpoint failed.
+    pub fn publish_checkpoint(
+        &mut self,
+        domain: DomainId,
+        pointer: &CheckpointPointerV1,
+    ) -> Result<Published, JournaledError> {
+        let barrier = BarrierId {
+            node_generation: self.incarnation,
+            boot_id: self.boot,
+            sequence: CHECKPOINT_SEQUENCE,
+        };
+        let state = self
+            .domains
+            .get_mut(&domain)
+            .ok_or(JournaledError::UnknownDomain)?;
+        if state.status != DomainStatus::Ready {
+            return Err(JournaledError::NotReady(state.status));
+        }
+        // The image is this incarnation's own. A pointer naming another
+        // origin describes storage this node does not have.
+        if pointer.origin != state.origin {
+            return Err(JournaledError::Quarantined(
+                "a checkpoint pointer of another origin",
+            ));
+        }
+        // `C <= M` is what makes the image loadable: an image claiming
+        // records the projection has not applied represents obligations
+        // it does not contain. The frontier is the one place that rule
+        // lives, so it is asked before anything is written, and advanced
+        // only once the pointer is durable.
+        let mut proposed = state.frontiers;
+        proposed
+            .publish_checkpoint(pointer.represented)
+            .map_err(JournaledError::Frontier)?;
+        let seq = state.head.next_seq()?;
+        let record = JournalRecordV1::seal(RecordDraft {
+            origin: state.origin,
+            seq,
+            predecessor: state.head_digest,
+            body: RecordBody::PublishLocalCheckpoint(*pointer),
+        })?;
+        let entry = GroupEntry::new(barrier, state.origin.stream, alloc_one(record.clone()))?;
+        let mut group = GroupWrite::new(self.limits.group);
+        group.push(entry)?;
+        state
+            .head
+            .reserve(barrier, NonZeroU32::new(1).expect("non-zero"))?;
+        match self.journal.append_group(&group) {
+            Ok(_) => {
+                let state = self.domains.get_mut(&domain).expect("attached");
+                state.head.complete_durable(barrier)?;
+                state.frontiers.advance_durable(record.seq())?;
+                state.head_digest = record.digest();
+                state.pending.push(Durable {
+                    barrier: None,
+                    record,
+                });
+                Self::materialize_domain(state)?;
+                state
+                    .frontiers
+                    .publish_checkpoint(pointer.represented)
+                    .map_err(JournaledError::Frontier)?;
+            }
+            Err(failure) => {
+                let state = self.domains.get_mut(&domain).expect("attached");
+                match &failure {
+                    // Nothing was written: the image on disk is simply
+                    // unselected and the prior publication stands.
+                    JournalFailure::Definite(_) => {
+                        state.head.fail_definite(barrier)?;
+                    }
+                    // The append may or may not be durable, so neither
+                    // the pointer nor the retirement may be assumed. The
+                    // stream reconciles before it serves again, and the
+                    // caller publishes again afterwards if it still
+                    // wants to.
+                    JournalFailure::Indeterminate(_) => {
+                        state.head.fail_indeterminate(barrier)?;
+                        state.inflight = alloc_one(record)
+                            .into_iter()
+                            .map(|record| Durable {
+                                barrier: None,
+                                record,
+                            })
+                            .collect();
+                        state.status = DomainStatus::JournalUncertain;
+                    }
+                }
+                return Err(JournaledError::Journal(failure));
+            }
+        }
+        // Only now, and never as a condition of the publication.
+        let stream = self.domains.get(&domain).expect("attached").origin.stream;
+        match self.journal.retire_prefix(stream, pointer) {
+            Ok(()) => Ok(Published {
+                published: pointer.represented,
+                retired: true,
+            }),
+            Err(_) => Ok(Published {
+                published: pointer.represented,
+                retired: false,
+            }),
+        }
+    }
+
+    /// The local recovery baseline of `domain`: the newest checkpoint
+    /// pointer durably published in this incarnation's stream, if any.
+    ///
+    /// Read from the journal and only from the journal. The newest
+    /// directory, the newest file, the largest sequence in a name --
+    /// none of those is an input. A pointer is published by an appended,
+    /// synced record, so the stream is where the selection is, and the
+    /// selection rule is the pointer with the highest represented
+    /// sequence of this exact origin.
+    ///
+    /// Called before the domain is attached, because what it answers is
+    /// *which projection to attach*: the live one that is still there,
+    /// or a fresh generation installed from the image this names. A
+    /// stream with no published pointer has no baseline, which is not
+    /// the same as an empty stream and is not permission to start from
+    /// nothing -- it means the whole journal is still the redo.
+    pub fn recovery_baseline(
+        &self,
+        domain: DomainId,
+    ) -> Result<Option<CheckpointPointerV1>, JournaledError> {
+        let key = StreamKey {
+            cluster: self.cluster,
+            domain,
+            incarnation: self.incarnation,
+        };
+        let Some(stream) = self.allocator.lookup(&key) else {
+            return Ok(None);
+        };
+        let origin = RecordOrigin {
+            cluster: self.cluster,
+            domain,
+            replica: self.replica,
+            incarnation: self.incarnation,
+            stream,
+        };
+        let mut found: Vec<CheckpointPointerV1> = Vec::new();
+        // Where the retained suffix begins, not zero: a prefix this
+        // stream already reclaimed is gone, and asking for it is a read
+        // the engine refuses rather than answers with a gap.
+        let mut after = self.journal.retained_from(stream)?;
+        loop {
+            let page = self.journal.read_suffix(stream, after, self.limits.read)?;
+            let Some(last) = page.records.last() else {
+                break;
+            };
+            after = last.seq();
+            for record in &page.records {
+                if let RecordBody::PublishLocalCheckpoint(pointer) = record.body() {
+                    found.push(*pointer);
+                }
+            }
+            if page.exhausted {
+                break;
+            }
+        }
+        Ok(select_recovery_pointer(&origin, found.iter()).copied())
     }
 
     /// Streams attached, in domain order.

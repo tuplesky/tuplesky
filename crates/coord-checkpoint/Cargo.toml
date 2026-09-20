@@ -15,6 +15,7 @@ role = "production"
 coord-types.workspace = true
 coord-core.workspace = true
 coord-consensus.workspace = true
+coord-journal-api.workspace = true
 coord-store-api.workspace = true
 coord-storage.workspace = true
 serde = { workspace = true, features = ["std"] }
