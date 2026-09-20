@@ -1084,6 +1084,7 @@ dependencies = [
  "coord-journal-raft-engine",
  "coord-membership",
  "coord-node-issuer",
+ "coord-sdk",
  "coord-session",
  "coord-state",
  "coord-storage",

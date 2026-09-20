@@ -39,6 +39,7 @@ clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
+coord-sdk.workspace = true
 coord-state.workspace = true
 postcard.workspace = true
 jsonwebtoken.workspace = true

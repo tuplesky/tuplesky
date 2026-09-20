@@ -308,6 +308,46 @@ pub enum Destination {
     Connection(ConnectionId),
 }
 
+/// Why a caller did not get an answer.
+///
+/// None of these says a command did not happen. The invocation keeps
+/// its identity and stays resolvable by it; what failed is this
+/// attempt to hear about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// No such connection.
+    NotConnected,
+    /// The connection is not one a question may be asked on: a peer
+    /// link, or one this side accepted rather than dialed.
+    NotAQuestionToAsk,
+    /// The request itself was not admitted.
+    Send(SendError),
+    /// No answer within the deadline. The outcome is unknown, not
+    /// failed.
+    Timeout,
+    /// The answer is not one well-formed frame within its class limit.
+    Malformed(String),
+    /// The stream failed.
+    Stream(String),
+}
+
+impl core::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RequestError::NotConnected => f.write_str("no such connection"),
+            RequestError::NotAQuestionToAsk => {
+                f.write_str("this connection is not one a question may be asked on")
+            }
+            RequestError::Send(e) => write!(f, "the request was not admitted: {e:?}"),
+            RequestError::Timeout => f.write_str("no answer within the deadline"),
+            RequestError::Malformed(e) => write!(f, "the answer is not a frame: {e}"),
+            RequestError::Stream(e) => write!(f, "the stream failed: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for RequestError {}
+
 /// Why a frame was not admitted to the transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendError {
@@ -1091,6 +1131,98 @@ impl Transport {
         stats.queued = state.queue.len();
         stats.rtt = state.peer.as_ref().map_or(Duration::ZERO, |p| p.conn.rtt());
         Some(stats)
+    }
+
+    /// Ask one question on `connection` and read its answer.
+    ///
+    /// The caller's shape, and the only one that reads a node's reply:
+    /// one bidirectional stream, the request written and finished on it,
+    /// the answer read back on the same stream. [`Transport::send`] is
+    /// the other shape and keeps its meaning -- output addressed *to* a
+    /// node, on a stream whose receiving half nobody reads -- and
+    /// [`TransportEvent::ApiDelivery`] is what that looks like at the
+    /// far end. This is beside them, not in place of either.
+    ///
+    /// The request is admitted under the destination and node budgets
+    /// before a stream is opened, exactly as a reply is: a caller with
+    /// many questions in flight must not be able to hand window after
+    /// window to QUIC outside the caps the lane exists to enforce. The
+    /// answer is read by the same bounded frame reader the rest of the
+    /// transport uses, so a response above its kind's class limit is
+    /// refused as a bound rather than truncated.
+    ///
+    /// # What an error means
+    ///
+    /// Only that this caller did not get an answer *here*. A timeout or
+    /// a dropped future says nothing about whether the node acted: the
+    /// invocation keeps its identity and is resolvable by it, which is
+    /// what `ResolveRequest` is for. Nothing in this method asserts that
+    /// a command was undone, and dropping the future releases this
+    /// caller's stream and budget and no more than that.
+    /// There is no group to name. A group is what the lane's fair queue
+    /// shares capacity between, and a question owns the stream it is
+    /// asked on: it is admitted under the destination and node budgets
+    /// and then written, never queued behind another group's frames.
+    pub async fn request(
+        &self,
+        connection: ConnectionId,
+        frame: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<Frame, RequestError> {
+        let peer = self
+            .shared
+            .peers
+            .lock()
+            .unwrap()
+            .get(&connection)
+            .cloned()
+            .ok_or(RequestError::NotConnected)?;
+        // A question is asked of a node this side dialed. On an accepted
+        // connection the streams this side opens are output, which is
+        // `send`'s shape and is read as a delivery at the far end; a
+        // request written there would be answered by nobody.
+        if peer.class != Class::Api || peer.accepted {
+            return Err(RequestError::NotAQuestionToAsk);
+        }
+        let link = self.shared.link(Shared::link_key(&peer));
+        let lane = peer.lane;
+        let bytes = frame.len();
+        for budget in [&link.budget, self.shared.node_budget.as_ref()] {
+            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
+                return Err(RequestError::Send(SendError::TooLarge { bytes, limit }));
+            }
+        }
+        let _dest = link
+            .budget
+            .acquire(lane, bytes)
+            .await
+            .map_err(|_| RequestError::Send(SendError::NotConnected))?;
+        let _node = self
+            .shared
+            .node_budget
+            .acquire(lane, bytes)
+            .await
+            .map_err(|_| RequestError::Send(SendError::NotConnected))?;
+        let _open = link.opens.acquire().await;
+        let (mut send, mut recv) = timeout(deadline, peer.conn.open_bi())
+            .await
+            .map_err(|_| RequestError::Timeout)?
+            .map_err(|e| RequestError::Stream(e.to_string()))?;
+        timeout(deadline, async {
+            send.write_all(&frame)
+                .await
+                .map_err(|e| RequestError::Stream(e.to_string()))?;
+            send.finish()
+                .map_err(|e| RequestError::Stream(e.to_string()))
+        })
+        .await
+        .map_err(|_| RequestError::Timeout)??;
+        match read_frame(&mut recv, deadline, true).await {
+            Ok(answer) => Ok(answer),
+            Err(FrameError::Timeout) => Err(RequestError::Timeout),
+            Err(FrameError::Wire(e)) => Err(RequestError::Malformed(format!("{e:?}"))),
+            Err(e) => Err(RequestError::Stream(format!("{e:?}"))),
+        }
     }
 
     /// Whether a connection currently holds `lane` of the link to

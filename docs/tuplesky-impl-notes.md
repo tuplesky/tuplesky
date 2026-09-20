@@ -269,7 +269,7 @@ failing it. Re-running it is not the fix, and neither is a retry
 annotation: both hide the case where the sensitivity is a real
 regression in the transport's own timing.
 
-## The Rust transport has no client-side unary request
+## The Rust transport had no client-side unary request
 
 **Where:** `coord_transport::Transport::send` (the `Class::Api` arm of
 the sender loop), `Responder::respond`, `TransportEvent::ApiDelivery`.
@@ -297,10 +297,38 @@ lifecycle and pooling and does not dial.
 speaks the caller's shape, which is what the daemon answers on. The test
 says so where it does it.
 
-**Revisit when:** something in Rust needs to be a client -- a control
-plane tool, a cross-domain relay, `coordctl` against a live node. The
-fix is a request method on `Transport` that keeps the receiving half and
-returns the answer, not a change to either existing path.
+**Resolved (task-j10):** `Transport::request` is that method. It keeps
+both halves of the stream it opens, writes the question, and reads the
+answer back on it. `send` and `ApiDelivery` are untouched and keep their
+meanings, because they are a different thing and not a broken version of
+this one: output addressed *to* a node this side dialed.
+
+Three properties are the reason it is a method rather than four lines at
+each call site:
+
+* The request is admitted under the destination and node budgets before
+  a stream is opened, exactly as a reply is. A caller with many
+  questions in flight would otherwise hand window after window to QUIC
+  outside the caps the lane exists to enforce.
+* The answer is read by the same bounded frame reader as everything
+  else, so a response above its kind's class limit is refused as a bound
+  rather than truncated and handed to a decoder.
+* A question may only be asked on an API-class connection this side
+  dialed. On an accepted connection the streams this side opens are
+  output, read as a delivery at the far end, so a request written there
+  would be answered by nobody.
+
+There is no group to name: a group is what the lane's fair queue shares
+capacity between, and a question owns the stream it is asked on.
+
+**What an error means** is the part worth keeping straight. Only that
+this caller did not hear back *here*. A timeout says nothing about
+whether the node acted, so the invocation keeps its identity and stays
+resolvable by it; dropping the future releases this caller's stream and
+budget and asserts nothing about the command. The SDK says the same
+thing in its own vocabulary -- `Outcome::Unknown`, then a
+`ResolveRequest` by identity -- and `coordd`'s tests drive both halves
+together against a real daemon.
 
 ## Genesis commits to a voter's key, and only a peer was checking
 
@@ -431,6 +459,65 @@ they are:
 **Revisit when:** task-j09 lands. The tests above then become the ones
 the plan asks for: a revision, a retained result, and a retry that
 resolves rather than re-executes.
+
+### What task-j09 turns out to need, and its open question
+
+It is not a wiring job. `InternalCommand::ConsumeAdmission` exists and
+writes the row (task-18), but nothing replicates an internal command:
+`plan_internal` and `build_internal_view` are reached only from tests
+that apply straight to a store, and every production path from a
+submission to execution is typed to a client request.
+
+* A replicated command's payload is `PayloadRecordV1 { retry_key,
+  logical }`, and `logical` is a canonical `LogicalRequest`.
+* Its identity is `CommandId::derive(&retry_key, &LogicalRequest)`.
+* `Follower::on_admitted` decodes exactly one `MessageV1::Request`, the
+  collector's `SubmitV1` carries a `RequestV1`, and `Applier::apply`
+  decodes a `LogicalRequest` and plans it as a client request.
+
+So an internal command has to become a thing the log can carry, and the
+task's own constraint decides most of how:
+
+> the claims are verified outside replicated execution, the receipt is
+> minted there, and **nothing about the session is asserted by a
+> command's payload**.
+
+That rules out the obvious implementation -- a `CanonicalOperation`
+variant carrying an `AdmissionReceiptV1` -- because then the payload
+would assert the session, the principal and the scope, and a payload is
+exactly what a client controls.
+
+The shape that satisfies it: the session-establishing command's payload
+says only *what operation this is*, and everything about the session
+comes from the admission receipt that already travels beside the
+payload and is already minted at the collector boundary
+(`admitted_from_submit`). That is the same mechanism a client's command
+uses, which is the point.
+
+**The open question is what the receipt has to carry.**
+`ConsumeAdmission` needs an `AdmissionReceiptV1 { receipt_id, session,
+principal, scope_ceiling, trust_rule, rule_generation, expires_at }`.
+The receipt that crosses the collector boundary today --
+`AdmissionClaimsV1`, minted into `AdmissionReceipt` -- carries
+`session`, `rule_generation`, `scope_ceiling`, `receipt_id` and
+`admitted_at_ticks`, and not `principal`, `trust_rule` or `expires_at`.
+Adding the three is a wire change *and* a change to a capability type
+whose constructor is on the `check-deps` boundary allow list, so it is a
+decision about what the trusted boundary is permitted to assert, not a
+field addition.
+
+The rest follows once that is settled, and none of it is contentious:
+a second domain-separated identity so an internal command is not a
+client command with a different payload; `Applier::apply` dispatching to
+`plan_internal` with `build_internal_view`; the bind's stream held until
+the session command is established, so the row is durable before the
+caller is told it is bound; and the receipt's single use (the token's
+`jti`) making a second bind of the same token find it consumed, which is
+how two bindings converge on one row.
+
+**Open:** whether the collector boundary may assert a principal, a trust
+rule and an expiry alongside the session it already asserts. Everything
+else in task-j09 rests on the answer.
 
 ## A command that was never speculated was never released
 

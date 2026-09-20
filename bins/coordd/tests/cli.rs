@@ -1878,3 +1878,345 @@ async fn three_voters_form_a_mesh_on_committed_identities() {
     let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
     assert_eq!(caller.session, coord_types::ids::SessionId([0x44; 16]));
 }
+
+/// A caller assembled from the Rust pieces a real client has: the
+/// `coord-transport` endpoint for the wire, and the `coord-sdk` client
+/// for the request lifecycle.
+///
+/// The direct-quinn `Caller` above exists because the transport had no
+/// caller's shape -- `Transport::send` opens a stream and drops the half
+/// the answer comes back on. `Transport::request` is that shape, and
+/// this is what says so: the SDK decides what to send and what an answer
+/// means, the transport carries it, and neither of them is a test
+/// double.
+struct SdkCaller {
+    transport: coord_transport::Transport,
+    connection: coord_transport::ConnectionId,
+    client: coord_sdk::Client<coord_sdk::StaticProvider>,
+    session: coord_types::ids::SessionId,
+}
+
+impl SdkCaller {
+    /// Dial `daemon` and bind `session`, driving the SDK's own binding
+    /// action rather than writing a bind frame directly.
+    async fn bind(
+        dir: &Path,
+        daemon: &Running,
+        ca: &Ca,
+        ring: &coord_sts::KeyRing,
+        session: [u8; 16],
+    ) -> Self {
+        use coord_types::wire_v1::PeerRole;
+
+        let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls_pki_types::CertificateDer::from(
+                ca.certificate.der().to_vec(),
+            ))
+            .expect("ca root");
+        // The caller's own binder is the committed membership's, from
+        // the same manifest the daemon read: what it is dialing is a
+        // voter of this domain because the configuration says the
+        // certificate it presented is, or it is nobody.
+        let manifest: coord_membership::genesis::GenesisManifest = serde_json::from_slice(
+            &std::fs::read(dir.join("genesis.json")).expect("the manifest is readable"),
+        )
+        .expect("a manifest");
+        let membership =
+            coord_membership::membership::Membership::from_genesis(&manifest).expect("membership");
+        let identity = coord_transport::LocalIdentity {
+            cluster: coord_types::ids::ClusterId(CLUSTER),
+            domain: coord_types::ids::DomainId(DOMAIN),
+            chain: vec![rustls_pki_types::CertificateDer::from(
+                certificate.der().to_vec(),
+            )],
+            key: rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            roots: std::sync::Arc::new(roots),
+            capabilities: coord_transport::role_lanes(PeerRole::Client)
+                .iter()
+                .map(|lane| lane.capability())
+                .collect(),
+            api_client: None,
+            serves: Some(coord_transport::Class::Api),
+            replica: None,
+        };
+        let transport = coord_transport::Transport::bind(
+            "127.0.0.1:0".parse().expect("loopback"),
+            identity,
+            std::sync::Arc::new(coord_membership::binder::PeerBinder::new(membership)),
+            coord_transport::Limits::default(),
+        )
+        .expect("the caller's endpoint");
+        let connection = transport
+            .connect(
+                daemon.api,
+                SERVER_NAME,
+                PeerRole::Client,
+                None,
+                coord_transport::Lane::Unary,
+                coord_transport::BoundIdentity {
+                    role: PeerRole::Voter,
+                    replica: Some(coord_types::ids::ReplicaId([1; 16])),
+                    incarnation: Some(coord_types::ids::ReplicaIncarnation::new(1).expect("one")),
+                    capabilities: Vec::new(),
+                },
+            )
+            .await
+            .expect("the caller reached the daemon");
+
+        // The credential the SDK presents is the service token the
+        // daemon's own keys verify. Expiry is in the SDK's ticks
+        // (milliseconds), which is also the clock the client is driven
+        // on below.
+        let token = service_token(ring, session);
+        let mut client = coord_sdk::Client::new(
+            coord_sdk::ClientConfig::default(),
+            coord_sdk::ClientInstance::new(
+                coord_types::ids::ClusterId(CLUSTER),
+                coord_types::ids::DomainId(DOMAIN),
+                coord_types::ids::SessionId(session),
+                coord_types::ids::ClientInstanceId([0x0c; 16]),
+            ),
+            coord_sdk::StaticProvider::new(coord_sdk::Credential::new(
+                token.into_bytes(),
+                u64::MAX,
+            )),
+        );
+        let sdk_connection = coord_sdk::ConnectionId(connection.0);
+        client
+            .connect(0, sdk_connection)
+            .expect("the client opened its connection");
+
+        // Exactly one action, and it is the binding: a credential is
+        // presented once per connection and never again.
+        let actions = client.take_actions();
+        let [coord_sdk::SdkAction::Bind { credential, .. }] = actions.as_slice() else {
+            panic!("the client did not ask to bind: {actions:?}");
+        };
+        let frame = coord_session::bind_frame(credential.present()).expect("bind frame");
+        let answer = transport
+            .request(connection, frame, Duration::from_secs(20))
+            .await
+            .expect("the daemon answered the binding");
+        let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
+        assert_eq!(ack.session, coord_types::ids::SessionId(session));
+        client.bound(0, sdk_connection);
+
+        SdkCaller {
+            transport,
+            connection,
+            client,
+            session: ack.session,
+        }
+    }
+
+    /// Submit `request` and carry it to a completion.
+    async fn ask(
+        &mut self,
+        now: u64,
+        request: &coord_types::logical_v1::LogicalRequest,
+    ) -> coord_sdk::Completion {
+        let id = self.client.submit(now, request, 0).expect("submitted");
+        let actions = self.client.take_actions();
+        let [coord_sdk::SdkAction::Send { frame, .. }] = actions.as_slice() else {
+            panic!("the client did not ask to send: {actions:?}");
+        };
+        let answer = self
+            .transport
+            .request(self.connection, frame.clone(), Duration::from_secs(20))
+            .await
+            .expect("the daemon answered the request");
+        // Back to the SDK as it arrived, framed: what a frame means is
+        // the SDK's to decide, and a caller that decoded it here would
+        // be a second opinion about what an answer is.
+        let bytes =
+            coord_types::wire_v1::encode_frame(answer.kind, answer.version, &answer.payload)
+                .expect("re-framed");
+        self.client
+            .on_frame(now, coord_sdk::ConnectionId(self.connection.0), &bytes)
+            .expect("the client accepted the answer");
+        let completions = self.client.take_completions();
+        let [completion] = completions.as_slice() else {
+            panic!("the client did not complete the request: {completions:?}");
+        };
+        assert_eq!(completion.request, id);
+        completion.clone()
+    }
+}
+
+/// A Rust caller sends a request and reads its answer through the SDK.
+///
+/// The same daemon the direct-quinn caller drives, and the same request,
+/// carried by the pieces a Rust client actually has. The SDK allocates
+/// the invocation, builds the frame and decides what the answer means;
+/// `Transport::request` carries it and reads the reply on the stream it
+/// was asked on.
+///
+/// What the answer *is* is not this test's claim -- it is the fail-closed
+/// refusal every command gets until the session row exists (task-j09).
+/// What is claimed is that a Rust caller asked and heard back, through
+/// the SDK, with the command identity the SDK allocated.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rust_caller_asks_through_the_sdk_and_reads_the_answer() {
+    let dir = workspace("sdk");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    let mut caller = SdkCaller::bind(&dir, &daemon, &ca, &ring, [0x44; 16]).await;
+    assert_eq!(caller.session, coord_types::ids::SessionId([0x44; 16]));
+
+    let mut logical = coord_types::logical_v1::LogicalRequest::new(
+        coord_types::ids::NamespaceId([0x5e; 16]),
+        coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    logical.canonicalize();
+    let completion = caller.ask(1, &logical).await;
+
+    // The SDK's own command identity, so the answer it accepted is the
+    // one it asked for and not merely the next frame on the wire.
+    let coord_sdk::Outcome::Established { result, .. } = &completion.outcome else {
+        panic!("the daemon did not establish the request: {completion:?}");
+    };
+    let executed: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+    assert_eq!(
+        executed.outcome,
+        coord_state::Outcome::ErrRejected {
+            reason: coord_state::RejectionReason::SessionInvalid
+        },
+        "the session row is not written by anything yet; see task-j09"
+    );
+}
+
+/// A deadline that passes makes the outcome unknown, not failed, and the
+/// invocation stays resolvable by its identity.
+///
+/// The request really is sent and really is answered; what does not
+/// happen is the answer reaching this caller. That is the ambiguous case
+/// the whole identity scheme exists for: the client cannot tell whether
+/// the command happened, so it says unknown, keeps the invocation, and
+/// asks again by identity rather than sending a second command.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_this_caller_never_saw_is_unknown_and_still_resolvable() {
+    let dir = workspace("sdk-unknown");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let mut caller = SdkCaller::bind(&dir, &daemon, &ca, &ring, [0x44; 16]).await;
+
+    let mut logical = coord_types::logical_v1::LogicalRequest::new(
+        coord_types::ids::NamespaceId([0x5e; 16]),
+        coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    logical.canonicalize();
+
+    // Sent and answered, and the answer dropped on the floor here.
+    let id = caller.client.submit(1, &logical, 50).expect("submitted");
+    let actions = caller.client.take_actions();
+    let [coord_sdk::SdkAction::Send { frame, .. }] = actions.as_slice() else {
+        panic!("{actions:?}");
+    };
+    let established = caller
+        .transport
+        .request(caller.connection, frame.clone(), Duration::from_secs(20))
+        .await
+        .expect("the daemon answered");
+
+    // The deadline passes with nothing fed back.
+    caller.client.tick(200);
+    let completions = caller.client.take_completions();
+    assert_eq!(
+        completions
+            .iter()
+            .map(|c| c.outcome.clone())
+            .collect::<Vec<_>>(),
+        vec![coord_sdk::Outcome::Unknown],
+        "a deadline is an unknown outcome, never a failed one"
+    );
+
+    // Two actions, and both matter. The abandoned stream is reset
+    // explicitly -- nothing else closes it, and the resolution needs its
+    // credit on a connection sized for one -- and the invocation is
+    // asked about by its identity rather than sent again.
+    let actions = caller.client.take_actions();
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, coord_sdk::SdkAction::Reset { .. })),
+        "the abandoned stream was not reset: {actions:?}"
+    );
+    let Some(coord_sdk::SdkAction::Resolve { frame, .. }) = actions
+        .iter()
+        .find(|a| matches!(a, coord_sdk::SdkAction::Resolve { .. }))
+    else {
+        panic!("the client did not ask to resolve: {actions:?}");
+    };
+    let resolved = caller
+        .transport
+        .request(caller.connection, frame.clone(), Duration::from_secs(20))
+        .await
+        .expect("the daemon answered the resolution");
+
+    assert_eq!(
+        response_of_frame(&resolved).command_id,
+        response_of_frame(&established).command_id,
+        "the resolution named another command"
+    );
+    let bytes =
+        coord_types::wire_v1::encode_frame(resolved.kind, resolved.version, &resolved.payload)
+            .expect("re-framed");
+    caller
+        .client
+        .on_frame(400, coord_sdk::ConnectionId(caller.connection.0), &bytes)
+        .expect("the client accepted the resolution");
+    let completions = caller.client.take_completions();
+    let [completion] = completions.as_slice() else {
+        panic!("the resolution did not complete the request: {completions:?}");
+    };
+    assert_eq!(completion.request, id);
+    let coord_sdk::Outcome::Established { result, .. } = &completion.outcome else {
+        panic!("the resolution did not return a result: {completion:?}");
+    };
+    let coord_types::wire_v1::OutcomeV1::Ok { result: first, .. } =
+        response_of_frame(&established).outcome
+    else {
+        panic!("the daemon's first answer was not a result");
+    };
+    assert_eq!(
+        result.as_slice(),
+        first.as_slice(),
+        "resolving the same invocation gave a different answer than the request did"
+    );
+
+    // Cancelling releases this caller's slot. It says the outcome is
+    // known now, and it does not say anything about the command being
+    // undone: nothing here could, because the record is the cluster's.
+    assert_eq!(caller.client.outstanding(), 0, "the request is finished");
+    assert!(caller.client.forget(id).is_some());
+}
+
+/// The response a frame carries.
+fn response_of_frame(frame: &coord_types::wire_v1::Frame) -> coord_types::wire_v1::ResponseV1 {
+    match coord_types::wire_v1::decode(frame) {
+        Ok(coord_types::wire_v1::MessageV1::Response(r)) => r,
+        other => panic!("not a response: {other:?}"),
+    }
+}
