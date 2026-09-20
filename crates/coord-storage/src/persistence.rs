@@ -122,6 +122,28 @@ pub trait Persistence {
 
     /// Resolve an indeterminate outcome against what is actually durable.
     fn reconcile(&mut self) -> Result<Lowered, EngineError>;
+
+    /// Everything a restarted replica wires its consensus machine from.
+    ///
+    /// This is on the seam, and it is the only way through it, because
+    /// the difference between the two coordinators here is exactly the
+    /// difference that a composition could get wrong without noticing.
+    /// Where the projection *is* the record, its snapshot is the whole
+    /// story. Where a journal is the record, the projection may lag it,
+    /// and a promise or a vote that is durable in the journal but not
+    /// materialized yet is still an obligation this replica owes: a
+    /// summary built from the projection alone would omit it, and this
+    /// replica would come back contradicting a vote it had already sent.
+    ///
+    /// So the journal-first implementation reads the authoritative cut
+    /// (design Section 4.8) and never the projection snapshot, and a
+    /// caller cannot ask for the other one because there is nothing here
+    /// to ask.
+    fn recovered(
+        &self,
+        epoch: coord_types::ids::ConfigurationEpoch,
+        budget: crate::views::ViewBudget,
+    ) -> Result<crate::protocol::RecoveredProtocol, EngineError>;
 }
 
 /// The reference path: the projection is itself the durable record.
@@ -170,6 +192,24 @@ impl<E: coord_store_api::engine::LocalEngine> Persistence for crate::worker::Sto
 
     fn reconcile(&mut self) -> Result<Lowered, EngineError> {
         crate::worker::StoreWorker::reconcile(self).map(lowered_from_worker)
+    }
+
+    /// The projection is the record, so its snapshot is the whole story:
+    /// there is no moment at which something is durable and not visible
+    /// here, and therefore nothing a cut could add.
+    fn recovered(
+        &self,
+        epoch: coord_types::ids::ConfigurationEpoch,
+        budget: crate::views::ViewBudget,
+    ) -> Result<crate::protocol::RecoveredProtocol, EngineError> {
+        let gated = Persistence::reader(self).snapshot().map_err(|e| match e {
+            crate::view::ViewError::Engine(e) => e,
+            other => EngineError::new(
+                coord_store_api::engine::ErrorClass::Busy,
+                format!("no snapshot to recover from: {other:?}"),
+            ),
+        })?;
+        crate::protocol::read_protocol(gated.view(), epoch, budget)
     }
 }
 
@@ -318,6 +358,23 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
             .reconcile(self.domain)
             .map(lowered_from_journal)
             .map_err(engine)
+    }
+
+    /// The authoritative cut, never the projection snapshot: the
+    /// materialized state plus every obligation the journal already
+    /// holds and the projection has not caught up with.
+    fn recovered(
+        &self,
+        epoch: coord_types::ids::ConfigurationEpoch,
+        budget: crate::views::ViewBudget,
+    ) -> Result<crate::protocol::RecoveredProtocol, EngineError> {
+        let cut = self.store.recovery_cut(self.domain).map_err(|e| {
+            EngineError::new(
+                coord_store_api::engine::ErrorClass::Corrupt,
+                format!("no authoritative recovery cut: {e:?}"),
+            )
+        })?;
+        crate::protocol::read_protocol(&cut, epoch, budget)
     }
 }
 

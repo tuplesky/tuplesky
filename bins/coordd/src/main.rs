@@ -372,10 +372,38 @@ fn voter(
         incarnation: placed.incarnation,
         role: ReplicaRole::Voter,
     };
+    // What this replica already owes, from the authoritative record.
+    //
+    // Not from the projection: on the journal-first profile a promise or
+    // a vote can be durable in the journal and not materialized yet, and
+    // a replica that recovered from the projection alone would come back
+    // contradicting a vote it had already sent. The seam only offers the
+    // authoritative answer, so there is no second source to pick by
+    // mistake.
+    let recovered = {
+        use coord_storage::Persistence;
+        applier
+            .store()
+            .recovered(m.epoch(), coord_storage::views::ViewBudget::default())
+            .map_err(|e| format!("this replica cannot read what it owes: {e:?}"))?
+    };
+    // The position the next command takes is the store's, not the
+    // summary's: it is what the applier validates a batch's base
+    // against, and a machine that planned against anything else would
+    // have its first command refused for a stale base.
     let executed_through = {
         use coord_storage::Persistence;
         applier.store().application_base().execution_position
     };
+    println!(
+        "recovered promise={:?} records={} payloads={} executed={} frontier={} position={}",
+        recovered.promise.as_ref().map(|p| p.promised.number),
+        recovered.records.len(),
+        recovered.payloads.len(),
+        recovered.executed.len(),
+        recovered.frontier.get(),
+        executed_through.get(),
+    );
     let machine = if placed.replica == ballot.leader {
         let mut leader = Leader::new(
             LeaderConfig {
@@ -385,20 +413,27 @@ fn voter(
                 frontend: collector,
                 capacity: 64,
             },
-            None,
+            recovered.promise.clone(),
             executed_through,
         );
         leader.set_learning(LearningMode::Full);
         coord_daemon::Machine::Leader(Box::new(leader))
     } else {
-        let mut follower = Follower::new(FollowerConfig {
-            identity,
-            quorum,
-            genesis: ballot,
-            frontend: collector,
-            capacity: 64,
-        })
-        .restore_execution(executed_through, []);
+        let mut follower = Follower::recover(
+            FollowerConfig {
+                identity,
+                quorum,
+                genesis: ballot,
+                frontend: collector,
+                capacity: 64,
+            },
+            recovered.promise.clone(),
+            recovered.records.clone(),
+            recovered.payloads.clone(),
+            executed_through,
+        )
+        .restore_execution(executed_through, recovered.executed.iter().map(|(c, _)| *c))
+        .restore_payloads(recovered.payloads.clone());
         follower.set_learning(LearningMode::Full);
         coord_daemon::Machine::Follower(Box::new(follower))
     };

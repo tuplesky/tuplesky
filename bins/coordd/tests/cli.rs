@@ -1085,6 +1085,73 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     );
 }
 
+/// A restarted replica comes back owing what it already owed.
+///
+/// The consensus machine is wired from the durable record -- the
+/// commands it holds, their payloads, what it has executed -- and not
+/// from an empty table. A replica that came back blank would have
+/// forgotten proposals it had voted on, and would be free to vote
+/// differently on them.
+///
+/// The record it reads is the authoritative one. On this profile the
+/// journal is the record and the projection may lag it, so a summary
+/// built from the projection alone can omit an obligation that is
+/// already durable; the persistence seam offers only the authoritative
+/// cut, so there is no second source to pick by mistake. That the cut
+/// and the projection genuinely differ while materialization lags is
+/// `coord-storage`'s own test; what this holds is that the daemon uses
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_replica_recovers_what_it_already_owed() {
+    let dir = workspace("recover");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    // A fresh store owes nothing, and says so.
+    {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .expect("the daemon answered the request");
+    }
+
+    let report = start_and_report(&path);
+    let line = report
+        .lines()
+        .find(|l| l.starts_with("recovered "))
+        .unwrap_or_else(|| panic!("the daemon said nothing about what it recovered:\n{report}"));
+    let field = |name: &str| -> u64 {
+        line.split_whitespace()
+            .find_map(|f| f.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} is not a number in {line:?}"))
+    };
+    assert!(
+        field("records") >= 1,
+        "no command survived the restart: {line}"
+    );
+    assert!(field("payloads") >= 1, "no payload survived: {line}");
+    assert!(
+        field("frontier") >= 1,
+        "the recovered summary says nothing has executed: {line}"
+    );
+    assert!(
+        field("position") >= 1,
+        "the next command would take a position already taken: {line}"
+    );
+    // `executed` is zero here and that is correct: the command was
+    // refused at execution (no session row -- task-j09), and a semantic
+    // refusal takes its position without writing an executed identity
+    // under it. The frontier moved, which is the part that matters for
+    // where the next command goes.
+    assert_eq!(field("executed"), 0, "{line}");
+}
+
 /// A process that cannot verify a caller does not come up saying it can.
 ///
 /// A JWKS that is valid JSON and holds no key this build can verify with
