@@ -3792,3 +3792,90 @@ fn copy_tree(from: &Path, to: &Path) {
         std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
     }
 }
+
+/// A build refuses a store whose cluster has activated something it
+/// cannot do, and says so before it could vote (task-60; design
+/// Sections 13, 17.7).
+///
+/// The rollback guard from the node's side. Compatible binaries coexist
+/// freely while nothing is active -- that is what makes a rolling
+/// upgrade possible -- and activation is the one-way point after which
+/// they do not. A node that started anyway would be operating on state
+/// it can only half interpret, which is the failure mode no later care
+/// recovers from.
+#[test]
+fn a_node_refuses_a_store_that_activated_something_this_build_cannot_do() {
+    let dir = workspace("features");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    // The build says what it is, on every start, so a mixed fleet can
+    // be reconciled by reading one line per node.
+    let report = start_and_report(&path);
+    assert!(
+        report.contains("build schema=1") && report.contains("features=checkpoint-floor"),
+        "the daemon did not report what this build is:\n{report}"
+    );
+
+    // Nothing activated: it serves, which is the coexistence half.
+    assert_eq!(run(&path, &["--check"]).code, Some(0));
+
+    // Now the cluster activates something this build has never heard
+    // of. An activation is written by the cluster, so a build that met
+    // an unknown identifier and quietly dropped it would conclude it
+    // may serve precisely when it may not.
+    write_activation(&dir, &[0x7fff]);
+    let refused = run(&path, &[]);
+    assert_eq!(
+        refused.code,
+        Some(2),
+        "a node served a store it cannot fully read:\n{}{}",
+        refused.out,
+        refused.err
+    );
+
+    // And one it does support is admitted again: the guard is about
+    // capability, not about the record existing.
+    write_activation(&dir, &[1]);
+    let served = start_and_report(&path);
+    assert!(
+        served.contains("phase=live"),
+        "a node refused a feature it supports:\n{served}"
+    );
+}
+
+/// Write the cluster's activation record straight into the selected
+/// generation, as the replicated path will once task-m02 drives it.
+fn write_activation(dir: &Path, features: &[u16]) {
+    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    let root = dir.join("state");
+    let identity = coord_storage_redb::StoreIdentity {
+        cluster_id: coord_types::ids::ClusterId(CLUSTER),
+        domain_id: coord_types::ids::DomainId(DOMAIN),
+        replica_id: coord_types::ids::ReplicaId([1; 16]),
+        incarnation: coord_types::ids::ReplicaIncarnation::new(1).unwrap(),
+    };
+    let options = coord_storage_redb::OpenOptions {
+        cache_bytes: 4 << 20,
+    };
+    let mut generation =
+        coord_storage_redb::Generation::open_existing(&root, identity, options).expect("open");
+    let record = coord_checkpoint::feature::ActiveFeaturesV1 {
+        cluster: coord_types::ids::ClusterId(CLUSTER),
+        domain: coord_types::ids::DomainId(DOMAIN),
+        configuration: coord_types::ids::ConfigurationEpoch::new(1).unwrap(),
+        features: features.to_vec(),
+        reporters: vec![coord_types::ids::ReplicaId([1; 16])],
+    };
+    let mut tx = generation.engine().begin_write().expect("write");
+    tx.put(
+        coord_store_api::registry::Collection::CheckpointV1.id(),
+        coord_checkpoint::feature::ACTIVE_KEY,
+        &record.encode().expect("encode"),
+    )
+    .expect("put");
+    tx.commit_durable().expect("commit");
+}

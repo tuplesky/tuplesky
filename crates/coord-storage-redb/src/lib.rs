@@ -26,12 +26,17 @@
 pub mod engine;
 pub mod lifecycle;
 pub mod manifest;
+pub mod migrate;
 
 pub use engine::{RedbEngine, RedbReader, RedbView, RedbWrite};
 pub use lifecycle::{
     ActivateStep, Generation, InactiveGeneration, OpenError, OpenOptions, RootLock, StoreIdentity,
 };
 pub use manifest::StoreManifestV1;
+pub use migrate::{
+    MigrateError, MigrateLimits, Outcome as MigrateOutcome, Row as MigrateRow, SchemaMigration,
+    Unchanged, migrate, rewrite_into_new_generation, selected_schema,
+};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";

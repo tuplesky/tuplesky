@@ -37,7 +37,7 @@ pub mod limits {
 }
 
 /// Version tag of this schema, included in every command hash.
-pub const SCHEMA_VERSION: u16 = 1;
+pub const SCHEMA_VERSION: u16 = crate::formats::Format::Command.current() as u16;
 
 /// An exact key or half-open interval `[key, range_end)` within a namespace.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

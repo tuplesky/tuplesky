@@ -501,6 +501,31 @@ impl Opened {
             checkpoint_root,
             adoption,
         } = self;
+        let mut generation = generation;
+        // The rollback guard (task-60). A build started against a cluster
+        // that has activated something it cannot do refuses here, before
+        // anything is adopted or the domain is attached, and long before
+        // it could vote, and names the feature: the answer an operator
+        // needs is "this node is too old for this cluster", not a
+        // puzzling failure three steps later. A store with no activation
+        // admits every build, which is what lets compatible binaries
+        // coexist before activation.
+        {
+            use coord_store_api::engine::{LocalEngine, SnapshotSource};
+            let directory = generation.directory().to_path_buf();
+            let view = generation
+                .engine()
+                .reader()
+                .snapshot()
+                .map_err(|e| StoreError::Refused {
+                    root: show(&directory),
+                    reason: format!("the activation record could not be read: {e}"),
+                })?;
+            coord_checkpoint::feature::admit(&view).map_err(|e| StoreError::Refused {
+                root: show(&directory),
+                reason: format!("{e}"),
+            })?;
+        }
         let generation = match adoption {
             None => generation,
             Some(adoption) => adopt(

@@ -18,7 +18,8 @@ use crate::record::RecordOrigin;
 
 /// Format version of `LocalRecoveryCheckpointV1` manifests a pointer may
 /// reference.
-pub const LOCAL_CHECKPOINT_FORMAT_V1: u16 = 1;
+pub const LOCAL_CHECKPOINT_FORMAT_V1: u16 =
+    coord_types::formats::Format::LocalCheckpoint.current() as u16;
 
 /// The durable pointer appended (as a `PublishLocalCheckpoint` record) once
 /// a complete inactive checkpoint and its manifest are synced. The newest

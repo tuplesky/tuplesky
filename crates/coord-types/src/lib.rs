@@ -33,6 +33,7 @@ extern crate alloc;
 
 pub mod config_v1;
 pub mod error;
+pub mod formats;
 pub mod identity;
 pub mod ids;
 pub mod logical_v1;
