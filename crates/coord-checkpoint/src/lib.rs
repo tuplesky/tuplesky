@@ -65,11 +65,20 @@
 
 pub mod export;
 pub mod install;
+pub mod local;
 pub mod manifest;
+pub mod store;
 pub mod trim;
 pub mod verify;
 
 pub use export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
+pub use local::{
+    InstallLocalError, InstallLocalLimits, LocalCheckpointV1, LocalError, LocalLimits,
+    LocalManifestV1, LocalPin, export_local, install_local, verify_local,
+};
+
+pub use store::{LocalCheckpointStore, StoreError};
+
 pub use install::{
     ChunkSet, InstallError, InstallLimits, InstallRequirements, Installed, InstalledCheckpointV1,
     SelectError, install_shared, installed_baseline, select_installed,

@@ -119,8 +119,8 @@ pub use apply::{AppliedOutcomeParts, Applier, ApplyError};
 pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
-    CutError, DomainStatus, FlushReport, JournalLimits, JournaledError, JournaledStore, Submission,
-    SubmitRefused, TransitionKind,
+    CutError, DomainStatus, FlushReport, JournalLimits, JournaledError, JournaledStore, Published,
+    Submission, SubmitRefused, TransitionKind,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{
