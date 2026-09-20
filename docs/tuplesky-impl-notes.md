@@ -444,39 +444,22 @@ replicated session -- and because task-j08's own gate does not depend on
 the answer: a request that is carried all the way to a replicated
 refusal has been through every stage that matters here.
 
-Two things in the acceptance tests are limited by it, and say so where
-they are:
+Two things in task-j08's acceptance tests were limited by it, and said
+so where they were: the served-request test asserted the shape of the
+answer rather than a mutation, and the restart test held that the same
+invocation is answered the same way without holding retry resolution
+from the durable record. Both now hold what the plan asks for --
+task-j09 landed, and the sections below are what it turned out to need.
 
-* The served-request test asserts the shape of the answer and the
-  command it belongs to, not a mutation.
-* The restart test holds that the same invocation is answered the same
-  way by the next process. It does *not* hold retry resolution from the
-  durable record: a semantic admission refusal deliberately records
-  nothing under the retry key, so there is nothing retained to resolve
-  to, and the second trip re-derives the same refusal. Holding that
-  needs a command that executes.
+### What task-j09 needed, and what was decided
 
-**Revisit when:** task-j09 lands. The tests above then become the ones
-the plan asks for: a revision, a retained result, and a retry that
-resolves rather than re-executes.
+It was not a wiring job. `InternalCommand::ConsumeAdmission` existed and
+wrote the row (task-18), but nothing replicated an internal command:
+`plan_internal` and `build_internal_view` were reached only from tests
+that applied straight to a store, and every production path from a
+submission to execution was typed to a client request.
 
-### What task-j09 turns out to need, and its open question
-
-It is not a wiring job. `InternalCommand::ConsumeAdmission` exists and
-writes the row (task-18), but nothing replicates an internal command:
-`plan_internal` and `build_internal_view` are reached only from tests
-that apply straight to a store, and every production path from a
-submission to execution is typed to a client request.
-
-* A replicated command's payload is `PayloadRecordV1 { retry_key,
-  logical }`, and `logical` is a canonical `LogicalRequest`.
-* Its identity is `CommandId::derive(&retry_key, &LogicalRequest)`.
-* `Follower::on_admitted` decodes exactly one `MessageV1::Request`, the
-  collector's `SubmitV1` carries a `RequestV1`, and `Applier::apply`
-  decodes a `LogicalRequest` and plans it as a client request.
-
-So an internal command has to become a thing the log can carry, and the
-task's own constraint decides most of how:
+The task's own constraint decided most of the shape:
 
 > the claims are verified outside replicated execution, the receipt is
 > minted there, and **nothing about the session is asserted by a
@@ -485,39 +468,122 @@ task's own constraint decides most of how:
 That rules out the obvious implementation -- a `CanonicalOperation`
 variant carrying an `AdmissionReceiptV1` -- because then the payload
 would assert the session, the principal and the scope, and a payload is
-exactly what a client controls.
+exactly what a client controls. So `CanonicalOperation::ConsumeAdmission`
+carries **nothing**: it names one action, and everything about the
+session comes from the admission travelling beside the payload.
 
-The shape that satisfies it: the session-establishing command's payload
-says only *what operation this is*, and everything about the session
-comes from the admission receipt that already travels beside the
-payload and is already minted at the collector boundary
-(`admitted_from_submit`). That is the same mechanism a client's command
-uses, which is the point.
+**The open question was what the receipt may carry**, and it was put to
+the plan's author. The answer, which the implementation follows
+literally:
 
-**The open question is what the receipt has to carry.**
-`ConsumeAdmission` needs an `AdmissionReceiptV1 { receipt_id, session,
-principal, scope_ceiling, trust_rule, rule_generation, expires_at }`.
-The receipt that crosses the collector boundary today --
-`AdmissionClaimsV1`, minted into `AdmissionReceipt` -- carries
-`session`, `rule_generation`, `scope_ceiling`, `receipt_id` and
-`admitted_at_ticks`, and not `principal`, `trust_rule` or `expires_at`.
-Adding the three is a wire change *and* a change to a capability type
-whose constructor is on the `check-deps` boundary allow list, so it is a
-decision about what the trusted boundary is permitted to assert, not a
-field addition.
+> The trusted authentication/admission boundary may attest the
+> principal, trust-rule ID and generation, scope ceiling, and
+> credential-validity bound associated with a session, provided these
+> are derived from verified credentials and configured trust -- not
+> from the command payload. [...] The approved boundary is: the
+> verifier attests who was authenticated, under which trust rule, and
+> within what limits; the replicated state machine decides what session
+> and permissions actually exist.
 
-The rest follows once that is settled, and none of it is contentious:
-a second domain-separated identity so an internal command is not a
-client command with a different payload; `Applier::apply` dispatching to
-`plan_internal` with `build_internal_view`; the bind's stream held until
-the session command is established, so the row is durable before the
-caller is told it is bound; and the receipt's single use (the token's
-`jti`) making a second bind of the same token find it consumed, which is
-how two bindings converge on one row.
+Six things follow from it, and each is a place the code says so.
 
-**Open:** whether the collector boundary may assert a principal, a trust
-rule and an expiry alongside the session it already asserts. Everything
-else in task-j09 rests on the answer.
+**1. Attesting is not identity authority.** `AttestedEstablishment`
+(principal, trust rule, credential deadline) is a *separate* shape from
+`AttestedAdmission`, not three optional fields on it. A submission
+receipt must not be *able* to carry a principal: if it could, every
+principal that may submit would be one field away from being an
+identity issuer, and the check that stops it would be a runtime
+condition rather than a type. `coord-session` joins the
+`VerifierToken::for_boundary` allow list because it is the
+authentication boundary; consensus and storage do not, and do not need
+to.
+
+**2. Establishment is not ordinary admission.** `AdmissionPurpose` is
+part of what the verifier attests, it is checked at the ingress against
+the role's authority (`may_establish_sessions`, which is `Frontend`
+only, versus `may_submit_for_clients`), and `Applier::apply` chooses
+the planner by the *accepted admission's purpose* rather than by the
+operation. A domain-scoped Kine collector can send a `Submit` and still
+cannot originate an identity.
+
+**3. The admission is part of what the command is.** `PayloadRecordV1`
+carries it, so a replica that executed the command, one that recovered
+its payload from a peer and one that replayed it from the journal all
+execute the same command. `FastAck` and `SlowAck` carry its digest and
+the command table binds it beside the identity, so two voters cannot
+accept one command as different session-creation facts. The command
+*identity* is untouched -- a retry under a rotated credential is still
+the same command -- which is exactly why the facts had to be bound to
+the acknowledgement instead.
+
+**4. Expiry is an admission constraint.** `CredentialDeadline` is whole
+seconds of the issuer's clock, checked once at the boundary. No replica
+reads a clock while applying and recovery does not revalidate; a
+command admitted before the deadline may finish after it, and what
+denies execution later is an ordered retirement or revocation at its
+own position.
+
+**5. Current replicated policy decides.** `plan_internal` rechecks the
+trust rule and its generation, refuses a consumed receipt, refuses a
+session identity that already exists, and consumes any grant
+commitments -- all in the one batch that also writes the session row and
+the retry binding.
+
+**6. The replication path was built, not bypassed.** The bind holds its
+stream until the command is established, so no credential is usable
+before the session durably exists.
+
+### A domain has to trust something before it can trust anyone
+
+Session establishment made a circularity visible that nothing had run
+into before. A session exists only under a trust rule replicated policy
+holds enabled; permission is allow-only and a fresh domain allows
+nothing. So the first command that would write a trust rule or a
+permission needs a session to be authorized, and that session needs the
+rule.
+
+`coordd init` therefore writes the domain's **genesis policy**: the
+trust rule its configured issuer signs under (`[sts] trust_rule`) and
+the permissions its genesis grants (`[[grant]]`). Every replica writes
+the same rows from the same configuration, as it does the genesis
+membership, and the batch carries no application base and takes no
+execution position -- it is initial state, not an execution. Everything
+after it is ordinary replicated administration.
+
+The identities in that configuration are row keys, so they are parsed
+strictly: exactly 32 lowercase hex characters, or the node refuses to
+start. A spelling that differed between nodes would be a different row
+on each, and the divergence would surface as a session that exists on
+some replicas and not others rather than as a bad configuration.
+
+### A retry after a restart was new work to the collector
+
+The last defect task-j09 found, and the one that was invisible until a
+command actually executed.
+
+The collector's retained results live in one process's memory. After a
+restart, a client's ordinary retry of a command the cluster had already
+executed was new work to it: it was proposed a second time, executed,
+and the applier handed back the outcome **at the position the command
+already had** -- which is not the position the restarted replica's
+learner was waiting to fill. The replica halted with a position
+mismatch and the caller got no answer at all.
+
+Before task-j09 this could not happen, because every command was refused
+at execution with `SessionInvalid` and a semantic refusal deliberately
+records nothing under the retry key: there was no retained record to
+hand back, so the second trip re-derived the same refusal at the next
+position.
+
+The fix is at the frontend, not in the learner: a request whose
+invocation this domain already holds a durable record for is answered
+from that record *before* anything is submitted, gated on the way out
+exactly as a fresh result is. Loosening the learner instead was tried
+and reverted -- accepting any outcome at or below the execution
+frontier would have made a replica whose durable records were lost
+accept re-proposed commands as already executed, which is precisely
+what `a_deliberately_omitted_durable_record_is_detected` exists to
+catch.
 
 ## A command that was never speculated was never released
 

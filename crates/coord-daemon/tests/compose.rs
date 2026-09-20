@@ -681,6 +681,47 @@ fn where_the_projection_lives_is_resolved_in_one_place() {
 /// A process with no API listener needs none of it: the auth broker and
 /// the node issuer establish credentials rather than consume them, so
 /// requiring an issuer of them would be circular.
+/// An identity in the configuration is an identity, or the node does not
+/// start.
+///
+/// The trust rule the issuer signs under and the principals a domain's
+/// genesis grants are row keys of replicated state, written by every
+/// replica from this file. A spelling that differed between nodes --
+/// upper case here, short there -- would be a different row on each,
+/// and the divergence would show up as a session that exists on some
+/// replicas and not others rather than as a bad configuration.
+#[test]
+fn an_identity_in_the_configuration_is_exactly_one_identity() {
+    let with = |field: &str, value: &str| {
+        base_config("").replace(
+            "trust_rule = \"7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c\"",
+            &format!("trust_rule = \"7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c\"\n\n[[grant]]\nprincipal = \"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"\nnamespace = \"{value}\"\n{field}"),
+        )
+    };
+    // A well-formed grant.
+    assert!(Config::parse(&with("", "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e")).is_ok());
+    // Too short.
+    assert_eq!(
+        Config::parse(&with("", "5e5e")),
+        Err(ConfigError::NotAnIdentity("grant.namespace"))
+    );
+    // Upper case is a second spelling of the same bytes, and a second
+    // spelling is what this refuses.
+    assert_eq!(
+        Config::parse(&with("", "5E5E5E5E5E5E5E5E5E5E5E5E5E5E5E5E")),
+        Err(ConfigError::NotAnIdentity("grant.namespace"))
+    );
+    // And the issuer's own rule.
+    let wrong = base_config("").replace(
+        "trust_rule = \"7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c\"",
+        "trust_rule = \"not-an-identity\"",
+    );
+    assert_eq!(
+        Config::parse(&wrong),
+        Err(ConfigError::NotAnIdentity("sts.trust_rule"))
+    );
+}
+
 #[test]
 fn a_process_that_serves_clients_is_configured_to_verify_them() {
     let config = Config::parse(&base_config("")).unwrap();
