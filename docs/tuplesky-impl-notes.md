@@ -1584,27 +1584,32 @@ and never observes more completions than entries. The test's doc comment
 says exactly that rather than claiming the stronger thing, because a
 test that overclaims is worse than one that is honest about its reach.
 
-It also found something. The second half of that claim was not true when
-it was written: the reader loaded `entered` before `completed`, so it
-could take an entry count from before an operation started and a
-completion count from after it finished, and report more completions
-than entries. The counters are separate atomics, so a snapshot taken
-under load is several instants rather than one, and which instant each
-counter belongs to is the reader's to arrange. The rule is to read in
-the opposite order to the writer -- the writer counts an entry, then a
-completion, then the sample behind it, so the reader takes the sample
-first and the entry last. Every counter is then read no earlier than the
-one it can never exceed.
+It also found two things, once it was run often enough.
+
+The second half of its claim was not true when it was written: the
+reader loaded `entered` before `completed`, and both were relaxed, so it
+could take an entry count from before an operation started beside a
+completion count from after it finished and report more completions than
+entries. Reading the counters in the other order is necessary and not
+sufficient -- relaxed operations on separate atomics give a reader no
+ordering at all. The completion counter is now the writer's last store
+for an operation and carries release ordering, and the reader acquires
+it first; everything that operation wrote is then visible, and every
+counter read afterwards is read no earlier than the one it can never be
+smaller than.
 
 It is a small lie and a bad one. An operator who reads "more finished
 than arrived" cannot tell a reporting artefact from a double count, and
 the whole point of this module is that a reading means what it says.
 
-## A domain that only one client ever talked to
-
-Recorded against task-48 and task-62. The deliverable was a Kubernetes
-certification workflow and a WAN benchmark harness; the finding was that
-neither could be run yet, and why.
+The second was in the test. It asserted that the writer had run
+alongside the readers, and on a loaded machine -- eighty-five tests in
+parallel -- the reader could finish its two thousand snapshots before
+the writer thread was scheduled at all. That is not a defect in the
+thing under test and not a reason to drop the assertion: a run where the
+two never overlapped shows nothing about either of them. The test now
+waits for the first write before it starts reading, so the overlap is
+established rather than assumed.
 
 ### Why the fixtures had to leave the test binary
 
@@ -1645,19 +1650,19 @@ credential of exactly the shape it will see. The endpoint refuses to bind
 anything but loopback, and the `test-only` crate role keeps all of it out
 of every production artifact.
 
-### Two findings, and neither was findable before
+### Findings, and why none was findable before
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-two things.
+four things, of which one is fixed here and three are written down.
 
-**A watch does not merely fail — it wedges the domain.** `Step::Watch` in
+**A watch is registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counts the watch and drops the responder, with
-a comment saying pumping it is the next piece of the loop. That reads
-like a missing feature. It is worse than one: the collector has already
-registered the watch with the hub, nothing ever drains it, and every
-operation after it goes unanswered. In a suite run this looks like three
-separate failures in three later tests, and it is one.
+a comment saying pumping it is the next piece of the loop. The collector
+has already registered the subscription with the hub by then, so the
+watch exists and nothing ever writes to it: the caller's stream closes
+with no replay, no event and no progress. An API server rebuilds every
+cache it has from watches, so it cannot start against this.
 
 The machinery to fix it is already there — `Dispatcher::open_watch`,
 `pump_watch`, the `WatchHub` and the close reasons all exist and are
@@ -1718,7 +1723,13 @@ one before it whatever keys it touches, and sequential callers satisfy
 that for free. That is the first thing to look at. It is not yet a
 diagnosis, and this note does not promote it to one.
 
-All three had been invisible for a structural reason worth stating. The
+**And a key under a time to live does not expire.** Written with a
+one-second lease, still readable a minute later. The private binding is
+not disclosed to the caller, which the same test checks and which
+passes, so what is missing is the expiry rather than the rule about what
+a caller may see.
+
+All of them had been invisible for a structural reason worth stating. The
 Kine backend holds one session and issues one invocation at a time, and
 the Go suite's etcd-level rows spend fewer requests than the old bound
 before the watch row stops the domain for its own reason. Every Rust
@@ -1727,9 +1738,9 @@ Nothing in the project had ever asked the composition a hundred
 questions in a row, or two at once. A Kubernetes API server does both
 while it is still booting.
 
-### What the benchmark harness had to get right to find that
+### What the benchmark harness had to get right to find these
 
-A closed-loop benchmark would not have found it. It sends the next
+A closed-loop benchmark would not have found the last two. It sends the next
 request when the previous one returns, so a domain that serializes work
 looks like a domain with a long service time and a perfectly respectable
 throughput curve.

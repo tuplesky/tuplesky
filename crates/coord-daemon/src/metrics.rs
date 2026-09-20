@@ -512,13 +512,19 @@ impl Recorder {
     }
 
     /// One operation completed `stage` after `took`.
+    ///
+    /// The completion counter is written last and with release ordering,
+    /// because it is what a reader synchronizes on. Everything this
+    /// operation contributed -- its sample, its nanoseconds, and the
+    /// entry that preceded it -- is written before that store, so a
+    /// reader that has seen the completion has seen all of it.
     pub fn completed(&self, stage: Stage, took: Duration) {
         let cells = self.cells(stage);
-        cells.completed.fetch_add(1, Ordering::Relaxed);
-        cells.samples.fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
         cells.total_nanos.fetch_add(nanos, Ordering::Relaxed);
         cells.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+        cells.samples.fetch_add(1, Ordering::Relaxed);
+        cells.completed.fetch_add(1, Ordering::Release);
     }
 
     /// One operation was refused by `stage`.
@@ -530,25 +536,27 @@ impl Recorder {
     ///
     /// The counters are separate atomics, so a snapshot taken while work
     /// is running is not an instant -- it is several instants, and which
-    /// one each counter belongs to is the reader's to arrange. The rule
-    /// is to read in the opposite order to the writer: a writer counts
-    /// an entry, then a completion, then the sample behind it, so a
-    /// reader takes the sample first and the entry last. Every counter
-    /// is then read no earlier than the one it can never exceed, and a
-    /// snapshot cannot report more completions than entries or more
-    /// samples than completions.
+    /// one each counter belongs to is the reader's to arrange.
     ///
-    /// Reading the other way round produces exactly that: `entered` from
-    /// before an operation started and `completed` from after it
-    /// finished. It is a small lie and a bad one, because an operator
-    /// reading "more finished than arrived" has no way to tell a
-    /// reporting artefact from a double count.
+    /// The completion counter is read first and with acquire ordering.
+    /// It is the writer's last store for an operation, so acquiring it
+    /// makes everything that operation wrote visible, and every counter
+    /// read afterwards is read no earlier than the one it can never be
+    /// smaller than. A snapshot therefore cannot report more completions
+    /// than entries, or more samples than completions.
+    ///
+    /// Reading the other way round -- or reading relaxed and trusting
+    /// program order -- produces exactly that: `entered` from before an
+    /// operation started beside `completed` from after it finished. It
+    /// is a small lie and a bad one, because an operator who reads "more
+    /// finished than arrived" has no way to tell a reporting artefact
+    /// from a double count.
     pub fn stage(&self, stage: Stage) -> StageMetrics {
         let cells = self.cells(stage);
+        let completed = cells.completed.load(Ordering::Acquire);
         let samples = cells.samples.load(Ordering::Relaxed);
         let total = Duration::from_nanos(cells.total_nanos.load(Ordering::Relaxed));
         let max = Duration::from_nanos(cells.max_nanos.load(Ordering::Relaxed));
-        let completed = cells.completed.load(Ordering::Relaxed);
         let refused = cells.refused.load(Ordering::Relaxed);
         StageMetrics {
             entered: cells.entered.load(Ordering::Relaxed),
