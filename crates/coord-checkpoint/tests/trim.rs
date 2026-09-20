@@ -25,9 +25,9 @@ use coord_checkpoint::trim::{
 use coord_consensus::quorum::EpochVoters;
 use coord_consensus::recovery::SyncDecision;
 use coord_consensus::rows::{
-    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SyncRecordV1, dependency_key,
-    encode_dependency, encode_payload, encode_promise, encode_proposal, encode_sync, payload_key,
-    promise_key, proposal_key, sync_key,
+    PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SealRecordV1, SyncRecordV1, dependency_key,
+    encode_dependency, encode_payload, encode_promise, encode_proposal, encode_seal, encode_sync,
+    payload_key, promise_key, proposal_key, seal_key, sync_key,
 };
 use coord_consensus::{CommandRecord, Phase};
 use coord_core::effect::StoreUpdate;
@@ -2053,4 +2053,76 @@ fn a_promise_is_built_from_what_a_voter_verified_and_round_trips() {
     let mut other_voter = promise;
     other_voter.voter = PEER;
     assert_eq!(other_voter.subject(), base);
+}
+
+/// Trimming never removes a seal row, of this epoch or an earlier one
+/// (task-55).
+///
+/// The survey's upper bound already stops before this epoch's own seal,
+/// so that one is outside every step by construction. An earlier
+/// epoch's is inside the range and is retained deliberately: a
+/// forgotten seal is an old configuration serving again, which is
+/// precisely the thing sealing exists to make impossible and precisely
+/// the kind of row a trim of "settled history" would look like it could
+/// take.
+#[test]
+fn trimming_never_removes_a_seal_row() {
+    let transition = coord_consensus::handoff::Transition {
+        from: epoch(EPOCH - 1),
+        to: epoch(EPOCH),
+        subject: Digest32([0xa1; 32]),
+    };
+    let older = SealRecordV1 {
+        transition,
+        at: ballot(1),
+    };
+    let current = SealRecordV1 {
+        transition: coord_consensus::handoff::Transition {
+            from: epoch(EPOCH),
+            to: epoch(EPOCH + 1),
+            subject: Digest32([0xb2; 32]),
+        },
+        at: ballot(1),
+    };
+    let mut engine = voter_store();
+    apply(
+        &mut engine,
+        &[
+            StoreUpdate {
+                collection: Collection::ProtocolV1.id(),
+                key: seal_key(epoch(EPOCH - 1)),
+                value: Some(encode_seal(&older).unwrap()),
+            },
+            StoreUpdate {
+                collection: Collection::ProtocolV1.id(),
+                key: seal_key(epoch(EPOCH)),
+                value: Some(encode_seal(&current).unwrap()),
+            },
+            publish_floor(&floor(), None).unwrap(),
+        ],
+    );
+    let before = protocol_keys(&engine);
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    let after = protocol_keys(&engine);
+    assert!(
+        after.len() < before.len(),
+        "the floor authorized no deletion at all, so retaining proves nothing"
+    );
+    for (epoch_of, record) in [(EPOCH - 1, older), (EPOCH, current)] {
+        let key = seal_key(epoch(epoch_of));
+        assert!(
+            after.contains(&key),
+            "the seal of epoch {epoch_of} was trimmed"
+        );
+        let view = engine.reader().snapshot().unwrap();
+        let bytes = view
+            .get(Collection::ProtocolV1.id(), &key)
+            .unwrap()
+            .expect("the row is there");
+        assert_eq!(
+            coord_consensus::rows::decode_seal(&bytes).unwrap(),
+            record,
+            "the seal of epoch {epoch_of} was rewritten"
+        );
+    }
 }

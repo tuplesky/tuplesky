@@ -897,9 +897,13 @@ fn classify<V: OrderedRead>(
                 Ok(Verdict::RetainPinning(proposal_deps))
             }
         }
-        // Promise rows (tag 0x00) and Sync rows: never trimmed. A forgotten
-        // promise lets a delayed lower ballot be voted, and a bound Sync
-        // must be reused after a crash, never reselected.
+        // Promise rows (tag 0x00), Sync rows and seal rows (task-55):
+        // never trimmed. A forgotten promise lets a delayed lower
+        // ballot be voted, a bound Sync must be reused after a crash
+        // rather than reselected, and a forgotten seal is an old
+        // configuration serving again. The survey's upper bound already
+        // stops before the floor epoch's own seal; this is what keeps
+        // an earlier epoch's.
         _ => Ok(Verdict::Retain),
     }
 }
