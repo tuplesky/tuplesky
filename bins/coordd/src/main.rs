@@ -11,6 +11,7 @@
 //! volume or a mistyped path into a fresh, empty, valid node -- which
 //! would then vote, having forgotten everything it had promised.
 
+mod backup;
 mod membership;
 mod peers;
 mod serve;
@@ -50,6 +51,42 @@ enum Command {
     /// refused, which is the right amount to tell it; replacing a node
     /// is done here, so the distinctions have to be available here.
     Inspect,
+    /// Take a backup of this node's selected generation (task-59).
+    ///
+    /// The common state at the boundary this node has materialized, and
+    /// nothing node-private: a backup restores a cluster, never a
+    /// voter. The procedure is `docs/operations/disaster-recovery.md`.
+    Backup {
+        /// Directory to write the backup into. It must not already hold
+        /// one.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Verify a backup without restoring it, and print its recovery
+    /// point.
+    Verify {
+        /// The backup directory.
+        #[arg(long)]
+        dir: std::path::PathBuf,
+    },
+    /// Establish this node's first generation from a backup of another
+    /// cluster.
+    ///
+    /// Not recovery: it creates a *new* cluster whose membership comes
+    /// from this node's own genesis, and it requires a fencing
+    /// attestation that the cluster the backup came from has been
+    /// isolated. Read the runbook first.
+    Restore {
+        /// The backup directory.
+        #[arg(long)]
+        dir: std::path::PathBuf,
+        /// The operator's fencing attestation.
+        #[arg(long)]
+        fencing: std::path::PathBuf,
+        /// Print what the restore would do and write nothing.
+        #[arg(long)]
+        plan: bool,
+    },
 }
 
 /// Write the domain's genesis policy: the trust rule its configured
@@ -171,6 +208,164 @@ fn renewal_state(renewal: &coord_node_issuer::Renewal) -> String {
     }
 }
 
+/// What a backup says about itself: where it came from and what its
+/// recovery point is. Printed before anything is decided, because the
+/// recovery point is the number an operator reconciles against callers
+/// and not an implementation detail.
+fn report_backup(manifest: &coord_checkpoint::BackupManifestV1) {
+    println!(
+        "backup source={} domain={} configuration={} taken_at={}",
+        short(&manifest.source.0),
+        short(&manifest.domain.0),
+        manifest.configuration.get(),
+        manifest.taken_at,
+    );
+    println!(
+        "recovery_point position={} revision={} retention_floor={} root={}",
+        manifest.boundary.execution_position.get(),
+        manifest.boundary.kv_revision.get(),
+        manifest.boundary.retention_floor.get(),
+        hex16(&manifest.root.0),
+    );
+}
+
+/// The first eight bytes of a digest, for a line an operator reads.
+fn hex16(bytes: &[u8; 32]) -> String {
+    bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// How the restore disposes of one class of state.
+fn disposition(d: coord_checkpoint::Disposition) -> &'static str {
+    use coord_checkpoint::Disposition as D;
+    match d {
+        D::RestoredAtBoundary => "restored-at-boundary",
+        D::NotCarried => "not-carried",
+        D::Invalidated => "invalidated",
+        D::Revoked => "revoked",
+        D::Resynchronized => "resynchronized",
+    }
+}
+
+/// Plan, and where asked, carry out a restore into this node's first
+/// generation (task-59).
+///
+/// The successor cluster is this node's own committed one: the operator
+/// has already established the new cluster's genesis and credentials,
+/// and the restore fills its first generation instead of `init`
+/// creating an empty one. Nothing here can establish that the old
+/// cluster was isolated, so the attestation is required and checked
+/// against the exact backup.
+fn restore(
+    config: &Config,
+    placed: &membership::Placed,
+    dir: &std::path::Path,
+    fencing: &std::path::Path,
+    plan_only: bool,
+) -> ExitCode {
+    let held = match backup::read(dir) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let attestation = match backup::fencing(fencing) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    report_backup(&held.manifest);
+    let configuration = placed.membership.epoch();
+    let plan = match backup::plan(
+        &held,
+        placed.membership.cluster(),
+        configuration,
+        &attestation,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "restore source={} successor={} configuration={}",
+        short(&plan.source.0),
+        short(&plan.successor.0),
+        plan.configuration.get(),
+    );
+    println!(
+        "disposition kv={} retries={} configurations={} sessions={} leases={} watches={}",
+        disposition(plan.kv),
+        disposition(plan.retries),
+        disposition(plan.configurations),
+        disposition(plan.sessions),
+        disposition(plan.leases),
+        disposition(plan.watches),
+    );
+    if plan_only {
+        println!("restore planned only; nothing was written");
+        return ExitCode::SUCCESS;
+    }
+    // The restore creates this node's first generation, exactly as
+    // `init` would, and fills it before anything attaches it to the
+    // journal. That window is the only one in which a whole store's
+    // worth of rows may be written directly: afterwards a projection
+    // has frontiers, and writing behind them is what quarantines a
+    // node.
+    let mut outcome = None;
+    let storage = store::open_storage_with(
+        config,
+        store::Intent::Initialize,
+        placed.membership.cluster(),
+        placed.membership.domain(),
+        placed.replica,
+        placed.incarnation,
+        |engine| {
+            outcome = Some(backup::carry_out(engine, &held, &plan, &attestation));
+            Ok(())
+        },
+    );
+    let restored = match outcome {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+        None => {
+            eprintln!("the restore never reached this node's projection");
+            return ExitCode::from(2);
+        }
+    };
+    let mut storage = match storage {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    // The successor's own genesis policy, exactly as `init` writes it.
+    // The backup deliberately carried none: the old cluster's trust
+    // rules and permissions are its authority, not this one's.
+    if let Err(e) = write_genesis_policy(config, &mut storage, placed.incarnation) {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    println!(
+        "restored rows={} detached={} commits={} into {}",
+        restored.receipt.rows,
+        restored.receipt.detached,
+        restored.commits,
+        storage.generation.display(),
+    );
+    for (collection, rows) in &restored.receipt.dropped {
+        println!("dropped collection={collection} rows={rows}");
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
@@ -277,6 +472,68 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         };
+    }
+
+    // Verifying a backup reads no store at all: an operator checks a
+    // backup from anywhere, including from a machine whose own store is
+    // the one that was lost.
+    if let Some(Command::Verify { dir }) = &cli.command {
+        return match backup::read(dir) {
+            Ok(held) => {
+                report_backup(&held.manifest);
+                println!("backup verified chunks={}", held.chunks.len());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if let Some(Command::Backup { out }) = &cli.command {
+        return match store::open_storage(
+            &config,
+            store::Intent::Serve,
+            placed.membership.cluster(),
+            placed.membership.domain(),
+            placed.replica,
+            placed.incarnation,
+        ) {
+            Ok(storage) => {
+                let origin = coord_checkpoint::export::CheckpointOrigin {
+                    cluster: placed.membership.cluster(),
+                    domain: placed.membership.domain(),
+                };
+                let Some(engine) = storage
+                    .domain
+                    .store()
+                    .projection(placed.membership.domain())
+                else {
+                    eprintln!("this node has no projection of its own domain to back up");
+                    return ExitCode::from(2);
+                };
+                match backup::take(engine, origin, out, now_seconds()) {
+                    Ok(manifest) => {
+                        report_backup(&manifest);
+                        println!("backup written {}", backup::describe(out).display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::from(2)
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if let Some(Command::Restore { dir, fencing, plan }) = &cli.command {
+        return restore(&config, &placed, dir, fencing, *plan);
     }
 
     if cli.check {

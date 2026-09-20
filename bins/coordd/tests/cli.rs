@@ -2712,3 +2712,257 @@ fn write_key(path: &Path, der: &[u8]) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
 }
+
+/// A backup restores a new cluster and refuses to restore the old one
+/// (task-59; design Sections 5.4, 7.4, 17.16).
+///
+/// The whole runbook end to end on a real node: back up a running
+/// domain's state, verify the backup off the disk, refuse the restore
+/// without a fencing attestation and under the source identity, and
+/// then restore a *different* cluster from the same bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backup_restores_a_new_cluster_and_refuses_to_restore_the_old_one() {
+    let dir = workspace("backup");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    // Something worth restoring.
+    {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x59; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+    }
+
+    let out = dir.join("backup");
+    let taken = run(&path, &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(taken.code, Some(0), "{}", taken.err);
+    assert!(
+        taken.out.contains("recovery_point position="),
+        "the backup did not state its recovery point:\n{}",
+        taken.out
+    );
+
+    // A backup is never written over one. For the duration of an
+    // overwrite there would be neither the old backup nor a complete
+    // new one, and a backup is exactly the thing that must not be
+    // unavailable at the moment it is wanted.
+    let twice = run(&path, &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(
+        twice.code,
+        Some(2),
+        "a backup was written over an existing one:\n{}",
+        twice.out
+    );
+
+    // A backup is verified from anywhere, including from a machine
+    // whose own store is the one that was lost.
+    let verified = run(&path, &["verify", "--dir", out.to_str().unwrap()]);
+    assert_eq!(verified.code, Some(0), "{}", verified.err);
+    assert!(verified.out.contains("backup verified chunks="));
+
+    // A backup index repointed at different bytes fails verification
+    // rather than at the restore.
+    let tampered = dir.join("tampered");
+    copy_tree(&out, &tampered);
+    let chunk = tampered.join("chunk-000000");
+    let mut bytes = std::fs::read(&chunk).expect("chunk");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&chunk, &bytes).expect("chunk");
+    let refused = run(&path, &["verify", "--dir", tampered.to_str().unwrap()]);
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+
+    // The manifest an operator reads, and the attestation they write
+    // from it.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("backup.json")).expect("manifest"))
+            .expect("json");
+    let root = manifest["root"].clone();
+
+    // The successor: a different cluster, with its own genesis and its
+    // own credentials.
+    let new_dir = workspace("backup-successor");
+    let new_cluster = [0xc5u8; 16];
+    let new_ca = credentials_of_cluster(
+        &new_dir,
+        new_cluster,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+    );
+    genesis_of_cluster(&new_dir, new_cluster, &new_ca.node_spki);
+    let _ = sts_keys(&new_dir);
+    let new_path = config_only(&new_dir);
+
+    // Without an attestation there is nothing to restore under: the
+    // isolation is an action outside this system and the restore will
+    // not assume it happened.
+    let unfenced = dir.join("unfenced.json");
+    std::fs::write(&unfenced, b"{}").expect("write");
+    let refused = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            unfenced.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+
+    // An attestation for the old cluster's own identity is a restore in
+    // place, which is the one thing that makes a rewound history
+    // indistinguishable from the live one.
+    let in_place = fencing_file(&dir, "in-place.json", CLUSTER, CLUSTER, &root);
+    let refused = run(
+        &path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            in_place.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        refused.code,
+        Some(2),
+        "a restore in place was carried out:\n{}",
+        refused.out
+    );
+
+    // The real one. Planning writes nothing and says what will be lost.
+    let attestation = fencing_file(&dir, "fencing.json", CLUSTER, new_cluster, &root);
+    let planned = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+            "--plan",
+        ],
+    );
+    assert_eq!(planned.code, Some(0), "{}", planned.err);
+    assert!(
+        planned.out.contains("nothing was written"),
+        "a planned restore wrote something:\n{}",
+        planned.out
+    );
+    assert!(
+        planned.out.contains(
+            "disposition kv=restored-at-boundary retries=restored-at-boundary \
+             configurations=not-carried sessions=invalidated leases=revoked \
+             watches=resynchronized"
+        ),
+        "the plan did not state every disposition:\n{}",
+        planned.out
+    );
+    assert!(!new_dir.join("state").exists(), "the plan created a store");
+
+    let restored = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(restored.code, Some(0), "{}", restored.err);
+    assert!(
+        restored.out.contains("restored rows="),
+        "the restore said nothing about what it wrote:\n{}",
+        restored.out
+    );
+
+    // And the new cluster comes up on the restored state, under its
+    // own identity: the generation attaches to its journal, the
+    // frontiers agree and it reports itself live.
+    let report = start_and_report(&new_path);
+    assert!(
+        report.contains("phase=live"),
+        "the restored cluster did not come up:\n{report}"
+    );
+    assert!(
+        report.contains("journaled_through="),
+        "the restored projection never attached:\n{report}"
+    );
+
+    // Restoring a second time onto the same node is refused: a restore
+    // writes a whole cluster's state and has nothing to merge with.
+    let again = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(again.code, Some(2), "{}", again.out);
+}
+
+/// A genesis for another cluster, as a successor deployment has it.
+fn genesis_of_cluster(dir: &Path, cluster: [u8; 16], voter_one_key: &[u8]) {
+    let manifest = serde_json::json!({
+        "cluster": hex(&cluster),
+        "domain": hex(&DOMAIN),
+        "epoch": 1,
+        "voters": [{
+            "node": hex(&[1u8; 16]),
+            "incarnation": 1,
+            "public_key": b64url(voter_one_key),
+        }],
+        "issuer_roots": [b64url(&[0xca; 8])],
+        "wif_rules": [{ "issuer": "test" }],
+        "admin": hex(&[0xa; 16]),
+        "protocol_version": 1,
+    });
+    std::fs::write(
+        dir.join("genesis.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest"),
+    )
+    .expect("write manifest");
+}
+
+/// An operator's fencing attestation, as the runbook has them write it.
+fn fencing_file(
+    dir: &Path,
+    name: &str,
+    abandoned: [u8; 16],
+    successor: [u8; 16],
+    backup_root: &serde_json::Value,
+) -> PathBuf {
+    let path = dir.join(name);
+    let attestation = serde_json::json!({
+        "abandoned": abandoned,
+        "successor": successor,
+        "backup": backup_root,
+        "action": "revoked the old cluster's node certificates, ticket DR-91",
+        "at": 1_700_000_600u64,
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&attestation).expect("json"),
+    )
+    .expect("write");
+    path
+}
+
+/// Copy a backup directory, for the tampering case.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("dir");
+    for entry in std::fs::read_dir(from).expect("read") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
+    }
+}

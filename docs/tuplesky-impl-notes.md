@@ -1302,3 +1302,88 @@ replaces its key, and asserts the same invocation gets the same command
 identifier and the same outcome afterwards -- and then puts the retired
 credential back and asserts the node refuses to start and `inspect`
 names it `state=stale committed=2 presented=1`.
+
+## A restore is the one operation that is allowed to lose things
+
+task-59 is backup, restore and the disaster-recovery runbook. Almost all
+of it is refusals, and the refusals are the deliverable: the code that
+carries out a restore is a variant of the task-50 install, while the
+code that decides whether one may happen is new and is where every
+acceptance criterion lives.
+
+The shape is `plan_restore` (a pure decision, reads no store, writes
+nothing) and `restore_shared` (carries out exactly the decision). They
+are separate so a rehearsal can take the decision and print it --
+`coordd restore --plan` -- which is what makes "rehearsals obey explicit
+policy" checkable rather than aspirational.
+
+### Four things a restore must not be allowed to be
+
+* **Ordinary recovery.** The restored store is stamped with a
+  *successor* cluster identity. Restoring under the source identity is
+  refused outright, because callers hold promises made by that name and
+  a rewound history behind it would satisfy them incorrectly rather than
+  visibly failing.
+* **Unfenced.** A restore is safe only once the old cluster cannot still
+  be serving, and nothing in this system can establish that: the old
+  voters may be partitioned from the operator and perfectly healthy.
+  `FencingAttestationV1` is therefore a *record* of an out-of-band
+  action, bound to the exact abandoned cluster, the exact successor and
+  the exact backup. It is not the fence. What it buys is that skipping
+  the isolation has to be a deliberate false statement rather than a
+  step somebody forgot, and the runbook says so in those words.
+* **A different artifact.** Section 17.16.1's three artifacts are not
+  interchangeable, so `Artifact` is an explicit argument and anything
+  but `Shared` is refused. A local checkpoint is one incarnation's
+  obligations; an observer snapshot may not even be full MVCC; neither
+  is a cluster, and neither recreates a voter's local state.
+* **Zero-loss.** `RestorePlan::rpo` states the boundary and when the
+  snapshot was pinned, and `coordd` prints it before anything is
+  decided. The recovery point is the number an operator reconciles
+  against callers.
+
+### What "never reuse stale voting authority" turned out to mean
+
+Concretely: the restored store holds no `config_v1` row and no
+`policy_v1` row. The configuration rows name the old cluster's voters
+and their keys; the policy rows are the authorization decisions made
+under them. Carrying either would leave the abandoned cluster deciding
+things here. Membership comes from the successor's own genesis
+(task-42), and `coordd restore` writes the successor's genesis policy
+afterwards exactly as `init` does.
+
+The execution frontier goes the same way. The position and the KV
+revision continue, so the new cluster's own history is not rewound
+within itself, but the configuration epoch is the *successor's*: the
+donor's epoch belongs to a configuration this store deliberately does
+not hold.
+
+Leases needed one more step than dropping. A key attached to a lease
+whose record is gone would be held forever by an authority that cannot
+expire it, so `restore_shared` decodes each restored `kv_current_v1`
+row and clears the attachment, counting them into the receipt. Retries
+go the other way and are kept: dropping a retained result turns a
+caller's retry into a second execution, which is worse than a stale
+answer.
+
+### Where the rows are allowed to be written
+
+The restore writes a whole store's worth of rows directly into an
+engine, which is precisely what task-58 established must never happen.
+The difference is the window: `store::open_storage_with` runs the
+restore after the generation is created and *before* it is attached to
+the journal, so there are no frontiers yet to violate. That is the same
+window the catch-up install has always used, and naming it explicitly
+in the storage helper is what keeps it from being reinvented somewhere
+it does not hold. Afterwards the projection attaches normally and every
+subsequent write goes through the journal.
+
+### The runbook is part of the deliverable
+
+`docs/operations/disaster-recovery.md` is where the isolation step
+lives, because the isolation is not code. It names three concrete
+actions (revoke at the issuer and let the short-lived leaves expire;
+take the addresses away; stop the nodes) and it says what a restore is
+not, in the same words the refusals use. A rehearsal that skips the
+isolation or restores in place is rehearsing something else -- and both
+are refused, so the rehearsal will say so.

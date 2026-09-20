@@ -69,6 +69,7 @@ pub mod install;
 pub mod local;
 pub mod maintain;
 pub mod manifest;
+pub mod restore;
 pub mod store;
 pub mod trim;
 pub mod verify;
@@ -98,6 +99,10 @@ pub use install::{
 pub use manifest::{
     CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1, MAX_CHUNKS,
     MAX_MANIFEST_BYTES, RowV1, SHARED_CHECKPOINT_FORMAT_V1, SharedCheckpointV1, SharedManifestV1,
+};
+pub use restore::{
+    Artifact, BackupManifestV1, Disposition, FencingAttestationV1, RestoreError, RestorePlan,
+    Restored, RestoredV1, Rpo, plan_restore, restore_shared, restored_baseline,
 };
 pub use trim::{
     CheckpointAckV1, FenceDecision, TrimBackpressure, TrimError, TrimFence, TrimFloor, TrimLimits,
