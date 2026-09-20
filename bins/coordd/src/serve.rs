@@ -274,6 +274,130 @@ impl Default for Budgets {
     }
 }
 
+/// The other voters of this domain, and the connections held to them.
+///
+/// Dialling is best effort and never a precondition. A voter this
+/// process cannot reach right now contributes no evidence and nothing
+/// else: it does not fail a submission, it does not stop the others from
+/// receiving one, and it does not change the quorum rule. So a failed
+/// dial is counted and retried, not reported as an error.
+pub struct PeerPlane {
+    transport: Transport,
+    domain: coord_types::ids::DomainId,
+    me: coord_types::ids::ReplicaIncarnation,
+    peers: Vec<crate::peers::Peer>,
+    connected:
+        std::collections::BTreeMap<coord_transport::ConnectionId, coord_types::ids::ReplicaId>,
+    /// Dials attempted and dials that reached a voter (diagnostic).
+    pub dialled: (u64, u64),
+}
+
+impl PeerPlane {
+    /// The plane over `transport`, for the voters in `peers`.
+    pub fn new(
+        transport: Transport,
+        domain: coord_types::ids::DomainId,
+        me: coord_types::ids::ReplicaIncarnation,
+        peers: Vec<crate::peers::Peer>,
+    ) -> Self {
+        PeerPlane {
+            transport,
+            domain,
+            me,
+            peers,
+            connected: std::collections::BTreeMap::new(),
+            dialled: (0, 0),
+        }
+    }
+
+    /// Voters currently reachable.
+    pub fn reachable(&self) -> usize {
+        self.connected.len()
+    }
+
+    /// Try every voter not currently connected.
+    ///
+    /// The identity expected on the other end is the committed one, so a
+    /// certificate that is not this domain's voter at its committed
+    /// incarnation fails the handshake rather than becoming a peer. That
+    /// is the whole of what an address is trusted for.
+    pub async fn dial_missing(&mut self) {
+        let held: std::collections::BTreeSet<coord_types::ids::ReplicaId> =
+            self.connected.values().copied().collect();
+        for peer in &self.peers {
+            if held.contains(&peer.replica) {
+                continue;
+            }
+            self.dialled.0 += 1;
+            let expected = coord_transport::BoundIdentity {
+                role: coord_types::wire_v1::PeerRole::Voter,
+                replica: Some(peer.replica),
+                incarnation: Some(peer.incarnation),
+                capabilities: Vec::new(),
+            };
+            let reached = self
+                .transport
+                .connect(
+                    peer.address,
+                    &peer.server_name,
+                    coord_types::wire_v1::PeerRole::Voter,
+                    Some(self.me),
+                    // A voter's lanes are control and bulk; a unary lane
+                    // is a collector's or a client's. Protocol traffic
+                    // between replicas is control traffic, which is also
+                    // why a bulk checkpoint transfer cannot delay a
+                    // vote.
+                    coord_transport::Lane::Control,
+                    expected,
+                )
+                .await;
+            match reached {
+                Ok(connection) => {
+                    self.dialled.1 += 1;
+                    self.connected.insert(connection, peer.replica);
+                }
+                // Not a failure of anything: a voter this process cannot
+                // reach right now contributes no evidence and nothing
+                // else. It is reported because an operator wants to see
+                // a cluster that cannot form, and retried on the next
+                // occasion.
+                Err(e) => eprintln!(
+                    "cannot reach voter {} at {}: {e:?}",
+                    hex4(&peer.replica),
+                    peer.address
+                ),
+            }
+        }
+    }
+
+    /// Forget a connection that ended, and say whether it was a peer's.
+    ///
+    /// A connection that ends is a voter this process can no longer
+    /// reach. Nothing about the protocol changes -- the voter is still a
+    /// committed voter and its evidence still counts when it arrives --
+    /// so this only decides whether to dial again.
+    fn lost(&mut self, connection: coord_transport::ConnectionId) -> bool {
+        self.connected.remove(&connection).is_some()
+    }
+
+    /// Queue one protocol frame for a voter.
+    fn send(
+        &self,
+        to: coord_core::effect::PeerId,
+        frame: Vec<u8>,
+    ) -> Result<(), coord_transport::SendError> {
+        self.transport.send(
+            coord_transport::Destination::Replica {
+                replica: to.replica,
+                incarnation: to.incarnation,
+                lane: coord_transport::Lane::Control,
+            },
+            self.domain,
+            frame,
+        )
+    }
+}
+
 /// One domain running in this process: the voter that writes its store,
 /// and the frontend in front of it.
 ///
@@ -284,6 +408,9 @@ impl Default for Budgets {
 pub struct Domain<P: Persistence> {
     backing: Backing<P>,
     frontend: Frontend,
+    /// The other voters, where this process votes. `None` for a process
+    /// that does not, and for a domain with nobody else in it.
+    plane: Option<PeerPlane>,
     budgets: Budgets,
 }
 
@@ -293,8 +420,20 @@ impl<P: Persistence> Domain<P> {
         Domain {
             backing,
             frontend,
+            plane: None,
             budgets,
         }
+    }
+
+    /// Reach the other voters through `plane`.
+    pub fn with_peers(mut self, plane: PeerPlane) -> Self {
+        self.plane = Some(plane);
+        self
+    }
+
+    /// Voters this process is currently connected to.
+    pub fn reachable(&self) -> usize {
+        self.plane.as_ref().map_or(0, PeerPlane::reachable)
     }
 
     /// What this loop has seen.
@@ -314,6 +453,22 @@ impl<P: Persistence> Domain<P> {
     /// own turn -- its timers, its peers, its recovery -- so the loop
     /// only waits on a socket once the voter has nothing left to do.
     pub async fn run(&mut self, transport: &mut Transport, clock: impl Fn() -> u64) {
+        // Reach the other voters before serving. A submission that
+        // arrived first would still be correct -- an unreachable voter
+        // contributes nothing and the quorum rule decides -- but it
+        // would need the peers to answer it, and they are not there yet.
+        if let Some(plane) = &mut self.plane {
+            plane.dial_missing().await;
+            // Stderr, not stdout: this happens after the startup
+            // report, and a process must not die because whoever read
+            // its startup report has stopped reading.
+            eprintln!(
+                "peers connected={} of {} attempts={}",
+                plane.reachable(),
+                plane.peers.len(),
+                plane.dialled.0
+            );
+        }
         loop {
             let progressed = match self.turn().await {
                 Ok(p) => p,
@@ -322,17 +477,31 @@ impl<P: Persistence> Domain<P> {
                     return;
                 }
             };
-            let event = tokio::select! {
+            // Two planes and one voter. The peer plane is polled first:
+            // a vote, an adoption or a recovery summary from a peer is
+            // the work that lets a caller's request finish, and a
+            // frontend under load must not be able to hold it up.
+            //
+            // Which plane an event arrived on is not a detail: a
+            // connection identity is unique within its own transport and
+            // nowhere else, so an api connection and a peer connection
+            // can share a number. Handling them through one arm would
+            // let a caller's closing stream look like a voter's.
+            let arrived = tokio::select! {
                 biased;
                 // Voter work that is still outstanding pre-empts waiting
-                // on a caller. This branch is taken only when the last
+                // on anything. This branch is taken only when the last
                 // turn actually did something, so a voter that cannot
                 // progress waits rather than spins.
                 () = std::future::ready(()), if progressed => continue,
-                event = transport.next_event() => event,
+                peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                event = transport.next_event() => event.map(Arrived::Api),
             };
-            let Some(event) = event else { return };
-            self.on_transport(transport, event, &clock).await;
+            match arrived {
+                Some(Arrived::Api(event)) => self.on_transport(transport, event, &clock).await,
+                Some(Arrived::Peer(event)) => self.on_peer_plane(event),
+                None => return,
+            }
         }
     }
 
@@ -364,15 +533,24 @@ impl<P: Persistence> Domain<P> {
         for frame in out.frontend {
             self.on_collector_frame(provenance, &frame);
         }
-        // The peer plane is not wired in this build. Frames for other
-        // voters, and the timers, views and entropy a machine asked for,
-        // are counted rather than dropped silently, so what this process
-        // cannot yet do is visible in its own report.
-        self.frontend.counts.unserved += (out.peer.len()
-            + out.arm.len()
-            + out.cancel.len()
-            + out.views.len()
-            + out.entropy.len()) as u64;
+        for (to, frame) in out.peer {
+            match self.plane.as_ref().map(|p| p.send(to, frame)) {
+                // Admitted to the lane's queue. Not a vote and not a
+                // delivery: what the peer does with it is the peer's,
+                // and the collector counts the evidence.
+                Some(Ok(())) => self.frontend.counts.queued_remote += 1,
+                // No route right now. The voter contributes nothing
+                // through this process until there is one; the quorum
+                // rule decides what that costs.
+                Some(Err(_)) | None => self.frontend.counts.unavailable += 1,
+            }
+        }
+        // Timers, read views and entropy are the runtime's, and this
+        // build has no loop for them yet. They are counted rather than
+        // dropped silently, so what this process cannot do is visible in
+        // its own report.
+        self.frontend.counts.unserved +=
+            (out.arm.len() + out.cancel.len() + out.views.len() + out.entropy.len()) as u64;
     }
 
     /// One frame a voter addressed to the trusted collector.
@@ -477,42 +655,6 @@ impl<P: Persistence> Domain<P> {
                 self.carry_out(transport, connection, decided, responder)
                     .await;
             }
-            TransportEvent::PeerFrame {
-                provenance,
-                kind,
-                version,
-                payload,
-                ..
-            } => match &mut self.backing {
-                Backing::Voting(voter) => {
-                    let frame = coord_types::wire_v1::Frame {
-                        kind,
-                        version,
-                        payload,
-                    };
-                    let bytes = match coord_types::wire_v1::encode_frame(
-                        frame.kind,
-                        frame.version,
-                        &frame.payload,
-                    ) {
-                        Ok(b) => b,
-                        Err(_) => {
-                            self.frontend.counts.unserved += 1;
-                            return;
-                        }
-                    };
-                    match voter.on_peer(provenance, bytes) {
-                        Ok(out) => {
-                            let provenance = voter.provenance();
-                            self.carry(out, provenance);
-                        }
-                        Err(e) => {
-                            eprintln!("this voter cannot carry out a peer's frame: {e}");
-                        }
-                    }
-                }
-                Backing::Serving(_) => self.frontend.counts.unserved += 1,
-            },
             TransportEvent::Closed { connection, .. } => {
                 // Both sides of the same closing: the frontend forgets
                 // the binding and the watches, and every stream this
@@ -526,10 +668,69 @@ impl<P: Persistence> Domain<P> {
                     drop(responder);
                 }
             }
-            TransportEvent::ApiDelivery { .. } => {
+            // A caller's plane carries no protocol traffic, and a
+            // delivery is something this process dialled for, which it
+            // does not do here.
+            TransportEvent::PeerFrame { .. } | TransportEvent::ApiDelivery { .. } => {
                 self.frontend.counts.unserved += 1;
             }
             TransportEvent::Connected { .. } => {}
+        }
+    }
+
+    /// One event from the peer plane.
+    ///
+    /// Everything here belongs to a voter: a proposal, a vote, an
+    /// adoption, a recovery summary. There is no caller's stream to
+    /// answer and no session to forget, which is why it is a different
+    /// handler and not a branch of the api one.
+    fn on_peer_plane(&mut self, event: TransportEvent) {
+        match event {
+            TransportEvent::PeerFrame {
+                provenance,
+                kind,
+                version,
+                payload,
+                ..
+            } => {
+                let Backing::Voting(voter) = &mut self.backing else {
+                    // A process that runs no voter has no use for
+                    // protocol traffic, and should not have a peer plane
+                    // at all.
+                    self.frontend.counts.unserved += 1;
+                    return;
+                };
+                let bytes = match coord_types::wire_v1::encode_frame(kind, version, &payload) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        self.frontend.counts.unserved += 1;
+                        return;
+                    }
+                };
+                match voter.on_peer(provenance, bytes) {
+                    Ok(out) => {
+                        let provenance = voter.provenance();
+                        self.carry(out, provenance);
+                    }
+                    Err(e) => eprintln!("this voter cannot carry out a peer's frame: {e}"),
+                }
+            }
+            // A link this process held is gone. It is forgotten and not
+            // re-dialled here: in a full mesh both ends dial, so one of
+            // every pair of links is replaced as a matter of course, and
+            // dialling on every close would answer that with a storm.
+            // The peer's own dial re-establishes it; periodic
+            // reconnection belongs with the timer loop.
+            TransportEvent::Closed { connection, .. } => {
+                if let Some(plane) = &mut self.plane {
+                    plane.lost(connection);
+                }
+            }
+            TransportEvent::Connected { .. } => {}
+            // A voter's plane carries no requests and no deliveries.
+            TransportEvent::ApiRequest { .. } | TransportEvent::ApiDelivery { .. } => {
+                self.frontend.counts.unserved += 1;
+            }
         }
     }
 
@@ -611,6 +812,31 @@ impl<P: Persistence> Domain<P> {
     }
 }
 
+fn hex4(replica: &coord_types::ids::ReplicaId) -> String {
+    replica.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The peer plane's next event, or nothing for ever when there is no
+/// peer plane.
+///
+/// A `select!` arm needs a future either way. A process with no peers
+/// must not have its arm resolve immediately -- that would spin the loop
+/// -- so it gets one that never completes and the other arms decide.
+async fn next_peer_event(plane: Option<&mut PeerPlane>) -> Option<TransportEvent> {
+    match plane {
+        Some(plane) => plane.transport.next_event().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Which plane an event arrived on.
+enum Arrived {
+    /// The api plane: callers and collectors.
+    Api(TransportEvent),
+    /// The peer plane: this domain's other voters.
+    Peer(TransportEvent),
+}
+
 /// One frame from bytes, through the reader the transport uses.
 fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
     let mut reader = coord_types::wire_v1::FrameReader::new();
@@ -640,6 +866,27 @@ const PUMP_BOUND: usize = 64;
 /// How far the local clock may be out before a binding is refused.
 const CLOCK_UNCERTAINTY_SECONDS: u64 = 5;
 
+/// Build the peer-plane endpoint on the socket already bound.
+///
+/// The same binder as the API plane, because the question is the same
+/// one: whoever is on the other end is a voter of this domain because
+/// the committed configuration says the certificate they presented is,
+/// or they are nobody. What differs is the role this node presents and
+/// therefore the lanes and the ALPN: a peer connection carries protocol
+/// traffic and a client's never does.
+pub fn peer_endpoint(
+    config: &Config,
+    membership: &Membership,
+    socket: std::net::UdpSocket,
+) -> Result<Transport, TransportError> {
+    endpoint(
+        config,
+        membership,
+        socket,
+        coord_types::wire_v1::PeerRole::Voter,
+    )
+}
+
 /// Build the API-plane endpoint on the socket already bound.
 ///
 /// The socket is taken rather than re-bound: binding again from the
@@ -655,11 +902,25 @@ pub fn api_endpoint(
     membership: &Membership,
     socket: std::net::UdpSocket,
 ) -> Result<Transport, TransportError> {
+    endpoint(
+        config,
+        membership,
+        socket,
+        coord_types::wire_v1::PeerRole::Frontend,
+    )
+}
+
+fn endpoint(
+    config: &Config,
+    membership: &Membership,
+    socket: std::net::UdpSocket,
+    role: coord_types::wire_v1::PeerRole,
+) -> Result<Transport, TransportError> {
     let identity = coord_daemon::load_identity(
         &config.identity,
         membership.cluster(),
         membership.domain(),
-        coord_transport::role_lanes(coord_types::wire_v1::PeerRole::Frontend)
+        coord_transport::role_lanes(role)
             .iter()
             .map(|lane| lane.capability())
             .collect(),

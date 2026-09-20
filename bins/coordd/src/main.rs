@@ -260,6 +260,7 @@ fn main() -> ExitCode {
     // function's: the endpoint serves on the socket that was bound, not
     // on the address it reported.
     let api_socket = listeners.take_api();
+    let peer_socket = listeners.take_peer();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -282,7 +283,28 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+        // The peer plane, where this process has peers to reach. A
+        // voter with none skips it: there is no socket to serve and
+        // nobody to dial, and binding one would be a listener nothing
+        // could arrive on.
+        if !peers.is_empty() {
+            let Some(socket) = peer_socket else {
+                eprintln!("this node votes alongside peers but bound no peer listener");
+                return ExitCode::from(2);
+            };
+            let plane = match serve::peer_endpoint(&config, &placed.membership, socket) {
+                Ok(t) => {
+                    serve::PeerPlane::new(t, placed.membership.domain(), placed.incarnation, peers)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
+            domain = domain.with_peers(plane);
+        }
         domain.run(&mut transport, now_seconds).await;
+        eprintln!("peers connected={}", domain.reachable());
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
