@@ -457,6 +457,11 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
     };
     let path = Digest32([1; 32]);
     let prov = |i: u8| PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1);
+    let admitted = f
+        .dispatcher()
+        .collector()
+        .admission(&c1)
+        .expect("outstanding");
     f.dispatcher_mut()
         .on_evidence(
             prov(0),
@@ -479,6 +484,9 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
                 deps: vec![],
                 paths: vec![],
                 path,
+                // Evidence for a command is counted only under the
+                // admission it was submitted with.
+                admission: admitted,
                 seqnum: None,
             }),
         )

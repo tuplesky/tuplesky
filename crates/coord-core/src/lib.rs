@@ -40,8 +40,8 @@ pub mod outbox;
 pub mod ports;
 
 pub use capability::{
-    AdmissionPurpose, AdmissionReceipt, AttestedAdmission, AttestedEstablishment,
-    CredentialDeadline, EstablishError, EstablishedResult, EstablishmentEvidence,
+    AdmissionFacts, AdmissionPurpose, AdmissionReceipt, AttestedAdmission, AttestedEstablishment,
+    CredentialDeadline, EstablishError, EstablishedResult, EstablishmentEvidence, admission_digest,
 };
 pub use effect::{
     BarrierId, BootId, CollectionId, Effect, EffectContext, PersistBatch, StoreUpdate, TimerId,

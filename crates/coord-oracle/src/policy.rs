@@ -231,6 +231,11 @@ impl PolicyOracle {
                     (ActionKind::Read, l, u),
                 ]
             }
+            // It touches no key, so it needs no key permission. What it
+            // does need is an admission that may establish a session,
+            // which is not a permission over an interval and is checked
+            // where admissions are.
+            CanonicalOperation::ConsumeAdmission => Vec::new(),
         }
     }
 

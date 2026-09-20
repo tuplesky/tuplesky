@@ -72,7 +72,7 @@ pub use expiry::{
 };
 pub use internal::InternalCommand;
 pub use lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
-pub use limits::PlanLimits;
+pub use limits::{PlanLimits, SESSION_RETRY_WINDOW};
 pub use plan::{
     ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, RejectionReason,
     Response,

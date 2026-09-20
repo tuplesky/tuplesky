@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 
-use coord_collector::wire::{AdmissionClaimsV1, SubmitV1, submit_frame};
+use coord_collector::wire::{SubmitV1, submit_frame};
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
     LearningMode, ReplicaRole,
@@ -244,14 +244,16 @@ fn submission(sequence: u64) -> Vec<u8> {
         request_sequence: RequestSequence::new(sequence).unwrap(),
     };
     submit_frame(&SubmitV1 {
-        receipt: AdmissionClaimsV1 {
-            cluster: CLUSTER,
-            domain: DOMAIN,
-            session: SESSION,
-            rule_generation: 1,
-            scope_ceiling: u32::MAX,
-            receipt_id: Digest32([7; 32]),
-            admitted_at_ticks: 0,
+        receipt: coord_core::AdmissionFacts {
+            attested: coord_core::AttestedAdmission {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([7; 32]),
+                admitted_at_ticks: 0,
+            },
             establishing: None,
         },
         request: RequestV1::new(key, &logical, 0).unwrap(),

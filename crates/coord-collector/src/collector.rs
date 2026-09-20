@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, VecDeque};
 use coord_consensus::{
     BallotConfiguration, FastAck, Learned, ProtocolMessage, Vote, VoteError, VoteSet,
 };
-use coord_core::capability::ReleasedResult;
+use coord_core::capability::{ReleasedResult, admission_digest};
 use coord_core::event::{AdmittedRequest, PeerProvenance};
 use coord_types::ids::{ReplicaId, SessionId};
 use coord_types::wire_v1::{
@@ -202,6 +202,11 @@ pub struct Expired {
 struct Pending {
     retry_key: RetryKey,
     session: SessionId,
+    /// Digest of the admission this collector submitted the command
+    /// with. Evidence counted for the command must agree with it: a
+    /// voter that acknowledged the same identity under other attested
+    /// facts did not acknowledge this request.
+    admission: coord_types::identity::Digest32,
     votes: VoteSet,
     released: Option<ReleasedResult>,
     attached: bool,
@@ -243,7 +248,13 @@ impl Collector {
         self.pending.len()
     }
 
-    /// Whether `command` is pending.
+    /// The admission digest `command` was submitted under, while it is
+    /// outstanding: what evidence for it has to agree with.
+    pub fn admission(&self, command: &CommandId) -> Option<coord_types::identity::Digest32> {
+        self.pending.get(command).map(|p| p.admission)
+    }
+
+    /// Whether `command` is outstanding here.
     pub fn is_pending(&self, command: &CommandId) -> bool {
         self.pending.contains_key(command)
     }
@@ -311,7 +322,7 @@ impl Collector {
             });
         }
         let frame = submit_frame(&SubmitV1 {
-            receipt: crate::wire::AdmissionClaimsV1::of(&admitted.receipt),
+            receipt: admitted.receipt.facts(),
             request: request.clone(),
         })
         .map_err(|_| SubmitRefusal::Malformed)?;
@@ -322,6 +333,7 @@ impl Collector {
             Pending {
                 retry_key: key,
                 session: admitted.receipt.session(),
+                admission: admission_digest(Some(&admitted.receipt.facts())),
                 votes: VoteSet::new(self.config.quorum.clone(), command),
                 released: None,
                 attached: true,
@@ -365,6 +377,17 @@ impl Collector {
                     deps,
                     paths: Vec::new(),
                     path,
+                    // A compact leader reply carries no evidence of the
+                    // admission, so what this vote is counted under is
+                    // what this collector submitted. That is the
+                    // stricter reading: every voter acknowledgement
+                    // afterwards is compared against the facts the
+                    // frontend actually sent, not against whatever the
+                    // first arrival happened to claim.
+                    admission: self
+                        .pending
+                        .get(&command)
+                        .map_or_else(|| admission_digest(None), |p| p.admission),
                     seqnum: Some(seqnum),
                 }),
             ),

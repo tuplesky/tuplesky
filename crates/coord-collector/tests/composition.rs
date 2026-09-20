@@ -948,11 +948,13 @@ fn voter_identities_are_counted_rather_than_connections() {
     );
     // The leader's proposal plus one adopter is the slow majority of three:
     // with the release already present, the second identity releases.
+    let admitted_under = c.admission(&command).expect("outstanding");
     let slow = |replica: u8| {
         ProtocolMessage::SlowAck(SlowAck {
             replica: r(replica),
             ballot: ballot(),
             command,
+            admission: admitted_under,
         })
     };
     assert_eq!(
@@ -989,6 +991,7 @@ fn voter_identities_are_counted_rather_than_connections() {
         deps: vec![],
         path,
     };
+    let admitted_under = c.admission(&command).expect("outstanding");
     let fast = |replica: u8, path: Digest32, deps: Vec<CommandId>| {
         ProtocolMessage::FastAck(FastAck {
             replica: r(replica),
@@ -997,6 +1000,7 @@ fn voter_identities_are_counted_rather_than_connections() {
             deps,
             paths: vec![],
             path,
+            admission: admitted_under,
             seqnum: None,
         })
     };
@@ -1078,11 +1082,13 @@ fn voter_identities_are_counted_rather_than_connections() {
         c.on_release(provenance(r(0), 1), right),
         Ok(Progress::Held(HoldReason::AwaitingVotes))
     );
+    let admitted_under = c.admission(&command).expect("outstanding");
     let slow = |replica: u8| {
         ProtocolMessage::SlowAck(SlowAck {
             replica: r(replica),
             ballot: ballot(),
             command,
+            admission: admitted_under,
         })
     };
     match c.on_evidence(provenance(r(2), 3), slow(2)) {
@@ -1400,15 +1406,17 @@ fn claims_attested_elsewhere_admit_nothing_here() {
 /// attest them.
 fn establishment_claims(cluster: ClusterId, domain: DomainId) -> coord_collector::SubmitV1 {
     coord_collector::SubmitV1 {
-        receipt: coord_collector::AdmissionClaimsV1 {
-            cluster,
-            domain,
-            session: SESSION,
-            rule_generation: 1,
-            scope_ceiling: u32::MAX,
-            receipt_id: Digest32([9; 32]),
-            admitted_at_ticks: 0,
-            establishing: Some(coord_collector::EstablishmentClaimsV1 {
+        receipt: coord_core::AdmissionFacts {
+            attested: AttestedAdmission {
+                cluster,
+                domain,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: Some(coord_core::AttestedEstablishment {
                 principal: PrincipalId([0xaa; 16]),
                 trust_rule: TrustRuleId([0xbb; 16]),
                 credential_valid_until: coord_core::capability::CredentialDeadline(1 << 40),
@@ -1444,6 +1452,7 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
                 replica: r(9),
                 ballot: ballot(),
                 command: c3,
+                admission: coord_core::capability::admission_digest(None),
             }),
         )
         .unwrap_err();

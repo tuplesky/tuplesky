@@ -25,6 +25,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use coord_core::capability::{AdmissionFacts, admission_digest};
 use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{Event, StorageEvent};
 use coord_core::machine::DeterministicMachine;
@@ -101,6 +102,15 @@ pub enum FollowerRejection {
     },
     /// A peer vote was rejected.
     Vote(VoteError),
+    /// A leader proposal named this command under an admission this
+    /// replica did not accept it under. The identity is shared; the
+    /// command is not.
+    AdmissionConflict {
+        /// Command.
+        command: CommandId,
+        /// What this replica accepted the command under.
+        accepted: coord_types::identity::Digest32,
+    },
     /// A `NewLeader` was rejected.
     Promise(PromiseRejection),
     /// A peer frame did not decode.
@@ -1108,7 +1118,7 @@ impl Follower {
         });
     }
 
-    fn on_admitted(&mut self, frame: &[u8]) -> Vec<Effect> {
+    fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         if self.boot.is_none() {
             return Vec::new();
         }
@@ -1125,12 +1135,21 @@ impl Follower {
                 return Vec::new();
             }
         };
-        self.on_request(request.retry_key, request.logical.as_slice().to_vec())
+        self.on_request(
+            request.retry_key,
+            request.logical.as_slice().to_vec(),
+            Some(admission),
+        )
     }
 
     /// A canonical request reached this replica (from the frontend, or as
     /// a transferred payload): initialize, persist, vote.
-    fn on_request(&mut self, retry_key: RetryKey, logical: Vec<u8>) -> Vec<Effect> {
+    fn on_request(
+        &mut self,
+        retry_key: RetryKey,
+        logical: Vec<u8>,
+        admission: Option<AdmissionFacts>,
+    ) -> Vec<Effect> {
         let Ok((request, rest)) =
             postcard::take_from_bytes::<coord_types::logical_v1::LogicalRequest>(&logical)
         else {
@@ -1160,11 +1179,19 @@ impl Follower {
             }
             None => {}
         }
+        let payload = PayloadRecordV1 {
+            retry_key,
+            logical,
+            admission,
+        };
         // Atomic initialization; the placeholder of an early proposal (if
-        // any) becomes the record in this same transition.
+        // any) becomes the record in this same transition. What is bound
+        // beside the identity is the admission: a second presentation of
+        // this command under different attested facts conflicts here
+        // instead of quietly replacing what this replica accepted.
         let init = match self.table.initialize(
             command,
-            command.0,
+            payload.admission_digest(),
             alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()],
         ) {
             Ok(i) => i,
@@ -1178,13 +1205,7 @@ impl Follower {
             }
         };
         self.bindings.insert(retry_key, command);
-        self.payloads.insert(
-            command,
-            PayloadRecordV1 {
-                retry_key,
-                logical: logical.clone(),
-            },
-        );
+        self.payloads.insert(command, payload.clone());
         let epoch = self.config.identity.epoch;
         let record = self
             .table
@@ -1193,7 +1214,7 @@ impl Follower {
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let updates = alloc::vec![
-            payload_update(&command, &PayloadRecordV1 { retry_key, logical }).expect("bounded"),
+            payload_update(&command, &payload).expect("bounded"),
             dependency_update(epoch, &command, &record).expect("bounded"),
         ];
         let mut effects = alloc::vec![Effect::Persist(PersistBatch {
@@ -1217,6 +1238,7 @@ impl Follower {
                 deps: init.deps.clone(),
                 paths: init.paths.clone(),
                 path: init.path,
+                admission: init.payload,
                 seqnum: None,
             };
             // Counted once the payload and dependency rows are durable.
@@ -1254,6 +1276,21 @@ impl Follower {
         let command = proposal.command;
         if self.adopted.contains_key(&command) || self.held.contains_key(&command) {
             // Duplicate proposal: converges without change.
+            return Vec::new();
+        }
+        // A proposal asserts something about a command. Where this
+        // replica already holds that command's payload and accepted it
+        // under other attested facts, the leader is proposing a
+        // different command under a shared identity: adopting it would
+        // execute facts this replica never admitted. Nothing is held,
+        // nothing is counted, and the mismatch is reported rather than
+        // resolved -- whichever of the two is the real command, this
+        // replica cannot tell from the proposal.
+        if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
+            && accepted != proposal.admission
+        {
+            self.rejections
+                .push(FollowerRejection::AdmissionConflict { command, accepted });
             return Vec::new();
         }
         // The leader's order is recorded into the path logs as soon as it is
@@ -1319,6 +1356,7 @@ impl Follower {
                     .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
                 let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();
+                let admission = record.payload.unwrap_or_else(|| admission_digest(None));
                 let barrier = self.alloc.as_mut().expect("booted").allocate();
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
@@ -1333,6 +1371,7 @@ impl Follower {
                     replica: self.config.identity.replica,
                     ballot: self.config.quorum.ballot(),
                     command,
+                    admission,
                 };
                 // Counted once the adoption row is durable, like the
                 // acknowledgement itself, which waits for the same batch.
@@ -1590,7 +1629,10 @@ impl Follower {
         if self.table.phase_of(&command).is_some() {
             return Vec::new();
         }
-        self.on_request(payload.retry_key, payload.logical)
+        // The admission travels with the payload, so a replica that
+        // recovered a command from a peer executes it under the same
+        // attested facts as the replica that accepted it first.
+        self.on_request(payload.retry_key, payload.logical, payload.admission)
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {
@@ -1627,7 +1669,7 @@ impl DeterministicMachine for Follower {
                 self.outbox = Some(Outbox::new(boot_id));
                 Vec::new()
             }
-            Event::Admitted(request) => self.on_admitted(&request.frame),
+            Event::Admitted(request) => self.on_admitted(&request.frame, request.receipt.facts()),
             Event::Storage(event) => self.on_storage(&event),
             Event::Peer(message) => {
                 // The authenticated sender at the exact incarnation the

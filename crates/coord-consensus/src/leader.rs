@@ -21,7 +21,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use coord_core::capability::ReleasedResult;
+use coord_core::capability::{AdmissionFacts, ReleasedResult, admission_digest};
 use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch, StoreUpdate};
 use coord_core::event::{Event, StorageError, StorageEvent};
 use coord_core::machine::DeterministicMachine;
@@ -387,6 +387,7 @@ impl Leader {
             deps: deps.clone(),
             paths: record.paths.clone(),
             path: record.path,
+            admission: record.payload.unwrap_or_else(|| admission_digest(None)),
             seqnum: Some(seqnum),
         };
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
@@ -691,7 +692,7 @@ impl Leader {
         out
     }
 
-    fn on_admitted(&mut self, frame: &[u8]) -> Vec<Effect> {
+    fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -731,31 +732,31 @@ impl Leader {
             }
             None => {}
         }
-        // Atomic initialization: payload binding, conservative dependencies,
-        // path evidence and index publication in one transition.
-        let init =
-            match self
-                .table
-                .initialize(command, command.0, alloc::vec![CONSERVATIVE_KEY.to_vec()])
-            {
-                Ok(i) => i,
-                Err(InitError::Backpressure) => {
-                    self.rejections.push(Rejection::Backpressure);
-                    return Vec::new();
-                }
-                Err(InitError::AlreadyInitialized | InitError::PayloadConflict) => {
-                    self.rejections.push(Rejection::Duplicate(command));
-                    return Vec::new();
-                }
-            };
-        self.bindings.insert(request.retry_key, command);
-        self.payloads.insert(
+        let payload = PayloadRecordV1 {
+            retry_key: request.retry_key,
+            logical: request.logical.as_slice().to_vec(),
+            admission: Some(admission),
+        };
+        // Atomic initialization: admission binding, conservative
+        // dependencies, path evidence and index publication in one
+        // transition.
+        let init = match self.table.initialize(
             command,
-            PayloadRecordV1 {
-                retry_key: request.retry_key,
-                logical: request.logical.as_slice().to_vec(),
-            },
-        );
+            payload.admission_digest(),
+            alloc::vec![CONSERVATIVE_KEY.to_vec()],
+        ) {
+            Ok(i) => i,
+            Err(InitError::Backpressure) => {
+                self.rejections.push(Rejection::Backpressure);
+                return Vec::new();
+            }
+            Err(InitError::AlreadyInitialized | InitError::PayloadConflict) => {
+                self.rejections.push(Rejection::Duplicate(command));
+                return Vec::new();
+            }
+        };
+        self.bindings.insert(request.retry_key, command);
+        self.payloads.insert(command, payload.clone());
         let ballot = self.config.quorum.ballot();
         let epoch = self.config.identity.epoch;
         let seqnum = self.seqnum;
@@ -770,14 +771,7 @@ impl Leader {
             .clone();
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         let updates: Vec<StoreUpdate> = alloc::vec![
-            payload_update(
-                &command,
-                &PayloadRecordV1 {
-                    retry_key: request.retry_key,
-                    logical: request.logical.as_slice().to_vec(),
-                },
-            )
-            .expect("bounded"),
+            payload_update(&command, &payload).expect("bounded"),
             dependency_update(epoch, &command, &record).expect("bounded"),
             proposal_update(
                 epoch,
@@ -804,6 +798,7 @@ impl Leader {
             deps: init.deps.clone(),
             paths: init.paths.clone(),
             path: init.path,
+            admission: init.payload,
             seqnum: Some(seqnum),
         };
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
@@ -934,6 +929,11 @@ impl Leader {
             return Vec::new();
         };
         let barrier = alloc.allocate();
+        let admission = self
+            .table
+            .record(&command)
+            .and_then(|r| r.payload)
+            .unwrap_or_else(|| admission_digest(None));
         let proposal = self.proposals.get_mut(&command).expect("checked above");
         proposal.barrier = barrier;
         proposal.attempts += 1;
@@ -949,6 +949,7 @@ impl Leader {
             deps: proposal.deps.clone(),
             paths: proposal.paths.clone(),
             path: proposal.path,
+            admission,
             seqnum: Some(proposal.seqnum),
         };
         let seqnum = proposal.seqnum;
@@ -1179,7 +1180,7 @@ impl DeterministicMachine for Leader {
                 self.outbox = Some(Outbox::new(boot_id));
                 Vec::new()
             }
-            Event::Admitted(request) => self.on_admitted(&request.frame),
+            Event::Admitted(request) => self.on_admitted(&request.frame, request.receipt.facts()),
             Event::Storage(event) => self.on_storage(&event),
             Event::Peer(message) => {
                 // The authenticated sender, at the exact incarnation the

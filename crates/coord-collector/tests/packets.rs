@@ -80,7 +80,7 @@ fn submission() -> Vec<u8> {
         request_sequence: RequestSequence::new(1).unwrap(),
     };
     submit_frame(&SubmitV1 {
-        receipt: coord_collector::AdmissionClaimsV1::of(&AdmissionReceipt::submitting(
+        receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
             AttestedAdmission {
                 cluster: CLUSTER,
@@ -91,7 +91,8 @@ fn submission() -> Vec<u8> {
                 receipt_id: Digest32([6; 32]),
                 admitted_at_ticks: 0,
             },
-        )),
+        )
+        .facts(),
         request: RequestV1::new(key, &logical, 0).unwrap(),
     })
     .unwrap()

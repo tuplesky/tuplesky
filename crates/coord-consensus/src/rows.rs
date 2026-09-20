@@ -4,6 +4,7 @@
 
 use alloc::vec::Vec;
 
+use coord_core::capability::{AdmissionFacts, admission_digest};
 use coord_core::effect::StoreUpdate;
 use coord_store_api::engine::{EngineError, ErrorClass};
 use coord_store_api::envelope::StoreEnvelopeV1;
@@ -142,13 +143,49 @@ pub fn dependency_update(
 }
 
 /// The immutable canonical command in `payload_v1`, keyed by command
-/// identity: retry key and canonical logical bytes (rehashed on read).
+/// identity: retry key, canonical logical bytes (rehashed on read), and
+/// the admission the command was accepted under.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PayloadRecordV1 {
     /// Stable invocation identity.
     pub retry_key: RetryKey,
     /// Canonical `LogicalRequest` encoding.
     pub logical: Vec<u8>,
+    /// What the admitting verifier attested, as part of what this
+    /// command durably *is*.
+    ///
+    /// Travelling beside the payload is not enough. Execution reads the
+    /// principal, the trust rule and the ceiling from here, so a
+    /// command whose admission were merely ambient would mean different
+    /// things to a replica that executed it now, a replica that
+    /// recovered its payload from a peer, and a replica that replayed
+    /// it from the journal. Recording it with the payload is what makes
+    /// those the same command.
+    ///
+    /// A fresh receipt presented on a retry does not replace it: the
+    /// record is written once, when the command is first accepted, and
+    /// a later presentation that disagrees is a conflict rather than an
+    /// update.
+    ///
+    /// `None` only for a record written before this field existed, and
+    /// for the protocol's own internal commands, which no verifier
+    /// admitted.
+    #[serde(default)]
+    pub admission: Option<AdmissionFacts>,
+}
+
+impl PayloadRecordV1 {
+    /// The digest that binds this command's admission into what the
+    /// command is.
+    ///
+    /// Distinct from the command identity, deliberately. Identity is
+    /// the retry key and the canonical request, so a retry keeps it and
+    /// a credential rotation does not change it. This is what replicas
+    /// compare to be sure they accepted the *same* command, and it is
+    /// what a payload transfer is checked against.
+    pub fn admission_digest(&self) -> Digest32 {
+        admission_digest(self.admission.as_ref())
+    }
 }
 
 /// `payload_v1` key: the command identity.

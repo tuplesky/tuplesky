@@ -44,6 +44,18 @@ pub struct FastAck {
     pub paths: Vec<(Vec<u8>, Digest32)>,
     /// Combined digest of the conflict path the sender saw.
     pub path: Digest32,
+    /// Digest of the admission this sender accepted the command under
+    /// ([`coord_core::capability::admission_digest`]).
+    ///
+    /// The command identity says which request this is; it deliberately
+    /// says nothing about the credential that admitted it, so a retry
+    /// under a rotated credential stays the same command. That leaves
+    /// the attested facts -- who was authenticated, under which trust
+    /// rule, within what limits -- outside the identity, and they
+    /// decide what execution does. So they are bound here instead: a
+    /// quorum cannot form across senders that accepted one command as
+    /// different facts.
+    pub admission: Digest32,
     /// Leader sequence number (leader proposal only).
     pub seqnum: Option<u64>,
 }
@@ -57,6 +69,11 @@ pub struct SlowAck {
     pub ballot: Ballot,
     /// Command.
     pub command: CommandId,
+    /// Digest of the admission this sender accepted the command under
+    /// (see [`FastAck::admission`]). Adopting the leader's order is
+    /// still accepting a command, and a replica that adopted it as
+    /// different facts would execute different facts.
+    pub admission: Digest32,
 }
 
 /// One acknowledgement.
@@ -92,6 +109,14 @@ impl Vote {
             Vote::Slow(s) => s.command,
         }
     }
+
+    /// Admission the sender accepted the command under.
+    pub const fn admission(&self) -> Digest32 {
+        match self {
+            Vote::Fast(f) => f.admission,
+            Vote::Slow(s) => s.admission,
+        }
+    }
 }
 
 /// Why a vote was rejected. Nothing was counted.
@@ -114,6 +139,13 @@ pub enum VoteError {
     /// The leader proposal carried no sequence number; the leader assigns
     /// the order, so nothing can be learned from it.
     MissingSequence,
+    /// The sender accepted this command under a different admission than
+    /// the votes already counted. Nothing is counted: the two are not
+    /// acknowledgements of the same thing, whatever identity they share.
+    AdmissionConflict {
+        /// What the counted votes accepted.
+        counted: Digest32,
+    },
 }
 
 /// A learned decision for the command.
@@ -148,6 +180,7 @@ pub struct VoteSet {
     leader: Option<FastAck>,
     fast: BTreeMap<ReplicaId, FastAck>,
     slow: BTreeSet<ReplicaId>,
+    admission: Option<Digest32>,
 }
 
 impl VoteSet {
@@ -159,7 +192,14 @@ impl VoteSet {
             leader: None,
             fast: BTreeMap::new(),
             slow: BTreeSet::new(),
+            admission: None,
         }
+    }
+
+    /// The admission every counted vote accepted this command under,
+    /// once anything has been counted.
+    pub const fn admission(&self) -> Option<Digest32> {
+        self.admission
     }
 
     /// The leader proposal, once received.
@@ -180,6 +220,7 @@ impl VoteSet {
     /// prototype keeps them in separate sets); a second of the same kind
     /// is a duplicate.
     pub fn add(&mut self, vote: Vote) -> Result<(), VoteError> {
+        let admission = vote.admission();
         if vote.command() != self.command {
             return Err(VoteError::WrongCommand);
         }
@@ -189,6 +230,16 @@ impl VoteSet {
         let replica = vote.replica();
         if !self.config.is_voter(&replica) {
             return Err(VoteError::NotAVoter);
+        }
+        // One command is one set of attested facts. A vote for the same
+        // identity under other facts is not a second opinion about this
+        // command; it is a vote about a different one, and counting it
+        // would let a quorum form for a command no quorum agreed on.
+        match self.admission {
+            Some(counted) if counted != vote.admission() => {
+                return Err(VoteError::AdmissionConflict { counted });
+            }
+            _ => {}
         }
         let is_leader = replica == self.config.leader();
         match vote {
@@ -223,6 +274,7 @@ impl VoteSet {
                 }
             }
         }
+        self.admission = Some(admission);
         Ok(())
     }
 

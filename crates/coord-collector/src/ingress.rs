@@ -8,7 +8,7 @@
 //! or voting access, and nothing that arrives on an API-class connection
 //! is ever treated as a vote (votes only exist on the peer plane).
 
-use coord_core::capability::{AdmissionReceipt, ReleasedResult, VerifierToken};
+use coord_core::capability::{AdmissionPurpose, AdmissionReceipt, ReleasedResult, VerifierToken};
 use coord_core::effect::{Effect, PeerId};
 use coord_core::event::AdmittedRequest;
 use coord_types::ids::{ClusterId, DomainId};
@@ -79,35 +79,26 @@ pub fn admitted_from_submit(
     domain: DomainId,
 ) -> Result<AdmittedRequest, IngressError> {
     let submit = decode_submit(frame).map_err(IngressError::Wire)?;
-    let claims = submit.receipt;
-    if claims.cluster != cluster || claims.domain != domain {
+    let facts = submit.receipt;
+    if facts.attested.cluster != cluster || facts.attested.domain != domain {
         return Err(IngressError::WrongOrigin {
-            cluster: claims.cluster,
-            domain: claims.domain,
+            cluster: facts.attested.cluster,
+            domain: facts.attested.domain,
         });
     }
-    let receipt = match claims.establishing {
-        None => {
-            if !role.may_submit_for_clients() {
-                return Err(IngressError::RoleNotAuthorized(role));
-            }
-            AdmissionReceipt::submitting(VerifierToken::for_boundary(), claims.attested())
-        }
-        Some(establishing) => {
-            if !role.may_establish_sessions() {
-                return Err(IngressError::NotASessionIssuer(role));
-            }
-            AdmissionReceipt::establishing(
-                VerifierToken::for_boundary(),
-                claims.attested(),
-                coord_core::AttestedEstablishment {
-                    principal: establishing.principal,
-                    trust_rule: establishing.trust_rule,
-                    credential_valid_until: establishing.credential_valid_until,
-                },
-            )
-        }
+    let authorized = match facts.purpose() {
+        AdmissionPurpose::Submit => role.may_submit_for_clients(),
+        AdmissionPurpose::Establish => role.may_establish_sessions(),
     };
+    if !authorized {
+        return Err(match facts.purpose() {
+            AdmissionPurpose::Submit => IngressError::RoleNotAuthorized(role),
+            AdmissionPurpose::Establish => IngressError::NotASessionIssuer(role),
+        });
+    }
+    // Only now: the ingress has the authority these facts call for, so
+    // they may become a capability.
+    let receipt = AdmissionReceipt::attesting(VerifierToken::for_boundary(), facts);
     let frame = MessageV1::Request(submit.request)
         .encode()
         .map_err(|_| IngressError::Wire(CollectorWireError::TooLarge))?;
