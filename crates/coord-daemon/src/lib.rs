@@ -66,6 +66,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod listen;
 pub mod mailbox;
+pub mod metrics;
 pub mod node;
 pub mod pending;
 pub mod role;
@@ -83,6 +84,10 @@ pub use identity::{IdentityError, load as load_identity};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use mailbox::{Ingress, IngressBudget, LocalRoute};
+pub use metrics::{
+    Durability, Frontiers, Headroom, Lane, LaneReading, Latency, Measure, MetricsSnapshot,
+    Recorder, ShardIndex, ShardReading, Stage, StageMetrics, StageReading, Unavailable,
+};
 pub use node::{DriveError, Machine, Node, Outbound};
 pub use pending::{Pending, Undeliverable};
 pub use role::{Role, RoleSet};
