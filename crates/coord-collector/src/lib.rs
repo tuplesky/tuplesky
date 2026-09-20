@@ -52,9 +52,9 @@ pub use dispatch::{Action, Delivery, Dispatcher};
 pub use ingress::{IngressError, admitted_from_submit, frontend_frame};
 pub use trace::CollectorEvent;
 pub use wire::{
-    AdmissionClaimsV1, CollectorWireError, KIND_EVIDENCE, KIND_RELEASE, KIND_SUBMIT, SubmitV1,
-    decode_evidence, decode_release, decode_submit, evidence_frame, evidence_frame_from_bytes,
-    release_frame, submit_frame,
+    AdmissionClaimsV1, CollectorWireError, EstablishmentClaimsV1, KIND_EVIDENCE, KIND_RELEASE,
+    KIND_SUBMIT, SubmitV1, decode_evidence, decode_release, decode_submit, evidence_frame,
+    evidence_frame_from_bytes, release_frame, submit_frame,
 };
 
 /// Crate role marker used by the dependency-policy check.

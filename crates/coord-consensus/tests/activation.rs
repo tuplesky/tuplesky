@@ -11,7 +11,9 @@ use coord_consensus::{
     FollowerConfig, FollowerRejection, Leader, LeaderConfig, PageError, Phase, ProtocolMessage,
     ReplicaRole, SyncDecision, decode_dependency, decode_promise, decode_sync,
 };
-use coord_core::capability::{AdmissionReceipt, EstablishedResult, VerifierToken};
+use coord_core::capability::{
+    AdmissionReceipt, AttestedAdmission, EstablishedResult, VerifierToken,
+};
 use coord_core::effect::{BootId, Effect, PeerId};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageEvent,
@@ -363,13 +365,17 @@ impl Cluster {
             if !self.nodes[i].alive {
                 continue;
             }
-            let receipt = AdmissionReceipt::from_verifier(
+            let receipt = AdmissionReceipt::submitting(
                 VerifierToken::for_boundary(),
-                SessionId([3; 16]),
-                1,
-                u32::MAX,
-                Digest32([9; 32]),
-                0,
+                AttestedAdmission {
+                    cluster: ClusterId([1; 16]),
+                    domain: DomainId([2; 16]),
+                    session: SessionId([3; 16]),
+                    rule_generation: 1,
+                    scope_ceiling: u32::MAX,
+                    receipt_id: Digest32([9; 32]),
+                    admitted_at_ticks: 0,
+                },
             );
             let effects = self.nodes[i].step(Event::Admitted(AdmittedRequest {
                 receipt,

@@ -40,7 +40,7 @@ use coord_core::event::{AuthenticatedPeerMessage, Event, PeerProvenance};
 use coord_membership::membership::Membership;
 use coord_storage::Persistence;
 use coord_types::CommandId;
-use coord_types::ids::{Ballot, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{Ballot, ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{FrameReader, WireError};
 
 use crate::mailbox::Ingress;
@@ -111,6 +111,9 @@ pub enum Refused {
 pub struct Voter<P: Persistence> {
     node: Node<P>,
     ingress: Ingress,
+    /// This domain's committed origin, which a submission's claims must
+    /// have been attested for.
+    origin: (ClusterId, DomainId),
     ballot: Ballot,
     provenance: PeerProvenance,
     origins: alloc_map::Origins,
@@ -128,11 +131,17 @@ impl<P: Persistence> Voter<P> {
     /// from the ingress's committed identity. It is not derived from
     /// anything a frame says, which is why the collector can count it
     /// the same way it counts a peer's.
-    pub fn new(node: Node<P>, ingress: Ingress, ballot: Ballot) -> Self {
+    pub fn new(
+        node: Node<P>,
+        ingress: Ingress,
+        origin: (ClusterId, DomainId),
+        ballot: Ballot,
+    ) -> Self {
         let provenance = PeerProvenance::from_local_voter(ingress.replica(), ingress.incarnation());
         Voter {
             node,
             ingress,
+            origin,
             ballot,
             provenance,
             origins: alloc_map::Origins::new(ORIGINS),
@@ -221,7 +230,7 @@ impl<P: Persistence> Voter<P> {
         frame: &coord_types::wire_v1::Frame,
         origin: Origin,
     ) -> Result<Result<Outbound, Refused>, DriveError> {
-        let admitted = match admitted_from_submit(submitter, frame) {
+        let admitted = match admitted_from_submit(submitter, frame, self.origin.0, self.origin.1) {
             Ok(a) => a,
             Err(e) => return Ok(Err(Refused::NotAdmissible(e))),
         };

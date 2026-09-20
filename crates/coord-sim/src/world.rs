@@ -10,10 +10,16 @@ use coord_core::event::{
 };
 use coord_core::machine::{ClockSnapshot, DeterministicMachine};
 use coord_types::identity::Digest32;
-use coord_types::ids::{ReplicaId, ReplicaIncarnation, SessionId};
+use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation, SessionId};
 use serde::{Deserialize, Serialize};
 
 use crate::actors::{CLIENT, DurableEcho, EagerEcho};
+
+/// The one cluster and domain a scenario runs in. The simulator drives
+/// ordering and failure; it is not a second origin to get wrong.
+const SIM_CLUSTER: ClusterId = ClusterId([0x51; 16]);
+/// The domain every simulated node serves.
+const SIM_DOMAIN: DomainId = DomainId([0x5d; 16]);
 use crate::network::Network;
 use crate::replay::{ActorKind, Fault, Scenario};
 use crate::rng::NamedStreams;
@@ -517,13 +523,21 @@ impl World {
         }
         Some(match pending {
             Pending::Admit { node, frame } => {
-                let receipt = AdmissionReceipt::from_verifier(
+                // A submission under a session the scenario treats as
+                // already established: the simulator drives ordering and
+                // failure, not authentication, and it attests no
+                // identity it did not verify.
+                let receipt = AdmissionReceipt::submitting(
                     VerifierToken::for_boundary(),
-                    SessionId([0x5e; 16]),
-                    1,
-                    u32::MAX,
-                    Digest32(*blake3::hash(&frame).as_bytes()),
-                    key.tick,
+                    coord_core::AttestedAdmission {
+                        cluster: SIM_CLUSTER,
+                        domain: SIM_DOMAIN,
+                        session: SessionId([0x5e; 16]),
+                        rule_generation: 1,
+                        scope_ceiling: u32::MAX,
+                        receipt_id: Digest32(*blake3::hash(&frame).as_bytes()),
+                        admitted_at_ticks: key.tick,
+                    },
                 );
                 self.dispatch(node, Event::Admitted(AdmittedRequest { receipt, frame }));
                 StepOutcome::Dispatched

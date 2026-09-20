@@ -13,7 +13,7 @@ use coord_consensus::{
     ProtocolMessage, Rejection, ReplicaRole, SlowAck, VoteError, decode_dependency, decode_payload,
     decode_proposal, dependency_key, payload_key, proposal_key,
 };
-use coord_core::capability::{AdmissionReceipt, VerifierToken};
+use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageError, StorageEvent,
@@ -115,13 +115,17 @@ fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
     let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
         .encode()
         .unwrap();
-    let receipt = AdmissionReceipt::from_verifier(
+    let receipt = AdmissionReceipt::submitting(
         VerifierToken::for_boundary(),
-        SessionId([3; 16]),
-        1,
-        u32::MAX,
-        Digest32([9; 32]),
-        0,
+        AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
     );
     (Event::Admitted(AdmittedRequest { receipt, frame }), command)
 }
