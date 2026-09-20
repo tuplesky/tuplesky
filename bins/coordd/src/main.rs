@@ -19,6 +19,7 @@
 
 mod genesis;
 mod membership;
+mod peers;
 mod serve;
 mod store;
 
@@ -257,6 +258,26 @@ fn main() -> ExitCode {
         serve::Backing::Voting(v) => Some(v.route()),
         serve::Backing::Serving(_) => None,
     };
+    // Where the other voters are, before a listener exists. A voter that
+    // came up without knowing how to reach its peers would serve
+    // requests it could never establish, and would look from outside
+    // like a slow cluster rather than a misconfigured one.
+    let peers = match peers::resolve(
+        &placed.membership,
+        placed.replica,
+        config.cluster_endpoints.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "peers reachable={} of {}",
+        peers.len(),
+        placed.membership.voters().count().saturating_sub(1)
+    );
     let frontend = match serve::Frontend::new(&config, placed.membership.clone(), local) {
         Ok(f) => f,
         Err(e) => {

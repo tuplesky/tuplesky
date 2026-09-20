@@ -1091,6 +1091,7 @@ dependencies = [
  "coord-sts",
  "coord-transport",
  "coord-types",
+ "jsonwebtoken",
  "postcard",
  "quinn",
  "rcgen",
