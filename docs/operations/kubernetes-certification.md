@@ -117,23 +117,25 @@ Run against three voters on one host, at the commit this document ships in:
 | Pagination: bounded, ordered, resumable at one revision | passes |
 | Compaction refuses a watch below the floor | passes |
 | Watch replay, live handover, progress, resume | **fails** |
-| Time-to-live expiry | **not reached** |
-| Concurrent writers on one key | **not reached** |
+| Time-to-live expiry | **fails** |
+| Concurrent writers on one key | **fails** |
 
-### The two gaps, named
+### The three gaps, named
 
-Neither is a flake, both are reproducible from a fresh domain, and both block
-compatibility labeling.
+None is a flake, all three are reproducible from a fresh domain, and each
+blocks compatibility labeling on its own. They are independent: a failing
+row no longer takes the rest of the run with it, which it used to.
 
 1. **`coordd` does not serve watch streams.** `Step::Watch` in
    `bins/coordd/src/serve.rs` counts the watch and drops the responder; the
    comment there says pumping it is the next piece of the loop. The collector
    already has the machinery -- `Dispatcher::open_watch`, `pump_watch`, the
    `WatchHub` and the close reasons -- so what is missing is the daemon
-   holding the stream and draining the hub onto it. The consequence is worse
-   than a missing feature: the hub keeps the registration, nothing drains it,
-   and the domain stops answering anything afterwards. Everything downstream
-   of the watch test in a suite run therefore fails for this one reason.
+   holding the stream and draining the hub onto it. The collector registers
+   the watch with the hub either way, so the subscription exists and nothing
+   ever delivers on it: the caller's stream closes with no replay, no event
+   and no progress. An API server rebuilds every cache from watches, so it
+   cannot start against this.
 2. **Concurrent callers are not served across a quorum.** Two callers
    issuing one request each at a time against a three-voter domain
    complete 13 of 100 operations within a five-second deadline. The same
@@ -153,7 +155,14 @@ compatibility labeling.
    A Kubernetes API server is concurrent from its first second, so this
    blocks the k3s run outright.
 
-A third, now fixed: a connection used to stop being answered after
+3. **A key under a time to live does not expire.** A key written with a
+   one-second lease is still readable a minute later. Kine's lease is a
+   TTL rather than an identity, and the domain keeps the binding private
+   (a caller never sees a lease identity on the key, which this suite
+   also checks and which passes) -- so what is missing is the expiry
+   itself, not the disclosure rule.
+
+A fourth, now fixed: a connection used to stop being answered after
 exactly 61 requests. The leader's command table is created with a
 capacity, and nothing ever retired an executed record from it, so the
 capacity was a bound on how many commands a replica could execute in its
@@ -165,9 +174,14 @@ one. The regression tests are
 and
 `crates/coord-consensus/tests/activation.rs::a_cluster_serves_past_its_table_capacity`.
 
-Until both are closed, this document's answer to "is this etcd-compatible" is
-no, for stated reasons, in a named profile. That is the point of certifying
-rather than booting.
+That fix is also why the three above are now three separate findings. A
+wedged domain used to turn one failure into every later one, so a suite
+run reported a cascade and the first line of the log was the only one
+worth reading.
+
+Until all three are closed, this document's answer to "is this
+etcd-compatible" is no, for stated reasons, in a named profile. That is
+the point of certifying rather than booting.
 
 ## Reading a failure
 
@@ -178,6 +192,9 @@ runtime diagnostics. The startup report carries the build's format window,
 the storage frontiers and the rendered metrics snapshot, so a failure can be
 attributed to a node before anything is reproduced.
 
-A run that ends with every operation reporting `outcome unknown after 3
-resolutions; retry` has not found three separate faults: it has found one
-wedged domain, and the first failure in the log is the one to read.
+A run whose later rows all report `outcome unknown after 3 resolutions;
+retry` has probably not found that many faults. An operation the client
+never learned the outcome of leaves an invocation resolvable by identity,
+and a client holding many of those refuses new work of its own -- so one
+row that exhausts its deadlines can make the rows after it look broken.
+Re-run a suspect row on a fresh domain before believing it.
