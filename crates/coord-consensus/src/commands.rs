@@ -25,7 +25,7 @@
 //! full and before anything is refused, and backpressure afterwards
 //! means what it says -- this much work really is outstanding.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use coord_types::CommandId;
@@ -117,8 +117,12 @@ struct KeyState {
 pub struct CommandTable {
     records: BTreeMap<CommandId, CommandRecord>,
     keys: BTreeMap<Vec<u8>, KeyState>,
-    /// Executed commands retired while a live record depends on them.
+    /// Commands retired after executing: what this replica still
+    /// remembers having executed, for the dependency guards.
     executed: BTreeSet<CommandId>,
+    /// The same commands in the order they were retired, so the oldest
+    /// is the one dropped when the memory reaches its bound.
+    retired: VecDeque<CommandId>,
     capacity: Option<usize>,
 }
 
@@ -129,6 +133,7 @@ impl CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
+            retired: VecDeque::new(),
             capacity: None,
         }
     }
@@ -139,6 +144,7 @@ impl CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
+            retired: VecDeque::new(),
             capacity: Some(capacity),
         }
     }
@@ -156,6 +162,7 @@ impl CommandTable {
             records: BTreeMap::new(),
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
+            retired: VecDeque::new(),
             capacity,
         };
         for (c, r) in records {
@@ -478,19 +485,37 @@ impl CommandTable {
     /// Forget an executed command. Unresolved acceptance is never deleted
     /// for capacity. An executed command needs no successor to order after
     /// it (its effects are complete), so the conflict index stops naming
-    /// it; a live record that already depends on it keeps seeing it as
-    /// executed through a tombstone, which is dropped with the last such
-    /// record, so the table keeps working on a hot key after recycling.
+    /// it; what the table keeps is a tombstone saying that it executed,
+    /// so the guards can still answer for it.
+    ///
+    /// The tombstone is unconditional, and that is the point. A
+    /// dependency is named by whoever holds the evidence, and not all of
+    /// that evidence is in this table: a follower holds the leader's
+    /// proposals until their payloads arrive, and the dependency such a
+    /// proposal names lives in the proposal, not in any record here. A
+    /// table that tombstoned only what a live record already depends on
+    /// would drop exactly the command the next proposal is about to name,
+    /// and the guard would then read "unknown" for a command this replica
+    /// executed itself -- a proposal that can never be adopted, with
+    /// every later command waiting behind it for ever.
+    ///
+    /// What bounds the memory is recency, not reference counting: the
+    /// oldest tombstone goes once there are more of them than the table
+    /// has room for records. A leader names as a dependency only a
+    /// command still live in its own table, which is the same size, so a
+    /// replica that remembers its last `capacity` retirements remembers
+    /// every command a leader can still name. An unbounded table keeps
+    /// them all, which is what unbounded means.
     pub fn retire(&mut self, command: &CommandId) -> Result<(), RetireError> {
-        let record = match self.records.get(command) {
+        let keys = match self.records.get(command) {
             None => return Err(RetireError::Unknown),
             Some(r) if r.phase != Phase::Executed => {
                 return Err(RetireError::NotExecuted(r.phase));
             }
-            Some(r) => r.clone(),
+            Some(r) => r.keys.clone(),
         };
         self.records.remove(command);
-        for key in &record.keys {
+        for key in &keys {
             if let Some(state) = self.keys.get_mut(key) {
                 if state.last == Some(*command) {
                     state.last = None;
@@ -498,24 +523,21 @@ impl CommandTable {
                 state.log.forget(command);
             }
         }
-        if self.referenced(command) {
-            self.executed.insert(*command);
+        if self.executed.insert(*command) {
+            self.retired.push_back(*command);
         }
-        // Tombstones the retired record was the last to reference go too.
-        for dep in &record.deps {
-            if self.executed.contains(dep) && !self.referenced(dep) {
-                self.executed.remove(dep);
+        if let Some(bound) = self.capacity {
+            while self.retired.len() > bound {
+                if let Some(oldest) = self.retired.pop_front() {
+                    self.executed.remove(&oldest);
+                }
             }
         }
         Ok(())
     }
 
-    /// Whether a live record depends on `command`.
-    fn referenced(&self, command: &CommandId) -> bool {
-        self.records.values().any(|r| r.deps.contains(command))
-    }
-
-    /// Executed commands retired while a live record still depends on them.
+    /// Commands this replica executed and retired, and still remembers
+    /// having executed.
     pub fn tombstones(&self) -> &BTreeSet<CommandId> {
         &self.executed
     }

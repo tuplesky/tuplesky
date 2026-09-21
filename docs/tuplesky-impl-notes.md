@@ -1654,7 +1654,8 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-four things, of which two are fixed here and two are written down.
+five things. All five are fixed here, and the last two only
+became findable once the ones before them were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counted the watch and dropped the responder.
@@ -1737,9 +1738,8 @@ touched: a record in START, PRE-ACCEPT, ACCEPT or COMMIT is an
 obligation, and evicting one to serve a newer command would lose it
 rather than shed load. And a retired record has to go on looking
 executed to anything that depends on it, which is what `retire`'s
-tombstones are for -- they are dropped with the last record that
-references them, so the bookkeeping stays bounded by the live set
-instead of by history.
+tombstones are for. How long a tombstone lives was answered wrongly
+first, and is the subject of the last finding below.
 
 The leader also had to stop asking the table whether a command executed.
 `unexecuted_in_order` filtered on `phase_of(c) < Some(Phase::Executed)`,
@@ -1800,6 +1800,64 @@ one. All four now say so. The second is that `Leader::take_rejections`
 had no caller at all -- the list grew for the life of the process, and
 the reasons in it were never read by anything. The driver drains it
 every turn.
+
+**A follower forgot a command the leader was about to name.** With the
+lowering loop in, two callers against three voters ran clean: two
+hundred operations, none unknown, three hundred and forty-five a second.
+Then the *next* invocation against the same domain could not even bind,
+and no later one ever did. Every voter had stopped serving, permanently,
+on an idle machine.
+
+The symptom is the one the table capacity produced before, and the cause
+is its mirror image. Both followers' tables were full and stayed full:
+sixty-four records, all of them proposals held for an order that could
+never be adopted, every payload present, nothing executable. Walking the
+chain down from the newest held proposal ends at leader sequence
+sixty-four, whose single dependency is a command that has no phase at
+all -- and which that same replica had adopted, committed, executed and
+retired minutes earlier.
+
+`retire` tombstoned a command only when a live record already depended on
+it. That rule quietly assumes every dependency is written down in the
+table, and on a follower it is not. A follower holds the leader's
+proposals until their payloads arrive, and the dependency such a proposal
+names lives in the proposal. So the sequence is: the follower executes a
+command, its table fills -- with held proposals as well as its own
+records, which is why it fills ahead of the leader's -- it reclaims, the
+command goes without a tombstone because no record refers to it, and the
+next proposal to arrive names exactly that command. `guard_accept` reads
+"unknown" for a command this replica ran itself, the proposal is never
+adopted, every later command queues behind it, and the table never drains
+again. A new caller's session is a replicated command like any other, so
+binding is what fails first, which is why it looked like a transport
+fault.
+
+The tombstone is now unconditional, and what bounds it is recency rather
+than reference counting: the oldest goes once there are more tombstones
+than the table has room for records. That bound is not arbitrary. A
+leader names as a dependency only a command still live in its own table,
+and under the conservative conflict key that is always the immediately
+preceding command; a replica that remembers its last `capacity`
+retirements therefore remembers every command a leader can still name,
+with a large margin.
+
+Why one caller never hit it is the same accident that hid the first two
+findings. With one request in flight, the table is nearly empty when
+reclamation runs, so there is rarely a held proposal to be orphaned --
+four hundred sequential operations pass. With two, there is always one,
+and the collapse is total: the run before the fix completed 190 of 200
+at seven operations a second, the six runs after it completed 200 of 200
+at about three hundred and forty-five.
+
+The regression test is at the table, where the defect is:
+`crates/coord-consensus/tests/graph.rs::a_dependency_retired_before_its_proposal_arrives_is_still_executed`
+retires a command nothing refers to and then adopts an order that names
+it. With the old rule it fails with `DependencyUnknown`, which is
+verbatim what the wedged follower reported.
+`bins/coordd/tests/cli.rs::a_quorum_keeps_answering_past_its_table_capacity`
+now carries the composition's half: past the capacity sequentially, then
+past it again with two callers in flight, and then a *new* session --
+because the symptom was never a slow domain, it was a dead one.
 
 **And a key under a time to live did not expire.** Written with a
 one-second lease, still readable a minute later. The private binding was
@@ -1887,11 +1945,17 @@ of fast completions followed by nothing at all, identical on every
 repetition and unchanged by a fifteen-fold longer deadline. A count that
 does not move when the deadline moves is a resource that ran out.
 
-The same separation is what distinguishes the remaining finding from
-that one. Adding a second caller does not move a count; it collapses the
+The same separation is what distinguishes the third finding from that
+one. Adding a second caller does not move a count; it collapses the
 completion rate while the service times of the few that get through stay
 ordinary. That is a different shape, and it is why the two are written
 up as two things rather than as "it gets slow under load".
+
+The fourth needed something else again: a run that succeeds, followed by
+a run against the same domain that cannot start. One invocation per row
+is what made that visible. A harness that stood a domain up and tore it
+down inside each row would have reported six healthy rows and never the
+state the first one left behind.
 
 The three-distribution split is not decoration. `queue` says whether the
 harness was the bottleneck, `service` says what the operation cost once
