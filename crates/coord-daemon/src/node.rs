@@ -103,9 +103,20 @@ impl Machine {
     /// Whether this replica is holding a command it knows by identity
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {
+        self.missing_payloads() > 0
+    }
+
+    /// How many commands this replica knows by identity and not by
+    /// content.
+    ///
+    /// The count, and not just the fact: a replica catching up asks
+    /// again as soon as the number moves, which is what turns a fixed
+    /// retry interval into a window that empties at the link's speed
+    /// rather than at the interval's.
+    pub fn missing_payloads(&self) -> usize {
         match self {
-            Machine::Leader(_) => false,
-            Machine::Follower(m) => !m.missing_payloads().is_empty(),
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.missing_payloads().len(),
         }
     }
 
@@ -295,6 +306,12 @@ impl<P: Persistence> Node<P> {
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {
         self.machine.wants_payloads()
+    }
+
+    /// How many commands this replica knows by identity and not by
+    /// content.
+    pub fn missing_payloads(&self) -> usize {
+        self.machine.missing_payloads()
     }
 
     /// Ask `from` for the payloads this replica lacks.

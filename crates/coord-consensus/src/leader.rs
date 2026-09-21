@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::{PathAnchors, ProtocolMessage};
+use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryReport, SyncDecision};
@@ -1250,6 +1250,12 @@ impl Leader {
                         payload: p.clone(),
                     })
             })
+            // A replica that fell behind asks again on a timer. If every
+            // ask were answered in full, the answers alone would fill
+            // the lane they share with the proposals and commits that
+            // replica is waiting for, and it would fall further behind
+            // for as long as it kept asking. See [`MAX_PAYLOAD_TRANSFER`].
+            .take(MAX_PAYLOAD_TRANSFER)
             .collect();
         if let Some(outbox) = self.outbox.as_mut() {
             for m in responses {

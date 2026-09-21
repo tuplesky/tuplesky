@@ -1654,7 +1654,7 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-seven things. All seven are fixed here, and each became findable
+eight things. All eight are fixed here, and each became findable
 only once the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
@@ -2027,9 +2027,100 @@ it passes, which is how the coupling was finally named. Bounding that
 memory is still worth doing and belongs with
 [task-j07](design/tuplesky-prs-plan.md#task-j07).
 
+**A voter that filled its table never emptied it again.** Once the
+straggler above was fixed the matrix ran eight times faster, and the
+re-run found the defect the old rate had been hiding. One voter of
+three would stop: sixty-four records at PRE-ACCEPT, every later proposal
+and submission refused for backpressure, its projection frozen at the
+position it reached, and -- because a frontend reads replicated policy
+out of that projection -- every read its own callers asked for refused
+as unauthorized for the rest of the run. About a third of the reads in
+the `scans` and `read-mostly` rows, which is what a caller bound to that
+voter's frontend sees, and nothing at all in the rows that ran before it
+stopped.
+
+The cause is two lines, both the same mistake. `Follower::on_proposal`
+and `Follower::on_request` each recorded a backpressure refusal and
+returned. What they returned from is the function that ends by calling
+`advance_pending` -- the step that adopts the records whose turn has
+come, and adoption is what lets a command execute, be retired, and free
+the slot that was missing. So the two doors into the machine, on the one
+occasion when making progress mattered most, were exactly the two that
+stopped making it. The table stayed full, and it stayed full for ever:
+the leader does not re-propose, there is no message to ask it for an
+order it already sent, and nothing else would prompt the replica to look
+again.
+
+The proposal was also *dropped*, which is the second half of it. A
+leader's order reaches a replica once. Dropped for want of a table slot,
+the command can never be adopted even after the slot frees and its
+payload arrives -- it sits at PRE-ACCEPT, and with a conservative key
+making the dependency chain total, so does everything ordered after it.
+It is now held instead, bounded at eight times the table's own capacity,
+which is generous on purpose: the failure mode of holding too few is the
+wedge, and the failure mode of holding too many is memory.
+
+**And a repair that made the thing it was repairing worse.** A replica
+that lacks a command's content asks its leader for it every fifty
+milliseconds until it arrives, which is right. It asked for *all* of
+them -- a tableful, sixty-four -- and the leader answered with sixty-four
+payload frames, several times a second, on the one bounded lane that
+also carries the proposals and acknowledgements that replica was waiting
+for. The lane filled, what it dropped was the traffic that would have
+let the replica catch up, and it fell further behind and asked for more.
+The leader's own log says it plainly: `QueueFull { lane: Control }` to
+one replica, over and over, while that replica reported sixty-four
+payloads missing and never fewer.
+
+Payload transfer is now bounded on both sides at
+`MAX_PAYLOAD_TRANSFER`, with a rotating cursor so that a bound on how
+many are asked for at once does not mean the same few are asked for
+every time and the rest never. The bound is on the answering side too,
+because a peer must not be able to make this replica flood its own lane
+by asking for more than the protocol's own bound.
+
+A bound on the ask needs a matching change to when the ask goes out, and
+this is the part that took a second run to see. The daemon repeated the
+ask on a fifty-millisecond interval, which was right when the ask was
+unbounded and wrong the moment it was not: a bounded ask on an interval
+is a *rate*, and a replica behind by more than the domain produces in an
+interval can never close the gap however long it runs. The soak showed
+exactly that -- a follower holding ninety-nine proposals and missing
+ninety-two payloads, asking for eight of them twenty times a second
+while the domain committed three hundred. The interval is now the floor
+for an ask nobody answered, and the ask is a window: one outstanding at
+a time, and the next goes the moment the number of missing payloads
+moves, which is to say as soon as the last one was answered.
+
+Which put the two halves of the repair in direct conflict, and that is
+the thing worth naming. Ask slowly and a replica behind by more than the
+interval's worth can never catch up; ask as fast as the answers come and
+the catch-up traffic fills the queue that the proposals and
+acknowledgements it is catching up *with* are waiting in. Both were
+measured, one wedge each. There is no rate that resolves it, because the
+two kinds of traffic were competing for one queue -- and the transport
+has had a lane for exactly this since task-31. Payload transfer now goes
+down the bulk lane, which is where moving whole command payloads
+belongs, and the control lane carries only what the protocol needs to
+make progress. The classification reads the encoded discriminant rather
+than decoding the frame, because deciding where to send a payload by
+decoding it would cost more than the send;
+`payload_transfer_is_recognized_from_the_encoded_discriminant` pins the
+two bytes against the encoder so that a variant added above them fails a
+test instead of quietly mis-routing.
+
+`a_full_table_still_adopts_and_still_keeps_the_order_it_was_sent` fills
+a follower's table exactly, refuses a submission and a proposal at the
+door, and asserts both halves: the order in the refused proposal is
+kept, and the records whose turn had come are adopted anyway. Reverting
+either half fails it. The bound and the rotation are asserted together
+by `payload_transfer_is_bounded_in_both_directions_and_still_covers_everything`:
+a bound that always took the same prefix would be a wedge with a bound
+on it rather than a fix.
+
 ### What the benchmark harness had to get right to find these
 
-A closed-loop benchmark would not have found the last two. It sends the next
+A closed-loop benchmark would not have found the fifth or the sixth. It sends the next
 request when the previous one returns, so a domain that serializes work
 looks like a domain with a long service time and a perfectly respectable
 throughput curve.

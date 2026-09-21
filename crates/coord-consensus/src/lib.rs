@@ -147,7 +147,9 @@ pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
     FloorInstall, FloorLedger, Readiness, ReadinessError, ReadinessLedger, activate, discover,
 };
-pub use follower::{Follower, FollowerConfig, FollowerRejection, HeldProposal};
+pub use follower::{
+    Follower, FollowerConfig, FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal,
+};
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,
 };
@@ -160,7 +162,7 @@ pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal, Rejection,
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-pub use messages::{PathAnchors, ProtocolMessage};
+pub use messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, is_payload_transfer};
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};

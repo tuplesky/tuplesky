@@ -1013,3 +1013,95 @@ fn a_rebind_refreshes_validity_and_never_the_authorization_context() {
     let ack = coord_session::decode_bind_ack(&frame_of(&ack)).unwrap();
     assert_eq!(ack.expires_at, NOW + 200);
 }
+
+/// A replica whose projection has not caught up with the session yet.
+/// The row is not there; it is not *gone*.
+struct Behind;
+
+impl coord_session::PolicySource for Behind {
+    fn barrier(
+        &self,
+        namespace: NamespaceId,
+        _: &SessionId,
+    ) -> Result<coord_session::AuthorizationBarrier, coord_session::PolicyError> {
+        Ok(coord_session::AuthorizationBarrier::new(
+            ExecutionPosition::ZERO,
+            namespace,
+            coord_state::policy::Authorization {
+                session: None,
+                trust_rule: None,
+                rules: Vec::new(),
+            },
+        ))
+    }
+}
+
+fn is_pending(d: &Delivery) -> bool {
+    matches!(outcome_of(d), OutcomeV1::Pending)
+}
+
+/// A node that has not projected the session yet says "not yet", and a
+/// node that has projected it and no longer finds it says "no".
+///
+/// The difference is the whole of it. A binding is established from a
+/// committed session-creation command, but the disclosure barrier reads
+/// this node's materialized projection, and a replica that has fallen
+/// behind has not projected that command yet. Refusing there is a false
+/// refusal, and an expensive one: the client library reads
+/// `NOT_ADMITTED` as a credential that is no longer good, throws it
+/// away and binds again -- making a newer session this node has
+/// projected even less of. A benchmark caught that as about a third of
+/// the reads of one caller in three failing, on a domain that was
+/// working, and never recovering.
+#[test]
+fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let mut f = frontend(&ring);
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 7, &bind, &hub, &domain.policy()),
+        Ingress::Bound(_)
+    ));
+    let (command, read) = request(1, range(b"a"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 7, &read, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+
+    // The answer comes back while this node's projection is behind:
+    // held, not refused, and nothing is disclosed either way.
+    let held = f
+        .deliver(delivery(7, 1, command, range_outcome(b"a")), &Behind)
+        .answered();
+    assert!(
+        is_pending(&held),
+        "a projection that is behind refused instead of holding: {:?}",
+        outcome_of(&held)
+    );
+    assert!(!is_denied(&held));
+    assert_eq!(f.deferred, 1);
+    assert_eq!(f.denied, 0);
+
+    // It catches up: the same answer is now disclosed.
+    let served = f
+        .deliver(
+            delivery(7, 1, command, range_outcome(b"a")),
+            &domain.policy(),
+        )
+        .answered();
+    assert!(!is_denied(&served) && !is_pending(&served));
+
+    // And once the row has been seen, its absence is a real answer:
+    // policy moved, and a projection only moves forward.
+    let refused = f
+        .deliver(delivery(7, 1, command, range_outcome(b"a")), &Behind)
+        .answered();
+    assert!(
+        is_denied(&refused),
+        "a session this node had seen and no longer finds was not refused"
+    );
+    assert_eq!(f.deferred, 1);
+    assert_eq!(f.denied, 1);
+}
