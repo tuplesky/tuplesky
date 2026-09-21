@@ -59,9 +59,14 @@ func mapClientError(err error) error {
 }
 
 // mapOutcomeError turns an established non-success outcome that the
-// calling operation cannot represent into a status.
-func mapOutcomeError(kind wire.OutcomeKind) error {
-	switch kind {
+// calling operation cannot represent into a status. It takes the whole
+// result rather than the discriminant because a rejection carries the
+// reason it was rejected for, and the reason -- not the outcome -- is
+// what decides the status an API server should see.
+func mapOutcomeError(res wire.Result) error {
+	switch res.Kind {
+	case wire.OutcomeErrRejected:
+		return mapRejection(res.Reason)
 	case wire.OutcomeErrPermissionDenied:
 		return status.Error(codes.PermissionDenied, "current policy does not permit the operation")
 	case wire.OutcomeErrSessionInvalid:
@@ -73,6 +78,39 @@ func mapOutcomeError(kind wire.OutcomeKind) error {
 	case wire.OutcomeErrFutureRevision:
 		return status.Error(codes.OutOfRange, "revision in the future")
 	default:
-		return status.Errorf(codes.Internal, "unexpected outcome %s", outcomeName(kind))
+		return status.Errorf(codes.Internal, "unexpected outcome %s", outcomeName(res.Kind))
+	}
+}
+
+// mapRejection turns the planner's deterministic refusal into a status.
+//
+// A rejection is a property of the command and the state it executed
+// against, identical on every replica, so none of these is retryable as
+// the same command: the statuses here say what the caller would have to
+// change, and none of them is Unavailable.
+func mapRejection(reason wire.RejectionReason) error {
+	msg := "command rejected: " + reason.String()
+	switch reason {
+	case wire.RejectedInvalid, wire.RejectedNamespaceMismatch:
+		return status.Error(codes.InvalidArgument, msg)
+	case wire.RejectedResponseTooLarge, wire.RejectedTooManyEvents,
+		wire.RejectedTooManyDeletes, wire.RejectedViewTooLarge,
+		wire.RejectedRetryOutOfWindow:
+		return status.Error(codes.ResourceExhausted, msg)
+	case wire.RejectedCounterOverflow:
+		return status.Error(codes.FailedPrecondition, msg)
+	case wire.RejectedUnsupported:
+		return status.Error(codes.Unimplemented, msg)
+	case wire.RejectedRetryConflict, wire.RejectedRetryTooOld:
+		// The sequence this command claimed is not available to it. A
+		// caller that establishes a fresh session gets a fresh window,
+		// which is what Aborted tells a client to do.
+		return status.Error(codes.Aborted, msg)
+	case wire.RejectedSessionInvalid:
+		return status.Error(codes.Unauthenticated, msg)
+	case wire.RejectedRetryUnauthorized, wire.RejectedAdmissionMismatch:
+		return status.Error(codes.PermissionDenied, msg)
+	default:
+		return status.Errorf(codes.Internal, "command rejected: reason %d", uint8(reason))
 	}
 }

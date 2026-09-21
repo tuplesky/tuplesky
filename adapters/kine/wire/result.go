@@ -1,6 +1,9 @@
 package wire
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // The Kine subset of the Rust `coord_state::Response` result schema: the
 // exact postcard bytes a released `Ok` result carries. Variant
@@ -25,7 +28,72 @@ const (
 	OutcomeKineDeleted         OutcomeKind = 22
 	OutcomeErrSessionInvalid   OutcomeKind = 23
 	OutcomeErrPermissionDenied OutcomeKind = 24
+	// OutcomeErrRejected is the planner's deterministic refusal of a
+	// command it executed: the reason is a function of the request and
+	// the state, so every replica reaches it for the same command and
+	// there is nothing to retry. It reaches a Kine caller like any
+	// other outcome, and a decoder that did not know it turned a
+	// well-defined refusal into an undecodable result.
+	OutcomeErrRejected OutcomeKind = 35
 )
+
+// RejectionReason is a `coord_state::RejectionReason` discriminant.
+type RejectionReason uint8
+
+// The reasons a command is rejected at execution.
+const (
+	RejectedInvalid RejectionReason = iota
+	RejectedNamespaceMismatch
+	RejectedResponseTooLarge
+	RejectedTooManyEvents
+	RejectedTooManyDeletes
+	RejectedCounterOverflow
+	RejectedUnsupported
+	RejectedViewTooLarge
+	RejectedRetryConflict
+	RejectedRetryTooOld
+	RejectedRetryOutOfWindow
+	RejectedSessionInvalid
+	RejectedRetryUnauthorized
+	RejectedAdmissionMismatch
+	rejectedBeyond
+)
+
+// String names a reason for an operator.
+func (r RejectionReason) String() string {
+	switch r {
+	case RejectedInvalid:
+		return "invalid request"
+	case RejectedNamespaceMismatch:
+		return "namespace mismatch"
+	case RejectedResponseTooLarge:
+		return "response too large"
+	case RejectedTooManyEvents:
+		return "too many events"
+	case RejectedTooManyDeletes:
+		return "too many deletes"
+	case RejectedCounterOverflow:
+		return "counter overflow"
+	case RejectedUnsupported:
+		return "unsupported operation"
+	case RejectedViewTooLarge:
+		return "view too large"
+	case RejectedRetryConflict:
+		return "retry key bound to another request"
+	case RejectedRetryTooOld:
+		return "retry key below the floor"
+	case RejectedRetryOutOfWindow:
+		return "retry key outside the window"
+	case RejectedSessionInvalid:
+		return "session invalid"
+	case RejectedRetryUnauthorized:
+		return "retry key not this session's"
+	case RejectedAdmissionMismatch:
+		return "admission mismatch"
+	default:
+		return "unknown reason"
+	}
+}
 
 // ErrUnexpectedOutcome: the result names an outcome no Kine request
 // produces.
@@ -76,6 +144,8 @@ type Result struct {
 	// KineDeleted:
 	Deleted bool
 	Prev    *KineKv
+	// ErrRejected:
+	Reason RejectionReason
 }
 
 // DecodeResult parses the postcard bytes of a response with full
@@ -129,11 +199,29 @@ func DecodeResult(payload []byte) (Result, error) {
 		if out.Prev, err = readOptionKineKv(r); err != nil {
 			return Result{}, err
 		}
+	case OutcomeErrRejected:
+		// The reason is a fieldless Rust enum, so postcard writes it as
+		// a bare varint discriminant. Bound it here rather than widening
+		// RejectionReason silently: a reason this package cannot name is
+		// a variant added upstream, and reporting it as an unnamed
+		// integer would turn a diagnosable rejection back into a guess.
+		reason, err := r.varint(2)
+		if err != nil {
+			return Result{}, err
+		}
+		if reason >= uint64(rejectedBeyond) {
+			return Result{}, fmt.Errorf("%w: rejection reason %d", ErrUnexpectedOutcome, reason)
+		}
+		out.Reason = RejectionReason(reason)
 	case OutcomeCompacted, OutcomeErrCompacted, OutcomeErrFutureRevision, OutcomeErrLeaseExists,
 		OutcomeKineCreated, OutcomeErrKeyExists, OutcomeErrSessionInvalid,
 		OutcomeErrPermissionDenied:
 	default:
-		return Result{}, ErrUnexpectedOutcome
+		// Named, not just refused. A result this package does not know
+		// is either a variant added upstream or a request the bridge
+		// mapped to an operation it did not mean to; an error that says
+		// only "unexpected" leaves an operator to guess which.
+		return Result{}, fmt.Errorf("%w: discriminant %d", ErrUnexpectedOutcome, out.Kind)
 	}
 	if !r.done() {
 		return Result{}, ErrTrailingPayloadBytes
@@ -213,6 +301,11 @@ func (res Result) Encode() ([]byte, error) {
 	case OutcomeKineDeleted:
 		w.boolean(res.Deleted)
 		writeOptionKineKv(w, res.Prev)
+	case OutcomeErrRejected:
+		if res.Reason >= rejectedBeyond {
+			return nil, fmt.Errorf("%w: rejection reason %d", ErrUnexpectedOutcome, uint8(res.Reason))
+		}
+		w.varint(uint64(res.Reason))
 	case OutcomeCompacted, OutcomeErrCompacted, OutcomeErrFutureRevision, OutcomeErrLeaseExists,
 		OutcomeKineCreated, OutcomeErrKeyExists, OutcomeErrSessionInvalid,
 		OutcomeErrPermissionDenied:
