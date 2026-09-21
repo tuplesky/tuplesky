@@ -4571,10 +4571,31 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
         said[1],
         said[2]
     );
+    // What must not happen is the hold's own bound being reached. Under
+    // this load a collector's fan-out is sometimes more than a peer's
+    // lane can queue, the transport drops it, and that voter is never
+    // told where the evidence for that command belongs -- so the hold
+    // expiring is ordinary here and is not what this asserts. The bound
+    // is sized for one hold's worth of that; reaching it would mean the
+    // bound and the traffic had diverged.
     for (n, s) in said.iter().enumerate() {
         assert!(
-            !s.contains("dropped evidence no submission ever claimed"),
-            "voter {} dropped evidence a caller's collector was waiting for:\n{}",
+            !s.contains("dropped held evidence for want of room"),
+            "voter {} ran out of room to hold evidence in:\n{}",
+            n + 1,
+            s
+        );
+    }
+    // And the hold is released, not merely filled. Under this load
+    // every voter meets a command whose submission the transport
+    // dropped, so every voter should have let evidence go on the
+    // window rather than carried it until something newer needed the
+    // room. A run where this is false is a run where the hold has
+    // stopped expiring, which is how the bound gets reached.
+    for (n, s) in said.iter().enumerate() {
+        assert!(
+            s.contains("let go of evidence no submission named inside the window"),
+            "voter {} never released held evidence, so the window is not expiring:\n{}",
             n + 1,
             s
         );
