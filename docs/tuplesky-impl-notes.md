@@ -2370,6 +2370,44 @@ it at the second invocation. On the composed path the difference is the
 whole benchmark: the rows that refused 230 of 300 and then 300 of 300
 complete 300 of 300.
 
+### Two things left open, and what is known about each
+
+**A replica that falls behind recovers, but not fast enough for its own
+callers.** Stated above, published with
+[the matrix](operations/wan-results.md#the-finding-this-run-exposed),
+and belonging with [task-j07](design/tuplesky-prs-plan.md#task-j07).
+
+**A voter drops a caller's acknowledgement when submissions lag behind
+proposals.** `bins/coordd/src/serve.rs` holds peer evidence for a
+command whose submitting collector this voter does not know yet, because
+a voter can learn a command from a peer before the submission naming it
+arrives, and handing that acknowledgement to the collector in this
+process would lose it. The queue is bounded at 256 entries, oldest
+first, and its comment assumes the window is "one frame per command
+between this voter acknowledging it and the submission naming it
+arriving here".
+
+Under sustained load that is not the window. A submission this voter
+refuses with `Backpressure` never tells it where the evidence goes, so
+the entry waits for a presentation that may not come while the leader's
+proposals keep arriving behind it. The queue overflows, the oldest goes,
+and a caller's collector is one acknowledgement short -- recovered,
+because the command is decided and durable and the caller resolves it by
+identity, but recovered through a path that should not be in use.
+
+`a_quorum_keeps_answering_past_its_table_capacity` asserts that no voter
+says `dropped evidence no submission ever claimed`, and on a loaded
+machine it fails about two runs in five. That is a real assertion about
+a real symptom, not a flaky one: every request in the run is still
+answered, which the assertions above it check, and this one is the
+hygiene check that says the answers did not come through the recovery
+path. It is pre-existing -- two failures in five on the commit before
+the retry-floor change -- and it is
+[task #81](design/tuplesky-prs-plan.md#task-63), left open here rather
+than silenced, because the choice between holding the evidence longer
+and discarding it when the submission is refused is a question about the
+collector boundary and not a bound to raise.
+
 ### What the benchmark harness had to get right to find these
 
 A closed-loop benchmark would not have found the fifth or the sixth. It sends the next
