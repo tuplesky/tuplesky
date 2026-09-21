@@ -894,7 +894,8 @@ fn main() -> ExitCode {
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \
 saturated={} unavailable={} refused={} released={} returned={} unreturnable={} \
-watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={}",
+watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={} \
+crowded_out={}",
             counts.queued_local,
             counts.queued_remote,
             counts.not_a_voter,
@@ -909,7 +910,8 @@ watches={} watch_frames={} watches_lost={} unserved={} parked={} unclaimed={}",
             counts.watches_lost,
             counts.unserved,
             counts.parked,
-            counts.unclaimed
+            counts.unclaimed,
+            counts.crowded_out
         );
         ExitCode::from(1)
     })

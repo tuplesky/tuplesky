@@ -156,9 +156,24 @@ pub struct Counts {
     /// Evidence this voter produced for a command whose submitter it did
     /// not know yet, held until it does.
     pub parked: u64,
-    /// Held evidence dropped because the submission it was waiting for
-    /// never arrived here.
+    /// Held evidence let go because the submission naming it did not
+    /// arrive inside the window the race can take.
+    ///
+    /// Ordinary under load, and the ordinary cause is named: a
+    /// collector's fan-out that the peer's lane could not queue is
+    /// dropped by the transport, so this voter is never told where that
+    /// command's evidence belongs. The command is decided and durable
+    /// on a quorum that did get the submission, and the caller resolves
+    /// it by identity.
     pub unclaimed: u64,
+    /// Held evidence dropped because the hold itself was full.
+    ///
+    /// Not ordinary. The hold is bounded by the commands that can be in
+    /// this state at once, and reaching it means more were than the
+    /// bound allows for -- an operator wants to know that the bound and
+    /// the traffic have diverged, which is a different thing from a
+    /// submission that never came.
+    pub crowded_out: u64,
 }
 
 impl Frontend {
@@ -630,17 +645,43 @@ pub struct Domain<P: Persistence> {
     asked: Option<(std::time::Instant, usize)>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
-    parked: VecDeque<(CommandId, PeerProvenance, Vec<u8>)>,
+    parked: VecDeque<Parked>,
     budgets: Budgets,
 }
 
+/// How long evidence waits for the submission that says where it goes.
+///
+/// The race this covers is short: the submission and the proposal leave
+/// the collector's node at nearly the same moment, and the proposal
+/// arriving first is a matter of scheduling, not of distance. What the
+/// window must not be is open-ended, because the other way a submission
+/// fails to arrive is that it never will -- a fan-out the peer's lane
+/// could not queue is dropped by the transport, and no retry of that
+/// presentation is coming. Holding those until the depth bound evicts
+/// them makes an ordinary consequence of backpressure look like a bound
+/// that is wrong.
+///
+/// A second is orders of magnitude past the race and still short enough
+/// that a loaded voter holds one second's evidence rather than a whole
+/// depth of it.
+const PARKED_HOLD: core::time::Duration = core::time::Duration::from_secs(1);
+
 /// How much evidence a node holds for want of a submitter.
 ///
-/// The window is one frame per command between this voter acknowledging
-/// it and the submission naming it arriving here, so the depth that
-/// matters is the commands in flight at once. This is comfortably past
-/// the command table's own capacity.
+/// With the hold above this is a ceiling rather than the working bound:
+/// what is normally in here is one second's worth of a race that is won
+/// in microseconds. Reaching it is a signal in its own right, counted
+/// and said apart from the hold expiring.
 const PARKED_EVIDENCE: usize = 256;
+
+/// One piece of evidence waiting for the submission that places it.
+struct Parked {
+    command: CommandId,
+    provenance: PeerProvenance,
+    bytes: Vec<u8>,
+    /// When it was parked, so the hold above can be applied to it.
+    since: std::time::Instant,
+}
 
 /// How often a node repeats a request for a payload it is waiting on.
 ///
@@ -1188,7 +1229,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// coming; the command is decided and durable either way, and the
     /// caller resolves it by identity.
     fn park(&mut self, command: CommandId, provenance: PeerProvenance, bytes: &[u8]) {
-        self.parked.push_back((command, provenance, bytes.to_vec()));
+        self.parked.push_back(Parked {
+            command,
+            provenance,
+            bytes: bytes.to_vec(),
+            since: std::time::Instant::now(),
+        });
         self.frontend.counts.parked += 1;
         // Said once, not once per frame. That this happens at all is
         // ordinary -- it is a command this voter heard about from a
@@ -1199,19 +1245,22 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
         while self.parked.len() > PARKED_EVIDENCE {
             self.parked.pop_front();
-            self.frontend.counts.unclaimed += 1;
-            // This one is not ordinary: a caller's collector is one
-            // acknowledgement short and will not be told why.
-            if self.frontend.counts.unclaimed == 1 {
-                eprintln!("this voter dropped evidence no submission ever claimed");
+            self.frontend.counts.crowded_out += 1;
+            // Said once, and not the same thing as the hold expiring:
+            // this is the bound itself being reached, which it should
+            // not be while the hold is doing the releasing.
+            if self.frontend.counts.crowded_out == 1 {
+                eprintln!("this voter dropped held evidence for want of room");
             }
         }
     }
 
-    /// Deliver held evidence whose submitter this voter now knows.
+    /// Deliver held evidence whose submitter this voter now knows, and
+    /// let go of what has waited longer than the race can take.
     ///
     /// Called after submissions are taken in, which is the only thing
-    /// that can supply the answer.
+    /// that can supply the answer, and on every local turn, which is
+    /// what makes the hold expire on a node nobody is submitting to.
     fn route_parked(&mut self, api: &Transport) {
         if self.parked.is_empty() {
             return;
@@ -1219,12 +1268,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &self.backing else {
             return;
         };
+        let now = std::time::Instant::now();
         let mut still_waiting = VecDeque::with_capacity(self.parked.len());
         let mut ready = Vec::new();
-        for (command, provenance, bytes) in core::mem::take(&mut self.parked) {
-            match voter.origin_of(&command) {
-                Some(origin) => ready.push((origin, provenance, bytes)),
-                None => still_waiting.push_back((command, provenance, bytes)),
+        for held in core::mem::take(&mut self.parked) {
+            match voter.origin_of(&held.command) {
+                Some(origin) => ready.push((origin, held.provenance, held.bytes)),
+                // Past the window the race takes, so the submission is
+                // not late, it is not coming. Let it go rather than
+                // hold it until something newer needs the room.
+                None if now.duration_since(held.since) >= PARKED_HOLD => {
+                    self.frontend.counts.unclaimed += 1;
+                    if self.frontend.counts.unclaimed == 1 {
+                        eprintln!(
+                            "this voter let go of evidence no submission named inside the window"
+                        );
+                    }
+                }
+                None => still_waiting.push_back(held),
             }
         }
         self.parked = still_waiting;
