@@ -83,8 +83,8 @@ second whatever the other three hundred and ninety-nine did, because the
 achieved rate is the count over the wall time and the wall time is the
 straggler's. Where a row shows a rate near forty with one or two
 `unknown`, that is what happened, and the per-path `whole` distribution
-in the row's own report is the honest reading of it. This is the open
-finding below, and it is the single largest limitation on this page.
+in the row's own report is the honest reading of it. See below: it has a
+cause, and the cause is fixed.
 
 **Queue against service.** Where the queue tail grows, the callers were
 the bottleneck, not the domain. Raise `--callers` and run again before
@@ -136,22 +136,28 @@ result. `scripts/bench/wan-matrix.sh` takes them unchanged on a host that
 has them: give it `REGIONS`, and it applies the topology, records the
 impairment the script prints, and runs the same rows.
 
-## The open finding
+## Why some rows show unknowns
 
-About one operation in two hundred is never answered. It is not
-slowness: the same count is lost with a two-second deadline, a
-four-second one and a thirty-second one, and the thirty-second run's
-straggler waits the whole thirty seconds. Every voter is idle when it
-happens and every command in the table has executed, while a caller's
-stream is still held; no refusal is recorded on any node. What is known
-and what has been ruled out is written up in
-[the implementation notes](../tuplesky-impl-notes.md), under the
+The rows above were produced before the last of the defects the matrix
+found was fixed, and they carry its signature: about one operation in
+two hundred was never answered, which shows as one or two `unknown` in a
+row and, because the achieved rate is the count over the wall time and
+the wall time is then the straggler's, as a rate near forty whatever the
+other three hundred and ninety-eight operations did.
+
+The cause is now understood and fixed: a voter that learned a command's
+content from a peer rather than from the collector's submission
+acknowledged it, had nowhere to send that acknowledgement because no
+submission had reached it yet, and the acknowledgement was dropped --
+so the caller's collector was one vote short of learning the command
+independently, for ever. It is written up in
+[the implementation notes](../tuplesky-impl-notes.md) under the
 benchmark's findings.
 
-It is published rather than smoothed over. The reports count these as
-`unknown`, which is what they are -- the client does not know, and the
-invocation stays resolvable by its identity -- and no row here has been
-re-run until it came out clean.
+These rows are kept as they were measured rather than re-run, and they
+are the reason the rate columns above may not be read as throughput.
+The rows to quote are the paced ones that completed everything they
+offered.
 
 ## What these results may not be used for
 

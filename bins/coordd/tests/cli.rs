@@ -4489,9 +4489,17 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
     // records. A follower in that state reclaims ahead of the leader,
     // and the next proposal names the command it has just retired: the
     // dependency guard has to read that as executed, because it was.
+    // Four, not two. What this phase is really for is the race between
+    // a voter hearing a command's identity from the leader and hearing
+    // its content from the collector, and the more callers there are
+    // the more often the first wins.
     const EACH: u64 = 120;
-    let first = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x44; 16]).await;
-    let second = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x45; 16]).await;
+    const CALLERS: usize = 4;
+    let mut callers = Vec::new();
+    for n in 0..CALLERS {
+        let session = [0x44 + n as u8; 16];
+        callers.push(Caller::bind(&running[0], &cluster.ca, &cluster.ring, session).await);
+    }
     async fn ask_all(caller: &Caller, tag: u8) -> u64 {
         let mut answered = 0;
         for n in 1..=EACH {
@@ -4505,11 +4513,23 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
         }
         answered
     }
-    let (a, b) = tokio::join!(ask_all(&first, 1), ask_all(&second, 2));
+    let mut work = Vec::new();
+    for (n, caller) in callers.iter().enumerate() {
+        work.push(ask_all(caller, n as u8 + 1));
+    }
+    // Every caller keeps one request in flight at a time, and all of
+    // them are in flight at once.
+    let (a, b, c, d) = tokio::join!(
+        work.remove(0),
+        work.remove(0),
+        work.remove(0),
+        work.remove(0)
+    );
+    let answered = vec![a, b, c, d];
     assert_eq!(
-        (a, b),
-        (EACH, EACH),
-        "two callers past the capacity were answered {a} and {b} of {EACH} each\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        answered,
+        vec![EACH; CALLERS],
+        "{CALLERS} callers past the capacity were answered {answered:?} of {EACH} each\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
         running[0].said(),
         running[1].said(),
         running[2].said()
@@ -4520,7 +4540,7 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
     // a replicated command like any other -- was refused at a door
     // that tells the caller nothing, and the binding waited out its
     // deadline. So the last thing asked here is a new session.
-    let later = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x46; 16]).await;
+    let later = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x50; 16]).await;
     assert!(
         ask(&later.connection, &later.put(1, b"after", b"v"))
             .await
@@ -4530,4 +4550,27 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
         running[1].said(),
         running[2].said()
     );
+
+    // Two callers at once is also what makes a voter hear about a
+    // command from a peer before the collector asks it for one, so this
+    // run is where the holding path is exercised. The assertions above
+    // are the ones that matter; these two say that they were not
+    // passed vacuously, and that nothing was lost on the way.
+    let said: Vec<String> = running.iter().map(Running::said).collect();
+    assert!(
+        said.iter()
+            .any(|s| s.contains("holding evidence for a submitter it does not know yet")),
+        "no voter ever held evidence, so this run did not exercise the path it is here for\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        said[0],
+        said[1],
+        said[2]
+    );
+    for (n, s) in said.iter().enumerate() {
+        assert!(
+            !s.contains("dropped evidence no submission ever claimed"),
+            "voter {} dropped evidence a caller's collector was waiting for:\n{}",
+            n + 1,
+            s
+        );
+    }
 }
