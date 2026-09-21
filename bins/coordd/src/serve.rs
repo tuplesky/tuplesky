@@ -13,7 +13,7 @@
 //! do: a join that happened in several places would be several
 //! opportunities for one of them to answer the wrong caller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use coord_authn::ClockHealth;
 use coord_checkpoint::local::LocalLimits;
@@ -35,8 +35,8 @@ use coord_session::{BindingConfig, BoundFrontend, Delivered, StorePolicySource};
 use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_transport::{Responder, Transport, TransportEvent};
-use coord_types::RetryKey;
 use coord_types::wire_v1::{Frame, MessageV1, decode};
+use coord_types::{CommandId, RetryKey};
 
 /// Why the loop could not be built.
 #[derive(Debug)]
@@ -153,6 +153,12 @@ pub struct Counts {
     /// Frames and effects this build has no loop for yet, counted rather
     /// than discarded so what arrives is visible.
     pub unserved: u64,
+    /// Evidence this voter produced for a command whose submitter it did
+    /// not know yet, held until it does.
+    pub parked: u64,
+    /// Held evidence dropped because the submission it was waiting for
+    /// never arrived here.
+    pub unclaimed: u64,
 }
 
 impl Frontend {
@@ -576,8 +582,19 @@ pub struct Domain<P: Persistence> {
     /// not a turn count: a domain with nothing else happening takes no
     /// turns, and that is exactly when the asking has to go on.
     asked: Option<std::time::Instant>,
+    /// Evidence this voter has produced for commands whose submitter it
+    /// does not know yet, oldest first.
+    parked: VecDeque<(CommandId, PeerProvenance, Vec<u8>)>,
     budgets: Budgets,
 }
+
+/// How much evidence a node holds for want of a submitter.
+///
+/// The window is one frame per command between this voter acknowledging
+/// it and the submission naming it arriving here, so the depth that
+/// matters is the commands in flight at once. This is comfortably past
+/// the command table's own capacity.
+const PARKED_EVIDENCE: usize = 256;
 
 /// How often a node repeats a request for a payload it is waiting on.
 ///
@@ -623,6 +640,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
             asked: None,
+            parked: VecDeque::new(),
             budgets,
         }
     }
@@ -921,6 +939,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             eprintln!("this voter's machine refused: {why}");
         }
         self.carry(api, out, provenance);
+        // A submission is the only thing that can say where this voter's
+        // evidence for a command belongs, so whatever was waiting for
+        // one is tried again here.
+        self.route_parked(api);
         Ok(did)
     }
 
@@ -1051,31 +1073,118 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// would leave the caller's collector with nothing to count and
     /// hand a second collector evidence for a request it never made.
     ///
-    /// Where this voter admitted the command locally -- and where it
-    /// cannot say, which is what an unrecognised or forgotten command
-    /// looks like -- the frame goes to the collector in this process.
-    /// The bytes are the same bytes either way: what changes is which
-    /// process counts them, and the identity they are counted under is
-    /// this voter's committed one in both cases.
+    /// Where this voter admitted the command locally, the frame goes to
+    /// the collector in this process. The bytes are the same bytes
+    /// either way: what changes is which process counts them, and the
+    /// identity they are counted under is this voter's committed one in
+    /// both cases.
+    ///
+    /// Where it cannot say at all, the frame is held rather than
+    /// delivered here. A voter learns a command's content from a
+    /// submission *or* from a peer, and when it learns it from a peer it
+    /// acknowledges a command no collector has yet asked it for. That
+    /// acknowledgement belongs to whichever collector did the asking,
+    /// and the submission naming it is usually already in flight; giving
+    /// it to the collector in this process instead loses it, because
+    /// that collector has never heard of the command. So it waits for
+    /// the submission to say where it goes.
     fn hand_to_collector(&mut self, api: &Transport, provenance: PeerProvenance, bytes: &[u8]) {
         let Ok(frame) = one_frame(bytes) else {
             self.frontend.counts.unserved += 1;
             return;
         };
-        let owed = self.owed_to(&frame);
-        if let Some(coord_daemon::voter::Origin::Connection(id)) = owed {
-            let sent = api.send(
-                coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
-                self.frontend.membership.domain(),
-                bytes.to_vec(),
-            );
-            match sent {
-                Ok(()) => self.frontend.counts.returned += 1,
-                Err(_) => self.frontend.counts.unreturnable += 1,
+        match self.owed_to(&frame) {
+            Some(coord_daemon::voter::Origin::Connection(id)) => {
+                self.return_to_collector(api, id, bytes);
             }
+            Some(coord_daemon::voter::Origin::Local) => {
+                self.on_frame_from_voter(provenance, &frame);
+            }
+            None => match command_of_frame(&frame) {
+                Some(command) => self.park(command, provenance, bytes),
+                // Not about a command at all: nothing can arrive later to
+                // say where it belongs, so this process is where it ends.
+                None => self.on_frame_from_voter(provenance, &frame),
+            },
+        }
+    }
+
+    /// Send a frame back to the collector on the other end of `id`.
+    fn return_to_collector(&mut self, api: &Transport, id: u64, bytes: &[u8]) {
+        let sent = api.send(
+            coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
+            self.frontend.membership.domain(),
+            bytes.to_vec(),
+        );
+        match sent {
+            Ok(()) => self.frontend.counts.returned += 1,
+            Err(_) => self.frontend.counts.unreturnable += 1,
+        }
+    }
+
+    /// Hold a frame until the submission that says where it belongs
+    /// arrives.
+    ///
+    /// Bounded, and by the same thing the window is: a command can be in
+    /// this state only between this voter acknowledging it and the
+    /// submission reaching this voter, so the queue is as deep as the
+    /// commands that can be in flight at once. Past the bound the oldest
+    /// goes, which is the one whose submission is least likely still
+    /// coming; the command is decided and durable either way, and the
+    /// caller resolves it by identity.
+    fn park(&mut self, command: CommandId, provenance: PeerProvenance, bytes: &[u8]) {
+        self.parked.push_back((command, provenance, bytes.to_vec()));
+        self.frontend.counts.parked += 1;
+        // Said once, not once per frame. That this happens at all is
+        // ordinary -- it is a command this voter heard about from a
+        // peer before the collector asked it -- and an operator wants
+        // to know the path is in use without a line per acknowledgement.
+        if self.frontend.counts.parked == 1 {
+            eprintln!("this voter is holding evidence for a submitter it does not know yet");
+        }
+        while self.parked.len() > PARKED_EVIDENCE {
+            self.parked.pop_front();
+            self.frontend.counts.unclaimed += 1;
+            // This one is not ordinary: a caller's collector is one
+            // acknowledgement short and will not be told why.
+            if self.frontend.counts.unclaimed == 1 {
+                eprintln!("this voter dropped evidence no submission ever claimed");
+            }
+        }
+    }
+
+    /// Deliver held evidence whose submitter this voter now knows.
+    ///
+    /// Called after submissions are taken in, which is the only thing
+    /// that can supply the answer.
+    fn route_parked(&mut self, api: &Transport) {
+        if self.parked.is_empty() {
             return;
         }
-        self.on_frame_from_voter(provenance, &frame);
+        let Backing::Voting(voter) = &self.backing else {
+            return;
+        };
+        let mut still_waiting = VecDeque::with_capacity(self.parked.len());
+        let mut ready = Vec::new();
+        for (command, provenance, bytes) in core::mem::take(&mut self.parked) {
+            match voter.origin_of(&command) {
+                Some(origin) => ready.push((origin, provenance, bytes)),
+                None => still_waiting.push_back((command, provenance, bytes)),
+            }
+        }
+        self.parked = still_waiting;
+        for (origin, provenance, bytes) in ready {
+            match origin {
+                coord_daemon::voter::Origin::Connection(id) => {
+                    self.return_to_collector(api, id, &bytes);
+                }
+                coord_daemon::voter::Origin::Local => {
+                    if let Ok(frame) = one_frame(&bytes) {
+                        self.on_frame_from_voter(provenance, &frame);
+                    }
+                }
+            }
+        }
     }
 
     /// Which collector this voter owes a frame to, where it knows.
@@ -1088,14 +1197,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &self.backing else {
             return None;
         };
-        let command = match frame.kind {
-            KIND_EVIDENCE => coord_consensus::ProtocolMessage::decode(&frame.payload)
-                .ok()?
-                .command()?,
-            KIND_RELEASE => decode_release(frame).ok()?.established().command(),
-            _ => return None,
-        };
-        voter.origin_of(&command)
+        voter.origin_of(&command_of_frame(frame)?)
     }
 
     /// One frame of a voter's evidence, for the collector in this
@@ -1419,12 +1521,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 let provenance = voter.provenance();
                 self.carry(api, out, provenance);
             }
+            // A refusal at the machine's door still told this voter
+            // where the command came from -- a duplicate submission is
+            // exactly the case where the evidence went out before the
+            // submitter was known -- so what was held is tried again
+            // either way.
             Ok(Err(why)) => {
                 eprintln!("this voter refused a collector's submission: {why:?}");
                 self.frontend.counts.refused += 1;
             }
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
         }
+        self.route_parked(api);
     }
 
     async fn carry_out(
@@ -1791,6 +1899,24 @@ fn hex4(replica: &coord_types::ids::ReplicaId) -> String {
 /// The peer plane's next event, or nothing for ever when there is no
 /// peer plane.
 ///
+/// The command a voter's frame is about, where it is about one.
+///
+/// Read from the frame's own payload rather than tracked beside it, for
+/// the same reason [`Domain::owed_to`] does: a second bookkeeping of
+/// which frame belongs to which command is a second thing that can be
+/// wrong.
+fn command_of_frame(frame: &Frame) -> Option<CommandId> {
+    match frame.kind {
+        KIND_EVIDENCE => coord_consensus::ProtocolMessage::decode(&frame.payload)
+            .ok()?
+            .command(),
+        KIND_RELEASE => decode_release(frame)
+            .ok()
+            .map(|r| r.established().command()),
+        _ => None,
+    }
+}
+
 /// A `select!` arm needs a future either way. A process with no peers
 /// must not have its arm resolve immediately -- that would spin the loop
 /// -- so it gets one that never completes and the other arms decide.

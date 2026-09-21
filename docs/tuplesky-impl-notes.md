@@ -1654,8 +1654,8 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-seven things. Six are fixed here and one is open; each became
-findable only once the ones before it were.
+seven things. All seven are fixed here, and each became findable
+only once the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counted the watch and dropped the responder.
@@ -1958,52 +1958,74 @@ questions in a row, or two at once, and nothing had ever held one of its
 streams open across two writes. A Kubernetes API server does all three
 while it is still booting.
 
-**Open: about one operation in two hundred is never answered.** With
-four callers against three voters, a run of two hundred operations ends
-with one or two that reach their deadline. It is not slowness. A run
-with a two-second deadline, a four-second one and a thirty-second one
-all lose the same count, and the thirty-second run's straggler waits the
-full thirty seconds: a count that does not move when the deadline moves
-is something that never completes.
+**And about one operation in two hundred was never answered.** With
+four callers against three voters, a run of two hundred operations ended
+with one or two that reached their deadline. Not slowness: a
+two-second deadline, a four-second one and a thirty-second one all lost
+the same count, and the thirty-second run's straggler waited the whole
+thirty seconds. A count that does not move when the deadline moves is
+something that never completes.
 
-What is known about it. Every voter is idle when it happens -- nothing
-queued for the journal, nothing unmaterialized, nothing withheld in an
-outbox, every record in the command table executed -- while each node
-still holds a caller's stream open. The collector on the node holding
-the stream reports the invocation as `awaiting-release`: it has the
-votes and is waiting for the leader's release, which the leader
-emitted. No refusal is recorded anywhere, on any node, for those
-commands, and the frontend's `unserved` counter, which counts a
-delivery that found no stream waiting, stays at zero. So the release
-left the leader addressed to the right collector and did not arrive.
+Every voter was idle when it happened. Nothing queued for the journal,
+nothing unmaterialized, nothing withheld in an outbox, every record in
+every command table executed -- and a caller's stream still held open.
+The collector holding that stream reported the invocation as
+`awaiting-release`; it had its votes and was waiting for a release the
+leader had already sent. No refusal was recorded anywhere.
 
-What has been ruled out: the leader's command table (every record
-executed), the payload path (nothing missing), the voter's ingress
-(empty), the submission fan-out (no destination refused, saturated or
-unroutable), a bounded map of which collector a command is owed to (its
-bound is sixty-four times the commands in the run), and a release
-routed to the wrong collector (the single one that happens is the
-leader's own lease-authority command, which no caller is waiting for).
+The count that gave it away was the collector's own. For the lost
+command it had exactly **one** vote -- the leader's -- while both
+followers had refused the submission as a `Duplicate`. They had already
+accepted that command; they simply never told the collector so.
 
-It is written down rather than fixed because a fix has to be the right
-one. A first attempt in this pass -- bounding the leader's per-command
-memory, which is genuinely unbounded today and is the other half of
-this -- was reverted rather than shipped: with it,
-`a_quorum_keeps_answering_past_its_table_capacity` fails every run, one
-to four operations short of four hundred and eighty, where without it
-it passes every run. That is the useful part of the experiment. The
-defect reproduces in-process, in seconds, under a debugger, the moment
-that bound is put back, and that is where the next attempt starts. Bounding the leader's proposals, vote
-sets and payloads belongs with
-[task-j07](design/tuplesky-prs-plan.md#task-j07), whose subject is
-bounded memory under load; what that experiment showed is that
-something still reads a command's leader state after it has executed,
-and the coupling has to be named before the memory can be bounded.
+A voter learns a command's content from a submission *or* from a peer.
+When it learns it from a peer -- because the leader's proposal outran
+the collector's submission and it asked for the payload -- it
+initializes the command and acknowledges it, correctly. But
+acknowledgement is owed to the collector that asked for the work, and
+this voter has not been asked yet: no submission has reached it, so it
+has nothing to say where the acknowledgement belongs. The daemon's rule
+for that case was to hand the frame to the collector in its own process,
+and that collector has never heard of the command, so the frame was
+dropped. Moments later the real submission arrived, the retry key was
+already bound, the replica refused it as a duplicate, and the
+acknowledgement was never produced again.
 
-Until then the matrix reports these as `unknown`, which is what they
-are: the client does not know, the invocation remains resolvable by its
-identity, and the operation is durable either way. They are not
-subtracted from anything and not counted as errors.
+The domain was never wrong: the command was ordered, executed and
+durable, and every voter agreed. What was lost was one third of the
+evidence the *caller's* collector needs to learn it independently, which
+is the whole reason the collector counts votes rather than trusting one
+replica's word.
+
+So evidence with no known submitter is now held instead of misdelivered,
+and a submission -- including one refused as a duplicate, which is
+exactly the case that produces this -- is what releases it. The hold is
+bounded by the thing the window is bounded by: a command can be in this
+state only between this voter acknowledging it and the submission
+reaching it, so the depth that matters is the commands in flight at
+once. Past the bound the oldest goes and says so, because a caller's
+collector is then one acknowledgement short and will not be told why.
+
+Two things this makes visible that were not. A voter now says once that
+it is holding evidence for a submitter it does not know, which is
+ordinary and worth seeing; and it says once if it ever drops any, which
+is not. `a_quorum_keeps_answering_past_its_table_capacity` asserts on
+both, and the second half of it -- four callers in flight past the
+table's capacity -- fails without the fix with a caller one or two
+short of its hundred and twenty.
+
+*A wrong turn worth recording.* The obvious first suspect was the
+leader's per-command memory, which is genuinely unbounded: proposals,
+vote sets and payloads are kept for the life of the process. Bounding
+them made the loss dramatically worse -- every run failed instead of one
+in two hundred -- and that looked like a second defect. It was the same
+one. Forgetting a payload makes a follower ask a peer for it, asking a
+peer is how a follower comes to hold a command no collector has asked it
+for, and every one of those was a chance to drop an acknowledgement. The
+bound was reverted at the time for being unsafe; with the routing fixed
+it passes, which is how the coupling was finally named. Bounding that
+memory is still worth doing and belongs with
+[task-j07](design/tuplesky-prs-plan.md#task-j07).
 
 ### What the benchmark harness had to get right to find these
 
