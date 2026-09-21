@@ -604,8 +604,10 @@ pub struct Domain<P: Persistence> {
     /// that runs no voter schedules nothing: an expiry is a command,
     /// and proposing one is a leader's.
     expiry: Option<crate::leases::Expiry>,
-    /// Turns spent holding a command whose payload this node lacks.
-    asking: u64,
+    /// When this node last asked for a payload it lacks. A time and
+    /// not a turn count: a domain with nothing else happening takes no
+    /// turns, and that is exactly when the asking has to go on.
+    asked: Option<std::time::Instant>,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -643,8 +645,13 @@ pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
     }
 }
 
-/// Turns between two asks for a missing payload.
-const ASK_EVERY: u64 = 16;
+/// How often a node repeats a request for a payload it is waiting on.
+///
+/// Bounded by time rather than by events for the same reason the ask
+/// exists at all: the replica that can answer may not have been able to
+/// the first time -- its own proposal was not durable yet -- and nothing
+/// else is going to happen on an idle domain to prompt a second try.
+const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Something in a domain that has work due at a time rather than on an
 /// event.
@@ -707,7 +714,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             plane: None,
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
-            asking: 0,
+            asked: None,
             budgets,
             recorder,
         }
@@ -904,6 +911,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
                 wake.unwrap_or_else(std::time::Instant::now),
             ));
+            // A replica waiting for the content of a command it knows
+            // by identity is waiting on a message no socket here will
+            // deliver on its own: the peer it asked may not have been
+            // able to answer -- its own proposal was not durable yet --
+            // and on an idle domain nothing else will prompt a second
+            // ask. So it comes back on a timer rather than waiting for
+            // an event that is not coming. Every command after the one
+            // it lacks is queued behind it, and so is every caller
+            // whose stream this node is holding.
+            let waiting_for_content = match &self.backing {
+                Backing::Voting(v) => v.awaiting().is_some() || v.wants_payloads(),
+                Backing::Serving(_) => false,
+            };
             let arrived = tokio::select! {
                 biased;
                 // Voter work that is still outstanding pre-empts waiting
@@ -911,6 +931,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // turn actually did something, so a voter that cannot
                 // progress waits rather than spins.
                 () = std::future::ready(()), if progressed => continue,
+                () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                 peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                 event = transport.next_event() => event.map(Arrived::Api),
                 () = sleep, if wake.is_some() => continue,
@@ -977,12 +998,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // enough until the answer comes, and a busy domain must not
         // turn one missing payload into a request per event.
         if voter.awaiting().is_some() || voter.wants_payloads() {
-            self.asking = self.asking.saturating_add(1);
-            if self.asking % ASK_EVERY == 1 {
+            let now = std::time::Instant::now();
+            if self
+                .asked
+                .is_none_or(|last| now.duration_since(last) >= PAYLOAD_RETRY)
+            {
+                self.asked = Some(now);
                 out.absorb(voter.request_payloads()?);
             }
         } else {
-            self.asking = 0;
+            self.asked = None;
         }
         // Expiry is the leader's to schedule, and every candidate it
         // produces is conditional: nothing here decides that a key

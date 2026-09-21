@@ -689,7 +689,8 @@ fn votes_are_collected_but_never_learned_here() {
     assert!(votes.learned_slow().is_some());
     assert_eq!(leader.table().phase_of(&c1), Some(Phase::Commit));
     assert_eq!(leader.next_executable(), Some(c1));
-    // Acknowledgements for an unknown command are refused.
+    // An acknowledgement for a command this leader has not proposed is
+    // held rather than refused, and counts for nothing until it does.
     let (_, unknown) = admitted(7, 7, 7);
     let stray = FastAck {
         command: unknown,
@@ -700,9 +701,70 @@ fn votes_are_collected_but_never_learned_here() {
             .step(peer(1, ProtocolMessage::FastAck(stray)))
             .is_empty()
     );
+    assert_eq!(leader.take_rejections(), vec![]);
+    assert!(
+        leader.votes(&unknown).is_none(),
+        "a held acknowledgement is not a vote set"
+    );
+}
+
+/// An acknowledgement that outruns the leader's own proposal still
+/// counts toward the fast path.
+///
+/// Every voter is sent the same submission, so a voter that initializes
+/// it first acknowledges it before this leader has ordered it. Refusing
+/// that acknowledgement does not lose the command -- the slow path
+/// learns it -- but it costs a round trip on every command whose
+/// acknowledgement wins the race, and under concurrent callers that is
+/// most of them. The benchmark saw a thousand of these on the leader in
+/// one matrix.
+#[test]
+fn an_acknowledgement_that_arrives_before_the_proposal_still_counts() {
+    let mut leader = booted();
+    // The command's identity, without offering it to the leader yet.
+    let (e1, c1) = admitted(1, 1, 1);
+    let mut ahead = booted();
+    let effects = ahead.step(e1.clone());
+    ahead.step(durable(&effects, 1).remove(0));
+    let proposal = ahead.proposal(&c1).unwrap();
+    let (path, paths) = (proposal.path, proposal.paths.clone());
+    let admitted_under = ahead
+        .table()
+        .record(&c1)
+        .and_then(|r| r.payload)
+        .expect("initialized");
+
+    // r1 acknowledges first. The leader has proposed nothing.
+    let early = FastAck {
+        replica: r(1),
+        ballot: ballot(0, 0),
+        command: c1,
+        deps: vec![],
+        paths,
+        path,
+        admission: admitted_under,
+        seqnum: None,
+    };
+    assert!(
+        leader
+            .step(peer(1, ProtocolMessage::FastAck(early)))
+            .is_empty()
+    );
+
+    // Now the submission reaches it. The held acknowledgement joins the
+    // leader's own, so the fast set is complete without another round.
+    let effects = leader.step(e1);
+    leader.step(durable(&effects, 1).remove(0));
+    let votes = leader.votes(&c1).expect("proposed");
+    assert_eq!(
+        votes.voted(),
+        [r(0), r(1)].into(),
+        "the acknowledgement that arrived first was not counted"
+    );
     assert_eq!(
         leader.take_rejections(),
-        vec![Rejection::Vote(VoteError::WrongCommand)]
+        vec![],
+        "holding an early acknowledgement is not a refusal"
     );
 }
 

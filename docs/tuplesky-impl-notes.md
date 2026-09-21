@@ -1743,8 +1743,8 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-five things. All five are fixed here, and the last two only
-became findable once the ones before them were.
+seven things. Six are fixed here and one is open; each became
+findable only once the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counted the watch and dropped the responder.
@@ -1948,6 +1948,36 @@ now carries the composition's half: past the capacity sequentially, then
 past it again with two callers in flight, and then a *new* session --
 because the symptom was never a slow domain, it was a dead one.
 
+**A vote that outran the proposal it was about was thrown away.** The
+leader logged `Vote(WrongCommand)` a thousand times in one matrix, under
+a comment reading "acknowledgements for a command this leader never
+proposed are kept out: nothing to learn from". It had not proposed them
+*yet*. Every voter is sent the same submission, so a voter that
+initializes one before this leader does acknowledges it before this
+leader has ordered it, and under concurrent callers that race is won by
+a follower most of the time.
+
+Dropping that acknowledgement loses nothing -- the follower's slow
+acknowledgement after the proposal still forms a quorum -- but it costs
+the fast path a round trip on the majority of commands, which is the
+difference the fast path exists to make. It is now held, in the same
+spirit as the proposal a follower holds until its payload arrives, and
+bounded the same way: as many commands as the table has room for, with
+the oldest evicted rather than the newest refused, so acknowledgements
+for a command nobody will ever propose cannot turn the mechanism off.
+After the fix that counter reads zero.
+
+**And a node that is waiting for content has to keep asking.** The
+request for a missing payload was sent every sixteenth *turn*, and a
+turn happens when an event arrives. A domain with nothing else going on
+takes no turns -- which is exactly the state a replica is in when
+execution has stopped at a command it lacks -- so the second ask never
+went out. The peer it asked may have had nothing to send the first time,
+because its own proposal was not durable yet, and then nobody asked
+again. The interval is now a duration and the loop has a timer arm for
+it: a replica waiting for content comes back on its own rather than
+waiting for an event that is not coming.
+
 **And a key under a time to live did not expire.** Written with a
 one-second lease, still readable a minute later. The private binding was
 not disclosed to the caller, which the same test checks and which
@@ -2037,6 +2067,51 @@ Nothing in the project had ever asked the composition a hundred
 questions in a row, or two at once, and nothing had ever held one of its
 streams open across two writes. A Kubernetes API server does all three
 while it is still booting.
+
+**Open: about one operation in two hundred is never answered.** With
+four callers against three voters, a run of two hundred operations ends
+with one or two that reach their deadline. It is not slowness. A run
+with a two-second deadline, a four-second one and a thirty-second one
+all lose the same count, and the thirty-second run's straggler waits the
+full thirty seconds: a count that does not move when the deadline moves
+is something that never completes.
+
+What is known about it. Every voter is idle when it happens -- nothing
+queued for the journal, nothing unmaterialized, nothing withheld in an
+outbox, every record in the command table executed -- while each node
+still holds a caller's stream open. The collector on the node holding
+the stream reports the invocation as `awaiting-release`: it has the
+votes and is waiting for the leader's release, which the leader
+emitted. No refusal is recorded anywhere, on any node, for those
+commands, and the frontend's `unserved` counter, which counts a
+delivery that found no stream waiting, stays at zero. So the release
+left the leader addressed to the right collector and did not arrive.
+
+What has been ruled out: the leader's command table (every record
+executed), the payload path (nothing missing), the voter's ingress
+(empty), the submission fan-out (no destination refused, saturated or
+unroutable), a bounded map of which collector a command is owed to (its
+bound is sixty-four times the commands in the run), and a release
+routed to the wrong collector (the single one that happens is the
+leader's own lease-authority command, which no caller is waiting for).
+
+It is written down rather than fixed because a fix has to be the right
+one. A first attempt in this pass -- bounding the leader's per-command
+memory, which is genuinely unbounded today and is the other half of
+this -- made the loss five times worse and was reverted rather than
+shipped. `a_quorum_keeps_answering_past_its_table_capacity` reproduces
+it in-process within seconds when that bound is put back, which is
+where the next attempt starts. Bounding the leader's proposals, vote
+sets and payloads belongs with
+[task-j07](design/tuplesky-prs-plan.md#task-j07), whose subject is
+bounded memory under load; what that experiment showed is that
+something still reads a command's leader state after it has executed,
+and the coupling has to be named before the memory can be bounded.
+
+Until then the matrix reports these as `unknown`, which is what they
+are: the client does not know, the invocation remains resolvable by its
+identity, and the operation is durable either way. They are not
+subtracted from anything and not counted as errors.
 
 ### What the benchmark harness had to get right to find these
 
