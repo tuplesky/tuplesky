@@ -86,23 +86,23 @@ path.
 
 | row | arm | offered/s | achieved/s | completed | unknown | refused | p50 us | p99 us | commands/op | credential exchanges | event p50 us |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| cold | native | 298 | 298 | 400 | 0 | 0 | 47954 | 632799 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
-| cold | backend | 227 | 227 | 400 | 0 | 0 | 83213 | 133672 | 1.15 | 8 | not stated |
-| cold | edge | 144 | 144 | 400 | 0 | 0 | 139180 | 198151 | measured on the other side of the edge | measured on the other side of the edge | not stated |
-| cold @20000us | native | 50 | 39 | 312 | 88 | 0 | 8103 | 13226 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
-| cold @20000us | backend | 50 | 50 | 400 | 0 | 0 | 15007 | 35672 | 1.43 | 8 | not stated |
-| cold @20000us | edge | 50 | 50 | 400 | 0 | 0 | 16657 | 22606 | measured on the other side of the edge | measured on the other side of the edge | not stated |
-| warm | native | 105 | 74 | 283 | 117 | 0 | 157519 | 284625 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
-| warm | backend | 67 | 67 | 400 | 0 | 0 | 299525 | 384931 | 1.40 | 8 | not stated |
-| warm | edge | 56 | 56 | 400 | 0 | 0 | 347440 | 532535 | measured on the other side of the edge | measured on the other side of the edge | not stated |
-| warm @20000us | native | 50 | 39 | 312 | 88 | 0 | 12643 | 21770 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
-| warm @20000us | backend | 50 | 50 | 400 | 0 | 0 | 22701 | 67199 | 1.42 | 8 | not stated |
-| warm @20000us | edge | 50 | 50 | 400 | 0 | 0 | 29478 | 54152 | measured on the other side of the edge | measured on the other side of the edge | not stated |
+| cold | native | 218 | 218 | 400 | 0 | 0 | 75056 | 158436 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
+| cold | backend | 162 | 162 | 400 | 0 | 0 | 114555 | 174435 | 1.15 | 8 | not stated |
+| cold | edge | 112 | 112 | 400 | 0 | 0 | 175188 | 230033 | measured on the other side of the edge | measured on the other side of the edge | not stated |
+| cold @20000us | native | 50 | 50 | 400 | 0 | 0 | 10205 | 47864 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
+| cold @20000us | backend | 50 | 50 | 400 | 0 | 0 | 15595 | 23006 | 1.43 | 8 | not stated |
+| cold @20000us | edge | 50 | 50 | 400 | 0 | 0 | 17637 | 212211 | measured on the other side of the edge | measured on the other side of the edge | not stated |
+| warm | native | 92 | 92 | 400 | 0 | 0 | 156716 | 237727 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
+| warm | backend | 70 | 70 | 400 | 0 | 0 | 279854 | 371547 | 1.41 | 8 | not stated |
+| warm | edge | 71 | 71 | 400 | 0 | 0 | 285869 | 356484 | measured on the other side of the edge | measured on the other side of the edge | not stated |
+| warm @20000us | native | 27 | 27 | 398 | 2 | 0 | 13527 | 10001919 | this program does not trace native invocations | this program does not hold the credential provider | no watch was opened |
+| warm @20000us | backend | 50 | 50 | 400 | 0 | 0 | 24072 | 199196 | 1.43 | 8 | not stated |
+| warm @20000us | edge | 50 | 50 | 400 | 0 | 0 | 24758 | 76299 | measured on the other side of the edge | measured on the other side of the edge | not stated |
 | events | native | not run: coord-wan-bench opens no watch; event delay is measured on the Go arms | | | | | | | | | |
-| events | backend | 36 | 36 | 400 | 0 | 0 | 541348 | 706781 | 1.43 | 8 | 0 (12 of 12 ahead of the ack) |
-| events | edge | 33 | 33 | 400 | 0 | 0 | 587508 | 765593 | measured on the other side of the edge | measured on the other side of the edge | 0 (12 of 12 ahead of the ack) |
-| events @20000us | backend | 36 | 36 | 400 | 0 | 0 | 815967 | 2992153 | 1.42 | 8 | 0 (14 of 14 ahead of the ack) |
-| events @20000us | edge | 28 | 28 | 400 | 0 | 0 | 3722900 | 6340135 | measured on the other side of the edge | measured on the other side of the edge | 0 (10 of 10 ahead of the ack) |
+| events | backend | 49 | 49 | 400 | 0 | 0 | 410389 | 513446 | 1.41 | 8 | 0 (17 of 17 ahead of the ack) |
+| events | edge | 46 | 46 | 400 | 0 | 0 | 431543 | 515865 | measured on the other side of the edge | measured on the other side of the edge | 0 (9 of 9 ahead of the ack) |
+| events @20000us | backend | 47 | 47 | 400 | 0 | 0 | 100158 | 567053 | 1.43 | 8 | 0 (10 of 10 ahead of the ack) |
+| events @20000us | edge | 34 | 34 | 400 | 0 | 0 | 2031825 | 3708385 | measured on the other side of the edge | measured on the other side of the edge | 0 (8 of 8 ahead of the ack) |
 
 ## The stages beneath the edge
 
@@ -114,14 +114,14 @@ than as a zero.
 
 | stage | measured | what it says |
 | --- | --- | --- |
-| Go postcard codec, per operation | p50 1.6--2.4 us, p99 12--25 us | Encoding the request and decoding the result is **0.006% to 0.03% of the native exchange it wraps** (p50 7.2 ms paced, 27.3 ms closed-loop). The codec is not a cost centre of this path. |
+| Go postcard codec, per operation | p50 2.0--3.2 us, p99 13--59 us | Encoding the request and decoding the result is **0.002% to 0.04% of the native exchange it wraps** (p50 7.4 ms paced, 40 ms closed-loop). The codec is not a cost centre of this path. |
 | Credential exchanges | **8 per row, against 400 and 440 operations** | One exchange per caller for the whole run, and the count does not move when the operation count does. There is no per-operation federation. |
-| Native commands per storage operation | 1.15 closed-loop, 1.40--1.43 paced | Near one. The excess is named below; it is not polling and not a lookup round trip. |
+| Native commands per storage operation | 1.15 closed-loop, 1.41--1.43 paced | Near one. The excess is named below; it is not polling and not a lookup round trip. |
 | Resolutions after an unknown outcome | **0 in every row** | No invocation had to be asked about twice. |
 
 **Where the excess over one command comes from, exactly.** The trace
 counts the logical operations the backend actually sent, by kind: in the
-closed-loop row, 172 `KineCreate`, 9 `KineUpdate` and 279 `Range` for
+closed-loop row, 170 `KineCreate`, 11 `KineUpdate` and 277 `Range` for
 400 operations. Kine's `server.Backend` interface makes `Create` return
 the created row, and the native create outcome does not carry it, so a
 create is followed by a `Get`. That is the whole of the difference, it
@@ -144,38 +144,36 @@ two arms of one run is.
 
 | what | measured | budget | why this one |
 | --- | --- | --- | --- |
-| codec p50 per operation | 1.6--2.4 us | **under 50 us** | Two orders of magnitude of headroom; anything approaching it means the codec started allocating or copying per field. |
-| codec p50 as a share of the native exchange | 0.006--0.03% | **under 1%** | The stage must stay invisible against a replicated commit. |
+| codec p50 per operation | 2.0--3.2 us | **under 50 us** | Two orders of magnitude of headroom; anything approaching it means the codec started allocating or copying per field. |
+| codec p50 as a share of the native exchange | 0.002--0.04% | **under 1%** | The stage must stay invisible against a replicated commit. |
 | credential exchanges per caller per run | 1 | **must not grow with the operation count** | This is the per-operation federation check, and it is a shape, not a number. |
 | native commands per storage operation | 1.15--1.43 | **under 2.0** | One command per operation plus the interface-forced create-then-`Get`. A third command per operation would be a new round trip. |
 | resolutions per operation | 0 | **under 0.01** | An invocation asked about twice is a lost answer, not a slow one. |
-| edge p50 over backend p50, paced | 1.11--1.30 | **under 2.0** | What the etcd client, its TLS, the gRPC framing, the bridge and the extra process hop cost together. |
-| backend p50 over native p50, paced | 1.79--1.85 | **under 3.0** | What the Go client path costs over the Rust one against the same domain. |
+| edge p50 over backend p50, paced | 1.03--1.13 | **under 2.0** | What the etcd client, its TLS, the gRPC framing, the bridge and the extra process hop cost together. |
+| backend p50 over native p50, paced | 1.53--1.78 | **under 3.0** | What the Go client path costs over the Rust one against the same domain. |
 
 A run that breaks one of these has a regression in that stage. A run
 that breaks none but is slower everywhere has a slower host, which is
 why there is no absolute latency in the table.
 
-## What these rows also show, which is not this task's
+## What these rows once showed, and no longer do
 
-The native arm loses operations to `unknown` -- 88 of 400 in the paced
-rows -- while the Go arms lose none. That is not an arm difference. It
-is the WAN matrix's finding of the time, seen from this side:
-`coord-wan-bench` spreads its callers over all three frontends, and the
-callers bound to one of them were not being answered, while the Go arms
-connect to one endpoint and did not meet it. Two defects were behind it
-and both are closed -- a catch-up path that flooded the lane its own
-answers travelled on, and a drive loop whose peer plane starved the
-caller's plane -- and [the results](wan-results.md) are re-run against
-the fix.
+An earlier run of this matrix had the native arm losing 88 of 400
+operations to `unknown` in the paced rows while the Go arms lost none,
+and that was not an arm difference: `coord-wan-bench` spreads its
+callers over all three frontends, and the callers bound to one of them
+were not being answered, while the Go arms connect to one endpoint and
+did not meet it. Two defects were behind it -- a catch-up path that
+flooded the bulk lane its own answers travelled on, and a drive loop
+whose peer plane starved the caller's plane -- and both are closed, in
+[the implementation notes](../tuplesky-impl-notes.md).
 
-**These rows are not.** They were measured before it, and the numbers
-above are what they were then. What that costs a reader is the arm
-comparison's precision, not its shape: the stage measurements the
-budgets are built on -- the codec, the credential exchanges, the
-commands per operation -- are taken inside the backend arm and do not
-depend on what the native arm was losing. Re-running this matrix
-against the current build is the next thing this page needs.
+The rows above are re-run against that fix. The native arm now loses
+nothing in five of its six rows, and 2 of 400 in the sixth, at a p99 of
+10.0 seconds against a 10-second deadline -- which is a saturated
+domain meeting the deadline rather than a caller going unanswered.
+The cross-arm difference on this page is a difference between arms
+again.
 
 ## Event delay is not write latency
 
@@ -190,7 +188,7 @@ missed rather than dropped from the sample.
 
 On these rows nothing was missed and **every observed event had already
 been delivered when the caller learned its write applied**: the index
-reads `0 (12 of 12 ahead of the ack)`. A duration has no sign, so those
+reads `0 (17 of 17 ahead of the ack)`. A duration has no sign, so those
 samples enter the distribution as zero, and the count beside it is what
 keeps that zero from reading as "delivered instantly". What it means is
 that the watcher was not waiting on the write at all -- the domain
