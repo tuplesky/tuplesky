@@ -53,6 +53,18 @@ type Event struct {
 	Resolves int
 	// Outcome names the result kind or the error class.
 	Outcome string
+	// CodecNs is the Go postcard encode of the request plus the decode
+	// of the result. Measured only when an Observer is configured, so a
+	// deployment that observes nothing pays nothing for it.
+	CodecNs int64
+	// NativeNs is frame out to answer in, resolutions included: the
+	// transport and the consensus beneath it, with the Go work either
+	// side of it excluded.
+	NativeNs int64
+	// PayloadBytes is the encoded request; ResultBytes the encoded
+	// result. Zero when nothing was encoded or decoded.
+	PayloadBytes int
+	ResultBytes  int
 }
 
 // Config configures a Backend.
@@ -269,13 +281,24 @@ func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryK
 		return wire.Result{}, status.Error(codes.Unavailable, err.Error())
 	}
 	var kind string
+	var codec time.Duration
+	var payloadBytes int
+	observing := b.cfg.Observer != nil
 	inv, err := inst.AllocateFor(b.cfg.DeadlineMs, func(key wire.RetryKey) ([]byte, [32]byte, error) {
 		logical := wire.LogicalRequest{Namespace: b.cfg.Namespace, Op: mk(key)}
 		kind = kindName(logical.Op)
+		var at time.Time
+		if observing {
+			at = time.Now()
+		}
 		payload, err := logical.Encode()
+		if observing {
+			codec += time.Since(at)
+		}
 		if err != nil {
 			return nil, [32]byte{}, err
 		}
+		payloadBytes = len(payload)
 		return payload, client.CommandID(key, payload), nil
 	})
 	if err != nil {
@@ -284,7 +307,7 @@ func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryK
 		}
 		return wire.Result{}, status.Error(codes.Internal, err.Error())
 	}
-	event := Event{Op: op, Kind: kind, Sequence: inv.Sequence}
+	event := Event{Op: op, Kind: kind, Sequence: inv.Sequence, PayloadBytes: payloadBytes}
 	res, err := b.exchange(ctx, inst, inv, &event)
 	// The outcome is final here whichever way it went: established, or
 	// given up on and reported as unknown so the API server issues a new
@@ -292,6 +315,7 @@ func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryK
 	// released rather than retained for every request the process ever
 	// made.
 	inst.Release(inv.Sequence)
+	event.CodecNs += int64(codec)
 	if err != nil {
 		event.Outcome = "error: " + status.Code(err).String()
 	}
@@ -310,6 +334,14 @@ func (b *Backend) exchange(ctx context.Context, inst *client.Instance, inv clien
 	resolveFrame, err := inst.ResolveFrame(inv)
 	if err != nil {
 		return wire.Result{}, status.Error(codes.Internal, err.Error())
+	}
+	observing := b.cfg.Observer != nil
+	// One clock around the exchange, resolutions and their waits
+	// included: what a caller waits for is the whole establishment of
+	// the outcome, not the fastest attempt at it.
+	var sent time.Time
+	if observing {
+		sent = time.Now()
 	}
 	out, err := b.cfg.Client.Do(ctx, inv.Frame)
 	if err != nil {
@@ -341,6 +373,9 @@ func (b *Backend) exchange(ctx context.Context, inst *client.Instance, inv clien
 			return wire.Result{}, mapClientError(err)
 		}
 	}
+	if observing {
+		event.NativeNs = int64(time.Since(sent))
+	}
 	if out.Unknown {
 		// Never a silent success: the API server retries with a new
 		// invocation, and conditional operations keep that safe.
@@ -353,7 +388,15 @@ func (b *Backend) exchange(ctx context.Context, inst *client.Instance, inv clien
 	if resp.Tag == wire.OutcomeErr {
 		return wire.Result{}, mapWireError(resp.Code, resp.Detail)
 	}
+	var decodedAt time.Time
+	if observing {
+		decodedAt = time.Now()
+	}
 	res, err := wire.DecodeResult(resp.Result)
+	if observing {
+		event.CodecNs += int64(time.Since(decodedAt))
+		event.ResultBytes = len(resp.Result)
+	}
 	if err != nil {
 		return wire.Result{}, status.Error(codes.Internal, "undecodable result: "+err.Error())
 	}
@@ -388,6 +431,8 @@ func outcomeName(kind wire.OutcomeKind) string {
 		return "ErrSessionInvalid"
 	case wire.OutcomeErrPermissionDenied:
 		return "ErrPermissionDenied"
+	case wire.OutcomeErrRejected:
+		return "ErrRejected"
 	default:
 		return fmt.Sprintf("outcome-%d", kind)
 	}
@@ -465,7 +510,7 @@ func readErr(res wire.Result) error {
 	case wire.OutcomeErrFutureRevision:
 		return server.ErrFutureRev
 	default:
-		return mapOutcomeError(res.Kind)
+		return mapOutcomeError(res)
 	}
 }
 
@@ -516,7 +561,7 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 	case wire.OutcomeErrKeyExists:
 		return rev, server.ErrKeyExists
 	default:
-		return rev, mapOutcomeError(res.Kind)
+		return rev, mapOutcomeError(res)
 	}
 }
 
@@ -541,7 +586,7 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 		return 0, nil, false, err
 	}
 	if res.Kind != wire.OutcomeKineUpdated {
-		return rev, nil, false, mapOutcomeError(res.Kind)
+		return rev, nil, false, mapOutcomeError(res)
 	}
 	return rev, keyValue(res.Current), res.Updated, nil
 }
@@ -564,7 +609,7 @@ func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64
 		return 0, nil, false, err
 	}
 	if res.Kind != wire.OutcomeKineDeleted {
-		return rev, nil, false, mapOutcomeError(res.Kind)
+		return rev, nil, false, mapOutcomeError(res)
 	}
 	return rev, keyValue(res.Prev), res.Deleted, nil
 }

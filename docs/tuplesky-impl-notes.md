@@ -1743,7 +1743,7 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-eight things. All eight are fixed here, and each became findable
+nine things. All nine are fixed here, and each became findable
 only once the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
@@ -2242,6 +2242,58 @@ the load that put the replica behind, which is a protocol question
 rather than a bound to adjust, and it belongs with
 [task-j07](design/tuplesky-prs-plan.md#task-j07) beside the leader's
 per-command memory.
+
+**A refusal the domain had a word for arrived as "internal error".**
+This one the Kubernetes overhead benchmark found rather than the matrix,
+and it is not a consensus defect at all: it is a codec that stopped one
+variant short. `coord_state::Outcome::ErrRejected { reason }` is the
+planner's deterministic refusal -- the request exceeded a replicated
+budget, or claimed a sequence that is not its session's, or carried an
+admission that does not authorize it. It is a *result*: the command
+holds its position, every replica reaches the same reason, and there is
+nothing to re-run. The Go `wire.DecodeResult` knew eleven outcomes and
+not that one, so the adapter answered `codes.Internal`, "undecodable
+result: unexpected outcome". An API server reads that as a bug in its
+storage backend and retries, which is the one thing a deterministic
+refusal will never reward.
+
+Three things were wrong at once and only the first of them was the
+decoder. The gRPC code was wrong: `Internal` says "this is our fault,
+try again", where the reasons span `InvalidArgument`,
+`ResourceExhausted`, `FailedPrecondition`, `Unimplemented`, `Aborted`,
+`Unauthenticated` and `PermissionDenied`, and none of them is
+`Unavailable`. The message was wrong: it named a discriminant where the
+domain had a sentence. And the failure was silent in the only place it
+mattered -- the decoder's fallback arm said "unexpected outcome" without
+saying which, so the number 35 had to be recovered from the Rust variant
+order by hand before anyone could tell whether it was a variant added
+upstream or a request the bridge had mapped to an operation it did not
+mean.
+
+So the fix is the reason table, not the discriminant. `RejectionReason`
+is spelled out in Go with all fourteen variants and a `String()` for
+each, bounded on decode -- a reason past the table is refused rather
+than kept as an integer, because a backend that cannot map a reason
+cannot choose a status for it either. `mapOutcomeError` now takes the
+whole `wire.Result` rather than the discriminant, since it is the reason
+and not the outcome that decides what an API server should do.
+`crates/coord-state/fixtures/kine_responses_v1.json` gained a vector per
+reason, so the fourteen encodings are frozen on the Rust side, and
+`every_rejection_reason_is_covered` is an exhaustive match over a value
+the fixture generator names: a reason added upstream fails to compile
+there rather than shipping bytes no adapter can read.
+`TestRejectionReasonsAreCovered` walks the same fixture from Go and
+fails if any reason decodes to "unknown reason", which is the other half
+of the same freeze. Reverting the decode arm reproduces exactly what the
+benchmark printed -- `unexpected outcome: discriminant 35` -- and
+reverting the bound accepts a fifteenth reason that does not exist.
+
+What made it findable was the third arm. The backend arm and the edge
+arm offer the same shaped work to the same domain; the backend arm
+completed every operation of every row and the edge arm, five rows in,
+refused every one. Two arms differing on one domain is a much narrower
+question than one arm failing, and it is the question the overhead
+benchmark exists to ask.
 
 ### What the benchmark harness had to get right to find these
 

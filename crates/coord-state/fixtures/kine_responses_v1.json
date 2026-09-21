@@ -380,6 +380,174 @@
         "outcome": "ErrLeaseExists"
       },
       "payload_hex": "140b"
+    },
+    {
+      "name": "err-rejected-invalid",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "Invalid"
+          }
+        }
+      },
+      "payload_hex": "142300"
+    },
+    {
+      "name": "err-rejected-namespace-mismatch",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "NamespaceMismatch"
+          }
+        }
+      },
+      "payload_hex": "142301"
+    },
+    {
+      "name": "err-rejected-response-too-large",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "ResponseTooLarge"
+          }
+        }
+      },
+      "payload_hex": "142302"
+    },
+    {
+      "name": "err-rejected-too-many-events",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "TooManyEvents"
+          }
+        }
+      },
+      "payload_hex": "142303"
+    },
+    {
+      "name": "err-rejected-too-many-deletes",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "TooManyDeletes"
+          }
+        }
+      },
+      "payload_hex": "142304"
+    },
+    {
+      "name": "err-rejected-counter-overflow",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "CounterOverflow"
+          }
+        }
+      },
+      "payload_hex": "142305"
+    },
+    {
+      "name": "err-rejected-unsupported",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "Unsupported"
+          }
+        }
+      },
+      "payload_hex": "142306"
+    },
+    {
+      "name": "err-rejected-view-too-large",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "ViewTooLarge"
+          }
+        }
+      },
+      "payload_hex": "142307"
+    },
+    {
+      "name": "err-rejected-retry-conflict",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "RetryConflict"
+          }
+        }
+      },
+      "payload_hex": "142308"
+    },
+    {
+      "name": "err-rejected-retry-too-old",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "RetryTooOld"
+          }
+        }
+      },
+      "payload_hex": "142309"
+    },
+    {
+      "name": "err-rejected-retry-out-of-window",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "RetryOutOfWindow"
+          }
+        }
+      },
+      "payload_hex": "14230a"
+    },
+    {
+      "name": "err-rejected-session-invalid",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "SessionInvalid"
+          }
+        }
+      },
+      "payload_hex": "14230b"
+    },
+    {
+      "name": "err-rejected-retry-unauthorized",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "RetryUnauthorized"
+          }
+        }
+      },
+      "payload_hex": "14230c"
+    },
+    {
+      "name": "err-rejected-admission-mismatch",
+      "response": {
+        "revision": 20,
+        "outcome": {
+          "ErrRejected": {
+            "reason": "AdmissionMismatch"
+          }
+        }
+      },
+      "payload_hex": "14230d"
     }
   ]
 }
