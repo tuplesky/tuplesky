@@ -366,18 +366,67 @@ fn a_hot_key_keeps_working_after_its_executed_predecessor_is_retired() {
     assert_eq!(i2.deps, vec![cmd(1)]);
     t.accept(cmd(2), vec![cmd(1)]).unwrap();
     t.execute(cmd(1)).unwrap();
-    // Retiring c1 drops c0's tombstone, the last reference to it.
+    // Retiring c1 does not drop c0's tombstone. What a tombstone
+    // answers for is a dependency, and a dependency is named by
+    // whoever holds the evidence -- which need not be a record in this
+    // table. The memory is bounded by recency instead: the table has
+    // room for two records, so it remembers its last two retirements.
     t.retire(&cmd(1)).unwrap();
     assert!(t.tombstones().contains(&cmd(1)));
-    assert!(!t.tombstones().contains(&cmd(0)));
-    assert_eq!(t.phase_of(&cmd(0)), None);
+    assert!(t.tombstones().contains(&cmd(0)));
+    assert_eq!(t.phase_of(&cmd(0)), Some(Phase::Executed));
     t.commit(cmd(2)).unwrap();
     t.execute(cmd(2)).unwrap();
     t.retire(&cmd(2)).unwrap();
-    assert!(t.tombstones().is_empty(), "nothing references anything");
+    // The third retirement pushes the oldest out, and only the oldest.
+    assert_eq!(
+        t.tombstones().len(),
+        2,
+        "the table remembers as many retirements as it has room for records"
+    );
+    assert!(!t.tombstones().contains(&cmd(0)));
+    assert!(t.tombstones().contains(&cmd(1)));
+    assert!(t.tombstones().contains(&cmd(2)));
     // The key's next command depends on nothing: the index was cleared.
     let i3 = t.initialize(cmd(3), payload(3), k("hot")).unwrap();
     assert_eq!(i3.deps, vec![]);
+}
+
+/// A command retired before the evidence that names it arrives is still
+/// executed as far as that evidence is concerned.
+///
+/// This is the shape a follower is in under concurrent callers. Its
+/// table holds the leader's proposals as well as its own records, so it
+/// fills -- and reclaims -- ahead of the leader, and the proposal that
+/// arrives next names the command it just retired. Nothing in the table
+/// referred to that command when it went, because the dependency the
+/// proposal names lives in the proposal.
+///
+/// Before the tombstone was made unconditional, the guard read "unknown"
+/// here for a command this replica had executed itself. The proposal
+/// could then never be adopted, every later command queued behind it,
+/// and the table stayed full: a replica that had answered two hundred
+/// operations stopped answering any, permanently.
+#[test]
+fn a_dependency_retired_before_its_proposal_arrives_is_still_executed() {
+    let mut t = CommandTable::with_capacity(2);
+    t.initialize(cmd(0), payload(0), k("key")).unwrap();
+    t.accept(cmd(0), vec![]).unwrap();
+    t.commit(cmd(0)).unwrap();
+    t.execute(cmd(0)).unwrap();
+    t.retire(&cmd(0)).unwrap();
+    assert!(
+        !t.records().any(|(_, r)| r.deps.contains(&cmd(0))),
+        "nothing in the table depends on the retired command"
+    );
+
+    // Now the leader's order for a later command arrives, naming it.
+    t.initialize(cmd(1), payload(1), k("key")).unwrap();
+    assert_eq!(
+        t.adopt(cmd(1), vec![cmd(0)], None, Digest32([0; 32])),
+        Ok(()),
+        "the leader's order names a command this replica executed"
+    );
 }
 
 #[test]
