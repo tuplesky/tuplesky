@@ -51,15 +51,38 @@ reproducible from its own report.
 | --- | --- |
 | cold | a fresh run directory, no warm-up (`--warmup-ops 0`) |
 | warm | the same directory, after a warm-up pass |
+| concurrency | the same mix closed-loop at each `--callers` count |
 | hot writers | `--hot-keys 4 --mix put=0,get=0,cas=100` |
 | transactions | `--mix txn=100 --transaction-keys 8` |
 | scans | `--mix scan=100 --scan-limit 128` |
 | read-mostly | `--mix get=95,cas=5` |
 | loss | the topology script's `LOSS` argument |
 | asymmetric | different forward and reverse round trips |
+| region loss | a region isolated while its voters keep running |
 
 Run each row at several `--arrival-ns` values rather than one: a single rate
 says nothing about where the knee is, and the knee is the result.
+
+`scripts/bench/wan-matrix.sh` runs the whole thing and indexes what it
+produced:
+
+```text
+RATES="0 20000000 10000000 5000000" CALLERS=8 FRONTENDS=3 \
+  DURABILITY="journal-first, one fsync per record" \
+  scripts/bench/wan-matrix.sh /tmp/matrix
+```
+
+It writes `matrix.json` and `matrix.md` beside the reports. A row it could
+not run is in both, named, with the reason -- never as a zero.
+
+Two things it does deliberately. Every row but `cold` runs against the
+*same* standing domain, in order, because a script that stood a domain up
+per row would report healthy rows and never what the row before it left
+behind; that is how the reclamation defect stayed hidden. And the impaired
+rows need `NET_ADMIN` and iproute2: give it `REGIONS`, and on a host that
+has them it applies the topology itself and records the impairment the
+script prints. Without them those rows are recorded as not run, and the
+rest of the matrix still runs.
 
 ## Shaping the wide area
 
