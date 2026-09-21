@@ -181,8 +181,11 @@ impairment the script prints, and runs the same rows.
 * A Kubernetes end-to-end number. That is
   [task-63](../design/tuplesky-prs-plan.md#task-63), through the
   composition certified in [Kubernetes
-  certification](kubernetes-certification.md), and published in [what
-  the Kubernetes storage path costs](kine-overhead.md).
+  certification](kubernetes-certification.md), and measured in [what
+  the Kubernetes storage path costs](kine-overhead.md), whose rows also
+  show this page's open finding from the other side: the arms that bind
+  every caller to one endpoint lose nothing to `unknown`, and the arm
+  that spreads them over three loses about a fifth.
 
 What they are good for is the shape of the curves -- where the knee is
 in offered rate and in caller count, and how the operation kinds differ

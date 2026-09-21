@@ -255,9 +255,18 @@ for entry in rows:
         operations = commands.get("operations") or 0
         ratio = f"{commands['invocations'] / operations:.2f}" if operations else ""
     exchanges = absent(credentials) or str(credentials.get("exchanges", ""))
-    events = (entry.get("events") or {}).get("delivered") or {"absent": "no watch was opened"}
+    all_events = entry.get("events") or {}
+    events = all_events.get("delivered") or {"absent": "no watch was opened"}
     observed = events.get("observed") or events.get("Observed")
     event_p50 = us(observed["p50_ns"]) if observed else (events.get("absent") or "")
+    # A zero here is not "delivered instantly". A duration has no sign,
+    # so an event the watcher already held when the caller learned the
+    # write applied enters the distribution as zero; saying how many did
+    # is what keeps the column readable.
+    ahead = all_events.get("ahead") or 0
+    if observed and ahead:
+        seen = all_events.get("observed") or 0
+        event_p50 += f" ({ahead} of {seen} ahead of the ack)"
     lines.append(
         f"| {label} | {entry['arm']} | {rate(achieved['offered_per_second'])} | {rate(achieved['achieved_per_second'])} | "
         f"{achieved['completed']} | {achieved.get('unknown', 0)} | {achieved['refused']} | "

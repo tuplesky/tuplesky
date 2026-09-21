@@ -195,6 +195,16 @@ type Events struct {
 	Observed uint64 `json:"observed"`
 	// Missed is how many it did not see before the run ended.
 	Missed uint64 `json:"missed"`
+	// Ahead is how many of the observed events had already been
+	// delivered when the caller learned the write applied.
+	//
+	// A duration cannot be negative, so those samples enter the
+	// distribution as zero. Counting them separately is what keeps the
+	// resulting `p50 = 0` from reading as "delivered instantly": it
+	// means the watcher was not waiting on the write at all, which on
+	// one host is the ordinary case and on a real topology would not
+	// be.
+	Ahead uint64 `json:"ahead"`
 }
 
 // Topology is what the domain was, as declared. This program drives a
