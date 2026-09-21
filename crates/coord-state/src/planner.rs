@@ -240,6 +240,11 @@ fn request_permissions(
         // submitted with, which is not a permission and is checked
         // where admissions are.
         CanonicalOperation::ConsumeAdmission => Vec::new(),
+        // The service's own operations need no permission over a key
+        // interval, and no permission would admit one: what decides is
+        // the absence of an admission, checked before planning.
+        CanonicalOperation::EstablishLeaseAuthority { .. }
+        | CanonicalOperation::ExpireLease { .. } => Vec::new(),
         CanonicalOperation::KineCreate(c) => vec![(Action::Write, KeyInterval::exact(&c.key))],
         CanonicalOperation::KineUpdate(u) => vec![
             (Action::Write, KeyInterval::exact(&u.key)),
@@ -816,6 +821,15 @@ fn plan_operation(
         // selected by the *receipt's* purpose rather than by anything
         // the payload says.
         CanonicalOperation::ConsumeAdmission => {
+            return Err(fail(Outcome::ErrPermissionDenied));
+        }
+        // A service operation reaching the *client* planner means a
+        // caller sent one. It is refused here rather than planned,
+        // whatever permissions its session holds: these commands run
+        // only for a command accepted with no admission at all, which
+        // nothing a collector submits ever is.
+        CanonicalOperation::EstablishLeaseAuthority { .. }
+        | CanonicalOperation::ExpireLease { .. } => {
             return Err(fail(Outcome::ErrPermissionDenied));
         }
         CanonicalOperation::Range(r) => {
@@ -1397,6 +1411,39 @@ pub fn plan(
             events,
         )
     })
+}
+
+/// The internal command a service operation names, or `None` when the
+/// request is an ordinary caller's.
+///
+/// This is the whole of the bridge between the wire's narrow service
+/// operations and the internal commands the state machine plans. It is
+/// deliberately total in one direction only: every service operation
+/// maps to exactly one internal command, and no other internal command
+/// has an operation that could carry it, so a payload cannot reach
+/// policy administration, trust rules or session retirement.
+pub fn service_command(request: &LogicalRequest) -> Option<InternalCommand> {
+    match &request.operation {
+        CanonicalOperation::EstablishLeaseAuthority { epoch } => {
+            Some(InternalCommand::EstablishLeaseAuthority {
+                namespace: request.namespace,
+                epoch: *epoch,
+            })
+        }
+        CanonicalOperation::ExpireLease {
+            lease_id,
+            generation,
+            expected_renewal_sequence,
+            authority_epoch,
+        } => Some(InternalCommand::ExpireLease {
+            namespace: request.namespace,
+            lease_id: *lease_id,
+            generation: *generation,
+            expected_renewal_sequence: *expected_renewal_sequence,
+            authority_epoch: *authority_epoch,
+        }),
+        _ => None,
+    }
 }
 
 /// Plan an internal replicated command against `view`. Same contract as

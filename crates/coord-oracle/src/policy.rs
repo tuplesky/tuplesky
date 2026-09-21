@@ -236,6 +236,12 @@ impl PolicyOracle {
             // which is not a permission over an interval and is checked
             // where admissions are.
             CanonicalOperation::ConsumeAdmission => Vec::new(),
+            // The service's own. No caller holds a permission that
+            // admits one, and no key interval is what decides: a
+            // command carrying an admission at all is refused before
+            // any permission is consulted.
+            CanonicalOperation::EstablishLeaseAuthority { .. }
+            | CanonicalOperation::ExpireLease { .. } => Vec::new(),
         }
     }
 

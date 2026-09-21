@@ -160,6 +160,15 @@ impl LeaseScheduler {
         self.armed.len()
     }
 
+    /// The leases currently armed, in lease id order.
+    ///
+    /// A driver reading committed state needs this to tell a lease that
+    /// ended from one it simply did not see: what is armed and absent
+    /// from an observation is what has gone.
+    pub fn armed_ids(&self) -> Vec<LeaseId> {
+        self.armed.keys().copied().collect()
+    }
+
     /// Whether nothing is armed.
     pub fn is_empty(&self) -> bool {
         self.armed.is_empty()

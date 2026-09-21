@@ -253,7 +253,12 @@ impl KvModel {
             // Session establishment is not KV history: the oracle models
             // the key-value semantics a client sees, and this operation
             // writes none of it.
-            | CanonicalOperation::ConsumeAdmission => ModelResponse {
+            | CanonicalOperation::ConsumeAdmission
+            // Neither are the service's own lease operations. They are
+            // not a client's to send, and what they delete when they do
+            // apply is modelled where leases are.
+            | CanonicalOperation::EstablishLeaseAuthority { .. }
+            | CanonicalOperation::ExpireLease { .. } => ModelResponse {
                 revision: self.revision,
                 outcome: Outcome::Unsupported,
             },

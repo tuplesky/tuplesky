@@ -79,6 +79,7 @@ pub use plan::{
 };
 pub use planner::{
     PlanError, authorize_retained, plan, plan_internal, rejection_plan, rejection_plan_at,
+    service_command,
 };
 pub use policy::{
     Action, AdmissionReceiptV1, Authorization, GrantKind, GrantRecord, GrantState, KeyInterval,

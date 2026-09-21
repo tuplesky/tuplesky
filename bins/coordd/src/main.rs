@@ -19,6 +19,7 @@
 
 mod backup;
 mod genesis;
+mod leases;
 mod membership;
 mod peers;
 mod serve;
@@ -1030,6 +1031,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let voting = roles.votes();
+    let cluster_id = placed.membership.cluster();
+    let domain_id = placed.membership.domain();
     runtime.block_on(async move {
         let Some(socket) = api_socket else {
             eprintln!("this process serves clients but bound no api listener");
@@ -1070,6 +1074,12 @@ fn main() -> ExitCode {
             domain = domain.with_peers(plane);
         }
         domain = domain.with_links(serve::CollectorLinks::new(links));
+        // Expiry is scheduled where this process votes. A frontend-only
+        // node schedules nothing: it proposes no commands, and an
+        // expiry is a command like any other.
+        if voting {
+            domain = domain.with_expiry(crate::leases::Expiry::new(cluster_id, domain_id));
+        }
         domain.run(&mut transport, now_seconds).await;
         eprintln!(
             "peers connected={} submittable={}",
@@ -1078,6 +1088,8 @@ fn main() -> ExitCode {
         );
         let (published, failed) = domain.checkpoints();
         eprintln!("checkpoints published={published} failed={failed}");
+        let (authorities, candidates, armed) = domain.expiries();
+        eprintln!("expiry authorities={authorities} candidates={candidates} armed={armed}");
         // The bounded snapshot (task-61). Rendered whole, because every
         // field is a number or a frozen enum: there is nothing in it to
         // redact, and an absent reading says why it is absent rather
