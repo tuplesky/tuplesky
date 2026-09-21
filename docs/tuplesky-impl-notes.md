@@ -2130,18 +2130,19 @@ on it rather than a fix.
 
 *And what is left, stated plainly.* A replica that falls behind now
 recovers instead of stopping, and nothing is lost or refused that was
-not lost or refused before it fell behind. It does not recover
-*quickly*: on the re-run matrix the read-heavy rows lose about three
-operations in ten to the ten-second deadline, all of them belonging to
-the callers bound to one frontend, at every offered rate including the
-closed loop. Those are reads held pending on a projection that has not
-caught up, not reads refused, and they are published in
-[the results](operations/wan-results.md#the-finding-this-run-exposed)
-rather than tuned away. Closing it means a catch-up path that outruns
-the load that put the replica behind, which is a protocol question
-rather than a bound to adjust, and it belongs with
-[task-j07](design/tuplesky-prs-plan.md#task-j07) beside the leader's
-per-command memory.
+not lost or refused before it fell behind. It did not recover
+*quickly*: on the matrix of the time the read-heavy rows lost about
+three operations in ten to the ten-second deadline, all of them
+belonging to the callers bound to one frontend, at every offered rate
+including the closed loop. Those were reads held pending on a
+projection that had not caught up, not reads refused, and they were
+published in [the results](operations/wan-results.md) rather than tuned
+away.
+
+That is closed now, in two places that both had to be right: the
+catch-up path was repeating its bounded ask on nearly every turn and
+flooding the lane its answers travel on, and the drive loop was letting
+the peer plane starve the caller's plane outright. Both are below.
 
 **A refusal the domain had a word for arrived as "internal error".**
 This one the Kubernetes overhead benchmark found rather than the matrix,
@@ -2325,6 +2326,65 @@ frontends:
 No overlap in ten runs. `scans` and `read-mostly` complete 300 of 300
 where they completed 192 and 201, and every row's throughput went up
 rather than down.
+
+**And that was not all of it.** Re-running the full matrix against the
+fix, the domain stopped serving one of its three frontends nine rows
+in: 38 of 44 rows did not run, because no `coord-wan-bench` caller
+could bind to that node any more. The second half of this finding is
+below, and the honest order of events is that pacing the asks did not
+expose it so much as change the balance enough to make it total.
+
+### The peer plane's priority had nothing behind it
+
+The drive loop polls two planes in a biased `tokio::select!`, peer
+first, under a comment that says exactly why: *"a vote, an adoption or a
+recovery summary from a peer is the work that lets a caller's request
+finish, and a frontend under load must not be able to hold it up."* The
+reverse hazard was never guarded. A biased select is a priority, and a
+priority with no budget behind it is starvation: on a busy domain the
+peer plane is ready on every poll, so the loop never polls the caller's
+plane at all.
+
+Instrumented with a counter per arm, one voter of three **served 4560
+api events and then not one more, while its peer arm took another
+80000**. Everything else about that node was fine -- it was voting, its
+logs were four kilobytes, its store was healthy -- and every caller
+bound to its frontend waited out its deadline against it. From the
+outside it looked exactly like a domain that had stopped accepting
+sessions, which is why it took a counter to see.
+
+The bias is a budget now: after `PEER_BEFORE_API` consecutive peer
+events the caller's plane is polled first for one turn. 64 is high
+enough that the ordering still holds for the case it is for -- a burst
+of votes for one command, a recovery summary -- and low enough that a
+caller waits for a bounded number of frames rather than for the domain
+to go quiet.
+
+On the same sequence of eleven rows against one standing domain:
+
+| | outcome |
+| --- | --- |
+| before the catch-up fix | every row ran, losing 17 to 98 operations of 400 |
+| after it, before this | rows 1-8 clean, rows 9-11 could not bind at all |
+| after this | every row runs, losing 0, 2 and 3 of 400 |
+
+And on a *fresh* domain, which is the comparison that holds the history
+constant, `warm` goes from 184 to 202 operations a second, `hot-writers`
+from 134 to 158, and `transactions` from 372 of 400 answered at 135 a
+second to 400 of 400 at 145.
+
+**What this cost to find, and what that is worth writing down.** Two
+false starts, both from measurement rather than from reading the code.
+The first was a bisect with a stale `coord-wan-bench`: the retry-floor
+change altered the digest a command carries, so an old client against a
+new daemon is a mismatched pair, and it reported a domain answering
+nothing at a commit that was fine. Acting on that, the held-evidence
+window was half reverted before a matched rebuild showed the commit was
+innocent. The second was running `cargo xtask ci` -- 822 tests on every
+core -- beside a benchmark, and reading the contention as a domain
+failure. A benchmark harness is an instrument, and an instrument used
+without checking that both ends are the same build, on a machine doing
+nothing else, measures itself.
 
 **A line per dropped frame is its own denial of service.** Found while
 measuring this. A send the transport could not queue printed a line, and
