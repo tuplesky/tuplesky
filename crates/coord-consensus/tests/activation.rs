@@ -358,7 +358,7 @@ impl Cluster {
             request_sequence: RequestSequence::new(seq).unwrap(),
         };
         let command = CommandId::derive(&rk, &request).unwrap();
-        let frame = MessageV1::Request(RequestV1::new(rk, &request, 0).unwrap())
+        let frame = MessageV1::Request(RequestV1::new(rk, &request, 0, 0).unwrap())
             .encode()
             .unwrap();
         for i in 0..self.nodes.len() {

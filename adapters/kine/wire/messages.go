@@ -107,6 +107,19 @@ type Request struct {
 	RetryKey   RetryKey
 	Logical    []byte
 	DeadlineMs uint32
+	// AckThrough is the highest sequence of this client instance whose
+	// result the client has received. Executing the command retires the
+	// invocation identities at or below it, which is what lets the
+	// outstanding window move forward; a client that never acknowledged
+	// would be refused once its sequence ran a window past the floor and
+	// would stay refused.
+	//
+	// Zero acknowledges nothing. It is fixed when the invocation is first
+	// built and repeated byte for byte on every retry: the prefix a
+	// command retires is part of what the command durably is, so a retry
+	// acknowledging more would be the same command asking two replicas to
+	// retire different prefixes.
+	AckThrough uint64
 }
 
 func (Request) kind() uint16 { return uint16(KindRequest) }
@@ -114,6 +127,7 @@ func (m Request) encode(w *writer) {
 	encodeRetryKey(w, m.RetryKey)
 	w.boundedBytes(m.Logical)
 	w.varint(uint64(m.DeadlineMs))
+	w.varint(m.AckThrough)
 }
 
 // Outcome discriminants.

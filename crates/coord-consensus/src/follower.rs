@@ -1194,6 +1194,7 @@ impl Follower {
             request.retry_key,
             request.logical.as_slice().to_vec(),
             Some(admission),
+            request.ack_through,
         )
     }
 
@@ -1204,6 +1205,7 @@ impl Follower {
         retry_key: RetryKey,
         logical: Vec<u8>,
         admission: Option<AdmissionFacts>,
+        ack_through: u64,
     ) -> Vec<Effect> {
         let Ok((request, rest)) =
             postcard::take_from_bytes::<coord_types::logical_v1::LogicalRequest>(&logical)
@@ -1238,6 +1240,7 @@ impl Follower {
             retry_key,
             logical,
             admission,
+            ack_through,
         };
         // Atomic initialization; the placeholder of an early proposal (if
         // any) becomes the record in this same transition. What is bound
@@ -1441,7 +1444,7 @@ impl Follower {
                     .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
                 let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();
-                let admission = record.payload.unwrap_or_else(|| admission_digest(None));
+                let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
                 let barrier = self.alloc.as_mut().expect("booted").allocate();
                 effects.push(Effect::Persist(PersistBatch {
                     barrier,
@@ -1764,7 +1767,12 @@ impl Follower {
         // placeholder cannot be accepted -- so there is no order here to
         // overwrite.
         if !self.table.is_initialized(&command) {
-            return self.on_request(payload.retry_key, payload.logical, payload.admission);
+            return self.on_request(
+                payload.retry_key,
+                payload.logical,
+                payload.admission,
+                payload.ack_through,
+            );
         }
         // A record already exists, so this replica heard the leader's
         // evidence before the payload and holds a placeholder -- or has

@@ -247,7 +247,7 @@ impl Expiry {
     ) -> Option<Vec<u8>> {
         let mut logical = LogicalRequest::new(namespace, operation);
         logical.canonicalize();
-        let request = RequestV1::new(retry_key, &logical, 0).ok()?;
+        let request = RequestV1::new(retry_key, &logical, 0, 0).ok()?;
         MessageV1::Request(request).encode().ok()
     }
 

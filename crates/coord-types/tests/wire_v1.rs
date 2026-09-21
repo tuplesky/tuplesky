@@ -41,7 +41,7 @@ fn bytes<const N: usize>(b: &[u8]) -> BoundedBytes<N> {
 }
 
 fn sample_messages() -> Vec<(&'static str, MessageV1)> {
-    let request = RequestV1::new(retry_key(), &logical(), 5000).unwrap();
+    let request = RequestV1::new(retry_key(), &logical(), 5000, 0).unwrap();
     let command_id = CommandId::derive(&retry_key(), &logical()).unwrap();
     vec![
         (
@@ -408,7 +408,7 @@ fn oversized_nested_collections_are_rejected_before_allocation() {
 
 #[test]
 fn identity_payloads_must_be_canonical() {
-    let request = RequestV1::new(retry_key(), &logical(), 0).unwrap();
+    let request = RequestV1::new(retry_key(), &logical(), 0, 0).unwrap();
     assert_eq!(request.logical().unwrap(), logical());
     // Same identity from the wire form as from the logical form.
     let from_wire = CommandId::derive(&request.retry_key, &request.logical().unwrap()).unwrap();
@@ -441,17 +441,19 @@ fn identity_payloads_must_be_canonical() {
     );
     let raw = postcard::to_allocvec(&unsorted).unwrap();
     let smuggled = RequestV1 {
+        ack_through: 0,
         retry_key: retry_key(),
         logical: BoundedBytes::new(raw).unwrap(),
         deadline_ms: 0,
     };
     assert_eq!(smuggled.logical(), Err(WireError::NonCanonicalPayload));
-    assert!(RequestV1::new(retry_key(), &unsorted, 0).is_err());
+    assert!(RequestV1::new(retry_key(), &unsorted, 0, 0).is_err());
 
     // Trailing bytes inside the logical payload are rejected.
     let mut raw = logical().canonical_bytes().unwrap();
     raw.push(0);
     let padded = RequestV1 {
+        ack_through: 0,
         retry_key: retry_key(),
         logical: BoundedBytes::new(raw).unwrap(),
         deadline_ms: 0,
@@ -462,6 +464,7 @@ fn identity_payloads_must_be_canonical() {
     );
     // Garbage is malformed.
     let garbage = RequestV1 {
+        ack_through: 0,
         retry_key: retry_key(),
         logical: BoundedBytes::new(vec![0xff; 3]).unwrap(),
         deadline_ms: 0,

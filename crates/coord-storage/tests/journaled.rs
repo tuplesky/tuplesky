@@ -204,6 +204,7 @@ fn request_of(sequence: u64) -> coord_types::logical_v1::LogicalRequest {
 
 fn payload_of(sequence: u64) -> PayloadRecordV1 {
     PayloadRecordV1 {
+        ack_through: 0,
         retry_key: retry_key(sequence),
         logical: postcard::to_allocvec(&request_of(sequence)).unwrap(),
         admission: None,

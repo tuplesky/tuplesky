@@ -1697,7 +1697,7 @@ fn request_frame() -> Vec<u8> {
         client_instance_id: coord_types::ids::ClientInstanceId([4; 16]),
         request_sequence: coord_types::ids::RequestSequence::new(1).unwrap(),
     };
-    MessageV1::Request(coord_types::wire_v1::RequestV1::new(retry_key, &request, 0).unwrap())
+    MessageV1::Request(coord_types::wire_v1::RequestV1::new(retry_key, &request, 0, 0).unwrap())
         .encode()
         .unwrap()
 }

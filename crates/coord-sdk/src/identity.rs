@@ -39,6 +39,14 @@ pub struct InstanceState {
     pub next_sequence: u64,
     /// Sequences whose payload is fixed, with their command identity.
     pub bound: BTreeMap<u64, Binding>,
+    /// The floor this instance has acknowledged: every sequence at or
+    /// below it reached a result here, so the domain may retire their
+    /// invocation identities and let the outstanding window move on.
+    /// Only the lifecycle's contiguous finished prefix advances it; a
+    /// sequence still outstanding holds it where it is, which is what
+    /// keeps the identity of a request that may yet be retried.
+    #[serde(default)]
+    pub acked: u64,
 }
 
 /// Why an invocation could not be built.
@@ -79,6 +87,13 @@ pub struct Binding {
     pub command_id: CommandId,
     /// Deadline the original frame carried.
     pub deadline_ms: u32,
+    /// The acknowledged floor the original frame carried. Fixed at
+    /// allocation and repeated on every retry: the floor a command
+    /// retires is part of what the command durably is, so a retry that
+    /// acknowledged more would be the same command asking the domain to
+    /// retire a different prefix.
+    #[serde(default)]
+    pub ack_through: u64,
 }
 
 /// A client instance: the allocator of invocation identities.
@@ -104,6 +119,7 @@ impl ClientInstance {
                 instance,
                 next_sequence: 1,
                 bound: BTreeMap::new(),
+                acked: 0,
             },
         }
     }
@@ -146,13 +162,15 @@ impl ClientInstance {
     ) -> Result<Invocation, InvocationError> {
         let sequence = self.state.next_sequence;
         let key = self.key(sequence).ok_or(InvocationError::Exhausted)?;
-        let invocation = build(key, request, deadline_ms)?;
+        let ack_through = self.state.acked;
+        let invocation = build(key, request, deadline_ms, ack_through)?;
         self.state.next_sequence = sequence.checked_add(1).ok_or(InvocationError::Exhausted)?;
         self.state.bound.insert(
             sequence,
             Binding {
                 command_id: invocation.command_id,
                 deadline_ms,
+                ack_through,
             },
         );
         Ok(invocation)
@@ -184,16 +202,26 @@ impl ClientInstance {
             });
         }
         let key = self.key(sequence).ok_or(InvocationError::Exhausted)?;
-        let invocation = build(key, request, deadline_ms)?;
+        let invocation = build(key, request, deadline_ms, bound.ack_through)?;
         if invocation.command_id != bound.command_id {
             return Err(InvocationError::PayloadConflict { sequence });
         }
         Ok(invocation)
     }
 
-    /// Forget sequences at or below `floor` (acknowledged and retired).
+    /// Forget sequences at or below `floor` (acknowledged and retired),
+    /// and record the floor so that the invocations allocated after this
+    /// point tell the domain about it. The domain cannot retire what it
+    /// was never told reached the caller, so a client that pruned its own
+    /// bindings and said nothing would run out of window and stay there.
     pub fn retire(&mut self, floor: u64) {
         self.state.bound.retain(|s, _| *s > floor);
+        self.state.acked = self.state.acked.max(floor);
+    }
+
+    /// The floor this instance has acknowledged.
+    pub const fn acked(&self) -> u64 {
+        self.state.acked
     }
 }
 
@@ -201,12 +229,13 @@ fn build(
     key: RetryKey,
     request: &LogicalRequest,
     deadline_ms: u32,
+    ack_through: u64,
 ) -> Result<Invocation, InvocationError> {
     let mut canonical = request.clone();
     canonical.canonicalize();
     let command_id = CommandId::derive(&key, &canonical).map_err(|_| InvocationError::Invalid)?;
-    let wire =
-        RequestV1::new(key, &canonical, deadline_ms).map_err(|_| InvocationError::Invalid)?;
+    let wire = RequestV1::new(key, &canonical, deadline_ms, ack_through)
+        .map_err(|_| InvocationError::Invalid)?;
     let frame = MessageV1::Request(wire)
         .encode()
         .map_err(|_| InvocationError::Invalid)?;

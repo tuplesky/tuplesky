@@ -334,7 +334,10 @@ impl BoundFrontend {
             self.config.namespace(),
             coord_types::logical_v1::CanonicalOperation::ConsumeAdmission,
         );
-        let Ok(request) = RequestV1::new(retry_key, &logical, 0) else {
+        // The establishment request acknowledges nothing: it is the
+        // session's first invocation, so there is no earlier result of
+        // this client instance for it to retire.
+        let Ok(request) = RequestV1::new(retry_key, &logical, 0, 0) else {
             return Ingress::Rejected(BindError::Malformed);
         };
         let Ok(frame) = MessageV1::Request(request).encode() else {

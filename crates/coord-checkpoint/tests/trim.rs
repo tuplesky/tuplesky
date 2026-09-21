@@ -90,6 +90,7 @@ fn request_of(n: u8) -> coord_types::logical_v1::LogicalRequest {
 
 fn payload_of(n: u8) -> PayloadRecordV1 {
     PayloadRecordV1 {
+        ack_through: 0,
         retry_key: retry_key(u64::from(n)),
         logical: postcard::to_allocvec(&request_of(n)).unwrap(),
         admission: None,

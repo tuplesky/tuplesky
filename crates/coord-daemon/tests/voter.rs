@@ -256,7 +256,7 @@ fn submission(sequence: u64) -> Vec<u8> {
             },
             establishing: None,
         },
-        request: RequestV1::new(key, &logical, 0).unwrap(),
+        request: RequestV1::new(key, &logical, 0, 0).unwrap(),
     })
     .expect("submit frame")
 }

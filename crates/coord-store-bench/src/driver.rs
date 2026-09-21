@@ -276,6 +276,7 @@ impl<E: LocalEngine> Domain<E> {
         let command = CommandId::derive(&key, &request)
             .map_err(|e| DriveError::Apply(format!("command identity: {e:?}")))?;
         let payload = PayloadRecordV1 {
+            ack_through: 0,
             retry_key: key,
             logical: postcard::to_allocvec(&request)
                 .map_err(|_| DriveError::Apply("payload encode".to_owned()))?,

@@ -427,7 +427,7 @@ impl Leader {
             deps: deps.clone(),
             paths: record.paths.clone(),
             path: record.path,
-            admission: record.payload.unwrap_or_else(|| admission_digest(None)),
+            admission: record.payload.unwrap_or_else(|| admission_digest(None, 0)),
             seqnum: Some(seqnum),
         };
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
@@ -825,6 +825,7 @@ impl Leader {
             retry_key: request.retry_key,
             logical: request.logical.as_slice().to_vec(),
             admission,
+            ack_through: request.ack_through,
         };
         // Atomic initialization: admission binding, conservative
         // dependencies, path evidence and index publication in one
@@ -1024,7 +1025,7 @@ impl Leader {
             .table
             .record(&command)
             .and_then(|r| r.payload)
-            .unwrap_or_else(|| admission_digest(None));
+            .unwrap_or_else(|| admission_digest(None, 0));
         let proposal = self.proposals.get_mut(&command).expect("checked above");
         proposal.barrier = barrier;
         proposal.attempts += 1;

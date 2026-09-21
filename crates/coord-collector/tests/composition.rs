@@ -147,7 +147,10 @@ fn request(seq: u64, op: CanonicalOperation, deadline_ms: u32) -> (CommandId, Re
     logical.canonicalize();
     let key = retry_key(seq);
     let command = CommandId::derive(&key, &logical).unwrap();
-    (command, RequestV1::new(key, &logical, deadline_ms).unwrap())
+    (
+        command,
+        RequestV1::new(key, &logical, deadline_ms, 0).unwrap(),
+    )
 }
 
 fn frame_of(bytes: &[u8]) -> Frame {
@@ -1452,7 +1455,7 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
                 replica: r(9),
                 ballot: ballot(),
                 command: c3,
-                admission: coord_core::capability::admission_digest(None),
+                admission: coord_core::capability::admission_digest(None, 0),
             }),
         )
         .unwrap_err();

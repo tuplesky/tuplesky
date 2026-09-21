@@ -241,7 +241,7 @@ fn request(seq: u64, op: CanonicalOperation) -> (CommandId, Frame) {
     logical.canonicalize();
     let key = retry_key(seq);
     let command = CommandId::derive(&key, &logical).unwrap();
-    let frame = MessageV1::Request(RequestV1::new(key, &logical, 0).unwrap())
+    let frame = MessageV1::Request(RequestV1::new(key, &logical, 0, 0).unwrap())
         .encode()
         .unwrap();
     (command, frame_of(&frame))
@@ -414,7 +414,7 @@ fn an_expired_warm_connection_cannot_admit_and_a_rebind_keeps_the_identity() {
     let mut logical = LogicalRequest::new(NS, put(b"c", false));
     logical.canonicalize();
     let req3 = frame_of(
-        &MessageV1::Request(RequestV1::new(foreign_key, &logical, 0).unwrap())
+        &MessageV1::Request(RequestV1::new(foreign_key, &logical, 0, 0).unwrap())
             .encode()
             .unwrap(),
     );
@@ -851,7 +851,7 @@ fn a_rejected_conflicting_request_never_replaces_the_accepted_metadata() {
     other.canonicalize();
     let key = retry_key(1);
     let conflicting = frame_of(
-        &MessageV1::Request(RequestV1::new(key, &other, 0).unwrap())
+        &MessageV1::Request(RequestV1::new(key, &other, 0, 0).unwrap())
             .encode()
             .unwrap(),
     );

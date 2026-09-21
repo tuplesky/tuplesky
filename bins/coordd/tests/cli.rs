@@ -1146,7 +1146,7 @@ impl Caller {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()
@@ -3443,7 +3443,7 @@ async fn a_key_under_a_time_to_live_stops_being_readable() {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()
@@ -3462,7 +3462,7 @@ async fn a_key_under_a_time_to_live_stops_being_readable() {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()
@@ -3562,7 +3562,7 @@ async fn a_caller_cannot_expire_a_lease_however_it_spells_it() {
         );
         logical.canonicalize();
         let frame = coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(caller.invocation(n as u64 + 1), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(caller.invocation(n as u64 + 1), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()

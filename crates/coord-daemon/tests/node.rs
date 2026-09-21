@@ -144,7 +144,7 @@ fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
         client_instance_id: ClientInstanceId([4; 16]),
         request_sequence: RequestSequence::new(sequence).unwrap(),
     };
-    let request = RequestV1::new(key, &logical, 0).unwrap();
+    let request = RequestV1::new(key, &logical, 0, 0).unwrap();
     coord_core::event::AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),

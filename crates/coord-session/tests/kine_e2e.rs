@@ -163,6 +163,7 @@ async fn serve(mut transport: Transport, config: BindingConfig) {
         // Nothing but a binding may precede work.
         let retained = if bound {
             let payload = PayloadRecordV1 {
+                ack_through: 0,
                 retry_key: request.retry_key,
                 logical: request.logical.as_slice().to_vec(),
                 admission: None,

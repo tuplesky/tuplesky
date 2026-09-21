@@ -59,6 +59,7 @@ fn retry_key(session: SessionId, seq: u64) -> RetryKey {
 
 fn binding(session: SessionId, seq: u64, request: &LogicalRequest) -> RetryBinding {
     RetryBinding {
+        retires: None,
         retry_key: retry_key(session, seq),
         command_id: CommandId::derive(&retry_key(session, seq), request).unwrap(),
     }
