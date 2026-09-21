@@ -2098,10 +2098,12 @@ leader's own lease-authority command, which no caller is waiting for).
 It is written down rather than fixed because a fix has to be the right
 one. A first attempt in this pass -- bounding the leader's per-command
 memory, which is genuinely unbounded today and is the other half of
-this -- made the loss five times worse and was reverted rather than
-shipped. `a_quorum_keeps_answering_past_its_table_capacity` reproduces
-it in-process within seconds when that bound is put back, which is
-where the next attempt starts. Bounding the leader's proposals, vote
+this -- was reverted rather than shipped: with it,
+`a_quorum_keeps_answering_past_its_table_capacity` fails every run, one
+to four operations short of four hundred and eighty, where without it
+it passes every run. That is the useful part of the experiment. The
+defect reproduces in-process, in seconds, under a debugger, the moment
+that bound is put back, and that is where the next attempt starts. Bounding the leader's proposals, vote
 sets and payloads belongs with
 [task-j07](design/tuplesky-prs-plan.md#task-j07), whose subject is
 bounded memory under load; what that experiment showed is that
