@@ -313,12 +313,20 @@ func observedEvents(watcher Watcher, writes map[int64]time.Time) Events {
 		return Events{Delivered: Missing(NotStated)}
 	}
 	var delay Samples
-	var missed uint64
+	var missed, ahead uint64
 	for revision, acked := range writes {
 		at, ok := watcher.DeliveredAt(revision)
 		if !ok {
 			missed++
 			continue
+		}
+		// An event the watcher already held when the caller was told
+		// the write applied is not a delay of zero, it is no wait at
+		// all. It still enters the distribution (as zero, since a
+		// duration has no sign) and is counted here so the zero can be
+		// read for what it is.
+		if !at.After(acked) {
+			ahead++
 		}
 		delay.Add(at.Sub(acked))
 	}
@@ -326,5 +334,6 @@ func observedEvents(watcher Watcher, writes map[int64]time.Time) Events {
 		Delivered: delay.Percentiles(),
 		Observed:  uint64(delay.Len()),
 		Missed:    missed,
+		Ahead:     ahead,
 	}
 }
