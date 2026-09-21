@@ -378,6 +378,13 @@ const PRINCIPAL: [u8; 16] = [0xa; 16];
 /// here is planned in.
 const REQUEST_NAMESPACE: [u8; 16] = [0x5e; 16];
 
+/// The single-use receipt identifier of `session`'s credential.
+fn receipt_of(session: [u8; 16]) -> [u8; 32] {
+    let mut out = [2u8; 32];
+    out[..16].copy_from_slice(&session);
+    out
+}
+
 fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -391,7 +398,12 @@ fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
         scope: 0xffff,
         rule: hex(&TRUST_RULE),
         generation: 1,
-        jti: hex(&[2u8; 32]),
+        // Per session, because a receipt is single use: the state
+        // machine consumes it when it creates the session, and a second
+        // session presenting the same one is correctly told the receipt
+        // is spent. A fixture that minted one identifier for every
+        // credential could establish exactly one session per domain.
+        jti: hex(&receipt_of(session)),
         iat: issued,
         exp: issued + 3600,
     })
@@ -993,7 +1005,7 @@ impl Caller {
         let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
         let answer = ask(&connection, &bind)
             .await
-            .expect("the daemon answered the binding within the bound");
+            .unwrap_or_else(|| panic!("the daemon did not answer the binding:\n{}", daemon.said()));
         let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
         assert_eq!(
             ack.session,
@@ -3328,5 +3340,60 @@ async fn a_watch_is_served_the_revisions_that_follow_it() {
     assert!(
         seen[0].0 < seen[1].0,
         "the watch delivered revisions out of order: {seen:?}"
+    );
+}
+
+/// Two callers asking at the same time are both served by a quorum.
+///
+/// One caller at a time is the shape every earlier test has: ask, wait,
+/// ask again. A domain can serialize all of its work and still pass
+/// every one of them. An API server is concurrent from its first
+/// second, so this asks two sessions to keep one request each in flight
+/// against three voters and expects every one of them answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_callers_at_once_are_both_served_by_a_quorum() {
+    let dir = workspace("concurrent");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0), "each store is made");
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "voter {} cannot submit to the other two:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    let first = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x41; 16]).await;
+    let second = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x42; 16]).await;
+
+    // Each caller keeps one request in flight and writes its own keys,
+    // so nothing here contends for a value: what is shared is the
+    // domain's ordering, not the data.
+    const EACH: usize = 25;
+    async fn ask_all(caller: &Caller, tag: u8) -> usize {
+        let mut answered = 0;
+        for n in 0..EACH {
+            let key = format!("{tag:02x}-{n:04}").into_bytes();
+            if ask(&caller.connection, &caller.put(n as u64 + 1, &key, b"v"))
+                .await
+                .is_some()
+            {
+                answered += 1;
+            }
+        }
+        answered
+    }
+    let (a, b) = tokio::join!(ask_all(&first, 1), ask_all(&second, 2));
+    assert_eq!(
+        (a, b),
+        (EACH, EACH),
+        "two callers at once were answered {a} and {b} of {EACH} each\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
     );
 }

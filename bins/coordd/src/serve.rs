@@ -826,7 +826,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         out.absorb(voter.execute()?);
         let provenance = voter.provenance();
         let did = !refused.is_empty() || !out.is_empty();
+        // A refusal at the voter's door is silent to the caller, whose
+        // stream is held for an answer that is not coming. The reason is
+        // a bounded enum, so this node says it rather than leaving an
+        // operator with a counter.
+        for why in &refused {
+            eprintln!("this voter refused a submission: {why:?}");
+        }
         self.frontend.counts.refused += refused.len() as u64;
+        // What the protocol machine itself refused. Drained every turn
+        // rather than left to grow: a refusal nobody reads is a list
+        // that lives as long as the process and a reason an operator
+        // never sees.
+        for why in voter.take_rejections() {
+            eprintln!("this voter's machine refused: {why}");
+        }
         self.carry(api, out, provenance);
         Ok(did)
     }
@@ -926,7 +940,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // No route right now. The voter contributes nothing
                 // through this process until there is one; the quorum
                 // rule decides what that costs.
-                Some(Err(_)) | None => self.frontend.counts.unavailable += 1,
+                //
+                // Said, not only counted. A vote this node produced and
+                // could not send is the difference between a quorum
+                // that forms and one that does not, and it is invisible
+                // from every other node.
+                Some(Err(e)) => {
+                    eprintln!("this voter could not send to {}: {e:?}", hex4(&to.replica));
+                    self.frontend.counts.unavailable += 1;
+                }
+                None => {
+                    eprintln!("this voter has no peer plane to send on");
+                    self.frontend.counts.unavailable += 1;
+                }
             }
         }
         // Timers, read views and entropy are the runtime's, and this
@@ -1100,8 +1126,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Delivered::Unbound {
                 connection,
                 retry_key,
-                ..
+                reason,
             } => {
+                // Said on this node's log for the same reason a refused
+                // bind is: the caller is told only that it has no
+                // session, so an operator who cannot see why has nothing
+                // to go on.
+                eprintln!("a session was not established: {reason:?}");
                 if let Ok(responder) = self.frontend.pending.take(connection, &retry_key) {
                     drop(responder);
                 }
@@ -1186,6 +1217,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.backing.applier().hub(),
                     &policy,
                 );
+                // A refused binding is the one refusal an operator
+                // cannot diagnose from the outside: the caller is told
+                // only that it was refused, deliberately, because
+                // whether a token was wrong or merely late is not
+                // something an unbound caller may distinguish. The
+                // reason is a bounded enum with nothing of the caller
+                // in it, so this node says it on its own log.
+                if let coord_session::Ingress::Rejected(reason) = &ingress {
+                    eprintln!("a binding was refused: {reason:?}");
+                }
                 let decided = step(ingress, retry_key);
                 self.carry_out(transport, connection, decided, responder)
                     .await;
@@ -1299,7 +1340,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 let provenance = voter.provenance();
                 self.carry(api, out, provenance);
             }
-            Ok(Err(_)) => self.frontend.counts.refused += 1,
+            Ok(Err(why)) => {
+                eprintln!("this voter refused a collector's submission: {why:?}");
+                self.frontend.counts.refused += 1;
+            }
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
         }
     }

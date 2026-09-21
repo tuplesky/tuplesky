@@ -118,82 +118,79 @@ Run against three voters on one host, at the commit this document ships in:
 | Compaction refuses a watch below the floor | passes |
 | Watch replay, live handover, progress, resume | passes |
 | Time-to-live expiry | **fails** |
-| Concurrent writers on one key | **fails** |
+| Concurrent writers on one key | passes |
 
-### The two gaps, named
+### The one gap, named
 
-Neither is a flake, both are reproducible from a fresh domain, and each
-blocks compatibility labeling on its own. They are independent: a failing
-row no longer takes the rest of the run with it, which it used to.
+It is not a flake, it is reproducible from a fresh domain, and it blocks
+compatibility labeling on its own.
 
-1. **Concurrent callers are not served across a quorum.** Two callers
-   issuing one request each at a time against a three-voter domain
-   complete 13 of 100 operations within a five-second deadline. The same
-   two callers against a *single* voter complete 100 of 100, and a single
-   caller against the three-voter domain completes 200 of 200 -- so it is
-   neither the client nor the volume, it is two commands in flight at
-   once across a real quorum.
+**A key under a time to live does not expire.** A key written with a
+one-second lease is still readable a minute later.
 
-   Every command is initialized with one conservative conflict key
-   (`CONSERVATIVE_KEY` in `Leader::on_admitted`), so the dependency chain
-   over all commands is total: each one is ordered after the one before
-   it, whatever keys they actually touch. Sequential callers satisfy that
-   for free. That is the mechanism to look at first; this document does
-   not claim it is the whole cause, because what has been measured is the
-   shape and not the proof.
+The specified behaviour, so the gap is measured against something.
+Design Section 6.6 says a Kine `lease` is a *TTL in seconds*, not a
+lease identity: at the reference pin `LeaseGrant` returns the
+requested TTL as the apparent lease id, so unrelated keys written with
+TTL 60 must not end up attached to one shared lease 60. A positive TTL
+creates or replaces a **hidden private per-key expiry binding**,
+atomically with the create or update that carries it -- one command,
+no separate lease-grant round trip before the `Put`. The binding's
+identity is derived from the stable request, and it is never
+disclosed: what a Kine caller reads back is the TTL, never the hidden
+id. A TTL of zero removes the binding. Replacing or refreshing the key
+invalidates the old binding, so a stale expiry candidate is a no-op.
 
-   A Kubernetes API server is concurrent from its first second, so this
-   blocks the k3s run outright.
+Expiry itself is Section 7.2-7.3, and its shape is the whole point:
+it is an **authoritative conditional command**, `ExpireLease`, matching
+the binding's generation, the expected renewal sequence and the
+replicated `LeaseAuthorityEpoch`, applied only if every field still
+matches -- never a local unconditional delete by whichever process
+noticed the time. A timer is a scheduling hint and not permission to
+mutate. The deadline is `(1 + rho) * TTL` local ticks from an anchor
+that is the observation of a *committed* grant or renewal, for a
+documented maximum fast clock-rate error `rho`, and TTL is anchored to
+the operation's linearization rather than to a reply's arrival. After
+a restart or a failover the new authority epoch rearms every surviving
+binding for its full TTL from that observation. So expiry may be late,
+and is allowed to be; it may not be early, and without a quorum it
+does not happen at all.
 
-2. **A key under a time to live does not expire.** A key written with a
-   one-second lease is still readable a minute later.
+What exists: the state machine side. `coord_state::expiry::Scheduler`
+arms deadlines under an authority epoch, rearms conservatively and
+emits `InternalCommand::ExpireLease` candidates, and the planner
+applies them conditionally; the private binding is created and
+replaced atomically with the write, and stays hidden (this suite
+checks the disclosure rule, and it passes).
 
-   The specified behaviour, so the gap is measured against something.
-   Design Section 6.6 says a Kine `lease` is a *TTL in seconds*, not a
-   lease identity: at the reference pin `LeaseGrant` returns the
-   requested TTL as the apparent lease id, so unrelated keys written with
-   TTL 60 must not end up attached to one shared lease 60. A positive TTL
-   creates or replaces a **hidden private per-key expiry binding**,
-   atomically with the create or update that carries it -- one command,
-   no separate lease-grant round trip before the `Put`. The binding's
-   identity is derived from the stable request, and it is never
-   disclosed: what a Kine caller reads back is the TTL, never the hidden
-   id. A TTL of zero removes the binding. Replacing or refreshing the key
-   invalidates the old binding, so a stale expiry candidate is a no-op.
+What is missing: the driver. Nothing in `coordd` constructs that
+scheduler, feeds it observations of committed lease state, or submits
+the candidates it produces -- `Scheduler` has no caller outside its own
+tests. The internal command also has no narrow `CanonicalOperation`
+to travel under, which is deliberate: each internal command gets its
+own discriminant so a client's payload can never reach lease-authority
+or policy operations, and `ExpireLease` needs one of its own before it
+can be submitted through the ordinary replicated path. Nothing here
+may be shortcut into a direct store write.
 
-   Expiry itself is Section 7.2-7.3, and its shape is the whole point:
-   it is an **authoritative conditional command**, `ExpireLease`, matching
-   the binding's generation, the expected renewal sequence and the
-   replicated `LeaseAuthorityEpoch`, applied only if every field still
-   matches -- never a local unconditional delete by whichever process
-   noticed the time. A timer is a scheduling hint and not permission to
-   mutate. The deadline is `(1 + rho) * TTL` local ticks from an anchor
-   that is the observation of a *committed* grant or renewal, for a
-   documented maximum fast clock-rate error `rho`, and TTL is anchored to
-   the operation's linearization rather than to a reply's arrival. After
-   a restart or a failover the new authority epoch rearms every surviving
-   binding for its full TTL from that observation. So expiry may be late,
-   and is allowed to be; it may not be early, and without a quorum it
-   does not happen at all.
+Three more, now fixed.
 
-   What exists: the state machine side. `coord_state::expiry::Scheduler`
-   arms deadlines under an authority epoch, rearms conservatively and
-   emits `InternalCommand::ExpireLease` candidates, and the planner
-   applies them conditionally; the private binding is created and
-   replaced atomically with the write, and stays hidden (this suite
-   checks the disclosure rule, and it passes).
-
-   What is missing: the driver. Nothing in `coordd` constructs that
-   scheduler, feeds it observations of committed lease state, or submits
-   the candidates it produces -- `Scheduler` has no caller outside its own
-   tests. The internal command also has no narrow `CanonicalOperation`
-   to travel under, which is deliberate: each internal command gets its
-   own discriminant so a client's payload can never reach lease-authority
-   or policy operations, and `ExpireLease` needs one of its own before it
-   can be submitted through the ordinary replicated path. Nothing here
-   may be shortcut into a direct store write.
-
-Two more, now fixed.
+**Concurrent callers are served across a quorum.** Two callers issuing
+one request each at a time against three voters used to complete 13 of
+100 operations, while the same two against a single voter completed 100
+of 100. The cause was not consensus: a replica's journal lowers one
+group per call, a group takes one batch per domain, and the driver
+lowered exactly once per round however many batches that round had
+submitted. Two adoptions decided together, or a proposal beside the
+acceptance its predecessor unblocked, left the rest queued -- and
+nothing comes back for a queued batch on its own, because the next
+lowering happens only because something else was persisted. So the queue
+lagged by one for ever and whatever was submitted last never became
+durable at all. A follower that never reports its adoption durable never
+releases the vote that waited on it, so the quorum that vote belongs to
+never forms, and the leader holds the command in ACCEPT while every
+other replica has executed it. The driver now lowers until the domain's
+queue is empty, bounded by the depth it started with.
 
 **Watches are served.** `Step::Watch` used to count the subscription and
 drop the responder, so a watch was registered with the hub and nothing
@@ -234,7 +231,7 @@ wedged domain used to turn one failure into every later one, so a suite
 run reported a cascade and the first line of the log was the only one
 worth reading.
 
-Until both are closed, this document's answer to "is this
+Until it is closed, this document's answer to "is this
 etcd-compatible" is no, for stated reasons, in a named profile. That is
 the point of certifying rather than booting.
 
