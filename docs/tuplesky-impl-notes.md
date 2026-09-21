@@ -2228,6 +2228,21 @@ by `payload_transfer_is_bounded_in_both_directions_and_still_covers_everything`:
 a bound that always took the same prefix would be a wedge with a bound
 on it rather than a fix.
 
+*And what is left, stated plainly.* A replica that falls behind now
+recovers instead of stopping, and nothing is lost or refused that was
+not lost or refused before it fell behind. It does not recover
+*quickly*: on the re-run matrix the read-heavy rows lose about three
+operations in ten to the ten-second deadline, all of them belonging to
+the callers bound to one frontend, at every offered rate including the
+closed loop. Those are reads held pending on a projection that has not
+caught up, not reads refused, and they are published in
+[the results](operations/wan-results.md#the-finding-this-run-exposed)
+rather than tuned away. Closing it means a catch-up path that outruns
+the load that put the replica behind, which is a protocol question
+rather than a bound to adjust, and it belongs with
+[task-j07](design/tuplesky-prs-plan.md#task-j07) beside the leader's
+per-command memory.
+
 ### What the benchmark harness had to get right to find these
 
 A closed-loop benchmark would not have found the fifth or the sixth. It sends the next
