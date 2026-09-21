@@ -662,6 +662,9 @@ pub struct Domain<P: Persistence> {
     no_plane_said: bool,
     /// Refusals this node keeps saying, so that it says them less.
     recurring: Recurring,
+    /// Peer events taken since the last caller's event, so the peer
+    /// plane's priority cannot become the caller plane's starvation.
+    peer_streak: u32,
     budgets: Budgets,
 }
 
@@ -767,6 +770,29 @@ impl Recurring {
 /// node has for it.
 const UNDELIVERABLE_SAID_AT: u64 = 64;
 
+/// How many peer events in a row are taken before the caller's plane is
+/// polled first for one turn.
+///
+/// High enough that the ordering still holds in the case it is for -- a
+/// burst of votes for one command is a handful of frames, and a
+/// recovery summary is not much more -- and low enough that a caller's
+/// request waits for a bounded number of peer frames rather than for
+/// the domain to go quiet.
+const PEER_BEFORE_API: u32 = 64;
+
+/// Whether the caller's plane is polled before the peer plane this
+/// turn, given how many peer events have been taken since the last
+/// caller's event.
+///
+/// The peer plane keeps its priority -- it is what lets a caller's
+/// request finish -- but only for a bounded run. A priority with
+/// nothing behind it is starvation, and on a busy domain the peer plane
+/// is ready on every poll, so a loop that always prefers it never polls
+/// the caller's plane at all.
+const fn poll_api_first(peer_streak: u32) -> bool {
+    peer_streak >= PEER_BEFORE_API
+}
+
 /// How many payloads one ask is for, given how many are missing.
 ///
 /// The protocol's own bound, applied here so the runtime knows what a
@@ -855,6 +881,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
+            peer_streak: 0,
             budgets,
         }
     }
@@ -1058,20 +1085,56 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Backing::Voting(v) => v.awaiting().is_some() || v.missing_payloads() > 0,
                 Backing::Serving(_) => false,
             };
-            let arrived = tokio::select! {
-                biased;
-                // Voter work that is still outstanding pre-empts waiting
-                // on anything. This branch is taken only when the last
-                // turn actually did something, so a voter that cannot
-                // progress waits rather than spins.
-                () = std::future::ready(()), if progressed => continue,
-                () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
-                peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
-                event = transport.next_event() => event.map(Arrived::Api),
+            // The peer plane goes first, and not for ever. A vote, an
+            // adoption or a recovery summary is the work that lets a
+            // caller's request finish, so a frontend under load must
+            // not be able to hold it up -- but a biased select is a
+            // priority, and a priority with nothing behind it is
+            // starvation. A busy domain keeps the peer plane ready on
+            // every poll, and this loop then never polls the caller's
+            // plane at all: measured on a three-voter domain, one
+            // voter served 4560 api events and then not one more while
+            // its peer arm took another 80000, so every caller bound
+            // to that frontend waited out its deadline against a node
+            // that was working perfectly.
+            //
+            // So the bias is a budget. After `PEER_BEFORE_API`
+            // consecutive peer events the caller's plane is polled
+            // first for one turn, which is enough to guarantee it a
+            // share without giving up the ordering that makes the
+            // domain progress.
+            let api_first = poll_api_first(self.peer_streak);
+            let arrived = if api_first {
+                tokio::select! {
+                    biased;
+                    // Voter work that is still outstanding pre-empts
+                    // waiting on anything. This branch is taken only
+                    // when the last turn actually did something, so a
+                    // voter that cannot progress waits rather than
+                    // spins.
+                    () = std::future::ready(()), if progressed => continue,
+                    () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
+                    event = transport.next_event() => event.map(Arrived::Api),
+                    peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    () = std::future::ready(()), if progressed => continue,
+                    () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
+                    peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                    event = transport.next_event() => event.map(Arrived::Api),
+                }
             };
             match arrived {
-                Some(Arrived::Api(event)) => self.on_transport(transport, event, &clock).await,
-                Some(Arrived::Peer(event)) => self.on_peer_plane(transport, event),
+                Some(Arrived::Api(event)) => {
+                    self.peer_streak = 0;
+                    self.on_transport(transport, event, &clock).await;
+                }
+                Some(Arrived::Peer(event)) => {
+                    self.peer_streak = self.peer_streak.saturating_add(1);
+                    self.on_peer_plane(transport, event);
+                }
                 None => return,
             }
         }
@@ -2379,9 +2442,35 @@ mod tests {
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 
     use super::{
-        PAYLOAD_RETRY, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed, ask_for_payloads_now,
-        payload_batch_size,
+        PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed,
+        ask_for_payloads_now, payload_batch_size, poll_api_first,
     };
+
+    /// The peer plane's priority is a budget, not a licence.
+    ///
+    /// Without the budget a busy domain keeps the peer plane ready on
+    /// every poll and the caller's plane is never polled: measured on a
+    /// three-voter domain under the benchmark's load, one voter served
+    /// 4560 api events and then not one more while its peer arm took
+    /// another 80000, and every caller bound to that frontend waited
+    /// out its deadline against a node that was otherwise working.
+    #[test]
+    fn the_peer_planes_priority_is_bounded_so_a_caller_is_never_starved() {
+        // Ordinary: the peer plane goes first, which is the ordering
+        // that makes a caller's own request finish.
+        assert!(!poll_api_first(0));
+        assert!(!poll_api_first(1));
+        assert!(!poll_api_first(PEER_BEFORE_API - 1));
+        // And a run of peer events cannot go on for ever.
+        assert!(poll_api_first(PEER_BEFORE_API));
+        assert!(poll_api_first(u32::MAX));
+        // The budget is big enough that the ordering still holds for
+        // what it is for -- a burst of votes for one command, or a
+        // recovery summary -- and small enough that a caller waits for
+        // a bounded number of frames rather than for the domain to go
+        // quiet.
+        assert!((8..=1024).contains(&PEER_BEFORE_API));
+    }
 
     /// A condition that keeps happening is said in full a few times and
     /// then logarithmically, so a node under sustained backpressure
