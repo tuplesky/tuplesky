@@ -1838,18 +1838,57 @@ outstanding, be speculated over, and have its result released a second
 time to a caller that already had it. The proposal now carries the fact
 itself.
 
-**Concurrent callers are still not served across a quorum.** With the
-table fixed, a single caller sustains 200 requests against three voters
-and 500 against one. Two callers against three voters complete 13 of
-100. The same two callers against a *single* voter complete 100 of 100.
-So it is not the client, not the volume, and not the number of sessions:
-it is two commands in flight at once across a real quorum.
+**Concurrent callers were not served across a quorum.** With the table
+fixed, a single caller sustained 200 requests against three voters and
+500 against one. Two callers against three voters completed 13 of 100;
+the same two against a *single* voter completed 100 of 100. So it was
+not the client, not the volume, and not the number of sessions: it was
+two commands in flight at once across a real quorum.
 
-Every command is initialized with one conservative conflict key, so the
-dependency chain over all commands is total -- each is ordered after the
-one before it whatever keys it touches, and sequential callers satisfy
-that for free. That is the first thing to look at. It is not yet a
-diagnosis, and this note does not promote it to one.
+The conservative conflict key was the obvious suspect and the wrong one.
+What the leader's table actually showed was commands sitting in ACCEPT
+while every follower had *executed* them -- so the order was agreed and
+the votes that would have told the leader so never arrived. The
+followers had published them. They were still in the outbox, waiting on
+a barrier that never became durable.
+
+A replica's journal lowers one group per call and a group takes one
+batch per domain; `Persistence::lower` says so in as many words. The
+driver lowered exactly once per round, however many batches that round
+had submitted. One round submits more than one whenever anything decides
+two things at once -- two adoptions unblocked together, a proposal
+beside the acceptance its predecessor just permitted -- and the rest
+stayed queued. Nothing comes back for a queued batch on its own: the
+next lowering happens only because something *else* was persisted. So
+the queue lagged by one for ever, and whatever was submitted last never
+became durable at all.
+
+Then the rule that makes a vote honest finishes the job. A follower's
+acknowledgement is published requiring every batch it has outstanding,
+because an acknowledgement is a promise not to forget, and a promise
+this replica cannot honour after a crash must not be sent. One batch
+stuck at the back of the queue therefore held every later
+acknowledgement behind it. The follower executed everything; the leader
+heard about none of it; the caller's stream waited out its deadline
+against a domain that had already agreed.
+
+The driver now lowers until the domain's queue is empty, bounded by the
+depth it started with -- so a lowering that moves nothing, an append
+still in flight or an uncertain head, ends the loop rather than
+spinning, and the next round tries again. The regression test is
+`bins/coordd/tests/cli.rs::two_callers_at_once_are_both_served_by_a_quorum`
+(two sessions, twenty-five requests each, three voters); with the loop
+reduced to one lowering again it answers 3 of 25 each.
+
+Two things this cost before it was found, both worth naming. The first
+is that nothing said anything: a refused submission, a rejection the
+protocol machine recorded, a send that found no route and a session that
+failed to establish were all counted and none was logged, so a domain
+that had stopped serving looked from its own log exactly like an idle
+one. All four now say so. The second is that `Leader::take_rejections`
+had no caller at all -- the list grew for the life of the process, and
+the reasons in it were never read by anything. The driver drains it
+every turn.
 
 **And a key under a time to live does not expire.** Written with a
 one-second lease, still readable a minute later. The private binding is
