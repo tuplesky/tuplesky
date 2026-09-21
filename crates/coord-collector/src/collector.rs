@@ -333,7 +333,7 @@ impl Collector {
             Pending {
                 retry_key: key,
                 session: admitted.receipt.session(),
-                admission: admission_digest(Some(&admitted.receipt.facts())),
+                admission: admission_digest(Some(&admitted.receipt.facts()), request.ack_through),
                 votes: VoteSet::new(self.config.quorum.clone(), command),
                 released: None,
                 attached: true,
@@ -387,7 +387,7 @@ impl Collector {
                     admission: self
                         .pending
                         .get(&command)
-                        .map_or_else(|| admission_digest(None), |p| p.admission),
+                        .map_or_else(|| admission_digest(None, 0), |p| p.admission),
                     seqnum: Some(seqnum),
                 }),
             ),

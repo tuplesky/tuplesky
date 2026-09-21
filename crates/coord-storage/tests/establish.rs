@@ -114,6 +114,7 @@ fn accepted(
     (
         CommandId::derive(&key, request).unwrap(),
         PayloadRecordV1 {
+            ack_through: 0,
             retry_key: key,
             logical: postcard::to_allocvec(request).unwrap(),
             admission,

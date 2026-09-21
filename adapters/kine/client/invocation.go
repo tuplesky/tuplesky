@@ -19,18 +19,28 @@ type Instance struct {
 
 	mu    sync.Mutex
 	next  uint64
-	bound map[uint64]allocation // sequence -> what the sequence was bound to
+	bound map[uint64]seqBinding
+	// acked is the contiguous prefix of sequences that reached a
+	// result here, and finished holds the ones past a gap that have.
+	// A sequence still outstanding holds the prefix where it is: its
+	// invocation identity has to survive for a retry, and the domain
+	// retires identities on this word alone.
+	acked    uint64
+	finished map[uint64]bool
 }
 
-// allocation is what an allocated sequence is bound to: the command id and
-// a digest of the canonical frame, so a retry that keeps the command id
-// but changes the logical bytes or the deadline is refused as a conflict
-// rather than emitted as a different frame under the same retry key. The
-// digest, not the frame, is kept so a bound sequence does not retain its
-// payload.
-type allocation struct {
-	commandID [32]byte
-	frame     [sha256.Size]byte
+// seqBinding is what an allocated sequence is fixed to: everything
+// besides the payload that its frame is built from, so a retry
+// reproduces the frame byte for byte rather than one that merely shares
+// its identity, and a digest of the canonical frame, so a retry that
+// keeps the command id but changes the logical bytes or the deadline is
+// refused as a conflict rather than emitted as a different frame under
+// the same retry key. The digest, not the frame, is kept so a bound
+// sequence does not retain its payload.
+type seqBinding struct {
+	commandID  [32]byte
+	ackThrough uint64
+	frame      [sha256.Size]byte
 }
 
 // InstanceConfig configures an Instance.
@@ -49,7 +59,8 @@ func NewInstance(cfg InstanceConfig) *Instance {
 		session:  cfg.Session,
 		instance: cfg.Instance,
 		next:     1,
-		bound:    make(map[uint64]allocation),
+		bound:    make(map[uint64]seqBinding),
+		finished: make(map[uint64]bool),
 	}
 }
 
@@ -59,6 +70,9 @@ type Invocation struct {
 	RetryKey  wire.RetryKey
 	CommandID [32]byte
 	Frame     []byte
+	// ackThrough is the floor this invocation's frame acknowledges,
+	// kept so a retry repeats it.
+	ackThrough uint64
 }
 
 func (i *Instance) retryKey(seq uint64) wire.RetryKey {
@@ -83,7 +97,7 @@ func (i *Instance) Allocate(logical []byte, commandID [32]byte, deadlineMs uint3
 		return Invocation{}, err
 	}
 	i.next = seq + 1
-	i.bound[seq] = allocation{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
+	i.bound[seq] = seqBinding{commandID: commandID, ackThrough: inv.ackThrough, frame: sha256.Sum256(inv.Frame)}
 	return inv, nil
 }
 
@@ -107,9 +121,45 @@ func (i *Instance) AllocateFor(
 		return Invocation{}, err
 	}
 	i.next = seq + 1
-	i.bound[seq] = allocation{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
+	i.bound[seq] = seqBinding{commandID: commandID, ackThrough: inv.ackThrough, frame: sha256.Sum256(inv.Frame)}
 	return inv, nil
 }
+
+// Retire records that `seq` reached a result, and advances the
+// acknowledged floor over the contiguous prefix that has. Every
+// invocation allocated afterwards carries the floor, which is the only
+// thing that lets the domain retire those identities: without it a
+// client instance is refused once its sequence runs a window past the
+// floor, and stays refused for the life of its session.
+//
+// Only a sequence the caller is finished with counts. One whose outcome
+// is unknown and may still be retried under its own identity holds the
+// prefix where it is, because what a retirement gives up is exactly the
+// retained result a retry would have been answered from.
+func (i *Instance) Retire(seq uint64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.finished[seq] = true
+	for i.finished[i.acked+1] {
+		i.acked++
+		delete(i.finished, i.acked)
+		delete(i.bound, i.acked)
+	}
+}
+
+// Acked is the floor this instance has acknowledged.
+func (i *Instance) Acked() uint64 {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.acked
+}
+
+// Release forgets an allocated sequence once its outcome is final and
+// the caller will not retry it. It is [`Instance.Retire`] under the name
+// a caller that thinks in bindings rather than floors reaches for: the
+// sequence counts towards the acknowledged prefix, its binding goes with
+// it, and the sequence is never reused.
+func (i *Instance) Release(seq uint64) { i.Retire(seq) }
 
 // Retry rebuilds an allocated sequence's invocation; the command id and
 // the canonical frame (logical bytes and deadline) must be the ones bound
@@ -125,7 +175,11 @@ func (i *Instance) Retry(seq uint64, logical []byte, commandID [32]byte, deadlin
 	if bound.commandID != commandID {
 		return Invocation{}, ErrPayloadConflict
 	}
-	inv, err := i.build(seq, logical, commandID, deadlineMs)
+	// The acknowledged floor is repeated, not recomputed: the prefix a
+	// command retires is part of what the command durably is, so a retry
+	// acknowledging more would be the same command asking two replicas
+	// to retire different prefixes.
+	inv, err := i.buildAcking(seq, logical, commandID, deadlineMs, bound.ackThrough)
 	if err != nil {
 		return Invocation{}, err
 	}
@@ -135,28 +189,34 @@ func (i *Instance) Retry(seq uint64, logical []byte, commandID [32]byte, deadlin
 	return inv, nil
 }
 
-// Release forgets an allocated sequence's binding once its outcome is
-// final and the caller will not retry it. The binding exists so that a
-// retry is the same invocation and never a different payload under the
-// same key; a request that is complete (established, or given up on and
-// reported as unknown so the caller issues a new invocation) is never
-// retried, and keeping its binding would grow the instance by one entry
-// per request for the life of the process. The sequence is not reused:
-// `next` has already moved past it, so a later Retry of it is refused as
-// unknown rather than rebuilt.
-func (i *Instance) Release(seq uint64) {
-	i.mu.Lock()
-	delete(i.bound, seq)
-	i.mu.Unlock()
+func (i *Instance) build(seq uint64, logical []byte, commandID [32]byte, deadlineMs uint32) (Invocation, error) {
+	return i.buildAcking(seq, logical, commandID, deadlineMs, i.acked)
 }
 
-func (i *Instance) build(seq uint64, logical []byte, commandID [32]byte, deadlineMs uint32) (Invocation, error) {
+func (i *Instance) buildAcking(
+	seq uint64,
+	logical []byte,
+	commandID [32]byte,
+	deadlineMs uint32,
+	ackThrough uint64,
+) (Invocation, error) {
 	key := i.retryKey(seq)
-	frame, err := wire.Encode(wire.Request{RetryKey: key, Logical: logical, DeadlineMs: deadlineMs})
+	frame, err := wire.Encode(wire.Request{
+		RetryKey:   key,
+		Logical:    logical,
+		DeadlineMs: deadlineMs,
+		AckThrough: ackThrough,
+	})
 	if err != nil {
 		return Invocation{}, err
 	}
-	return Invocation{Sequence: seq, RetryKey: key, CommandID: commandID, Frame: frame}, nil
+	return Invocation{
+		Sequence:   seq,
+		RetryKey:   key,
+		CommandID:  commandID,
+		Frame:      frame,
+		ackThrough: ackThrough,
+	}, nil
 }
 
 // ResolveFrame builds a ResolveRequest frame for an invocation.

@@ -112,7 +112,7 @@ fn logical(key: u8, value: u8) -> LogicalRequest {
 fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
     let request = logical(key, value);
     let command = CommandId::derive(&retry_key(seq), &request).unwrap();
-    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
+    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0, 0).unwrap())
         .encode()
         .unwrap();
     let receipt = AdmissionReceipt::submitting(

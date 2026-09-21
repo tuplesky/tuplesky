@@ -416,10 +416,22 @@ impl AdmissionFacts {
 /// `None` -- a command no verifier admitted, such as the protocol's own
 /// internal work -- has its own digest rather than a zero, so "no
 /// admission" is a value that must be agreed on too.
-pub fn admission_digest(facts: Option<&AdmissionFacts>) -> Digest32 {
+///
+/// `ack_through` is the other thing a command carries beside its
+/// identity: the client's acknowledged floor, which retires invocation
+/// identities when the command executes. It is here for exactly the
+/// reason the admission is. Two replicas that accepted one command
+/// under different acknowledged floors would retire different prefixes
+/// of the same client's sequences, and a later invocation would then be
+/// `TooOld` on one replica and new work on another. Like the admission
+/// it is not identity -- a retry acknowledging the same floor is the
+/// same command -- and like the admission it has to be agreed before
+/// anyone acts on it.
+pub fn admission_digest(facts: Option<&AdmissionFacts>, ack_through: u64) -> Digest32 {
+    let ack = ack_through.to_be_bytes();
     match facts {
-        Some(f) => HashDomain::AdmissionReceipt.digest(&[&f.canonical_bytes()]),
-        None => HashDomain::AdmissionReceipt.digest(&[&[]]),
+        Some(f) => HashDomain::AdmissionReceipt.digest(&[&f.canonical_bytes(), &ack]),
+        None => HashDomain::AdmissionReceipt.digest(&[&[], &ack]),
     }
 }
 

@@ -724,14 +724,33 @@ pub struct RequestV1 {
     pub logical: BoundedBytes<{ limits::MAX_REQUEST_BYTES + 64 * 1024 }>,
     /// Client deadline in milliseconds from admission (0 = none).
     pub deadline_ms: u32,
+    /// The highest sequence of this client instance whose result the
+    /// client has received, so that the domain may retire the
+    /// invocation identities at or below it and let the outstanding
+    /// window move forward (design Section 12: "advance the floor only
+    /// after all results through that sequence are received").
+    ///
+    /// Zero acknowledges nothing, which is what every request of a
+    /// client that has not yet completed one carries.
+    ///
+    /// It is not part of the command's identity -- a retry is the same
+    /// command whatever it acknowledges -- but it *is* part of what the
+    /// command durably is, so a client fixes it when the invocation is
+    /// first built and presents the same value on every retry. Two
+    /// replicas cannot then accept one command as retiring different
+    /// prefixes; see [`coord_consensus::PayloadRecordV1`].
+    #[serde(default)]
+    pub ack_through: u64,
 }
 
 impl RequestV1 {
-    /// Build from a canonical request.
+    /// Build from a canonical request. `ack_through` is the client's
+    /// acknowledged floor; zero acknowledges nothing.
     pub fn new(
         retry_key: RetryKey,
         request: &LogicalRequest,
         deadline_ms: u32,
+        ack_through: u64,
     ) -> Result<Self, WireError> {
         let bytes = request
             .canonical_bytes()
@@ -740,6 +759,7 @@ impl RequestV1 {
             retry_key,
             logical: BoundedBytes::new(bytes)?,
             deadline_ms,
+            ack_through,
         })
     }
 

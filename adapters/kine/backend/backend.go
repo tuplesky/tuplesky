@@ -309,12 +309,6 @@ func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryK
 	}
 	event := Event{Op: op, Kind: kind, Sequence: inv.Sequence, PayloadBytes: payloadBytes}
 	res, err := b.exchange(ctx, inst, inv, &event)
-	// The outcome is final here whichever way it went: established, or
-	// given up on and reported as unknown so the API server issues a new
-	// invocation. Nothing retries this sequence, so its binding is
-	// released rather than retained for every request the process ever
-	// made.
-	inst.Release(inv.Sequence)
 	event.CodecNs += int64(codec)
 	if err != nil {
 		event.Outcome = "error: " + status.Code(err).String()
@@ -331,6 +325,16 @@ func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryK
 // identity) re-sends the identical invocation, which an endpoint that did
 // see it answers from its retained result. Attempts are bounded.
 func (b *Backend) exchange(ctx context.Context, inst *client.Instance, inv client.Invocation, event *Event) (wire.Result, error) {
+	// This invocation is finished with when the exchange returns, one
+	// way or the other: an established outcome is its result, and an
+	// outcome still unknown after the bounded resolutions is reported
+	// to the caller as unknown and never asked about again under this
+	// identity. Either way the backend is done with the sequence, so it
+	// says so -- the domain retires invocation identities on the
+	// client's word alone, and a client that kept quiet about the
+	// sequences it had finished with would run its outstanding window
+	// down to nothing and be refused for the life of its session.
+	defer inst.Retire(inv.Sequence)
 	resolveFrame, err := inst.ResolveFrame(inv)
 	if err != nil {
 		return wire.Result{}, status.Error(codes.Internal, err.Error())

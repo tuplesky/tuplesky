@@ -101,7 +101,7 @@ fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
         }),
     );
     let command = CommandId::derive(&retry_key(seq), &request).unwrap();
-    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
+    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0, 0).unwrap())
         .encode()
         .unwrap();
     let receipt = AdmissionReceipt::submitting(
@@ -151,18 +151,21 @@ fn proposal(
 /// A proposal that named another one would be a proposal about another
 /// command, whatever identity it shares.
 fn admitted_under() -> Digest32 {
-    coord_core::capability::admission_digest(Some(&coord_core::capability::AdmissionFacts {
-        attested: AttestedAdmission {
-            cluster: ClusterId([1; 16]),
-            domain: DomainId([2; 16]),
-            session: SessionId([3; 16]),
-            rule_generation: 1,
-            scope_ceiling: u32::MAX,
-            receipt_id: Digest32([9; 32]),
-            admitted_at_ticks: 0,
-        },
-        establishing: None,
-    }))
+    coord_core::capability::admission_digest(
+        Some(&coord_core::capability::AdmissionFacts {
+            attested: AttestedAdmission {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: None,
+        }),
+        0,
+    )
 }
 
 fn durable_of(effects: &[Effect], seq: u64) -> Vec<Event> {
@@ -774,7 +777,7 @@ fn admitted_with_key(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
         }),
     );
     let command = CommandId::derive(&retry_key(seq), &request).unwrap();
-    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
+    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0, 0).unwrap())
         .encode()
         .unwrap();
     let receipt = AdmissionReceipt::submitting(

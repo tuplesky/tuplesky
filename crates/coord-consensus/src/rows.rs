@@ -180,6 +180,26 @@ pub struct PayloadRecordV1 {
     /// admitted.
     #[serde(default)]
     pub admission: Option<AdmissionFacts>,
+    /// The client's acknowledged floor, as the accepted request carried
+    /// it: the highest sequence of this client instance whose result it
+    /// has received. Executing the command retires the invocation
+    /// identities at or below it, which is what lets the client's
+    /// outstanding window move forward.
+    ///
+    /// It is recorded here for the same reason the admission is. The
+    /// floor a command retires is state, so a replica that recovered
+    /// this payload from a peer and a replica that replayed it from the
+    /// journal must retire the same prefix as the replica that executed
+    /// it first. Carried beside the payload rather than in it, two
+    /// replicas could retire different prefixes of one client's
+    /// sequences and then disagree about whether a later invocation is
+    /// new work or already retired.
+    ///
+    /// Zero -- acknowledging nothing -- for a client that has completed
+    /// nothing, for the protocol's own internal commands, and for a
+    /// record written before this field existed.
+    #[serde(default)]
+    pub ack_through: u64,
 }
 
 impl PayloadRecordV1 {
@@ -192,7 +212,7 @@ impl PayloadRecordV1 {
     /// compare to be sure they accepted the *same* command, and it is
     /// what a payload transfer is checked against.
     pub fn admission_digest(&self) -> Digest32 {
-        admission_digest(self.admission.as_ref())
+        admission_digest(self.admission.as_ref(), self.ack_through)
     }
 }
 

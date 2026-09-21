@@ -133,12 +133,17 @@ fn attested(receipt: u8, ticks: u64) -> AttestedAdmission {
 
 /// The request as it reaches a voter, admitted under `receipt`.
 fn admitted(receipt: u8, ticks: u64) -> Event {
+    acking(receipt, ticks, 0)
+}
+
+/// The same, acknowledging a floor.
+fn acking(receipt: u8, ticks: u64, ack_through: u64) -> Event {
     Event::Admitted(AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
             attested(receipt, ticks),
         ),
-        frame: MessageV1::Request(RequestV1::new(retry_key(), &logical(), 0).unwrap())
+        frame: MessageV1::Request(RequestV1::new(retry_key(), &logical(), 0, ack_through).unwrap())
             .encode()
             .unwrap(),
     })
@@ -196,10 +201,13 @@ fn a_fresh_receipt_on_a_retry_does_not_replace_what_was_accepted() {
 fn a_proposal_that_disagrees_with_the_payload_is_refused() {
     let mut f = booted(1);
     let effects = f.step(admitted(9, 17));
-    let accepted = admission_digest(Some(&AdmissionFacts {
-        attested: attested(9, 17),
-        establishing: None,
-    }));
+    let accepted = admission_digest(
+        Some(&AdmissionFacts {
+            attested: attested(9, 17),
+            establishing: None,
+        }),
+        0,
+    );
     // Make this replica's own vote durable first, so the only thing
     // under test is the proposal.
     for event in durable(&effects) {
@@ -207,14 +215,17 @@ fn a_proposal_that_disagrees_with_the_payload_is_refused() {
     }
     f.take_rejections();
 
-    let elsewhere = admission_digest(Some(&AdmissionFacts {
-        attested: attested(9, 17),
-        establishing: Some(AttestedEstablishment {
-            principal: PrincipalId([0xbd; 16]),
-            trust_rule: TrustRuleId([0x7c; 16]),
-            credential_valid_until: CredentialDeadline(u64::MAX),
+    let elsewhere = admission_digest(
+        Some(&AdmissionFacts {
+            attested: attested(9, 17),
+            establishing: Some(AttestedEstablishment {
+                principal: PrincipalId([0xbd; 16]),
+                trust_rule: TrustRuleId([0x7c; 16]),
+                credential_valid_until: CredentialDeadline(u64::MAX),
+            }),
         }),
-    }));
+        0,
+    );
     let proposal = FastAck {
         replica: r(0),
         ballot: ballot(),
@@ -242,14 +253,20 @@ fn a_proposal_that_disagrees_with_the_payload_is_refused() {
 /// different facts.
 #[test]
 fn evidence_under_other_facts_is_not_counted() {
-    let ours = admission_digest(Some(&AdmissionFacts {
-        attested: attested(9, 17),
-        establishing: None,
-    }));
-    let theirs = admission_digest(Some(&AdmissionFacts {
-        attested: attested(4, 99),
-        establishing: None,
-    }));
+    let ours = admission_digest(
+        Some(&AdmissionFacts {
+            attested: attested(9, 17),
+            establishing: None,
+        }),
+        0,
+    );
+    let theirs = admission_digest(
+        Some(&AdmissionFacts {
+            attested: attested(4, 99),
+            establishing: None,
+        }),
+        0,
+    );
     let mut votes = VoteSet::new(quorum(), command());
     let proposal = FastAck {
         replica: r(0),
@@ -311,4 +328,62 @@ fn durable(effects: &[Effect]) -> Vec<Event> {
             _ => None,
         })
         .collect()
+}
+
+/// A command's acknowledged floor is part of what the command is.
+///
+/// Executing a command retires the invocation identities at or below the
+/// floor its frame acknowledged, and retirement is state. Two replicas
+/// that accepted one command under different acknowledged floors would
+/// retire different prefixes of the same client's sequences, and a later
+/// invocation would then be `TooOld` on one and new work on another. So
+/// the floor is bound into the digest every acknowledgement carries,
+/// exactly as the admission is, and a proposal naming a different one is
+/// a conflict rather than an update.
+#[test]
+fn a_proposal_that_acknowledges_a_different_floor_is_refused() {
+    let mut f = booted(1);
+    let effects = f.step(acking(9, 17, 4));
+    let accepted = admission_digest(
+        Some(&AdmissionFacts {
+            attested: attested(9, 17),
+            establishing: None,
+        }),
+        4,
+    );
+    for event in durable(&effects) {
+        f.step(event);
+    }
+    f.take_rejections();
+
+    // Same admission, same identity, another floor.
+    let elsewhere = admission_digest(
+        Some(&AdmissionFacts {
+            attested: attested(9, 17),
+            establishing: None,
+        }),
+        9,
+    );
+    assert_ne!(accepted, elsewhere, "the floor reaches the digest");
+    let proposal = FastAck {
+        replica: r(0),
+        ballot: ballot(),
+        command: command(),
+        deps: Vec::new(),
+        paths: Vec::new(),
+        path: Digest32([7; 32]),
+        admission: elsewhere,
+        seqnum: Some(1),
+    };
+    assert!(
+        f.step(peer(0, ProtocolMessage::Proposal(proposal)))
+            .is_empty()
+    );
+    assert_eq!(
+        f.take_rejections(),
+        vec![FollowerRejection::AdmissionConflict {
+            command: command(),
+            accepted,
+        }]
+    );
 }

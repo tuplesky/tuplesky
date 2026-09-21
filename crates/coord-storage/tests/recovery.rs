@@ -643,7 +643,7 @@ impl Cluster {
         request.canonicalize();
         let key = retry_key(seq);
         let command = CommandId::derive(&key, &request).unwrap();
-        let frame = MessageV1::Request(RequestV1::new(key, &request, 0).unwrap())
+        let frame = MessageV1::Request(RequestV1::new(key, &request, 0, 0).unwrap())
             .encode()
             .unwrap();
         self.tick += 1;
@@ -1914,6 +1914,7 @@ fn command_of(seq: u64) -> CommandId {
 
 fn payload_of(seq: u64) -> coord_consensus::PayloadRecordV1 {
     coord_consensus::PayloadRecordV1 {
+        ack_through: 0,
         retry_key: retry_key(seq),
         logical: postcard::to_allocvec(&request_of(seq)).unwrap(),
         admission: None,

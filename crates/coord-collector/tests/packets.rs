@@ -93,7 +93,7 @@ fn submission() -> Vec<u8> {
             },
         )
         .facts(),
-        request: RequestV1::new(key, &logical, 0).unwrap(),
+        request: RequestV1::new(key, &logical, 0, 0).unwrap(),
     })
     .unwrap()
 }

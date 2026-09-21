@@ -180,7 +180,11 @@ func decodeRequest(r *reader) (Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Request{RetryKey: key, Logical: logical, DeadlineMs: deadline}, nil
+	ack, err := r.u64()
+	if err != nil {
+		return nil, err
+	}
+	return Request{RetryKey: key, Logical: logical, DeadlineMs: deadline, AckThrough: ack}, nil
 }
 
 func decodeResponse(r *reader) (Message, error) {
