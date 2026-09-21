@@ -1743,21 +1743,60 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-four things, of which one is fixed here and three are written down.
+four things, of which two are fixed here and two are written down.
 
-**A watch is registered and never delivered on.** `Step::Watch` in
-`bins/coordd/src/serve.rs` counts the watch and drops the responder, with
-a comment saying pumping it is the next piece of the loop. The collector
-has already registered the subscription with the hub by then, so the
-watch exists and nothing ever writes to it: the caller's stream closes
-with no replay, no event and no progress. An API server rebuilds every
-cache it has from watches, so it cannot start against this.
+**A watch was registered and never delivered on.** `Step::Watch` in
+`bins/coordd/src/serve.rs` counted the watch and dropped the responder.
+The collector had already registered the subscription with the hub by
+then, so the watch existed and nothing ever wrote to it: the caller's
+stream closed with no replay, no event and no progress. An API server
+rebuilds every cache it has from watches, so it could not start against
+this.
 
-The machinery to fix it is already there — `Dispatcher::open_watch`,
-`pump_watch`, the `WatchHub` and the close reasons all exist and are
-tested. What is missing is the daemon holding the stream open and draining
-the hub onto it, which `Responder::respond` cannot do because it consumes
-itself and finishes the stream.
+The daemon now holds that stream. Three things the wiring had to get
+right, none of them the pump itself.
+
+*The handover has to be one sequence.* The hub attaches a watch at the
+frontier it had when the open was decided and queues everything above it
+from that instant. What is below the frontier is history, and it is read
+out of one pinned snapshot -- one, because reading it from several would
+be reading it at several execution points -- and replayed into the same
+watch before the subscription goes live. A replay that cannot be finished
+ends the subscription instead of starting it live, and says which of
+"compacted" or "source lost" it was, because those have different
+resumptions: the first needs a fresh list, the second another replica.
+
+*Pumping cannot be conditioned on local progress.* A revision reaches the
+hub from applying a command, and a follower applies commands it learned
+from its peers -- which is not work that node's own turn reports. So the
+pump runs every time round the loop, before it waits on a socket, and
+returns immediately when there is nothing subscribed. A subscriber is not
+an event source: nothing will wake the loop on its behalf.
+
+*A stream that is gone releases the subscription.* `Responder::push`
+completes when QUIC has room, so a consumer that stopped reading blocks
+that one frame rather than accumulating; when the write fails the
+subscription is cancelled at the hub and drained, because a hub that went
+on queueing for it would be a queue filling on behalf of a consumer that
+does not exist.
+
+Wiring it also surfaced two shape errors in the Go client, and they are
+the reason the open had never reached the frontend at all. A caller ends
+the request half of a stream it opens -- the frontend reads exactly one
+frame from such a stream, and will not begin serving one whose sender has
+not finished -- and the watch open left it open, so the frontend waited
+out its frame deadline and closed the whole connection. And a cancel is
+its own request on its own stream of the same connection, not a second
+frame written onto the stream the frontend is delivering events on. Both
+are now what every other request does; the same mistake in the Rust
+integration test failed the same way, which is how they were found.
+
+One property of the open worth naming, because a test that ignores it
+tests the network instead. A watch that starts at whatever the frontier
+happens to be races the first write, since the open and the write are on
+different streams. A watch that names a revision does not: what preceded
+the attachment is replayed and what followed is live. The API server
+always names one; the certification row and the daemon test do too.
 
 **A connection stops being answered after about sixty requests.** One
 caller, one request in flight at a time, three voters: exactly 61 of 100
@@ -1818,13 +1857,32 @@ not disclosed to the caller, which the same test checks and which
 passes, so what is missing is the expiry rather than the rule about what
 a caller may see.
 
+Worth being precise about what "the expiry" is, because the shape is the
+substance. Design Sections 7.2-7.3 make expiry an authoritative
+conditional command -- `ExpireLease` matching the binding's generation,
+the expected renewal sequence and the replicated `LeaseAuthorityEpoch`,
+applied only if every field still matches -- and a timer a scheduling
+hint rather than permission to mutate. The deadline is `(1 + rho) * TTL`
+local ticks from the observation of a committed grant or renewal, so
+expiry may be late and may not be early; a restart rearms every surviving
+binding for its full TTL from the new epoch's observation. The state
+machine has all of that: `coord_state::expiry::Scheduler` arms, rearms
+and emits candidates, and the planner applies them conditionally. What
+has no caller is the scheduler. Nothing in `coordd` constructs one, feeds
+it observations, or submits what it produces, and `ExpireLease` has no
+narrow `CanonicalOperation` to travel under -- deliberately, since each
+internal command gets its own discriminant so that a client's payload can
+never reach a lease-authority or policy operation. Closing this means
+building that path, not deleting a key locally when a timer fires.
+
 All of them had been invisible for a structural reason worth stating. The
 Kine backend holds one session and issues one invocation at a time, and
 the Go suite's etcd-level rows spend fewer requests than the old bound
 before the watch row stops the domain for its own reason. Every Rust
 integration test builds one caller and asks it a handful of questions.
 Nothing in the project had ever asked the composition a hundred
-questions in a row, or two at once. A Kubernetes API server does both
+questions in a row, or two at once, and nothing had ever held one of its
+streams open across two writes. A Kubernetes API server does all three
 while it is still booting.
 
 ### What the benchmark harness had to get right to find these

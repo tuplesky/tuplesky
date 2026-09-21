@@ -386,6 +386,25 @@ impl Dispatcher {
         out
     }
 
+    /// Cancel a watch this dispatcher opened, so both the hub and this
+    /// dispatcher forget the subscription. Answers whether there was
+    /// one.
+    ///
+    /// The client's own cancel arrives as a frame and is acknowledged;
+    /// this is the other way a subscription can end -- its output
+    /// stream is gone, so there is nobody to deliver to and nothing to
+    /// acknowledge. Leaving the hub's watcher behind would be a queue
+    /// filling for a consumer that no longer exists.
+    pub fn cancel_watch(&mut self, connection: u64, watch_id: u64, hub: &WatchHub) -> bool {
+        match self.watches.remove(&(connection, watch_id)) {
+            Some(id) => {
+                drop_watch(hub, id);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Evidence from a voter identity.
     pub fn on_evidence(
         &mut self,

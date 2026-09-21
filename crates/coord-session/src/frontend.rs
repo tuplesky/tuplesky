@@ -157,6 +157,18 @@ impl BoundFrontend {
         self.bindings.get(&connection)
     }
 
+    /// The namespace a live watch of `connection` was opened on, or
+    /// `None` when this frontend holds no such subscription.
+    ///
+    /// A runtime that owns the output stream needs both: the namespace
+    /// to replay from a snapshot into the hub, and the absence of an
+    /// entry to know the subscription has ended -- cancelled by the
+    /// client, closed by the hub -- so the stream is finished rather
+    /// than held open for events that will never come.
+    pub fn watch_namespace(&self, connection: u64, watch_id: u64) -> Option<NamespaceId> {
+        self.watches.get(&(connection, watch_id)).copied()
+    }
+
     /// Replace the STS keys (rotation).
     pub fn set_jwks(&mut self, jwks: serde_json::Value) {
         self.config.jwks = jwks;
@@ -608,6 +620,13 @@ impl BoundFrontend {
             self.watches.remove(&(connection, watch_id));
         }
         frames
+    }
+
+    /// End a watch whose output stream is gone: the hub and the
+    /// dispatcher both forget it. Answers whether there was one.
+    pub fn cancel_watch(&mut self, connection: u64, watch_id: u64, hub: &WatchHub) -> bool {
+        self.watches.remove(&(connection, watch_id));
+        self.dispatcher.cancel_watch(connection, watch_id, hub)
     }
 
     /// Time passed: connections whose binding ended (to close) and the
