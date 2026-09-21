@@ -660,6 +660,8 @@ pub struct Domain<P: Persistence> {
     /// Whether this node has already said it has no peer plane. The
     /// same reason: it is a standing condition, not an event.
     no_plane_said: bool,
+    /// Refusals this node keeps saying, so that it says them less.
+    recurring: Recurring,
     budgets: Budgets,
 }
 
@@ -704,6 +706,56 @@ struct Parked {
 /// the first time -- its own proposal was not durable yet -- and nothing
 /// else is going to happen on an idle domain to prompt a second try.
 const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How many times a recurring condition is said in full before it is
+/// said only at each doubling.
+const SAID_IN_FULL: u64 = 8;
+
+/// How many distinct recurring reasons this node tracks separately.
+///
+/// The reasons come from bounded enums, so this is headroom rather than
+/// a policy. Past it everything new is folded together, because a map
+/// keyed by something a peer influences is a map a peer can grow.
+const RECURRING_REASONS: usize = 64;
+
+/// Conditions this node says over and over, kept so that it says them
+/// less.
+///
+/// A refusal under sustained load is not an event, it is a condition,
+/// and the loop that produces it runs as fast as the runtime turns. A
+/// line each time is a line every few microseconds: it fills a disk, it
+/// buries the line an operator was meant to read, and it costs the node
+/// the turns it should be spending on the work that would end the
+/// condition. One voter of three wrote a 106 MB log saying
+/// `Backpressure` while the payloads it was waiting for went
+/// undelivered, which is the failure this exists to stop being part of.
+///
+/// Each reason is said in full the first `SAID_IN_FULL` times -- an
+/// operator debugging a handful of refusals wants all of them -- and
+/// after that at each doubling, so the lines are logarithmic in the
+/// occurrences and the last one is within a factor of two of the truth.
+#[derive(Default)]
+struct Recurring {
+    counts: BTreeMap<String, u64>,
+}
+
+impl Recurring {
+    /// Record one occurrence of `reason`, and say how many there have
+    /// been if this one should be printed.
+    fn seen(&mut self, reason: &str) -> Option<u64> {
+        // The head, because a reason carrying a command identity is a
+        // different string every time and would defeat the point.
+        let head = reason.split('(').next().unwrap_or(reason);
+        let key = if self.counts.contains_key(head) || self.counts.len() < RECURRING_REASONS {
+            head
+        } else {
+            "other"
+        };
+        let n = self.counts.entry(key.to_string()).or_insert(0);
+        *n += 1;
+        (*n <= SAID_IN_FULL || n.is_power_of_two()).then_some(*n)
+    }
+}
 
 /// How many frames this node must fail to queue for one peer before it
 /// says so.
@@ -802,6 +854,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             parked: VecDeque::new(),
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
+            recurring: Recurring::default(),
             budgets,
         }
     }
@@ -1110,9 +1163,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // A refusal at the voter's door is silent to the caller, whose
         // stream is held for an answer that is not coming. The reason is
         // a bounded enum, so this node says it rather than leaving an
-        // operator with a counter.
+        // operator with a counter -- and says it less as it repeats, so
+        // a domain under sustained backpressure is described rather
+        // than transcribed.
         for why in &refused {
-            eprintln!("this voter refused a submission: {why:?}");
+            let said = format!("{why:?}");
+            if let Some(n) = self.recurring.seen(&said) {
+                eprintln!("this voter refused a submission: {said} ({n} so far)");
+            }
         }
         self.frontend.counts.refused += refused.len() as u64;
         // What the protocol machine itself refused. Drained every turn
@@ -1120,7 +1178,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // that lives as long as the process and a reason an operator
         // never sees.
         for why in voter.take_rejections() {
-            eprintln!("this voter's machine refused: {why}");
+            if let Some(n) = self.recurring.seen(&why) {
+                eprintln!("this voter's machine refused: {why} ({n} so far)");
+            }
         }
         self.carry(api, out, provenance);
         // A submission is the only thing that can say where this voter's
@@ -1770,7 +1830,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // submitter was known -- so what was held is tried again
             // either way.
             Ok(Err(why)) => {
-                eprintln!("this voter refused a collector's submission: {why:?}");
+                let said = format!("{why:?}");
+                if let Some(n) = self.recurring.seen(&said) {
+                    eprintln!("this voter refused a collector's submission: {said} ({n} so far)");
+                }
                 self.frontend.counts.refused += 1;
             }
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
@@ -2315,7 +2378,67 @@ mod tests {
     use coord_membership::genesis::{GenesisManifest, VoterSeed};
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 
-    use super::{PAYLOAD_RETRY, addressed, ask_for_payloads_now, payload_batch_size};
+    use super::{
+        PAYLOAD_RETRY, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed, ask_for_payloads_now,
+        payload_batch_size,
+    };
+
+    /// A condition that keeps happening is said in full a few times and
+    /// then logarithmically, so a node under sustained backpressure
+    /// describes itself instead of transcribing itself.
+    ///
+    /// The number that matters is the last one: 100_000 occurrences
+    /// must cost tens of lines, not 100_000. A voter of three spent a
+    /// 106 MB log and the turns it needed to catch up saying
+    /// `Backpressure` once per refusal, and the domain lost it.
+    #[test]
+    fn a_condition_that_keeps_happening_is_said_less_as_it_does() {
+        let mut said = Recurring::default();
+        let mut lines = 0;
+        let mut last = 0;
+        for _ in 0..100_000 {
+            if let Some(n) = said.seen("Backpressure") {
+                lines += 1;
+                last = n;
+            }
+        }
+        assert!(
+            lines < 32,
+            "100000 occurrences cost {lines} lines, which is not logarithmic"
+        );
+        assert!(
+            last * 2 > 100_000,
+            "the last line said {last}, which is not within a factor of two of 100000"
+        );
+        // The first few are said in full, because an operator chasing a
+        // handful of refusals wants all of them.
+        let mut fresh = Recurring::default();
+        for n in 1..=SAID_IN_FULL {
+            assert_eq!(fresh.seen("Duplicate"), Some(n));
+        }
+    }
+
+    /// Reasons are counted apart, and a reason carrying a command
+    /// identity is still one reason.
+    #[test]
+    fn a_reason_is_its_head_and_the_set_of_them_is_bounded() {
+        let mut said = Recurring::default();
+        // Two reasons, counted separately.
+        assert_eq!(said.seen("Backpressure"), Some(1));
+        assert_eq!(said.seen("Duplicate(CommandIdDigest32(aa))"), Some(1));
+        assert_eq!(said.seen("Backpressure"), Some(2));
+        // A different digest is the same reason, which is the whole
+        // point: keyed by the full string this would never repeat and
+        // would never be folded.
+        assert_eq!(said.seen("Duplicate(CommandIdDigest32(bb))"), Some(2));
+        // And a build that started producing unbounded reason heads
+        // costs a fold rather than a growing map.
+        let mut many = Recurring::default();
+        for n in 0..(RECURRING_REASONS * 4) {
+            many.seen(&format!("reason{n}"));
+        }
+        assert!(many.counts.len() <= RECURRING_REASONS + 1);
+    }
 
     /// A replica catching up asks a batch at a time, and a partial
     /// answer is not a complete one.
