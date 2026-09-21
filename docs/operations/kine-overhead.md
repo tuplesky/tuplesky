@@ -160,13 +160,22 @@ why there is no absolute latency in the table.
 
 The native arm loses operations to `unknown` -- 88 of 400 in the paced
 rows -- while the Go arms lose none. That is not an arm difference. It
-is [the open finding](wan-results.md#the-finding-this-run-exposed) of
-the WAN matrix: `coord-wan-bench` spreads its callers over all three
-frontends, and the callers bound to a replica whose projection is behind
-run out their deadline waiting for it to catch up. The Go arms connect
-to one endpoint and do not meet it. The rows are published with it
-rather than with the callers rebalanced, because rebalancing them would
-hide a real property of the domain in a page about the edge.
+is the WAN matrix's finding of the time, seen from this side:
+`coord-wan-bench` spreads its callers over all three frontends, and the
+callers bound to one of them were not being answered, while the Go arms
+connect to one endpoint and did not meet it. Two defects were behind it
+and both are closed -- a catch-up path that flooded the lane its own
+answers travelled on, and a drive loop whose peer plane starved the
+caller's plane -- and [the results](wan-results.md) are re-run against
+the fix.
+
+**These rows are not.** They were measured before it, and the numbers
+above are what they were then. What that costs a reader is the arm
+comparison's precision, not its shape: the stage measurements the
+budgets are built on -- the codec, the credential exchanges, the
+commands per operation -- are taken inside the backend arm and do not
+depend on what the native arm was losing. Re-running this matrix
+against the current build is the next thing this page needs.
 
 ## Event delay is not write latency
 

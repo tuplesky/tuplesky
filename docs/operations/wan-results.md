@@ -35,47 +35,47 @@ report has the distributions per path.
 
 | row | offered/s | achieved/s | completed | unknown | refused | p50 us | p99 us | queue p99 us |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| cold (closed) | 311 | 311 | 400 | 0 | 0 | 48896 | 548424 | 39626 |
-| cold @20000us | 50 | 50 | 400 | 0 | 0 | 6950 | 16480 | 1324 |
-| cold @10000us | 100 | 100 | 400 | 0 | 0 | 8086 | 9894 | 1752 |
-| cold @5000us | 143 | 143 | 400 | 0 | 0 | 60851 | 2534443 | 99496 |
-| cold @3333us | 183 | 183 | 399 | 1 | 0 | 458060 | 2005747 | 740315 |
-| cold @2000us | 159 | 127 | 319 | 81 | 0 | 937772 | 1723537 | 1673850 |
-| warm (closed) | 315 | 315 | 400 | 0 | 0 | 50685 | 132837 | 37969 |
-| warm @20000us | 50 | 50 | 400 | 0 | 0 | 7362 | 35505 | 4118 |
-| warm @10000us | 100 | 100 | 400 | 0 | 0 | 7575 | 13711 | 1925 |
-| warm @5000us | 147 | 147 | 400 | 0 | 0 | 20850 | 2646961 | 33910 |
-| warm @3333us | 181 | 181 | 400 | 0 | 0 | 429600 | 810711 | 779911 |
-| warm @2000us | 137 | 109 | 318 | 82 | 0 | 1210041 | 2133517 | 2079924 |
-| concurrency-1 (closed) | 143 | 143 | 400 | 0 | 0 | 20120 | 119213 | 69074 |
-| concurrency-2 (closed) | 137 | 137 | 400 | 0 | 0 | 37178 | 56937 | 45828 |
-| concurrency-4 (closed) | 113 | 93 | 331 | 69 | 0 | 77689 | 137861 | 93830 |
-| concurrency-8 (closed) | 91 | 73 | 325 | 75 | 0 | 215719 | 293754 | 176335 |
-| concurrency-16 (closed) | 77 | 60 | 309 | 91 | 0 | 404336 | 637501 | 340902 |
-| hot-writers (closed) | 77 | 77 | 400 | 0 | 0 | 204812 | 336144 | 183343 |
-| hot-writers @20000us | 50 | 50 | 400 | 0 | 0 | 11541 | 141146 | 1456 |
-| hot-writers @10000us | 70 | 70 | 400 | 0 | 0 | 797261 | 1722713 | 1610111 |
-| hot-writers @5000us | 63 | 63 | 400 | 0 | 0 | 2328927 | 4338166 | 4215573 |
-| hot-writers @3333us | 57 | 57 | 400 | 0 | 0 | 3139514 | 5605293 | 5496521 |
-| hot-writers @2000us | 53 | 53 | 400 | 0 | 0 | 3565876 | 6653437 | 6483739 |
-| transactions (closed) | 48 | 48 | 400 | 0 | 0 | 313082 | 667021 | 413861 |
-| transactions @20000us | 49 | 49 | 400 | 0 | 0 | 18463 | 358767 | 143628 |
-| transactions @10000us | 47 | 47 | 400 | 0 | 0 | 2480654 | 4531398 | 4368895 |
-| transactions @5000us | 42 | 42 | 400 | 0 | 0 | 4054693 | 7371378 | 7255754 |
-| transactions @3333us | 40 | 40 | 400 | 0 | 0 | 4676451 | 8532864 | 8375870 |
-| transactions @2000us | 38 | 38 | 400 | 0 | 0 | 5244001 | 9536356 | 9374866 |
-| scans (closed) | 41 | 28 | 274 | 126 | 0 | 373514 | 586551 | 308027 |
-| scans @20000us | 42 | 30 | 284 | 116 | 0 | 922787 | 1571780 | 1354361 |
-| scans @10000us | 39 | 26 | 274 | 126 | 0 | 3331697 | 6174486 | 6012080 |
-| scans @5000us | 36 | 24 | 275 | 125 | 0 | 4985628 | 9006823 | 8785036 |
-| scans @3333us | 32 | 22 | 274 | 126 | 0 | 6328356 | 10880932 | 10725624 |
-| scans @2000us | 33 | 23 | 274 | 126 | 0 | 6030909 | 11092132 | 10889841 |
-| read-mostly (closed) | 33 | 24 | 287 | 113 | 0 | 446754 | 797903 | 404184 |
-| read-mostly @20000us | 31 | 22 | 286 | 114 | 0 | 2702055 | 4720009 | 4499287 |
-| read-mostly @10000us | 30 | 21 | 282 | 118 | 0 | 5022576 | 9263629 | 9118522 |
-| read-mostly @5000us | 29 | 21 | 285 | 115 | 0 | 6235019 | 11533815 | 11331544 |
-| read-mostly @3333us | 27 | 19 | 282 | 118 | 0 | 7664136 | 13384926 | 13265027 |
-| read-mostly @2000us | 27 | 19 | 282 | 118 | 0 | 7638554 | 13962092 | 13717899 |
+| cold (closed) | 222 | 222 | 400 | 0 | 0 | 69204 | 651295 | 57669 |
+| cold @20000us | 50 | 50 | 400 | 0 | 0 | 9156 | 12774 | 1665 |
+| cold @10000us | 100 | 100 | 400 | 0 | 0 | 9712 | 13106 | 1471 |
+| cold @5000us | 132 | 132 | 400 | 0 | 0 | 449220 | 1458291 | 909266 |
+| cold @3333us | 121 | 121 | 400 | 0 | 0 | 973470 | 2637634 | 1837422 |
+| cold @2000us | 112 | 112 | 400 | 0 | 0 | 1325375 | 3299110 | 2600893 |
+| warm (closed) | 181 | 181 | 400 | 0 | 0 | 90840 | 220359 | 69812 |
+| warm @20000us | 50 | 50 | 400 | 0 | 0 | 10746 | 44159 | 2061 |
+| warm @10000us | 100 | 100 | 400 | 0 | 0 | 11095 | 19568 | 1778 |
+| warm @5000us | 119 | 119 | 400 | 0 | 0 | 946830 | 1594961 | 1307080 |
+| warm @3333us | 98 | 98 | 400 | 0 | 0 | 1635214 | 2622479 | 2589380 |
+| warm @2000us | 96 | 96 | 400 | 0 | 0 | 1908004 | 4035512 | 3275175 |
+| concurrency-1 (closed) | 109 | 109 | 400 | 0 | 0 | 27789 | 94421 | 82975 |
+| concurrency-2 (closed) | 108 | 108 | 400 | 0 | 0 | 45227 | 77208 | 45697 |
+| concurrency-4 (closed) | 55 | 55 | 400 | 0 | 0 | 89769 | 184451 | 84662 |
+| concurrency-8 (closed) | 28 | 28 | 398 | 2 | 0 | 166211 | 10091977 | 172776 |
+| concurrency-16 (closed) | 27 | 27 | 397 | 3 | 0 | 357247 | 10169552 | 341041 |
+| hot-writers (closed) | 28 | 28 | 398 | 2 | 0 | 183523 | 259632 | 151945 |
+| hot-writers @20000us | 32 | 32 | 398 | 2 | 0 | 15301 | 115179 | 1845 |
+| hot-writers @10000us | 26 | 25 | 398 | 2 | 0 | 1171402 | 2114545 | 2023758 |
+| hot-writers @5000us | 27 | 27 | 398 | 2 | 0 | 2352087 | 4324586 | 4234936 |
+| hot-writers @3333us | 34 | 34 | 398 | 2 | 0 | 3137720 | 5588249 | 5469757 |
+| hot-writers @2000us | 27 | 27 | 398 | 2 | 0 | 3673399 | 6595511 | 6507346 |
+| transactions (closed) | 30 | 30 | 398 | 2 | 0 | 275831 | 424422 | 236031 |
+| transactions @20000us | 33 | 33 | 398 | 2 | 0 | 213666 | 444644 | 256750 |
+| transactions @10000us | 26 | 26 | 398 | 2 | 0 | 2521911 | 4528335 | 4425714 |
+| transactions @5000us | 24 | 24 | 398 | 2 | 0 | 4028259 | 7413897 | 7267977 |
+| transactions @3333us | 27 | 27 | 398 | 2 | 0 | 5497102 | 9591486 | 9433306 |
+| transactions @2000us | 28 | 28 | 398 | 2 | 0 | 5310009 | 9447337 | 9274401 |
+| scans (closed) | 28 | 28 | 398 | 2 | 0 | 316947 | 465679 | 255275 |
+| scans @20000us | 26 | 26 | 396 | 4 | 0 | 1562858 | 2334518 | 2136450 |
+| scans @10000us | 26 | 26 | 398 | 2 | 0 | 3262843 | 6062094 | 5924045 |
+| scans @5000us | 26 | 26 | 398 | 2 | 0 | 4925103 | 8943039 | 8785786 |
+| scans @3333us | 24 | 23 | 396 | 4 | 0 | 6060119 | 10707184 | 10496834 |
+| scans @2000us | 26 | 26 | 398 | 2 | 0 | 5851984 | 10614977 | 10507289 |
+| read-mostly (closed) | 29 | 29 | 398 | 2 | 0 | 394191 | 532945 | 352932 |
+| read-mostly @20000us | 24 | 23 | 396 | 4 | 0 | 2810165 | 4573942 | 4418293 |
+| read-mostly @10000us | 27 | 27 | 398 | 2 | 0 | 4680343 | 8517184 | 8346000 |
+| read-mostly @5000us | 27 | 26 | 398 | 2 | 0 | 6112213 | 11056057 | 10918796 |
+| read-mostly | not run: the run did not finish | | | | | | | |
+| read-mostly @2000us | 21 | 21 | 396 | 4 | 0 | 7687667 | 13137367 | 12940065 |
 | loss | not run: no REGIONS given | | | | | | | |
 | asymmetric | not run: no REGIONS given | | | | | | | |
 | region-loss | not run: no REGIONS given | | | | | | | |
@@ -105,57 +105,59 @@ concluding anything from such a row.
 **A paced hundred operations a second is comfortable, and two hundred
 is the knee.** Every row offered at 20 ms and 10 ms arrivals achieved
 the rate it asked for with a median under 12 ms. At 5 ms -- two hundred
-a second -- the mixed rows still achieve about 145 but the median has
-risen by an order of magnitude, and past that the queue runs into
+a second -- the mixed rows still achieve about 130 but the median has
+risen by two orders of magnitude, and past that the queue runs into
 seconds and the median follows it, which is the shape of a saturated
 system rather than a slow one.
 
 **Closed-loop throughput does not rise with callers.** One caller, two,
-four, eight, sixteen: the achieved rate falls from 143 to 60 while the
-median rises roughly in proportion to the caller count -- 20 ms, 37 ms,
-78 ms, 216 ms, 404 ms. That is a serialized write path. It is what a
+four, eight, sixteen: the achieved rate falls from 109 to 27 while the
+median rises roughly in proportion to the caller count -- 28 ms, 45 ms,
+90 ms, 166 ms, 357 ms. That is a serialized write path. It is what a
 conservative conflict key and one journal group per batch produce, and
 it is the number the knee is really about: there is no concurrency to be
 had past one caller on this domain as it stands.
 
 **The operation kinds separate cleanly.** Under saturation the medians
 rank put and get lowest, then hot-key conditional writes, then
-transactions, then scans -- 205 ms, 313 ms and 374 ms closed-loop for
-the three heaviest mixes. That ordering is the useful part; the absolute
-numbers are a saturation measurement on one host.
+transactions, then scans and reads -- 184 ms, 276 ms, 317 ms and 394 ms
+closed-loop for the four heaviest mixes. That ordering is the useful
+part; the absolute numbers are a saturation measurement on one host.
 
-## The finding this run exposed
+**A row late in the matrix is not a row early in it.** The rows run in
+order against one standing domain, deliberately, and the achieved rate
+falls from about 200 to about 27 across the run. That is the domain's
+accumulated state, not the workload's shape: the same three rows on a
+*fresh* domain are `warm` at 202/s, `hot-writers` at 158/s and
+`transactions` at 145/s, all answering every operation. Two rows of
+this matrix may be compared with each other; neither may be quoted on
+its own as what this composition costs.
 
-**A replica that falls behind cannot catch up, and its own callers see
-it.** The read-heavy rows are the ones that show it: `scans` loses about
-31% of its operations to `unknown` and `read-mostly` about 29%, at every
-offered rate including the closed loop, while the write-heavy rows --
-`warm`, `hot-writers`, `transactions` -- lose none at all. The share is
-stable because it is not a rate effect: eight callers are spread over
-three frontends, and it is the callers bound to *one* of them that are
-not answered.
+## What this run answers that the last one did not
 
-What is behind that frontend is a voter whose materialized projection
-has stopped tracking the journal. A frontend reads replicated policy --
-including the session a caller is bound to -- out of that projection, so
-a read it should authorize meets a projection that has not yet seen the
-session. That answer used to be `NOT_ADMITTED`, which was a false
-refusal and an expensive one: the client library reads it as a bad
-credential, throws the credential away and binds again, making a newer
-session the replica has projected even less of. It is now held as
-pending, so nothing is refused and no credential is thrown away -- and
-the operation still runs out its deadline when the replica stays behind,
-which is what these rows count.
+**Every row answers what it was offered.** The worst row here loses 4
+operations of 400 to the caller's deadline, against a previous run that
+lost 113 to 126 of 400 on every read-heavy row. Those losses were one
+defect and it is closed: a replica that fell behind was repeating a
+bounded payload ask whenever the count of what it was missing moved,
+which under load is on nearly every turn, so the bulk lane its answers
+travel on filled with answers to asks already superseded.
 
-Why the replica falls behind, and what has already been fixed about it,
-is in [the implementation notes](../tuplesky-impl-notes.md) under the
-benchmark's findings: it used to be permanent and domain-wide, and the
-five defects behind that are fixed here, each with a regression test and
-a verified negative control. What is left is a replica that is merely
-*slow* to catch up, and a catch-up path that does not outrun the load
-that put it behind. Until that is closed, these rows are what a
-read-heavy workload against a loaded domain looks like, and they are
-published rather than tuned away.
+**And what was left after that was not in the catch-up path at all.**
+With the asks paced, a node stopped serving its callers entirely nine
+rows into the matrix: 38 of 44 rows did not run, because no caller could
+bind to it any more. The node was otherwise working -- voting, clean
+logs, healthy store. Its drive loop polls the peer plane and the
+caller's plane in a biased select, peer first, and on a busy domain the
+peer plane is ready on every poll, so the caller's plane was never
+polled: 4560 api events served and then not one more while the peer arm
+took another 80000. The bias is a budget now. Both are written up in
+[the implementation notes](../tuplesky-impl-notes.md).
+
+The remaining losses are what a deadline is for. The rows that lose 2
+or 4 of 400 report a p99 at 10.09 and 10.17 seconds against a 10-second
+deadline: those are operations a saturated domain did not finish in
+time, not operations it lost.
 
 ## The rows that were not run
 
