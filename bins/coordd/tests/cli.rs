@@ -1152,6 +1152,40 @@ impl Caller {
         .encode()
         .expect("bounded")
     }
+
+    /// A bounded range read over `prefix`.
+    ///
+    /// A read is what shows a replica that has stopped keeping up: it
+    /// is served from this node's own projection, so a frontend whose
+    /// voter is behind answers from state that has stopped moving --
+    /// or, for the replicated policy a binding is held against, does
+    /// not answer at all.
+    fn scan(&self, sequence: u64, prefix: &[u8]) -> Vec<u8> {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            coord_types::ids::NamespaceId([0x5e; 16]),
+            coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
+                // The prefix as a half-open interval, which is how
+                // a canonical range says "everything under this".
+                range: coord_types::logical_v1::KeyRange::interval(prefix.to_vec(), {
+                    let mut end = prefix.to_vec();
+                    let last = end.len() - 1;
+                    end[last] += 1;
+                    end
+                }),
+                revision: None,
+                limit: 64,
+                keys_only: false,
+                count_only: false,
+            }),
+        );
+        logical.canonicalize();
+        coord_types::wire_v1::MessageV1::Request(
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
+                .expect("bounded"),
+        )
+        .encode()
+        .expect("bounded")
+    }
 }
 
 /// Write `frame` on a fresh stream and read the answer the daemon
@@ -1165,8 +1199,9 @@ async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types
     // here so a wedged domain fails the test instead of hanging it, and
     // a sustained-load test sharing a machine with the rest of the suite
     // can legitimately take tens of seconds for one request without
-    // anything being wrong.
-    let bytes = tokio::time::timeout(Duration::from_secs(90), async {
+    // anything being wrong. A test that needs the whole load to finish
+    // inside a bound sets that bound itself.
+    let bytes = tokio::time::timeout(Duration::from_secs(45), async {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 4096];
         while let Some(n) = recv.read(&mut buf).await.expect("readable") {
@@ -3595,6 +3630,160 @@ async fn a_caller_cannot_expire_a_lease_however_it_spells_it() {
                 reason: coord_state::RejectionReason::AdmissionMismatch
             },
             "a caller's service operation was not refused for the right reason"
+        );
+    }
+}
+
+/// A replica that falls behind catches up, and its own callers are
+/// answered while it does.
+///
+/// A voter that learns a command's identity before its content asks a
+/// peer for the payload, and until that arrives it executes nothing
+/// past it. The ask is bounded at `MAX_PAYLOAD_TRANSFER` commands and
+/// travels on the bulk lane, so the rate it is *repeated* at decides
+/// whether the catch-up path works or eats itself: a replica that asks
+/// again before its last batch is answered puts a fresh batch of eight
+/// on that lane for every payload that lands, the lane fills, the
+/// answers are dropped, and it falls further behind for having asked.
+///
+/// The load here is what makes a replica fall behind at all -- sustained,
+/// read-heavy, and spread over all three frontends so every voter is
+/// serving as well as voting. What this asserts is the visible
+/// consequence: nothing wedges, no voter reports a bulk lane it could
+/// not queue on, and every caller is answered. Driving the same load
+/// with the ask repeated on every partial answer fills one voter's log
+/// with `QueueFull { lane: Bulk }` and leaves a third of the reads
+/// unanswered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up() {
+    let dir = workspace("catch-up-quorum");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0), "each store is made");
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "voter {} cannot submit to the other two:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    // Two callers per frontend, so a voter that stops keeping up is a
+    // voter whose own callers stop being answered -- which is how this
+    // shows up in a deployment and is invisible when every caller binds
+    // to the same node -- and so there is enough concurrency for a
+    // replica to learn a command's identity before its content.
+    const PER_FRONTEND: usize = 2;
+    let mut callers = Vec::new();
+    for (n, node) in running.iter().enumerate() {
+        for k in 0..PER_FRONTEND {
+            let session = [0x60 + (n * PER_FRONTEND + k) as u8; 16];
+            callers.push(Caller::bind(node, &cluster.ca, &cluster.ring, session).await);
+        }
+    }
+
+    // Writes to put every voter well past its table's capacity, so the
+    // ones that are behind have payloads to ask for, and then reads,
+    // which are what a replica that has stopped keeping up cannot
+    // answer: a read is served from this node's own projection.
+    const WRITES: u64 = 120;
+    const READS: u64 = 60;
+    async fn load(caller: &Caller, tag: u8) -> u64 {
+        let mut answered = 0;
+        for n in 1..=WRITES {
+            let key = format!("b{tag:02x}-{n:04}").into_bytes();
+            if ask(&caller.connection, &caller.put(n, &key, b"v"))
+                .await
+                .is_some()
+            {
+                answered += 1;
+            }
+        }
+        for n in 1..=READS {
+            let prefix = format!("b{:02x}-", (n % 6) as u8 + 1).into_bytes();
+            if ask(&caller.connection, &caller.scan(WRITES + n, &prefix))
+                .await
+                .is_some()
+            {
+                answered += 1;
+            }
+        }
+        answered
+    }
+    // Bounded, because the failure this guards against is a domain
+    // that stops making progress rather than one that answers wrongly.
+    // Without a bound a build with the defect does not fail here, it
+    // hangs, and a gate that hangs tells an operator less than one that
+    // fails.
+    let all = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(
+            load(&callers[0], 1),
+            load(&callers[1], 2),
+            load(&callers[2], 3),
+            load(&callers[3], 4),
+            load(&callers[4], 5),
+            load(&callers[5], 6)
+        )
+    })
+    .await;
+    let Ok((a, b, c, d, e, f)) = all else {
+        panic!(
+            "the load never finished, so the domain stopped making progress\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+            running[0].said(),
+            running[1].said(),
+            running[2].said()
+        );
+    };
+    let answered = vec![a, b, c, d, e, f];
+    assert_eq!(
+        answered,
+        vec![WRITES + READS; callers.len()],
+        "each caller was answered {answered:?} of {} \n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        WRITES + READS,
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
+    );
+
+    // No voter may report a sustained bulk lane it could not queue on.
+    // That is the catch-up path starving itself: the answers to a
+    // replica's asks are what fills that lane, so a node that cannot
+    // queue on it is one whose peer asked faster than it could be
+    // answered. A lane that fills and drains inside a turn is ordinary
+    // and says nothing; the line appears only past
+    // `UNDELIVERABLE_SAID_AT` frames and then at each doubling, so its
+    // presence at all is the finding.
+    let said: Vec<String> = running.iter().map(Running::said).collect();
+    for (n, s) in said.iter().enumerate() {
+        let complained: Vec<&str> = s
+            .lines()
+            .filter(|l| l.contains("QueueFull { lane: Bulk }"))
+            .collect();
+        assert!(
+            complained.is_empty(),
+            "voter {} could not queue on the lane its catch-up travels on: {:?}\n{}",
+            n + 1,
+            complained,
+            s
+        );
+    }
+
+    // And the domain still answers a caller that arrives afterwards,
+    // on every frontend: a replica that quietly stopped executing
+    // serves reads from a projection that has stopped moving, and the
+    // first thing that shows it is a binding that is never answered.
+    for (n, node) in running.iter().enumerate() {
+        let later = Caller::bind(node, &cluster.ca, &cluster.ring, [0x70 + n as u8; 16]).await;
+        assert!(
+            ask(&later.connection, &later.put(1, b"after", b"v"))
+                .await
+                .is_some(),
+            "voter {} never answered a caller that arrived after the load\n{}",
+            n + 1,
+            node.said()
         );
     }
 }

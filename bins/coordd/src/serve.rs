@@ -35,6 +35,7 @@ use coord_session::{BindingConfig, BoundFrontend, Delivered, StorePolicySource};
 use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_transport::{Responder, Transport, TransportEvent};
+use coord_types::ids::ReplicaId;
 use coord_types::wire_v1::{Frame, MessageV1, decode};
 use coord_types::{CommandId, RetryKey};
 
@@ -637,15 +638,28 @@ pub struct Domain<P: Persistence> {
     /// and proposing one is a leader's.
     expiry: Option<crate::leases::Expiry>,
     /// When this node last asked for a payload it lacks, and how many
-    /// it was missing when it did. A time and not a turn count: a
-    /// domain with nothing else happening takes no turns, and that is
-    /// exactly when the asking has to go on. The count beside it makes
-    /// the ask a window rather than a rate: an answer moves the number,
-    /// and the next ask goes at once.
-    asked: Option<(std::time::Instant, usize)>,
+    /// payload transfers a peer had answered it with by then. A time
+    /// and not a turn count: a domain with nothing else happening takes
+    /// no turns, and that is exactly when the asking has to go on. The
+    /// count beside it makes the ask a window rather than a rate -- a
+    /// batch answered in full moves it, and the next ask goes at once
+    /// -- and it counts answers rather than what is missing, because
+    /// what is missing also moves when a command arrives by identity,
+    /// which under load is every turn. The third field is how many
+    /// that ask was for, so a partial answer is not mistaken for a
+    /// complete one.
+    asked: Option<(std::time::Instant, u64, u64)>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: VecDeque<Parked>,
+    /// Peers this node currently cannot queue a frame for, and how many
+    /// frames it has dropped for each since it last could. Kept so the
+    /// condition is said once when it starts and once when it ends,
+    /// rather than once per frame.
+    undeliverable: BTreeMap<ReplicaId, u64>,
+    /// Whether this node has already said it has no peer plane. The
+    /// same reason: it is a standing condition, not an event.
+    no_plane_said: bool,
     budgets: Budgets,
 }
 
@@ -691,6 +705,64 @@ struct Parked {
 /// else is going to happen on an idle domain to prompt a second try.
 const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How many frames this node must fail to queue for one peer before it
+/// says so.
+///
+/// A queue that fills and drains again is what backpressure looks like
+/// when it is working, and saying so would be a line per turn about a
+/// domain that is fine. What an operator needs to hear about is a lane
+/// that stays full, which is a peer too far behind to take what this
+/// node has for it.
+const UNDELIVERABLE_SAID_AT: u64 = 64;
+
+/// How many payloads one ask is for, given how many are missing.
+///
+/// The protocol's own bound, applied here so the runtime knows what a
+/// complete answer to its ask looks like without the machine having to
+/// tell it.
+const fn payload_batch_size(missing: usize) -> u64 {
+    let bound = coord_consensus::messages::MAX_PAYLOAD_TRANSFER;
+    if missing < bound {
+        missing as u64
+    } else {
+        bound as u64
+    }
+}
+
+/// Whether a replica lacking payloads should ask for them now.
+///
+/// `asked` is what the last ask was: when it went, how many payload
+/// transfers had been answered by then, and how many it was for.
+/// `answered` is how many have been answered since boot.
+///
+/// Two rules, and the second is the one that was missing. The ask goes
+/// again at once when the last one was answered **in full**, so a
+/// replica behind by more than one batch catches up at a batch per
+/// round trip rather than a batch per interval. And it goes again on
+/// the interval when it was not, so an ask nobody could answer -- part
+/// of a batch the peer does not hold durably yet -- does not stop the
+/// asking for good.
+///
+/// What it must not do is treat *part* of an answer as the whole. An
+/// ask is worth up to `MAX_PAYLOAD_TRANSFER` frames on the bulk lane,
+/// so re-asking when the first of them lands puts a fresh batch of
+/// eight on that lane for every payload that arrives. On a peer that is
+/// already behind -- which is the only peer that asks -- the lane fills,
+/// the answers are dropped, and the replica falls further behind for
+/// having asked: the loop `MAX_PAYLOAD_TRANSFER` exists to prevent, one
+/// lane over. The same goes for pacing by how many payloads are still
+/// missing, which moves whenever a command arrives by identity and so,
+/// under load, moves on nearly every turn.
+fn ask_for_payloads_now(
+    asked: Option<(std::time::Instant, u64, u64)>,
+    answered: u64,
+    now: std::time::Instant,
+) -> bool {
+    asked.is_none_or(|(last, then, batch)| {
+        answered >= then.saturating_add(batch) || now.duration_since(last) >= PAYLOAD_RETRY
+    })
+}
+
 /// Where this node's local recovery images live, and when it makes one.
 ///
 /// A local checkpoint is not a replicated fact and not a protocol step:
@@ -728,6 +800,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             expiry: None,
             asked: None,
             parked: VecDeque::new(),
+            undeliverable: BTreeMap::new(),
+            no_plane_said: false,
             budgets,
         }
     }
@@ -997,10 +1071,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // that many per interval -- and a replica behind by more
             // than the domain produces in an interval would never close
             // the gap, however long it ran.
-            if self.asked.is_none_or(|(last, then)| {
-                then != missing || now.duration_since(last) >= PAYLOAD_RETRY
-            }) {
-                self.asked = Some((now, missing));
+            //
+            // What says the last ask was answered is the count of
+            // answers, not the count of what is still missing. The
+            // missing count moves for two reasons -- a payload arrived,
+            // or a command arrived by identity -- and under load the
+            // second happens on nearly every turn, so a replica pacing
+            // itself by it asks continuously. That is not a wasted
+            // message: an ask is answered with up to
+            // `MAX_PAYLOAD_TRANSFER` payload frames on the bulk lane,
+            // so asking on every turn fills that lane with answers to
+            // asks already superseded, the lane drops them, and the
+            // replica falls further behind for having asked -- the same
+            // loop `MAX_PAYLOAD_TRANSFER` exists to prevent, one lane
+            // over.
+            let answered = voter.payloads_answered();
+            let want = payload_batch_size(missing);
+            if ask_for_payloads_now(self.asked, answered, now) {
+                self.asked = Some((now, answered, want));
                 out.absorb(voter.request_payloads()?);
             }
         } else {
@@ -1133,7 +1221,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // Admitted to the lane's queue. Not a vote and not a
                 // delivery: what the peer does with it is the peer's,
                 // and the collector counts the evidence.
-                Some(Ok(())) => self.frontend.counts.queued_remote += 1,
+                Some(Ok(())) => {
+                    self.frontend.counts.queued_remote += 1;
+                    // Coming back is as much an operator's business as
+                    // going away, and it is what closes the episode
+                    // above. Said only when the going away was said,
+                    // so a lane that fills and drains inside one turn
+                    // -- ordinary backpressure -- stays quiet in both
+                    // directions.
+                    if let Some(lost) = self.undeliverable.remove(&to.replica)
+                        && lost >= UNDELIVERABLE_SAID_AT
+                    {
+                        eprintln!(
+                            "this voter can send to {} again, after {lost} frames it could not",
+                            hex4(&to.replica)
+                        );
+                    }
+                }
                 // No route right now. The voter contributes nothing
                 // through this process until there is one; the quorum
                 // rule decides what that costs.
@@ -1142,12 +1246,35 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // could not send is the difference between a quorum
                 // that forms and one that does not, and it is invisible
                 // from every other node.
+                //
+                // Not once per frame, though, and not once per
+                // episode either. A lane that is full stays full for as
+                // long as the peer is behind, and this loop runs as
+                // fast as the runtime turns: a line each time is a line
+                // every few microseconds, which fills a disk and buries
+                // the line an operator was meant to read. A lane that
+                // fills and drains inside a turn is ordinary
+                // backpressure and says nothing at all, and once an
+                // episode is long enough to matter it is said at each
+                // doubling -- so the lines are logarithmic in the
+                // frames lost and the last one an operator reads is
+                // within a factor of two of the truth.
                 Some(Err(e)) => {
-                    eprintln!("this voter could not send to {}: {e:?}", hex4(&to.replica));
+                    let lost = self.undeliverable.entry(to.replica).or_insert(0);
+                    *lost += 1;
+                    if *lost >= UNDELIVERABLE_SAID_AT && lost.is_power_of_two() {
+                        eprintln!(
+                            "this voter could not send to {}: {e:?} ({lost} frames and counting)",
+                            hex4(&to.replica)
+                        );
+                    }
                     self.frontend.counts.unavailable += 1;
                 }
                 None => {
-                    eprintln!("this voter has no peer plane to send on");
+                    if !self.no_plane_said {
+                        self.no_plane_said = true;
+                        eprintln!("this voter has no peer plane to send on");
+                    }
                     self.frontend.counts.unavailable += 1;
                 }
             }
@@ -2188,7 +2315,69 @@ mod tests {
     use coord_membership::genesis::{GenesisManifest, VoterSeed};
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 
-    use super::addressed;
+    use super::{PAYLOAD_RETRY, addressed, ask_for_payloads_now, payload_batch_size};
+
+    /// A replica catching up asks a batch at a time, and a partial
+    /// answer is not a complete one.
+    ///
+    /// The negative control is the third case: with the old rule -- ask
+    /// again as soon as anything came back -- it is true, and one
+    /// payload landing puts another whole batch on the bulk lane. That
+    /// is what made a replica behind by a few hundred commands ask
+    /// thousands of times a second, fill the lane its answers travel
+    /// on, and never catch up.
+    #[test]
+    fn a_replica_asks_again_when_its_batch_is_answered_in_full_and_not_before() {
+        let t0 = std::time::Instant::now();
+        // Nothing asked yet: ask.
+        assert!(ask_for_payloads_now(None, 0, t0));
+        // A batch of eight asked, none answered, no time passed.
+        let asked = Some((t0, 0, 8));
+        assert!(!ask_for_payloads_now(asked, 0, t0));
+        // Seven of eight back. Still outstanding -- this is the case
+        // the old rule got wrong.
+        assert!(!ask_for_payloads_now(asked, 7, t0));
+        // All eight back: ask again at once, without waiting out the
+        // interval. This is what lets a replica behind by more than one
+        // batch catch up at a batch per round trip.
+        assert!(ask_for_payloads_now(asked, 8, t0));
+        // More than eight, because an earlier ask's answers arrived
+        // late: still answered in full.
+        assert!(ask_for_payloads_now(asked, 12, t0));
+        // Not answered, but the interval has passed: ask again, so a
+        // batch the peer cannot answer does not stop the asking.
+        assert!(ask_for_payloads_now(
+            asked,
+            3,
+            t0 + PAYLOAD_RETRY + std::time::Duration::from_millis(1)
+        ));
+    }
+
+    /// One ask is for at most the protocol's bound, and for no more
+    /// than is missing -- so a replica missing three does not wait for
+    /// eight answers that are not coming.
+    #[test]
+    fn an_ask_is_for_what_is_missing_up_to_the_protocol_bound() {
+        assert_eq!(payload_batch_size(0), 0);
+        assert_eq!(payload_batch_size(3), 3);
+        assert_eq!(
+            payload_batch_size(coord_consensus::messages::MAX_PAYLOAD_TRANSFER),
+            coord_consensus::messages::MAX_PAYLOAD_TRANSFER as u64
+        );
+        assert_eq!(
+            payload_batch_size(10_000),
+            coord_consensus::messages::MAX_PAYLOAD_TRANSFER as u64
+        );
+        // And a short ask is answered in full by its own size, not by
+        // the bound: a replica missing three that gets three asks again
+        // at once.
+        let t0 = std::time::Instant::now();
+        assert!(ask_for_payloads_now(
+            Some((t0, 0, payload_batch_size(3))),
+            3,
+            t0
+        ));
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()

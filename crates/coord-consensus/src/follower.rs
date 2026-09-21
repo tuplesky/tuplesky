@@ -200,6 +200,14 @@ pub struct Follower {
     /// that a bound on how many are asked for at once does not mean the
     /// same few are asked for every time and the rest never.
     payload_cursor: usize,
+    /// How many payload transfers a peer has answered this replica with.
+    ///
+    /// The count of *answers*, not of what is still missing. A replica
+    /// catching up wants to know whether its last ask was replied to,
+    /// and the missing count cannot say: under load it moves because
+    /// new commands arrive by identity, whether or not anything came
+    /// back. This only moves when a peer sent a payload.
+    payloads_answered: u64,
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
@@ -307,6 +315,7 @@ impl Follower {
             // this replica can honour.
             served_payloads: payloads.keys().copied().collect(),
             payload_cursor: 0,
+            payloads_answered: 0,
             payloads,
             durable_payloads: BTreeMap::new(),
             ledger,
@@ -402,6 +411,7 @@ impl Follower {
             durable_payloads: BTreeMap::new(),
             served_payloads: state.served_payloads,
             payload_cursor: 0,
+            payloads_answered: 0,
             ledger: state.ledger,
             learner: state.learner,
             deferred: BTreeMap::new(),
@@ -1029,6 +1039,11 @@ impl Follower {
             });
         }
         self.release()
+    }
+
+    /// How many payload transfers a peer has answered this replica with.
+    pub const fn payloads_answered(&self) -> u64 {
+        self.payloads_answered
     }
 
     /// The durable payload of an initialized command.
@@ -1688,6 +1703,7 @@ impl Follower {
                 self.serve_payloads(from.replica, &commands)
             }
             ProtocolMessage::PayloadResponse { command, payload } => {
+                self.payloads_answered = self.payloads_answered.saturating_add(1);
                 let mut out = self.on_payload(command, payload);
                 if self.campaign.is_some() {
                     // A campaign waiting for this payload can bind now.

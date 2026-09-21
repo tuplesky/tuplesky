@@ -315,6 +315,12 @@ impl<P: Persistence> Voter<P> {
         self.node.missing_payloads()
     }
 
+    /// How many payload transfers a peer has answered this replica
+    /// with.
+    pub const fn payloads_answered(&self) -> u64 {
+        self.node.payloads_answered()
+    }
+
     /// Ask this ballot's leader for the payloads this replica lacks.
     pub fn request_payloads(&mut self) -> Result<Outbound, DriveError> {
         let leader = self.ballot.leader;
