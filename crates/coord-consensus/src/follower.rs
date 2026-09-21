@@ -38,7 +38,7 @@ use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, Replic
 use crate::campaign::Campaign;
 use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::ProtocolMessage;
+use crate::messages::{MAX_PAYLOAD_TRANSFER, ProtocolMessage};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryError, SyncDecision, SyncEntry};
@@ -147,6 +147,17 @@ pub enum FollowerRejection {
 /// A recovery report this replica owes a candidate.
 type ReportDue = crate::role::PendingReport;
 
+/// How many times the command table's own capacity of leader proposals
+/// this replica will hold while it has no room to record them.
+///
+/// Holding is what keeps a full table from becoming a permanent one: the
+/// order in a proposal is the only copy this replica is ever offered, so
+/// a proposal dropped for want of a table slot is a command it can never
+/// adopt, and with a conservative key making the chain total, neither is
+/// anything ordered after it. The slack is generous for that reason, and
+/// bounded because a peer's proposals are still a peer's input.
+pub const HELD_PROPOSAL_SLACK: usize = 8;
+
 /// A leader proposal not yet adopted: held until the payload arrives and
 /// every dependency is at least ACCEPT.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,6 +203,10 @@ pub struct Follower {
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
     durable_payloads: BTreeMap<BarrierId, CommandId>,
     served_payloads: alloc::collections::BTreeSet<CommandId>,
+    /// Where the next bounded payload ask starts in the missing set, so
+    /// that a bound on how many are asked for at once does not mean the
+    /// same few are asked for every time and the rest never.
+    payload_cursor: usize,
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
@@ -298,6 +313,7 @@ impl Follower {
             // restart: a report claiming the payload is present must be one
             // this replica can honour.
             served_payloads: payloads.keys().copied().collect(),
+            payload_cursor: 0,
             payloads,
             durable_payloads: BTreeMap::new(),
             ledger,
@@ -392,6 +408,7 @@ impl Follower {
             payloads: state.payloads,
             durable_payloads: BTreeMap::new(),
             served_payloads: state.served_payloads,
+            payload_cursor: 0,
             ledger: state.ledger,
             learner: state.learner,
             deferred: BTreeMap::new(),
@@ -973,10 +990,28 @@ impl Follower {
         out
     }
 
+    /// The next bounded batch of missing payloads to ask for.
+    ///
+    /// Bounded because the ask repeats on a timer and the answer travels
+    /// on a shared, bounded lane; rotating because a bound that always
+    /// took the same prefix would leave the rest of the set unasked for
+    /// ever. See [`MAX_PAYLOAD_TRANSFER`].
+    fn payload_batch(&mut self) -> Vec<CommandId> {
+        let mut missing = self.missing_payloads();
+        if missing.len() <= MAX_PAYLOAD_TRANSFER {
+            return missing;
+        }
+        let start = self.payload_cursor % missing.len();
+        self.payload_cursor = start.wrapping_add(MAX_PAYLOAD_TRANSFER);
+        missing.rotate_left(start);
+        missing.truncate(MAX_PAYLOAD_TRANSFER);
+        missing
+    }
+
     /// Ask `from` for the payloads this replica lacks; the request has no
     /// durable prerequisite and is released at once.
     pub fn request_payloads(&mut self, from: ReplicaId) -> Vec<Effect> {
-        let commands = self.missing_payloads();
+        let commands = self.payload_batch();
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -1231,8 +1266,14 @@ impl Follower {
         ) {
             Ok(i) => i,
             Err(InitError::Backpressure) => {
+                // No room for this command -- and returning here would
+                // also skip `advance_pending`, which is what adopts the
+                // records whose turn has come and so what makes room. A
+                // replica that stopped adopting while its table was full
+                // would keep it full, and the submitter's retry would
+                // meet the same refusal for ever.
                 self.rejections.push(FollowerRejection::Backpressure);
-                return Vec::new();
+                return self.advance_pending();
             }
             Err(InitError::AlreadyInitialized | InitError::PayloadConflict) => {
                 self.rejections.push(FollowerRejection::Duplicate(command));
@@ -1339,8 +1380,26 @@ impl Follower {
         self.table
             .record_leader_path(command, proposal.seqnum.unwrap_or(0), &proposal.paths);
         if self.table.phase_of(&command).is_none() && self.table.expect(command).is_err() {
+            // No room for a placeholder. That is a reason to wait, and it
+            // is emphatically not a reason to return: what this function
+            // ends with is `advance_pending`, which adopts the records
+            // whose turn has come -- and adoption is what lets them
+            // execute, retire, and make the room that was missing. A
+            // replica that stopped adopting the moment its table filled
+            // could never empty it again, and nothing would prompt it to
+            // try: the leader does not re-propose, and there is no
+            // message to ask it for an order it already sent.
+            //
+            // So the refusal is recorded and the proposal is held rather
+            // than dropped. Held, because the order it carries is the
+            // only copy this replica is ever offered; dropped, the
+            // command would sit at PRE-ACCEPT for ever once its payload
+            // did arrive, and with a conservative key making the chain
+            // total, so would everything ordered after it.
             self.rejections.push(FollowerRejection::Backpressure);
-            return Vec::new();
+            if self.held.len() >= self.config.capacity.saturating_mul(HELD_PROPOSAL_SLACK) {
+                return self.advance_pending();
+            }
         }
         if let Some(set) = self.votes.get_mut(&command) {
             if let Err(e) = set.add(Vote::Fast(proposal.clone())) {
@@ -1680,6 +1739,9 @@ impl Follower {
                         payload: p.clone(),
                     })
             })
+            // A peer cannot make this replica flood its own lane, even
+            // by asking for more than the protocol's own bound.
+            .take(MAX_PAYLOAD_TRANSFER)
             .collect();
         if let Some(outbox) = self.outbox.as_mut() {
             for m in responses {

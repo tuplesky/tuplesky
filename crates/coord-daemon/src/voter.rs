@@ -330,6 +330,12 @@ impl<P: Persistence> Voter<P> {
         self.node.wants_payloads()
     }
 
+    /// How many commands this replica knows by identity and not by
+    /// content.
+    pub fn missing_payloads(&self) -> usize {
+        self.node.missing_payloads()
+    }
+
     /// Ask this ballot's leader for the payloads this replica lacks.
     pub fn request_payloads(&mut self) -> Result<Outbound, DriveError> {
         let leader = self.ballot.leader;

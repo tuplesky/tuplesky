@@ -945,3 +945,127 @@ fn a_seal_stops_the_follower_voting_live_and_after_a_restart() {
     );
     assert_eq!(restarted.take_rejections(), vec![sealed; 2]);
 }
+
+/// A full table stops this replica taking new work. It must not stop it
+/// finishing the work it has.
+///
+/// Both doors into the machine used to give up the moment the table was
+/// full: a submission it had no room for, and a proposal it had no room
+/// to place a marker for, each recorded the refusal and returned. What
+/// they returned from is the function that ends by adopting the records
+/// whose turn has come -- and adoption is what lets a command execute,
+/// be retired, and free the slot that was missing. So a table that
+/// filled stayed full, and stayed full for ever: the leader does not
+/// re-propose, there is no message to ask it for an order it already
+/// sent, and nothing else would prompt this replica to look again.
+///
+/// That is not a hypothetical. One voter of three did exactly this under
+/// a benchmark: sixty-four records at PRE-ACCEPT, every later proposal
+/// refused, its projection frozen, and -- because a frontend reads
+/// replicated policy from that projection -- every read its own callers
+/// asked for refused as unauthorized for the rest of the run.
+#[test]
+fn a_full_table_still_adopts_and_still_keeps_the_order_it_was_sent() {
+    let capacity = config(1).capacity;
+    let mut f = booted(1);
+
+    // The leader's view, so the proposals carry real path evidence.
+    let mut leader_view = coord_consensus::CommandTable::new();
+    let mut commands = Vec::new();
+    let mut orders = Vec::new();
+    for seq in 1..=(capacity as u64 + 2) {
+        let (event, command) = admitted(seq, 1, seq as u8);
+        let order = leader_view
+            .initialize(command, command.0, vec![CONSERVATIVE_KEY.to_vec()])
+            .unwrap();
+        commands.push((seq, event, command));
+        orders.push(order);
+    }
+
+    // Fill the table exactly, leaving nothing adopted: the proposals
+    // arrive in reverse, so every one of them is held behind a
+    // dependency that is still at PRE-ACCEPT.
+    for (seq, event, _) in commands.iter().take(capacity) {
+        let effects = f.step(event.clone());
+        for durable in durable_of(&effects, *seq) {
+            f.step(durable);
+        }
+    }
+    assert_eq!(f.table().len(), capacity, "the table is exactly full");
+    for index in (1..capacity).rev() {
+        let (_, _, command) = commands[index];
+        let deps = vec![commands[index - 1].2];
+        let order = &orders[index];
+        f.step(peer(
+            0,
+            proposal(command, deps, index as u64, order.paths.clone(), order.path),
+        ));
+    }
+    assert_eq!(
+        f.held().len(),
+        capacity - 1,
+        "every proposal but the first is held behind its dependency"
+    );
+
+    // Now the two commands there is no room for. Both doors are tried:
+    // the submission and the proposal.
+    let (overflow_seq, overflow_event, overflow) = commands[capacity].clone();
+    let refused = f.step(overflow_event);
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "a submission with no room is refused, and says so"
+    );
+    assert!(refused.is_empty(), "nothing was admitted");
+    assert_eq!(f.table().phase_of(&overflow), None, "and nothing recorded");
+    let _ = overflow_seq;
+
+    let (_, _, beyond) = commands[capacity + 1];
+    let order = &orders[capacity + 1];
+    f.step(peer(
+        0,
+        proposal(
+            beyond,
+            vec![overflow],
+            (capacity + 1) as u64,
+            order.paths.clone(),
+            order.path,
+        ),
+    ));
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "a proposal with no room for a marker is refused, and says so"
+    );
+    assert!(
+        f.held().contains_key(&beyond),
+        "but the order it carries is kept: it is the only copy this \
+         replica is ever offered, and the leader does not re-propose"
+    );
+
+    // And the refusals did not stop the machine finishing what it had.
+    // The first command's proposal arrives; every held proposal behind
+    // it adopts in the same turn, exactly as it would on an empty table.
+    let order = &orders[0];
+    let adoptions = f.step(peer(
+        0,
+        proposal(commands[0].2, vec![], 0, order.paths.clone(), order.path),
+    ));
+    assert_eq!(
+        adoptions.len(),
+        capacity,
+        "a full table adopts every record whose turn has come"
+    );
+    for (_, _, command) in commands.iter().take(capacity) {
+        assert!(
+            f.table().phase_of(command) >= Some(Phase::Accept),
+            "adopted under the leader's order, not left at {:?}",
+            f.table().phase_of(command)
+        );
+    }
+    assert_eq!(
+        f.held().len(),
+        1,
+        "only the proposal whose command has no record is still held"
+    );
+}

@@ -646,3 +646,145 @@ fn payload_rows(storage: &StorageModel) -> Vec<(CommandId, coord_consensus::Payl
         })
         .collect()
 }
+
+/// A replica that is missing many payloads asks for a bounded batch, and
+/// a peer answers with a bounded batch, however many were asked for.
+///
+/// This is not a tidiness rule. The ask repeats on a timer until the
+/// content arrives, and every peer frame of a domain shares one bounded
+/// lane. Unbounded, the ask answers itself: a replica missing a tableful
+/// of payloads asks for all of them several times a second, the peer
+/// answers with that many frames each time, the lane fills, and what it
+/// drops includes the proposals and acknowledgements that would have let
+/// the replica catch up. It then falls further behind and asks for more,
+/// and it never returns -- which is exactly what a benchmark caught one
+/// voter of three doing, with every read that voter's frontend served
+/// refused for the rest of the run.
+#[test]
+fn payload_transfer_is_bounded_in_both_directions_and_still_covers_everything() {
+    let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
+    let mut l = leader();
+    let mut f = follower(2);
+    // More than the bound and inside the leader's own table capacity, so
+    // every one of them really is proposed.
+    let wanted = bound * 2;
+
+    // The leader proposes `wanted` commands; every proposal reaches the
+    // follower, and not one of the submissions does.
+    let mut commands = BTreeSet::new();
+    for seq in 1..=wanted as u64 {
+        let (event, command) = admitted(seq, 1);
+        commands.insert(command);
+        let effects = l.step(event);
+        for durable in durable_of(&effects) {
+            let released = l.step(durable);
+            for (to, message) in sends(&released) {
+                if to == r(2) && matches!(message, ProtocolMessage::Proposal(_)) {
+                    f.step(peer(0, message));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        f.missing_payloads().len(),
+        wanted,
+        "the follower should be missing every payload it has a proposal for"
+    );
+
+    // Each ask is bounded, and successive asks walk the whole set: a
+    // bound that always took the same prefix would leave the rest
+    // unasked for ever, which is a wedge with a bound on it rather than
+    // a fix.
+    let mut asked_for = BTreeSet::new();
+    for _ in 0..4 {
+        let sent = sends(&f.request_payloads(r(0)));
+        assert_eq!(sent.len(), 1, "one request frame per ask");
+        let ProtocolMessage::PayloadRequest { commands: asked } = &sent[0].1 else {
+            panic!("not a payload request: {:?}", sent[0].1);
+        };
+        assert!(
+            asked.len() <= bound,
+            "asked for {} payloads, bound is {bound}",
+            asked.len()
+        );
+        asked_for.extend(asked.iter().copied());
+
+        // However many are asked for, the peer answers with at most the
+        // same bound.
+        let answered = sends(&l.step(peer(2, sent[0].1.clone())));
+        assert!(
+            answered.len() <= bound,
+            "answered with {} payloads, bound is {bound}",
+            answered.len()
+        );
+    }
+    assert_eq!(
+        asked_for, commands,
+        "every missing payload is asked for within a few rounds"
+    );
+
+    // And a peer cannot make this leader flood by asking for more than
+    // the protocol's own bound.
+    let greedy = ProtocolMessage::PayloadRequest {
+        commands: commands.iter().copied().collect(),
+    };
+    let answered = sends(&l.step(peer(2, greedy)));
+    assert!(
+        answered.len() <= bound,
+        "a request for {} payloads was answered with {}",
+        commands.len(),
+        answered.len()
+    );
+}
+
+/// The two payload-transfer messages are recognized from the byte the
+/// encoder writes, and nothing else is.
+///
+/// The routing that sends catch-up traffic down the bulk lane reads this
+/// byte rather than decoding the frame, so a variant added above them in
+/// the enum has to fail here rather than quietly send proposals to the
+/// bulk lane or payloads to the control one.
+#[test]
+fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
+    let command = CommandId(Digest32([1; 32]));
+    let request = ProtocolMessage::PayloadRequest {
+        commands: vec![command],
+    };
+    let response = ProtocolMessage::PayloadResponse {
+        command,
+        payload: coord_consensus::PayloadRecordV1 {
+            retry_key: retry_key(1),
+            logical: vec![1, 2, 3],
+            admission: None,
+        },
+    };
+    for message in [&request, &response] {
+        assert!(
+            coord_consensus::is_payload_transfer(&message.encode()),
+            "payload transfer not recognized: {message:?}"
+        );
+    }
+    let not_transfer = [
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 0),
+        },
+        ProtocolMessage::Promise {
+            ballot: ballot(1, 0),
+            synced: ballot(0, 0),
+            replica: r(1),
+        },
+        ProtocolMessage::LeaderReply {
+            ballot: ballot(0, 0),
+            command,
+            seqnum: 1,
+            deps: vec![],
+            path: Digest32([3; 32]),
+        },
+    ];
+    for message in &not_transfer {
+        assert!(
+            !coord_consensus::is_payload_transfer(&message.encode()),
+            "not payload transfer, but recognized as it: {message:?}"
+        );
+    }
+}

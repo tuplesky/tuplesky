@@ -14,7 +14,7 @@
 //!   batch closes the watch as unauthorized before any progress crosses
 //!   it. An unreadable barrier denies (fail closed).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_authn::ClockHealth;
 use coord_collector::{Action, Delivery, Dispatcher, codes};
@@ -115,6 +115,23 @@ pub struct BoundFrontend {
     pub sessions_checked: u64,
     /// Disclosures denied by a barrier.
     pub denied: u64,
+    /// Disclosures held because this node's replicated state had not
+    /// caught up with the session yet. Counted apart from `denied`,
+    /// because they are not refusals: the caller is told to ask again.
+    pub deferred: u64,
+    /// Connections whose session a barrier on this node has shown at
+    /// least once.
+    ///
+    /// The distinction this draws is between "not yet" and "no". A
+    /// binding is established from a committed session-creation
+    /// command, but the barrier reads this node's *materialized*
+    /// projection, which lags the journal. Between the two, a barrier
+    /// finds no session row for a session that certainly exists -- and
+    /// refusing there turns a replica that is behind into a caller
+    /// whose reads are unauthorized. Once a barrier has shown the row,
+    /// its absence is a real answer again: policy has moved, and the
+    /// projection only moves forward.
+    seen: BTreeSet<u64>,
 }
 
 impl BoundFrontend {
@@ -138,6 +155,8 @@ impl BoundFrontend {
             pump_bound: pump_bound.max(1),
             barriers_read: 0,
             sessions_checked: 0,
+            deferred: 0,
+            seen: BTreeSet::new(),
             denied: 0,
         }
     }
@@ -547,6 +566,25 @@ impl BoundFrontend {
         let Ok(barrier) = policy.barrier(namespace, &session) else {
             return self.deny(delivery, response.command_id);
         };
+        // "Not yet" is not "no". This node's binding was established
+        // from a committed session-creation command, but the barrier
+        // reads this node's materialized projection, and a replica that
+        // has fallen behind has not projected that command yet. A
+        // refusal there is a false one, and an expensive one: the
+        // client library treats it as a credential that is no longer
+        // good, throws the credential away and binds again -- which
+        // creates a newer session that this node has projected even
+        // less of. Under load that is a caller whose reads never
+        // succeed again, on a domain that is working.
+        //
+        // So a session this node has never seen means wait, and the
+        // caller resolves as it does for any pending outcome. Once a
+        // barrier has shown the row, its absence is a real answer:
+        // policy moved, and the projection only moves forward.
+        if barrier.session_record().is_none() && !self.seen.contains(&delivery.connection) {
+            return self.defer(delivery, response.command_id);
+        }
+        self.seen.insert(delivery.connection);
         if !barrier.permits_keys(keys.iter().map(Vec::as_slice)) {
             return self.deny(delivery, response.command_id);
         }
@@ -557,6 +595,20 @@ impl BoundFrontend {
             return self.deny(delivery, response.command_id);
         }
         delivery
+    }
+
+    /// Hold a disclosure this node cannot yet decide: nothing is shown,
+    /// and the caller is told the outcome is still pending rather than
+    /// that its credential was refused.
+    fn defer(&mut self, delivery: Delivery, command: coord_types::CommandId) -> Delivery {
+        self.deferred += 1;
+        Delivery {
+            connection: delivery.connection,
+            retry_key: delivery.retry_key,
+            frame: MessageV1::Response(codes::pending_response(command))
+                .encode()
+                .expect("bounded"),
+        }
     }
 
     fn deny(&mut self, delivery: Delivery, command: coord_types::CommandId) -> Delivery {
@@ -645,6 +697,7 @@ impl BoundFrontend {
     /// A connection closed: its binding, watches and attached requests go.
     pub fn on_connection_closed(&mut self, connection: u64, hub: &WatchHub) {
         self.bindings.remove(&connection);
+        self.seen.remove(&connection);
         self.watches.retain(|(c, _), _| *c != connection);
         self.dispatcher.on_connection_closed(connection, hub);
     }

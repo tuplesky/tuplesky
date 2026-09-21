@@ -19,6 +19,50 @@ use crate::vote::{FastAck, SlowAck};
 /// Per-key path digests through one command, in key order.
 pub type PathAnchors = Vec<(Vec<u8>, Digest32)>;
 
+/// How many payloads one [`ProtocolMessage::PayloadRequest`] asks for,
+/// and how many one peer answers with.
+///
+/// The ask repeats until the content arrives, and every peer frame of a
+/// domain shares one bounded lane. An unbounded ask therefore answers
+/// itself: a replica missing a tableful of payloads asks for all of
+/// them several times a second, the peer answers with that many payload
+/// frames each time, the lane fills, and what it drops includes the
+/// proposals and acknowledgements that would have let the replica catch
+/// up -- so it falls further behind and asks for more. The bound is on
+/// both sides, because neither side may be able to make the other
+/// flood: a request for more than this is answered with this many.
+pub const MAX_PAYLOAD_TRANSFER: usize = 8;
+
+/// Whether an encoded protocol message is payload transfer.
+///
+/// Payload transfer is bulk. A replica catching up moves whole command
+/// payloads, and it must not move them on the lane that carries the
+/// proposals and acknowledgements the rest of the domain is waiting
+/// for: that is the difference between a replica that catches up and
+/// one that starves the domain while it tries. Sharing the lane is not
+/// a theoretical risk -- it is what one voter of three did under a
+/// benchmark, its catch-up traffic filling the control queue until the
+/// frames it needed to catch up with were the ones being dropped.
+///
+/// Read from the encoded discriminant rather than by decoding, because
+/// the caller is about to hand the frame to the transport and decoding
+/// a payload to decide where to send it would cost more than the send.
+/// `payload_transfer_is_recognized_from_the_encoded_discriminant` pins
+/// these two bytes against the encoder, so a variant added above them
+/// fails a test rather than quietly mis-routing.
+pub fn is_payload_transfer(frame: &[u8]) -> bool {
+    matches!(
+        frame.first(),
+        Some(&PAYLOAD_REQUEST_TAG | &PAYLOAD_RESPONSE_TAG)
+    )
+}
+
+/// The encoded discriminant of [`ProtocolMessage::PayloadRequest`].
+const PAYLOAD_REQUEST_TAG: u8 = 7;
+
+/// The encoded discriminant of [`ProtocolMessage::PayloadResponse`].
+const PAYLOAD_RESPONSE_TAG: u8 = 8;
+
 /// A peer message of the ballot/promise increment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProtocolMessage {

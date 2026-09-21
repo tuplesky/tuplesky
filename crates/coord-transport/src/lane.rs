@@ -140,14 +140,25 @@ impl LaneLimits {
         queue_depth: 16,
         max_groups: 64,
     };
-    /// Bulk: few streams, large windows, shallow queue.
+    /// Bulk: few streams, large windows, a queue deep enough for a
+    /// replica catching up.
+    ///
+    /// The depth was eight while the only bulk traffic was a checkpoint
+    /// image, which is one transfer at a time. It also carries payload
+    /// transfer now -- a replica fetching the content of commands it
+    /// missed, a bounded batch at a time -- and a queue as deep as one
+    /// batch drops part of every batch, so the replica re-asks and
+    /// catches up at a fraction of the rate it could. What it must stay
+    /// far from is the control lane's depth, because the point of the
+    /// separation is that catch-up traffic cannot crowd out the frames
+    /// the protocol needs to make progress.
     pub const BULK: LaneLimits = LaneLimits {
         max_uni_streams: 4,
         max_bidi_streams: 4,
         stream_receive_window: 8 * 1024 * 1024 + 64 * 1024,
         receive_window: 16 * 1024 * 1024,
         send_window: 16 * 1024 * 1024,
-        queue_depth: 8,
+        queue_depth: 64,
         max_groups: 16,
     };
 

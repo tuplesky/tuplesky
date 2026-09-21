@@ -339,9 +339,9 @@ pub struct PeerPlane {
     peers: Vec<crate::peers::Peer>,
     /// Dials attempted and dials that reached a voter (diagnostic).
     pub dialled: (u64, u64),
-    /// The reachable count last reported on stderr, so the report is
+    /// The control and bulk counts last reported on stderr, so the report is
     /// repeated when it changes and not on every connection event.
-    reported: Option<usize>,
+    reported: Option<(usize, usize)>,
 }
 
 impl PeerPlane {
@@ -376,16 +376,17 @@ impl PeerPlane {
     /// a process must not die because whoever read its startup report
     /// has stopped reading.
     fn report(&mut self) {
-        let reachable = self.reachable();
+        let reachable = (self.reachable(), self.reachable_bulk());
         if self.reported == Some(reachable) {
             return;
         }
         self.reported = Some(reachable);
         eprintln!(
-            "peers connected={} of {} attempts={}",
-            reachable,
+            "peers connected={} of {} attempts={} bulk={}",
+            reachable.0,
             self.peers.len(),
-            self.dialled.0
+            self.dialled.0,
+            reachable.1
         );
     }
 
@@ -400,13 +401,22 @@ impl PeerPlane {
         self.peers.iter().filter(|p| self.holds(p)).count()
     }
 
+    /// Voters whose bulk lane a connection is holding.
+    pub fn reachable_bulk(&self) -> usize {
+        self.peers
+            .iter()
+            .filter(|p| self.holds_lane(p, coord_transport::Lane::Bulk))
+            .count()
+    }
+
     /// Whether a connection is holding this peer's control lane.
     fn holds(&self, peer: &crate::peers::Peer) -> bool {
-        self.transport.linked(
-            peer.replica,
-            peer.incarnation,
-            coord_transport::Lane::Control,
-        )
+        self.holds_lane(peer, coord_transport::Lane::Control)
+    }
+
+    /// Whether a connection is holding one of this peer's lanes.
+    fn holds_lane(&self, peer: &crate::peers::Peer, lane: coord_transport::Lane) -> bool {
+        self.transport.linked(peer.replica, peer.incarnation, lane)
     }
 
     /// Try every voter not currently connected.
@@ -416,17 +426,34 @@ impl PeerPlane {
     /// incarnation fails the handshake rather than becoming a peer. That
     /// is the whole of what an address is trusted for.
     pub async fn dial_missing(&mut self) {
+        // A voter's lanes are control and bulk; a unary lane is a
+        // collector's or a client's. Both are dialled, because both are
+        // used: what the protocol needs to make progress goes down the
+        // control lane, and a replica fetching the content of commands
+        // it missed moves whole payloads down the bulk one, which is
+        // what keeps catching up from starving the thing it is catching
+        // up with.
+        //
+        // Reachability stays the control lane's. A voter this node can
+        // vote with is reachable whether or not its bulk lane is up
+        // yet, and counting bulk would report a cluster that cannot
+        // form when what is actually true is that nobody has needed to
+        // catch up.
+        self.dial_lane(coord_transport::Lane::Control, true).await;
+        self.dial_lane(coord_transport::Lane::Bulk, false).await;
+    }
+
+    /// Dial every voter whose `lane` this node is not holding.
+    async fn dial_lane(&mut self, lane: coord_transport::Lane, counted: bool) {
         let missing: Vec<crate::peers::Peer> = self
             .peers
             .iter()
-            .filter(|p| !self.holds(p))
+            .filter(|p| !self.holds_lane(p, lane))
             .cloned()
             .collect();
-        self.dialled.0 += missing.len() as u64;
-        // A voter's lanes are control and bulk; a unary lane is a
-        // collector's or a client's. Protocol traffic between replicas
-        // is control traffic, which is also why a bulk checkpoint
-        // transfer cannot delay a vote.
+        if counted {
+            self.dialled.0 += missing.len() as u64;
+        }
         let transport = &self.transport;
         let me = self.me;
         let reached = concurrently(
@@ -438,7 +465,7 @@ impl PeerPlane {
                         peer,
                         Some(me),
                         coord_types::wire_v1::PeerRole::Voter,
-                        coord_transport::Lane::Control,
+                        lane,
                     ))
                 })
                 .collect(),
@@ -446,7 +473,11 @@ impl PeerPlane {
         .await;
         for (peer, outcome) in missing.iter().zip(reached) {
             match outcome {
-                Ok(_) => self.dialled.1 += 1,
+                Ok(_) => {
+                    if counted {
+                        self.dialled.1 += 1;
+                    }
+                }
                 // Not a failure of anything: a voter this process cannot
                 // reach right now contributes no evidence and nothing
                 // else. It is reported because an operator wants to see
@@ -459,7 +490,7 @@ impl PeerPlane {
                 // it now has: reporting that as unreachable would make
                 // an ordinary mesh look broken.
                 Err(e) => {
-                    if !self.holds(peer) {
+                    if counted && !self.holds_lane(peer, lane) {
                         eprintln!(
                             "cannot reach voter {} on the peer plane: {e:?}",
                             hex4(&peer.replica)
@@ -482,11 +513,24 @@ impl PeerPlane {
         // refuses anything else rather than handing it to consensus.
         let frame = coord_transport::evidence_frame(message)
             .map_err(|_| coord_transport::SendError::NotConnected)?;
+        // Catch-up traffic goes down the bulk lane, and everything the
+        // protocol needs to make progress goes down the control one.
+        // They are separated because they compete: a replica fetching
+        // the content of commands it missed moves whole payloads, and
+        // sharing a queue with proposals and acknowledgements means the
+        // frames it drops when that queue fills are the ones it is
+        // catching up *with*. That is not a hypothesis -- it is what one
+        // voter of three did under a benchmark, permanently.
+        let lane = if coord_consensus::is_payload_transfer(message) {
+            coord_transport::Lane::Bulk
+        } else {
+            coord_transport::Lane::Control
+        };
         self.transport.send(
             coord_transport::Destination::Replica {
                 replica: to.replica,
                 incarnation: to.incarnation,
-                lane: coord_transport::Lane::Control,
+                lane,
             },
             self.domain,
             frame,
@@ -610,10 +654,13 @@ pub struct Domain<P: Persistence> {
     /// that runs no voter schedules nothing: an expiry is a command,
     /// and proposing one is a leader's.
     expiry: Option<crate::leases::Expiry>,
-    /// When this node last asked for a payload it lacks. A time and
-    /// not a turn count: a domain with nothing else happening takes no
-    /// turns, and that is exactly when the asking has to go on.
-    asked: Option<std::time::Instant>,
+    /// When this node last asked for a payload it lacks, and how many
+    /// it was missing when it did. A time and not a turn count: a
+    /// domain with nothing else happening takes no turns, and that is
+    /// exactly when the asking has to go on. The count beside it makes
+    /// the ask a window rather than a rate: an answer moves the number,
+    /// and the next ask goes at once.
+    asked: Option<(std::time::Instant, usize)>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: VecDeque<(CommandId, PeerProvenance, Vec<u8>)>,
@@ -939,7 +986,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // it lacks is queued behind it, and so is every caller
             // whose stream this node is holding.
             let waiting_for_content = match &self.backing {
-                Backing::Voting(v) => v.awaiting().is_some() || v.wants_payloads(),
+                Backing::Voting(v) => v.awaiting().is_some() || v.missing_payloads() > 0,
                 Backing::Serving(_) => false,
             };
             let arrived = tokio::select! {
@@ -1015,13 +1062,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // has no durable prerequisite and goes out at once, so one is
         // enough until the answer comes, and a busy domain must not
         // turn one missing payload into a request per event.
-        if voter.awaiting().is_some() || voter.wants_payloads() {
+        let missing = voter.missing_payloads();
+        if voter.awaiting().is_some() || missing > 0 {
             let now = std::time::Instant::now();
-            if self
-                .asked
-                .is_none_or(|last| now.duration_since(last) >= PAYLOAD_RETRY)
-            {
-                self.asked = Some(now);
+            // One ask outstanding at a time, and the next one goes the
+            // moment the last was answered. The interval is the floor
+            // for an ask nobody answered, not the rate a replica catches
+            // up at: an ask is bounded at `MAX_PAYLOAD_TRANSFER`
+            // commands, so an interval alone would cap catching up at
+            // that many per interval -- and a replica behind by more
+            // than the domain produces in an interval would never close
+            // the gap, however long it ran.
+            if self.asked.is_none_or(|(last, then)| {
+                then != missing || now.duration_since(last) >= PAYLOAD_RETRY
+            }) {
+                self.asked = Some((now, missing));
                 out.absorb(voter.request_payloads()?);
             }
         } else {
