@@ -116,27 +116,17 @@ Run against three voters on one host, at the commit this document ships in:
 | Create, read, compare-and-swap, delete | passes |
 | Pagination: bounded, ordered, resumable at one revision | passes |
 | Compaction refuses a watch below the floor | passes |
-| Watch replay, live handover, progress, resume | **fails** |
+| Watch replay, live handover, progress, resume | passes |
 | Time-to-live expiry | **fails** |
 | Concurrent writers on one key | **fails** |
 
-### The three gaps, named
+### The two gaps, named
 
-None is a flake, all three are reproducible from a fresh domain, and each
+Neither is a flake, both are reproducible from a fresh domain, and each
 blocks compatibility labeling on its own. They are independent: a failing
 row no longer takes the rest of the run with it, which it used to.
 
-1. **`coordd` does not serve watch streams.** `Step::Watch` in
-   `bins/coordd/src/serve.rs` counts the watch and drops the responder; the
-   comment there says pumping it is the next piece of the loop. The collector
-   already has the machinery -- `Dispatcher::open_watch`, `pump_watch`, the
-   `WatchHub` and the close reasons -- so what is missing is the daemon
-   holding the stream and draining the hub onto it. The collector registers
-   the watch with the hub either way, so the subscription exists and nothing
-   ever delivers on it: the caller's stream closes with no replay, no event
-   and no progress. An API server rebuilds every cache from watches, so it
-   cannot start against this.
-2. **Concurrent callers are not served across a quorum.** Two callers
+1. **Concurrent callers are not served across a quorum.** Two callers
    issuing one request each at a time against a three-voter domain
    complete 13 of 100 operations within a five-second deadline. The same
    two callers against a *single* voter complete 100 of 100, and a single
@@ -155,15 +145,80 @@ row no longer takes the rest of the run with it, which it used to.
    A Kubernetes API server is concurrent from its first second, so this
    blocks the k3s run outright.
 
-3. **A key under a time to live does not expire.** A key written with a
-   one-second lease is still readable a minute later. Kine's lease is a
-   TTL rather than an identity, and the domain keeps the binding private
-   (a caller never sees a lease identity on the key, which this suite
-   also checks and which passes) -- so what is missing is the expiry
-   itself, not the disclosure rule.
+2. **A key under a time to live does not expire.** A key written with a
+   one-second lease is still readable a minute later.
 
-A fourth, now fixed: a connection used to stop being answered after
-exactly 61 requests. The leader's command table is created with a
+   The specified behaviour, so the gap is measured against something.
+   Design Section 6.6 says a Kine `lease` is a *TTL in seconds*, not a
+   lease identity: at the reference pin `LeaseGrant` returns the
+   requested TTL as the apparent lease id, so unrelated keys written with
+   TTL 60 must not end up attached to one shared lease 60. A positive TTL
+   creates or replaces a **hidden private per-key expiry binding**,
+   atomically with the create or update that carries it -- one command,
+   no separate lease-grant round trip before the `Put`. The binding's
+   identity is derived from the stable request, and it is never
+   disclosed: what a Kine caller reads back is the TTL, never the hidden
+   id. A TTL of zero removes the binding. Replacing or refreshing the key
+   invalidates the old binding, so a stale expiry candidate is a no-op.
+
+   Expiry itself is Section 7.2-7.3, and its shape is the whole point:
+   it is an **authoritative conditional command**, `ExpireLease`, matching
+   the binding's generation, the expected renewal sequence and the
+   replicated `LeaseAuthorityEpoch`, applied only if every field still
+   matches -- never a local unconditional delete by whichever process
+   noticed the time. A timer is a scheduling hint and not permission to
+   mutate. The deadline is `(1 + rho) * TTL` local ticks from an anchor
+   that is the observation of a *committed* grant or renewal, for a
+   documented maximum fast clock-rate error `rho`, and TTL is anchored to
+   the operation's linearization rather than to a reply's arrival. After
+   a restart or a failover the new authority epoch rearms every surviving
+   binding for its full TTL from that observation. So expiry may be late,
+   and is allowed to be; it may not be early, and without a quorum it
+   does not happen at all.
+
+   What exists: the state machine side. `coord_state::expiry::Scheduler`
+   arms deadlines under an authority epoch, rearms conservatively and
+   emits `InternalCommand::ExpireLease` candidates, and the planner
+   applies them conditionally; the private binding is created and
+   replaced atomically with the write, and stays hidden (this suite
+   checks the disclosure rule, and it passes).
+
+   What is missing: the driver. Nothing in `coordd` constructs that
+   scheduler, feeds it observations of committed lease state, or submits
+   the candidates it produces -- `Scheduler` has no caller outside its own
+   tests. The internal command also has no narrow `CanonicalOperation`
+   to travel under, which is deliberate: each internal command gets its
+   own discriminant so a client's payload can never reach lease-authority
+   or policy operations, and `ExpireLease` needs one of its own before it
+   can be submitted through the ordinary replicated path. Nothing here
+   may be shortcut into a direct store write.
+
+Two more, now fixed.
+
+**Watches are served.** `Step::Watch` used to count the subscription and
+drop the responder, so a watch was registered with the hub and nothing
+ever delivered on it. The daemon now holds that stream for the life of
+the subscription: it replays what the registration named out of one
+pinned snapshot, then moves what the hub produces onto the stream every
+time round its loop, one fresh authorization barrier per bounded pump. A
+stream whose consumer is gone releases the subscription rather than
+leaving a queue filling behind it.
+
+Two shape errors in the Go client came out with it, both of which had
+kept the open from ever reaching the frontend. A caller ends the request
+half of a stream it opens -- the frontend reads exactly one frame from
+such a stream and will not begin serving one whose sender has not
+finished -- and the watch open was leaving it open, so the frontend waited
+out its frame deadline and closed the connection. And a cancel is its own
+request on its own stream of the same connection, not a second frame on
+the stream the frontend is writing events on. The regression tests are
+`bins/coordd/tests/cli.rs::a_watch_is_served_the_revisions_that_follow_it`
+and the certification row itself, which now exercises replay, live
+handover, a delete event, progress on an idle prefix and resumption from
+a stored revision through the API server's own client library.
+
+**A connection is answered past its 61st request.** It used to stop after
+exactly 61. The leader's command table is created with a
 capacity, and nothing ever retired an executed record from it, so the
 capacity was a bound on how many commands a replica could execute in its
 lifetime rather than on how much unresolved work it held. A full table
@@ -174,12 +229,12 @@ one. The regression tests are
 and
 `crates/coord-consensus/tests/activation.rs::a_cluster_serves_past_its_table_capacity`.
 
-That fix is also why the three above are now three separate findings. A
+That fix is also why the remaining rows are separate findings. A
 wedged domain used to turn one failure into every later one, so a suite
 run reported a cascade and the first line of the log was the only one
 worth reading.
 
-Until all three are closed, this document's answer to "is this
+Until both are closed, this document's answer to "is this
 etcd-compatible" is no, for stated reasons, in a named profile. That is
 the point of certifying rather than booting.
 

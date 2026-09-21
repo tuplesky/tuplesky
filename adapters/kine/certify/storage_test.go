@@ -231,8 +231,20 @@ func TestWatchReplaysResumesAndReportsProgress(t *testing.T) {
 	}
 	resume := live.Events[0].Kv.ModRevision
 
-	if _, err := cli.Delete(ctx, key); err != nil {
+	// The supported delete shape: a compare on the key's mod revision,
+	// the delete in the success branch and a read in the failure one.
+	// An unguarded DeleteRange is not one of the three transactions the
+	// bridge serves, and the API server never sends one.
+	removal, err := cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", resume)).
+		Then(clientv3.OpDelete(key)).
+		Else(clientv3.OpGet(key)).
+		Commit()
+	if err != nil {
 		t.Fatalf("delete: %v", err)
+	}
+	if !removal.Succeeded {
+		t.Fatalf("delete did not apply: %+v", removal)
 	}
 	removed := next(t, events, "delete")
 	if len(removed.Events) != 1 || removed.Events[0].Type != clientv3.EventTypeDelete {

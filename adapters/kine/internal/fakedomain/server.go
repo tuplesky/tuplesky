@@ -345,6 +345,13 @@ func (s *Server) handle(stream *quic.Stream, bound *boundSession) {
 		case wire.WatchOpen:
 			s.watch(stream, m)
 			return
+		case wire.WatchClose:
+			// A cancel is its own request on its own stream, as it is
+			// against the real frontend: the watch's own stream is the
+			// one the domain is writing events on, and a caller does
+			// not write onto it.
+			s.cancelWatch(m.WatchID)
+			out = closeFrame(m.WatchID, wire.WatchCancelled, nil)
 		default:
 			return
 		}
@@ -526,7 +533,10 @@ func (s *Server) watch(stream *quic.Stream, open wire.WatchOpen) {
 	s.watchers[w] = struct{}{}
 	s.mu.Unlock()
 	m.mu.Unlock()
-	go s.readCancel(w)
+	// Nothing is read from this stream. A caller ends the request half
+	// of a stream it opens, so the open is the last thing that arrives
+	// on it; what a watch needs after that -- a cancel -- is its own
+	// request on its own stream.
 	for {
 		select {
 		case frame := <-w.queue:
@@ -547,18 +557,20 @@ func (s *Server) watch(stream *quic.Stream, open wire.WatchOpen) {
 	}
 }
 
-func (s *Server) readCancel(w *watcher) {
-	frame, err := readFrame(w.stream)
-	if err != nil {
-		w.close(nil)
-		return
-	}
-	if msg, err := wire.Decode(frame); err == nil {
-		if _, ok := msg.(wire.WatchClose); ok {
-			s.record(Logged{Kind: "watch-cancel", Sequence: w.open.WatchID})
+// cancelWatch ends every watch carrying `id`, as a client's cancel does.
+func (s *Server) cancelWatch(id uint64) {
+	s.mu.Lock()
+	var cancelled []*watcher
+	for w := range s.watchers {
+		if w.open.WatchID == id {
+			cancelled = append(cancelled, w)
 		}
 	}
-	w.close(nil)
+	s.mu.Unlock()
+	for _, w := range cancelled {
+		s.record(Logged{Kind: "watch-cancel", Sequence: id})
+		w.close(nil)
+	}
 }
 
 func (s *Server) remove(w *watcher) {

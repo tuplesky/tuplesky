@@ -3191,3 +3191,142 @@ async fn a_node_reports_bounded_secret_free_metrics() {
         "the snapshot carries a {longest}-character run, which is identity-shaped:\n{rendered}"
     );
 }
+
+/// A watch opened against the running daemon is served the events of
+/// the revisions that follow it, on the stream it was opened on.
+///
+/// This is the one request shape whose stream outlives its frame. The
+/// caller opens it once; the events are written onto that same stream
+/// for the life of the subscription, which means the daemon has to hold
+/// the responder and keep moving what the hub produces onto it rather
+/// than answering once and letting the stream go.
+///
+/// Two writes, because one proves less than it looks: a single event
+/// could be delivered by a pump that happens to run when the request
+/// that caused it is answered. The second arrives with nothing else
+/// going on, so it is the subscription that delivered it.
+///
+/// What this does not test is resumption from history: the watch here
+/// starts at the frontier, and replaying a compacted or retained past
+/// is the certification suite's, where a real API server's reflector
+/// asks for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_is_served_the_revisions_that_follow_it() {
+    let dir = workspace("watch");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x77; 16]).await;
+
+    // The subscription's own stream. It is not finished: the caller has
+    // said everything it has to say, and everything else on this stream
+    // comes the other way.
+    let (mut send, mut recv) = caller
+        .connection
+        .open_bi()
+        .await
+        .expect("a stream for the watch");
+    let open = coord_types::wire_v1::MessageV1::WatchOpen(coord_types::wire_v1::WatchOpenV1 {
+        watch_id: 7,
+        namespace: coord_types::ids::NamespaceId(REQUEST_NAMESPACE),
+        key: coord_types::wire_v1::BoundedBytes::new(b"w".to_vec()).expect("bounded"),
+        range_end: None,
+        // From the start of history, which is what a resuming client
+        // asks for and what makes this deterministic: the open and the
+        // first write are on different streams, so which of them the
+        // daemon sees first is the network's to decide. A watch from a
+        // revision is delivered either way -- replayed when it attached
+        // above the write, live when below -- and one that attached at
+        // whatever the frontier happened to be would be a test of that
+        // race instead.
+        start_revision: Some(coord_types::ids::KvRevision::new(1).expect("nonzero")),
+        prev_kv: false,
+        progress_notify: false,
+    })
+    .encode()
+    .expect("bounded");
+    send.write_all(&open).await.expect("the open is written");
+    // The request half ends here, as it does for every request: a
+    // caller says one thing on a stream it opens. The receiving half is
+    // what stays, and it is the subscription.
+    send.finish().expect("the open is complete");
+
+    let mut reader = coord_types::wire_v1::FrameReader::new();
+    let mut buffered: Vec<coord_types::wire_v1::Frame> = Vec::new();
+    let mut seen: Vec<(u64, Vec<u8>)> = Vec::new();
+    for (sequence, value) in [(1u64, b"one".to_vec()), (2, b"two".to_vec())] {
+        let answer = ask(&caller.connection, &caller.put(sequence, b"w", &value))
+            .await
+            .expect("the daemon never answered the write");
+        let coord_types::wire_v1::MessageV1::Response(response) =
+            coord_types::wire_v1::decode(&answer).expect("a decodable answer")
+        else {
+            panic!("the daemon answered a write with something else");
+        };
+        assert!(
+            matches!(response.outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+            "the write did not execute: {response:?}"
+        );
+
+        // One event frame per write, read off the subscription's stream
+        // within a bound. A watch that is registered and never pumped
+        // fails here by timing out, which is what this build did before
+        // the daemon held the stream.
+        let frame = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(frame) = buffered.pop() {
+                    return Some(frame);
+                }
+                if let Some(frame) = reader.next_frame().expect("a frame") {
+                    return Some(frame);
+                }
+                let mut buf = [0u8; 4096];
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => reader.push(&buf[..n]).expect("within the reader bound"),
+                    // The daemon ended the stream, or the connection.
+                    // Either is a failure of the subscription, and what
+                    // the daemon said about it is the diagnosis.
+                    Ok(None) => return None,
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the watch delivered nothing within the bound:\n{}",
+                daemon.said()
+            )
+        })
+        .unwrap_or_else(|| panic!("the daemon ended the watch stream:\n{}", daemon.said()));
+        match coord_types::wire_v1::decode(&frame).expect("a decodable watch frame") {
+            coord_types::wire_v1::MessageV1::WatchEvents(events) => {
+                assert_eq!(events.watch_id, 7, "another subscription's events");
+                assert!(events.complete, "a revision arrived in pieces");
+                let delivered: Vec<Vec<u8>> = events
+                    .events
+                    .as_slice()
+                    .iter()
+                    .map(|e| e.value.as_slice().to_vec())
+                    .collect();
+                seen.push((events.revision.get(), delivered.concat()));
+            }
+            other => panic!("the watch delivered something else: {other:?}"),
+        }
+    }
+
+    // In order, each revision once, carrying what was written.
+    assert_eq!(
+        seen.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        vec![b"one".to_vec(), b"two".to_vec()],
+        "the watch delivered {seen:?}"
+    );
+    assert!(
+        seen[0].0 < seen[1].0,
+        "the watch delivered revisions out of order: {seen:?}"
+    );
+}
