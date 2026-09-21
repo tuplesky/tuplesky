@@ -727,6 +727,50 @@ impl Leader {
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
+        self.propose(frame, Some(admission))
+    }
+
+    /// Propose one of the service's own commands.
+    ///
+    /// This is the path the scheduler's expiry candidates take, and it
+    /// exists because there is no verifier for them: a lease expiring
+    /// is not somebody's request, so there is no credential to check,
+    /// no session to name and no receipt to mint. The command is
+    /// accepted with no admission at all, which
+    /// [`PayloadRecordV1::admission`] has always had a case for, and
+    /// that absence is exactly what execution keys on -- every
+    /// submission a collector makes carries a receipt, so a caller can
+    /// never reach this planner however it spells its payload.
+    ///
+    /// Narrow on purpose. Only the two service operations may travel
+    /// this way; anything else is refused here rather than proposed, so
+    /// this is one door for two named actions and not an internal
+    /// command endpoint.
+    ///
+    /// Safety of the thing itself is not this door's to provide. Every
+    /// field of an expiry is a condition the state machine rechecks
+    /// against replicated state, so a stale candidate -- a renewed
+    /// lease, a rebound key, a superseded authority epoch -- executes
+    /// as a no-op at its own position rather than deleting anything.
+    pub fn propose_service(&mut self, frame: &[u8]) -> Vec<Effect> {
+        let permitted = match decode_stream(frame).as_deref() {
+            Ok([MessageV1::Request(r)]) => r.logical().is_ok_and(|l| {
+                matches!(
+                    l.operation,
+                    coord_types::logical_v1::CanonicalOperation::EstablishLeaseAuthority { .. }
+                        | coord_types::logical_v1::CanonicalOperation::ExpireLease { .. }
+                )
+            }),
+            _ => false,
+        };
+        if !permitted {
+            self.rejections.push(Rejection::MalformedRequest);
+            return Vec::new();
+        }
+        self.propose(frame, None)
+    }
+
+    fn propose(&mut self, frame: &[u8], admission: Option<AdmissionFacts>) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -769,7 +813,7 @@ impl Leader {
         let payload = PayloadRecordV1 {
             retry_key: request.retry_key,
             logical: request.logical.as_slice().to_vec(),
-            admission: Some(admission),
+            admission,
         };
         // Atomic initialization: admission binding, conservative
         // dependencies, path evidence and index publication in one

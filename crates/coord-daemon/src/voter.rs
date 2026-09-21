@@ -296,6 +296,35 @@ impl<P: Persistence> Voter<P> {
         self.node.take_rejections()
     }
 
+    /// Propose one of the service's own commands (an expiry candidate,
+    /// a lease authority epoch). Nothing happens unless this replica
+    /// leads, and nothing but those two operations may travel this way.
+    pub fn propose_service(&mut self, frame: &[u8]) -> Result<Outbound, DriveError> {
+        self.node.propose_service(frame, &self.ballot)
+    }
+
+    /// Whether this replica is holding a command it knows by identity
+    /// and not by content.
+    pub fn wants_payloads(&self) -> bool {
+        self.node.wants_payloads()
+    }
+
+    /// Ask this ballot's leader for the payloads this replica lacks.
+    pub fn request_payloads(&mut self) -> Result<Outbound, DriveError> {
+        let leader = self.ballot.leader;
+        self.node.request_payloads(leader, &self.ballot)
+    }
+
+    /// The command execution is waiting for a payload for, if any.
+    pub fn awaiting(&self) -> Option<coord_types::CommandId> {
+        self.node.awaiting()
+    }
+
+    /// Whether this replica currently leads its ballot.
+    pub fn leads(&self) -> bool {
+        self.node.machine().leads()
+    }
+
     /// Apply every command whose turn has come.
     pub fn execute(&mut self) -> Result<Outbound, DriveError> {
         self.node.execute(&self.ballot)

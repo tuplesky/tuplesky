@@ -1801,14 +1801,14 @@ had no caller at all -- the list grew for the life of the process, and
 the reasons in it were never read by anything. The driver drains it
 every turn.
 
-**And a key under a time to live does not expire.** Written with a
-one-second lease, still readable a minute later. The private binding is
+**And a key under a time to live did not expire.** Written with a
+one-second lease, still readable a minute later. The private binding was
 not disclosed to the caller, which the same test checks and which
-passes, so what is missing is the expiry rather than the rule about what
-a caller may see.
+passed, so what was missing was the expiry rather than the rule about
+what a caller may see.
 
 Worth being precise about what "the expiry" is, because the shape is the
-substance. Design Sections 7.2-7.3 make expiry an authoritative
+substance, and the shape is what the fix had to keep. Design Sections 7.2-7.3 make expiry an authoritative
 conditional command -- `ExpireLease` matching the binding's generation,
 the expected renewal sequence and the replicated `LeaseAuthorityEpoch`,
 applied only if every field still matches -- and a timer a scheduling
@@ -1816,14 +1816,49 @@ hint rather than permission to mutate. The deadline is `(1 + rho) * TTL`
 local ticks from the observation of a committed grant or renewal, so
 expiry may be late and may not be early; a restart rearms every surviving
 binding for its full TTL from the new epoch's observation. The state
-machine has all of that: `coord_state::expiry::Scheduler` arms, rearms
-and emits candidates, and the planner applies them conditionally. What
-has no caller is the scheduler. Nothing in `coordd` constructs one, feeds
-it observations, or submits what it produces, and `ExpireLease` has no
-narrow `CanonicalOperation` to travel under -- deliberately, since each
-internal command gets its own discriminant so that a client's payload can
-never reach a lease-authority or policy operation. Closing this means
-building that path, not deleting a key locally when a timer fires.
+machine had all of that: `coord_state::expiry` arms, rearms and emits
+candidates, and the planner applies them conditionally. What had no
+caller was the scheduler.
+
+So the fix is the path between them, and it has three parts.
+
+*The leader schedules.* On becoming the one that proposes, a node orders
+a fresh authority epoch for its own boot. That is not bookkeeping: an
+expiry carries the epoch it was scheduled under, and the state machine
+refuses an older one, so installing a new epoch is what stops a
+predecessor's timers from deleting a key after this node has taken over.
+Only when that epoch commits does it arm anything, and then it arms every
+surviving lease for its full TTL from *that* observation -- not from
+whatever the previous authority had counted. Committed lease state is
+read back on an interval rather than every turn, which is the
+conservative direction: a renewal this node has not seen yet can only
+make a candidate stale, and a stale candidate is a no-op.
+
+*The command is narrow, and narrowness is not what protects it.*
+`ExpireLease` and `EstablishLeaseAuthority` are two appended canonical
+operations, in the same spirit as `ConsumeAdmission`. But what keeps a
+caller out of them is the admission beside the payload: every submission
+a collector makes carries a receipt minted for a session, and these two
+execute only for a command accepted with *no* admission at all, which
+only a voter's own proposal is. A caller naming one is refused whatever
+its session holds. That is a property worth a test of its own, and it has
+one.
+
+*Two latent defects had to come out first.* Until now every command
+reached every voter as a submission, so no replica ever had to execute
+one whose payload it lacked -- and a leader-originated command is exactly
+that. A replica that heard a proposal before the payload left a
+placeholder in its table, and `advance_pending` treated a placeholder as
+acceptable: it took the proposal out of the held set, the adoption failed
+against a record with no payload to accept an order *for*, and the
+proposal was dropped silently. A placeholder is now held until it is
+initialized. Second, a payload arriving for a command the replica already
+had a record for was discarded outright, so a replica in that state could
+never acquire one; it is now bound and written. And nothing ever asked:
+`request_payloads` had no caller, so a replica now asks this ballot's
+leader on an interval, and execution waits at the command it cannot run
+rather than failing the node -- which is what it used to do, taking the
+whole process down with it.
 
 All of them had been invisible for a structural reason worth stating. The
 Kine backend holds one session and issues one invocation at a time, and

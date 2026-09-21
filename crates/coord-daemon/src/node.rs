@@ -90,6 +90,34 @@ impl Machine {
         }
     }
 
+    /// Propose one of the service's own commands, where this replica
+    /// leads. A follower proposes nothing: leading is what the ballot
+    /// says, and a replica that does not lead has no order to offer.
+    pub fn propose_service(&mut self, frame: &[u8]) -> Vec<Effect> {
+        match self {
+            Machine::Leader(m) => m.propose_service(frame),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
+    /// Whether this replica is holding a command it knows by identity
+    /// and not by content.
+    pub fn wants_payloads(&self) -> bool {
+        match self {
+            Machine::Leader(_) => false,
+            Machine::Follower(m) => !m.missing_payloads().is_empty(),
+        }
+    }
+
+    /// Ask `from` for the payloads this replica lacks. Only a follower
+    /// lacks one: a leader holds every payload it proposed.
+    pub fn request_payloads(&mut self, from: coord_types::ids::ReplicaId) -> Vec<Effect> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.request_payloads(from),
+        }
+    }
+
     /// Whether this replica currently leads.
     pub const fn leads(&self) -> bool {
         matches!(self, Machine::Leader(_))
@@ -215,6 +243,8 @@ pub struct Node<P: Persistence> {
     pub executed: u64,
     withheld: u64,
     withheld_evidence: u64,
+    /// The command execution is waiting for a payload for, if any.
+    awaiting: Option<CommandId>,
 }
 
 impl<P: Persistence> Node<P> {
@@ -230,6 +260,7 @@ impl<P: Persistence> Node<P> {
             executed: 0,
             withheld: 0,
             withheld_evidence: 0,
+            awaiting: None,
         }
     }
 
@@ -241,6 +272,39 @@ impl<P: Persistence> Node<P> {
     /// Take what the machine refused since the last call, rendered.
     pub fn take_rejections(&mut self) -> Vec<String> {
         self.machine.take_rejections()
+    }
+
+    /// The command this replica cannot execute because it does not hold
+    /// the payload, if execution is waiting on one.
+    pub const fn awaiting(&self) -> Option<CommandId> {
+        self.awaiting
+    }
+
+    /// Propose one of the service's own commands and carry out what that
+    /// produced.
+    pub fn propose_service(
+        &mut self,
+        frame: &[u8],
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let effects = self.machine.propose_service(frame);
+        self.carry_out(effects, ballot)
+    }
+
+    /// Whether this replica is holding a command it knows by identity
+    /// and not by content.
+    pub fn wants_payloads(&self) -> bool {
+        self.machine.wants_payloads()
+    }
+
+    /// Ask `from` for the payloads this replica lacks.
+    pub fn request_payloads(
+        &mut self,
+        from: coord_types::ids::ReplicaId,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let effects = self.machine.request_payloads(from);
+        self.carry_out(effects, ballot)
     }
 
     /// The applier (watch hub, reader, store).
@@ -481,10 +545,18 @@ impl<P: Persistence> Node<P> {
             // order is the whole of the guarantee, and going on would
             // apply a later command first.
             let Some(payload) = self.machine.payload(&command) else {
-                return Err(DriveError::Submit(format!(
-                    "no payload for the next executable command {command:?}"
-                )));
+                // Not something to skip past -- the order is the whole
+                // of the guarantee -- and not a fault either. A replica
+                // learns a command's identity from evidence and its
+                // content from a submission or a peer, and the two can
+                // arrive in either order; a command the leader proposed
+                // out of its own scheduler has no submission coming at
+                // all. So execution stops here, the command is named,
+                // and the runtime asks for what it is missing.
+                self.awaiting = Some(command);
+                return Ok(out);
             };
+            self.awaiting = None;
             let outcome = self
                 .applier
                 .apply(command, &payload)

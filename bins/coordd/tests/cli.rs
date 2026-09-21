@@ -3397,3 +3397,198 @@ async fn two_callers_at_once_are_both_served_by_a_quorum() {
         running[2].said()
     );
 }
+
+/// A key written under a time to live stops being readable, and the
+/// domain says so because a replicated command deleted it.
+///
+/// This is the whole of the private-TTL path end to end: a Kine create
+/// carries a TTL and the hidden binding it derives, the leader's
+/// scheduler arms a deadline under an authority epoch it ordered, and
+/// when the deadline passes it proposes a conditional expiry that every
+/// replica applies at its own position. Nothing here deletes a key
+/// locally because a timer went off.
+///
+/// The wait is generous on purpose. Expiry is allowed to be late --
+/// the deadline waits `(1 + rho) * TTL` local ticks and the scheduler
+/// reads committed state on an interval -- and it is not allowed to be
+/// early, which the first read is there to check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_under_a_time_to_live_stops_being_readable() {
+    let dir = workspace("ttl");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x7c; 16]).await;
+
+    let namespace = coord_types::ids::NamespaceId(REQUEST_NAMESPACE);
+    let key = b"ttl-key".to_vec();
+    let create = |sequence: u64| {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            namespace,
+            coord_types::logical_v1::CanonicalOperation::KineCreate(
+                coord_types::logical_v1::KineCreateOp {
+                    key: key.clone(),
+                    value: b"v".to_vec(),
+                    ttl_seconds: 1,
+                    // The collector derives this from the stable
+                    // request; what matters here is that it is the
+                    // key's own binding and never reaches the caller.
+                    binding: Some(coord_types::ids::LeaseId([0xb1; 16])),
+                },
+            ),
+        );
+        logical.canonicalize();
+        coord_types::wire_v1::MessageV1::Request(
+            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0)
+                .expect("bounded"),
+        )
+        .encode()
+        .expect("bounded")
+    };
+    let read = |sequence: u64| {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            namespace,
+            coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
+                range: coord_types::logical_v1::KeyRange::exact(key.clone()),
+                revision: None,
+                limit: 0,
+                keys_only: false,
+                count_only: false,
+            }),
+        );
+        logical.canonicalize();
+        coord_types::wire_v1::MessageV1::Request(
+            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0)
+                .expect("bounded"),
+        )
+        .encode()
+        .expect("bounded")
+    };
+    /// The rows a read answered with.
+    fn rows(frame: &coord_types::wire_v1::Frame) -> u64 {
+        let response = response_of(frame);
+        let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+            panic!("the read failed: {response:?}");
+        };
+        let decoded: coord_state::Response =
+            postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+        match decoded.outcome {
+            coord_state::Outcome::Range { count, .. } => count,
+            other => panic!("a read answered with {other:?}"),
+        }
+    }
+
+    let answer = ask(&caller.connection, &create(1))
+        .await
+        .expect("the daemon never answered the write");
+    let response = response_of(&answer);
+    assert!(
+        matches!(response.outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+        "the write did not execute: {response:?}"
+    );
+
+    // Present immediately: a deadline is not permission, and nothing
+    // may delete the key before its time.
+    let present = ask(&caller.connection, &read(2))
+        .await
+        .expect("the daemon never answered the read");
+    assert_eq!(rows(&present), 1, "the key was gone before its time");
+
+    // And gone once the deadline passes. Polled rather than slept
+    // through: what is being tested is that it goes, not when.
+    let mut sequence = 3;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let answer = ask(&caller.connection, &read(sequence))
+            .await
+            .expect("the daemon never answered the read");
+        if rows(&answer) == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the key was still readable a minute after a one-second time to live:\n{}",
+            daemon.said()
+        );
+        sequence += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A caller naming one of the service's own operations is refused,
+/// whatever its session may do.
+///
+/// The two service operations are narrow by design, but narrowness is
+/// not what keeps a caller out of them: what does is the admission
+/// beside the payload. Every submission a collector makes carries a
+/// receipt minted for a session, and these execute only for a command
+/// accepted with no receipt at all -- which only a voter's own proposal
+/// is. So this asks for the one thing a caller must never be able to
+/// ask for: the deletion of somebody's key, spelled as an expiry, with
+/// an authority epoch it chose itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_cannot_expire_a_lease_however_it_spells_it() {
+    let dir = workspace("service-op");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x5e; 16]).await;
+
+    for (n, operation) in [
+        coord_types::logical_v1::CanonicalOperation::ExpireLease {
+            lease_id: coord_types::ids::LeaseId([0xb1; 16]),
+            generation: coord_types::ids::LeaseGeneration::new(1).expect("nonzero"),
+            expected_renewal_sequence: 0,
+            authority_epoch: coord_types::ids::LeaseAuthorityEpoch::new(1).expect("nonzero"),
+        },
+        coord_types::logical_v1::CanonicalOperation::EstablishLeaseAuthority {
+            epoch: coord_types::ids::LeaseAuthorityEpoch::new(99).expect("nonzero"),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            coord_types::ids::NamespaceId(REQUEST_NAMESPACE),
+            operation,
+        );
+        logical.canonicalize();
+        let frame = coord_types::wire_v1::MessageV1::Request(
+            coord_types::wire_v1::RequestV1::new(caller.invocation(n as u64 + 1), &logical, 0)
+                .expect("bounded"),
+        )
+        .encode()
+        .expect("bounded");
+        let answer = ask(&caller.connection, &frame)
+            .await
+            .expect("the daemon never answered");
+        let response = response_of(&answer);
+        // Refused as a replicated outcome, at the position the command
+        // already has: a command chosen to execute is never left
+        // unexecuted, and the refusal changes nothing.
+        let coord_types::wire_v1::OutcomeV1::Ok { result, revision } = &response.outcome else {
+            panic!("the daemon answered with a transport-level error: {response:?}");
+        };
+        assert!(
+            revision.is_none(),
+            "a refused service operation consumed a revision: {response:?}"
+        );
+        let executed: coord_state::Response =
+            postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+        assert_eq!(
+            executed.outcome,
+            coord_state::Outcome::ErrRejected {
+                reason: coord_state::RejectionReason::AdmissionMismatch
+            },
+            "a caller's service operation was not refused for the right reason"
+        );
+    }
+}

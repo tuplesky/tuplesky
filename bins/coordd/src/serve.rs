@@ -568,8 +568,17 @@ pub struct Domain<P: Persistence> {
     /// with nobody else in it, and for a process whose frontend holds no
     /// collector credential to submit with.
     links: CollectorLinks,
+    /// Lease and private-TTL expiry, where this process votes. A node
+    /// that runs no voter schedules nothing: an expiry is a command,
+    /// and proposing one is a leader's.
+    expiry: Option<crate::leases::Expiry>,
+    /// Turns spent holding a command whose payload this node lacks.
+    asking: u64,
     budgets: Budgets,
 }
+
+/// Turns between two asks for a missing payload.
+const ASK_EVERY: u64 = 16;
 
 /// Where this node's local recovery images live, and when it makes one.
 ///
@@ -605,6 +614,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             housekeeping: None,
             plane: None,
             links: CollectorLinks::new(Vec::new()),
+            expiry: None,
+            asking: 0,
             budgets,
         }
     }
@@ -812,6 +823,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
+    /// Schedule lease and private-TTL expiry from this node's leader.
+    pub fn with_expiry(mut self, expiry: crate::leases::Expiry) -> Self {
+        self.expiry = Some(expiry);
+        self
+    }
+
+    /// Authority epochs proposed, expiry candidates proposed, and leases
+    /// currently armed.
+    pub fn expiries(&self) -> (u64, u64, usize) {
+        self.expiry
+            .as_ref()
+            .map_or((0, 0, 0), |e| (e.done.0, e.done.1, e.armed()))
+    }
+
     /// Give the voter its turn: the local submissions it is owed, then
     /// whatever applying those produced.
     ///
@@ -824,6 +849,35 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         };
         let (mut out, refused) = voter.serve_local(self.budgets.local_per_turn)?;
         out.absorb(voter.execute()?);
+        // A command whose identity this replica learned from evidence
+        // and whose content nobody sent it. Execution stops at it
+        // rather than going past it, so what unblocks the domain is
+        // asking the leader for the payload; the request carries no
+        // durable prerequisite and goes out at once.
+        //
+        // Asked on an interval rather than on every turn: the request
+        // has no durable prerequisite and goes out at once, so one is
+        // enough until the answer comes, and a busy domain must not
+        // turn one missing payload into a request per event.
+        if voter.awaiting().is_some() || voter.wants_payloads() {
+            self.asking = self.asking.saturating_add(1);
+            if self.asking % ASK_EVERY == 1 {
+                out.absorb(voter.request_payloads()?);
+            }
+        } else {
+            self.asking = 0;
+        }
+        // Expiry is the leader's to schedule, and every candidate it
+        // produces is conditional: nothing here decides that a key
+        // goes, only that the cluster should be asked.
+        if voter.leads()
+            && let Some(expiry) = self.expiry.as_mut()
+        {
+            let frames = expiry.due(voter.node().applier().store());
+            for frame in frames {
+                out.absorb(voter.propose_service(&frame)?);
+            }
+        }
         let provenance = voter.provenance();
         let did = !refused.is_empty() || !out.is_empty();
         // A refusal at the voter's door is silent to the caller, whose

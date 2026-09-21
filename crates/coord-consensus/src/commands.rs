@@ -560,6 +560,20 @@ impl CommandTable {
             .ok_or(GuardViolation::DependencyUnknown { dep: *command })
     }
 
+    /// Whether this table holds `command`'s payload, not merely its
+    /// identity.
+    ///
+    /// The difference matters wherever a record is about to be changed.
+    /// A placeholder says "a command with this identity exists and I
+    /// have been told about it"; only an initialized record has the
+    /// dependencies, the keys and the admission that make it a command
+    /// this replica can accept an order for or execute.
+    pub fn is_initialized(&self, command: &CommandId) -> bool {
+        self.records
+            .get(command)
+            .is_some_and(|r| r.payload.is_some())
+    }
+
     /// Number of records (placeholders included).
     pub fn len(&self) -> usize {
         self.records.len()
