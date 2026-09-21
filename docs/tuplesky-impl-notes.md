@@ -1743,8 +1743,9 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-ten things. All ten are fixed here, and each became findable
-only once the ones before it were.
+thirteen things. Twelve are fixed here and the thirteenth is stated
+below with what is known about it, and each became findable only once
+the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counted the watch and dropped the responder.
@@ -2370,43 +2371,119 @@ it at the second invocation. On the composed path the difference is the
 whole benchmark: the rows that refused 230 of 300 and then 300 of 300
 complete 300 of 300.
 
-### Two things left open, and what is known about each
+### And the replica that could not catch up
 
-**A replica that falls behind recovers, but not fast enough for its own
-callers.** Stated above, published with
-[the matrix](operations/wan-results.md#the-finding-this-run-exposed),
-and belonging with [task-j07](design/tuplesky-prs-plan.md#task-j07).
+The finding the WAN matrix was published with, closed here. It said a
+replica falls behind, recovers but not quickly, and its own callers
+lose about three operations in ten to their deadline while it does. What
+it did not say -- because nothing had looked -- is why the catch-up path
+was so slow.
 
-**A voter drops a caller's acknowledgement when submissions lag behind
-proposals.** `bins/coordd/src/serve.rs` holds peer evidence for a
-command whose submitting collector this voter does not know yet, because
-a voter can learn a command from a peer before the submission naming it
-arrives, and handing that acknowledgement to the collector in this
-process would lose it. The queue is bounded at 256 entries, oldest
-first, and its comment assumes the window is "one frame per command
-between this voter acknowledging it and the submission naming it
-arriving here".
+A voter that learns a command's identity before its content executes
+nothing past it until a peer sends the payload. It asks for up to
+`MAX_PAYLOAD_TRANSFER` of them at a time, and that bound exists for a
+reason the source states plainly: *"An unbounded ask therefore answers
+itself: a replica missing a tableful of payloads asks for all of them
+several times a second, the peer answers with that many payload frames
+each time, the lane fills, and what it drops includes the proposals and
+acknowledgements that would have let the replica catch up -- so it falls
+further behind and asks for more."*
 
-Under sustained load that is not the window. A submission this voter
-refuses with `Backpressure` never tells it where the evidence goes, so
-the entry waits for a presentation that may not come while the leader's
-proposals keep arriving behind it. The queue overflows, the oldest goes,
-and a caller's collector is one acknowledgement short -- recovered,
-because the command is decided and durable and the caller resolves it by
-identity, but recovered through a path that should not be in use.
+The bound was right and the *rate* was not. The runtime repeated the ask
+whenever the count of missing payloads moved, and that count moves for
+two reasons: a payload arrived, or a command arrived by identity. Under
+load the second happens on nearly every turn, so the replica asked
+continuously -- which is exactly the sentence above, with the flood
+moved from the control lane to the bulk one the transfer was separated
+onto. Instrumented on a three-voter domain under the read-heavy
+workload: one follower issued over 2400 asks while its missing count
+climbed from 243 to 436, the leader logged `QueueFull { lane: Bulk }` on
+390 sends to it, and that follower refused 8527 submissions with
+`Backpressure` because its command table was full of commands it could
+not execute for want of content it had asked for 2400 times.
 
-`a_quorum_keeps_answering_past_its_table_capacity` asserts that no voter
-says `dropped evidence no submission ever claimed`, and on a loaded
-machine it fails about two runs in five. That is a real assertion about
-a real symptom, not a flaky one: every request in the run is still
-answered, which the assertions above it check, and this one is the
-hygiene check that says the answers did not come through the recovery
-path. It is pre-existing -- two failures in five on the commit before
-the retry-floor change -- and it is
-[task #81](design/tuplesky-prs-plan.md#task-63), left open here rather
-than silenced, because the choice between holding the evidence longer
-and discarding it when the submission is refused is a question about the
-collector boundary and not a bound to raise.
+The comment beside the old rule already said what the rule should have
+been -- *"one ask outstanding at a time, and the next one goes the
+moment the last was answered"*. Nothing counted answers. So
+`Follower::payloads_answered` does, and it moves only when a peer
+replied; `ask_for_payloads_now` lets the next ask go when the last batch
+is answered **in full**, and otherwise on the retry floor. In full
+matters: an ask is worth eight frames on the bulk lane, so re-asking
+when the first of them lands puts a fresh batch of eight on that lane
+for every payload that arrives, which is the same loop reached from the
+other side. The floor is still there for the case the answer-driven rule
+cannot cover, which is part of a batch the peer does not hold durably
+yet and so will never send.
+
+Measured over five trials each, 1500 operations per trial through three
+frontends:
+
+| | operations never answered | bulk lane queue-full on the leader |
+| --- | --- | --- |
+| before | 21, 172, 134, 127, 2 | 392, 185, 189, 203, 284 |
+| after | 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0 |
+
+No overlap in ten runs. `scans` and `read-mostly` complete 300 of 300
+where they completed 192 and 201, and every row's throughput went up
+rather than down.
+
+**A line per dropped frame is its own denial of service.** Found while
+measuring this. A send the transport could not queue printed a line, and
+that loop runs as fast as the runtime turns: one run wrote a 157 MB log
+and filled the disk, which took out the benchmark rows that were meant
+to measure the fix. The line is now silent for a lane that fills and
+drains inside a turn -- that is backpressure working, not an event --
+and past `UNDELIVERABLE_SAID_AT` frames it is said at each doubling, so
+the lines are logarithmic in the frames lost and the last one an
+operator reads is within a factor of two of the truth.
+
+### A voter's unplaced evidence waits for a race, not for a bound
+
+**What it looked like.** `a_quorum_keeps_answering_past_its_table_capacity`
+failed about two runs in five on a loaded machine, on its hygiene
+assertion that no voter says `dropped evidence no submission ever
+claimed`. Every request in the run was still answered -- the assertions
+above it check that -- so what failed was the check that the answers did
+not come through the recovery path. Pre-existing: two failures in five
+on the commit before the retry-floor change.
+
+**What it was.** A voter can learn a command from a peer before the
+submission naming it arrives, and the acknowledgement it then produces
+belongs to whichever collector did the asking; handing it to the
+collector in this process would lose it, so it waits. The wait was
+bounded at 256 entries, oldest evicted, under a comment saying the
+window is "one frame per command between this voter acknowledging it and
+the submission naming it arriving here".
+
+That is one of the two ways a submission fails to arrive. The other is
+that it never will. Instrumenting the fan-out under load showed 317 of
+about 880 submissions rejected by the transport with
+`Unavailable(QueueFull { lane: Unary })`: the peer's lane queue is full,
+the frame is dropped, and no retry of that presentation is coming. The
+command still commits, because the local voter and one remote peer took
+it and that is a quorum of three -- but the third voter is never told
+where its evidence belongs, so it holds it until something newer needs
+the room. The hold grows monotonically, the bound is reached, and an
+ordinary consequence of backpressure gets reported as a bound that is
+wrong.
+
+**What it is now.** A window, not a depth. Evidence waits `PARKED_HOLD`
+-- one second, orders of magnitude past a race won in microseconds --
+and is released after that, counted and said once. The 256-entry bound
+stays as a ceiling with its own counter and its own line, because
+reaching *it* means the bound and the traffic have diverged, which is a
+different fact. The test now asserts both halves: that no voter ran out
+of room, and that every voter did release held evidence on the window,
+so a run where the hold has stopped expiring fails rather than passing
+on its way to the bound. A bound of 4 fails the first; a window of 600
+seconds fails the second.
+
+**What it did not fix.** The fan-out. A submission a peer's lane cannot
+queue leaves that command on a bare quorum, and nothing says so beyond a
+count on the shutdown report. Whether the collector should re-offer it,
+or whether a lane too full to take a submission should refuse the caller
+rather than silently narrow the quorum, is a question about the
+collector boundary rather than a bound to raise, and it is open.
 
 ### What the benchmark harness had to get right to find these
 
