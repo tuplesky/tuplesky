@@ -162,6 +162,29 @@ fn an_unavailable_metric_is_never_reported_as_zero() {
     assert_eq!(bounded.pressure_permille(), Measure::Observed(250));
 }
 
+/// The mean divides by the whole count, however large it has grown.
+///
+/// A denominator capped at `u32::MAX` while the total kept growing
+/// would report a mean that inflates with every further sample, and a
+/// busy stage reaches four billion samples in about half a day. The
+/// state is constructed directly: recording that many samples is not a
+/// test anyone should wait for.
+#[test]
+fn the_mean_stays_true_past_four_billion_samples() {
+    let each = Duration::from_micros(10);
+    let count = u64::from(u32::MAX) * 4;
+    let long_lived = Latency {
+        count,
+        total: Duration::from_nanos(u64::try_from(each.as_nanos()).expect("fits") * count),
+        max: each,
+    };
+    assert_eq!(
+        long_lived.measure(),
+        Measure::Observed(each),
+        "the mean was divided by a truncated count"
+    );
+}
+
 /// A sync, the whole operation and backpressure are three answers to
 /// three different questions.
 #[test]
@@ -385,6 +408,14 @@ fn reading_diagnostics_never_blocks_the_work_being_measured() {
         assert!(
             journal.entered >= journal.completed,
             "a snapshot observed more completions than entries"
+        );
+        // Every wait is ten microseconds, so a total larger than ten
+        // microseconds per counted sample means the snapshot paired a
+        // newer total with an older count, and a mean built from it
+        // would be inflated by work the count has not seen.
+        assert!(
+            journal.latency.total <= Duration::from_nanos(10_000 * journal.latency.count),
+            "a snapshot paired a total with a count that had not caught up to it"
         );
         readings += 1;
     }

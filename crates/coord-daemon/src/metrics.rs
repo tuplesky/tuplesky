@@ -289,7 +289,14 @@ impl Latency {
         if self.count == 0 {
             return Measure::Unavailable(Unavailable::NoSamples);
         }
-        Measure::Observed(self.total / u32::try_from(self.count).unwrap_or(u32::MAX))
+        // Divide by the whole count. `Duration / u32` would cap the
+        // denominator at `u32::MAX` while the total kept growing, and a
+        // busy stage passes four billion samples in about half a day,
+        // after which the reported mean would inflate without bound.
+        let nanos = self.total.as_nanos() / u128::from(self.count);
+        Measure::Observed(Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ))
     }
 
     /// The longest observed wait, or why there is none.
@@ -512,31 +519,53 @@ impl Recorder {
     }
 
     /// One operation completed `stage` after `took`.
+    ///
+    /// The order of the writes is part of the reading protocol in
+    /// [`Recorder::stage`]: the sample is counted before its wait joins
+    /// the total, and the completion is published last, each with
+    /// release semantics, so a reader that acquires the later value is
+    /// guaranteed to see the earlier ones.
     pub fn completed(&self, stage: Stage, took: Duration) {
         let cells = self.cells(stage);
-        cells.completed.fetch_add(1, Ordering::Relaxed);
-        cells.samples.fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
-        cells.total_nanos.fetch_add(nanos, Ordering::Relaxed);
+        cells.samples.fetch_add(1, Ordering::Relaxed);
+        cells.total_nanos.fetch_add(nanos, Ordering::Release);
         cells.max_nanos.fetch_max(nanos, Ordering::Relaxed);
+        cells.completed.fetch_add(1, Ordering::Release);
     }
 
     /// One operation was refused by `stage`.
     pub fn refused(&self, stage: Stage) {
-        self.cells(stage).refused.fetch_add(1, Ordering::Relaxed);
+        self.cells(stage).refused.fetch_add(1, Ordering::Release);
     }
 
     /// The accounting of one stage as it stands.
+    ///
+    /// There is no lock, so the counters are read one at a time while
+    /// writers keep going, and the reading order is what keeps the
+    /// result coherent. A counter is loaded before the one it may not
+    /// exceed: completions and refusals before entries, and the total
+    /// before the sample count. Every entry precedes its completion or
+    /// refusal, and every sample is counted before its wait joins the
+    /// total, so acquiring the later counter shows at least the earlier
+    /// ones. A snapshot therefore never reports more completions than
+    /// entries, an in-flight count below zero, or a mean inflated by a
+    /// wait whose sample it has not counted; the only skew left is the
+    /// handful of recordings in progress at the instant of the read.
     pub fn stage(&self, stage: Stage) -> StageMetrics {
         let cells = self.cells(stage);
+        let completed = cells.completed.load(Ordering::Acquire);
+        let refused = cells.refused.load(Ordering::Acquire);
+        let entered = cells.entered.load(Ordering::Relaxed);
+        let total_nanos = cells.total_nanos.load(Ordering::Acquire);
         let samples = cells.samples.load(Ordering::Relaxed);
         StageMetrics {
-            entered: cells.entered.load(Ordering::Relaxed),
-            completed: cells.completed.load(Ordering::Relaxed),
-            refused: cells.refused.load(Ordering::Relaxed),
+            entered,
+            completed,
+            refused,
             latency: Latency {
                 count: samples,
-                total: Duration::from_nanos(cells.total_nanos.load(Ordering::Relaxed)),
+                total: Duration::from_nanos(total_nanos),
                 max: Duration::from_nanos(cells.max_nanos.load(Ordering::Relaxed)),
             },
         }
