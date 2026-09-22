@@ -46,12 +46,18 @@ type RangeItem struct {
 	Entry KvEntry
 }
 
-// KineKv is a Kine-facing entry: the entry plus the TTL of its private
-// binding (never the hidden binding identity).
+// KineKv is a Kine-facing entry: the value and revisions of the entry
+// plus the TTL of its private binding. It carries no lease identity at
+// all: the hidden binding (and any native lease) never reaches a Kine
+// caller, so there is no KvEntry to embed here. This mirrors
+// coord_state::KineKv field for field, which is what the leader encodes.
 type KineKv struct {
-	Key        []byte
-	Entry      KvEntry
-	TTLSeconds uint32
+	Key            []byte
+	Value          []byte
+	CreateRevision uint64
+	ModRevision    uint64
+	Version        uint64
+	TTLSeconds     uint32
 }
 
 // Result is a decoded response: the header revision plus the outcome.
@@ -167,7 +173,16 @@ func readOptionKineKv(r *reader) (*KineKv, error) {
 	if kv.Key, err = r.boundedBytes(maxKeyBytes); err != nil {
 		return nil, err
 	}
-	if kv.Entry, err = readEntry(r); err != nil {
+	if kv.Value, err = r.boundedBytes(maxValueBytes); err != nil {
+		return nil, err
+	}
+	if kv.CreateRevision, err = r.u64(); err != nil {
+		return nil, err
+	}
+	if kv.ModRevision, err = r.u64(); err != nil {
+		return nil, err
+	}
+	if kv.Version, err = r.u64(); err != nil {
 		return nil, err
 	}
 	if kv.TTLSeconds, err = r.u32(); err != nil {
@@ -227,6 +242,9 @@ func writeOptionKineKv(w *writer, kv *KineKv) {
 	}
 	w.byte(1)
 	w.boundedBytes(kv.Key)
-	writeEntry(w, kv.Entry)
+	w.boundedBytes(kv.Value)
+	w.varint(kv.CreateRevision)
+	w.varint(kv.ModRevision)
+	w.varint(kv.Version)
 	w.varint(uint64(kv.TTLSeconds))
 }

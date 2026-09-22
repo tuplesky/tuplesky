@@ -337,10 +337,10 @@ func keyValue(kv *wire.KineKv) *server.KeyValue {
 	}
 	return &server.KeyValue{
 		Key:            string(kv.Key),
-		Value:          kv.Entry.Value,
-		Version:        int64(kv.Entry.Version),
-		CreateRevision: int64(kv.Entry.CreateRevision),
-		ModRevision:    int64(kv.Entry.ModRevision),
+		Value:          kv.Value,
+		Version:        int64(kv.Version),
+		CreateRevision: int64(kv.CreateRevision),
+		ModRevision:    int64(kv.ModRevision),
 		Lease:          int64(kv.TTLSeconds),
 	}
 }

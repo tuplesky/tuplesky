@@ -12,13 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coord_transport::{
-    ALPN_API, ALPN_PEER, BudgetLimits, Class, CloseReason, Destination, Lane, LaneLimits, Limits,
-    SendError, Transport, TransportError, TransportEvent, evidence_frame,
+    ALPN_API, ALPN_PEER, BudgetLimits, Class, CloseCode, CloseReason, Destination, Lane,
+    LaneLimits, Limits, SendError, Transport, TransportError, TransportEvent, evidence_frame,
 };
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedVec, CloseV1, HEADER_LEN, HelloV1, MessageV1, PeerRole, encode_frame,
+    BoundedVec, CloseV1, HEADER_LEN, HelloV1, KIND_SESSION_BIND, KIND_SESSION_BIND_ACK, MessageV1,
+    PeerRole, SESSION_BIND_VERSION, encode_frame,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::time::timeout;
@@ -919,6 +920,85 @@ async fn api_streams_carry_only_client_originated_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_session_binding_is_the_only_undecodable_kind_an_api_stream_may_carry() {
+    // The binding frame's payload belongs to `coord-session`, so this
+    // crate admits it by kind. That exception is enumerated: it covers
+    // exactly this kind at exactly this version, and no other kind the
+    // typed decoder does not know reaches a consumer.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    let (_client, conn, _control) = negotiated(
+        &f,
+        &f.ids[1],
+        ALPN_API,
+        &mut acceptor,
+        PeerRole::Frontend,
+        &[],
+    )
+    .await;
+
+    // The binding arrives as a request frame, undecoded.
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(
+        &encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, &[0x02, 0xaa, 0xbb]).unwrap(),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    loop {
+        match event(&mut acceptor).await {
+            TransportEvent::ApiRequest { frame, .. } => {
+                assert_eq!(frame.kind, KIND_SESSION_BIND);
+                assert_eq!(frame.version, SESSION_BIND_VERSION);
+                break;
+            }
+            TransportEvent::Closed { reason, .. } => panic!("binding refused: {reason:?}"),
+            _ => {}
+        }
+    }
+
+    // A binding of another version, the acknowledgement kind (which only
+    // the frontend may send), and a neighbouring unregistered kind are
+    // each refused. A refusal closes the connection, so each case gets
+    // its own.
+    for (kind, version) in [
+        (KIND_SESSION_BIND, SESSION_BIND_VERSION + 1),
+        (KIND_SESSION_BIND_ACK, SESSION_BIND_VERSION),
+        (KIND_SESSION_BIND + 0x10, SESSION_BIND_VERSION),
+    ] {
+        let (_client, conn, _control) = negotiated(
+            &f,
+            &f.ids[1],
+            ALPN_API,
+            &mut acceptor,
+            PeerRole::Frontend,
+            &[],
+        )
+        .await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&encode_frame(kind, version, &[0x02, 0xaa, 0xbb]).unwrap())
+            .await
+            .unwrap();
+        send.finish().unwrap();
+        loop {
+            match event(&mut acceptor).await {
+                TransportEvent::ApiRequest { .. } => {
+                    panic!("{kind:#06x} v{version} was dispatched as a request")
+                }
+                TransportEvent::Closed { reason, .. } => {
+                    assert!(
+                        matches!(reason, CloseReason::Malformed(_)),
+                        "{kind:#06x} v{version}: {reason:?}"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_close_pipelined_behind_the_hello_is_not_lost() {
     // One QUIC read can carry the hello and the close that follows it.
     // The reader holding those extra bytes lives with the control stream,
@@ -1296,4 +1376,142 @@ async fn a_client_certificate_outside_the_trust_anchors_is_refused_on_both_plane
             "an untrusted certificate negotiated: {reason:?}"
         );
     }
+}
+
+/// A watch is not a request with a long answer: the caller opens one
+/// stream and the frontend writes events, progress and finally a close
+/// onto it over the life of the subscription. A responder that could only
+/// write once and finish could not serve that shape at all.
+///
+/// Each frame is still admitted under both budgets. What differs from a
+/// unary reply is only how long the admitted bytes are held: a
+/// subscription outlives any one frame, so holding each frame's budget
+/// until the stream ends would let one slow consumer take the lane's
+/// whole allowance and never give it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_stream_carries_many_frames_and_ends_when_the_frontend_says_so() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    let client = raw_client(&f, &f.ids[1], ALPN_API);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut control, _control_recv) = conn.open_bi().await.unwrap();
+    control
+        .write_all(&hello_with(
+            PeerRole::Frontend,
+            CLUSTER,
+            None,
+            vec![Lane::Watch.capability()],
+        ))
+        .await
+        .unwrap();
+    match event(&mut acceptor).await {
+        TransportEvent::Connected { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&request_frame()).await.unwrap();
+    send.finish().unwrap();
+    let mut responder = match event(&mut acceptor).await {
+        TransportEvent::ApiRequest { responder, .. } => responder,
+        other => panic!("{other:?}"),
+    };
+
+    let mut expected = Vec::new();
+    for round in 0..4u8 {
+        let frame = evidence_frame(&vec![round; 1024]).unwrap();
+        expected.extend_from_slice(&frame);
+        responder.push(&frame).await.unwrap();
+    }
+    responder.finish().unwrap();
+
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Some(n) = recv.read(&mut buf).await.unwrap() {
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        got, expected,
+        "every frame arrived, in order, and the stream ended"
+    );
+    // Each pushed frame was charged on its way out, like any other
+    // traffic: the peak covers at least one whole frame.
+    let (_, peak) = acceptor.node_budget();
+    assert!(peak >= 1024, "watch frames were never charged: peak {peak}");
+}
+
+/// A connection the runtime above refuses stops being served.
+///
+/// The transport refuses what it can judge alone -- framing, negotiation,
+/// lane -- but whether a bound session may still send is not one of those
+/// things. Without this the daemon could only ignore such a caller's
+/// frames, which is not the same as closing: the same frame can be sent
+/// again on the next stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_runtime_can_close_a_connection_the_transport_would_have_allowed() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut acceptor = bind(&f, 0);
+    let client = raw_client(&f, &f.ids[1], ALPN_API);
+    let conn = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut control, _control_recv) = conn.open_bi().await.unwrap();
+    control
+        .write_all(&hello_with(
+            PeerRole::Frontend,
+            CLUSTER,
+            None,
+            vec![Lane::Unary.capability()],
+        ))
+        .await
+        .unwrap();
+    let connection = match event(&mut acceptor).await {
+        TransportEvent::Connected { connection, .. } => connection,
+        other => panic!("{other:?}"),
+    };
+
+    assert!(acceptor.disconnect(connection, CloseCode::Rejected, "not bound"));
+    // The close this endpoint took is distinguishable afterwards from one
+    // the peer took: it carries this side's own reason.
+    match event(&mut acceptor).await {
+        TransportEvent::Closed { reason, .. } => {
+            assert_eq!(reason, CloseReason::Rejected("not bound".into()));
+        }
+        other => panic!("{other:?}"),
+    }
+    // And the peer really is gone, not merely unsubscribed: the client
+    // itself observes the close, carrying the code this side sent.
+    //
+    // This waits for the close rather than probing with `open_bi`.
+    // Opening a stream is a local act -- QUIC hands out a stream id
+    // without a round trip -- so it can still succeed for as long as the
+    // CONNECTION_CLOSE is in flight, which made that check fail about
+    // one run in three.
+    let ended = timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .expect("the client observed the close within the bound");
+    assert!(
+        matches!(
+            ended,
+            quinn::ConnectionError::ApplicationClosed(ref c)
+                if c.error_code == quinn::VarInt::from_u32(CloseCode::Rejected as u32)
+        ),
+        "the client saw a different ending: {ended:?}"
+    );
+    for _ in 0..50 {
+        if acceptor.connections() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(acceptor.connections(), 0);
+
+    // A connection that is not open is reported as such rather than
+    // silently succeeding: the caller learns its close did nothing.
+    assert!(!acceptor.disconnect(connection, CloseCode::Rejected, "again"));
 }
