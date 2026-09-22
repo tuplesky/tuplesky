@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use coord_collector::{
     Action, Admission, AdmissionLimits, AdmissionRefusal, Caller, Collector, CollectorConfig,
     CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason, KIND_EVIDENCE, KIND_RELEASE,
-    OfferOutcome, Offered, Progress, SubmitRefusal, Submitted, admitted_from_submit, codes,
-    decode_evidence, decode_release, frontend_frame,
+    MonotonicMillis, OfferOutcome, Offered, Progress, SubmitRefusal, Submitted,
+    admitted_from_submit, codes, decode_evidence, decode_release, frontend_frame,
 };
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, FastAck, Follower, FollowerConfig,
@@ -576,7 +576,7 @@ impl World {
             self.deliver(item);
         }
         while self.execute_and_speculate() {}
-        let expired = self.frontend.expire(self.tick);
+        let expired = self.frontend.expire(MonotonicMillis::new(self.tick));
         for d in expired {
             self.deliveries.push((self.tick, d));
         }
@@ -618,9 +618,14 @@ impl World {
         let (command, request) = request(seq, op, deadline_ms);
         let frame = frame_of(&MessageV1::Request(request).encode().unwrap());
         let hub = self.hub();
-        let action = self
-            .frontend
-            .on_frame(self.tick, connection, &caller(), &frame, &hub);
+        let action = self.frontend.on_frame(
+            self.tick,
+            MonotonicMillis::new(self.tick),
+            connection,
+            &caller(),
+            &frame,
+            &hub,
+        );
         if let Action::FanOut(fan_out) = &action {
             assert_eq!(fan_out.command, command);
             let mut outcomes = Vec::new();
@@ -640,7 +645,8 @@ impl World {
             // is a collector that believes nothing was ever delivered,
             // which is exactly what it should believe.
             let report = Offered { command, outcomes };
-            self.frontend.offered(self.tick, &report);
+            self.frontend
+                .offered(MonotonicMillis::new(self.tick), &report);
         }
         (command, action)
     }
@@ -655,10 +661,14 @@ impl World {
             .unwrap(),
         );
         let hub = self.hub();
-        match self
-            .frontend
-            .on_frame(self.tick, connection, &caller(), &frame, &hub)
-        {
+        match self.frontend.on_frame(
+            self.tick,
+            MonotonicMillis::new(self.tick),
+            connection,
+            &caller(),
+            &frame,
+            &hub,
+        ) {
             Action::Respond(d) => response_of(&d),
             other => panic!("resolve produced {other:?}"),
         }
@@ -920,7 +930,7 @@ fn voter_identities_are_counted_rather_than_connections() {
         ),
         frame: MessageV1::Request(req).encode().unwrap(),
     };
-    let Submitted::FanOut(fan_out) = c.submit(0, &admitted).unwrap() else {
+    let Submitted::FanOut(fan_out) = c.submit(MonotonicMillis::ZERO, &admitted).unwrap() else {
         panic!()
     };
     assert_eq!(
@@ -997,7 +1007,7 @@ fn voter_identities_are_counted_rather_than_connections() {
         receipt: admitted.receipt.clone(),
         frame: MessageV1::Request(req).encode().unwrap(),
     };
-    c.submit(0, &admitted).unwrap();
+    c.submit(MonotonicMillis::ZERO, &admitted).unwrap();
     let reply = ProtocolMessage::LeaderReply {
         ballot: ballot(),
         command,
@@ -1167,15 +1177,15 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
             .unwrap(),
     };
     assert!(matches!(
-        c.submit(0, &admitted(1)),
+        c.submit(MonotonicMillis::ZERO, &admitted(1)),
         Ok(Submitted::FanOut(_))
     ));
     assert_eq!(
-        c.submit(0, &admitted(2)),
+        c.submit(MonotonicMillis::ZERO, &admitted(2)),
         Err(SubmitRefusal::Backpressure { pending: 1 })
     );
     assert!(matches!(
-        c.submit(0, &admitted(1)),
+        c.submit(MonotonicMillis::ZERO, &admitted(1)),
         Ok(Submitted::Attached { .. })
     ));
 }
@@ -1198,14 +1208,18 @@ fn unary_and_finalized_watch_dispatch() {
         .encode()
         .unwrap(),
     );
-    let registration = match w.frontend.on_frame(0, 5, &caller(), &open, &hub) {
-        Action::WatchOpened {
-            connection: 5,
-            watch_id: 9,
-            registration,
-        } => registration,
-        other => panic!("{other:?}"),
-    };
+    let registration =
+        match w
+            .frontend
+            .on_frame(0, MonotonicMillis::ZERO, 5, &caller(), &open, &hub)
+        {
+            Action::WatchOpened {
+                connection: 5,
+                watch_id: 9,
+                registration,
+            } => registration,
+            other => panic!("{other:?}"),
+        };
     if let Some((from, through)) = registration.replay {
         let gated = w.nodes[1].applier.store().reader().snapshot().unwrap();
         replay_from_view(&hub, gated.view(), registration.id, NS, from, through).unwrap();
@@ -1270,7 +1284,14 @@ fn unary_and_finalized_watch_dispatch() {
         .encode()
         .unwrap(),
     );
-    match w.frontend.on_frame(w.tick, 5, &caller(), &close, &hub) {
+    match w.frontend.on_frame(
+        w.tick,
+        MonotonicMillis::new(w.tick),
+        5,
+        &caller(),
+        &close,
+        &hub,
+    ) {
         Action::Respond(d) => assert!(matches!(
             decode_stream(&d.frame).unwrap().as_slice(),
             [MessageV1::WatchClose(c)] if c.watch_id == 9
@@ -1298,7 +1319,14 @@ fn unary_and_finalized_watch_dispatch() {
             .unwrap(),
     );
     assert!(matches!(
-        w.frontend.on_frame(w.tick, 1, &caller(), &hello, &hub),
+        w.frontend.on_frame(
+            w.tick,
+            MonotonicMillis::new(w.tick),
+            1,
+            &caller(),
+            &hello,
+            &hub
+        ),
         Action::Violation { connection: 1, .. }
     ));
     let voter = Caller {
@@ -1310,7 +1338,10 @@ fn unary_and_finalized_watch_dispatch() {
             .encode()
             .unwrap(),
     );
-    match w.frontend.on_frame(w.tick, 1, &voter, &req, &hub) {
+    match w
+        .frontend
+        .on_frame(w.tick, MonotonicMillis::new(w.tick), 1, &voter, &req, &hub)
+    {
         Action::Respond(d) => assert_eq!(err_code(&response_of(&d)), codes::NOT_ADMITTED),
         other => panic!("{other:?}"),
     }
@@ -1322,7 +1353,7 @@ fn unary_and_finalized_watch_dispatch() {
     let Submitted::FanOut(fan_out) = w
         .frontend
         .collector_mut()
-        .submit(0, &admitted.request)
+        .submit(MonotonicMillis::ZERO, &admitted.request)
         .unwrap()
     else {
         panic!()

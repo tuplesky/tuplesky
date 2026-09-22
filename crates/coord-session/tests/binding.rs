@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 
 use coord_authn::ClockHealth;
 use coord_collector::{
-    Action, Admission, AdmissionLimits, Collector, CollectorConfig, Delivery, Dispatcher, codes,
+    Action, Admission, AdmissionLimits, Collector, CollectorConfig, Delivery, Dispatcher,
+    MonotonicMillis, codes,
 };
 use coord_consensus::{BallotConfiguration, FastAck, ProtocolMessage};
 use coord_core::capability::{EstablishedResult, EstablishmentEvidence, ReleasedResult};
@@ -58,6 +59,13 @@ fn hex(b: &[u8]) -> String {
 
 fn clock(now: u64) -> ClockHealth {
     ClockHealth::healthy(now, 5)
+}
+
+/// The monotonic reading that goes with `clock(now)`: the same seconds
+/// counted from `NOW`, in milliseconds, so a test that moves the wall
+/// clock moves local time with it unless it says otherwise.
+fn at(now: u64) -> MonotonicMillis {
+    MonotonicMillis::new(now.saturating_sub(NOW) * 1_000)
 }
 
 fn frame_of(bytes: &[u8]) -> Frame {
@@ -344,57 +352,86 @@ fn an_expired_warm_connection_cannot_admit_and_a_rebind_keeps_the_identity() {
     let (_, req) = request(1, put(b"a", false));
     // Nothing before a binding.
     assert_eq!(
-        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::NotBound
     );
     // A binding admits.
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
-    let Ingress::Bound(ack) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+    let Ingress::Bound(ack) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
         panic!()
     };
     let ack = coord_session::decode_bind_ack(&frame_of(&ack)).unwrap();
     assert_eq!(ack.session, SESSION);
     assert_eq!(ack.expires_at, NOW + 100);
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     // Validity ends conservatively: nothing is admitted, and the tick
     // names the connection to close.
     let (_, req2) = request(2, put(b"b", false));
     assert_eq!(
-        f.on_frame(&clock(NOW + 96), 1, &req2, &hub, &domain.policy()),
+        f.on_frame(
+            &clock(NOW + 96),
+            at(NOW + 96),
+            1,
+            &req2,
+            &hub,
+            &domain.policy()
+        ),
         Ingress::Expired
     );
-    assert_eq!(f.tick(&clock(NOW + 96)).0, vec![1]);
+    assert_eq!(f.tick(&clock(NOW + 96), at(NOW + 96)).0, vec![1]);
     // A rebind for the same session refreshes validity; another session
     // is refused and the binding stays.
     let other = frame_of(&bind_frame(&token(&ring, SessionId([8; 16]), NOW + 1000)).unwrap());
     assert_eq!(
-        f.on_frame(&clock(NOW + 96), 1, &other, &hub, &domain.policy()),
+        f.on_frame(
+            &clock(NOW + 96),
+            at(NOW + 96),
+            1,
+            &other,
+            &hub,
+            &domain.policy()
+        ),
         Ingress::Rejected(BindError::SessionMismatch { bound: SESSION })
     );
     let again = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW + 96), 1, &again, &hub, &domain.policy()),
+        f.on_frame(
+            &clock(NOW + 96),
+            at(NOW + 96),
+            1,
+            &again,
+            &hub,
+            &domain.policy()
+        ),
         Ingress::Bound(_)
     ));
     assert_eq!(f.binding(1).unwrap().rebinds, 1);
     assert!(matches!(
-        f.on_frame(&clock(NOW + 96), 1, &req2, &hub, &domain.policy()),
+        f.on_frame(
+            &clock(NOW + 96),
+            at(NOW + 96),
+            1,
+            &req2,
+            &hub,
+            &domain.policy()
+        ),
         Ingress::Action(Action::FanOut(_))
     ));
     // Expired, wrong-audience and foreign-key tokens never bind; an
     // unhealthy clock cannot establish validity.
     let expired = frame_of(&bind_frame(&token(&ring, SESSION, NOW - 1)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 2, &expired, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 2, &expired, &hub, &domain.policy()),
         Ingress::Rejected(BindError::Token(TokenError::Time(_)))
     ));
     let foreign = ring_other();
     let stranger = frame_of(&bind_frame(&token(&foreign, SESSION, NOW + 100)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 2, &stranger, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 2, &stranger, &hub, &domain.policy()),
         Ingress::Rejected(BindError::Token(TokenError::UnknownKey))
     ));
     let sick = ClockHealth {
@@ -403,7 +440,7 @@ fn an_expired_warm_connection_cannot_admit_and_a_rebind_keeps_the_identity() {
         healthy: false,
     };
     assert!(matches!(
-        f.on_frame(&sick, 2, &bind, &hub, &domain.policy()),
+        f.on_frame(&sick, at(NOW), 2, &bind, &hub, &domain.policy()),
         Ingress::Rejected(BindError::Token(TokenError::Time(_)))
     ));
     assert!(f.binding(2).is_none());
@@ -418,7 +455,14 @@ fn an_expired_warm_connection_cannot_admit_and_a_rebind_keeps_the_identity() {
             .encode()
             .unwrap(),
     );
-    match f.on_frame(&clock(NOW + 96), 1, &req3, &hub, &domain.policy()) {
+    match f.on_frame(
+        &clock(NOW + 96),
+        at(NOW + 96),
+        1,
+        &req3,
+        &hub,
+        &domain.policy(),
+    ) {
         Ingress::Action(Action::Respond(d)) => assert!(is_denied(&d)),
         other => panic!("{other:?}"),
     }
@@ -437,14 +481,14 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
     let mut f = frontend(&ring);
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy()),
         Ingress::Bound(_)
     ));
     // A read is admitted; its result passes the barrier while policy
     // permits, with one fresh barrier per delivery.
     let (c1, req) = request(1, range(b"a"));
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     let d = f
@@ -552,7 +596,7 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
         .encode()
         .unwrap(),
     );
-    match f.on_frame(&clock(NOW), 1, &resolve, &hub, &domain.policy()) {
+    match f.on_frame(&clock(NOW), at(NOW), 1, &resolve, &hub, &domain.policy()) {
         Ingress::Action(Action::Respond(d)) => {
             assert!(is_denied(&d), "revoked: cached data denied")
         }
@@ -563,7 +607,7 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
     // is gated by the request's key.
     let (c2, req2) = request(2, put(b"a", true));
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &req2, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &req2, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     let ack = f
@@ -598,7 +642,7 @@ fn watch_output_is_gated_per_selected_batch_and_progress_cannot_bypass_it() {
     let mut f = frontend(&ring);
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy()),
         Ingress::Bound(_)
     ));
     let open = frame_of(
@@ -614,7 +658,7 @@ fn watch_output_is_gated_per_selected_batch_and_progress_cannot_bypass_it() {
         .encode()
         .unwrap(),
     );
-    let registration = match f.on_frame(&clock(NOW), 1, &open, &hub, &domain.policy()) {
+    let registration = match f.on_frame(&clock(NOW), at(NOW), 1, &open, &hub, &domain.policy()) {
         Ingress::Action(Action::WatchOpened { registration, .. }) => registration,
         other => panic!("{other:?}"),
     };
@@ -684,7 +728,7 @@ fn watch_output_is_gated_per_selected_batch_and_progress_cannot_bypass_it() {
         .encode()
         .unwrap(),
     );
-    let registration = match f.on_frame(&clock(NOW), 1, &open2, &hub, &domain.policy()) {
+    let registration = match f.on_frame(&clock(NOW), at(NOW), 1, &open2, &hub, &domain.policy()) {
         Ingress::Action(Action::WatchOpened { registration, .. }) => registration,
         other => panic!("{other:?}"),
     };
@@ -701,11 +745,18 @@ fn watch_output_is_gated_per_selected_batch_and_progress_cannot_bypass_it() {
     let mut g = frontend(&ring);
     let short = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 10)).unwrap());
     assert!(matches!(
-        g.on_frame(&clock(NOW), 3, &short, &hub, &Domain::new().policy()),
+        g.on_frame(
+            &clock(NOW),
+            at(NOW),
+            3,
+            &short,
+            &hub,
+            &Domain::new().policy()
+        ),
         Ingress::Bound(_)
     ));
     let fresh = Domain::new();
-    let registration = match g.on_frame(&clock(NOW), 3, &open, &hub, &fresh.policy()) {
+    let registration = match g.on_frame(&clock(NOW), at(NOW), 3, &open, &hub, &fresh.policy()) {
         Ingress::Action(Action::WatchOpened { registration, .. }) => registration,
         other => panic!("{other:?}"),
     };
@@ -727,7 +778,7 @@ fn previously_authorized_in_flight_work_follows_documented_semantics() {
     let mut f = frontend(&ring);
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 50)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy()),
         Ingress::Bound(_)
     ));
     // Admitted before revocation: a write and a read.
@@ -735,7 +786,7 @@ fn previously_authorized_in_flight_work_follows_documented_semantics() {
     let (cr, read) = request(2, range(b"a"));
     for req in [&write, &read] {
         assert!(matches!(
-            f.on_frame(&clock(NOW), 1, req, &hub, &domain.policy()),
+            f.on_frame(&clock(NOW), at(NOW), 1, req, &hub, &domain.policy()),
             Ingress::Action(Action::FanOut(_))
         ));
     }
@@ -755,12 +806,19 @@ fn previously_authorized_in_flight_work_follows_documented_semantics() {
     assert!(is_denied(&data));
     // The binding's own expiry does not cancel admitted work: it stays
     // pending and resolvable under the session, only new work is refused.
-    let (deadline, _) = f.tick(&clock(NOW + 100));
+    let (deadline, _) = f.tick(&clock(NOW + 100), at(NOW + 100));
     assert_eq!(deadline, vec![1]);
     assert!(f.dispatcher().collector().is_pending(&cw));
     let (_, req3) = request(3, put(b"b", false));
     assert_eq!(
-        f.on_frame(&clock(NOW + 100), 1, &req3, &hub, &domain.policy()),
+        f.on_frame(
+            &clock(NOW + 100),
+            at(NOW + 100),
+            1,
+            &req3,
+            &hub,
+            &domain.policy()
+        ),
         Ingress::Expired
     );
     // A closed connection detaches its watches and requests; the
@@ -783,12 +841,12 @@ fn previously_authorized_in_flight_work_follows_documented_semantics() {
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
     let fresh = Domain::new();
     assert!(matches!(
-        g.on_frame(&clock(NOW), 2, &bind, &hub, &fresh.policy()),
+        g.on_frame(&clock(NOW), at(NOW), 2, &bind, &hub, &fresh.policy()),
         Ingress::Bound(_)
     ));
     let (c4, read) = request(4, range(b"a"));
     assert!(matches!(
-        g.on_frame(&clock(NOW), 2, &read, &hub, &fresh.policy()),
+        g.on_frame(&clock(NOW), at(NOW), 2, &read, &hub, &fresh.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     assert!(is_denied(
@@ -836,13 +894,14 @@ fn a_rejected_conflicting_request_never_replaces_the_accepted_metadata() {
     let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
     let mut f = frontend(&ring);
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
-    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
         panic!()
     };
     // The accepted request reads the protected namespace.
     let (command, req) = request(1, range(b"secret"));
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     // A conflicting payload under the same retry key, naming another
@@ -855,7 +914,14 @@ fn a_rejected_conflicting_request_never_replaces_the_accepted_metadata() {
             .encode()
             .unwrap(),
     );
-    match f.on_frame(&clock(NOW), 1, &conflicting, &hub, &domain.policy()) {
+    match f.on_frame(
+        &clock(NOW),
+        at(NOW),
+        1,
+        &conflicting,
+        &hub,
+        &domain.policy(),
+    ) {
         Ingress::Action(Action::Respond(d)) => assert!(
             matches!(outcome_of(&d), OutcomeV1::Err { code, .. }
                 if code == codes::REQUEST_IDENTITY_CONFLICT),
@@ -892,12 +958,13 @@ fn read_output_that_names_no_key_is_still_reauthorized() {
     let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
     let mut f = frontend(&ring);
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 100)).unwrap());
-    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
         panic!()
     };
     let (command, req) = request(1, range(b"secret"));
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     let empty = Outcome::Range {
@@ -919,7 +986,7 @@ fn read_output_that_names_no_key_is_still_reauthorized() {
     // A pure mutation acknowledgement still needs no barrier.
     let (put_command, put_req) = request(2, put(b"a", false));
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &put_req, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &put_req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     let ack = f
@@ -943,12 +1010,13 @@ fn a_token_without_the_read_bit_receives_no_read_output() {
     let write_only = PolicyAction::Write.bit() | PolicyAction::Delete.bit();
     let bind =
         frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 100, write_only, 1)).unwrap());
-    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
         panic!()
     };
     let (command, req) = request(1, range(b"secret"));
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
     let gated = f
@@ -976,7 +1044,8 @@ fn a_rebind_refreshes_validity_and_never_the_authorization_context() {
     let mut f = frontend(&ring);
     let narrow = PolicyAction::Read.bit();
     let bind = frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 100, narrow, 1)).unwrap());
-    let Ingress::Bound(_) = f.on_frame(&clock(NOW), 1, &bind, &hub, &domain.policy()) else {
+    let Ingress::Bound(_) = f.on_frame(&clock(NOW), at(NOW), 1, &bind, &hub, &domain.policy())
+    else {
         panic!()
     };
     // The same session with a wider scope is refused.
@@ -992,7 +1061,7 @@ fn a_rebind_refreshes_validity_and_never_the_authorization_context() {
     );
     assert!(
         matches!(
-            f.on_frame(&clock(NOW), 1, &wider, &hub, &domain.policy()),
+            f.on_frame(&clock(NOW), at(NOW), 1, &wider, &hub, &domain.policy()),
             Ingress::Rejected(_)
         ),
         "a rebind may not widen the scope"
@@ -1001,13 +1070,22 @@ fn a_rebind_refreshes_validity_and_never_the_authorization_context() {
     let regenerated =
         frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 200, narrow, 2)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 1, &regenerated, &hub, &domain.policy()),
+        f.on_frame(
+            &clock(NOW),
+            at(NOW),
+            1,
+            &regenerated,
+            &hub,
+            &domain.policy()
+        ),
         Ingress::Rejected(_)
     ));
     // The same claims with a later expiry refresh validity.
     let refreshed =
         frame_of(&bind_frame(&token_with(&ring, SESSION, NOW + 200, narrow, 1)).unwrap());
-    let Ingress::Bound(ack) = f.on_frame(&clock(NOW), 1, &refreshed, &hub, &domain.policy()) else {
+    let Ingress::Bound(ack) =
+        f.on_frame(&clock(NOW), at(NOW), 1, &refreshed, &hub, &domain.policy())
+    else {
         panic!("a pure refresh is accepted")
     };
     let ack = coord_session::decode_bind_ack(&frame_of(&ack)).unwrap();
@@ -1065,7 +1143,7 @@ fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
     let credential = token(&ring, SESSION, NOW + 1000);
     let bind = frame_of(&bind_frame(&credential).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 7, &bind, &hub, &Behind),
+        f.on_frame(&clock(NOW), at(NOW), 7, &bind, &hub, &Behind),
         Ingress::Establishing(_)
     ));
     let key = coord_session::verify_bind(&config(&ring), &credential, &clock(NOW), None)
@@ -1080,7 +1158,7 @@ fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
     ));
     assert!(f.binding(7).is_some(), "the establishment did not bind");
     assert!(matches!(
-        f.on_frame(&clock(NOW), 7, &read, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 7, &read, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
 
@@ -1133,12 +1211,12 @@ fn a_session_the_bind_barrier_showed_and_then_retired_is_refused_not_held() {
     // The row is present when the connection binds.
     let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 7, &bind, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 7, &bind, &hub, &domain.policy()),
         Ingress::Bound(_)
     ));
     let (command, read) = request(1, range(b"a"));
     assert!(matches!(
-        f.on_frame(&clock(NOW), 7, &read, &hub, &domain.policy()),
+        f.on_frame(&clock(NOW), at(NOW), 7, &read, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
 

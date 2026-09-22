@@ -2744,6 +2744,53 @@ after the change read 173/129/123 against a single run before it of
 a measurement. It is not one. The 202 was simply a fast run, and three
 trials show the distributions sitting on top of each other.
 
+### Two clocks were one parameter, and a deadline was in seconds
+
+**Where:** `coord-collector` (`clock.rs`, `collector.rs`, `dispatch.rs`),
+`coord-session/frontend.rs`, `bins/coordd/src/serve.rs`,
+[task-c03](design/tuplesky-prs-plan.md#task-c03).
+
+**Expected:** a request's `deadline_ms` is milliseconds, and a nominal
+1,500 ms deadline expires 1,500 ms after the request was presented.
+
+**Actually:** the dispatcher took one `now_ticks: u64` and handed it to
+two things that wanted different clocks. The admission gate stamps a
+receipt with it, and that is `ClockHealth::now` -- Unix seconds, with
+an uncertainty beside it, the clock a token's `exp`, `nbf` and `iat`
+are judged against. The collector added `deadline_ms` to the same
+number, so a 1,500 ms deadline was 1,500 seconds, and a subsecond one
+was a whole second or nothing. Inert in the daemon, because `expire()`
+was never called there; live in every test that expressed a deadline
+in ticks and happened to count ticks in whatever unit made it pass.
+
+**What it is now.** Two inputs at the boundary, distinct at the
+signature. `ClockHealth` is untouched: it authenticates, and its units
+are load-bearing there. Beside it, `MonotonicMillis` -- a reading of a
+monotonic clock in milliseconds since an origin the caller chose -- is
+what a request's deadline and a destination's repeat schedule are
+measured on. The collector holds no clock of its own; coordd reads its
+loop's `Instant` and passes the value in, which is the same reading
+task-c01 already used for re-offers, now under a type rather than as a
+bare `u64` beside the other bare `u64`. Submission, retry attachment,
+expiry and the repeat schedule share that one time base, so a step in
+the wall clock -- a correction, a leap, an operator's mistake -- moves
+nothing the collector is waiting on, in either direction.
+
+`coord-collector/tests/deadline.rs` holds the cases: 1,500 ms not
+expired at 1,499 and expired at 1,500; measured from the presentation,
+not the origin; 250 ms at 250 ms; zero never; a retry restarts it; a
+day's wall-clock jump with ten milliseconds of local time expires
+nothing, and local time passing with the wall clock standing still
+expires exactly what is due; repeats and deadlines compared against
+the one reading. Expiration reports and retains, as before: a caller's
+deadline is not the lifetime of accepted work.
+
+**Not done here, and said so.** `expire()` is still not called from the
+serving loop. Wiring it -- a timeout response on the caller's stream,
+the stream's cleanup, the attached-request bookkeeping -- is a
+behaviour change of its own, with its own tests, and is a named
+follow-up rather than something a unit fix carries in by the way.
+
 ### What the benchmark harness had to get right to find these
 
 A closed-loop benchmark would not have found the fifth or the sixth. It sends the next

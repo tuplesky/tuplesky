@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 
 use coord_collector::{
     Collector, CollectorConfig, CollectorEvent, EvidenceError, HoldReason, KIND_EVIDENCE,
-    KIND_RELEASE, Progress, Release, SettleError, Submitted, decode_evidence, decode_release,
+    KIND_RELEASE, MonotonicMillis, Progress, Release, SettleError, Submitted, decode_evidence,
+    decode_release,
 };
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
@@ -370,7 +371,7 @@ impl Cluster {
     fn submit(&mut self, sequence: u64) -> Vec<u8> {
         match self
             .collector
-            .submit(0, &admitted(sequence))
+            .submit(MonotonicMillis::ZERO, &admitted(sequence))
             .expect("submitted")
         {
             Submitted::FanOut(fan_out) => {

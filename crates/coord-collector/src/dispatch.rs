@@ -29,6 +29,7 @@ use coord_types::wire_v1::{
 use coord_types::{CommandId, RetryKey};
 
 use crate::admission::{Admission, AdmissionRefusal, Caller};
+use crate::clock::MonotonicMillis;
 use crate::codes;
 use crate::collector::{
     Collector, EvidenceError, Progress, Release, Resolution, SubmitRefusal, Submitted,
@@ -131,12 +132,12 @@ impl Dispatcher {
     /// that asked for it.
     pub fn establish(
         &mut self,
-        now_ticks: u64,
+        now: MonotonicMillis,
         connection: u64,
         admitted: &coord_core::event::AdmittedRequest,
         retry_key: RetryKey,
     ) -> Result<Action, SubmitRefusal> {
-        match self.collector.submit(now_ticks, admitted)? {
+        match self.collector.submit(now, admitted)? {
             Submitted::FanOut(fan_out) => {
                 self.attach(connection, retry_key);
                 Ok(Action::FanOut(fan_out))
@@ -154,9 +155,15 @@ impl Dispatcher {
     }
 
     /// Dispatch one frame of `connection` from `caller`.
+    ///
+    /// Two readings of time, for two different questions. `now_ticks`
+    /// is the authentication wall clock the admission gate stamps the
+    /// receipt with; `now` is the monotonic reading the request's
+    /// deadline is measured from. Neither stands in for the other.
     pub fn on_frame(
         &mut self,
         now_ticks: u64,
+        now: MonotonicMillis,
         connection: u64,
         caller: &Caller,
         frame: &Frame,
@@ -193,7 +200,7 @@ impl Dispatcher {
                     }
                 };
                 let reserved = admitted.reserved;
-                match self.collector.submit(now_ticks, &admitted.request) {
+                match self.collector.submit(now, &admitted.request) {
                     Ok(Submitted::FanOut(fan_out)) => {
                         self.attach(connection, key);
                         Action::FanOut(fan_out)
@@ -420,18 +427,22 @@ impl Dispatcher {
     ///
     /// Delivery only: nothing here answers a caller, and nothing here
     /// can fail a command.
-    pub fn offered(&mut self, now_millis: u64, report: &crate::collector::Offered) {
-        self.collector.offered(now_millis, report);
+    pub fn offered(&mut self, now: MonotonicMillis, report: &crate::collector::Offered) {
+        self.collector.offered(now, report);
     }
 
     /// The re-offers that are due, bounded by `budget` destinations.
-    pub fn due_offers(&mut self, now_millis: u64, budget: usize) -> Vec<crate::collector::FanOut> {
-        self.collector.due_offers(now_millis, budget)
+    pub fn due_offers(
+        &mut self,
+        now: MonotonicMillis,
+        budget: usize,
+    ) -> Vec<crate::collector::FanOut> {
+        self.collector.due_offers(now, budget)
     }
 
     /// When the next re-offer falls due, on the clock `due_offers` is
     /// given; see [`crate::Collector::next_due`].
-    pub fn next_due(&self) -> Option<u64> {
+    pub fn next_due(&self) -> Option<MonotonicMillis> {
         self.collector.next_due()
     }
 
@@ -502,9 +513,9 @@ impl Dispatcher {
     /// Client deadlines that passed: the attached callers hear that the
     /// outcome is pending (never failed) and resolvable by identity; the
     /// commands keep collecting.
-    pub fn expire(&mut self, now_ticks: u64) -> Vec<Delivery> {
+    pub fn expire(&mut self, now: MonotonicMillis) -> Vec<Delivery> {
         let mut out = Vec::new();
-        for expired in self.collector.expire(now_ticks) {
+        for expired in self.collector.expire(now) {
             if let Some(connection) = self.owner.remove(&expired.retry_key) {
                 if let Some(set) = self.by_connection.get_mut(&connection) {
                     set.remove(&expired.retry_key);

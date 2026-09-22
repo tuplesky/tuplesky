@@ -22,7 +22,9 @@ use coord_collector::ingress::is_collector;
 use coord_collector::wire::{
     KIND_EVIDENCE, KIND_RELEASE, KIND_SUBMIT, decode_evidence, decode_release,
 };
-use coord_collector::{Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher};
+use coord_collector::{
+    Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher, MonotonicMillis,
+};
 use coord_core::event::PeerProvenance;
 use coord_daemon::mailbox::LocalRoute;
 use coord_daemon::metrics::Stage;
@@ -894,7 +896,7 @@ impl Deadline for Reoffers<'_> {
     fn next_deadline(&self) -> Option<std::time::Instant> {
         self.dispatcher
             .next_due()
-            .map(|at| self.started + std::time::Duration::from_millis(at))
+            .map(|at| self.started + std::time::Duration::from_millis(at.get()))
     }
 }
 
@@ -1758,9 +1760,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
-    /// Monotonic milliseconds since this domain's loop started.
-    fn now_millis(&self) -> u64 {
-        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    /// Monotonic milliseconds since this domain's loop started: the
+    /// reading a request's deadline and a destination's repeat schedule
+    /// are measured on. Not the wall clock the caller's token is judged
+    /// by, and never stands in for it.
+    fn now_millis(&self) -> MonotonicMillis {
+        MonotonicMillis::new(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Record one offer's outcome with the collector, and count it.
@@ -2183,8 +2188,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // verified and admitted, answered, or refused at the door.
                 self.recorder.entered(Stage::Admission);
                 let started = std::time::Instant::now();
+                let now = self.now_millis();
                 let ingress = self.frontend.frontend.on_frame(
                     &health,
+                    now,
                     connection.0,
                     &frame,
                     self.backing.applier().hub(),
