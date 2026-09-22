@@ -309,6 +309,11 @@ impl BoundFrontend {
         };
         match barrier.session_record() {
             Some(record) if binding.agrees_with(record) => {
+                // This barrier showed the row, so the disclosure gate
+                // must not read its later absence as "not yet": a
+                // session retired before the connection's first gated
+                // read is refused, not held for ever.
+                self.seen.insert(connection);
                 self.bindings.insert(connection, binding);
                 Ingress::Bound(ack)
             }
@@ -398,7 +403,14 @@ impl BoundFrontend {
             // exists is the session this credential describes, which
             // current replicated state answers and this node does not.
             Some(Outcome::ErrReceiptConsumed) => {
-                self.barrier_agrees(policy, &binding).unwrap_or(false)
+                let agrees = self.barrier_agrees(policy, &binding).unwrap_or(false);
+                // That barrier showed the row; the outcome above did
+                // not, since this node may not have projected the
+                // command it answers yet.
+                if agrees {
+                    self.seen.insert(connection);
+                }
+                agrees
             }
             _ => false,
         };

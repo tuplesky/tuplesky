@@ -190,6 +190,16 @@ fn token(ring: &KeyRing, session: SessionId, exp: u64) -> Vec<u8> {
     ring.sign(&claims).unwrap().into_bytes()
 }
 
+fn config(ring: &KeyRing) -> BindingConfig {
+    BindingConfig {
+        issuer: ISSUER.into(),
+        resource: RESOURCE.into(),
+        jwks: ring.jwks(),
+        cluster: CLUSTER,
+        domain: DOMAIN,
+    }
+}
+
 fn frontend(ring: &KeyRing) -> BoundFrontend {
     let fast: BTreeSet<ReplicaId> = (0..2).map(r).collect();
     let quorum = BallotConfiguration::c2(
@@ -212,18 +222,7 @@ fn frontend(ring: &KeyRing) -> BoundFrontend {
         }),
         16,
     );
-    BoundFrontend::new(
-        dispatcher,
-        BindingConfig {
-            issuer: ISSUER.into(),
-            resource: RESOURCE.into(),
-            jwks: ring.jwks(),
-            cluster: CLUSTER,
-            domain: DOMAIN,
-        },
-        4,
-        64,
-    )
+    BoundFrontend::new(dispatcher, config(ring), 4, 64)
 }
 
 fn retry_key(seq: u64) -> RetryKey {
@@ -1059,12 +1058,26 @@ fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
     let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
     let domain = Domain::new();
     let mut f = frontend(&ring);
-    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
+    // No barrier on this node has shown the row: the binding is
+    // established from the session-creation command's outcome, which
+    // is the one way a binding exists before the projection has it.
+    let credential = token(&ring, SESSION, NOW + 1000);
+    let bind = frame_of(&bind_frame(&credential).unwrap());
     assert!(matches!(
-        f.on_frame(&clock(NOW), 7, &bind, &hub, &domain.policy()),
-        Ingress::Bound(_)
+        f.on_frame(&clock(NOW), 7, &bind, &hub, &Behind),
+        Ingress::Establishing(_)
     ));
+    let key = coord_session::verify_bind(&config(&ring), &credential, &clock(NOW), None)
+        .unwrap()
+        .establishment_key(&config(&ring));
     let (command, read) = request(1, range(b"a"));
+    let mut created = delivery(7, 1, command, Outcome::SessionCreated { session: SESSION });
+    created.retry_key = key;
+    assert!(matches!(
+        f.deliver(created, &Behind),
+        coord_session::Delivered::Answer(_)
+    ));
+    assert!(f.binding(7).is_some(), "the establishment did not bind");
     assert!(matches!(
         f.on_frame(&clock(NOW), 7, &read, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
@@ -1103,5 +1116,42 @@ fn a_projection_that_is_behind_holds_a_disclosure_instead_of_refusing_it() {
         "a session this node had seen and no longer finds was not refused"
     );
     assert_eq!(f.deferred, 1);
+    assert_eq!(f.denied, 1);
+}
+
+/// The bind barrier counts as having seen the row. A connection that
+/// bound against a present session and read nothing before that session
+/// was retired gets the real refusal on its first gated read, not a
+/// "not yet" that would hold every retry for ever.
+#[test]
+fn a_session_the_bind_barrier_showed_and_then_retired_is_refused_not_held() {
+    let ring = ring();
+    let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+    let domain = Domain::new();
+    let mut f = frontend(&ring);
+    // The row is present when the connection binds.
+    let bind = frame_of(&bind_frame(&token(&ring, SESSION, NOW + 1000)).unwrap());
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 7, &bind, &hub, &domain.policy()),
+        Ingress::Bound(_)
+    ));
+    let (command, read) = request(1, range(b"a"));
+    assert!(matches!(
+        f.on_frame(&clock(NOW), 7, &read, &hub, &domain.policy()),
+        Ingress::Action(Action::FanOut(_))
+    ));
+
+    // By the time the answer comes back the row is gone. This node had
+    // shown it at the bind, so its absence is an answer, not a lag.
+    let refused = f
+        .deliver(delivery(7, 1, command, range_outcome(b"a")), &Behind)
+        .answered();
+    assert!(
+        is_denied(&refused),
+        "a session the bind barrier showed and no longer finds was held instead of refused: {:?}",
+        outcome_of(&refused)
+    );
+    assert!(!is_pending(&refused));
+    assert_eq!(f.deferred, 0);
     assert_eq!(f.denied, 1);
 }

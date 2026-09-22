@@ -10,7 +10,7 @@
 # script exists rather than a list of commands in a document.
 #
 # Rows:
-#   cold          a fresh domain, no warm-up
+#   cold          a fresh domain for every rate, no warm-up
 #   warm          the standing domain after a warm-up pass
 #   hot-writers   conditional writes onto four keys
 #   transactions  multi-key transactions only
@@ -96,17 +96,23 @@ note() { printf '%s\n' "$*" >&2; }
 # row | rate | report-or-empty | reason-or-empty
 record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$OUT_DIR/.rows"; }
 
+# skip_row ROW REASON [RATE]
 skip_row() {
-  note "wan-matrix.sh: $1 not run -- $2"
-  record "$1" "" "" "$2"
+  note "wan-matrix.sh: $1${3:+ at ${3}ns} not run -- $2"
+  record "$1" "${3:-}" "" "$2"
 }
 
+# DOMAIN is the domain that is up; DOMAIN_DIR is the directory the last
+# attempt was made in, which is set before the attempt can fail so that
+# what it started can be found and stopped.
 DOMAIN=""
+DOMAIN_DIR=""
 HARNESS_PID=""
 
 domain_up() {
   local dir=$1
   rm -rf "$dir"; mkdir -p "$dir"
+  DOMAIN_DIR=$dir
   "$HARNESS" up --dir "$dir" --coordd "$COORDD" --voters "$VOTERS" --edge-port 0 \
     > "$dir/harness.log" 2>&1 &
   HARNESS_PID=$!
@@ -126,13 +132,34 @@ domain_up() {
 
 domain_down() {
   [ -n "$HARNESS_PID" ] && kill -TERM "$HARNESS_PID" 2>/dev/null
-  local p
-  for p in $(ps -eo pid,args | grep "[c]oordd" | grep -F "$DOMAIN" | awk '{print $1}'); do
-    kill -TERM "$p" 2>/dev/null
-  done
+  # Only the voters of this directory. An empty pattern would match
+  # every coordd on the host, and the host may not be ours alone.
+  if [ -n "$DOMAIN_DIR" ]; then
+    local p
+    for p in $(ps -eo pid,args | grep "[c]oordd" | grep -F -- "$DOMAIN_DIR" | awk '{print $1}'); do
+      kill -TERM "$p" 2>/dev/null
+    done
+  fi
   HARNESS_PID=""
   DOMAIN=""
+  DOMAIN_DIR=""
   sleep 1
+}
+
+# impose ROW RTT [BACK_RTT] [LOSS]: apply the impaired topology to the
+# standing domain and set IMPAIRMENT to what it reports. When it cannot
+# be applied the row is recorded as not run and IMPAIRMENT is left as
+# it was, so nothing is measured under a shape that is not there.
+impose() {
+  local row=$1; shift
+  local said
+  if said=$("$TOPOLOGY" apply "$DOMAIN" "$REGIONS" "$@"); then
+    IMPAIRMENT=$(printf '%s\n' "$said" | sed -n "s/^--impairment '\(.*\)'$/\1/p")
+    [ -n "$IMPAIRMENT" ] && return 0
+    IMPAIRMENT=$DECLARED
+  fi
+  skip_row "$row" "the topology could not be applied"
+  return 1
 }
 
 # offer ROW RATE WARMUP EXTRA...
@@ -185,15 +212,20 @@ impaired_available() {
 trap 'domain_down; [ -n "$REGIONS" ] && command -v tc >/dev/null 2>&1 && "$TOPOLOGY" restore >/dev/null 2>&1; exit 130' INT TERM
 
 # `cold` is the only row with its own domain, because a cold run means a
-# store nothing has touched.
+# store nothing has touched -- so it is one domain per rate, not one for
+# the row: the second rate against the first rate's domain would be
+# measuring a store the first had already written to.
 for row in $ROWS; do
   case "$row" in
     cold)
-      domain_up "$OUT_DIR/domain-cold" || { skip_row cold "the domain did not come up"; continue; }
       ROW_WARMUP=0
-      run_row cold
+      for rate in $RATES; do
+        domain_up "$OUT_DIR/domain-cold-$rate" \
+          || { skip_row cold "the domain did not come up" "$rate"; continue; }
+        offer cold "$rate" "$ROW_WARMUP"
+        domain_down
+      done
       ROW_WARMUP=$WARMUP
-      domain_down
       ;;
     warm|concurrency|hot-writers|transactions|scans|read-mostly)
       if [ -z "$DOMAIN" ]; then
@@ -220,23 +252,25 @@ for row in $ROWS; do
       reason=$(impaired_available) || { skip_row "$row" "$reason"; continue; }
       [ -n "$DOMAIN" ] || domain_up "$OUT_DIR/domain" || { skip_row "$row" "the domain did not come up"; continue; }
       case "$row" in
-        loss)       IMPAIRMENT=$("$TOPOLOGY" apply "$DOMAIN" "$REGIONS" "$RTT" "$RTT" "$LOSS" | sed -n "s/^--impairment '\(.*\)'$/\1/p")
-                    run_row loss
-                    "$TOPOLOGY" restore > /dev/null ;;
-        asymmetric) IMPAIRMENT=$("$TOPOLOGY" apply "$DOMAIN" "$REGIONS" "$RTT" "$BACK_RTT" | sed -n "s/^--impairment '\(.*\)'$/\1/p")
-                    run_row asymmetric
-                    "$TOPOLOGY" restore > /dev/null ;;
+        loss)       impose loss "$RTT" "$RTT" "$LOSS" && run_row loss ;;
+        asymmetric) impose asymmetric "$RTT" "$BACK_RTT" && run_row asymmetric ;;
         # A region is taken away while its voters keep running and keep
         # what they promised, so what this measures is a partition and a
         # rejoin. A `kill` would measure a restart, which is a different
         # question with a different answer.
-        region-loss) IMPAIRMENT=$("$TOPOLOGY" apply "$DOMAIN" "$REGIONS" "$RTT" | sed -n "s/^--impairment '\(.*\)'$/\1/p")
-                    first=${REGIONS%%|*}
-                    "$TOPOLOGY" isolate "$DOMAIN" "$first" > /dev/null
-                    IMPAIRMENT="$IMPAIRMENT; region $first unreachable and still running"
-                    run_row region-loss
-                    "$TOPOLOGY" restore > /dev/null ;;
+        region-loss) if impose region-loss "$RTT"; then
+                      first=${REGIONS%%|*}
+                      if "$TOPOLOGY" isolate "$DOMAIN" "$first" > /dev/null; then
+                        IMPAIRMENT="$IMPAIRMENT; region $first unreachable and still running"
+                        run_row region-loss
+                      else
+                        skip_row region-loss "region $first could not be taken away"
+                      fi
+                    fi ;;
       esac
+      # Restored whether or not the shape went on: an apply that failed
+      # part way through has left part of it on the device.
+      "$TOPOLOGY" restore > /dev/null
       IMPAIRMENT=$DECLARED
       ;;
     *)
@@ -276,8 +310,11 @@ lines = [
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
 ]
 for r in rows:
+    name = r["row"] if r["arrival_ns"] in (None, 0) else f"{r['row']} @{r['arrival_ns'] // 1000}us"
+    if r["arrival_ns"] == 0:
+        name += " (closed)"
     if "report" not in r:
-        lines.append(f"| {r['row']} | not run: {r['not_run']} | | | | | | | |")
+        lines.append(f"| {name} | not run: {r['not_run']} | | | | | | | |")
         continue
     run = json.load(open(os.path.join(os.path.dirname(sys.argv[2]), r["report"])))
     a = run["achieved"]
@@ -290,9 +327,6 @@ for r in rows:
     p50 = max((p["whole"]["p50_ns"] for p in run["paths"].values()), default=None)
     p99 = max((p["whole"]["p99_ns"] for p in run["paths"].values()), default=None)
     q99 = max((p["queue"]["p99_ns"] for p in run["paths"].values()), default=None)
-    name = r["row"] if r["arrival_ns"] in (None, 0) else f"{r['row']} @{r['arrival_ns'] // 1000}us"
-    if r["arrival_ns"] == 0:
-        name += " (closed)"
     lines.append(
         f"| {name} | {rate('offered_per_second')} | {rate('achieved_per_second')} | "
         f"{a['completed']} | {a['unknown']} | {a['refused']} | "
