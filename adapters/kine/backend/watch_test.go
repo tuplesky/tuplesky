@@ -3,6 +3,7 @@ package backend_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,12 +176,40 @@ func TestCompactionEndsCompactedWatchesExplicitly(t *testing.T) {
 	if !ok || !resp.Canceled || resp.Err() != rpctypes.ErrCompacted {
 		t.Fatalf("compacted start: ok=%v %+v err=%v", ok, resp, resp.Err())
 	}
+	// Read the cancelled watch to the end before opening another on the
+	// same client, so this test's substreams are torn down in a known
+	// order rather than racing the client's close.
+	drain(t, wch)
 	// A watch at the floor is fine.
 	fine := br.cli.Watch(ctx, key, clientv3.WithRev(4))
-	update(t, br.cli, key, "4", 4, 0) // 5
-	got := expectEvents(t, fine, 2)
+	got := func() []*clientv3.Event {
+		defer func() {
+			cancel()
+			drain(t, fine)
+		}()
+		update(t, br.cli, key, "4", 4, 0) // 5
+		return expectEvents(t, fine, 2)
+	}()
 	if got[0].Kv.ModRevision != 4 || got[1].Kv.ModRevision != 5 {
 		t.Fatalf("watch at floor %d %d", got[0].Kv.ModRevision, got[1].Kv.ModRevision)
+	}
+}
+
+// drain reads `wch` until the client closes it, so the substream is gone
+// before the test moves on. A watch left half-torn-down outlives the
+// test and races whatever closes the client.
+func drain(t *testing.T, wch clientv3.WatchChan) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case _, ok := <-wch:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("watch did not close")
+		}
 	}
 }
 
@@ -449,78 +478,97 @@ func TestSyncWaitTerminatesLaggardsAndCloseUnblocks(t *testing.T) {
 // key never moves while the domain's frontier advances to R, and the
 // terminated watch's teardown is deliberately delayed: neither the
 // bridge's per-watch progress timer nor its broadcast path may advertise
-// R to a watch that is still live and never delivered through it.
+// A watch that cannot synchronize must stay out of progress publication
+// until it is actually closed, not merely until its cancellation has
+// been requested. The domain publishes no processed marker, the watch's
+// key never moves while the domain's frontier advances to R, and the
+// terminated watch's teardown is deliberately delayed.
+//
+// The barrier is WaitForSyncTo, and it is asserted here directly rather
+// than through an etcd client watch. Both of the bridge's progress paths
+// -- ProgressIfSynced per watch and ProgressAll broadcast -- publish R
+// only once that call returns, so the contract this holds is the one
+// both of them rest on, and it is ours rather than the bridge's.
+//
+// Driving it through clientv3 instead is what the earlier version did,
+// and it made this test fail roughly one run in four: etcd client
+// v3.7.1 panics when a progress notify is dispatched to a watch the
+// server has cancelled. Its run loop closes the cancelled substream's
+// recvc and hands the substream to closingc, but the entry stays in
+// w.substreams until that handoff completes (watch.go:610-626,
+// 685-688), and broadcastResponse meanwhile sends to every entry in the
+// map (watch.go:738-747) -- a send on a closed channel, which no select
+// case can skip. v3.6.14 carries the identical code, so a downgrade is
+// not a fix. It is etcd-io/etcd#21969, whose PR #22191 is open and
+// unmerged. The bridge's progress path keeps its coverage in
+// TestProgressNeverOvertakesEvents, whose watch is never cancelled.
 func TestSynchronizationFailureWithholdsProgressUntilTheWatchIsActuallyClosed(t *testing.T) {
-	for _, broadcast := range []bool{false, true} {
-		name := "individual progress"
-		if broadcast {
-			name = "broadcast progress"
+	const (
+		syncTimeout   = 300 * time.Millisecond
+		teardownDelay = 1200 * time.Millisecond
+	)
+	br := startBridge(t, bridgeOptions{
+		syncTimeout:    syncTimeout,
+		teardownDelay:  teardownDelay,
+		notifyInterval: 150 * time.Millisecond,
+	})
+	// A source that never says it processed a revision: the watch's
+	// frontier can only move by delivering events.
+	br.domain.HoldProgress.Store(true)
+	ctx := ctxT(t)
+
+	res := br.backend.Watch(ctx, "/registry/w", "", 1)
+	if res.CompactRevision != 0 {
+		t.Fatalf("compacted start: %+v", res)
+	}
+	// Drain the watch so a delivery would be observed rather than parking
+	// the pump, which is what a real consumer does.
+	var delivered atomic.Int64
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for batch := range res.Events {
+			delivered.Add(int64(len(batch)))
 		}
-		t.Run(name, func(t *testing.T) {
-			br := startBridge(t, bridgeOptions{
-				syncTimeout:    300 * time.Millisecond,
-				teardownDelay:  1200 * time.Millisecond,
-				notifyInterval: 150 * time.Millisecond,
-			})
-			// A source that never says it processed a revision: the
-			// watch's frontier can only move by delivering events.
-			br.domain.HoldProgress.Store(true)
-			ctx := ctxT(t)
-			wch := br.cli.Watch(ctx, "/registry/w",
-				clientv3.WithRev(1),
-				clientv3.WithProgressNotify(),
-				clientv3.WithCreatedNotify())
-			if created, ok := <-wch; !ok || !created.Created {
-				t.Fatalf("watch not created: %+v", created)
-			}
-			// The domain advances outside this watch's key: R is the
-			// frontier and this watch has delivered nothing through it.
-			started := time.Now()
-			resp := create(t, br.cli, "/registry/elsewhere", "v", 0)
-			target := resp.Header.Revision
-			if target <= 0 {
-				t.Fatalf("revision %d", target)
-			}
-			if broadcast {
-				// The API server asks for a broadcast progress report
-				// while the caches are syncing; the bridge answers it
-				// only when every watch is synced.
-				stop := make(chan struct{})
-				defer close(stop)
-				go func() {
-					for {
-						select {
-						case <-stop:
-							return
-						case <-time.After(50 * time.Millisecond):
-							_ = br.cli.RequestProgress(ctx)
-						}
-					}
-				}()
-			}
-			// The watch is terminated once it cannot synchronize; the
-			// stream ends with it. Nothing on it may advertise the
-			// frontier this watch never delivered through.
-			for answer := range wch {
-				if answer.Canceled {
-					continue
-				}
-				if len(answer.Events) > 0 {
-					t.Fatalf("events on a watch whose key never moved: %+v", answer.Events)
-				}
-				if answer.Header.Revision >= target {
-					t.Fatalf("progress advertised revision %d for a live watch that never delivered through %d",
-						answer.Header.Revision, target)
-				}
-			}
-			// The barrier is what held progress back: the wait could not
-			// return before the terminated watch's teardown finished.
-			if held := time.Since(started); held < 300*time.Millisecond+1200*time.Millisecond {
-				t.Fatalf("the watch ended after %v, before its teardown could finish", held)
-			}
-			if br.domain.Watchers() != 0 {
-				t.Fatal("the native watch outlived the terminated Kine watch")
-			}
-		})
+	}()
+
+	// The domain advances outside this watch's key: R is the frontier and
+	// this watch has delivered nothing through it.
+	started := time.Now()
+	resp := create(t, br.cli, "/registry/elsewhere", "v", 0)
+	target := resp.Header.Revision
+	if target <= 0 {
+		t.Fatalf("revision %d", target)
+	}
+
+	// The wait gives the laggard until the timeout, terminates it, and
+	// only then waits for it to be gone. Returning any earlier would let
+	// the bridge advertise R for a watch still able to receive.
+	br.backend.WaitForSyncTo(target)
+	held := time.Since(started)
+	if held < syncTimeout+teardownDelay {
+		t.Fatalf("the wait returned after %v, before the terminated watch's teardown could finish", held)
+	}
+
+	// By the time it returned the watch is closed, delivered nothing, and
+	// ended with the synchronization error its consumer resumes from.
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watch's delivery channel was still open after the wait returned")
+	}
+	if n := delivered.Load(); n != 0 {
+		t.Fatalf("%d events on a watch whose key never moved", n)
+	}
+	select {
+	case err := <-res.Errorc:
+		if err != backend.ErrSyncTimeout {
+			t.Fatalf("terminal error %v, want ErrSyncTimeout", err)
+		}
+	default:
+		t.Fatal("the terminated watch reported no terminal error")
+	}
+	if br.domain.Watchers() != 0 {
+		t.Fatal("the native watch outlived the terminated Kine watch")
 	}
 }
