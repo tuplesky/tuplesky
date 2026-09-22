@@ -11,7 +11,7 @@ use coord_storage_redb::{Generation as RedbGeneration, OpenError, OpenOptions, S
 use coord_store_api::engine::{
     Direction, ErrorClass, LocalEngine, OrderedRead, ScanRequest, SnapshotSource, WriteTxn,
 };
-use coord_store_api::registry::Collection;
+use coord_store_api::registry::{Collection, meta_fields};
 use coord_store_testkit::conformance::{ConformanceHarness, ScriptedOutcome, run_all};
 use coord_store_testkit::scenario::{Step, StoreScenarioV1, replay};
 use coord_types::ids::*;
@@ -463,5 +463,30 @@ fn damaged_or_missing_data_fails_closed() {
     assert!(matches!(
         FjallGeneration::open_existing(other.path(), identity(), options()),
         Err(OpenError::IdentityRecordMismatch("domain_id"))
+    ));
+}
+
+/// A database whose identity record names another durability profile is
+/// refused even when its manifest (the same identity, this profile) would be
+/// accepted: the record inside the database is authoritative for the profile
+/// that wrote it. This crate has one profile, so the record is rewritten
+/// directly.
+#[test]
+fn wrong_profile_in_identity_record_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut generation = FjallGeneration::create(dir.path(), identity(), options()).unwrap();
+        let mut tx = generation.engine().begin_write().unwrap();
+        tx.put(
+            Collection::MetaV1.id(),
+            meta_fields::PROFILE,
+            b"some-other-profile-v1",
+        )
+        .unwrap();
+        tx.commit_durable().unwrap();
+    }
+    assert!(matches!(
+        FjallGeneration::open_existing(dir.path(), identity(), options()),
+        Err(OpenError::IdentityRecordMismatch("profile"))
     ));
 }

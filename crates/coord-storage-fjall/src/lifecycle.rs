@@ -271,6 +271,10 @@ impl FjallGeneration {
                 &manifest.incarnation.to_be_bytes(),
             )?;
             check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
+            // The manifest's profile was checked above, but a manifest can be
+            // copied onto another database; the record inside the database is
+            // what says which durability profile actually wrote it.
+            check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
             match view.get(meta, fjall_fields::LAYOUT).map_err(corrupt)? {
                 Some(v) if v == LAYOUT_NAME.as_bytes() => {}
                 Some(_) => {
