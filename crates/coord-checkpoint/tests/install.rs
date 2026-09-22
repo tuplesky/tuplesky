@@ -310,11 +310,7 @@ fn donor_engine() -> ModelEngine {
     }
     let seq = LocalJournalSeq::new(41).unwrap();
     DurableMeta {
-        stamp: AppliedStamp {
-            store_seq: StoreSeq::from_journal(seq),
-            journal_seq: seq,
-            last_batch_digest: Digest32([0xab; 32]),
-        },
+        stamp: AppliedStamp::new(StoreSeq::from_journal(seq), Digest32([0xab; 32])),
         frontier: ExecutionFrontier {
             configuration: epoch(EPOCH),
             execution_position: pos(4),
