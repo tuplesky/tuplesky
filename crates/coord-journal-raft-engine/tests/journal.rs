@@ -379,10 +379,55 @@ fn lifecycle_is_fail_closed() {
 }
 
 #[test]
+fn open_existing_on_an_empty_directory_leaves_it_creatable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("empty");
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(matches!(
+        RaftEngineJournal::open_existing(&root, identity(), &options()),
+        Err(OpenError::NotInitialized)
+    ));
+    // A refused open must not have written engine files into the directory.
+    assert!(
+        std::fs::read_dir(&root).unwrap().next().is_none(),
+        "open-existing wrote into an uninitialized directory"
+    );
+    let journal = RaftEngineJournal::create(&root, identity(), &options()).unwrap();
+    assert_eq!(journal.identity().unwrap(), identity());
+    drop(journal);
+    let reopened = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
+    assert_eq!(reopened.identity().unwrap(), identity());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_directory_is_refused_without_touching_the_disk() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(OsStr::from_bytes(b"j\xff"));
+    assert!(matches!(
+        RaftEngineJournal::create(&root, identity(), &options()),
+        Err(OpenError::InvalidOptions(_))
+    ));
+    assert!(!root.exists(), "create made a directory it could not open");
+    assert!(matches!(
+        RaftEngineJournal::open_existing(&root, identity(), &options()),
+        Err(OpenError::InvalidOptions(_))
+    ));
+    // The lossy spelling of the path must not have been used instead.
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "a lossy-converted path was created"
+    );
+}
+
+#[test]
 fn mapping_is_durable_before_use_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("j");
-    let (mut journal, allocator, streams) = create(&root, Arc::new(DefaultFileSystem), &[1, 2]);
+    let (mut journal, mut allocator, streams) = create(&root, Arc::new(DefaultFileSystem), &[1, 2]);
     let unmapped = StorageStreamId::from_durable(9).unwrap();
     let err = journal
         .append_group(&group(vec![(
@@ -424,11 +469,45 @@ fn mapping_is_durable_before_use_and_survives_reopen() {
             .unwrap_err()
             .is_definite()
     );
+    // Retirement is permanent: the retired row cannot be rewritten as
+    // active, and the stream stays closed to appends.
+    let retired = allocator.retire(streams[1].id).unwrap();
+    assert!(retired.retired);
+    journal
+        .persist_mapping(allocator.high_water(), &retired)
+        .unwrap();
+    let revived = StreamMappingV1 {
+        retired: false,
+        ..retired
+    };
+    let err = journal
+        .persist_mapping(allocator.high_water(), &revived)
+        .unwrap_err();
+    assert!(err.is_definite());
+    assert!(
+        journal
+            .persist_mapping(allocator.high_water(), &retired)
+            .is_ok(),
+        "rewriting the retired row unchanged is allowed"
+    );
+    let err = journal
+        .append_group(&group(vec![(
+            barrier(1),
+            streams[1].id,
+            vec![genesis(streams[1].origin)],
+        )]))
+        .unwrap_err();
+    assert!(err.is_definite());
     drop(journal);
     let reopened = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
     let (hw, mappings) = reopened.mappings().unwrap();
     assert_eq!(hw, allocator.high_water());
     assert_eq!(mappings, allocator.mappings());
+    assert!(
+        mappings
+            .iter()
+            .any(|m| m.stream == streams[1].id && m.retired)
+    );
     assert_eq!(
         reopened.durable_head(streams[0].id).unwrap(),
         LocalJournalSeq::ZERO

@@ -249,9 +249,37 @@ fn engine_open_error(e: raft_engine::Error) -> OpenError {
     }
 }
 
-fn config(dir: &Path, options: &JournalOptions) -> Config {
-    Config {
-        dir: dir.to_string_lossy().into_owned(),
+/// Suffixes of the files the pinned engine writes under its directory. A
+/// directory carrying none of them was never opened by the engine, so it
+/// cannot hold an identity row.
+const ENGINE_FILE_SUFFIXES: [&str; 2] = [".raftlog", ".rewrite"];
+
+/// Whether `dir` holds at least one engine log file. Only names are
+/// inspected: the engine validates the contents when it opens.
+fn has_engine_files(dir: &Path) -> Result<bool, OpenError> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if ENGINE_FILE_SUFFIXES.iter().any(|s| name.ends_with(s)) && entry.file_type()?.is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn config(dir: &Path, options: &JournalOptions) -> Result<Config, OpenError> {
+    // The engine takes its directory as a string; a lossy conversion would
+    // hand it a path other than the one that was checked and recorded.
+    let Some(dir) = dir.to_str() else {
+        return Err(OpenError::InvalidOptions(
+            "journal directory path is not valid UTF-8".to_owned(),
+        ));
+    };
+    Ok(Config {
+        dir: dir.to_owned(),
         recovery_mode: match options.recovery {
             RecoveryPolicy::AbsoluteConsistency => RecoveryMode::AbsoluteConsistency,
             RecoveryPolicy::TolerateTailCorruption => RecoveryMode::TolerateTailCorruption,
@@ -263,7 +291,7 @@ fn config(dir: &Path, options: &JournalOptions) -> Config {
         enable_log_recycle: false,
         prefill_for_recycle: false,
         ..Config::default()
-    }
+    })
 }
 
 fn put_value(
@@ -307,12 +335,12 @@ impl<F: FileSystem> RaftEngineJournal<F> {
         options: &JournalOptions,
         file_system: Arc<F>,
     ) -> Result<Self, OpenError> {
+        let cfg = config(dir, options)?;
         if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
             return Err(OpenError::AlreadyInitialized);
         }
         std::fs::create_dir_all(dir)?;
-        let engine = Engine::open_with_file_system(config(dir, options), file_system)
-            .map_err(engine_open_error)?;
+        let engine = Engine::open_with_file_system(cfg, file_system).map_err(engine_open_error)?;
         if !engine.is_empty() {
             return Err(OpenError::Corrupt(
                 "fresh directory holds entries".to_owned(),
@@ -360,11 +388,17 @@ impl<F: FileSystem> RaftEngineJournal<F> {
         options: &JournalOptions,
         file_system: Arc<F>,
     ) -> Result<Self, OpenError> {
+        let cfg = config(dir, options)?;
         if !dir.is_dir() {
             return Err(OpenError::NotInitialized);
         }
-        let engine = Engine::open_with_file_system(config(dir, options), file_system)
-            .map_err(engine_open_error)?;
+        // The engine's open creates its lock and first log file when the
+        // directory has none, which would leave an uninitialized directory
+        // looking like a used one and refuse a later create. Refuse first.
+        if !has_engine_files(dir)? {
+            return Err(OpenError::NotInitialized);
+        }
+        let engine = Engine::open_with_file_system(cfg, file_system).map_err(engine_open_error)?;
         let row = match engine.get(METADATA_REGION, IDENTITY_KEY) {
             None => return Err(OpenError::NotInitialized),
             Some(bytes) => match decode_value(&bytes) {
@@ -888,6 +922,15 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
             return Err(definite(
                 "mapping identity of an allocated stream cannot change",
             ));
+        }
+        // Retirement is permanent: a retired identifier is never reused, so
+        // no later row may turn the stream active again.
+        if inner
+            .mappings
+            .get(&mapping.stream)
+            .is_some_and(|existing| existing.retired && !mapping.retired)
+        {
+            return Err(definite("retired stream cannot become active again"));
         }
         if inner
             .mappings
