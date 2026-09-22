@@ -2711,6 +2711,22 @@ fails the reconfiguration test. On the eleven-row benchmark sequence
 every row completes, worst case one operation of 400 to a ten-second
 deadline on a saturated domain.
 
+Re-offering costs nothing measurable. Three trials each on a fresh
+domain, before and after, in operations a second:
+
+| row | before | after |
+| --- | --- | --- |
+| `warm` | 155, 153, 168 | 165, 165, 157 |
+| `hot-writers` | 129, 133, 121 | 125, 132, 133 |
+| `transactions` | 116, 112, 121 | 116, 119, 118 |
+
+Fully overlapping, so the published matrix stands. Worth saying how
+close that came to being reported the other way: the first single run
+after the change read 173/129/123 against a single run before it of
+202/158/145, which is a 15% regression if one sample is allowed to be
+a measurement. It is not one. The 202 was simply a fast run, and three
+trials show the distributions sitting on top of each other.
+
 ### What the benchmark harness had to get right to find these
 
 A closed-loop benchmark would not have found the fifth or the sixth. It sends the next
