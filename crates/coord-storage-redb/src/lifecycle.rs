@@ -751,6 +751,20 @@ impl InactiveGeneration {
         stage_with_lock_for(root, lock, identity, options, Obligations::Carried)
     }
 
+    /// [`InactiveGeneration::stage_migration`] under a root lock the
+    /// caller already holds -- the one the source generation was read
+    /// under -- so nothing can open, write and close the selected
+    /// generation between the rows being read and the replacement being
+    /// staged. The source engine must already be closed.
+    pub(crate) fn stage_migration_with_lock(
+        root: &Path,
+        lock: RootLock,
+        identity: StoreIdentity,
+        options: OpenOptions,
+    ) -> Result<InactiveGeneration, OpenError> {
+        stage_with_lock_for(root, lock, identity, options, Obligations::Carried)
+    }
+
     /// Stage the next generation of `root` for `identity`, acquiring the
     /// root lock.
     ///

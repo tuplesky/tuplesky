@@ -204,8 +204,27 @@ pub fn record_support<V: OrderedRead>(
 ) -> Result<StoreUpdate, TrimError> {
     let mut ledger = SupportLedger::new(voters.clone());
     if let Some(held) = own_support(view, &offered.voter)? {
+        // A row from an earlier configuration is what a voter retained
+        // across a membership change left behind, and the report it is
+        // making now replaces it: refusing the row as another
+        // configuration's would leave the voter unable to report ever
+        // again, and the activation waiting on it forever. What the row
+        // reported still binds, though, so it is read into this
+        // configuration's ledger and a withdrawal across the change is
+        // refused exactly as one within it. A row from a *later*
+        // configuration is one this node cannot explain, and stays an
+        // error.
+        if held.configuration > voters.epoch() {
+            return Err(TrimError::Engine(corrupt(
+                "a durable support row is from a later configuration",
+            )));
+        }
+        let prior = Support {
+            epoch: voters.epoch(),
+            ..held.report()?
+        };
         ledger
-            .record(&held.report()?)
+            .record(&prior)
             .map_err(|_| corrupt("a durable support row is not this configuration's"))?;
     }
     ledger
@@ -352,6 +371,16 @@ pub fn activate_feature<V: OrderedRead>(
     })?;
     let mut reports = Vec::with_capacity(rows.len());
     for row in &rows {
+        // A row is evidence only for the cluster and domain it names.
+        // The consensus-level report carries neither, so this is the
+        // one place a row copied or replayed from another store can be
+        // caught before it counts toward unanimity here -- and such a
+        // row is corruption of this store, not a stale report to skip.
+        if row.cluster != cluster || row.domain != domain {
+            return Err(ActivateError::Engine(corrupt(
+                "a support row of another cluster or domain",
+            )));
+        }
         reports.push(row.report()?);
     }
     let ledger = SupportLedger::recovered(voters.clone(), &reports);

@@ -289,13 +289,19 @@ pub fn rewrite_into_new_generation(
     step: &dyn SchemaMigration,
     limits: &MigrateLimits,
 ) -> Result<Outcome, MigrateError> {
-    // The source is opened read-only through its own generation, and the
-    // staging takes the root lock, so the two cannot be the same handle.
+    // The source is opened through its own generation, and the root lock
+    // it took is carried straight into the staging: were it released in
+    // between, a writer could open the selected generation, commit and
+    // close in the gap, and the staging would proceed from rows read
+    // before those writes and activate without them. Only the source
+    // engine is closed first, because a root has one open database per
+    // process.
     let source = Generation::open_existing(root, identity, options)?;
     let rows = collect(&source, limits)?;
-    drop(source);
+    let (engine, lock, _) = source.into_parts();
+    drop(engine);
 
-    let mut staged = InactiveGeneration::stage_migration(root, identity, options)?;
+    let mut staged = InactiveGeneration::stage_migration_with_lock(root, lock, identity, options)?;
     let mut written = 0u64;
     let mut dropped = 0u64;
     let mut commits = 0u32;
