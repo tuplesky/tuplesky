@@ -33,7 +33,9 @@ use coord_storage::JournaledDomain;
 use coord_storage::journaled::{JournalLimits, JournaledStore};
 use coord_storage_redb::RedbEngine;
 use coord_storage_redb::lifecycle::{Generation, OpenError, OpenOptions, StoreIdentity};
-use coord_types::ids::{Ballot, ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{
+    Ballot, ClusterId, DomainId, LocalJournalSeq, ReplicaId, ReplicaIncarnation,
+};
 
 /// What this node's projection is being opened for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,8 +337,13 @@ impl Opened {
         // Shard 0 for the single-domain preview; task-j07 is where a node
         // spreads domains over a shard set.
         let shard = ShardId::new(0).expect("shard zero");
+        // The baseline goes in with the projection. `C` recovered at zero
+        // would count the whole retained stream as unreclaimed, and the
+        // housekeeping that watches that number would publish a full image
+        // on every restart of a node that had once crossed its threshold.
+        let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
         store
-            .attach(domain_id, shard, engine)
+            .attach_with_baseline(domain_id, shard, engine, represented)
             .map_err(|e| StoreError::Refused {
                 root: show(&directory),
                 reason: format!("the projection could not be attached to the journal: {e:?}"),

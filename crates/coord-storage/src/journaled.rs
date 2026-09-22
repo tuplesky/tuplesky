@@ -615,11 +615,39 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// state the failure produced (uncertain or quarantined) rather than
     /// forgetting that the record may exist; [`JournaledStore::status`]
     /// reports it and [`JournaledStore::reconcile`] resolves it.
+    ///
+    /// The stream is taken to have no baseline: `C` starts at zero. A
+    /// caller that read a published pointer first attaches with
+    /// [`JournaledStore::attach_with_baseline`] instead.
     pub fn attach(
         &mut self,
         domain: DomainId,
         shard: ShardId,
         engine: E,
+    ) -> Result<StorageStreamId, JournaledError> {
+        self.attach_with_baseline(domain, shard, engine, LocalJournalSeq::ZERO)
+    }
+
+    /// [`JournaledStore::attach`] for a stream whose recovery baseline is
+    /// already known: `baseline` is the represented sequence of the
+    /// pointer [`JournaledStore::recovery_baseline`] selected, and `C`
+    /// starts there.
+    ///
+    /// The baseline is a fact of the stream and it has to survive the
+    /// boot with the other two frontiers. Recovered at zero, `J - C`
+    /// counted every record the stream still held rather than the ones
+    /// the baseline does not represent, so a node that had once passed
+    /// its checkpoint threshold published a full image on every restart
+    /// before it served anything. A baseline the projection has not
+    /// applied (`C > M`) is refused like any other inconsistent
+    /// frontier: the prefix through `C` may already be gone, and a
+    /// replay from `M` could not cross it.
+    pub fn attach_with_baseline(
+        &mut self,
+        domain: DomainId,
+        shard: ShardId,
+        engine: E,
+        baseline: LocalJournalSeq,
     ) -> Result<StorageStreamId, JournaledError> {
         if self.domains.contains_key(&domain) {
             return Err(JournaledError::AlreadyAttached);
@@ -656,7 +684,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 "projection is materialized past the journal's durable head",
             ));
         }
-        let frontiers = Frontiers::recovered(durable, applied.materialized, LocalJournalSeq::ZERO)?;
+        let frontiers = Frontiers::recovered(durable, applied.materialized, baseline)?;
         let gate = Arc::new(Frontier::default());
         gate.set_completed(meta.stamp.store_seq());
         let mut state = Domain {

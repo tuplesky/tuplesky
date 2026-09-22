@@ -17,6 +17,7 @@ use coord_core::effect::{
 use coord_core::event::{StorageError, StorageEvent};
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend, ReleaseError};
 use coord_journal_api::failure::JournalFailure;
+use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::record::RecordError;
 use coord_journal_api::stream::ShardId;
 use coord_storage::journaled::{
@@ -850,6 +851,100 @@ fn a_projection_ahead_of_the_journal_is_refused_rather_than_repaired() {
         Err(JournaledError::Quarantined(_))
     ));
     drop(journal);
+}
+
+/// Publish a checkpoint representing everything materialized in `A`,
+/// journal three more transitions on top of it and end the boot. Returns
+/// the pointer, the journal, the projection and the durable head as the
+/// ending boot saw it.
+fn end_a_boot_with_a_baseline() -> (
+    CheckpointPointerV1,
+    ModelJournal,
+    ModelEngine,
+    LocalJournalSeq,
+) {
+    let mut world = World::new();
+    for step in 1..=3u64 {
+        world.protocol(A, ballot(step), promise(step));
+    }
+    world.store.flush().unwrap();
+    // The image is the caller's business; the store only needs the
+    // pointer to be durable in its own stream.
+    let represented = world.store.frontiers(A).unwrap().materialized();
+    let pointer = CheckpointPointerV1 {
+        origin: world.store.origin(A).unwrap(),
+        represented,
+        format: 1,
+        manifest_digest: Digest32([0x5a; 32]),
+        checkpoint_id: Digest32([0x5b; 32]),
+    };
+    world.store.publish_checkpoint(A, &pointer).unwrap();
+    for step in 4..=6u64 {
+        world.protocol(A, ballot(step), promise(step));
+    }
+    world.store.flush().unwrap();
+    let durable = world.store.frontiers(A).unwrap().durable();
+    let (journal, mut engines) = world.store.into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    (pointer, journal, engine, durable)
+}
+
+#[test]
+fn attaching_with_the_recovered_baseline_counts_only_the_records_past_it() {
+    let (pointer, journal, engine, durable) = end_a_boot_with_a_baseline();
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    let baseline = next
+        .recovery_baseline(A)
+        .unwrap()
+        .expect("the published pointer selects");
+    assert_eq!(baseline, pointer);
+    next.attach_with_baseline(A, shard(), engine, baseline.represented)
+        .unwrap();
+    let recovered = next.frontiers(A).unwrap();
+    assert_eq!(next.status(A), Some(DomainStatus::Ready));
+    assert_eq!(
+        recovered.checkpoint(),
+        pointer.represented,
+        "C survived the boot"
+    );
+    // Attaching appended this boot's lifecycle record, so `J` is one past
+    // what the ending boot saw; what the baseline does not represent is
+    // `J - N`, not the whole retained stream.
+    assert_eq!(recovered.durable().get(), durable.get() + 1);
+    assert_eq!(
+        recovered.durable().get() - recovered.checkpoint().get(),
+        durable.get() + 1 - pointer.represented.get()
+    );
+}
+
+/// A baseline the projection has not applied is refused at attach: the
+/// prefix through it may already be gone, and a replay from `M` could
+/// not cross it.
+#[test]
+fn a_baseline_past_the_projection_is_refused_at_attach() {
+    let (_pointer, journal, engine, durable) = end_a_boot_with_a_baseline();
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        next.attach_with_baseline(A, shard(), engine, seq(durable.get() + 10)),
+        Err(JournaledError::Frontier(_))
+    ));
+    assert_eq!(next.frontiers(A), None, "nothing was attached");
 }
 
 /// Steps of the atomic-initialization exploration.
