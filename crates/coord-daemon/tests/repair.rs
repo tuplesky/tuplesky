@@ -348,6 +348,7 @@ impl Cluster {
                 quorum: quorum(),
                 max_pending: 16,
                 max_resolved: 16,
+                max_undelivered_bytes: usize::MAX,
             }),
             now: Instant::now(),
             peers: VecDeque::new(),
@@ -375,7 +376,7 @@ impl Cluster {
             Submitted::FanOut(fan_out) => {
                 assert_eq!(fan_out.command, self.command(sequence));
                 assert_eq!(fan_out.targets, (0..3).map(r).collect::<Vec<_>>());
-                fan_out.frame
+                fan_out.frame.to_vec()
             }
             other => panic!("not new work: {other:?}"),
         }

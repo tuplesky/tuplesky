@@ -93,7 +93,7 @@ fn plan(targets: Vec<ReplicaId>) -> FanOut {
             request_sequence: RequestSequence::new(1).unwrap(),
         },
         targets,
-        frame: b"submit-frame".to_vec(),
+        frame: std::sync::Arc::from(&b"submit-frame"[..]),
     }
 }
 
@@ -496,4 +496,103 @@ fn a_transport_that_answers_short_leaves_no_target_counted_as_queued() {
 
     assert_eq!(out.queued_remote(), 1);
     assert_eq!(out.unavailable(), 2);
+}
+
+/// A transport refusal is classified by what kind of problem it is, not
+/// by which error the transport happened to name.
+///
+/// The classes drive different schedules downstream -- saturation and
+/// unreachability are offered again, a configuration disagreement and
+/// an oversized envelope are not -- so a refusal landing in the wrong
+/// class is a destination put on the wrong schedule. `QueueFull` and
+/// `TooManyGroups` are the transport's two ways of saying "this
+/// destination's share of a bounded resource is spent", which is what a
+/// full local ingress says too.
+#[test]
+fn a_transport_refusal_is_classified_by_what_kind_of_problem_it_is() {
+    struct Fixed(SendError);
+    impl PeerFanOut for Fixed {
+        fn fan_out(
+            &self,
+            targets: &[(ReplicaId, ReplicaIncarnation)],
+            _group: DomainId,
+            _frame: &[u8],
+        ) -> Vec<Result<(), SendError>> {
+            targets.iter().map(|_| Err(self.0.clone())).collect()
+        }
+    }
+    let membership = membership();
+    let plan = plan(vec![replica(1)]);
+
+    let saturating = [
+        SendError::QueueFull {
+            lane: coord_transport::Lane::Unary,
+        },
+        SendError::TooManyGroups {
+            lane: coord_transport::Lane::Unary,
+        },
+    ];
+    for e in saturating {
+        let out = dispatch(&membership, &Fixed(e.clone()), None, &plan);
+        assert_eq!(out.saturated(), 1, "{e:?} is a destination at a bound");
+        assert_eq!(out.unavailable(), 0);
+    }
+
+    // This frame against this route, for as long as both stand.
+    let out = dispatch(
+        &membership,
+        &Fixed(SendError::TooLarge {
+            bytes: 1 << 20,
+            limit: 1024,
+        }),
+        None,
+        &plan,
+    );
+    assert_eq!(out.undeliverable(), 1);
+    assert_eq!(out.saturated(), 0);
+
+    // A link that is not there right now.
+    for e in [SendError::NotConnected, SendError::Timeout] {
+        let out = dispatch(&membership, &Fixed(e.clone()), None, &plan);
+        assert_eq!(out.unavailable(), 1, "{e:?} is a link, not a bound");
+        assert_eq!(out.saturated(), 0);
+    }
+}
+
+/// The report the collector gets names every planned destination once,
+/// in the collector's own vocabulary.
+///
+/// A destination missing from the report is a destination the collector
+/// would go on believing it had heard nothing about, which is how a
+/// rejected target used to be forgotten.
+#[test]
+fn every_planned_destination_appears_in_the_offer_report() {
+    let membership = membership();
+    let peers = Peers::new(vec![replica(2)]);
+    // One voter, one unreachable voter, one target the configuration
+    // does not name.
+    let plan = plan(vec![replica(1), replica(2), replica(9)]);
+    let out = dispatch(&membership, &peers, None, &plan);
+
+    let report = out.offered(plan.command);
+    assert_eq!(report.command, plan.command);
+    let named: Vec<ReplicaId> = report.outcomes.iter().map(|(r, _)| *r).collect();
+    for target in &plan.targets {
+        assert!(named.contains(target), "{target:?} is not in the report");
+    }
+    assert_eq!(report.outcomes.len(), plan.targets.len());
+    let by_replica: std::collections::BTreeMap<ReplicaId, coord_collector::OfferOutcome> =
+        report.outcomes.iter().copied().collect();
+    assert_eq!(
+        by_replica[&replica(1)],
+        coord_collector::OfferOutcome::Queued
+    );
+    assert_eq!(
+        by_replica[&replica(2)],
+        coord_collector::OfferOutcome::Unreachable
+    );
+    assert_eq!(
+        by_replica[&replica(9)],
+        coord_collector::OfferOutcome::NotACommittedVoter
+    );
 }
