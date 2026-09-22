@@ -56,6 +56,9 @@ type Provider struct {
 	mu       sync.Mutex
 	cached   *serviceToken
 	inflight bool
+	// refreshErr is why the last refresh failed (nil when it succeeded);
+	// waiters that coalesced onto it report this rather than a stale entry.
+	refreshErr error
 	// Exchanges performed against the STS (for tests).
 	Exchanges int
 }
@@ -90,6 +93,9 @@ func NewProvider(cfg ProviderConfig) *Provider {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout: 10 * time.Second,
+			// A dedicated transport: the default one honours HTTP(S)_PROXY,
+			// which would route the assertion through an unintended proxy.
+			Transport: &http.Transport{Proxy: nil},
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return errors.New("redirects disabled")
 			},
@@ -122,8 +128,7 @@ func (p *Provider) readAssertion() (string, error) {
 // callers coalesce: only one exchange runs at a time.
 func (p *Provider) Token(ctx context.Context) (string, error) {
 	p.mu.Lock()
-	if p.cached != nil && p.clock().Add(p.margin).Before(p.cached.expiresAt) {
-		token := p.cached.token
+	if token, ok := p.usableLocked(); ok {
 		p.mu.Unlock()
 		return token, nil
 	}
@@ -139,6 +144,7 @@ func (p *Provider) Token(ctx context.Context) (string, error) {
 	token, err := p.exchange(ctx)
 	p.mu.Lock()
 	p.inflight = false
+	p.refreshErr = err
 	if err == nil {
 		p.cached = token
 	}
@@ -147,6 +153,15 @@ func (p *Provider) Token(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return token.token, nil
+}
+
+// usableLocked returns the cached token when it is outside the refresh
+// margin. The caller holds p.mu.
+func (p *Provider) usableLocked() (string, bool) {
+	if p.cached != nil && p.clock().Add(p.margin).Before(p.cached.expiresAt) {
+		return p.cached.token, true
+	}
+	return "", false
 }
 
 func (p *Provider) waitForRefresh(ctx context.Context) (string, error) {
@@ -159,15 +174,18 @@ func (p *Provider) waitForRefresh(ctx context.Context) (string, error) {
 		case <-ticker.C:
 			p.mu.Lock()
 			done := !p.inflight
-			var token string
-			var ok bool
-			if p.cached != nil {
-				token, ok = p.cached.token, true
-			}
+			// The same predicate as the caller that started the refresh: a
+			// failed exchange leaves an expired entry in place, and that
+			// entry is not a usable token.
+			token, ok := p.usableLocked()
+			refreshErr := p.refreshErr
 			p.mu.Unlock()
 			if done {
 				if ok {
 					return token, nil
+				}
+				if refreshErr != nil {
+					return "", refreshErr
 				}
 				return "", ErrExchangeFailed
 			}

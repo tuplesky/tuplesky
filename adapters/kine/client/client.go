@@ -69,7 +69,12 @@ type Client struct {
 
 	mu   sync.Mutex
 	conn *quic.Conn
-	sem  chan struct{}
+	// dialing is non-nil while one goroutine dials and binds the shared
+	// connection; it is closed when that attempt settles so the others
+	// wait for its result instead of each dialing a connection of their
+	// own.
+	dialing chan struct{}
+	sem     chan struct{}
 	// Reconnects performed (for tests).
 	Reconnects int
 }
@@ -111,16 +116,48 @@ func newWithDialer(cfg Config, dial func(ctx context.Context) (*quic.Conn, error
 }
 
 // connect returns a live connection, dialing and binding (Hello) if
-// needed. A binding presents the service token once.
+// needed. A binding presents the service token once. Only one goroutine
+// dials at a time: the others wait for that attempt to settle and then
+// re-check, so a burst of requests on a fresh or dropped client shares
+// one connection rather than opening one per request.
 func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
-	c.mu.Lock()
-	if c.conn != nil {
-		conn := c.conn
+	for {
+		c.mu.Lock()
+		if c.conn != nil {
+			conn := c.conn
+			c.mu.Unlock()
+			return conn, nil
+		}
+		if wait := c.dialing; wait != nil {
+			c.mu.Unlock()
+			select {
+			case <-wait:
+				// The attempt settled: either it published a connection
+				// or it failed and this goroutine takes its own turn.
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		c.dialing = done
 		c.mu.Unlock()
-		return conn, nil
-	}
-	c.mu.Unlock()
 
+		conn, err := c.dialAndBind(ctx)
+		c.mu.Lock()
+		if err == nil {
+			c.conn = conn
+		}
+		c.dialing = nil
+		close(done)
+		c.mu.Unlock()
+		return conn, err
+	}
+}
+
+// dialAndBind dials one connection and binds it, closing it on a failed
+// bind so it never leaks.
+func (c *Client) dialAndBind(ctx context.Context) (*quic.Conn, error) {
 	conn, err := c.dialFn(ctx)
 	if err != nil {
 		return nil, ErrNotConnected
@@ -129,9 +166,6 @@ func (c *Client) connect(ctx context.Context) (*quic.Conn, error) {
 		_ = conn.CloseWithError(2, "bind failed")
 		return nil, err
 	}
-	c.mu.Lock()
-	c.conn = conn
-	c.mu.Unlock()
 	return conn, nil
 }
 
@@ -164,17 +198,20 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
 	return nil
 }
 
-// drop closes and forgets the connection so the next call reconnects.
-func (c *Client) drop() {
+// drop closes and forgets `failed` so the next call reconnects, but only
+// while it is still the shared connection. A late failure from a
+// connection that was already replaced must not close its healthy
+// replacement; that stale connection was closed when it was dropped.
+func (c *Client) drop(failed *quic.Conn) {
 	c.mu.Lock()
-	conn := c.conn
-	c.conn = nil
-	if conn != nil {
+	current := c.conn == failed && failed != nil
+	if current {
+		c.conn = nil
 		c.Reconnects++
 	}
 	c.mu.Unlock()
-	if conn != nil {
-		_ = conn.CloseWithError(0, "drop")
+	if current {
+		_ = failed.CloseWithError(0, "drop")
 	}
 }
 
@@ -197,11 +234,11 @@ func (c *Client) Do(ctx context.Context, frame []byte) (Outcome, error) {
 	defer cancel()
 	stream, err := conn.OpenStreamSync(streamCtx)
 	if err != nil {
-		c.drop()
+		c.drop(conn)
 		return Outcome{Unknown: true}, nil
 	}
 	if err := writeFrame(stream, frame); err != nil {
-		c.drop()
+		c.drop(conn)
 		return Outcome{Unknown: true}, nil
 	}
 	_ = stream.Close()
@@ -210,7 +247,7 @@ func (c *Client) Do(ctx context.Context, frame []byte) (Outcome, error) {
 		// The request was sent but no response was established: a reset,
 		// a timeout or a dropped connection is an explicit unknown
 		// outcome, never a silent success. Drop for a warm reconnect.
-		c.drop()
+		c.drop(conn)
 		return Outcome{Unknown: true}, nil
 	}
 	msg, err := wire.Decode(resp)

@@ -303,9 +303,95 @@ func TestPayloadConflictAndUnknownSequence(t *testing.T) {
 	if _, err := inst.Retry(inv.Sequence, []byte("y"), command(9), 0); err != ErrPayloadConflict {
 		t.Fatalf("expected payload conflict, got %v", err)
 	}
+	// The bound command id with changed logical bytes or a changed
+	// deadline is a conflict too: a retry never emits a different frame
+	// under the same retry key.
+	if _, err := inst.Retry(inv.Sequence, []byte("y"), command(1), 0); err != ErrPayloadConflict {
+		t.Fatalf("expected payload conflict for changed logical bytes, got %v", err)
+	}
+	if _, err := inst.Retry(inv.Sequence, []byte("x"), command(1), 5); err != ErrPayloadConflict {
+		t.Fatalf("expected payload conflict for changed deadline, got %v", err)
+	}
 	// An unallocated sequence.
 	if _, err := inst.Retry(99, []byte("z"), command(9), 0); err != ErrUnknownSequence {
 		t.Fatalf("expected unknown sequence, got %v", err)
+	}
+}
+
+func TestStaleDropKeepsTheReplacementConnection(t *testing.T) {
+	cert, pool := testCert(t)
+	var b serverBehavior
+	addr, stop := runServer(t, cert, &b)
+	defer stop()
+	c := New(addr, Config{TLS: clientTLS(pool), Cluster: [16]byte{1}, Domain: [16]byte{2}, FrameTimeout: 3 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	old, err := c.dialFn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = old.CloseWithError(0, "test") }()
+	replacement, err := c.dialFn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = replacement.CloseWithError(0, "test") }()
+
+	// A late failure from the old connection must not close the healthy
+	// replacement that is now the shared connection.
+	c.conn = replacement
+	c.drop(old)
+	if c.conn != replacement || c.Reconnects != 0 {
+		t.Fatalf("stale drop touched the replacement: conn=%v reconnects=%d", c.conn == replacement, c.Reconnects)
+	}
+	if err := replacement.Context().Err(); err != nil {
+		t.Fatalf("stale drop closed the replacement: %v", err)
+	}
+	// Dropping the connection that is actually current clears and closes
+	// it, and a second drop of the same connection is a no-op.
+	c.drop(replacement)
+	if c.conn != nil || c.Reconnects != 1 {
+		t.Fatalf("current drop: conn=%v reconnects=%d", c.conn, c.Reconnects)
+	}
+	c.drop(replacement)
+	if c.Reconnects != 1 {
+		t.Fatalf("repeated drop counted again: %d", c.Reconnects)
+	}
+}
+
+func TestConcurrentRequestsShareOneDial(t *testing.T) {
+	cert, pool := testCert(t)
+	var b serverBehavior
+	addr, stop := runServer(t, cert, &b)
+	defer stop()
+	tlsConf := clientTLS(pool)
+	var dials atomic.Int64
+	c := newWithDialer(Config{Cluster: [16]byte{1}, Domain: [16]byte{2}, FrameTimeout: 3 * time.Second}, func(ctx context.Context) (*quic.Conn, error) {
+		dials.Add(1)
+		// A slow dial lets every caller observe the missing connection.
+		time.Sleep(50 * time.Millisecond)
+		return quic.DialAddr(ctx, addr, tlsConf, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	})
+	inst := instance()
+	var wg sync.WaitGroup
+	var failures atomic.Int64
+	for i := 0; i < 8; i++ {
+		inv, _ := inst.Allocate([]byte("p"), command(uint64(i+1)), 0)
+		wg.Add(1)
+		go func(f []byte) {
+			defer wg.Done()
+			out, err := c.Do(context.Background(), f)
+			if err != nil || out.Unknown {
+				failures.Add(1)
+			}
+		}(inv.Frame)
+	}
+	wg.Wait()
+	if failures.Load() != 0 {
+		t.Fatalf("%d requests failed", failures.Load())
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("expected one shared dial, got %d", dials.Load())
 	}
 }
 

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -98,6 +99,71 @@ func TestProviderCachesRotatesAndSingleFlights(t *testing.T) {
 	wg.Wait()
 	if got := exchanges.Load(); got != 3 {
 		t.Fatalf("single-flight: expected 3 exchanges, got %d", got)
+	}
+}
+
+func TestWaitersDoNotReuseAnExpiredTokenAfterAFailedRefresh(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "coord-node.jwt")
+	writeToken(t, tokenFile, "assertion-1")
+	var fail atomic.Bool
+	sts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A slow exchange lets the waiters coalesce onto the refresh.
+		time.Sleep(40 * time.Millisecond)
+		if fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "svc", "expires_in": 3600})
+	}))
+	defer sts.Close()
+	now := time.Unix(1_700_000_000, 0)
+	p := NewProvider(ProviderConfig{
+		TokenFile: tokenFile,
+		STSURL:    sts.URL,
+		Audience:  "a",
+		HTTP:      sts.Client(),
+		Clock:     func() time.Time { return now },
+	})
+	if _, err := p.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The cached token expires and the STS starts refusing: the caller
+	// that refreshes and every waiter that coalesced onto it must see the
+	// failure, never the expired entry.
+	now = now.Add(2 * time.Hour)
+	fail.Store(true)
+	var wg sync.WaitGroup
+	var tokens, failures atomic.Int64
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := p.Token(context.Background())
+			if err == nil || tok != "" {
+				tokens.Add(1)
+				return
+			}
+			if !errors.Is(err, ErrExchangeFailed) {
+				t.Errorf("unexpected error %v", err)
+			}
+			failures.Add(1)
+		}()
+	}
+	wg.Wait()
+	if tokens.Load() != 0 || failures.Load() != 8 {
+		t.Fatalf("expired token returned to %d callers, %d saw the failure", tokens.Load(), failures.Load())
+	}
+}
+
+func TestDefaultClientDoesNotHonourEnvProxies(t *testing.T) {
+	p := NewProvider(ProviderConfig{TokenFile: "x", STSURL: "http://sts", Audience: "a"})
+	transport, ok := p.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("default client uses %T, not a dedicated transport", p.http.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("default transport consults a proxy")
 	}
 }
 

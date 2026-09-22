@@ -1,6 +1,7 @@
 package client
 
 import (
+	"crypto/sha256"
 	"sync"
 
 	"github.com/tuplesky/tuplesky/adapters/kine/wire"
@@ -18,7 +19,18 @@ type Instance struct {
 
 	mu    sync.Mutex
 	next  uint64
-	bound map[uint64][32]byte // sequence -> command id
+	bound map[uint64]binding // sequence -> what the sequence was bound to
+}
+
+// binding is what an allocated sequence is bound to: the command id and
+// a digest of the canonical frame, so a retry that keeps the command id
+// but changes the logical bytes or the deadline is refused as a conflict
+// rather than emitted as a different frame under the same retry key. The
+// digest, not the frame, is kept so a bound sequence does not retain its
+// payload.
+type binding struct {
+	commandID [32]byte
+	frame     [sha256.Size]byte
 }
 
 // InstanceConfig configures an Instance.
@@ -37,7 +49,7 @@ func NewInstance(cfg InstanceConfig) *Instance {
 		session:  cfg.Session,
 		instance: cfg.Instance,
 		next:     1,
-		bound:    make(map[uint64][32]byte),
+		bound:    make(map[uint64]binding),
 	}
 }
 
@@ -71,12 +83,14 @@ func (i *Instance) Allocate(logical []byte, commandID [32]byte, deadlineMs uint3
 		return Invocation{}, err
 	}
 	i.next = seq + 1
-	i.bound[seq] = commandID
+	i.bound[seq] = binding{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
 	return inv, nil
 }
 
-// Retry rebuilds an allocated sequence's invocation; the command id must
-// be the one bound at allocation (no implicit fresh identity).
+// Retry rebuilds an allocated sequence's invocation; the command id and
+// the canonical frame (logical bytes and deadline) must be the ones bound
+// at allocation (no implicit fresh identity, no changed payload under a
+// stable identity).
 func (i *Instance) Retry(seq uint64, logical []byte, commandID [32]byte, deadlineMs uint32) (Invocation, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -84,10 +98,17 @@ func (i *Instance) Retry(seq uint64, logical []byte, commandID [32]byte, deadlin
 	if !ok {
 		return Invocation{}, ErrUnknownSequence
 	}
-	if bound != commandID {
+	if bound.commandID != commandID {
 		return Invocation{}, ErrPayloadConflict
 	}
-	return i.build(seq, logical, commandID, deadlineMs)
+	inv, err := i.build(seq, logical, commandID, deadlineMs)
+	if err != nil {
+		return Invocation{}, err
+	}
+	if sha256.Sum256(inv.Frame) != bound.frame {
+		return Invocation{}, ErrPayloadConflict
+	}
+	return inv, nil
 }
 
 func (i *Instance) build(seq uint64, logical []byte, commandID [32]byte, deadlineMs uint32) (Invocation, error) {
