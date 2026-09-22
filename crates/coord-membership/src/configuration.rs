@@ -495,16 +495,30 @@ impl ConfigurationChain {
     /// `max`, and whether they reach the current epoch. This is what a
     /// node answers a bootstrap with; the answer carries the evidence, so
     /// the answering node's word is never needed.
+    ///
+    /// `known_certificate` is the certificate hash the client holds for
+    /// `known`. When this chain holds that epoch under another certificate
+    /// the two have diverged, and an answer of only later records would let
+    /// the client apply nothing and believe itself current. The answer then
+    /// starts at `known` itself: the held record is the evidence, and the
+    /// client's monotonic installation refuses it as divergent for an epoch
+    /// it already holds. Without a certificate there is nothing to compare
+    /// and the answer is the plain suffix.
     pub fn records_after(
         &self,
         known: Option<ConfigurationEpoch>,
+        known_certificate: Option<Digest32>,
         max: usize,
     ) -> (Vec<GroupConfigurationV1>, bool) {
         let max = max.clamp(1, limits::MAX_CHAIN_RECORDS);
+        let diverged = match (known, known_certificate) {
+            (Some(k), Some(c)) => self.at(k).is_some_and(|held| held.certificate() != c),
+            _ => false,
+        };
         let records: Vec<GroupConfigurationV1> = self
             .records
             .iter()
-            .filter(|r| known.is_none_or(|k| r.epoch() > k))
+            .filter(|r| known.is_none_or(|k| r.epoch() > k || (diverged && r.epoch() == k)))
             .take(max)
             .map(|r| r.record.clone())
             .collect();

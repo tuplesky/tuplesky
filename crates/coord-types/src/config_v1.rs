@@ -198,6 +198,10 @@ pub enum ConfigError {
     TooLong,
     /// The page limit is zero or above the bound.
     BadLimit,
+    /// A page's cursor disagrees with its entries: a complete page with a
+    /// cursor, an incomplete page without one or with no entries, or a
+    /// cursor that is not the last entry's node.
+    BadCursor,
     /// Frame problem.
     Wire(WireError),
 }
@@ -243,6 +247,22 @@ fn check_signers(signers: &[VoterSignatureV1]) -> Result<(), ConfigError> {
 fn check_address(address: &str) -> Result<(), ConfigError> {
     if address.len() > limits::MAX_ADDRESS_BYTES {
         return Err(ConfigError::TooLong);
+    }
+    Ok(())
+}
+
+/// The per-entry bounds of an observer entry, the same whether the entry
+/// arrives inside a catalog or inside a discovery page: a page is decoded
+/// directly, so it cannot lean on the catalog it was cut from.
+fn check_observer_entry(entry: &ObserverEntryV1) -> Result<(), ConfigError> {
+    if entry.region.len() > limits::MAX_REGION_BYTES {
+        return Err(ConfigError::TooLong);
+    }
+    if entry.addresses.len() > limits::MAX_ADDRESSES {
+        return Err(ConfigError::TooMany);
+    }
+    for a in &entry.addresses {
+        check_address(a)?;
     }
     Ok(())
 }
@@ -597,15 +617,7 @@ impl ObserverCatalogV1 {
         }
         check_sorted_nodes(&self.observers, |o| o.node)?;
         for o in &self.observers {
-            if o.region.len() > limits::MAX_REGION_BYTES {
-                return Err(ConfigError::TooLong);
-            }
-            if o.addresses.len() > limits::MAX_ADDRESSES {
-                return Err(ConfigError::TooMany);
-            }
-            for a in &o.addresses {
-                check_address(a)?;
-            }
+            check_observer_entry(o)?;
         }
         check_signature(&self.attestation.signature)
     }
@@ -766,16 +778,25 @@ pub struct ObserverDiscoveryPageV1 {
 }
 
 impl ObserverDiscoveryPageV1 {
-    /// Structural validation.
+    /// Structural validation: the entry bounds a catalog applies, node
+    /// order, and a cursor the client can follow. An incomplete page must
+    /// carry at least one entry and name its last entry as `next`, so
+    /// paging always advances and never skips past an observer the page
+    /// did not show; a page that says otherwise is malformed, not
+    /// followed.
     pub fn validate_shape(&self) -> Result<(), ConfigError> {
         if self.entries.len() > limits::MAX_PAGE as usize {
             return Err(ConfigError::TooMany);
         }
         check_sorted_nodes(&self.entries, |o| o.node)?;
-        if self.complete != self.next.is_none() {
-            return Err(ConfigError::BadLimit);
+        for o in &self.entries {
+            check_observer_entry(o)?;
         }
-        Ok(())
+        match (self.complete, self.next) {
+            (true, None) => Ok(()),
+            (false, Some(next)) if self.entries.last().map(|o| o.node) == Some(next) => Ok(()),
+            _ => Err(ConfigError::BadCursor),
+        }
     }
 }
 

@@ -370,9 +370,37 @@ fn observer_paging_is_deterministic_and_complete() {
         .validate_shape(),
         Err(ConfigError::BadLimit)
     );
+    p2.validate_shape().unwrap();
+    p3.validate_shape().unwrap();
     let mut inconsistent = p1.clone();
     inconsistent.complete = true;
-    assert_eq!(inconsistent.validate_shape(), Err(ConfigError::BadLimit));
+    assert_eq!(inconsistent.validate_shape(), Err(ConfigError::BadCursor));
+    // An incomplete page must move the client: it carries at least one
+    // entry and its cursor is exactly its last entry. An empty page with a
+    // cursor would loop forever, a cursor ahead of the page would skip the
+    // observers between, and a cursor behind it would re-read them.
+    let mut empty = p1.clone();
+    empty.entries.clear();
+    assert_eq!(empty.validate_shape(), Err(ConfigError::BadCursor));
+    let mut ahead = p1.clone();
+    ahead.next = Some(node(13));
+    assert_eq!(ahead.validate_shape(), Err(ConfigError::BadCursor));
+    let mut behind = p1.clone();
+    behind.next = Some(node(10));
+    assert_eq!(behind.validate_shape(), Err(ConfigError::BadCursor));
+    let mut no_cursor = p1.clone();
+    no_cursor.next = None;
+    assert_eq!(no_cursor.validate_shape(), Err(ConfigError::BadCursor));
+    // A page decoded on its own is held to the catalog's entry bounds.
+    let mut region = p3.clone();
+    region.entries[0].region = "r".repeat(limits::MAX_REGION_BYTES + 1);
+    assert_eq!(region.validate_shape(), Err(ConfigError::TooLong));
+    let mut many = p3.clone();
+    many.entries[0].addresses = vec!["a".to_owned(); limits::MAX_ADDRESSES + 1];
+    assert_eq!(many.validate_shape(), Err(ConfigError::TooMany));
+    let mut long = p3.clone();
+    long.entries[0].addresses = vec!["x".repeat(limits::MAX_ADDRESS_BYTES + 1)];
+    assert_eq!(long.validate_shape(), Err(ConfigError::TooLong));
 }
 
 #[test]
@@ -426,7 +454,7 @@ fn configuration_frames_round_trip_exactly() {
     ];
     let mut reader = FrameReader::new();
     for f in &frames {
-        reader.push(f);
+        reader.push(f).unwrap();
     }
     let decoded: Vec<_> = std::iter::from_fn(|| reader.next_frame().unwrap()).collect();
     reader.finish().unwrap();

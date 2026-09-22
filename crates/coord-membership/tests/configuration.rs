@@ -11,7 +11,7 @@ use coord_membership::configuration::{
     GenesisAnchor, HintDecision, Installed, sign_message, verify_signature,
 };
 use coord_membership::genesis::{
-    GenesisManifest, SignedGenesis, VoterSeed, hex_id, sign_genesis, verify_genesis,
+    GenesisManifest, SignedGenesis, VoterSeed, b64url, hex_id, sign_genesis, verify_genesis,
 };
 use coord_types::config_v1::{
     ActivationEvidenceV1, BallotConfigurationV1, BootstrapResponseV1, ConfigurationHintV1,
@@ -99,9 +99,16 @@ fn manifest(cluster: ClusterId, domain: DomainId, voters: &[&Node]) -> GenesisMa
             .map(|v| VoterSeed {
                 node: hex_id(&v.id.0),
                 incarnation: v.incarnation.get(),
+                public_key: b64url(v.key.public_key_raw()),
             })
             .collect(),
         issuer_roots: vec!["cm9vdA".to_owned()],
+        wif_rules: vec![serde_json::json!({
+            "issuer": "k8s",
+            "namespace": "voters",
+            "serviceaccount": "voter-1",
+            "scope_ceiling": 7,
+        })],
         admin: hex_id(&[9; 16]),
         protocol_version: PROTOCOL,
     }
@@ -396,22 +403,38 @@ fn chain_grows_only_through_old_quorum_approval_and_keeps_history() {
     assert_eq!(chain.at(epoch(4)), None);
 
     // Bootstrap paging over the chain.
-    let (all, complete) = chain.records_after(None, 64);
+    let (all, complete) = chain.records_after(None, None, 64);
     assert_eq!(all.len(), 3);
     assert!(complete);
-    let (one, complete) = chain.records_after(None, 1);
+    let (one, complete) = chain.records_after(None, None, 1);
     assert_eq!(one[0].epoch, epoch(1));
     assert!(!complete);
-    let (after1, complete) = chain.records_after(Some(epoch(1)), 64);
+    let (after1, complete) =
+        chain.records_after(Some(epoch(1)), Some(w.root.certificate_hash()), 64);
     assert_eq!(
         after1.iter().map(|r| r.epoch.get()).collect::<Vec<_>>(),
         vec![2, 3]
     );
     assert!(complete);
-    let (none, complete) = chain.records_after(Some(epoch(3)), 64);
+    let (none, complete) = chain.records_after(Some(epoch(3)), Some(e3.certificate_hash()), 64);
     assert!(none.is_empty() && complete);
-    let (none, complete) = chain.records_after(Some(epoch(9)), 64);
+    let (none, complete) = chain.records_after(Some(epoch(3)), None, 64);
+    assert!(none.is_empty() && complete);
+    let (none, complete) = chain.records_after(Some(epoch(9)), Some(Digest32([0; 32])), 64);
     assert!(none.is_empty() && !complete);
+    // A client that holds a known epoch under another certificate has
+    // diverged from this chain: the answer starts at that epoch, so the
+    // held record reaches the client as evidence instead of an empty
+    // "you are current".
+    let (diverged, complete) = chain.records_after(Some(epoch(2)), Some(Digest32([0; 32])), 64);
+    assert_eq!(
+        diverged.iter().map(|r| r.epoch.get()).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert!(complete);
+    let (diverged, complete) = chain.records_after(Some(epoch(3)), Some(Digest32([0; 32])), 64);
+    assert_eq!(diverged, vec![e3.clone()]);
+    assert!(complete);
 }
 
 #[test]
@@ -628,7 +651,28 @@ fn directory_is_not_transition_authority() {
     );
     let divergent = handoff_record(&w.root, &five, &[w.n(1), w.n(2)]);
     assert_eq!(
-        client.install_configuration(divergent),
+        client.install_configuration(divergent.clone()),
+        Err(ChainError::Divergent)
+    );
+    assert_eq!(client.current().certificate(), real.certificate_hash());
+    // A node whose chain holds the other epoch-two record answers a
+    // bootstrap naming the client's known epoch and certificate with that
+    // record, so the client detects the divergence instead of applying an
+    // empty answer and believing itself current.
+    let mut other = w.chain();
+    other.extend(divergent.clone()).unwrap();
+    let (records, complete) =
+        other.records_after(Some(epoch(2)), Some(real.certificate_hash()), 64);
+    assert_eq!(records, vec![divergent]);
+    assert!(complete);
+    let response = BootstrapResponseV1 {
+        records,
+        complete,
+        ballot: None,
+        endpoints: None,
+    };
+    assert_eq!(
+        client.apply_bootstrap(&response),
         Err(ChainError::Divergent)
     );
     assert_eq!(client.current().certificate(), real.certificate_hash());
@@ -672,7 +716,7 @@ fn ballot_fast_set_is_fixed_and_only_voters_promise() {
         &[w.n(4), w.n(5), w.n(2)],
     );
     client.install_ballot(b2).unwrap();
-    assert_eq!(client.ballot().unwrap().ballot.number, 2);
+    assert_eq!(client.ballot().unwrap().ballot().number, 2);
     // A lower ballot is stale.
     let b0 = ballot_record(&e2, 1, leader, &[w.n(1), w.n(2), w.n(3)], &promisers);
     assert_eq!(client.install_ballot(b0), Err(BallotError::Stale));
@@ -839,7 +883,7 @@ fn a_ballot_certificate_of_one_domain_is_refused_by_another_that_shares_its_vote
         Err(BallotError::OriginMismatch)
     );
     // The domain the promises were made in still holds them.
-    assert_eq!(here.ballot().unwrap().ballot.number, 7);
+    assert_eq!(here.ballot().unwrap().ballot().number, 7);
     here.install_ballot(mine).unwrap();
 }
 
@@ -1008,6 +1052,6 @@ fn historical_evidence_verifies_without_an_issuer() {
     // An old epoch's ballot configuration verifies as history too.
     let b = ballot_record(&w.root, 4, w.n(1), &[w.n(1), w.n(2)], &[w.n(1), w.n(3)]);
     let config = chain.verify_ballot(&b).unwrap();
-    assert_eq!(config.epoch, epoch(1));
+    assert_eq!(config.epoch(), epoch(1));
     assert_eq!(config.fast_size(), 2);
 }
