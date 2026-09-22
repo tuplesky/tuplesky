@@ -589,6 +589,40 @@ fn rows_beyond_the_boundary_are_refused() {
             collection: Collection::ExecutedV1.id().0
         }
     );
+    // A retained retry response at or below the execution position but
+    // naming a KV revision above the frontier is beyond the boundary too:
+    // the position check alone would let a cached answer about state the
+    // snapshot does not hold through.
+    let mut engine = model(Profile::default());
+    let mut tx = engine.begin_write().unwrap();
+    let key = RetryKey {
+        cluster_id: CLUSTER,
+        domain_id: DOMAIN,
+        session_id: SESSION,
+        client_instance_id: CLIENT,
+        request_sequence: RequestSequence::new(2).unwrap(),
+    };
+    tx.put(
+        Collection::RetryV1.id(),
+        &codecs::retry_key(&key),
+        &codecs::encode_retry(&RetryRecordV1 {
+            command_id: command(2),
+            position: pos(2),
+            revision: Some(rev(9)),
+            response: b"ok".to_vec(),
+            result_digest: Digest32([2; 32]),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    tx.commit_durable().unwrap();
+    let view = engine.reader().snapshot().unwrap();
+    assert_eq!(
+        export_shared(&view, origin(), &limits).unwrap_err(),
+        ExportError::BeyondBoundary {
+            collection: Collection::RetryV1.id().0
+        }
+    );
     let mut engine = model(Profile::default());
     let mut tx = engine.begin_write().unwrap();
     tx.put(

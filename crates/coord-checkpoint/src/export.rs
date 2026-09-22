@@ -321,6 +321,14 @@ fn traverse<V: OrderedRead>(
                     if record.position > boundary.execution_position {
                         return Err(beyond(collection));
                     }
+                    // A retained response refers to the KV revision its
+                    // command produced; one above the frontier would be
+                    // restored as a cached answer about state the snapshot
+                    // does not contain, so it is beyond the boundary
+                    // exactly as an executed record with that revision is.
+                    if record.revision.is_some_and(|r| r > boundary.kv_revision) {
+                        return Err(beyond(collection));
+                    }
                     include(row, writer)?;
                 }
                 Collection::KvCurrentV1 => {
