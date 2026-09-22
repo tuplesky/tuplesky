@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.4.  
 **Date:** 2026-09-17.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 92 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05` and `task-q01` suffixes and prerequisites are preserved. Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 93 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01` and `task-q01` suffixes and prerequisites are preserved. Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -148,7 +148,8 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-o05](#task-o05) | Add observer historical reads and authoritative read fences | task-o04, task-18 |
 | [task-o06](#task-o06) | Qualify observer correctness and regional scaling | task-o03, task-o04, task-o05, task-j05 |
 | [task-m01](#task-m01) | Define authoritative configuration discovery and epoch records | task-02, task-19 |
-| [task-m02](#task-m02) | Make Kine a full epoch-aware trusted collector | task-m01, task-33, task-48 |
+| [task-c01](#task-c01) | Give the collector a submission delivery lifecycle (contract revision 2) | task-33, task-62 |
+| [task-m02](#task-m02) | Make Kine a full epoch-aware trusted collector | task-m01, task-33, task-48, task-c01 |
 | [task-m03](#task-m03) | Connect observer staging to sealed handoff and activation | task-m01, task-o02, task-57, task-j04 |
 | [task-m04](#task-m04) | Implement conservative regional placement and quorum tuning | task-m03, task-m02 |
 | [task-m05](#task-m05) | Qualify client-aware membership under mixed failures | task-m02, task-m03, task-m04, task-58 |
@@ -1309,7 +1310,7 @@ A question is asked only on an API-class connection this side dialed: on an acce
 <a id="task-m02"></a>
 ### task-m02: Make Kine a full epoch-aware trusted collector
 
-**Prerequisites:** task-m01, task-33, task-48.  
+**Prerequisites:** task-m01, task-33, task-48, task-c01.  
 **Design:** Sections 3.2, 10.5.
 
 **Implement:** Authorized Go client direct fan-out, exact completion, configuration refresh, stable retry, voter identity dedup and historical result handling. Shared language-neutral Rust/Go traces; optional local sidecar measured separately.
@@ -1357,6 +1358,18 @@ Include the evidence-conditioned handoff recovery branches and the explicit five
 A surviving three-voter majority progresses only after required leader recovery, and only through a valid available path. Until redundancy is restored it has no further voter-failure margin; observers cannot substitute as voters. Report that interval and degraded latency.
 
 **Review boundary:** No absolute availability when required authority is unavailable; DR is separately declared workflow.
+
+<a id="task-c01"></a>
+### task-c01: Give the collector a submission delivery lifecycle (contract revision 2)
+
+**Prerequisites:** task-33, task-62.  
+**Design:** Sections 3.2, 4.3, 4.4.
+
+**Implement:** Revision 1 said fan-out reaches every voter at once and said nothing about a destination that could not take it, so the transport dropped that copy and nothing re-offered it -- 317 of about 880 submissions in one measured run, with the command committing on whatever subset was free and the caller told nothing. The rule is that all-voter targeting is required and all-voter acceptance is not: every voter is offered the submission independently and without blocking, and while the command is unresolved the collector that accepted it owns re-offering what could not be queued. Reserve the pending slot *and* the envelope's bytes before any destination is offered anything, so a refusal means nothing was sent by this attempt and no later answer from a destination can become a refusal of the command. Retain the original envelope rather than a recipe; classify a full queue and an absent route as delivery backpressure and a configuration disagreement or an oversized envelope as something repeating cannot settle; bound the rate with a floor, backoff and a per-turn budget fair across commands, never the obligation; retire at settlement, recording the voters that never took it; reconcile destinations on reconfiguration.
+
+**Acceptance:** A destination's saturation costs that destination and nothing else, and is offered again without a caller retry. Collector capacity refuses only before dispatch. A caller's timeout or disconnection does not discard the obligation. A permanently unavailable minority never blocks a quorum result, and settlement clears the retry state. A repeat carries the original command identity and admission facts and cannot be counted as a second vote. Sustained saturation stays inside the byte, command and per-turn bounds. A voter's hold for an unplaced acknowledgement outlasts the repeat schedule's ceiling, because a duplicate submission produces no effects.
+
+**Review boundary:** Delivery only. No change to the learning predicate, the leader release gate or what evidence a command is established on; queue acceptance is never promoted into delivery evidence, and reliable end-to-end delivery is not claimed.
 
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report

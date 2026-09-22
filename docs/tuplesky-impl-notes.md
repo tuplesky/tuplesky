@@ -1663,9 +1663,8 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-thirteen things. Twelve are fixed here and the thirteenth is stated
-below with what is known about it, and each became findable only once
-the ones before it were.
+fourteen things. All fourteen are fixed here, and each became findable
+only once the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counted the watch and dropped the responder.
@@ -2438,11 +2437,114 @@ on its way to the bound. A bound of 4 fails the first; a window of 600
 seconds fails the second.
 
 **What it did not fix.** The fan-out. A submission a peer's lane cannot
-queue leaves that command on a bare quorum, and nothing says so beyond a
-count on the shutdown report. Whether the collector should re-offer it,
-or whether a lane too full to take a submission should refuse the caller
-rather than silently narrow the quorum, is a question about the
-collector boundary rather than a bound to raise, and it is open.
+queue left that command on a bare quorum, and nothing said so beyond a
+count on the shutdown report. That is the next note.
+
+### A submission nobody could take was nobody's to offer again
+
+**Where:** `coord-collector` (the contract), `coord-daemon/fanout.rs`
+(the classes), `bins/coordd/src/serve.rs` (the sockets), task-c01.
+
+**Expected:** the fan-out puts a command in front of every voter, so
+every voter has a chance to be part of it.
+
+**Actually:** a destination whose lane was full got nothing and nothing
+remembered it. The collector produced the plan, the daemon counted what
+was rejected, and the frame was gone -- 317 of about 880 submissions in
+one measured run. The command still committed, because the
+destinations that *did* take it were a quorum, so from the caller's
+side nothing looked wrong at all. What had happened is that a voter
+busy for a moment was left out of a command it should have had, and the
+next thing to go wrong on one of the two that took it would have no
+third to fall back on.
+
+Presenting the request again does not repair this, and deliberately so:
+a retry of a pending command attaches and sends nothing. So the missing
+piece is a delivery lifecycle, not a bigger queue.
+
+**The rule.** *All-voter targeting is required; all-voter acceptance is
+not.* Both halves do work. The first is why unresolved work keeps its
+delivery obligation: a voter whose lane was full is still a voter, and
+a saturated minority must never acquire a veto by being slow. The
+second is why settled work does not wait: a command established by the
+quorum it needed is answered, and holding a collector's capacity open
+for a destination that may never come back is paying for a delivery
+nobody is waiting on.
+
+**What that needed.** Six things, and the order is the interesting
+part, because each one is what makes the next honest:
+
+*Reserve before dispatch.* A command costs a pending slot and its
+envelope's bytes; both are reserved before a single destination is
+offered anything. That is the last point at which refusing is truthful.
+Past it the command may be anywhere, so "not executed" stops being this
+collector's to say -- and a destination refusing its queue afterwards
+must never be allowed to become one.
+
+*Retain the envelope, not a recipe.* A repeat is another delivery
+attempt for the original submission -- same identity, retry key,
+canonical request, admission facts, acknowledged sequence floor -- from
+one shared handle. Rebuilding it from current session state would mint
+fresh admission facts for a command already submitted under others, and
+a voter comparing the two would be right to call them different
+requests.
+
+*Classify refusals.* A full queue and an absent route pass and are
+offered again. A target the committed configuration does not name as a
+voter, and an envelope a route can never carry, do not: repeating them
+is a busy loop with a known answer. `QueueFull` and `TooManyGroups`
+normalise to saturation, which is also what a full local ingress says,
+so a submission is classified by what it met rather than by which side
+of the process boundary it met it on.
+
+*Bound the rate, never the obligation.* A floor of 25 ms doubling to a
+ceiling of a second per destination, fair across commands, at most
+sixteen destinations a turn. "Bounded retries" here means bounded
+memory and retry pressure -- never *forget an accepted, unresolved
+command after N attempts*, which is the reading that would quietly
+reintroduce the defect.
+
+*Stop at settlement.* The retry state retires, the capacity is
+released, and the voters that never took the submission are recorded
+rather than passing unnoticed. Closing what they missed is the
+replication and recovery path's job, which is what it is for.
+
+*Reconcile on reconfiguration.* A replica that stops being a voter
+stops being a destination; one that becomes a voter is owed the
+submission -- but only while the envelope is still held. A command
+every voter had taken released it, and a latecomer cannot be handed
+what no longer exists, so it is recorded as missed instead of left owed
+an offer that can never be made. Saturation gets no say in either
+direction: a busy queue is not a membership change.
+
+**The coupling this exposed.** A voter that acknowledged a command
+before the submission naming its submitter arrived holds that evidence
+until a submission places it. A duplicate submission produces *no
+effects at all* -- `FollowerRejection::Duplicate` returns an empty
+effect list -- so a repeat that lands after the hold expired finds a
+voter with nothing to hand over, and that acknowledgement is lost for
+good. The hold and the repeat schedule are in different crates and
+neither is free to move alone, so `PARKED_HOLD` is now derived from
+`OFFER_CEILING_MILLIS` rather than chosen beside it.
+
+**What is still not claimed.** An accepted enqueue is not delivery
+evidence. A destination that takes the frame may still fail before
+processing it, and that remains the same-identity retry and recovery
+problem it always was. Repairing `NotQueued` establishes that a
+submission a destination could not take is offered again while the
+command is unresolved -- not reliable end-to-end delivery.
+
+**Did:** `spec/collector-v1.md` is revision 2, because this is a
+contract change and not a daemon detail: the shared document says it,
+not a comment. 17 tests in `dissemination.rs` and two in the daemon's
+fan-out, with a negative control per property -- forgetting a rejected
+destination fails four of them, dropping the byte reservation fails the
+admission test, not retiring at settlement fails the minority test, a
+constant wait fails the backoff test, removing the fairness cursor
+fails the spread test, and marking a latecomer due without an envelope
+fails the reconfiguration test. On the eleven-row benchmark sequence
+every row completes, worst case one operation of 400 to a ten-second
+deadline on a saturated domain.
 
 ### What the benchmark harness had to get right to find these
 

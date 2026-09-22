@@ -712,20 +712,32 @@ pub struct Domain<P: Persistence> {
 /// the caller's collector is one vote short of a quorum it should have
 /// had.
 ///
-/// So the window is derived from that ceiling rather than chosen
-/// beside it. Several ceilings of margin, because what must be covered
-/// is not one repeat but the gap between the slowest two; the depth
-/// bound below still caps what this costs.
+/// So the window is derived from that ceiling rather than chosen beside
+/// it. Twice it, which is what the schedule actually needs: the first
+/// repeat goes at the floor and the wait doubles from there, so two
+/// ceilings covers six consecutive refusals of the same destination
+/// before the wait is at the ceiling at all. Sizing it for the ceiling
+/// *itself* would be sizing the common case for the rare one -- the
+/// hold's volume is the ordinary race, which resolves in microseconds,
+/// and every millisecond of window costs a domain's whole offered rate
+/// in entries.
 const PARKED_HOLD: core::time::Duration =
-    core::time::Duration::from_millis(coord_collector::OFFER_CEILING_MILLIS * 8);
+    core::time::Duration::from_millis(coord_collector::OFFER_CEILING_MILLIS * 2);
 
 /// How much evidence a node holds for want of a submitter.
+///
+/// The ceiling on what the window above can cost. The two are one
+/// bound, not two: a node holds roughly its offered rate times the
+/// window, so a window that grows and a depth that does not is a depth
+/// that starts being reached. This covers a couple of seconds of a
+/// domain running at hundreds of commands a second, in frames that are
+/// one vote each.
 ///
 /// With the hold above this is a ceiling rather than the working bound:
 /// what is normally in here is one second's worth of a race that is won
 /// in microseconds. Reaching it is a signal in its own right, counted
 /// and said apart from the hold expiring.
-const PARKED_EVIDENCE: usize = 256;
+const PARKED_EVIDENCE: usize = 1024;
 
 /// One piece of evidence waiting for the submission that places it.
 struct Parked {
