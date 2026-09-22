@@ -128,6 +128,14 @@ pub struct Counts {
     /// Destinations there was no route to. Not a failure of the
     /// submission: only the quorum rule decides that.
     pub unavailable: u64,
+    /// Destinations an envelope could not reach as it stood. Permanent
+    /// for that frame, so it is not repeated on the congestion
+    /// schedule.
+    pub undeliverable: u64,
+    /// Offers of a submission this node made again, to destinations
+    /// that had not taken it. Not second submissions: the same
+    /// envelope, the same command identity.
+    pub reoffered: u64,
     /// Submissions this node's own voter refused at its door.
     pub refused: u64,
     /// Results the collector released to a waiting caller.
@@ -203,6 +211,16 @@ impl Frontend {
             quorum,
             max_pending: config.limits.max_outstanding_per_session,
             max_resolved: config.limits.max_outstanding_per_session,
+            // Derived from the two bounds that already govern this
+            // domain rather than given a number of its own: what the
+            // collector may owe at once is at most one request's worth
+            // of envelope for each command it may hold pending. A
+            // separate setting here could be raised past either of them
+            // and would stop meaning anything.
+            max_undelivered_bytes: config
+                .limits
+                .max_outstanding_per_session
+                .saturating_mul(config.limits.max_request_bytes),
         });
         let admission = Admission::new(
             membership.cluster(),
@@ -662,6 +680,14 @@ pub struct Domain<P: Persistence> {
     no_plane_said: bool,
     /// Refusals this node keeps saying, so that it says them less.
     recurring: Recurring,
+    /// When this domain's loop started, as the base of the monotonic
+    /// milliseconds the collector schedules re-offers against.
+    ///
+    /// Not the wall clock the deadline path uses. A retry schedule on a
+    /// clock that can step is a schedule that can stall or stampede,
+    /// and a node whose time source is corrected must not answer that
+    /// by re-offering everything at once.
+    started: std::time::Instant,
     /// Peer events taken since the last caller's event, so the peer
     /// plane's priority cannot become the caller plane's starvation.
     peer_streak: u32,
@@ -670,20 +696,28 @@ pub struct Domain<P: Persistence> {
 
 /// How long evidence waits for the submission that says where it goes.
 ///
-/// The race this covers is short: the submission and the proposal leave
-/// the collector's node at nearly the same moment, and the proposal
-/// arriving first is a matter of scheduling, not of distance. What the
-/// window must not be is open-ended, because the other way a submission
-/// fails to arrive is that it never will -- a fan-out the peer's lane
-/// could not queue is dropped by the transport, and no retry of that
-/// presentation is coming. Holding those until the depth bound evicts
-/// them makes an ordinary consequence of backpressure look like a bound
-/// that is wrong.
+/// The race this covers used to be short: the submission and the
+/// proposal leave the collector's node at nearly the same moment, and
+/// the proposal arriving first is a matter of scheduling rather than of
+/// distance. A second was orders of magnitude past that.
 ///
-/// A second is orders of magnitude past the race and still short enough
-/// that a loaded voter holds one second's evidence rather than a whole
-/// depth of it.
-const PARKED_HOLD: core::time::Duration = core::time::Duration::from_secs(1);
+/// It is not the only race any more. A submission a destination's lane
+/// could not queue is now offered again by the collector that owns it,
+/// on a schedule that backs off to
+/// [`coord_collector::OFFER_CEILING_MILLIS`] between repeats -- and a
+/// hold shorter than that schedule expires *between* two repeats. The
+/// frame then lands on a voter that has already acknowledged the
+/// command and has nothing left to hand over: a duplicate submission
+/// produces no effects, so the acknowledgement is lost for good and
+/// the caller's collector is one vote short of a quorum it should have
+/// had.
+///
+/// So the window is derived from that ceiling rather than chosen
+/// beside it. Several ceilings of margin, because what must be covered
+/// is not one repeat but the gap between the slowest two; the depth
+/// bound below still caps what this costs.
+const PARKED_HOLD: core::time::Duration =
+    core::time::Duration::from_millis(coord_collector::OFFER_CEILING_MILLIS * 8);
 
 /// How much evidence a node holds for want of a submitter.
 ///
@@ -769,6 +803,14 @@ impl Recurring {
 /// that stays full, which is a peer too far behind to take what this
 /// node has for it.
 const UNDELIVERABLE_SAID_AT: u64 = 64;
+
+/// Destinations one turn will re-offer a submission to.
+///
+/// A repeat is delivery work, and delivery work must never be able to
+/// crowd out the work it exists to enable. This is the whole of what a
+/// turn spends on it; what is still owed after that is owed on the next
+/// turn, on the collector's schedule.
+const OFFERS_PER_TURN: usize = 16;
 
 /// How many peer events in a row are taken before the caller's plane is
 /// polled first for one turn.
@@ -881,6 +923,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
+            started: std::time::Instant::now(),
             peer_streak: 0,
             budgets,
         }
@@ -1062,6 +1105,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // source, so nothing will wake the loop on its behalf.
             self.pump_watches(&ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS))
                 .await;
+            // A submission a destination could not take is offered
+            // again here, on the collector's schedule and within a
+            // per-turn budget. It goes after the voter's own turn and
+            // before the loop waits, for the same reason the watches
+            // do: nothing else will wake this loop on a re-offer's
+            // behalf, and a domain that has gone quiet is exactly when
+            // the destination that was busy is free again.
+            self.reoffer(transport);
             // Two planes and one voter. The peer plane is polled first:
             // a vote, an adoption or a recovery summary from a peer is
             // the work that lets a caller's request finish, and a
@@ -1505,6 +1556,65 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
+    /// Monotonic milliseconds since this domain's loop started.
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record one offer's outcome with the collector, and count it.
+    ///
+    /// Every offer goes through here, the first and every repeat, so
+    /// the delivery state the collector re-offers from is the state
+    /// this process actually produced rather than a plan it was
+    /// assumed to have carried out.
+    fn record_offer(&mut self, command: CommandId, out: &fanout::Dispatched) {
+        let counts = &mut self.frontend.counts;
+        counts.queued_local += out.queued_local() as u64;
+        counts.queued_remote += out.queued_remote() as u64;
+        counts.not_a_voter += out.not_a_committed_voter() as u64;
+        counts.saturated += out.saturated() as u64;
+        counts.unavailable += out.unavailable() as u64;
+        counts.undeliverable += out.undeliverable() as u64;
+        let now = self.now_millis();
+        self.frontend
+            .frontend
+            .dispatcher_mut()
+            .offered(now, &out.offered(command));
+    }
+
+    /// Offer again what a destination could not take, for commands this
+    /// collector still owes one.
+    ///
+    /// Bounded in two ways that matter. `OFFERS_PER_TURN` caps what one
+    /// turn spends on repeats, so a congested destination cannot
+    /// displace new work, protocol traffic or recovery; and the
+    /// collector's own schedule decides which destinations are due, so
+    /// the budget is spread across commands rather than poured into the
+    /// first one. Neither bound ever gives up on an accepted command:
+    /// what they bound is the rate, and the obligation ends at
+    /// settlement.
+    fn reoffer(&mut self, transport: &Transport) {
+        let now = self.now_millis();
+        let due = self
+            .frontend
+            .frontend
+            .dispatcher_mut()
+            .due_offers(now, OFFERS_PER_TURN);
+        for plan in due {
+            let command = plan.command;
+            let out = fanout::dispatch(
+                &self.frontend.membership,
+                transport,
+                self.frontend
+                    .local
+                    .as_ref()
+                    .map(|l| l as &dyn fanout::LocalIngress),
+                &plan,
+            );
+            self.frontend.counts.reoffered += 1;
+            self.record_offer(command, &out);
+        }
+    }
     /// Deliver held evidence whose submitter this voter now knows, and
     /// let go of what has waited longer than the race can take.
     ///
@@ -1932,6 +2042,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 {
                     drop(displaced);
                 }
+                let command = plan.command;
                 let out = fanout::dispatch(
                     &self.frontend.membership,
                     transport,
@@ -1941,12 +2052,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         .map(|l| l as &dyn fanout::LocalIngress),
                     &plan,
                 );
-                let counts = &mut self.frontend.counts;
-                counts.queued_local += out.queued_local() as u64;
-                counts.queued_remote += out.queued_remote() as u64;
-                counts.not_a_voter += out.not_a_committed_voter() as u64;
-                counts.saturated += out.saturated() as u64;
-                counts.unavailable += out.unavailable() as u64;
+                self.record_offer(command, &out);
             }
             Step::Watch {
                 watch_id,

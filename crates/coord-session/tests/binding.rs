@@ -209,6 +209,7 @@ fn frontend(ring: &KeyRing) -> BoundFrontend {
             quorum,
             max_pending: 64,
             max_resolved: 16,
+            max_undelivered_bytes: usize::MAX,
         }),
         16,
     );

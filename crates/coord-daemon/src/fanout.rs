@@ -77,6 +77,15 @@ pub struct Queued {
 }
 
 /// Why a planned destination received nothing.
+///
+/// Four classes, and they are four because they want four different
+/// answers. Saturation is a live voter under load and wants another
+/// offer shortly. Unavailability is a link that is down and wants
+/// another offer too, but tells an operator something different.
+/// A plan naming a non-voter is a disagreement with the configuration,
+/// which repeating cannot settle. An envelope that cannot fit the route
+/// is permanent for this frame. Collapsing any of them into the others
+/// would put one on the wrong schedule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotQueued {
     /// The committed configuration does not name this replica as a voter
@@ -86,7 +95,19 @@ pub enum NotQueued {
     NotACommittedVoter,
     /// The destination's ingress is full. The voter exists and is
     /// addressable; there was no room to accept the frame right now.
+    ///
+    /// Both routes reach this the same way. A local ingress says so
+    /// directly; a remote one says `QueueFull` or `TooManyGroups`,
+    /// which are the transport's two ways of saying the same thing --
+    /// this destination's share of a bounded resource is spent. They
+    /// are normalised here so that what a caller's submission meets is
+    /// classified by what it *is* rather than by which side of the
+    /// process boundary it happened on.
     Saturated,
+    /// The frame cannot reach this destination as it stands: it does
+    /// not fit what the route may carry. Permanent for this envelope,
+    /// so it is not on the congestion schedule.
+    Undeliverable(SendError),
     /// There is no route to the destination at the moment.
     Unavailable(SendError),
 }
@@ -103,6 +124,32 @@ pub struct Dispatched {
 }
 
 impl Dispatched {
+    /// What this attempt achieved, in the vocabulary the collector owes
+    /// the obligation in.
+    ///
+    /// The translation is one way on purpose. This module knows about
+    /// routes, incarnations and transports; the collector knows about
+    /// destinations and whether they still owe an enqueue. Handing it
+    /// `SendError` would make the collector's contract depend on which
+    /// transport is underneath it.
+    pub fn offered(&self, command: coord_types::CommandId) -> coord_collector::Offered {
+        let mut outcomes: Vec<(ReplicaId, coord_collector::OfferOutcome)> = self
+            .queued
+            .iter()
+            .map(|q| (q.replica, coord_collector::OfferOutcome::Queued))
+            .collect();
+        outcomes.extend(self.rejected.iter().map(|(replica, why)| {
+            let outcome = match why {
+                NotQueued::NotACommittedVoter => coord_collector::OfferOutcome::NotACommittedVoter,
+                NotQueued::Saturated => coord_collector::OfferOutcome::Saturated,
+                NotQueued::Undeliverable(_) => coord_collector::OfferOutcome::Undeliverable,
+                NotQueued::Unavailable(_) => coord_collector::OfferOutcome::Unreachable,
+            };
+            (*replica, outcome)
+        }));
+        coord_collector::Offered { command, outcomes }
+    }
+
     /// Frames taken by a voter's ingress in this process.
     pub fn queued_local(&self) -> usize {
         self.queued
@@ -135,6 +182,14 @@ impl Dispatched {
         self.rejected
             .iter()
             .filter(|(_, why)| matches!(why, NotQueued::Unavailable(_)))
+            .count()
+    }
+
+    /// Destinations this envelope can never reach as it stands.
+    pub fn undeliverable(&self) -> usize {
+        self.rejected
+            .iter()
+            .filter(|(_, why)| matches!(why, NotQueued::Undeliverable(_)))
             .count()
     }
 
@@ -206,6 +261,21 @@ pub trait LocalIngress {
 /// An ingress with no room for another frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Saturated;
+
+/// Which class a transport refusal belongs to.
+///
+/// The transport reports what it could not do; this says what kind of
+/// problem that is. `QueueFull` and `TooManyGroups` are a destination
+/// at a bound and will pass; `TooLarge` is this frame against this
+/// route and will not; everything else is a link that is not there
+/// right now.
+fn classify(e: SendError) -> NotQueued {
+    match e {
+        SendError::QueueFull { .. } | SendError::TooManyGroups { .. } => NotQueued::Saturated,
+        SendError::TooLarge { .. } => NotQueued::Undeliverable(e),
+        _ => NotQueued::Unavailable(e),
+    }
+}
 
 /// What `dispatch` decided to do with one planned target.
 enum Destination {
@@ -284,7 +354,7 @@ pub fn dispatch(
                         incarnation,
                         route: Route::Remote,
                     }),
-                    Some(Err(e)) => out.rejected.push((*target, NotQueued::Unavailable(e))),
+                    Some(Err(e)) => out.rejected.push((*target, classify(e))),
                     // A transport that answered fewer targets than it was
                     // given has told us nothing about this one. It is
                     // reported as unreachable rather than quietly counted

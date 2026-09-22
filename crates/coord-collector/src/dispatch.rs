@@ -415,6 +415,25 @@ impl Dispatcher {
         Ok(self.deliver(progress))
     }
 
+    /// Record what an offer of a submission achieved, destination by
+    /// destination.
+    ///
+    /// Delivery only: nothing here answers a caller, and nothing here
+    /// can fail a command.
+    pub fn offered(&mut self, now_millis: u64, report: &crate::collector::Offered) {
+        self.collector.offered(now_millis, report);
+    }
+
+    /// The re-offers that are due, bounded by `budget` destinations.
+    pub fn due_offers(&mut self, now_millis: u64, budget: usize) -> Vec<crate::collector::FanOut> {
+        self.collector.due_offers(now_millis, budget)
+    }
+
+    /// Commands that still owe a destination an enqueue (diagnostic).
+    pub fn undelivered(&self) -> usize {
+        self.collector.undelivered()
+    }
+
     /// A release from the leader.
     pub fn on_release(
         &mut self,
