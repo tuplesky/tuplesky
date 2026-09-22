@@ -13,7 +13,7 @@
 //! do: a join that happened in several places would be several
 //! opportunities for one of them to answer the wrong caller.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use coord_authn::ClockHealth;
 use coord_checkpoint::local::LocalLimits;
@@ -176,6 +176,10 @@ pub struct Counts {
     /// the traffic have diverged, which is a different thing from a
     /// submission that never came.
     pub crowded_out: u64,
+    /// Commands the collector completed from this node's own durable
+    /// record of their execution, because half of what a release needs
+    /// had arrived and the other half had not (task-c02).
+    pub settled_from_record: u64,
 }
 
 impl Frontend {
@@ -684,7 +688,7 @@ pub struct Domain<P: Persistence> {
     asked: Option<(std::time::Instant, u64, u64)>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
-    parked: VecDeque<Parked>,
+    parked: coord_daemon::parked::Parked,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -739,17 +743,16 @@ pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
 ///
 /// The race this covers is short: the submission and the proposal leave
 /// the collector's node at nearly the same moment, and the proposal
-/// arriving first is a matter of scheduling, not of distance. What the
-/// window must not be is open-ended, because the other way a submission
-/// fails to arrive is that it never will -- a fan-out the peer's lane
-/// could not queue is dropped by the transport, and no retry of that
-/// presentation is coming. Holding those until the depth bound evicts
-/// them makes an ordinary consequence of backpressure look like a bound
-/// that is wrong.
+/// arriving first is a matter of scheduling, not of distance. A second
+/// is orders of magnitude past it.
 ///
-/// A second is orders of magnitude past the race and still short enough
-/// that a loaded voter holds one second's evidence rather than a whole
-/// depth of it.
+/// A performance control, not a correctness boundary (task-c02). What
+/// is let go here is not lost: the voter that produced it keeps what it
+/// published, and the submission that eventually names the command --
+/// a collector's repeat, or a retry -- has the voter publish it again.
+/// The hold exists so that the ordinary race, won in microseconds, is
+/// served from here rather than from that repair, and so that a loaded
+/// voter holds a second's evidence rather than a whole depth of it.
 const PARKED_HOLD: core::time::Duration = core::time::Duration::from_secs(1);
 
 /// How much evidence a node holds for want of a submitter.
@@ -757,22 +760,9 @@ const PARKED_HOLD: core::time::Duration = core::time::Duration::from_secs(1);
 /// With the hold above this is a ceiling rather than the working bound:
 /// what is normally in here is one second's worth of a race that is won
 /// in microseconds. Reaching it is a signal in its own right, counted
-/// and said apart from the hold expiring.
+/// and said apart from the hold expiring. Like the hold, what it drops
+/// is recoverable the same way (task-c02).
 const PARKED_EVIDENCE: usize = 256;
-
-/// One piece of evidence waiting for the submission that places it.
-///
-/// Generic over the provenance only so the hold's timing can be tested
-/// without minting a voter's provenance here: that constructor is
-/// confined to the voter runtime, and nothing about when a hold runs out
-/// depends on whose evidence it is.
-struct Parked<P = PeerProvenance> {
-    command: CommandId,
-    provenance: P,
-    bytes: Vec<u8>,
-    /// When it was parked, so the hold above can be applied to it.
-    since: std::time::Instant,
-}
 
 /// Held evidence is due to be let go when the oldest of it has waited
 /// the whole hold.
@@ -783,36 +773,10 @@ struct Parked<P = PeerProvenance> {
 /// not be said, until unrelated traffic arrived. Registered here, the
 /// loop takes a turn when the oldest hold runs out, and that turn lets
 /// it go -- which moves this deadline on to the next oldest, or away.
-impl<P> Deadline for VecDeque<Parked<P>> {
+impl Deadline for coord_daemon::parked::Parked {
     fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.front().map(|oldest| oldest.since + PARKED_HOLD)
+        self.next_expiry()
     }
-}
-
-/// Take out what can be routed at `now`: every frame whose submitter
-/// `origin_of` names, in the order it was parked, and let go of what has
-/// waited the whole hold without one. Returns the ready frames and how
-/// many were let go.
-fn route_held<P>(
-    parked: &mut VecDeque<Parked<P>>,
-    now: std::time::Instant,
-    origin_of: impl Fn(&CommandId) -> Option<coord_daemon::voter::Origin>,
-) -> (Vec<(coord_daemon::voter::Origin, P, Vec<u8>)>, u64) {
-    let mut still_waiting = VecDeque::with_capacity(parked.len());
-    let mut ready = Vec::new();
-    let mut unclaimed = 0;
-    for held in core::mem::take(parked) {
-        match origin_of(&held.command) {
-            Some(origin) => ready.push((origin, held.provenance, held.bytes)),
-            // Past the window the race takes, so the submission is not
-            // late, it is not coming. Let it go rather than hold it until
-            // something newer needs the room.
-            None if now.duration_since(held.since) >= PARKED_HOLD => unclaimed += 1,
-            None => still_waiting.push_back(held),
-        }
-    }
-    *parked = still_waiting;
-    (ready, unclaimed)
 }
 
 /// How often a node repeats a request for a payload it is waiting on.
@@ -842,6 +806,11 @@ pub trait Deadline {
     /// wake the loop again at once, for ever.
     fn next_deadline(&self) -> Option<std::time::Instant>;
 }
+
+/// How many half-held commands one turn consults the durable record for
+/// (task-c02). A bound on one turn's reads, not on the obligation: what
+/// is not reached this turn is reached the next.
+const SETTLE_PER_TURN: usize = 16;
 
 /// How many times a recurring condition is said in full before it is
 /// said only at each doubling.
@@ -1016,7 +985,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
             asked: None,
-            parked: VecDeque::new(),
+            parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
@@ -1199,6 +1168,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // source, so nothing will wake the loop on its behalf.
             self.pump_watches(&ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS))
                 .await;
+            self.settle_from_records();
             // Two planes and one voter. The peer plane is polled first:
             // a vote, an adoption or a recovery summary from a peer is
             // the work that lets a caller's request finish, and a
@@ -1643,20 +1613,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Hold a frame until the submission that says where it belongs
     /// arrives.
     ///
-    /// Bounded, and by the same thing the window is: a command can be in
-    /// this state only between this voter acknowledging it and the
-    /// submission reaching this voter, so the queue is as deep as the
-    /// commands that can be in flight at once. Past the bound the oldest
-    /// goes, which is the one whose submission is least likely still
-    /// coming; the command is decided and durable either way, and the
-    /// caller resolves it by identity.
+    /// Bounded in depth as well as in time, and past the depth the
+    /// oldest goes, which is the one whose submission is least likely
+    /// still coming. Neither bound loses anything a caller needs: the
+    /// command is decided and durable either way, and the submission
+    /// that names it has this voter publish its evidence again
+    /// (task-c02).
     fn park(&mut self, command: CommandId, provenance: PeerProvenance, bytes: &[u8]) {
-        self.parked.push_back(Parked {
+        let crowded_out = self.parked.park(
             command,
             provenance,
-            bytes: bytes.to_vec(),
-            since: std::time::Instant::now(),
-        });
+            bytes.to_vec(),
+            std::time::Instant::now(),
+        );
         self.frontend.counts.parked += 1;
         // Said once, not once per frame. That this happens at all is
         // ordinary -- it is a command this voter heard about from a
@@ -1665,15 +1634,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         if self.frontend.counts.parked == 1 {
             eprintln!("this voter is holding evidence for a submitter it does not know yet");
         }
-        while self.parked.len() > PARKED_EVIDENCE {
-            self.parked.pop_front();
-            self.frontend.counts.crowded_out += 1;
+        if crowded_out > 0 {
             // Said once, and not the same thing as the hold expiring:
             // this is the bound itself being reached, which it should
             // not be while the hold is doing the releasing.
-            if self.frontend.counts.crowded_out == 1 {
+            if self.frontend.counts.crowded_out == 0 {
                 eprintln!("this voter dropped held evidence for want of room");
             }
+            self.frontend.counts.crowded_out += crowded_out as u64;
         }
     }
 
@@ -1693,17 +1661,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &self.backing else {
             return;
         };
-        let (ready, unclaimed) =
-            route_held(&mut self.parked, std::time::Instant::now(), |command| {
-                voter.origin_of(command)
-            });
-        if unclaimed > 0 {
+        let routed = self.parked.route(std::time::Instant::now(), |command| {
+            voter.origin_of(command)
+        });
+        if routed.unclaimed > 0 {
             if self.frontend.counts.unclaimed == 0 {
                 eprintln!("this voter let go of evidence no submission named inside the window");
             }
-            self.frontend.counts.unclaimed += unclaimed;
+            self.frontend.counts.unclaimed += routed.unclaimed as u64;
         }
-        for (origin, provenance, bytes) in ready {
+        for (origin, provenance, bytes) in routed.ready {
             match origin {
                 coord_daemon::voter::Origin::Connection(id) => {
                     self.return_to_collector(api, id, &bytes);
@@ -1714,6 +1681,66 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     }
                 }
             }
+        }
+    }
+
+    /// Complete what the collector half holds from this node's own
+    /// durable record of the command's execution (task-c02).
+    ///
+    /// A collector that holds the leader's release but not the votes, or
+    /// the votes but not the release, is the shape a lost frontend
+    /// delivery leaves behind: the acknowledgement or the release went to
+    /// a frontend that did not yet know which collector had asked, and
+    /// that frontend stopped holding it. A voter repairs the first case
+    /// when the submission reaches it again; this closes both when the
+    /// command has executed *here*, because then this node's committed
+    /// state says what the missing half would have said. It is the same
+    /// record that answers a caller's retry before anything is
+    /// submitted, read the same way, and trusted for the same reason.
+    ///
+    /// Bounded per turn, and cheap when nothing is half held, which is
+    /// nearly always.
+    fn settle_from_records(&mut self) {
+        let half = self.frontend.frontend.dispatcher_mut().half_established();
+        if half.is_empty() {
+            return;
+        }
+        let mut deliveries = Vec::new();
+        let records = coord_daemon::settle::records_for(
+            self.backing.applier(),
+            half.into_iter().take(SETTLE_PER_TURN),
+        );
+        for (command, record) in records {
+            match self.frontend.frontend.dispatcher_mut().settle_from_record(
+                command,
+                record.result_digest,
+                record.revision,
+                &record.response,
+            ) {
+                Ok(delivery) => {
+                    self.frontend.counts.settled_from_record += 1;
+                    deliveries.extend(delivery);
+                }
+                // The release this collector holds and what this node
+                // executed disagree. Neither is believed; said, because
+                // it is the one outcome here that is not ordinary.
+                Err(coord_collector::SettleError::Mismatch) => {
+                    let head: String = command.as_bytes()[..4]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    let said = format!("release-record-mismatch({head})");
+                    if let Some(n) = self.recurring.seen(&said) {
+                        eprintln!(
+                            "this node's durable record and the leader's release disagree: {said} ({n} so far)"
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        for delivery in deliveries {
+            self.answer(delivery);
         }
     }
 
@@ -2696,36 +2723,35 @@ mod tests {
     /// its turn would instead wake the loop for ever.
     #[test]
     fn held_evidence_is_due_when_its_hold_runs_out_and_its_turn_lets_it_go() {
-        use super::{Deadline, PARKED_HOLD, Parked, route_held};
+        use super::{Deadline, PARKED_EVIDENCE, PARKED_HOLD};
         use coord_types::identity::Digest32;
 
         let t0 = std::time::Instant::now();
-        let held = |n: u8, since| Parked {
-            command: coord_types::CommandId(Digest32([n; 32])),
-            provenance: (),
-            bytes: vec![n],
-            since,
-        };
-        let mut parked = std::collections::VecDeque::new();
+        let command = |n: u8| coord_types::CommandId(Digest32([n; 32]));
+        let provenance = coord_core::event::PeerProvenance::from_local_voter(
+            ReplicaId([1; 16]),
+            ReplicaIncarnation::new(1).expect("positive"),
+        );
+        let mut parked = coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE);
         assert_eq!(parked.next_deadline(), None, "nothing held, nothing due");
         let later = t0 + std::time::Duration::from_millis(300);
-        parked.push_back(held(1, t0));
-        parked.push_back(held(2, later));
+        parked.park(command(1), provenance, vec![1], t0);
+        parked.park(command(2), provenance, vec![2], later);
         let due = t0 + PARKED_HOLD;
         assert_eq!(parked.next_deadline(), Some(due), "due with the oldest");
 
         // A turn before the deadline lets nothing go and leaves it.
         let early = due - std::time::Duration::from_millis(1);
-        let (ready, unclaimed) = route_held(&mut parked, early, |_| None);
-        assert!(ready.is_empty());
-        assert_eq!(unclaimed, 0);
+        let routed = parked.route(early, |_| None);
+        assert!(routed.ready.is_empty());
+        assert_eq!(routed.unclaimed, 0);
         assert_eq!(parked.next_deadline(), Some(due));
 
         // The turn the deadline wakes lets the oldest go, as unclaimed,
         // and the deadline moves on to the next oldest -- in the future.
-        let (ready, unclaimed) = route_held(&mut parked, due, |_| None);
-        assert!(ready.is_empty());
-        assert_eq!(unclaimed, 1);
+        let routed = parked.route(due, |_| None);
+        assert!(routed.ready.is_empty());
+        assert_eq!(routed.unclaimed, 1);
         let next = parked.next_deadline().expect("one still held");
         assert_eq!(next, later + PARKED_HOLD);
         assert!(
@@ -2734,8 +2760,7 @@ mod tests {
         );
 
         // And once nothing is held nothing is due.
-        let (_, unclaimed) = route_held(&mut parked, next, |_| None);
-        assert_eq!(unclaimed, 1);
+        assert_eq!(parked.route(next, |_| None).unclaimed, 1);
         assert_eq!(parked.next_deadline(), None);
     }
 

@@ -2117,6 +2117,47 @@ reaching it, so the depth that matters is the commands in flight at
 once. Past the bound the oldest goes and says so, because a caller's
 collector is then one acknowledgement short and will not be told why.
 
+*Revisited under [task-c02](design/tuplesky-prs-plan.md#task-c02).* The
+hold was the wrong place to put the correctness. What a caller's
+collector needs is that voter's acknowledgement, and the voter still has
+it: it published it once, and a submission naming the command is the
+voter being asked again. So a voter now keeps what it published to the
+frontend for every command it remembers and, on an exact duplicate --
+same identity, same admission facts, same acknowledged floor --
+publishes it again to the frontend only, through the same outbox and
+the same gates (boot, durability, promise), with the release driven in
+the same step. The leader does the same for its reply, which turned out
+to matter more: a follower's lost acknowledgement leaves a collector one
+voter short, the leader's leaves it unable to learn at all. The hold and
+its depth are now performance controls -- they keep the ordinary race
+off the repair path -- and not the boundary of recoverability.
+
+The boundary of recoverability is the durable record. A voter that has
+forgotten a command, or restarted since it acknowledged it, has nothing
+to publish again; but if the command executed, its retry record is
+committed state on every node that applied it, including the
+collector's own. A collector holding half of a release -- the predicate
+without the release, or the release without the predicate, which is the
+shape a lost frontend delivery leaves -- now completes the command from
+that record, checked against the release it holds where it holds one,
+and never from nothing. That is the same record and the same trust that
+answer a caller's retry before anything is submitted.
+`coord_consensus::replay` and `Collector::settle_from_record` carry the
+two halves; `spec/collector-v1.md` revision 2 states them. The hold
+itself moved out of the serving loop into `coord_daemon::parked`, with
+the instant as an input, and the record lookup into
+`coord_daemon::settle`, so that the schedule that lost the evidence --
+the hold expiring, or the depth crowding it out with no time passing --
+is one a test produces rather than waits for. `coord-daemon/tests/repair.rs`
+runs it against three real voters over real stores and the real
+collector: the evidence is lost, the duplicate arrives, the collector
+learns and releases from what was published again and from nothing
+else, no peer is sent to and nothing executes twice; the same schedule
+with the repair's output discarded -- which is what the code did before
+-- leaves the caller waiting, and stubbing the repair out fails the
+core tests. The record path is exercised the same way, once after a
+refused repair and once for a lost release.
+
 Two things this makes visible that were not. A voter now says once that
 it is holding evidence for a submitter it does not know, which is
 ordinary and worth seeing; and it says once if it ever drops any, which

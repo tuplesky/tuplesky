@@ -46,7 +46,7 @@ pub mod wire;
 pub use admission::{Admission, AdmissionLimits, AdmissionRefusal, Caller};
 pub use collector::{
     Collector, CollectorConfig, EvidenceError, Expired, FanOut, HoldReason, Progress, Release,
-    Resolution, SubmitRefusal, Submitted,
+    Resolution, SettleError, SubmitRefusal, Submitted,
 };
 pub use dispatch::{Action, Delivery, Dispatcher};
 pub use ingress::{IngressError, admitted_from_submit, frontend_frame};

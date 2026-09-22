@@ -95,6 +95,15 @@ pub enum CollectorEvent {
         /// Whether a caller was still attached to receive it.
         delivered: bool,
     },
+    /// The durable record of the command's execution on this node
+    /// completed what the collector half held (task-c02). Followed by
+    /// the `Released` it produced.
+    SettledFromRecord {
+        /// Command.
+        command: String,
+        /// What the collector held of its own: `release` or `votes`.
+        corroborated: String,
+    },
     /// The caller went away; identity and outcome resolution stay.
     Cancelled {
         /// Command.

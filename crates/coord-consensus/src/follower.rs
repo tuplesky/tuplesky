@@ -77,8 +77,31 @@ pub enum FollowerRejection {
         /// Command bound first.
         bound: CommandId,
     },
-    /// Already initialized; nothing changed.
+    /// The same command was presented again under the same facts. Not a
+    /// fault: what this replica already produced for it is offered to
+    /// the submitter again (task-c02).
     Duplicate(CommandId),
+    /// The retry key is bound to this command, but the presentation
+    /// carries other admission facts or another acknowledged floor. The
+    /// identity is shared; the request is not, and nothing is replayed
+    /// for it.
+    RequestFactsConflict {
+        /// Command.
+        command: CommandId,
+        /// Digest of the facts this replica accepted the command under.
+        accepted: coord_types::identity::Digest32,
+    },
+    /// The command table holds this command under another payload
+    /// digest. Nothing is replayed for it.
+    PayloadConflict(CommandId),
+    /// An exact duplicate could not repair delivery of this replica's
+    /// evidence, and why. The command itself is unaffected.
+    ReplayRefused {
+        /// Command.
+        command: CommandId,
+        /// Why.
+        why: crate::replay::ReplayRefusal,
+    },
     /// The command table is full.
     Backpressure,
     /// A vote or adoption batch failed; the command stays where it was.
@@ -242,6 +265,11 @@ pub struct Follower {
     /// synchronized to but not finished installing.
     resumed: Option<SyncDecision>,
     rejections: Vec<FollowerRejection>,
+    /// What this replica published to the frontend for each command it
+    /// still remembers, kept so an exact duplicate submission can offer
+    /// it to the submitter again (task-c02). Never recovered: the outbox
+    /// it went through is this boot's.
+    replay: crate::replay::EvidenceStore,
 }
 
 impl Follower {
@@ -312,6 +340,7 @@ impl Follower {
             .map(|(c, _)| (*c, (u64::MAX, true)))
             .collect();
         Follower {
+            replay: crate::replay::EvidenceStore::new(config.capacity),
             config,
             sync_barrier: None,
             boot: None,
@@ -446,6 +475,7 @@ impl Follower {
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
             resumed: None,
+            replay: crate::replay::EvidenceStore::new(state.capacity),
         }
     }
 
@@ -1178,13 +1208,17 @@ impl Follower {
     /// acceptance batches of its prerequisites are all part of what the
     /// acknowledgement claims, so none of them may still be volatile when
     /// it leaves. (The outbox drops a send whose barrier fails.)
-    fn publish_to_voters_and_frontend(&mut self, barrier: BarrierId, message: ProtocolMessage) {
+    fn publish_to_voters_and_frontend(
+        &mut self,
+        command: CommandId,
+        barrier: BarrierId,
+        message: ProtocolMessage,
+    ) {
         let Some(boot) = self.boot else {
             return;
         };
-        let context =
-            self.ballots
-                .context(boot, self.config.quorum.ballot(), LocalJournalSeq::ZERO);
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let mut requires: Vec<BarrierId> = self.pending.keys().copied().collect();
         if !requires.contains(&barrier) {
             requires.push(barrier);
@@ -1207,10 +1241,77 @@ impl Follower {
         }
         outbox.publish(PendingSend {
             context,
-            requires,
+            requires: requires.clone(),
             to: self.config.frontend,
-            frame,
+            frame: frame.clone(),
         });
+        // The frontend's copy is the one a submission can ask for again:
+        // it is the one that may have been held and let go before the
+        // submitter was known (task-c02).
+        self.replay.retain(
+            command,
+            crate::replay::RetainedEvidence {
+                barrier,
+                ballot,
+                context,
+                requires,
+                frame,
+            },
+            &self.table,
+        );
+    }
+
+    /// Offer the submitter the evidence this replica already published
+    /// for `command`, because a submission naming it arrived again.
+    ///
+    /// The ordinary way a submission arrives after this replica has
+    /// acknowledged the command: the acknowledgement went to a frontend
+    /// that did not yet know which collector had asked, and that frontend
+    /// has stopped holding it. The collector is one voter short; the
+    /// command, ordered and perhaps executed, is unaffected. So the same
+    /// acknowledgement -- the bytes that were published, under the
+    /// context they were published in, requiring the barriers they
+    /// required -- is published again, to the frontend only, through the
+    /// same outbox. The boot fence, the durable prerequisites and the
+    /// promise are checked at release exactly as they were the first
+    /// time, and the release is driven here so there is no gap between
+    /// the publication and the check.
+    fn repair_evidence(&mut self, command: CommandId) -> Vec<Effect> {
+        let why = if !self.may_vote() {
+            crate::replay::ReplayRefusal::Fenced
+        } else {
+            let Some(outbox) = self.outbox.as_mut() else {
+                self.rejections.push(FollowerRejection::ReplayRefused {
+                    command,
+                    why: crate::replay::ReplayRefusal::Fenced,
+                });
+                return Vec::new();
+            };
+            match self.replay.plan(
+                command,
+                outbox,
+                self.config.quorum.ballot(),
+                self.config.frontend,
+                &self.table,
+            ) {
+                Ok(sends) => {
+                    for send in sends {
+                        outbox.publish(send);
+                    }
+                    return self.release();
+                }
+                Err(why) => why,
+            }
+        };
+        self.rejections
+            .push(FollowerRejection::ReplayRefused { command, why });
+        Vec::new()
+    }
+
+    /// How often `command`'s evidence has been published again this boot
+    /// (diagnostic).
+    pub fn evidence_repairs(&self, command: &CommandId) -> u32 {
+        self.replay.repairs_of(command)
     }
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
@@ -1266,6 +1367,12 @@ impl Follower {
             self.rejections.push(FollowerRejection::MalformedRequest);
             return Vec::new();
         };
+        let payload = PayloadRecordV1 {
+            retry_key,
+            logical,
+            admission,
+            ack_through,
+        };
         match self.bindings.get(&retry_key) {
             Some(bound) if *bound != command => {
                 self.rejections
@@ -1275,18 +1382,39 @@ impl Follower {
                     });
                 return Vec::new();
             }
+            // The same identity again. Whether it is the same *request*
+            // is decided by everything that travelled beside the identity
+            // -- the attested admission and the acknowledged floor --
+            // against what this replica accepted the command under. Only
+            // an exact match is a duplicate, and a duplicate is not
+            // nothing: the submitter presenting it may never have
+            // received what this replica already said about the command.
             Some(_) => {
-                self.rejections.push(FollowerRejection::Duplicate(command));
-                return Vec::new();
+                let accepted = self
+                    .payloads
+                    .get(&command)
+                    .map(PayloadRecordV1::admission_digest);
+                return match accepted {
+                    Some(accepted) if accepted == payload.admission_digest() => {
+                        self.rejections.push(FollowerRejection::Duplicate(command));
+                        self.repair_evidence(command)
+                    }
+                    Some(accepted) => {
+                        self.rejections
+                            .push(FollowerRejection::RequestFactsConflict { command, accepted });
+                        Vec::new()
+                    }
+                    // Bound but no payload row to compare against: nothing
+                    // here can vouch for the facts, so nothing is replayed
+                    // and nothing is re-initialized over the binding.
+                    None => {
+                        self.rejections.push(FollowerRejection::Duplicate(command));
+                        Vec::new()
+                    }
+                };
             }
             None => {}
         }
-        let payload = PayloadRecordV1 {
-            retry_key,
-            logical,
-            admission,
-            ack_through,
-        };
         // Atomic initialization; the placeholder of an early proposal (if
         // any) becomes the record in this same transition. What is bound
         // beside the identity is the admission: a second presentation of
@@ -1308,8 +1436,20 @@ impl Follower {
                 self.rejections.push(FollowerRejection::Backpressure);
                 return self.advance_pending();
             }
-            Err(InitError::AlreadyInitialized | InitError::PayloadConflict) => {
+            // Initialized, but the retry key was not bound: the record
+            // exists without a payload row this replica can name (an
+            // earlier boot's rows, or a transferred payload whose binding
+            // was not kept). The table compared the digest, so
+            // `AlreadyInitialized` is an exact duplicate and
+            // `PayloadConflict` is not.
+            Err(InitError::AlreadyInitialized) => {
+                self.bindings.insert(retry_key, command);
                 self.rejections.push(FollowerRejection::Duplicate(command));
+                return self.repair_evidence(command);
+            }
+            Err(InitError::PayloadConflict) => {
+                self.rejections
+                    .push(FollowerRejection::PayloadConflict(command));
                 return Vec::new();
             }
         };
@@ -1358,7 +1498,7 @@ impl Follower {
                     vote: Vote::Fast(ack.clone()),
                 },
             );
-            self.publish_to_voters_and_frontend(barrier, ProtocolMessage::FastAck(ack));
+            self.publish_to_voters_and_frontend(command, barrier, ProtocolMessage::FastAck(ack));
         }
         // A proposal (or Sync entry) that arrived before the payload can now
         // be adopted (once its dependencies allow it).
@@ -1527,7 +1667,11 @@ impl Follower {
                         vote: Vote::Slow(ack.clone()),
                     },
                 );
-                self.publish_to_voters_and_frontend(barrier, ProtocolMessage::SlowAck(ack));
+                self.publish_to_voters_and_frontend(
+                    command,
+                    barrier,
+                    ProtocolMessage::SlowAck(ack),
+                );
             }
         }
     }

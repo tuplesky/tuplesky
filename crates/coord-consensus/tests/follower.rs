@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
-    FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole,
-    decode_dependency, decode_payload, dependency_key,
+    FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplayRefusal,
+    ReplicaRole, decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -241,9 +241,17 @@ fn fast_votes_wait_for_durable_payload_dependencies_and_path() {
     assert_eq!(slow.pending_sends(), 0);
     assert!(slow.step(durable_of(&effects, 1).remove(0)).is_empty());
     assert_eq!(slow.table().phase_of(&c1), Some(Phase::PreAccept));
-    // Duplicate identities: the same request again changes nothing; a
-    // different payload under the same retry key is refused.
-    assert!(fast.step(admitted(1, 1, 1).0).is_empty());
+    // Duplicate identities: the same request again is answered with the
+    // same acknowledgement, to the frontend only (task-c02); a different
+    // payload under the same retry key is refused.
+    let again = sends(&fast.step(admitted(1, 1, 1).0));
+    assert_eq!(again.len(), 1, "one send, and only to the frontend");
+    assert_eq!(again[0].0, FRONTEND.replica);
+    assert!(
+        matches!(&again[0].1, ProtocolMessage::FastAck(a) if a.replica == r(1) && a.path == row.path),
+        "the same acknowledgement, not a new one: {:?}",
+        again[0].1
+    );
     assert!(fast.step(admitted(1, 1, 7).0).is_empty());
     let rejections = fast.take_rejections();
     assert_eq!(rejections[0], FollowerRejection::Duplicate(c1));
@@ -757,11 +765,21 @@ fn recovery_rebuilds_retry_key_bindings_from_durable_payloads() {
     );
     assert_eq!(recovered.table().phase_of(&other.1), None);
     // The same bytes are the same command: a duplicate, not new work.
+    // Nothing is replayed for it either: the acknowledgement was the
+    // previous boot's, published through an outbox this boot does not
+    // have, and the durable record of the execution is the way back
+    // (task-c02).
     let (again, _) = admitted(1, 1, 1);
     assert!(recovered.step(again).is_empty());
     assert_eq!(
         recovered.take_rejections(),
-        vec![FollowerRejection::Duplicate(c1)]
+        vec![
+            FollowerRejection::Duplicate(c1),
+            FollowerRejection::ReplayRefused {
+                command: c1,
+                why: ReplayRefusal::NothingToReplay
+            }
+        ]
     );
 }
 

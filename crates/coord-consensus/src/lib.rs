@@ -131,6 +131,7 @@ pub mod phase;
 pub mod publication;
 pub mod quorum;
 pub mod recovery;
+pub mod replay;
 pub mod role;
 pub mod rows;
 pub mod speculation;
@@ -167,6 +168,7 @@ pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};
 pub use recovery::{RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, select};
+pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
 pub use role::{PendingReport, RecoveredState};
 pub use rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,

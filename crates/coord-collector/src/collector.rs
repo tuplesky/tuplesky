@@ -31,7 +31,7 @@ use coord_consensus::{
 };
 use coord_core::capability::{ReleasedResult, admission_digest};
 use coord_core::event::{AdmittedRequest, PeerProvenance};
-use coord_types::ids::{ReplicaId, SessionId};
+use coord_types::ids::{KvRevision, ReplicaId, SessionId};
 use coord_types::wire_v1::{
     BoundedBytes, MessageV1, OutcomeV1, ResolveRequestV1, ResponseV1, decode_stream,
 };
@@ -196,6 +196,24 @@ pub struct Expired {
     pub command: CommandId,
     /// Session.
     pub session: SessionId,
+}
+
+/// Why the durable record of a command's execution did not settle it
+/// here (task-c02).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettleError {
+    /// Not pending here: never submitted through this collector, or
+    /// already resolved and beyond the retained window.
+    NotPending,
+    /// Nothing of this collector's own corroborates the record -- neither
+    /// the learning predicate nor the leader's release. The record alone
+    /// is deliberately not enough here; a caller's retry is answered from
+    /// it directly, before anything is submitted, and that is the path
+    /// for a command this collector holds nothing for.
+    Uncorroborated,
+    /// The release this collector holds and the record disagree on what
+    /// the command produced. Neither is believed over the other.
+    Mismatch,
 }
 
 #[derive(Debug)]
@@ -523,30 +541,55 @@ impl Collector {
         };
         let entry = self.pending.remove(&command).expect("present");
         let fast = matches!(learned, Learned::Fast { .. });
-        let voters: Vec<String> = entry.votes.voted().iter().map(replica_hex).collect();
         let established = released.established();
-        // What the client can be answered with is bounded by the API
-        // frame class, not by the storage result bound: a result between
-        // the two is real but undeliverable, and saying so is an answer
-        // while silence is not.
-        let deliverable = released.response().len() <= MAX_DELIVERABLE_RESULT_BYTES;
-        let response = match BoundedBytes::new(released.response().to_vec()) {
+        let response = self.answer_of(command, established.revision(), released.response());
+        self.finish(command, entry, response, released.speculative(), fast)
+    }
+
+    /// The response a caller is handed for a result, bounded by what
+    /// can be delivered.
+    ///
+    /// Bounded by the API frame class, not by the storage result bound:
+    /// a result between the two is real but undeliverable, and saying so
+    /// is an answer while silence is not.
+    fn answer_of(
+        &self,
+        command: CommandId,
+        revision: Option<KvRevision>,
+        result: &[u8],
+    ) -> ResponseV1 {
+        let deliverable = result.len() <= MAX_DELIVERABLE_RESULT_BYTES;
+        match BoundedBytes::new(result.to_vec()) {
             Ok(result) if deliverable => ResponseV1 {
                 command_id: command,
-                outcome: OutcomeV1::Ok {
-                    revision: established.revision(),
-                    result,
-                },
+                outcome: OutcomeV1::Ok { revision, result },
             },
             _ => codes::error_response(command, codes::RESULT_TOO_LARGE, "result bound"),
+        }
+    }
+
+    /// Retire a pending entry with its answer: retain the outcome for
+    /// resolution, record the release, hand back what the caller gets.
+    fn finish(
+        &mut self,
+        command: CommandId,
+        entry: Pending,
+        response: ResponseV1,
+        speculative: bool,
+        fast: bool,
+    ) -> Progress {
+        let voters: Vec<String> = entry.votes.voted().iter().map(replica_hex).collect();
+        let revision = match &response.outcome {
+            OutcomeV1::Ok { revision, .. } => revision.map(|r| r.get()),
+            _ => None,
         };
         self.retain(entry.retry_key, command, response.clone());
         self.trace.push(CollectorEvent::Released {
             command: command_hex(&command),
-            speculative: released.speculative(),
+            speculative,
             fast,
             voters,
-            revision: established.revision().map(|r| r.get()),
+            revision,
             delivered: entry.attached,
         });
         Progress::Released(Release {
@@ -554,10 +597,81 @@ impl Collector {
             command,
             session: entry.session,
             response,
-            speculative: released.speculative(),
+            speculative,
             fast,
             attached: entry.attached,
         })
+    }
+
+    /// Pending commands that hold half of what a release needs: the
+    /// learning predicate without the leader's release, or the release
+    /// without the predicate (task-c02).
+    ///
+    /// A fresh command has neither and a releasable one has both. These
+    /// are the ones something arrived for and something else did not,
+    /// which is the shape a lost frontend delivery leaves behind, and the
+    /// only shape the durable record is consulted for.
+    pub fn half_established(&self) -> Vec<(CommandId, RetryKey)> {
+        self.pending
+            .iter()
+            .filter(|(_, e)| e.votes.learned().is_some() != e.released.is_some())
+            .map(|(c, e)| (*c, e.retry_key))
+            .collect()
+    }
+
+    /// Settle `command` from the durable record its execution left
+    /// behind on this node (task-c02).
+    ///
+    /// The record is not evidence and is not a release. It is this
+    /// node's own committed state -- the same thing that answers a
+    /// caller's retry before anything is submitted -- and it is trusted
+    /// here only to complete what the collector already half holds. When
+    /// the release is held, the record must agree with it on the digest
+    /// and the bytes, and then it confirms what the missing votes would
+    /// have: the command executed. When the learning predicate holds, the
+    /// record supplies the response the missing release would have
+    /// carried. With neither, the record is not used, deliberately: a
+    /// collector that answered from local state alone would be a
+    /// different component under a different contract.
+    ///
+    /// Never counted as a vote, never `speculative`, and never fast: what
+    /// this collector learned is recorded as whatever it actually
+    /// counted, and the trace says the record completed it.
+    pub fn settle_from_record(
+        &mut self,
+        command: CommandId,
+        result_digest: coord_types::identity::Digest32,
+        revision: Option<KvRevision>,
+        response: &[u8],
+    ) -> Result<Progress, SettleError> {
+        let Some(entry) = self.pending.get(&command) else {
+            return if self.is_resolved(&command) {
+                Ok(Progress::Settled)
+            } else {
+                Err(SettleError::NotPending)
+            };
+        };
+        let learned = entry.votes.learned();
+        let fast = matches!(learned, Some(Learned::Fast { .. }));
+        let corroborated = match (&entry.released, learned.is_some()) {
+            (Some(released), _) => {
+                if released.established().result_digest() != result_digest
+                    || released.response() != response
+                {
+                    return Err(SettleError::Mismatch);
+                }
+                "release"
+            }
+            (None, true) => "votes",
+            (None, false) => return Err(SettleError::Uncorroborated),
+        };
+        let entry = self.pending.remove(&command).expect("present");
+        self.trace.push(CollectorEvent::SettledFromRecord {
+            command: command_hex(&command),
+            corroborated: corroborated.into(),
+        });
+        let response = self.answer_of(command, revision, response);
+        Ok(self.finish(command, entry, response, false, fast))
     }
 
     fn retain(&mut self, key: RetryKey, command: CommandId, response: ResponseV1) {

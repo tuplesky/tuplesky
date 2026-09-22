@@ -1,4 +1,4 @@
-# Collector contract, revision 1 (task-33)
+# Collector contract, revision 2 (task-33, revised by task-c02)
 
 The collector is the trusted component that turns an admitted client
 request into a SwiftPaxos command, fans it out to the voters and
@@ -7,6 +7,22 @@ establishes the result from source-exact evidence (design Sections 3,
 frontend (`crates/coord-collector`) and the authorized Go collector inside
 Kine (task-m02). Go implements *collection*, never a second voting state
 machine. This revision is frozen; changes are a new revision.
+
+**What revision 2 changed.** Revision 1 assumed that what a voter said
+about a command reached the collector that submitted it. It need not: a
+voter that learns a command from a peer acknowledges it before any
+submission has told the voter's frontend which collector asked, and a
+frontend that holds such evidence for a while and then lets it go left
+the collector short of that voter's evidence for ever, on a command the
+domain had executed. Two things close that. The voters repair it
+(task-c02, `coord_consensus::replay`): an exact duplicate submission --
+same identity, same admission facts, same acknowledged floor --
+publishes the same acknowledgement again, to the frontend only, under
+the same gates as the first time. And the collector completes what it
+half holds from the durable record of the command's execution on its
+own node; see *Release*. Nothing about evidence or learning moved: a
+command is established on exactly the evidence it was before, and the
+record is never counted as a vote.
 
 ## Roles and authority
 
@@ -103,6 +119,21 @@ revision, result } }` with the exact response bytes, or `Err` with the
 frozen `RESULT_TOO_LARGE` code when the result does not fit the response
 bound.
 
+**Settlement from the durable record** (revision 2). A collector that
+holds one of the two -- the predicate without the release, or the
+release without the predicate -- may complete the command from the
+durable retry record of its execution on the collector's own node,
+which is the same committed state that answers a caller's retry before
+anything is submitted. The record must name this exact command; when the
+release is held, the record must also agree with it on the result digest
+and the response bytes, and a disagreement settles nothing and is
+reported. With neither half held the record is not consulted: a
+collector that answered from local state alone would be a different
+component under a different contract. A settlement of this kind is never
+counted as a vote and is never speculative. It is recorded in the trace
+as `SettledFromRecord` followed by the `Released` it produced, whose
+`voters` are the identities actually counted.
+
 ## Cancellation, deadlines, resolution
 
 * A caller that goes away (connection closed) is detached; the command
@@ -126,8 +157,10 @@ refresh are task-m02.
 
 Every transition is recorded as a `CollectorEvent` (`Submitted`,
 `Attached`, `Retained`, `Refused`, `Evidence`, `Held`, `Released`,
-`Cancelled`, `Resolved`, `TimedOut`, `Reconfigured`) with identities in
-lowercase hex. The Rust reference trace of the frozen scenario is
+`Cancelled`, `Resolved`, `TimedOut`, `Reconfigured`, `SettledFromRecord`)
+with identities in lowercase hex. The one added in revision 2 appears
+only when a delivery was lost, so the frozen revision-1 scenario produces
+the same trace it always did. The Rust reference trace of the frozen scenario is
 `crates/coord-collector/fixtures/collector_trace_v1.json` (regenerate
 deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). The Go collector
 must produce the same trace for the same scenario; differential tests of
@@ -142,3 +175,11 @@ are determined by the leader's release gate (task-29), whose output the
 collector binds to its own evidence but does not recompute. No production
 listener, session binding (task-37) or SDK (task-34) is part of this
 revision.
+
+Repair is delivery, not a guarantee of it. A voter repairs what it
+retained, and what it retained is bounded by what its command table
+remembers -- its live records and the tombstones of the ones it retired
+-- and not by any count of unrelated commands. A voter that restarted
+repairs nothing, because the sends were the previous boot's. Past both,
+the durable record is the path, for the collector as above and for a
+caller's retry as before, and this revision claims no more than that.
