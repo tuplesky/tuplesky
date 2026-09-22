@@ -1561,12 +1561,35 @@ fn a_voter_whose_key_the_configuration_does_not_commit_to_stops_at_startup() {
 /// daemon exists, because the endpoint catalog names it and a voter
 /// reads that before it binds anything. The window between here and the
 /// daemon's own bind is the standard cost of naming a port in advance.
+///
+/// The port is chosen below the kernel's ephemeral range rather than
+/// taken from it. Every test in this file runs in its own process, and
+/// the ones that bind `:0` -- a client endpoint, a daemon told to pick
+/// its own address -- are handed ephemeral ports; asking the kernel for
+/// one here too meant a port released by this test could be the next
+/// one the kernel gave a neighbour, and the daemon then found its named
+/// address taken. A port outside that range collides only with another
+/// test's named port, which is one draw in ten thousand rather than the
+/// kernel's next in line.
 fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("loopback")
-        .local_addr()
-        .expect("bound")
-        .port()
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut seed = u64::from(std::process::id()) ^ (u64::from(nanos) << 16);
+    for _ in 0..1000 {
+        // A small linear congruential step is enough: this is spreading
+        // draws out, not randomness anybody relies on.
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let port = 20000 + u16::try_from((seed >> 33) % 10000).expect("below 10000");
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free loopback port in 20000..30000");
 }
 
 /// Three real daemons of one domain: one certificate authority, three
