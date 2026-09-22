@@ -74,6 +74,10 @@ type Server struct {
 	// HoldProgress suppresses progress frames (a source that never says
 	// it processed a revision).
 	HoldProgress atomic.Bool
+	// ResetWatchOpens accepts every watch stream and resets it before a
+	// frame is delivered (a peer that admits the open but never serves
+	// it), so the client sees the stream lost at once.
+	ResetWatchOpens atomic.Bool
 
 	// PendingOnce answers the next Request with a Pending outcome (the
 	// result is still retained for resolution).
@@ -506,6 +510,10 @@ func closeFrame(id uint64, reason wire.WatchCloseReason, last *uint64) []byte {
 // client cancels or the watch closes.
 func (s *Server) watch(stream *quic.Stream, open wire.WatchOpen) {
 	s.record(Logged{Kind: "watch-open", Sequence: open.WatchID})
+	if s.ResetWatchOpens.Load() {
+		stream.CancelWrite(0)
+		return
+	}
 	w := &watcher{open: open, stream: stream, queue: make(chan []byte, 4096), done: make(chan struct{})}
 	m := s.model
 	m.mu.Lock()

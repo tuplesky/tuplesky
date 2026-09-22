@@ -72,6 +72,9 @@ type bridgeOptions struct {
 	teardownDelay time.Duration
 	// notifyInterval is the bridge's progress-report interval (default 5s).
 	notifyInterval time.Duration
+	// reconnectAttempts and reconnectBackoff bound a lost watch's reopens.
+	reconnectAttempts int
+	reconnectBackoff  time.Duration
 }
 
 func startDomain(t *testing.T) (*fakedomain.Server, *tls.Config) {
@@ -98,16 +101,18 @@ func startBridge(t *testing.T, opts bridgeOptions) *bridge {
 	native := client.New(domain.Addr(), client.Config{TLS: tlsConf, Tokens: tokens, Cluster: [16]byte{1}, Domain: [16]byte{2}, FrameTimeout: 3 * time.Second})
 	br := &bridge{domain: domain}
 	be, err := backend.New(backend.Config{
-		Client:              native,
-		Cluster:             [16]byte{1},
-		Domain:              [16]byte{2},
-		Namespace:           [16]byte{3},
-		Session:             opts.session,
-		ClientInstance:      [16]byte{4},
-		AccountingPageLimit: opts.accountingPage,
-		AccountingMaxPages:  opts.accountingPages,
-		SyncTimeout:         opts.syncTimeout,
-		WatchTeardownDelay:  opts.teardownDelay,
+		Client:                 native,
+		Cluster:                [16]byte{1},
+		Domain:                 [16]byte{2},
+		Namespace:              [16]byte{3},
+		Session:                opts.session,
+		ClientInstance:         [16]byte{4},
+		AccountingPageLimit:    opts.accountingPage,
+		AccountingMaxPages:     opts.accountingPages,
+		SyncTimeout:            opts.syncTimeout,
+		WatchTeardownDelay:     opts.teardownDelay,
+		WatchReconnectAttempts: opts.reconnectAttempts,
+		WatchReconnectBackoff:  opts.reconnectBackoff,
 		Observer: func(e backend.Event) {
 			br.mu.Lock()
 			br.events = append(br.events, e)

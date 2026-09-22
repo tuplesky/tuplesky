@@ -2,10 +2,12 @@ package backend_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/tuplesky/tuplesky/adapters/kine/backend"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -291,6 +293,42 @@ func TestWatchResumesAfterConnectionLoss(t *testing.T) {
 	update(t, br.cli, key, "4", 4, 0) // 5
 	if got = expectEvents(t, wch, 1); got[0].Kv.ModRevision != 5 {
 		t.Fatalf("after resume %d", got[0].Kv.ModRevision)
+	}
+}
+
+// A peer that accepts every watch stream and resets it before delivering
+// a frame is not a reachable source: each such stream counts toward the
+// reconnect bound, so the watch fails explicitly after the configured
+// attempts instead of reopening forever.
+func TestWatchStreamsLostBeforeAnyFrameExhaustTheReconnectBound(t *testing.T) {
+	br := startBridge(t, bridgeOptions{reconnectAttempts: 2, reconnectBackoff: 10 * time.Millisecond})
+	key := "/registry/x"
+	create(t, br.cli, key, "v", 0) // 2
+	br.domain.ResetWatchOpens.Store(true)
+	br.resetTrace()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wr := br.backend.Watch(ctx, key, "", 1)
+	select {
+	case err := <-wr.Errorc:
+		if !errors.Is(err, backend.ErrWatchUnavailable) {
+			t.Fatalf("watch ended with %v, want %v", err, backend.ErrWatchUnavailable)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watch kept reopening streams that never delivered a frame")
+	}
+	if _, ok := <-wr.Events; ok {
+		t.Fatal("events open after the watch failed")
+	}
+	opened := 0
+	for _, e := range br.trace() {
+		if e.Op == "Watch" && e.Outcome == "opened" {
+			opened++
+		}
+	}
+	// The first open plus one reopen per allowed attempt, and no more.
+	if opened != 3 {
+		t.Fatalf("opened %d streams, want 3: %+v", opened, br.trace())
 	}
 }
 

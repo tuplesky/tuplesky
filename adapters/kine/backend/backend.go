@@ -88,7 +88,9 @@ type Config struct {
 	// rather than reported synced (default 30s).
 	SyncTimeout time.Duration
 	// WatchReconnectAttempts bounds consecutive failed reopen attempts of
-	// a lost watch before it fails (default 5).
+	// a lost watch before it fails (default 5). A stream the peer accepts
+	// but ends before it delivers a frame counts as a failed attempt; only
+	// a stream that served a frame clears the count.
 	WatchReconnectAttempts int
 	// WatchReconnectBackoff is the base delay between reopen attempts.
 	WatchReconnectBackoff time.Duration

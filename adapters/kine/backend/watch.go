@@ -185,7 +185,28 @@ func (b *Backend) runWatch(ctx context.Context, ws *watchState, key, end string,
 		e := []byte(end)
 		rangeEnd = &e
 	}
+	// The reconnect bound counts consecutive attempts that did not get a
+	// stream to the point of carrying a frame: a refused open and a stream
+	// the peer accepted but ended before delivering anything are the same
+	// failure to this watch. Only a stream that served a frame proves the
+	// source reachable again and clears the count, so a peer that accepts
+	// every open and resets it at once still exhausts the bound instead of
+	// being reopened in a hot loop.
 	attempts := 0
+	retry := func() bool {
+		attempts++
+		if attempts > b.cfg.WatchReconnectAttempts {
+			fail(ErrWatchUnavailable)
+			return false
+		}
+		select {
+		case <-time.After(b.cfg.WatchReconnectBackoff * time.Duration(attempts)):
+			return true
+		case <-ctx.Done():
+			b.finish(ws, fail)
+			return false
+		}
+	}
 	for {
 		b.wmu.Lock()
 		resume := ws.processed + 1
@@ -204,23 +225,14 @@ func (b *Backend) runWatch(ctx context.Context, ws *watchState, key, end string,
 				b.finish(ws, fail)
 				return
 			}
-			attempts++
 			b.observeWatch("WatchOpen", ws, "error: "+err.Error())
-			if attempts > b.cfg.WatchReconnectAttempts {
-				fail(ErrWatchUnavailable)
-				return
-			}
-			select {
-			case <-time.After(b.cfg.WatchReconnectBackoff * time.Duration(attempts)):
-			case <-ctx.Done():
-				b.finish(ws, fail)
+			if !retry() {
 				return
 			}
 			continue
 		}
-		attempts = 0
 		b.observeWatch("WatchOpen", ws, "opened")
-		lost, err := b.pump(ctx, ws, w, events)
+		served, lost, err := b.pump(ctx, ws, w, events)
 		w.Cancel()
 		if err != nil {
 			fail(err)
@@ -231,6 +243,13 @@ func (b *Backend) runWatch(ctx context.Context, ws *watchState, key, end string,
 			return
 		}
 		b.observeWatch("WatchOpen", ws, "lost")
+		if served {
+			attempts = 0
+			continue
+		}
+		if !retry() {
+			return
+		}
 	}
 }
 
@@ -262,24 +281,27 @@ func kineEvent(e wire.Event) *server.Event {
 	return ev
 }
 
-// pump delivers one stream. It returns (lost, terminal): lost asks for
-// a resume from the processed frontier; terminal ends the watch.
-func (b *Backend) pump(ctx context.Context, ws *watchState, w *client.Watch, events chan<- []*server.Event) (bool, error) {
+// pump delivers one stream. It returns (served, lost, terminal): served
+// says the stream carried at least one event or progress frame, so the
+// source was reachable through it; lost asks for a resume from the
+// processed frontier; terminal ends the watch.
+func (b *Backend) pump(ctx context.Context, ws *watchState, w *client.Watch, events chan<- []*server.Event) (served bool, lost bool, terminal error) {
 	var pending []*server.Event
 	pendingRev := uint64(0)
 	for {
 		msg, err := w.Next(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return false, nil
+				return served, false, nil
 			}
 			if errors.Is(err, client.ErrWatchLost) || errors.Is(err, client.ErrProtocol) {
-				return true, nil
+				return served, true, nil
 			}
-			return false, status.Error(codes.Unavailable, err.Error())
+			return served, false, status.Error(codes.Unavailable, err.Error())
 		}
 		switch m := msg.(type) {
 		case wire.WatchEvents:
+			served = true
 			b.wmu.Lock()
 			processed := ws.processed
 			b.wmu.Unlock()
@@ -288,7 +310,7 @@ func (b *Backend) pump(ctx context.Context, ws *watchState, w *client.Watch, eve
 				continue
 			}
 			if pending != nil && pendingRev != m.Revision {
-				return false, status.Error(codes.Internal, "interleaved revision chunks")
+				return served, false, status.Error(codes.Internal, "interleaved revision chunks")
 			}
 			pendingRev = m.Revision
 			for _, e := range m.Events {
@@ -309,27 +331,28 @@ func (b *Backend) pump(ctx context.Context, ws *watchState, w *client.Watch, eve
 			case events <- batch:
 				b.advance(ws, m.Revision)
 			case <-ctx.Done():
-				return false, nil
+				return served, false, nil
 			}
 		case wire.WatchProgress:
+			served = true
 			if pending == nil {
 				b.advance(ws, m.Revision)
 			}
 		case wire.WatchClose:
 			switch m.Reason {
 			case wire.WatchCompacted:
-				return false, server.ErrCompacted
+				return served, false, server.ErrCompacted
 			case wire.WatchUnauthorized:
-				return false, ErrWatchUnauthorized
+				return served, false, ErrWatchUnauthorized
 			case wire.WatchSlowConsumer, wire.WatchSourceLost:
 				if m.LastCompleteRevision != nil {
 					b.advance(ws, *m.LastCompleteRevision)
 				}
-				return true, nil
+				return served, true, nil
 			default:
 				// Cancelled without our cancel: the source replaced or
 				// ended the stream; resume.
-				return ctx.Err() == nil, nil
+				return served, ctx.Err() == nil, nil
 			}
 		}
 	}
