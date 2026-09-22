@@ -241,7 +241,7 @@ impl<E: LocalEngine> Domain<E> {
         worker
             .submit(PersistBatch {
                 barrier: alloc.allocate(),
-                base: None,
+                base: Some(worker.application_base()),
                 updates,
             })
             .map_err(|e| DriveError::Apply(format!("bootstrap batch: {e:?}")))?;
