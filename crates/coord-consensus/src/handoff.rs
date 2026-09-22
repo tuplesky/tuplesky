@@ -23,10 +23,12 @@
 //!   fenced ordinary voting for the whole old configuration, across
 //!   ballots. Handoff-only recovery stays possible; nothing else does.
 //! * [`CancellationCertificate`]: a majority of the old voters have
-//!   durably refused the transition instead. A voter records one stance
-//!   per transition and never reverses it ([`StanceLedger`]), so two
-//!   majorities cannot form and a seal and a cancellation can never
-//!   both authorize a continuation.
+//!   durably refused the transition instead, and none of them sealed.
+//!   A voter records one stance per transition and never reverses it
+//!   ([`StanceLedger`]), so two majorities cannot form and a seal and a
+//!   cancellation can never both authorize a continuation; and a single
+//!   fence refuses the certificate outright, because cancellation is
+//!   what happens before the seal and nothing else.
 //! * [`TerminalCertificate`]: after the seal, a majority of the old
 //!   voters report the same terminal root and the same successor. Mixed
 //!   roots are refused rather than merged, and there is no selection
@@ -220,6 +222,23 @@ pub enum HandoffError {
     },
     /// A record is about another transition.
     WrongTransition,
+    /// The voter set offered is not the configuration the transition
+    /// leaves, or the successor offered is not the one it enters. A
+    /// majority is a majority of that exact configuration; counted over
+    /// some other set it is not a weaker certificate, it is none.
+    EpochMismatch,
+    /// The successor configuration offered for activation is not the
+    /// one the terminal certificate names. The certificate was selected
+    /// by the old majority for that successor and no other.
+    WrongSuccessor,
+    /// A cancellation was asked for after some voter sealed the
+    /// transition. Cancellation is a pre-seal outcome: one fence is
+    /// already irreversible, so the transition continues or blocks, and
+    /// the refusals arrived too late to be a certificate.
+    Fenced {
+        /// A voter that sealed.
+        by: ReplicaId,
+    },
     /// Fewer than a majority.
     NoQuorum {
         /// Distinct replicas offered.
@@ -297,6 +316,12 @@ fn certify(
     stances: &[StanceRecord],
     wanted: Stance,
 ) -> Result<BTreeSet<ReplicaId>, HandoffError> {
+    // The majority is of the configuration being left. Counted over
+    // another epoch's voters the signers could be a majority of a set
+    // that never fenced anything.
+    if voters.epoch() != transition.from {
+        return Err(HandoffError::EpochMismatch);
+    }
     let mut signers = BTreeSet::new();
     for record in stances {
         if !voters.is_voter(&record.voter) {
@@ -334,11 +359,22 @@ pub fn seal(
 }
 
 /// Certify that the transition was refused before it sealed.
+///
+/// A single fence forbids it. A voter that sealed will not vote in the
+/// old configuration again whatever the others decided, so a
+/// cancellation formed beside it would authorize a return to `Stable`
+/// that the fence has already made impossible.
 pub fn cancel(
     voters: &EpochVoters,
     transition: Transition,
     stances: &[StanceRecord],
 ) -> Result<CancellationCertificate, HandoffError> {
+    if let Some(fence) = stances
+        .iter()
+        .find(|s| s.transition == transition && s.stance == Stance::Sealed)
+    {
+        return Err(HandoffError::Fenced { by: fence.voter });
+    }
     Ok(CancellationCertificate {
         transition,
         signers: certify(voters, transition, stances, Stance::Cancelled)?,
@@ -406,6 +442,9 @@ pub fn select_terminal(
     reports: &[TerminalReport],
 ) -> Result<TerminalCertificate, HandoffError> {
     let transition = seal.transition();
+    if voters.epoch() != transition.from {
+        return Err(HandoffError::EpochMismatch);
+    }
     let mut roots: BTreeMap<Digest32, BTreeSet<ReplicaId>> = BTreeMap::new();
     for report in reports {
         if !voters.is_voter(&report.voter) {
@@ -486,12 +525,20 @@ impl ActivationCertificate {
 /// A majority of the successor set must have durably installed that
 /// exact terminal root. Installing something else is not a weaker
 /// installation, it is another history, and it is refused rather than
-/// counted.
+/// counted. The successor set is the certificate's, not the caller's:
+/// a majority of some other set holding the root is a set the old
+/// majority never selected.
 pub fn activate(
     successor: &EpochVoters,
     certificate: &TerminalCertificate,
     installs: &[InstallRecord],
 ) -> Result<ActivationCertificate, HandoffError> {
+    if successor.epoch() != certificate.transition().to {
+        return Err(HandoffError::EpochMismatch);
+    }
+    if successor.voters() != certificate.successor() {
+        return Err(HandoffError::WrongSuccessor);
+    }
     let mut installers = BTreeSet::new();
     for record in installs {
         if !successor.is_voter(&record.replica) {
@@ -587,6 +634,12 @@ pub fn resume(
     transition: Transition,
     evidence: Evidence<'_>,
 ) -> Result<Stage, HandoffError> {
+    // The configurations are the transition's. Certifying over any
+    // other pair would count majorities of sets the records are not
+    // about, and a stage justified that way is justified by nothing.
+    if old.epoch() != transition.from || successor.epoch() != transition.to {
+        return Err(HandoffError::EpochMismatch);
+    }
     // An activation that exists is the answer. Reuse it rather than
     // recomputing an outcome that could differ from the one the
     // successor is already serving under.

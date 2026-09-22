@@ -769,6 +769,151 @@ fn removing_a_handoff_rule_produces_the_counterexample_it_exists_for() {
     fixture("handoff_counterexamples.json", &out);
 }
 
+/// Every certificate is a majority of the configuration the transition
+/// names, never of whatever set the caller offered.
+#[test]
+fn a_certificate_counts_only_the_configuration_the_transition_names() {
+    let old = old_voters();
+    let new = successor();
+    let sealed_by: Vec<StanceRecord> = [r(0), r(1)]
+        .iter()
+        .map(|voter| StanceRecord {
+            voter: *voter,
+            transition: transition(THIS),
+            stance: Stance::Sealed,
+        })
+        .collect();
+
+    // A stale configuration holding the same replica ids is not the one
+    // being left, so its majority fences nothing.
+    let stale = EpochVoters::new(epoch(OLD - 1), [r(0), r(1)].into()).unwrap();
+    assert_eq!(
+        seal(&stale, transition(THIS), &sealed_by),
+        Err(HandoffError::EpochMismatch)
+    );
+    assert_eq!(
+        cancel(&stale, transition(THIS), &[]),
+        Err(HandoffError::EpochMismatch)
+    );
+    let certificate = seal(&old, transition(THIS), &sealed_by).unwrap();
+    let reports: Vec<TerminalReport> = [r(0), r(1)]
+        .iter()
+        .map(|voter| TerminalReport {
+            voter: *voter,
+            transition: transition(THIS),
+            terminal_root: root(0x77),
+        })
+        .collect();
+    assert_eq!(
+        select_terminal(&stale, &certificate, new.voters(), &reports),
+        Err(HandoffError::EpochMismatch)
+    );
+    let terminal = select_terminal(&old, &certificate, new.voters(), &reports).unwrap();
+
+    // The successor that installs is the one the certificate names.
+    // Another epoch, or another set of replicas under the right epoch,
+    // is a set the old majority never selected, however many of it
+    // hold the root.
+    let installs = |voters: &EpochVoters| -> Vec<InstallRecord> {
+        voters
+            .voters()
+            .iter()
+            .map(|replica| InstallRecord {
+                replica: *replica,
+                transition: transition(THIS),
+                terminal_root: terminal.terminal_root(),
+            })
+            .collect()
+    };
+    let later = EpochVoters::new(epoch(NEW + 1), new.voters().clone()).unwrap();
+    assert_eq!(
+        activate(&later, &terminal, &installs(&later)),
+        Err(HandoffError::EpochMismatch)
+    );
+    let strangers = EpochVoters::new(epoch(NEW), [r(5), r(6), r(7)].into()).unwrap();
+    assert_eq!(
+        activate(&strangers, &terminal, &installs(&strangers)),
+        Err(HandoffError::WrongSuccessor)
+    );
+    assert!(activate(&new, &terminal, &installs(&new)).is_ok());
+
+    // And a recovering coordinator holding the wrong configurations
+    // has no evidence to read them against.
+    let evidence = Evidence {
+        authorized: true,
+        stances: &sealed_by,
+        reports: &reports,
+        terminal: Some(&terminal),
+        installs: &[],
+        activation: None,
+    };
+    assert_eq!(
+        resume(&stale, &new, transition(THIS), evidence),
+        Err(HandoffError::EpochMismatch)
+    );
+    assert_eq!(
+        resume(&old, &later, transition(THIS), evidence),
+        Err(HandoffError::EpochMismatch)
+    );
+    assert_eq!(
+        resume(&old, &new, transition(THIS), evidence),
+        Ok(Stage::Installing)
+    );
+}
+
+/// A cancellation is a pre-seal outcome: one voter's fence refuses it
+/// however many of the others cancelled.
+#[test]
+fn a_single_fence_refuses_a_cancellation() {
+    let old = old_voters();
+    let mut ledgers: Vec<StanceLedger> = (0..3)
+        .map(|i| StanceLedger::new(r(i), epoch(OLD)))
+        .collect();
+    ledgers[0]
+        .record(&old, transition(THIS), Stance::Sealed)
+        .unwrap();
+    ledgers[1]
+        .record(&old, transition(THIS), Stance::Cancelled)
+        .unwrap();
+    ledgers[2]
+        .record(&old, transition(THIS), Stance::Cancelled)
+        .unwrap();
+    let stances = stances_of(&ledgers);
+    assert_eq!(
+        cancel(&old, transition(THIS), &stances),
+        Err(HandoffError::Fenced { by: r(0) })
+    );
+    // A fence left by another transition is not this one's business
+    // here; `resume` reports it as such.
+    let elsewhere = [StanceRecord {
+        voter: r(0),
+        transition: transition(OTHER),
+        stance: Stance::Sealed,
+    }];
+    assert_eq!(
+        cancel(&old, transition(THIS), &elsewhere),
+        Err(HandoffError::WrongTransition)
+    );
+    // The cancelled majority does not send the configuration back to
+    // `Stable`: the sealed voter continues, or blocks.
+    assert_eq!(
+        resume(
+            &old,
+            &successor(),
+            transition(THIS),
+            Evidence {
+                authorized: true,
+                stances: &stances,
+                reports: &[],
+                terminal: None,
+                installs: &[],
+                activation: None,
+            }
+        ),
+        Ok(Stage::Sealing)
+    );
+}
+
 /// A sealed voter is not available for another transition, and a stale
 /// attempt is a different transition rather than an older version of
 /// this one.
