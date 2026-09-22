@@ -102,7 +102,7 @@ fn manifest(cluster: ClusterId, domain: DomainId, voters: &[&Node]) -> GenesisMa
                 // Genesis commits each voter's key, so a certificate the
                 // issuer signs for a committed node is not by itself
                 // that voter (task-42).
-                public_key: coord_membership::genesis::b64url(v.key.public_key_raw()),
+                public_key: b64url(v.key.public_key_raw()),
             })
             .collect(),
         issuer_roots: vec!["cm9vdA".to_owned()],
