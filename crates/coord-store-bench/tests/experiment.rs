@@ -41,6 +41,16 @@ fn a_store_root_is_never_used_or_removed() {
         RunRoot::allocate(dir.path(), "run"),
         Err(RunRootError::LooksLikeStoreRoot(_))
     ));
+    // A child of the service root, such as its `experiments` directory,
+    // would put experiment generations inside production state: it is
+    // refused too, and the error names the service root.
+    std::fs::write(dir.path().join("lock"), b"").unwrap();
+    let nested = dir.path().join("experiments").join("local");
+    match RunRoot::allocate(&nested, "run") {
+        Err(RunRootError::LooksLikeStoreRoot(root)) => assert_eq!(root, dir.path()),
+        other => panic!("a directory beneath a store root was accepted: {other:?}"),
+    }
+    assert!(!nested.exists(), "nothing was created beneath the store root");
     // An unmarked directory is never removed, even when it is empty.
     let other = tempfile::tempdir().unwrap();
     let run = RunRoot::allocate(other.path(), "run").unwrap();

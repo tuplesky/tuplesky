@@ -14,7 +14,9 @@ use clap::{Parser, Subcommand};
 use coord_store_bench::compare::{Semantics, compare, semantics};
 use coord_store_bench::manifest::{EngineKind, TrialLabel};
 use coord_store_bench::runroot::RunRoot;
-use coord_store_bench::trial::{TrialSpec, committed_fixture, replay_fixture, run_trial};
+use coord_store_bench::trial::{
+    TrialSpec, committed_fixture, replay_fixture, run_trial, with_fixture_digest,
+};
 use coord_store_bench::workload::WorkloadSpec;
 
 #[derive(Parser)]
@@ -105,10 +107,18 @@ fn run(cli: &Cli) -> Result<String, String> {
             let fixture = committed_fixture();
             let mut reports = Vec::new();
             let mut digests = std::collections::BTreeMap::new();
+            let mut fixture_differences = Vec::new();
             for engine in EngineKind::ALL {
                 let (digest, matched, nanos) =
                     replay_fixture(engine, &fixture, &run_root, 0, cli.cache_bytes)
                         .map_err(|e| e.to_string())?;
+                if !matched {
+                    fixture_differences.push(format!(
+                        "{}: the committed fixture replay differs from the oracle or the \
+                         frozen digest",
+                        engine.name()
+                    ));
+                }
                 digests.insert(
                     engine.name().to_owned(),
                     format!(
@@ -129,10 +139,21 @@ fn run(cli: &Cli) -> Result<String, String> {
                     cache_bytes: cli.cache_bytes,
                     maintenance: true,
                 };
-                reports.push(run_trial(&trial, &run_root).map_err(|e| e.to_string())?);
+                // The report names the fixture that anchored its
+                // correctness result, so a persisted raw report can be
+                // traced back to it.
+                let report = run_trial(&trial, &run_root).map_err(|e| e.to_string())?;
+                reports.push(with_fixture_digest(report, digest));
             }
             let mut result: Semantics = semantics(&reports);
             result.fixture_digests = digests;
+            // A fixture mismatch is a semantic difference like any other:
+            // it fails the run rather than being rendered only into the
+            // digest string beside a successful exit.
+            if !fixture_differences.is_empty() {
+                result.equal = false;
+                result.differences.extend(fixture_differences);
+            }
             run_root
                 .write_json("differential.json", &result)
                 .map_err(|e| e.to_string())?;

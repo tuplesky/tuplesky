@@ -273,11 +273,21 @@ fn execute<E: LocalEngine>(
             && index.is_multiple_of(pinned_every)
             && index + hold <= ops.len()
         {
+            // The operations held under the pinned snapshot are measured
+            // operations like any other, so maintenance follows each of
+            // them exactly as it does outside the group; the held revision
+            // is what keeps collection from vanishing under the snapshot.
+            // The maintenance timings are collected inside the churn and
+            // recorded afterwards, so the pinned read itself excludes them.
             let slice = &ops[index..index + hold];
             let mut inner = Vec::new();
+            let mut maintained = Vec::new();
             let (_, pinned) = domain.pinned_read(|d| {
                 for (offset, op) in slice.iter().enumerate() {
                     inner.push(one(d, op, start, interval, (index + offset) as u64)?);
+                    if spec.maintenance {
+                        maintained.push(maintain(d, budget)?);
+                    }
                 }
                 Ok(())
             })?;
@@ -290,6 +300,9 @@ fn execute<E: LocalEngine>(
                     &mut generator_lag,
                     &mut publication,
                 );
+            }
+            for step in maintained {
+                record_maintenance(step, &mut counters, &mut maintenance_step);
             }
             pinned_read.push(pinned.read_ns);
             counters.pinned_checks += 1;
@@ -306,13 +319,8 @@ fn execute<E: LocalEngine>(
             &mut publication,
         );
         if spec.maintenance {
-            let t = Instant::now();
-            let done = domain.maintenance_step(budget)?;
-            maintenance_step.push(t.elapsed().as_nanos() as u64);
-            counters.maintenance_steps += 1;
-            if !done {
-                counters.maintenance_debt_steps += 1;
-            }
+            let step = maintain(&mut domain, budget)?;
+            record_maintenance(step, &mut counters, &mut maintenance_step);
         }
         index += 1;
     }
@@ -392,6 +400,33 @@ fn one<E: LocalEngine>(
         revisions,
         events,
     })
+}
+
+/// One bounded maintenance step: how long it took and whether collection
+/// was complete afterwards.
+struct MaintenanceStep {
+    step_ns: u64,
+    done: bool,
+}
+
+fn maintain<E: LocalEngine>(
+    domain: &mut Domain<E>,
+    budget: GcBudget,
+) -> Result<MaintenanceStep, DriveError> {
+    let t = Instant::now();
+    let done = domain.maintenance_step(budget)?;
+    Ok(MaintenanceStep {
+        step_ns: t.elapsed().as_nanos() as u64,
+        done,
+    })
+}
+
+fn record_maintenance(step: MaintenanceStep, counters: &mut Counters, samples: &mut Samples) {
+    samples.push(step.step_ns);
+    counters.maintenance_steps += 1;
+    if !step.done {
+        counters.maintenance_debt_steps += 1;
+    }
 }
 
 fn absorb(

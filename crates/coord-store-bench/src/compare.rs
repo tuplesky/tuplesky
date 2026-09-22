@@ -120,9 +120,14 @@ fn hex(d: &coord_types::identity::Digest32) -> String {
     d.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Compare the logical state several engines produced.
+/// Compare the logical state several engines produced. The state after
+/// prefill is compared as well as the final state: a prefill that went
+/// wrong on one engine can be overwritten or deleted by the later churn,
+/// so equal final states alone do not show that every engine started the
+/// measured phase from the same validated state.
 pub fn semantics(reports: &[TrialReport]) -> Semantics {
     let mut per_engine: BTreeMap<String, Observable> = BTreeMap::new();
+    let mut prefill_per_engine: BTreeMap<String, Observable> = BTreeMap::new();
     let mut differences = Vec::new();
     for report in reports {
         let engine = report.manifest.engine.name.clone();
@@ -134,7 +139,32 @@ pub fn semantics(reports: &[TrialReport]) -> Semantics {
             )),
             Some(_) => {}
             None => {
-                per_engine.insert(engine, report.observable.clone());
+                per_engine.insert(engine.clone(), report.observable.clone());
+            }
+        }
+        match prefill_per_engine.get(&engine) {
+            Some(earlier) if *earlier != report.after_prefill => differences.push(format!(
+                "{engine}: repetitions of the same engine disagree after prefill \
+                 (common digest {} vs {})",
+                hex(&earlier.common_digest),
+                hex(&report.after_prefill.common_digest)
+            )),
+            Some(_) => {}
+            None => {
+                prefill_per_engine.insert(engine, report.after_prefill.clone());
+            }
+        }
+    }
+    let mut prefill = prefill_per_engine.iter();
+    if let Some((first_name, first)) = prefill.next() {
+        for (name, other) in prefill {
+            if other != first {
+                differences.push(format!(
+                    "{name} and {first_name} started the measured phase from different \
+                     prefill states (common digest {} vs {})",
+                    hex(&other.common_digest),
+                    hex(&first.common_digest)
+                ));
             }
         }
     }
@@ -248,7 +278,16 @@ pub fn compare(
                 cache_bytes,
                 maintenance: true,
             };
-            reports.push(run_trial(&spec, run_root)?);
+            let report = run_trial(&spec, run_root)?;
+            // Each completed trial's manifest and raw samples are written as
+            // soon as it finishes, so a later engine or repetition that
+            // fails leaves the evidence of the earlier ones in the run root
+            // instead of only in memory.
+            run_root.write_json(
+                &format!("raw/{}-{repetition:03}.json", engine.name()),
+                &report,
+            )?;
+            reports.push(report);
         }
     }
     let semantics = semantics(&reports);
@@ -448,6 +487,33 @@ mod tests {
             Verdict::Disqualified { reasons },
             Verdict::Disqualified { .. }
         ));
+    }
+
+    #[test]
+    fn a_different_prefill_state_disqualifies_even_when_the_final_states_agree() {
+        let mut reports = vec![
+            report(EngineKind::Redb, 100, observable(1, 7)),
+            report(EngineKind::Fjall, 50, observable(1, 7)),
+        ];
+        assert!(semantics(&reports).equal);
+        // The measured churn erased the trace of a prefill that went
+        // wrong; the final states agree, the starting states do not.
+        reports[1].after_prefill = observable(9, 3);
+        let s = semantics(&reports);
+        assert!(!s.equal);
+        assert!(
+            s.differences.iter().any(|d| d.contains("prefill")),
+            "{:?}",
+            s.differences
+        );
+        assert!(!disqualifications(&reports, &s).is_empty());
+        // Two repetitions of one engine must also prefill identically.
+        let mut repeated = vec![
+            report(EngineKind::Redb, 100, observable(1, 7)),
+            report(EngineKind::Redb, 100, observable(1, 7)),
+        ];
+        repeated[1].after_prefill = observable(9, 3);
+        assert!(!semantics(&repeated).equal);
     }
 
     #[test]

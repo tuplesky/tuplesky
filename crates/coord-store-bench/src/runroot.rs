@@ -3,8 +3,9 @@
 //! Every trial allocates an absent directory under an experiment
 //! directory, marks it as a disposable experiment root and never touches
 //! anything else. Allocation refuses a directory that carries a store
-//! lifecycle (a `CURRENT` pointer, a manifest or a root lock), so an
-//! experiment can never be pointed at service state; removal refuses any
+//! lifecycle (a `CURRENT` pointer, a manifest or a root lock) or sits
+//! beneath one, so an experiment can never be pointed at service state or
+//! created inside it; removal refuses any
 //! directory this harness did not mark. Raw outputs, including those of a
 //! failed run, stay in the run root.
 
@@ -75,6 +76,23 @@ pub fn looks_like_store_root(path: &Path) -> bool {
     STORE_MARKERS.iter().any(|m| path.join(m).exists())
 }
 
+/// The nearest of `path` and its ancestors that carries store lifecycle
+/// files, if any. A child of a service root, such as its `experiments`
+/// subdirectory, is inside production state just as much as the root
+/// itself, so the check walks upward rather than looking at one level.
+/// A relative path is resolved against the working directory first so
+/// its real ancestors are examined.
+pub fn enclosing_store_root(path: &Path) -> Option<PathBuf> {
+    let absolute = match std::env::current_dir() {
+        Ok(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    absolute
+        .ancestors()
+        .find(|p| looks_like_store_root(p))
+        .map(Path::to_path_buf)
+}
+
 fn unique_id(label: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -94,10 +112,10 @@ pub struct RunRoot {
 impl RunRoot {
     /// Allocate an absent run root under `experiment_dir`.
     pub fn allocate(experiment_dir: &Path, label: &str) -> Result<RunRoot, RunRootError> {
-        if looks_like_store_root(experiment_dir) {
-            return Err(RunRootError::LooksLikeStoreRoot(
-                experiment_dir.to_path_buf(),
-            ));
+        // The directory itself or any ancestor may be a service root; the
+        // error names whichever one refused the allocation.
+        if let Some(root) = enclosing_store_root(experiment_dir) {
+            return Err(RunRootError::LooksLikeStoreRoot(root));
         }
         std::fs::create_dir_all(experiment_dir)?;
         let run_id = unique_id(label);

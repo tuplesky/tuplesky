@@ -69,7 +69,14 @@ fn the_protocol_shaped_workload_produces_one_logical_state_on_every_engine() {
         );
         assert!(report.counters.published_revisions > 0, "events published");
         assert!(report.counters.pinned_checks > 0, "pinned reads were held");
-        assert!(report.counters.maintenance_steps > 0, "maintenance ran");
+        // Maintenance follows every measured operation, including the ones
+        // held under a pinned snapshot; otherwise the manifest's
+        // maintenance_enabled would describe a workload that did not run.
+        assert_eq!(
+            report.counters.maintenance_steps,
+            u64::from(spec().measured_ops),
+            "maintenance ran after every measured operation"
+        );
         assert_eq!(report.counters.errors, 0);
         assert_eq!(report.counters.rejected, 0);
         assert_eq!(report.service.count as u32, spec().measured_ops);
@@ -114,6 +121,14 @@ fn a_paired_comparison_reports_cost_only_between_durable_engines() {
         assert_eq!(summary.repetitions, 2);
         assert_eq!(summary.service_p50_variation.repetitions, 2);
         assert!(summary.service_p50_variation.spread_percent.is_some());
+        // Every trial's manifest and raw samples were written as it
+        // completed, so a later failure could not have lost them.
+        for repetition in 0..2 {
+            let raw = run
+                .path()
+                .join(format!("raw/{}-{repetition:03}.json", summary.engine));
+            assert!(raw.is_file(), "{} was not persisted", raw.display());
+        }
     }
 }
 
