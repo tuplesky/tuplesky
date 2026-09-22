@@ -54,14 +54,34 @@ Record what you did and when. The next step makes you state it.
 
 ## 1. Choose the backup and verify it
 
+A backup is one directory, written by a node of the cluster it came
+from:
+
 ```text
-coordd backup verify --manifest <backup.json> --artifact <snapshot/>
+coordd --config <node.toml> backup --out <backup/>
+```
+
+It holds `backup.json` (the backup manifest, which you will read), the
+artifact's own manifest and its chunks, and it is never written over an
+existing one. Every `coordd` invocation names its configuration with
+`--config` before the subcommand; the flags of the subcommand come after
+it.
+
+Verify the backup you have chosen:
+
+```text
+coordd --config <coordd.toml> verify --dir <backup/>
 ```
 
 This recomputes every chunk digest and the artifact root, checks the
 backup manifest binds that exact root, and prints the boundary and the
 time the snapshot was pinned. A backup index that has been repointed at
 different bytes fails here.
+
+Verification reads no store and needs no cluster: any configuration
+this build parses will do, including that of a machine whose own store
+is the one that was lost and one whose certificate no cluster names as a
+voter. Run it wherever the backup is.
 
 Check that the artifact is a **common snapshot** (`SharedCheckpointV1`).
 The three artifacts of design Section 17.16.1 are not interchangeable
@@ -82,7 +102,11 @@ otherwise healthy, you want ordinary recovery, not this page.
 The restored cluster is a **new cluster** with a new cluster identity,
 and its membership comes from its own genesis (task-42) and from
 nowhere else. Generate the successor's genesis manifest and node
-credentials exactly as for a new deployment.
+credentials exactly as for a new deployment, and write the
+configuration (`<successor.toml>` below) of the node the restore will
+fill. Do **not** run `coordd init` on that node: the restore creates
+its first generation itself, and a node that already has one is
+refused.
 
 Restoring under the old cluster's identity is refused, and it is worth
 knowing why it is refused rather than merely discouraged: callers hold
@@ -93,13 +117,21 @@ would satisfy them incorrectly rather than visibly failing.
 
 ```json
 {
-  "abandoned": "<old cluster id>",
-  "successor": "<new cluster id>",
-  "backup": "<backup manifest root>",
+  "abandoned": <the "source" value of backup.json>,
+  "successor": <the successor's cluster id, in the same form>,
+  "backup": <the "root" value of backup.json>,
   "action": "revoked node certificates at the issuer and removed the LB backends, ticket DR-91",
   "at": 1700000600
 }
 ```
+
+Identities and digests are written the way `backup.json` writes them:
+as JSON arrays of byte values, sixteen for a cluster identity and
+thirty-two for a digest. Copy `source` and `root` out of `backup.json`
+verbatim, and write the successor's cluster identity -- the sixteen
+bytes its genesis manifest names as `cluster` -- in the same form. A
+value in any other encoding is refused as unreadable, before anything
+is checked.
 
 The attestation is not the fence. The fence is what you did in step 0;
 this is your record of it, bound to the exact clusters and the exact
@@ -113,8 +145,13 @@ reference is refused.
 ## 4. Plan the restore and read what it will lose
 
 ```text
-coordd restore --plan --manifest <backup.json> --fencing <fencing.json>
+coordd --config <successor.toml> restore --plan --dir <backup/> --fencing <fencing.json>
 ```
+
+This runs on the successor node, under its own configuration: the
+successor's identity is the one its committed genesis gives that node,
+which is why the restore is refused under the old cluster's
+configuration.
 
 The plan prints the recovery point and the disposition of every class of
 state. Check the recovery point against what callers were told, and
@@ -137,8 +174,10 @@ naming any voter.
 ## 5. Restore
 
 ```text
-coordd restore --manifest <backup.json> --artifact <snapshot/> --fencing <fencing.json>
+coordd --config <successor.toml> restore --dir <backup/> --fencing <fencing.json>
 ```
+
+The same invocation without `--plan`, on the same node.
 
 The restore writes into a fresh generation of the *successor* cluster
 and selects nothing until it has finished, so a failure or a crash at

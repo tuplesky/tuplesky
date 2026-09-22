@@ -396,6 +396,14 @@ fn restore(
     // worth of rows may be written directly: afterwards a projection
     // has frontiers, and writing behind them is what quarantines a
     // node.
+    //
+    // A restore that fails is reported *as* the storage failure, not
+    // beside it. The callback's error is what stops `open_storage_with`
+    // before the journal is opened and the projection attached, so a
+    // generation holding part of a backup never acquires a journal
+    // stream in this process and the error an operator reads is the
+    // restore's own. Returning `Ok` here and reporting the failure
+    // afterwards would attach the partial projection first.
     let mut outcome = None;
     let storage = store::open_storage_with(
         config,
@@ -404,22 +412,21 @@ fn restore(
         placed.membership.domain(),
         placed.replica,
         placed.incarnation,
-        |engine| {
-            outcome = Some(backup::carry_out(engine, &held, &plan, &attestation));
-            Ok(())
+        |engine| match backup::carry_out(engine, &held, &plan, &attestation) {
+            Ok(restored) => {
+                outcome = Some(restored);
+                Ok(())
+            }
+            Err(e) => Err(store::StoreError::Refused {
+                root: config
+                    .state
+                    .root_path(&config.state_directory)
+                    .display()
+                    .to_string(),
+                reason: e.to_string(),
+            }),
         },
     );
-    let restored = match outcome {
-        Some(Ok(r)) => r,
-        Some(Err(e)) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-        None => {
-            eprintln!("the restore never reached this node's projection");
-            return ExitCode::from(2);
-        }
-    };
     let mut opened = match storage {
         Ok(o) => o,
         Err(e) => {
@@ -444,6 +451,10 @@ fn restore(
             eprintln!("{e}");
             return ExitCode::from(2);
         }
+    };
+    let Some(restored) = outcome else {
+        eprintln!("the restore never reached this node's projection");
+        return ExitCode::from(2);
     };
     // The successor's own genesis policy, exactly as `init` writes it.
     // The backup deliberately carried none: the old cluster's trust
@@ -518,6 +529,26 @@ fn main() -> ExitCode {
                     report.leaf.expires_at,
                     renewal_state(&report.renewal),
                 );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    // Verifying a backup reads no store at all, and it comes before
+    // placement for the same reason inspecting does: an operator checks
+    // a backup from anywhere, including from a machine whose own store
+    // is the one that was lost and from one that is a voter of no
+    // cluster at all. Nothing about a backup's integrity depends on who
+    // is asking.
+    if let Some(Command::Verify { dir }) = &cli.command {
+        return match backup::read(dir) {
+            Ok(held) => {
+                report_backup(&held.manifest);
+                println!("backup verified chunks={}", held.chunks.len());
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -617,23 +648,6 @@ fn main() -> ExitCode {
         return match finish_initialization(&config, &placed, opened) {
             Ok(directory) => {
                 println!("initialized {}", directory.display());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    // Verifying a backup reads no store at all: an operator checks a
-    // backup from anywhere, including from a machine whose own store is
-    // the one that was lost.
-    if let Some(Command::Verify { dir }) = &cli.command {
-        return match backup::read(dir) {
-            Ok(held) => {
-                report_backup(&held.manifest);
-                println!("backup verified chunks={}", held.chunks.len());
                 ExitCode::SUCCESS
             }
             Err(e) => {

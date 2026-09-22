@@ -3423,6 +3423,33 @@ async fn a_backup_restores_a_new_cluster_and_refuses_to_restore_the_old_one() {
     assert_eq!(verified.code, Some(0), "{}", verified.err);
     assert!(verified.out.contains("backup verified chunks="));
 
+    // And from a machine that is a voter of no cluster: the recovery
+    // host's certificate need not be one the committed configuration
+    // names, because nothing about a backup's integrity depends on who
+    // is asking. Placement refuses this configuration; verification
+    // does not go through placement.
+    let elsewhere = workspace("backup-elsewhere");
+    let elsewhere_config = config(&elsewhere);
+    credentials(&elsewhere, 9, coord_types::wire_v1::PeerRole::Voter);
+    let stranger = run(&elsewhere_config, &["--check"]);
+    assert_eq!(
+        stranger.code,
+        Some(2),
+        "the recovery host is placeable, so this proves nothing:\n{}",
+        stranger.out
+    );
+    let verified = run(
+        &elsewhere_config,
+        &["verify", "--dir", out.to_str().unwrap()],
+    );
+    assert_eq!(
+        verified.code,
+        Some(0),
+        "a backup could not be verified from a machine that is not a voter:\n{}",
+        verified.err
+    );
+    assert!(verified.out.contains("backup verified chunks="));
+
     // A backup index repointed at different bytes fails verification
     // rather than at the restore.
     let tampered = dir.join("tampered");
