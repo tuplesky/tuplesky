@@ -166,7 +166,7 @@ pub enum RecordError {
     ZeroPosition,
     /// The ballot's epoch, the context epoch and the base epoch disagree.
     EpochMismatch,
-    /// The outcome does not extend its base.
+    /// The outcome's position is not the one right after its base.
     PositionNotAfterBase,
     /// The pointer names another origin.
     PointerOriginMismatch,
@@ -375,7 +375,15 @@ fn check_body(
             if *position == ExecutionPosition::ZERO {
                 return Err(RecordError::ZeroPosition);
             }
-            if *position <= base.execution_position {
+            // Established history is contiguous: the planner and the strict
+            // materializer assign every command the position right after
+            // its base, so a record encoding a gap could never be reconciled
+            // with the frontier replay derives from the base.
+            let next = base
+                .execution_position
+                .checked_next()
+                .map_err(|_| RecordError::PositionNotAfterBase)?;
+            if *position != next {
                 return Err(RecordError::PositionNotAfterBase);
             }
             check_updates(updates)

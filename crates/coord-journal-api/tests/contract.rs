@@ -377,6 +377,14 @@ fn seal_rejects_bounds_and_guards() {
             outcome(9, base, ctx),
             RecordError::PositionNotAfterBase,
         ),
+        // Established history is contiguous: a position beyond the next
+        // one encodes a gap replay could never reconcile with the base.
+        (
+            seq(2),
+            g.digest(),
+            outcome(11, base, ctx),
+            RecordError::PositionNotAfterBase,
+        ),
         (
             seq(2),
             g.digest(),

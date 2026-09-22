@@ -219,7 +219,8 @@ impl StreamAllocator {
     }
 
     /// Rebuild from durable metadata. Every restored mapping is `Durable`
-    /// (or `Retired`); duplicates and identifiers above the high-water mark
+    /// (or `Retired`); a zero identifier, a shard at or above
+    /// [`MAX_SHARDS`], duplicates and identifiers above the high-water mark
     /// are rejected rather than repaired.
     pub fn restore(
         high_water: StreamHighWater,
@@ -231,6 +232,17 @@ impl StreamAllocator {
             streams: BTreeMap::new(),
         };
         for mapping in mappings {
+            // The derived decoders build identifiers without going through
+            // `from_durable` or `ShardId::new`, so corrupted metadata is
+            // held to the same invariants here before it can enter the map.
+            if mapping.stream.get() == 0 {
+                return Err(StreamError::ZeroStream);
+            }
+            if mapping.shard.get() >= MAX_SHARDS {
+                return Err(StreamError::ShardOutOfRange {
+                    index: mapping.shard.get(),
+                });
+            }
             if mapping.stream.get() > high_water.get() {
                 return Err(StreamError::AboveHighWater);
             }
@@ -448,6 +460,43 @@ mod tests {
         assert_eq!(
             ShardId::new(MAX_SHARDS),
             Err(StreamError::ShardOutOfRange { index: MAX_SHARDS })
+        );
+    }
+
+    #[test]
+    fn restore_holds_decoded_metadata_to_the_constructor_invariants() {
+        // The derived decoders can produce a zero identifier or an
+        // out-of-range shard that `from_durable` and `ShardId::new` refuse;
+        // restore must refuse them too, so the values below are built
+        // exactly as a decoder would build them.
+        let hw = StreamHighWater::from_durable(2);
+        let zero = StreamMappingV1 {
+            stream: StorageStreamId(0),
+            key: key(1, 1),
+            shard: ShardId(0),
+            retired: false,
+        };
+        assert_eq!(
+            StreamAllocator::restore(hw, [zero]).err(),
+            Some(StreamError::ZeroStream)
+        );
+        let wide = StreamMappingV1 {
+            stream: StorageStreamId(1),
+            key: key(1, 1),
+            shard: ShardId(MAX_SHARDS),
+            retired: false,
+        };
+        assert_eq!(
+            StreamAllocator::restore(hw, [wide]).err(),
+            Some(StreamError::ShardOutOfRange { index: MAX_SHARDS })
+        );
+        // The same values decoded from durable bytes are refused alike.
+        let bytes = postcard::to_allocvec(&wide).unwrap();
+        let decoded: StreamMappingV1 = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, wide);
+        assert_eq!(
+            StreamAllocator::restore(hw, [decoded]).err(),
+            Some(StreamError::ShardOutOfRange { index: MAX_SHARDS })
         );
     }
 

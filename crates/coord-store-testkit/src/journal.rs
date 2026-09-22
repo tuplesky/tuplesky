@@ -20,7 +20,7 @@ use coord_journal_api::failure::{JournalError, JournalErrorClass, JournalFailure
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_journal_api::group::{GroupReceipt, GroupWrite};
 use coord_journal_api::head::WrittenBytes;
-use coord_journal_api::record::{JournalRecordV1, RecordBody, RecordExpectation};
+use coord_journal_api::record::{JournalRecordV1, RecordBody, RecordExpectation, RecordOrigin};
 use coord_journal_api::stream::{StorageStreamId, StreamHighWater, StreamMappingV1};
 use coord_types::ids::LocalJournalSeq;
 
@@ -137,14 +137,30 @@ impl ModelJournal {
         self.streams.get(&stream).map_or(&[], |s| &s.records)
     }
 
-    fn expectation(&self, stream: StorageStreamId, first: &JournalRecordV1) -> RecordExpectation {
-        match self.streams.get(&stream).and_then(|s| s.records.last()) {
+    /// What the next record of a stream must be. A stream with durable
+    /// records continues their chain; an empty one expects genesis under
+    /// the identity its durable mapping was allocated for, so the cluster,
+    /// domain and incarnation checks compare against the mapping rather
+    /// than against the record that is being validated. The mapping does
+    /// not persist a replica, so that field is the record's own.
+    fn expectation(&self, mapping: &StreamMappingV1, first: &JournalRecordV1) -> RecordExpectation {
+        match self
+            .streams
+            .get(&mapping.stream)
+            .and_then(|s| s.records.last())
+        {
             Some(last) => RecordExpectation {
                 origin: *last.origin(),
                 seq: last.seq().checked_next().expect("model head below maximum"),
                 predecessor: last.digest(),
             },
-            None => RecordExpectation::genesis(*first.origin()),
+            None => RecordExpectation::genesis(RecordOrigin {
+                cluster: mapping.key.cluster,
+                domain: mapping.key.domain,
+                replica: first.origin().replica,
+                incarnation: mapping.key.incarnation,
+                stream: mapping.stream,
+            }),
         }
     }
 
@@ -153,10 +169,15 @@ impl ModelJournal {
             return Err(definite("empty group"));
         }
         for entry in group.entries() {
-            if !self.mappings.contains_key(&entry.stream()) {
+            let Some(mapping) = self.mappings.get(&entry.stream()) else {
                 return Err(definite("stream mapping not durable"));
+            };
+            // A retired mapping stays durable so the identifier is never
+            // recycled, but the stream it names is closed to appends.
+            if mapping.retired {
+                return Err(definite("stream retired"));
             }
-            let mut expect = self.expectation(entry.stream(), &entry.records()[0]);
+            let mut expect = self.expectation(mapping, &entry.records()[0]);
             if let Some(s) = self.streams.get(&entry.stream())
                 && s.records.is_empty()
                 && s.retired != LocalJournalSeq::ZERO

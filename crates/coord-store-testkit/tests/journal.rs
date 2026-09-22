@@ -174,6 +174,69 @@ fn mapping_must_be_durable_before_use_and_ids_are_distinct() {
 }
 
 #[test]
+fn empty_stream_expects_genesis_under_its_mapped_identity() {
+    // Stream 1 is mapped to domain 1: a validly sealed genesis claiming
+    // domain 2 must not start the chain under the wrong identity, so the
+    // expected origin comes from the durable mapping, not from the record.
+    let (mut journal, _, s1, _) = journal_with_streams();
+    let foreign = genesis(origin(2, s1));
+    let err = journal
+        .append_group(&group(vec![(barrier(1), s1, vec![foreign])]))
+        .unwrap_err();
+    assert!(err.is_definite());
+    assert_eq!(err.error().class, JournalErrorClass::GuardRejected);
+    assert_eq!(journal.durable_head(s1).unwrap(), LocalJournalSeq::ZERO);
+    assert_eq!(journal.appends(), 0);
+    // The genesis sealed for the mapped identity is accepted.
+    journal
+        .append_group(&group(vec![(barrier(2), s1, vec![genesis(origin(1, s1))])]))
+        .unwrap();
+    assert_eq!(
+        journal.durable_head(s1).unwrap(),
+        LocalJournalSeq::new(1).unwrap()
+    );
+}
+
+#[test]
+fn retired_mapping_refuses_appends() {
+    let (mut journal, mut allocator, s1, s2) = journal_with_streams();
+    journal
+        .append_group(&group(vec![(barrier(1), s2, vec![genesis(origin(2, s2))])]))
+        .unwrap();
+    // Retirement is persisted like any other mapping change; the identifier
+    // stays reserved but the stream is closed to appends.
+    let retired = allocator.retire(s2).unwrap();
+    journal
+        .persist_mapping(allocator.high_water(), &retired)
+        .unwrap();
+    let g2 = journal.records(s2)[0].clone();
+    let more = chain(origin(2, s2), &g2, vec![transition(1)]);
+    let err = journal
+        .append_group(&group(vec![(barrier(2), s2, more)]))
+        .unwrap_err();
+    assert!(err.is_definite());
+    assert_eq!(err.error().class, JournalErrorClass::GuardRejected);
+    assert_eq!(
+        journal.durable_head(s2).unwrap(),
+        LocalJournalSeq::new(1).unwrap()
+    );
+    assert_eq!(journal.appends(), 1);
+    // The retired mapping is still reported, so restore keeps the
+    // reservation, and the other stream is unaffected.
+    let (hw, mappings) = journal.mappings().unwrap();
+    assert!(mappings.iter().any(|m| m.stream == s2 && m.retired));
+    assert_eq!(
+        StreamAllocator::restore(hw, mappings)
+            .unwrap()
+            .lookup(&key(2)),
+        Some(s2)
+    );
+    journal
+        .append_group(&group(vec![(barrier(3), s1, vec![genesis(origin(1, s1))])]))
+        .unwrap();
+}
+
+#[test]
 fn multi_stream_group_completes_each_stream_exactly() {
     let (mut journal, _, s1, s2) = journal_with_streams();
     let g1 = genesis(origin(1, s1));
