@@ -27,6 +27,10 @@ fn dir() -> PathBuf {
 
 fn write(dir: &std::path::Path, name: &str, bytes: &[u8], mode: u32) -> String {
     let path = dir.join(name);
+    // A test writes the same name more than once under different modes,
+    // and one of those modes is read-only. Truncating a read-only file in
+    // place is refused for anyone but root, so the old one goes first.
+    let _ = std::fs::remove_file(&path);
     let mut file = std::fs::File::create(&path).expect("create");
     file.write_all(bytes).expect("write");
     drop(file);
