@@ -285,6 +285,61 @@ fn a_leader_publishes_its_reply_again_to_the_frontend_only() {
     );
 }
 
+/// A leader whose proposal batch was definitely rejected presents the
+/// same rows again under a fresh barrier and republishes the identical
+/// reply behind it. What a later duplicate replays is that retry, once
+/// the retry is durable -- not the first publication, whose batch
+/// failed. The bytes are the same; the barrier they rest on is not.
+#[test]
+fn a_retried_proposal_is_replayed_under_its_retrys_barrier() {
+    let mut l = leader();
+    let (e, c) = admitted(1, 1, 1);
+    let effects = l.step(e);
+    let Effect::Persist(first) = &effects[0] else {
+        panic!("a proposal persists its batch: {effects:?}");
+    };
+    // Definitely rejected: the batch is presented again, unchanged,
+    // under a new barrier, and the reply is published again behind it.
+    let retried = l.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: first.barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    let Effect::Persist(again) = &retried[0] else {
+        panic!("the rejected batch is presented again: {retried:?}");
+    };
+    assert_ne!(again.barrier, first.barrier);
+    assert_eq!(l.take_rejections(), vec![Rejection::ProposalRetried(c)]);
+
+    // Before the retry is durable there is nothing to replay yet: the
+    // retry's own send is still queued, and the failed original is not
+    // what is retained.
+    assert!(frontend_only(&l.step(admitted(1, 1, 1).0)).is_empty());
+    assert_eq!(
+        l.take_rejections(),
+        vec![
+            Rejection::Duplicate(c),
+            Rejection::ReplayRefused {
+                command: c,
+                why: ReplayRefusal::NotYetDurable
+            }
+        ]
+    );
+
+    // The retry lands. Its reply goes, and a duplicate now replays it.
+    let mut released = Vec::new();
+    for d in durable_of(&retried, 2) {
+        released.extend(l.step(d));
+    }
+    let reply = sends(&released)
+        .into_iter()
+        .find(|(to, _)| *to == FRONTEND.replica)
+        .map(|(_, m)| m)
+        .expect("the retry's reply reached the frontend");
+    assert_eq!(frontend_only(&l.step(admitted(1, 1, 1).0)), vec![reply]);
+    assert_eq!(l.take_rejections(), vec![Rejection::Duplicate(c)]);
+    assert_eq!(l.evidence_repairs(&c), 1);
+}
+
 // --- what is not a duplicate -----------------------------------------------
 
 /// The same identity under other admission facts is a conflict. Nothing

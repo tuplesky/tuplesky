@@ -689,6 +689,10 @@ pub struct Domain<P: Persistence> {
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
+    /// Where the last turn's look at the collector's half-held commands
+    /// left off, so a command that cannot settle here does not keep the
+    /// ones behind it from being looked at.
+    settle_cursor: usize,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -809,7 +813,8 @@ pub trait Deadline {
 
 /// How many half-held commands one turn consults the durable record for
 /// (task-c02). A bound on one turn's reads, not on the obligation: what
-/// is not reached this turn is reached the next.
+/// is not reached this turn is reached on a later one, because the turns
+/// rotate through the list rather than each starting at its head.
 const SETTLE_PER_TURN: usize = 16;
 
 /// How many times a recurring condition is said in full before it is
@@ -986,6 +991,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             expiry: None,
             asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
+            settle_cursor: 0,
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
@@ -1706,10 +1712,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return;
         }
         let mut deliveries = Vec::new();
-        let records = coord_daemon::settle::records_for(
-            self.backing.applier(),
-            half.into_iter().take(SETTLE_PER_TURN),
-        );
+        // Bounded per turn and rotated across turns: the bound is on
+        // this turn's reads, and the rotation is what keeps it from
+        // becoming a bound on which commands are ever read.
+        let (this_turn, cursor) =
+            coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
+        self.settle_cursor = cursor;
+        let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
         for (command, record) in records {
             match self.frontend.frontend.dispatcher_mut().settle_from_record(
                 command,

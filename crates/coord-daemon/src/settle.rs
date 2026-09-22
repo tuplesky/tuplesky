@@ -23,6 +23,30 @@ use coord_storage::codecs::RetryRecordV1;
 use coord_storage::{Applier, Persistence};
 use coord_types::{CommandId, RetryKey};
 
+/// Up to `per_turn` of `half`, starting where the last turn left off.
+///
+/// `cursor` is the turn's own bookkeeping: pass the value the last call
+/// returned, and get the value to pass next time. What one turn looks
+/// at is bounded; what is looked at *eventually* is not, and that is
+/// the point of the rotation. Taking the first `per_turn` every time
+/// would let a command that can never settle here -- no record of it on
+/// this node, or a record that disagrees with the release -- occupy the
+/// front of the list for as long as it is pending, and everything
+/// behind it would wait with it, unexamined. Starting where the last
+/// turn stopped means every half-held command is reached within
+/// `len / per_turn` turns of becoming half held, whatever sits in front
+/// of it.
+pub fn window<T: Clone>(half: Vec<T>, cursor: usize, per_turn: usize) -> (Vec<T>, usize) {
+    if half.is_empty() || per_turn == 0 {
+        return (Vec::new(), 0);
+    }
+    let len = half.len();
+    let start = cursor % len;
+    let take = per_turn.min(len);
+    let taken = half.into_iter().cycle().skip(start).take(take).collect();
+    (taken, start + take)
+}
+
 /// The durable records this node holds for `half`, under each command's
 /// own identity.
 ///

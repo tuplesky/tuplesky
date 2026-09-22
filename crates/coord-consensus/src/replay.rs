@@ -132,18 +132,26 @@ impl EvidenceStore {
     /// Keep `evidence` for `command`.
     ///
     /// A command has at most one fast and one adoption acknowledgement
-    /// from one replica, so at most two are kept; the same bytes twice
-    /// are one publication. Bounded by what the table remembers, which
-    /// is bounded by its capacity twice over -- the live records and the
+    /// from one replica, so at most two are kept. The same bytes
+    /// published again are one publication under its *latest* barrier
+    /// and context: a leader whose proposal batch was definitely
+    /// rejected presents the same rows again under a fresh barrier and
+    /// republishes the identical reply behind it, and what a later
+    /// duplicate must replay is that retry, not the publication whose
+    /// batch failed. Bounded by what the table remembers, which is
+    /// bounded by its capacity twice over -- the live records and the
     /// tombstones of retired ones -- and swept when it has outgrown that
     /// rather than on every insert, so the sweep is amortized over the
     /// growth that made it necessary.
     pub fn retain(&mut self, command: CommandId, evidence: RetainedEvidence, table: &CommandTable) {
         let kept = self.own.entry(command).or_default();
-        if !kept.iter().any(|e| e.frame == evidence.frame) {
-            kept.push(evidence);
-            if kept.len() > 2 {
-                kept.remove(0);
+        match kept.iter_mut().find(|e| e.frame == evidence.frame) {
+            Some(same) => *same = evidence,
+            None => {
+                kept.push(evidence);
+                if kept.len() > 2 {
+                    kept.remove(0);
+                }
             }
         }
         if self.own.len() > self.capacity.saturating_mul(2) {
