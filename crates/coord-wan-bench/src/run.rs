@@ -211,6 +211,11 @@ pub async fn run(dir: &Path, mut spec: RunSpec) -> Result<WanRunV1, RunError> {
     let origin = Instant::now();
     let mut measured_started = origin;
     let mut offered = 0u64;
+    // The resource reading is taken again when the measured window
+    // opens, so the delta is over the same window as the latencies. In
+    // an open loop the scheduling loop is the run: reading the counters
+    // only after it would cover the final drain and nothing else.
+    let mut before = ProcessCounters::read();
 
     for index in 0..total {
         let measured = index >= spec.warmup_ops;
@@ -227,6 +232,7 @@ pub async fn run(dir: &Path, mut spec: RunSpec) -> Result<WanRunV1, RunError> {
         }
         if measured && offered == 0 {
             measured_started = scheduled;
+            before = ProcessCounters::read();
         }
         if measured {
             offered += 1;
@@ -244,7 +250,6 @@ pub async fn run(dir: &Path, mut spec: RunSpec) -> Result<WanRunV1, RunError> {
     }
     drop(arrivals_tx);
 
-    let before = ProcessCounters::read();
     for worker in workers {
         let _ = worker.await;
     }

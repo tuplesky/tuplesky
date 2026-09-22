@@ -140,6 +140,9 @@ impl Mix {
     }
 }
 
+/// The prefix every object key shares; a scan runs to its end.
+const OBJECTS: &[u8] = b"/registry/bench/objects/";
+
 /// How the offered work is shaped.
 #[derive(Clone, Copy, Debug)]
 pub struct Workload {
@@ -181,7 +184,9 @@ impl Workload {
     }
 
     fn key(&self, index: u32) -> Vec<u8> {
-        format!("/registry/bench/objects/{index:08}").into_bytes()
+        let mut key = OBJECTS.to_vec();
+        key.extend_from_slice(format!("{index:08}").as_bytes());
+        key
     }
 
     fn hot(&self, index: u32) -> Vec<u8> {
@@ -263,19 +268,46 @@ impl Workload {
         }))
     }
 
+    /// A bounded range read from a random object key to the end of the
+    /// object prefix. The end is the prefix's successor rather than the
+    /// start key's: a range that ended just past the start key would
+    /// hold that key and nothing else, and `scan_limit` would never be
+    /// what bounded the read.
     fn scan(&self, rng: &mut impl Rng) -> LogicalRequest {
         let from = rng.next_u32() % self.keyspace.max(1);
-        let mut end = self.key(from);
-        end.push(0xff);
         self.finish(CanonicalOperation::Range(RangeOp {
-            range: KeyRange {
-                key: self.key(from),
-                range_end: Some(end),
-            },
+            range: KeyRange::interval(self.key(from), prefix_end(OBJECTS)),
             revision: None,
             limit: self.scan_limit.max(1),
             keys_only: false,
             count_only: false,
         }))
+    }
+}
+
+/// The first key that sorts after every key with `prefix`: the last byte
+/// that can be incremented is, and everything after it is dropped. A
+/// prefix of nothing but `0xff` has no such key; none of the prefixes
+/// here is one, and the empty answer is a range no request validates.
+fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last != 0xff {
+            end.push(last + 1);
+            break;
+        }
+    }
+    end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_end;
+
+    #[test]
+    fn a_prefix_end_carries_past_a_full_byte() {
+        assert_eq!(prefix_end(b"/objects/"), b"/objects0");
+        assert_eq!(prefix_end(b"ab\xff\xff"), b"ac");
+        assert_eq!(prefix_end(b"\xff"), b"");
     }
 }

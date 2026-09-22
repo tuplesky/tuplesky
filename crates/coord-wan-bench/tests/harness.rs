@@ -78,6 +78,42 @@ fn conditional_writes_contend_on_the_hot_keys() {
     );
 }
 
+/// A scan is a range over the object keys that follow its start, so the
+/// row limit is what bounds it. A range that ended just past the start
+/// key would return that key and nothing else, and the scan rows of a
+/// matrix would be point reads under another name.
+#[test]
+fn a_scan_ranges_over_the_keys_that_follow_its_start() {
+    let mut spec = workload(Mix {
+        put: 0,
+        get: 0,
+        compare_and_swap: 0,
+        transaction: 0,
+        scan: 1,
+    });
+    // One key to start from, so every scan starts at object zero.
+    spec.keyspace = 1;
+    let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(5);
+    let (kind, request) = spec.next(&mut rng);
+    assert_eq!(kind, Kind::Scan);
+    let coord_types::logical_v1::CanonicalOperation::Range(range) = &request.operation else {
+        panic!("a scan is a range read");
+    };
+    let end = range.range.range_end.as_deref().expect("a scan is bounded");
+    for index in 0..4u32 {
+        let key = format!("/registry/bench/objects/{index:08}").into_bytes();
+        assert!(
+            range.range.key.as_slice() <= key.as_slice() && key.as_slice() < end,
+            "object {index} is outside the scan"
+        );
+    }
+    assert!(
+        b"/registry/bench/other/00000000".as_slice() >= end,
+        "the scan left the object prefix"
+    );
+    assert_eq!(range.limit, 16, "the row limit is what bounds a scan");
+}
+
 /// A mix has to name something.
 #[test]
 fn an_empty_mix_is_refused() {
