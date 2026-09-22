@@ -207,6 +207,7 @@ fn kine_response_vectors_are_frozen() {
                 prev: Some(unbound.clone()),
             },
         ),
+        vector("compacted", 20, Outcome::Compacted),
         vector("err-compacted", 20, Outcome::ErrCompacted),
         vector("err-future-revision", 20, Outcome::ErrFutureRevision),
         vector("err-permission-denied", 20, Outcome::ErrPermissionDenied),
