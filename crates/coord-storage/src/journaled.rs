@@ -585,11 +585,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// is replayed into the projection before the domain serves anything,
     /// and this boot is then recorded in the stream.
     ///
-    /// A failure after the lifecycle record was submitted leaves the domain
-    /// attached in the state the failure produced (uncertain or
-    /// quarantined) rather than forgetting that the record may exist;
-    /// [`JournaledStore::status`] reports it and
-    /// [`JournaledStore::reconcile`] resolves it.
+    /// A failure that definitely did not write the lifecycle record leaves
+    /// the domain detached, so the caller can attach it again. A failure
+    /// after the record was submitted leaves the domain attached in the
+    /// state the failure produced (uncertain or quarantined) rather than
+    /// forgetting that the record may exist; [`JournaledStore::status`]
+    /// reports it and [`JournaledStore::reconcile`] resolves it.
     pub fn attach(
         &mut self,
         domain: DomainId,
@@ -663,7 +664,24 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         state.journaled_frontier = state.meta.frontier;
         state.queued_frontier = state.meta.frontier;
         self.domains.insert(domain, state);
-        self.record_boot(domain)?;
+        if let Err(e) = self.record_boot(domain) {
+            // A domain left attached and ready after its boot was never
+            // recorded served readers and submissions under a lifecycle
+            // the stream does not hold, and a retry was told it was
+            // already attached. When the failure is definite there is
+            // nothing to reconcile, so the domain is taken out again and
+            // the retry attaches it afresh; a domain the failure left
+            // uncertain or quarantined stays, because forgetting it would
+            // forget that the record may exist.
+            if self
+                .domains
+                .get(&domain)
+                .is_some_and(|d| d.status == DomainStatus::Ready)
+            {
+                self.domains.remove(&domain);
+            }
+            return Err(e);
+        }
         Ok(stream)
     }
 
@@ -934,7 +952,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
 
     /// Stop admitting new transitions of an obsolete ballot in one domain
     /// (design Section 4.8) and report the queued transitions that are
-    /// therefore refused, so no barrier is left waiting forever. Work
+    /// therefore refused, so no barrier is left waiting forever. A queued
+    /// application planned against a refused one is refused with it, since
+    /// its base no longer extends the history the stream will hold. Work
     /// already submitted to the journal is not touched here: its outcome
     /// is resolved by the append or by [`JournaledStore::reconcile`], and
     /// a late completion still updates bookkeeping without authorizing an
@@ -961,29 +981,47 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         state.fence = Some(promised);
         let mut refused = Vec::new();
         let mut kept = VecDeque::new();
+        // The frontier is recomputed from what the journal holds or may
+        // still hold: an uncertain batch is not touched here, so a
+        // successor planned against it remains valid until `reconcile`
+        // settles it. Refusing a queued application removes its position
+        // from that history, and a retained successor whose base named
+        // the removed position no longer extends anything: journaling it
+        // would produce a record the projection cannot accept, and the
+        // domain would be quarantined at materialization for a plan the
+        // store itself admitted. Such a successor is refused as well, so
+        // it is replanned from the frontier the domain actually reports.
+        let mut frontier = state
+            .inflight
+            .iter()
+            .fold(state.journaled_frontier, |frontier, item| {
+                frontier_after(frontier, &item.record)
+            });
         for submission in state.queue.drain(..) {
-            if obsolete(&submission.ballot, &promised) {
+            let extends = match (submission.kind, submission.batch.base) {
+                (TransitionKind::Application { .. }, Some(base)) => base == frontier.as_base(),
+                _ => true,
+            };
+            if obsolete(&submission.ballot, &promised) || !extends {
                 refused.push(StorageEvent::Failed {
                     barrier_id: submission.batch.barrier,
                     error: StorageError::DefinitelyNotCommitted,
                 });
-            } else {
-                kept.push_back(submission);
+                continue;
             }
-        }
-        state.queue = kept;
-        state.queued_bytes = state.queue.iter().map(|s| batch_bytes(&s.batch)).sum();
-        state.queued_frontier = state.journaled_frontier;
-        for submission in &state.queue {
             if let TransitionKind::Application { position, .. } = submission.kind
                 && let Some(base) = submission.batch.base
             {
-                state.queued_frontier = ExecutionFrontier {
+                frontier = ExecutionFrontier {
                     configuration: base.configuration,
                     execution_position: position,
                 };
             }
+            kept.push_back(submission);
         }
+        state.queue = kept;
+        state.queued_bytes = state.queue.iter().map(|s| batch_bytes(&s.batch)).sum();
+        state.queued_frontier = frontier;
         Ok(refused)
     }
 

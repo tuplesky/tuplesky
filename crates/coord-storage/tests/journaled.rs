@@ -16,6 +16,7 @@ use coord_core::effect::{
 };
 use coord_core::event::{StorageError, StorageEvent};
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend, ReleaseError};
+use coord_journal_api::failure::JournalFailure;
 use coord_journal_api::record::RecordError;
 use coord_journal_api::stream::ShardId;
 use coord_storage::journaled::{
@@ -582,6 +583,100 @@ fn a_late_old_ballot_completion_updates_bookkeeping_but_never_authorizes_a_new_v
             .unwrap()
             .promised,
         ballot(7)
+    );
+}
+
+#[test]
+fn fencing_refuses_a_retained_application_whose_base_names_a_refused_position() {
+    let mut world = World::new();
+    world.protocol(A, ballot(1), promise(1));
+    world.store.flush().unwrap();
+    // An old-ballot application is queued, and a newer-ballot successor
+    // is planned against the position it would establish.
+    let obsolete = world.application(A, 1, position(1), vec![kv_update(b"k", b"v1")]);
+    let successor = world.application(A, 2, position(2), vec![kv_update(b"k", b"v2")]);
+    let before = world.store.application_base(A).unwrap();
+    assert_eq!(before.execution_position, position(2));
+
+    // Fencing refuses the obsolete application. Its position is gone
+    // from the history the stream will hold, so the successor, which
+    // named that position as its base, no longer extends anything: kept,
+    // it would be journaled and then quarantine the domain at
+    // materialization. It is refused too, so it is replanned. The promise
+    // is in the applications' own epoch, so the successor is refused for
+    // its base alone, not as obsolete.
+    let promised = Ballot {
+        epoch: before.configuration,
+        number: 2,
+        leader: REPLICA,
+    };
+    let refused = world.store.fence(A, promised).unwrap();
+    let failed: BTreeSet<BarrierId> = refused
+        .iter()
+        .map(|e| match e {
+            StorageEvent::Failed {
+                barrier_id,
+                error: StorageError::DefinitelyNotCommitted,
+            } => *barrier_id,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(failed, BTreeSet::from([obsolete, successor]));
+    assert_eq!(world.store.queued(A), 0);
+    assert_eq!(world.store.queued_bytes(A), 0);
+    // The base the domain reports is the journaled one, and a command
+    // replanned from it goes through the whole pipeline.
+    let base = world.store.application_base(A).unwrap();
+    assert_eq!(base.execution_position, ExecutionPosition::ZERO);
+    let replanned = world.application(A, 2, position(1), vec![kv_update(b"k", b"v1")]);
+    let report = world.store.flush().unwrap();
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+    assert!(
+        report.events.iter().any(|e| matches!(
+            e,
+            StorageEvent::Materialized { barrier_id, .. } if *barrier_id == replanned
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(
+        world.store.application_base(A).unwrap().execution_position,
+        position(1)
+    );
+}
+
+#[test]
+fn a_boot_record_that_is_definitely_not_written_leaves_the_domain_detached() {
+    // The domain was inserted before its boot record was appended and
+    // stayed attached and ready when the append definitely failed: the
+    // caller got an error, a retry got `AlreadyAttached`, and readers and
+    // submissions served a boot the stream never recorded.
+    let mut journal = ModelJournal::new();
+    journal.script_append(AppendScript::DefinitelyNotCommitted);
+    let mut store = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BOOT,
+        JournalLimits::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.attach(A, shard(), ModelEngine::new()),
+        Err(JournaledError::Journal(JournalFailure::Definite(_)))
+    ));
+    assert_eq!(store.status(A), None, "nothing serves an unrecorded boot");
+    assert!(store.reader(A).is_none());
+    assert!(store.attached().is_empty());
+
+    // The retry attaches afresh and records the boot.
+    let stream = store.attach(A, shard(), ModelEngine::new()).unwrap();
+    assert_eq!(store.status(A), Some(DomainStatus::Ready));
+    assert_eq!(
+        store.journal().records(stream).len(),
+        2,
+        "genesis and boot are durable"
     );
 }
 
