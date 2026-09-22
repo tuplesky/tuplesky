@@ -307,18 +307,42 @@ fn every_world_of_the_floor_protocol_holds_the_four_properties() {
                 );
             }
             // A voter that promised may never vote from below its own
-            // promise, whatever else happened in the world.
+            // promise, whatever else happened in the world. The baseline
+            // it votes from is the promise its ledger holds, so that is
+            // what is checked: nothing it ever recorded is above it, and
+            // every floor it signed admits it there. Neither follows
+            // from `admits_voter` alone -- without the regression
+            // refusal a voter could sign the high floor, then lower its
+            // promise to the low one, and hold a baseline that the very
+            // floor it certified would refuse.
             for (voter, held) in &run.held {
-                if let Some(candidate) = held {
-                    let below = ExecutionPosition::new(candidate.position.get() - 1).unwrap();
-                    for floor in &floors {
-                        if floor.position() <= candidate.position {
-                            assert!(
-                                !floor.admits_voter(below) || floor.position() <= below,
-                                "{voter:?} would vote from below its own promise"
-                            );
-                        }
-                    }
+                let baseline = ReadinessLedger::recovered(*voter, epoch(), *held).floor();
+                let signed: Vec<_> = floors
+                    .iter()
+                    .filter(|floor| floor.signers().contains(voter))
+                    .collect();
+                let Some(candidate) = held else {
+                    assert!(
+                        signed.is_empty(),
+                        "{voter:?} signed a floor without holding a promise"
+                    );
+                    continue;
+                };
+                assert_eq!(baseline, candidate.position);
+                for promise in run.promises.get(voter).into_iter().flatten() {
+                    assert!(
+                        promise.candidate.position <= baseline,
+                        "{voter:?} promised {:?} and then held the lower {baseline:?}",
+                        promise.candidate.position
+                    );
+                }
+                for floor in signed {
+                    assert!(
+                        floor.admits_voter(baseline),
+                        "{voter:?} signed the floor at {:?} but would vote from {baseline:?}, \
+                         below its own promise",
+                        floor.position()
+                    );
                 }
             }
         }
