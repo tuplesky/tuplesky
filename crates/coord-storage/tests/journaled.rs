@@ -183,6 +183,36 @@ fn retry_key(sequence: u64) -> RetryKey {
     }
 }
 
+/// A canonical request whose identity a recovering reader can rederive.
+/// The payload row is only this command's payload if it rehashes to this
+/// key, so a test that writes one writes a real request, not a tag.
+fn request_of(sequence: u64) -> coord_types::logical_v1::LogicalRequest {
+    use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
+    let mut r = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: sequence.to_be_bytes().to_vec(),
+            value: vec![7],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    r.canonicalize();
+    r
+}
+
+fn payload_of(sequence: u64) -> PayloadRecordV1 {
+    PayloadRecordV1 {
+        retry_key: retry_key(sequence),
+        logical: postcard::to_allocvec(&request_of(sequence)).unwrap(),
+    }
+}
+
+/// The identity the recovering reader derives for [`payload_of`].
+fn derived_command(sequence: u64) -> CommandId {
+    CommandId::derive(&retry_key(sequence), &request_of(sequence)).unwrap()
+}
+
 fn kv_update(key: &[u8], value: &[u8]) -> StoreUpdate {
     StoreUpdate {
         collection: coord_store_api::registry::Collection::KvCurrentV1.id(),
@@ -436,7 +466,7 @@ fn a_recovery_cut_held_behind_materialization_still_summarizes_every_voting_obli
     world.store.flush().unwrap();
     // Sequence 4: a vote that is durable in the journal but deliberately
     // left unmaterialized, exactly the Section 4.8 counterexample.
-    let vote = command(0xa1);
+    let vote = derived_command(1);
     let record = CommandRecord {
         phase: Phase::Accept,
         deps: Vec::new(),
@@ -444,20 +474,14 @@ fn a_recovery_cut_held_behind_materialization_still_summarizes_every_voting_obli
         payload: Some(Digest32([0x5; 32])),
         paths: Vec::new(),
         path: Digest32([0x6; 32]),
+        synced_seq: None,
     };
     world.protocol(
         A,
         ballot(7),
         vec![
             dependency_update(epoch(), &vote, &record).unwrap(),
-            payload_update(
-                &vote,
-                &PayloadRecordV1 {
-                    retry_key: retry_key(1),
-                    logical: vec![0xaa],
-                },
-            )
-            .unwrap(),
+            payload_update(&vote, &payload_of(1)).unwrap(),
         ],
     );
     world.store.append_pending().unwrap();
@@ -894,7 +918,7 @@ fn run_schedule(
                     world.protocol(A, ballot(1), vec![payload]);
                     continue;
                 }
-                let id = command(if i == 0 { 0xa1 } else { 0xb2 });
+                let id = derived_command(i as u64 + 1);
                 let found = conflict_lookup(gated.view(), &keys);
                 drop(gated);
                 let record = CommandRecord {
@@ -904,16 +928,10 @@ fn run_schedule(
                     payload: Some(Digest32([i as u8; 32])),
                     paths: Vec::new(),
                     path: Digest32([0x9; 32]),
+                    synced_seq: None,
                 };
                 let dependency = dependency_update(epoch(), &id, &record).unwrap();
-                let payload = payload_update(
-                    &id,
-                    &PayloadRecordV1 {
-                        retry_key: retry_key(i as u64 + 1),
-                        logical: vec![i as u8],
-                    },
-                )
-                .unwrap();
+                let payload = payload_update(&id, &payload_of(i as u64 + 1)).unwrap();
                 deps.insert(i, found);
                 proposed.insert(i);
                 journaled.insert(id);
@@ -985,8 +1003,8 @@ fn atomic_initialization_and_conflict_lookup_hold_under_every_yielding_schedule(
         let deps = run_schedule(schedule, false).unwrap_or_else(|e| panic!("{schedule:?}: {e}"));
         let first = deps.get(&0).cloned().unwrap_or_default();
         let second = deps.get(&1).cloned().unwrap_or_default();
-        let a_on_b = first.contains(&command(0xb2));
-        let b_on_a = second.contains(&command(0xa1));
+        let a_on_b = first.contains(&derived_command(2));
+        let b_on_a = second.contains(&derived_command(1));
         assert!(
             a_on_b ^ b_on_a,
             "{schedule:?}: conflicting proposals must be ordered exactly one way"
@@ -1084,8 +1102,8 @@ fn the_pipeline_never_reports_a_store_sequence_that_is_not_the_materialized_reco
         world.store.frontiers(A).unwrap().materialized()
     );
     let gated = world.store.reader(A).unwrap().snapshot().unwrap();
-    assert_eq!(gated.meta().stamp.journal_seq, seq(3));
-    assert_eq!(gated.meta().stamp.last_batch_digest, applied.last_digest);
+    assert_eq!(gated.meta().stamp.journal_seq(), seq(3));
+    assert_eq!(gated.meta().stamp.last_batch_digest(), applied.last_digest);
 }
 
 #[test]
