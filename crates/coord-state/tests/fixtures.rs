@@ -98,14 +98,23 @@ fn kine_response_vectors_are_frozen() {
         key: b"/registry/b".to_vec(),
         entry: entry(b"vb", 11, 11, 1, Some(B1)),
     };
+    // A Kine entry carries its own value and revisions: the lease that
+    // backs a private TTL binding never reaches a Kine caller, so there
+    // is no `KvEntry` to embed here.
     let bound = KineKv {
         key: b"/registry/b".to_vec(),
-        entry: entry(b"vb", 11, 11, 1, Some(B1)),
+        value: b"vb".to_vec(),
+        create_revision: rev(11),
+        mod_revision: rev(11),
+        version: 1,
         ttl_seconds: 30,
     };
     let unbound = KineKv {
         key: b"/registry/a".to_vec(),
-        entry: entry(b"va", 3, 7, 2, None),
+        value: b"va".to_vec(),
+        create_revision: rev(3),
+        mod_revision: rev(7),
+        version: 2,
         ttl_seconds: 0,
     };
     let vectors = vec![
@@ -198,6 +207,7 @@ fn kine_response_vectors_are_frozen() {
                 prev: Some(unbound.clone()),
             },
         ),
+        vector("compacted", 20, Outcome::Compacted),
         vector("err-compacted", 20, Outcome::ErrCompacted),
         vector("err-future-revision", 20, Outcome::ErrFutureRevision),
         vector("err-permission-denied", 20, Outcome::ErrPermissionDenied),

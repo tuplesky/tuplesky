@@ -1151,6 +1151,8 @@ fn request_frame() -> Vec<u8> {
     MessageV1::Request(coord_types::wire_v1::RequestV1::new(retry_key, &request, 0).unwrap())
         .encode()
         .unwrap()
+}
+
 /// Open a raw QUIC connection to `acceptor` offering `alpn`, with a
 /// client certificate only when `identity` is given, and send `first` as
 /// the first control frame. Returns how the acceptor ended it.
