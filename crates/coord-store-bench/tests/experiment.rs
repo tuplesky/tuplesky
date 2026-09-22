@@ -50,7 +50,10 @@ fn a_store_root_is_never_used_or_removed() {
         Err(RunRootError::LooksLikeStoreRoot(root)) => assert_eq!(root, dir.path()),
         other => panic!("a directory beneath a store root was accepted: {other:?}"),
     }
-    assert!(!nested.exists(), "nothing was created beneath the store root");
+    assert!(
+        !nested.exists(),
+        "nothing was created beneath the store root"
+    );
     // An unmarked directory is never removed, even when it is empty.
     let other = tempfile::tempdir().unwrap();
     let run = RunRoot::allocate(other.path(), "run").unwrap();
