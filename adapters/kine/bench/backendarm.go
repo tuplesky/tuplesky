@@ -2,6 +2,7 @@ package bench
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -148,8 +149,12 @@ func (a *BackendArm) Close() {
 // server keeps the same memory in its cache: a guarded update names the
 // revision the previous answer reported, and a failed guard hands back
 // the current one in the same answer, so no read is needed to retry.
+//
+// The backend is held through Kine's interface rather than as the
+// concrete type: the caller uses nothing beyond it, and a test can then
+// hand it a backend that answers a create however the test needs.
 type backendCaller struct {
-	backend *backend.Backend
+	backend server.Backend
 	mu      sync.Mutex
 	seen    map[string]int64
 }
@@ -171,7 +176,7 @@ func (c *backendCaller) Do(ctx context.Context, op Operation) Answer {
 	case KindGet:
 		_, kv, err := c.backend.Get(ctx, op.Key, 0, false)
 		if err != nil {
-			return Answer{Outcome: Refused(reasonOf(err))}
+			return Answer{Outcome: outcomeOf(err)}
 		}
 		if kv != nil {
 			c.remember(op.Key, kv.ModRevision)
@@ -180,7 +185,7 @@ func (c *backendCaller) Do(ctx context.Context, op Operation) Answer {
 	case KindScan:
 		_, _, err := c.backend.List(ctx, op.From, op.To, op.Limit, 0, false)
 		if err != nil {
-			return Answer{Outcome: Refused(reasonOf(err))}
+			return Answer{Outcome: outcomeOf(err)}
 		}
 		return Answer{Outcome: Established}
 	default:
@@ -196,7 +201,7 @@ func (c *backendCaller) write(ctx context.Context, op Operation) Answer {
 	if revision := c.revision(op.Key); revision > 0 {
 		rev, kv, updated, err := c.backend.Update(ctx, op.Key, op.Value, revision, 0)
 		if err != nil {
-			return Answer{Outcome: Refused(reasonOf(err))}
+			return Answer{Outcome: outcomeOf(err)}
 		}
 		if !updated {
 			if kv != nil {
@@ -211,7 +216,7 @@ func (c *backendCaller) write(ctx context.Context, op Operation) Answer {
 		return Answer{Outcome: Established, Revision: rev, Wrote: true}
 	}
 	rev, err := c.backend.Create(ctx, op.Key, op.Value, 0)
-	if err != nil {
+	if errors.Is(err, server.ErrKeyExists) {
 		// The key exists already: this caller had not written it, so it
 		// learns the revision with one read and then stays guarded.
 		_, kv, getErr := c.backend.Get(ctx, op.Key, 0, false)
@@ -220,6 +225,14 @@ func (c *backendCaller) write(ctx context.Context, op Operation) Answer {
 		}
 		c.remember(op.Key, kv.ModRevision)
 		return Answer{Outcome: Established, Revision: kv.ModRevision}
+	}
+	if err != nil {
+		// Only the domain's own word that the key exists earns the read
+		// above. Any other failure -- a deadline, a lost transport, an
+		// outcome never established -- is reported as what it was: a
+		// read that happened to find the key would otherwise turn a
+		// failed write into an established one.
+		return Answer{Outcome: outcomeOf(err)}
 	}
 	c.remember(op.Key, rev)
 	return Answer{Outcome: Established, Revision: rev, Wrote: true}

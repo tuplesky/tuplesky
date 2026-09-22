@@ -173,7 +173,7 @@ func (c *edgeCaller) Do(ctx context.Context, op Operation) Answer {
 	case KindGet:
 		got, err := c.cli.Get(ctx, op.Key)
 		if err != nil {
-			return Answer{Outcome: Refused(reasonOf(err))}
+			return Answer{Outcome: outcomeOf(err)}
 		}
 		if len(got.Kvs) == 1 {
 			c.remember(op.Key, got.Kvs[0].ModRevision)
@@ -183,7 +183,7 @@ func (c *edgeCaller) Do(ctx context.Context, op Operation) Answer {
 		_, err := c.cli.Get(ctx, op.From,
 			clientv3.WithRange(op.To), clientv3.WithLimit(op.Limit))
 		if err != nil {
-			return Answer{Outcome: Refused(reasonOf(err))}
+			return Answer{Outcome: outcomeOf(err)}
 		}
 		return Answer{Outcome: Established}
 	default:
@@ -202,7 +202,7 @@ func (c *edgeCaller) write(ctx context.Context, op Operation) Answer {
 		Else(clientv3.OpGet(op.Key)).
 		Commit()
 	if err != nil {
-		return Answer{Outcome: Refused(reasonOf(err))}
+		return Answer{Outcome: outcomeOf(err)}
 	}
 	if !done.Succeeded {
 		for _, response := range done.Responses {

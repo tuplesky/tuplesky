@@ -217,8 +217,10 @@ pub fn lookup<V: OrderedRead>(
 
 /// Decide how to treat a presented invocation. Checked at execution time
 /// against the durable state, so retirement and session changes ordered
-/// earlier are honored. A retained result is handed out only when
-/// `authorize` accepts it under the current policy (see
+/// earlier are honored, and against the retirement the binding itself
+/// carries, so an acknowledgement that reopens the window is admitted
+/// with the request it rides on. A retained result is handed out only
+/// when `authorize` accepts it under the current policy (see
 /// [`coord_state::authorize_retained`]); otherwise the admission is
 /// [`Admission::Unauthorized`].
 pub fn admit<V: OrderedRead>(
@@ -241,7 +243,20 @@ pub fn admit<V: OrderedRead>(
     if key.request_sequence <= floor.floor {
         return Ok(Admission::TooOld { floor: floor.floor });
     }
-    if key.request_sequence.get() - floor.floor.get() > u64::from(floor.width) {
+    // The window is measured from the floor this command's own
+    // acknowledgement establishes, not from the floor it found. The
+    // retirement rides on the request and lands in the same batch, so
+    // once the command is durable that is the floor; checking the
+    // window against the older one would refuse the very request that
+    // moves it. A client that filled its whole window before any result
+    // came back acknowledged nothing on those frames; the first frame
+    // past the window is the one that acknowledges them all, and a
+    // window that refused it could never be reopened, since nothing but
+    // an admitted request advances the floor. The binding's retirement
+    // is resolved from the same view (see [`retirement`]), so this
+    // stays a function of the durable state and the accepted payload.
+    let reopened = binding.retires.map_or(floor.floor, |r| r.through);
+    if key.request_sequence.get() - reopened.get() > u64::from(floor.width) {
         return Ok(Admission::OutOfWindow {
             floor: floor.floor,
             width: floor.width,

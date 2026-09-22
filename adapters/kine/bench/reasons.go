@@ -8,6 +8,23 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// unknownOutcome is the reason of the one failure that is not a refusal
+// at all: the domain may or may not have applied the operation.
+const unknownOutcome = "unknown outcome"
+
+// outcomeOf names what an error left the operation as. The error the
+// backend raises to say the outcome was never established is the
+// Unknown outcome, counted on its own; every other error is a bounded
+// refusal. A report that filed the unknowns under refusals would show a
+// loss experiment as a run with nothing indeterminate in it.
+func outcomeOf(err error) string {
+	reason := reasonOf(err)
+	if reason == unknownOutcome {
+		return Unknown
+	}
+	return Refused(reason)
+}
+
 // reasonOf names a failure by its bounded class, never by its text. A
 // report groups refusals, and a refusal carrying a message no two runs
 // spell the same way cannot be grouped.
@@ -25,7 +42,7 @@ func reasonOf(err error) string {
 		if s.Code() == codes.Unavailable && isUnknownOutcome(s.Message()) {
 			// The domain may or may not have applied it. That is a
 			// distinct thing from a refusal and is counted as one.
-			return "unknown outcome"
+			return unknownOutcome
 		}
 		return s.Code().String()
 	}

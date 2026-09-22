@@ -153,8 +153,9 @@ impl<E: LocalEngine> Domain<E> {
 
     /// The whole path a client's request takes, acknowledging the floor
     /// its frame carries: the retirement is resolved against the view
-    /// the plan is built on and applied in the same batch, which is
-    /// exactly what `Applier::apply_bound` does.
+    /// the plan is built on, before admission so the window is measured
+    /// from the floor it establishes, and applied in the same batch,
+    /// which is exactly what `Applier::apply_bound` does.
     fn submit_acking(
         &mut self,
         seq: u64,
@@ -163,11 +164,11 @@ impl<E: LocalEngine> Domain<E> {
     ) -> (Admission, Option<coord_state::Response>) {
         let mut b = binding(seq, request);
         let gated = self.worker.reader().snapshot().unwrap();
+        b.retires = retry::retirement(gated.view(), &b.retry_key, ack_through).unwrap();
         let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
         if admission != Admission::New {
             return (admission, None);
         }
-        b.retires = retry::retirement(gated.view(), &b.retry_key, ack_through).unwrap();
         let view = build_read_view(
             &gated,
             NS,
@@ -676,4 +677,54 @@ fn an_acknowledgement_never_retires_more_than_the_client_can_have_received() {
     // Acknowledging nothing, or what is already retired, retires
     // nothing rather than rewriting the row.
     assert_eq!(retry::retirement(gated.view(), &key(5), 0).unwrap(), None);
+}
+
+/// A client that fills its whole window before any result comes back
+/// acknowledges nothing on those frames, because it has received
+/// nothing; the first frame past the window is the one that acknowledges
+/// them all. That frame is admitted, since the floor it establishes is
+/// the one its window is measured from. Measured from the floor it
+/// found instead, it would be refused as out of window, and so would
+/// every frame after it: the window can only be reopened by an admitted
+/// request, so a client with a window's worth of concurrency would be
+/// shut out for the life of its instance the first time it used it.
+#[test]
+fn a_filled_window_is_reopened_by_the_frame_that_first_crosses_it() {
+    const WINDOW: u32 = 4;
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(WINDOW);
+    // A window's worth in flight at once, none of them able to
+    // acknowledge anything yet.
+    for seq in 1..=u64::from(WINDOW) {
+        let request = put(format!("k{seq}").as_bytes(), b"v");
+        let (admission, _) = d.submit_acking(seq, &request, 0);
+        assert_eq!(admission, Admission::New, "sequence {seq}");
+    }
+    assert_eq!(d.floor(), 0);
+
+    // Every result is back; the next frame says so.
+    let beyond = u64::from(WINDOW) + 1;
+    let request = put(b"kx", b"v");
+    let (admission, response) = d.submit_acking(beyond, &request, u64::from(WINDOW));
+    assert_eq!(admission, Admission::New, "the acknowledging frame");
+    assert!(response.is_some());
+    assert_eq!(d.floor(), u64::from(WINDOW));
+    for seq in 1..=u64::from(WINDOW) {
+        assert!(!d.retained(seq), "result of {seq} kept");
+    }
+    assert!(d.retained(beyond));
+
+    // And the window is a window still: a frame that acknowledges the
+    // same floor but stands more than a window past it is refused.
+    let too_far = u64::from(WINDOW) * 2 + 2;
+    let request = put(b"ky", b"v");
+    let (admission, _) = d.submit_acking(too_far, &request, u64::from(WINDOW));
+    assert_eq!(
+        admission,
+        Admission::OutOfWindow {
+            floor: RequestSequence::new(u64::from(WINDOW)).unwrap(),
+            width: WINDOW,
+        }
+    );
+    assert_eq!(d.floor(), u64::from(WINDOW), "a refusal moves nothing");
 }

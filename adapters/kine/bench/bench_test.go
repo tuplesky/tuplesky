@@ -1,9 +1,15 @@
 package bench
 
 import (
+	"context"
+	"errors"
 	"math/rand/v2"
 	"testing"
 	"time"
+
+	"github.com/k3s-io/kine/pkg/server"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The same seed offers the same work. A comparison between two arms is
@@ -131,5 +137,85 @@ func TestPrefixEndIsTheExclusiveUpperBound(t *testing.T) {
 	}
 	if got := prefixEnd("\xff\xff"); got != "" {
 		t.Fatalf("an all-0xff prefix has no upper bound, got %q", got)
+	}
+}
+
+// An error is either the one Unknown outcome or a bounded refusal, and
+// the two are told apart before a report counts them. A loss or timeout
+// experiment whose indeterminate operations were filed under refusals
+// would report `unknown` as zero, which is the one number it exists to
+// show.
+func TestAnUnknownOutcomeIsNotARefusal(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"unknown after resolution",
+			status.Error(codes.Unavailable, "outcome unknown after 3 resolutions; retry"),
+			Unknown},
+		{"unreachable", status.Error(codes.Unavailable, "not connected"),
+			Refused("Unavailable")},
+		{"deadline", context.DeadlineExceeded, Refused("deadline")},
+		{"cancelled", context.Canceled, Refused("cancelled")},
+		{"key exists", server.ErrKeyExists, Refused(status.Code(server.ErrKeyExists).String())},
+		{"opaque", errors.New("something"), Refused(codes.Unknown.String())},
+	}
+	for _, c := range cases {
+		if got := outcomeOf(c.err); got != c.want {
+			t.Errorf("%s: outcomeOf = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// scriptedBackend answers a create with whatever the test says and a
+// read with a key that exists. Everything else is never called.
+type scriptedBackend struct {
+	server.Backend
+	createErr error
+	reads     int
+}
+
+func (b *scriptedBackend) Create(context.Context, string, []byte, int64) (int64, error) {
+	return 0, b.createErr
+}
+
+func (b *scriptedBackend) Get(context.Context, string, int64, bool) (int64, *server.KeyValue, error) {
+	b.reads++
+	return 7, &server.KeyValue{Key: "k", ModRevision: 7}, nil
+}
+
+// Only the domain's own word that the key exists earns the recovery
+// read. A create that timed out, lost its transport or was never
+// established is reported as that, even though a read would find the
+// key: the key being there says nothing about whether this write put it
+// there, and an Established answer would hide the failure the run was
+// meant to measure.
+func TestOnlyAKeyThatExistsIsRecoveredByReading(t *testing.T) {
+	cases := []struct {
+		name  string
+		err   error
+		want  string
+		reads int
+	}{
+		{"key exists", server.ErrKeyExists, Established, 1},
+		{"deadline", context.DeadlineExceeded, Refused("deadline"), 0},
+		{"transport", status.Error(codes.Unavailable, "not connected"), Refused("Unavailable"), 0},
+		{"unknown", status.Error(codes.Unavailable, "outcome unknown after 2 resolutions; retry"), Unknown, 0},
+		{"denied", status.Error(codes.PermissionDenied, "not admitted"), Refused("PermissionDenied"), 0},
+	}
+	for _, c := range cases {
+		b := &scriptedBackend{createErr: c.err}
+		caller := &backendCaller{backend: b, seen: map[string]int64{}}
+		answer := caller.Do(context.Background(), Operation{Kind: KindPut, Key: "k", Value: []byte("v")})
+		if answer.Outcome != c.want {
+			t.Errorf("%s: outcome %q, want %q", c.name, answer.Outcome, c.want)
+		}
+		if b.reads != c.reads {
+			t.Errorf("%s: %d recovery reads, want %d", c.name, b.reads, c.reads)
+		}
+		if remembered := caller.revision("k") > 0; remembered != (c.want == Established) {
+			t.Errorf("%s: revision remembered = %v", c.name, remembered)
+		}
 	}
 }
