@@ -18,9 +18,12 @@ use coord_core::effect::{
 };
 use coord_core::event::{StorageError, StorageEvent};
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend, ReleaseError};
+use coord_journal_api::engine::ReadBudget;
 use coord_journal_api::failure::JournalFailure;
 use coord_journal_api::frontier::CheckpointPointerV1;
-use coord_journal_api::record::RecordError;
+use coord_journal_api::record::{
+    JournalRecordV1, LifecycleRecordV1, RecordBody, RecordDraft, RecordError, RecordOrigin,
+};
 use coord_journal_api::stream::ShardId;
 use coord_storage::journaled::{
     CutError, DomainStatus, JournalLimits, JournaledError, JournaledStore, Submission,
@@ -1643,4 +1646,105 @@ fn a_replaced_node_replays_the_suffix_its_previous_generation_wrote() {
     // generation carries nothing, and the generation that was replaced
     // cannot take the stream back.
     assert_eq!(next.adopt_stream(A, inc()).unwrap(), None);
+}
+
+/// A carried stream's generation never goes back (task-58).
+///
+/// The prefix an earlier generation wrote is this node's own history,
+/// so replay accepts a record below the generation the mapping serves.
+/// It may not accept one below the record *before* it: a generation only
+/// advances, and a record at an older generation after a newer one is
+/// what a fenced generation writing past its replacement looks like.
+/// The journal catches that within a page, where each page seeds from
+/// its first record; across a page boundary it is the store's to refuse,
+/// so the same suffix is replayed one record per page as well.
+fn a_carried_stream_that_goes_back_a_generation_is_refused(limits: JournalLimits) {
+    let world = World::new();
+    let (journal, mut engines) = world.store.into_parts();
+    let engine = engines.pop().expect("one domain").1;
+
+    // The node's key was replaced and the replacement wrote a suffix,
+    // durable and deliberately not materialized.
+    let replaced = ReplicaIncarnation::new(inc().get() + 1).unwrap();
+    let boot = BootId([0x89; 16]);
+    let mut next = JournaledStore::open(journal, CLUSTER, REPLICA, replaced, boot, limits).unwrap();
+    let stream = next
+        .adopt_stream(A, inc())
+        .unwrap()
+        .expect("the replacement did not carry this domain's stream forward");
+    next.attach(A, shard(), engine).unwrap();
+    let barrier = BarrierAllocator::new(replaced, boot).allocate();
+    next.submit(Submission {
+        domain: A,
+        ballot: ballot(1),
+        kind: TransitionKind::Protocol,
+        batch: PersistBatch {
+            barrier,
+            base: None,
+            updates: promise(1),
+        },
+    })
+    .unwrap();
+    next.append_pending().unwrap();
+    let frontiers = next.frontiers(A).unwrap();
+    assert!(
+        frontiers.materialized() < frontiers.durable(),
+        "nothing was owed, so this test would prove nothing"
+    );
+
+    // Then a record at the replaced generation, chained onto the newer
+    // one. The writer would never accept it; the reader must not either.
+    let (mut journal, mut engines) = next.into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    let last = journal
+        .records(stream)
+        .last()
+        .expect("a durable suffix")
+        .clone();
+    assert_eq!(last.origin().incarnation, replaced);
+    let stale = JournalRecordV1::seal(RecordDraft {
+        origin: RecordOrigin {
+            incarnation: inc(),
+            ..*last.origin()
+        },
+        seq: last.seq().checked_next().unwrap(),
+        predecessor: last.digest(),
+        body: RecordBody::Lifecycle(LifecycleRecordV1::Boot {
+            boot: BootId([0x1f; 16]),
+        }),
+    })
+    .unwrap();
+    journal.inject_record(stream, stale);
+
+    let mut again = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        replaced,
+        BootId([0x9a; 16]),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(again.adopt_stream(A, inc()).unwrap(), None);
+    let err = again.attach(A, shard(), engine).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            JournaledError::Record(RecordError::IncarnationMismatch)
+        ),
+        "the regression was replayed: {err:?}"
+    );
+}
+
+#[test]
+fn a_carried_stream_that_goes_back_a_generation_is_refused_within_a_page() {
+    a_carried_stream_that_goes_back_a_generation_is_refused(JournalLimits::default());
+}
+
+#[test]
+fn a_carried_stream_that_goes_back_a_generation_is_refused_across_pages() {
+    a_carried_stream_that_goes_back_a_generation_is_refused(JournalLimits {
+        read: ReadBudget::new(1, 1024 * 1024),
+        ..JournalLimits::default()
+    });
 }

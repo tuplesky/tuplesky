@@ -1033,8 +1033,16 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
         if let Some(existing) = inner.mappings.get(&mapping.stream) {
             // An authorized replacement carries the stream forward with
             // the rest of the node's durable state (task-58); nothing
-            // else may move a mapping.
-            if existing.key != mapping.key && !existing.adopts(mapping) {
+            // else may move a mapping. A mapping that keeps its key
+            // keeps its shard too: `adopts` checks the shard for a
+            // carried stream, and this checks it for a re-persisted one,
+            // so neither path lets a stream's placement be rewritten.
+            let moved = if existing.key == mapping.key {
+                existing.shard != mapping.shard
+            } else {
+                !existing.adopts(mapping)
+            };
+            if moved {
                 return Err(definite(
                     "mapping identity of an allocated stream cannot change",
                 ));

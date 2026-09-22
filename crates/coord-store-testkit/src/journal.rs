@@ -137,6 +137,14 @@ impl ModelJournal {
         self.streams.get(&stream).map_or(&[], |s| &s.records)
     }
 
+    /// Place a record at the head of a stream without validating it
+    /// against the durable head: a fault injection for tests of the
+    /// reader, which must refuse what the writer never would have
+    /// accepted. The record is durable and is read back like any other.
+    pub fn inject_record(&mut self, stream: StorageStreamId, record: JournalRecordV1) {
+        self.streams.entry(stream).or_default().records.push(record);
+    }
+
     /// What the next record of a stream must be. A stream with durable
     /// records continues their chain; an empty one expects genesis under
     /// the identity its durable mapping was allocated for, so the cluster,
@@ -350,8 +358,14 @@ impl JournalEngine for ModelJournal {
         if let Some(existing) = self.mappings.get(&mapping.stream) {
             // An authorized replacement carries the stream forward with
             // the rest of the node's durable state (task-58); nothing
-            // else may move a mapping.
-            if existing.key != mapping.key && !existing.adopts(mapping) {
+            // else may move a mapping, and a mapping that keeps its key
+            // keeps its shard, here as in the real journal.
+            let moved = if existing.key == mapping.key {
+                existing.shard != mapping.shard
+            } else {
+                !existing.adopts(mapping)
+            };
+            if moved {
                 return Err(definite(
                     "mapping identity of an allocated stream cannot change",
                 ));
