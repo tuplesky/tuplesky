@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use coord_checkpoint::export::{CheckpointOrigin, ExportLimits, export_shared};
 use coord_checkpoint::floor::{
     ACTIVATION_KEY, CheckpointReadinessV1, READINESS_KEY_PREFIX, RecoveryObligation,
-    activate_floor, publish_activation, published_activation, read_readiness, readiness_key,
-    record_readiness, recovery_obligation,
+    RecoveryReport, activate_floor, publish_activation, published_activation, read_readiness,
+    readiness_key, record_readiness, recovery_obligation,
 };
 use coord_checkpoint::manifest::{CheckpointBoundary, SharedManifestV1};
 use coord_checkpoint::trim::{
@@ -1576,10 +1576,15 @@ fn an_observer_or_a_foreign_promise_is_refused_rather_than_counted() {
 fn a_recovery_honours_the_highest_floor_a_majority_reports_and_refuses_a_narrower_read() {
     let voters = floor_voters();
     let promises = vec![readiness(SELF), readiness(PEER)];
+    let reports: Vec<RecoveryReport> = promises
+        .iter()
+        .copied()
+        .map(RecoveryReport::promised)
+        .collect();
 
     // A lagging replica must obtain the checkpoint before voting.
     let behind = pos(FLOOR_POSITION - 1);
-    let obligation = recovery_obligation(&voters, &promises, behind).unwrap();
+    let obligation = recovery_obligation(&voters, &reports, behind).unwrap();
     assert_eq!(
         obligation,
         RecoveryObligation::Install {
@@ -1590,7 +1595,7 @@ fn a_recovery_honours_the_highest_floor_a_majority_reports_and_refuses_a_narrowe
 
     // One that is already at or beyond the floor owes nothing.
     assert_eq!(
-        recovery_obligation(&voters, &promises, pos(FLOOR_POSITION)).unwrap(),
+        recovery_obligation(&voters, &reports, pos(FLOOR_POSITION)).unwrap(),
         RecoveryObligation::None
     );
 
@@ -1600,7 +1605,11 @@ fn a_recovery_honours_the_highest_floor_a_majority_reports_and_refuses_a_narrowe
     // that missed it would vote from a baseline the cluster forgot
     // below. One report is one report whatever it says.
     assert_eq!(
-        recovery_obligation(&voters, &[readiness(LAGGARD)], behind),
+        recovery_obligation(
+            &voters,
+            &[RecoveryReport::promised(readiness(LAGGARD))],
+            behind
+        ),
         Err(TrimError::NoQuorum { have: 1, need: 2 })
     );
     assert_eq!(
@@ -1608,7 +1617,15 @@ fn a_recovery_honours_the_highest_floor_a_majority_reports_and_refuses_a_narrowe
         Err(TrimError::NoQuorum { have: 0, need: 2 })
     );
     assert_eq!(
-        recovery_obligation(&voters, &[readiness(SELF)], behind),
+        recovery_obligation(
+            &voters,
+            &[RecoveryReport::promised(readiness(SELF))],
+            behind
+        ),
+        Err(TrimError::NoQuorum { have: 1, need: 2 })
+    );
+    assert_eq!(
+        recovery_obligation(&voters, &[RecoveryReport::unpromised(LAGGARD)], behind),
         Err(TrimError::NoQuorum { have: 1, need: 2 })
     );
 
@@ -1621,30 +1638,20 @@ fn a_recovery_honours_the_highest_floor_a_majority_reports_and_refuses_a_narrowe
         BTreeSet::from([PEER, LAGGARD]),
         voters.voters().clone(),
     ] {
-        let reports: Vec<CheckpointReadinessV1> = promises
-            .iter()
-            .filter(|p| majority.contains(&p.voter))
-            .copied()
-            .collect();
-        // The laggard promised nothing, so a majority containing it
-        // reports one promise -- but it is still a majority of voters
-        // reporting, which is what the rule requires.
-        let reporting: Vec<CheckpointReadinessV1> = majority
+        // The laggard promised nothing and answers so. A majority
+        // containing it reports one promise -- but it is a majority of
+        // voters answering, which is what the rule requires: the
+        // signers this replica can reach may be fewer than a majority
+        // while the voters it can reach are not, and it is the voters
+        // that are counted.
+        let reporting: Vec<RecoveryReport> = majority
             .iter()
             .map(|v| {
-                reports
+                promises
                     .iter()
                     .find(|p| &p.voter == v)
                     .copied()
-                    .unwrap_or_else(|| {
-                        // A voter that promised nothing reports its
-                        // absence of a promise; modelled here as a
-                        // promise at the zero boundary, which is what a
-                        // fresh replica would report.
-                        let mut nothing = readiness(*v);
-                        nothing.boundary.execution_position = ExecutionPosition::ZERO;
-                        nothing
-                    })
+                    .map_or_else(|| RecoveryReport::unpromised(*v), RecoveryReport::promised)
             })
             .collect();
         let discovered = recovery_obligation(&voters, &reporting, behind).unwrap();
@@ -1657,6 +1664,85 @@ fn a_recovery_honours_the_highest_floor_a_majority_reports_and_refuses_a_narrowe
             "a majority containing a signer discovered less than the floor"
         );
     }
+
+    // A majority that has promised nothing is a complete answer: nobody
+    // has promised, so nothing is owed.
+    assert_eq!(
+        recovery_obligation(
+            &voters,
+            &[
+                RecoveryReport::unpromised(PEER),
+                RecoveryReport::unpromised(LAGGARD)
+            ],
+            behind
+        )
+        .unwrap(),
+        RecoveryObligation::None
+    );
+}
+
+/// A promise from another configuration is refused before it is
+/// counted, and a report that carries somebody else's promise is not
+/// a report.
+///
+/// A delayed answer from a prior epoch would otherwise satisfy the
+/// majority read and could replace the intersecting signer's current
+/// promise with an older, lower one -- and the voter set it is evidence
+/// about need not intersect this one at all.
+#[test]
+fn a_recovery_refuses_a_promise_from_another_configuration() {
+    let voters = floor_voters();
+    let behind = pos(FLOOR_POSITION - 1);
+
+    // The peer's stale answer from the prior epoch names a lower floor.
+    let mut stale = readiness(PEER);
+    stale.configuration = epoch(EPOCH - 1);
+    stale.boundary.execution_position = pos(FLOOR_POSITION - 1);
+    assert_eq!(
+        recovery_obligation(
+            &voters,
+            &[
+                RecoveryReport::promised(readiness(SELF)),
+                RecoveryReport::promised(stale)
+            ],
+            behind
+        ),
+        Err(TrimError::FloorOriginMismatch {
+            field: "configuration"
+        })
+    );
+
+    // It is refused even when it would not change the answer: it is
+    // rejected as evidence, not weighed.
+    assert_eq!(
+        recovery_obligation(
+            &voters,
+            &[
+                RecoveryReport::promised(readiness(SELF)),
+                RecoveryReport::promised(readiness(LAGGARD)),
+                RecoveryReport::promised(stale)
+            ],
+            behind
+        ),
+        Err(TrimError::FloorOriginMismatch {
+            field: "configuration"
+        })
+    );
+
+    // A report naming one voter and carrying another's promise is
+    // malformed rather than counted for either.
+    let relayed = RecoveryReport {
+        voter: LAGGARD,
+        readiness: Some(readiness(SELF)),
+    };
+    assert!(matches!(
+        recovery_obligation(
+            &voters,
+            &[RecoveryReport::promised(readiness(SELF)), relayed],
+            behind
+        ),
+        Err(TrimError::Engine(_))
+    ));
 }
 
 /// The published certificate never moves backwards, and a disagreement

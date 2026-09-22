@@ -80,7 +80,7 @@ pub use local::{
 };
 
 pub use floor::{
-    ActivatedFloorV1, CheckpointReadinessV1, RecoveryObligation, activate_floor,
+    ActivatedFloorV1, CheckpointReadinessV1, RecoveryObligation, RecoveryReport, activate_floor,
     publish_activation, read_readiness, record_readiness, recovery_obligation,
 };
 pub use maintain::{BaselineError, LocalBaseline, Publication};

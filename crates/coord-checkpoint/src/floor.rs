@@ -513,25 +513,83 @@ pub enum RecoveryObligation {
     },
 }
 
-/// What `reports` -- the readiness of a majority of `voters` -- means for
+/// One voter's answer to a recovery's readiness query.
+///
+/// The voter is named apart from its promise because a voter that has
+/// promised nothing still answered, and answering is what a recovery
+/// counts: the intersection argument is about how many of the
+/// configuration's voters were read, not how many of them happen to
+/// hold a promise. Counting promises instead would leave a replica
+/// unable to recover whenever the signers it can reach are fewer than
+/// a majority, even though the voters it can reach are not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// The voter that answered.
+    pub voter: ReplicaId,
+    /// Its promise, if it has made one.
+    pub readiness: Option<CheckpointReadinessV1>,
+}
+
+impl RecoveryReport {
+    /// The answer of a voter that has promised.
+    pub const fn promised(readiness: CheckpointReadinessV1) -> Self {
+        RecoveryReport {
+            voter: readiness.voter,
+            readiness: Some(readiness),
+        }
+    }
+
+    /// The answer of a voter that has promised nothing.
+    pub const fn unpromised(voter: ReplicaId) -> Self {
+        RecoveryReport {
+            voter,
+            readiness: None,
+        }
+    }
+}
+
+/// What `reports` -- the answers of a majority of `voters` -- mean for
 /// a replica whose own executed prefix is `executed_through`.
 ///
-/// Fewer than a majority of distinct voters is refused with
+/// Fewer than a majority of distinct voters answering is refused with
 /// [`TrimError::NoQuorum`], and that refusal is the protocol rather than
 /// caution: activation needed a majority, two majorities of one set
 /// intersect, and a narrower read has no such guarantee. A replica that
 /// answered from one report could miss the highest floor entirely and
-/// then vote from below it.
+/// then vote from below it. A voter that answered with no promise
+/// counts towards the majority read and contributes nothing to the
+/// floor; a promise from another configuration is refused, as it is
+/// everywhere else, because a delayed report from a prior epoch is
+/// evidence about a voter set this one need not intersect.
 pub fn recovery_obligation(
     voters: &EpochVoters,
-    reports: &[CheckpointReadinessV1],
+    reports: &[RecoveryReport],
     executed_through: ExecutionPosition,
 ) -> Result<RecoveryObligation, TrimError> {
-    let reporting: BTreeSet<ReplicaId> = reports
-        .iter()
-        .map(|r| r.voter)
-        .filter(|v| voters.is_voter(v))
-        .collect();
+    let mut reporting: BTreeSet<ReplicaId> = BTreeSet::new();
+    let mut promises: Vec<Readiness> = Vec::new();
+    for report in reports {
+        if !voters.is_voter(&report.voter) {
+            continue;
+        }
+        if let Some(readiness) = &report.readiness {
+            if readiness.voter != report.voter {
+                return Err(TrimError::Engine(corrupt(
+                    "recovery report voter differs from its promise",
+                )));
+            }
+            if readiness.configuration != voters.epoch() {
+                return Err(TrimError::FloorOriginMismatch {
+                    field: "configuration",
+                });
+            }
+            promises.push(Readiness {
+                voter: readiness.voter,
+                candidate: readiness.candidate(),
+            });
+        }
+        reporting.insert(report.voter);
+    }
     let need = voters.majority();
     if reporting.len() < need {
         return Err(TrimError::NoQuorum {
@@ -539,14 +597,6 @@ pub fn recovery_obligation(
             need,
         });
     }
-    let promises: Vec<Readiness> = reports
-        .iter()
-        .filter(|r| voters.is_voter(&r.voter))
-        .map(|r| Readiness {
-            voter: r.voter,
-            candidate: r.candidate(),
-        })
-        .collect();
     let Some(discovered) = discover(&promises) else {
         return Ok(RecoveryObligation::None);
     };
