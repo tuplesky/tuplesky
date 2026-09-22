@@ -135,6 +135,21 @@ func (i *Instance) Retry(seq uint64, logical []byte, commandID [32]byte, deadlin
 	return inv, nil
 }
 
+// Release forgets an allocated sequence's binding once its outcome is
+// final and the caller will not retry it. The binding exists so that a
+// retry is the same invocation and never a different payload under the
+// same key; a request that is complete (established, or given up on and
+// reported as unknown so the caller issues a new invocation) is never
+// retried, and keeping its binding would grow the instance by one entry
+// per request for the life of the process. The sequence is not reused:
+// `next` has already moved past it, so a later Retry of it is refused as
+// unknown rather than rebuilt.
+func (i *Instance) Release(seq uint64) {
+	i.mu.Lock()
+	delete(i.bound, seq)
+	i.mu.Unlock()
+}
+
 func (i *Instance) build(seq uint64, logical []byte, commandID [32]byte, deadlineMs uint32) (Invocation, error) {
 	key := i.retryKey(seq)
 	frame, err := wire.Encode(wire.Request{RetryKey: key, Logical: logical, DeadlineMs: deadlineMs})

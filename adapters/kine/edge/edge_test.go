@@ -82,6 +82,39 @@ func TestUnixSocketIsRestricted(t *testing.T) {
 	}
 }
 
+// A configured socket mode that lets the group or everyone write is
+// refused before the socket exists: write permission is what connecting
+// needs, and the Unix edge authenticates nothing else. A mode that only
+// widens reading is applied as configured.
+func TestUnixSocketModeMustNotBeGroupOrWorldWritable(t *testing.T) {
+	for _, mode := range []os.FileMode{0o666, 0o660, 0o606, 0o620, 0o602, 0o622} {
+		sock := filepath.Join(t.TempDir(), "kine.sock")
+		ln, err := Listen(context.Background(), Config{Listener: "unix://" + sock, SocketMode: mode})
+		if ln != nil {
+			_ = ln.Close()
+		}
+		if !errors.Is(err, ErrSocketModeTooOpen) {
+			t.Fatalf("mode %#o: %v, want %v", uint32(mode), err, ErrSocketModeTooOpen)
+		}
+		if _, err := os.Stat(sock); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("mode %#o: a refused configuration left a socket behind: %v", uint32(mode), err)
+		}
+	}
+	sock := filepath.Join(t.TempDir(), "kine.sock")
+	ln, err := Listen(context.Background(), Config{Listener: "unix://" + sock, SocketMode: 0o640})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	info, err := os.Stat(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o640 {
+		t.Fatalf("socket mode %o", info.Mode().Perm())
+	}
+}
+
 // Client authorization matches exact names only: DNS SAN, URI SAN or
 // common name, never a prefix or any certificate of the CA.
 func TestAuthorizedMatchesExactNames(t *testing.T) {

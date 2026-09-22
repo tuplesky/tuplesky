@@ -540,3 +540,39 @@ func TestAllocateForBindsDerivedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A released sequence no longer retains its binding, is not reused, and
+// can no longer be retried: the instance holds one entry per request in
+// flight, not one per request the process ever made.
+func TestReleaseForgetsTheBindingWithoutReusingTheSequence(t *testing.T) {
+	inst := instance()
+	for seq := uint64(1); seq <= 3; seq++ {
+		if _, err := inst.Allocate([]byte("op"), command(seq), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(inst.bound) != 3 {
+		t.Fatalf("bindings retained before release: %d", len(inst.bound))
+	}
+	inst.Release(1)
+	inst.Release(2)
+	if len(inst.bound) != 1 {
+		t.Fatalf("bindings retained after release: %d", len(inst.bound))
+	}
+	if _, err := inst.Retry(1, []byte("op"), command(1), 1); !errors.Is(err, ErrUnknownSequence) {
+		t.Fatalf("retry of a released sequence: %v", err)
+	}
+	if _, err := inst.Retry(3, []byte("op"), command(3), 1); err != nil {
+		t.Fatalf("retry of a retained sequence: %v", err)
+	}
+	inv, err := inst.Allocate([]byte("op"), command(4), 1)
+	if err != nil || inv.Sequence != 4 {
+		t.Fatalf("allocation after release reused a sequence: %v %+v", err, inv)
+	}
+	// Releasing an unknown or already released sequence is harmless.
+	inst.Release(1)
+	inst.Release(99)
+	if len(inst.bound) != 2 {
+		t.Fatalf("bindings retained: %d", len(inst.bound))
+	}
+}

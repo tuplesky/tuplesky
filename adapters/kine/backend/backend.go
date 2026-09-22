@@ -238,6 +238,12 @@ func (b *Backend) invoke(ctx context.Context, op string, mk func(key wire.RetryK
 	}
 	event := Event{Op: op, Kind: kind, Sequence: inv.Sequence}
 	res, err := b.exchange(ctx, inst, inv, &event)
+	// The outcome is final here whichever way it went: established, or
+	// given up on and reported as unknown so the API server issues a new
+	// invocation. Nothing retries this sequence, so its binding is
+	// released rather than retained for every request the process ever
+	// made.
+	inst.Release(inv.Sequence)
 	if err != nil {
 		event.Outcome = "error: " + status.Code(err).String()
 	}

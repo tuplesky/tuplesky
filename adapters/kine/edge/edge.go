@@ -42,6 +42,10 @@ var (
 	ErrClientNotAuthorized = errors.New("client identity not authorized for this domain")
 	// ErrEmptyListener: no listener.
 	ErrEmptyListener = errors.New("listener address required")
+	// ErrSocketModeTooOpen: a Unix socket mode that lets the group or
+	// everyone connect. Filesystem permission is the Unix edge's only
+	// client authentication, so a writable socket is an open endpoint.
+	ErrSocketModeTooOpen = errors.New("unix socket mode must not be group- or world-writable")
 )
 
 // Config configures the edge.
@@ -59,7 +63,10 @@ type Config struct {
 	// SkipVerify is refused when set; the field exists so a deployment
 	// flag maps to an explicit rejection rather than silence.
 	SkipVerify bool
-	// SocketMode is the Unix socket mode (default 0600).
+	// SocketMode is the Unix socket mode (default 0600). A mode with a
+	// group- or world-writable bit is refused: connecting to the socket
+	// needs write permission on it and nothing else authenticates the
+	// client.
 	SocketMode os.FileMode
 }
 
@@ -80,6 +87,23 @@ func schemeAndAddress(s string) (string, string) {
 		return parts[0], parts[1]
 	}
 	return "", s
+}
+
+// socketMode is the mode a unix:// socket is created with. Connecting to
+// a Unix socket needs write permission on it and the edge authenticates
+// nothing beyond that, so a mode that lets the group or everyone write
+// would open the privileged etcd endpoint to every local workload that
+// can reach the path; it is refused at configuration time rather than
+// applied.
+func socketMode(cfg Config) (os.FileMode, error) {
+	mode := cfg.SocketMode
+	if mode == 0 {
+		return 0o600, nil
+	}
+	if mode&0o022 != 0 {
+		return 0, fmt.Errorf("%w: %#o", ErrSocketModeTooOpen, uint32(mode))
+	}
+	return mode, nil
 }
 
 func baseOptions() []grpc.ServerOption {
@@ -172,16 +196,19 @@ func Listen(ctx context.Context, cfg Config) (*Listener, error) {
 		if address == "" {
 			return nil, ErrEmptyListener
 		}
+		// The mode is validated before anything touches the filesystem, so
+		// a refused configuration neither removes a stale socket nor leaves
+		// a bound one behind.
+		mode, err := socketMode(cfg)
+		if err != nil {
+			return nil, err
+		}
 		if err := os.Remove(address); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("stale socket: %w", err)
 		}
 		ln, err := lc.Listen(ctx, "unix", address)
 		if err != nil {
 			return nil, err
-		}
-		mode := cfg.SocketMode
-		if mode == 0 {
-			mode = 0o600
 		}
 		if err := os.Chmod(address, mode); err != nil {
 			_ = ln.Close()
