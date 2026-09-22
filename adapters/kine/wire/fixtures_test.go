@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -159,6 +160,93 @@ func TestEveryByteTruncationIsIncomplete(t *testing.T) {
 	// The full frame decodes.
 	if _, _, err := NextFrame(sample); err != nil {
 		t.Fatalf("full frame: %v", err)
+	}
+}
+
+// TestU64VarintTenthByte: the tenth byte of a u64 varint holds only the
+// 64th bit, so any value above 0x01 there is malformed, exactly as
+// postcard's DeserializeBadVarint; the overflow bits are never shifted
+// away into an aliased value.
+func TestU64VarintTenthByte(t *testing.T) {
+	nine := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}
+	cases := []struct {
+		name  string
+		tenth byte
+		want  uint64
+		ok    bool
+	}{
+		{name: "zero", tenth: 0x00, want: 0, ok: true},
+		{name: "top-bit", tenth: 0x01, want: 1 << 63, ok: true},
+		{name: "one-bit-above", tenth: 0x02},
+		{name: "two-bits", tenth: 0x03},
+		{name: "all-payload-bits", tenth: 0x7f},
+		{name: "continuation", tenth: 0x81},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newReader(append(append([]byte{}, nine...), c.tenth))
+			v, err := r.u64()
+			if !c.ok {
+				if !errors.Is(err, ErrMalformedPayload) {
+					t.Fatalf("expected MalformedPayload, got %v (value %#x)", err, v)
+				}
+				return
+			}
+			if err != nil || v != c.want {
+				t.Fatalf("expected %#x, got %#x (%v)", c.want, v, err)
+			}
+		})
+	}
+	// The same nine bytes and a tenth 0x02 as a length prefix are
+	// malformed too, never a zero length.
+	r := newReader(append(append([]byte{}, nine...), 0x02))
+	if _, err := r.length(16); !errors.Is(err, ErrMalformedPayload) {
+		t.Fatalf("length: expected MalformedPayload, got %v", err)
+	}
+}
+
+// TestReservedRangeClassLimits: a header of a reserved range is judged
+// against that range's own limit, so a legal frame of another plane is
+// not refused as LengthAboveClassLimit before Decode names it
+// unsupported; a kind outside every range takes the smallest limit.
+func TestReservedRangeClassLimits(t *testing.T) {
+	header := func(length uint32, kind uint16) []byte {
+		var h [headerLen]byte
+		binary.BigEndian.PutUint32(h[0:4], length)
+		binary.BigEndian.PutUint16(h[4:6], kind)
+		binary.BigEndian.PutUint16(h[6:8], 1)
+		return h[:]
+	}
+	cases := []struct {
+		kind  uint16
+		limit uint32
+	}{
+		{kind: 0x0300, limit: 4 * 1024 * 1024},
+		{kind: 0x0400, limit: 256 * 1024},
+		{kind: 0x0500, limit: 8*1024*1024 + 64*1024},
+		{kind: 0x0600, limit: 1024*1024 + 64*1024},
+		{kind: 0x0700, limit: 8*1024*1024 + 64*1024},
+		{kind: 0x0800, limit: 64 * 1024},
+		{kind: 0x0900, limit: 64 * 1024},
+		{kind: 0xffff, limit: 64 * 1024},
+	}
+	for _, c := range cases {
+		// At the limit the header is legal and the stream is merely short.
+		if _, _, err := NextFrame(header(c.limit, c.kind)); !errors.Is(err, ErrIncompleteFrame) {
+			t.Fatalf("kind %#04x at limit: expected IncompleteFrame, got %v", c.kind, err)
+		}
+		if _, _, err := NextFrame(header(c.limit+1, c.kind)); !errors.Is(err, ErrLengthAboveClassLimit) {
+			t.Fatalf("kind %#04x above limit: expected LengthAboveClassLimit, got %v", c.kind, err)
+		}
+	}
+	// A complete reserved-range frame passes the header and is then
+	// refused by kind, not by length.
+	frame, _, err := NextFrame(append(header(5, 0x0400), 0x00))
+	if err != nil {
+		t.Fatalf("reserved frame header: %v", err)
+	}
+	if _, err := Decode(frame); !errors.Is(err, ErrUnsupportedKind) {
+		t.Fatalf("reserved frame: expected UnsupportedKind, got %v", err)
 	}
 }
 

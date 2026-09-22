@@ -72,7 +72,12 @@ func kindClass(kind uint16) (uint16, bool) {
 	}
 }
 
-// maxFrameLength is the class limit for a kind's range.
+// maxFrameLength is the class limit for a kind's range, mirroring
+// KindRange::max_frame_length in the Rust schema. The reserved ranges
+// carry their own limits so that a legal frame of another plane is
+// refused as an unsupported kind after its header, not as a length above
+// the negotiation limit before it; a kind outside every range takes the
+// smallest limit, as the Rust reader does.
 func maxFrameLength(kind uint16) uint32 {
 	switch kind >> 8 {
 	case 0x00:
@@ -81,6 +86,18 @@ func maxFrameLength(kind uint16) uint32 {
 		return 3 * 1024 * 1024
 	case 0x02:
 		return 8*1024*1024 + 64*1024
+	case 0x03: // protocol evidence
+		return 4 * 1024 * 1024
+	case 0x04: // configuration
+		return 256 * 1024
+	case 0x05: // observer replication
+		return 8*1024*1024 + 64*1024
+	case 0x06: // snapshot
+		return 1024*1024 + 64*1024
+	case 0x07: // collector evidence
+		return 8*1024*1024 + 64*1024
+	case 0x08: // read fence
+		return 64 * 1024
 	default:
 		return 64 * 1024
 	}

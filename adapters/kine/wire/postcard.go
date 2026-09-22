@@ -1,6 +1,9 @@
 package wire
 
-import "errors"
+import (
+	"errors"
+	"math/bits"
+)
 
 // reader consumes a postcard payload with checked bounds.
 type reader struct {
@@ -50,6 +53,13 @@ func (r *reader) varint(maxBytes int) (uint64, error) {
 			if b&0x80 != 0 {
 				return 0, ErrMalformedPayload
 			}
+		}
+		// A byte whose payload bits would land above the 64th is refused
+		// rather than shifted away: postcard rejects a tenth u64 byte
+		// above 0x01 (DeserializeBadVarint), and silently dropping those
+		// bits would let a malformed encoding alias a valid value.
+		if shift+uint(bits.Len8(b&0x7f)) > 64 {
+			return 0, ErrMalformedPayload
 		}
 		value |= uint64(b&0x7f) << shift
 		if b&0x80 == 0 {
