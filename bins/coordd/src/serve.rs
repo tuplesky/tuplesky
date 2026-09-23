@@ -296,6 +296,9 @@ pub struct PeerPlane {
     peers: Vec<crate::peers::Peer>,
     /// Dials attempted and dials that reached a voter (diagnostic).
     pub dialled: (u64, u64),
+    /// The reachable count last reported on stderr, so the report is
+    /// repeated when it changes and not on every connection event.
+    reported: Option<usize>,
 }
 
 impl PeerPlane {
@@ -312,7 +315,35 @@ impl PeerPlane {
             me,
             peers,
             dialled: (0, 0),
+            reported: None,
         }
+    }
+
+    /// Say on stderr how many voters this node holds a link to, when
+    /// that differs from what it last said.
+    ///
+    /// Reachability is not settled by the startup dial. Both ends of a
+    /// pair dial, the connection that loses the collision is closed,
+    /// and the one that won may still be finishing its handshake at
+    /// this end when the loser goes: a count taken at that instant is
+    /// one short, and a count reported only once would stay so for
+    /// whoever reads it. So the line follows the mesh instead.
+    ///
+    /// Stderr, not stdout: this happens after the startup report, and
+    /// a process must not die because whoever read its startup report
+    /// has stopped reading.
+    fn report(&mut self) {
+        let reachable = self.reachable();
+        if self.reported == Some(reachable) {
+            return;
+        }
+        self.reported = Some(reachable);
+        eprintln!(
+            "peers connected={} of {} attempts={}",
+            reachable,
+            self.peers.len(),
+            self.dialled.0
+        );
     }
 
     /// Voters currently reachable: those whose control lane a
@@ -598,15 +629,7 @@ impl<P: Persistence> Domain<P> {
             async {
                 if let Some(plane) = plane {
                     plane.dial_missing().await;
-                    // Stderr, not stdout: this happens after the startup
-                    // report, and a process must not die because whoever
-                    // read its startup report has stopped reading.
-                    eprintln!(
-                        "peers connected={} of {} attempts={}",
-                        plane.reachable(),
-                        plane.peers.len(),
-                        plane.dialled.0
-                    );
+                    plane.report();
                 }
             },
             // The links this domain's collector submits over, which go
@@ -959,9 +982,16 @@ impl<P: Persistence> Domain<P> {
             // holding that link's lane, and in a full mesh one
             // connection of every pair is closed as soon as the two
             // meet. Re-dialling here would answer that with a storm;
-            // periodic reconnection belongs with the timer loop.
-            TransportEvent::Closed { .. } => {}
-            TransportEvent::Connected { .. } => {}
+            // periodic reconnection belongs with the timer loop. What
+            // does happen here is the report: the count of voters held
+            // is what an operator reads to see a mesh form, and it is
+            // said again whenever a connection's coming or going
+            // changed it.
+            TransportEvent::Closed { .. } | TransportEvent::Connected { .. } => {
+                if let Some(plane) = &mut self.plane {
+                    plane.report();
+                }
+            }
             // A voter's plane carries no requests and no deliveries.
             TransportEvent::ApiRequest { .. } | TransportEvent::ApiDelivery { .. } => {
                 self.frontend.counts.unserved += 1;
