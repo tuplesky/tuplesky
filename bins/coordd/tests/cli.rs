@@ -1568,28 +1568,30 @@ fn a_voter_whose_key_the_configuration_does_not_commit_to_stops_at_startup() {
 /// its own address -- are handed ephemeral ports; asking the kernel for
 /// one here too meant a port released by this test could be the next
 /// one the kernel gave a neighbour, and the daemon then found its named
-/// address taken. A port outside that range collides only with another
-/// test's named port, which is one draw in ten thousand rather than the
-/// kernel's next in line.
+/// address taken. A port outside that range can only collide with
+/// another test's named port, and the tests do not draw at random:
+/// each process owns a slice of that range keyed by its process id and
+/// hands its ports out in order, so two tests alive at the same time
+/// name the same port only when their ids are a few hundred apart.
+/// The probe below still catches the residue -- a port some live
+/// socket already holds -- and a slice that runs dry continues into
+/// the next.
 fn free_port() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let mut seed = u64::from(std::process::id()) ^ (u64::from(nanos) << 16);
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const FIRST: u32 = 10000;
+    const SLICE: u32 = 100;
+    // 227 slices of 100 end at 32700, still below the ephemeral range.
+    const SLICES: u32 = 227;
+    static DRAWN: AtomicU32 = AtomicU32::new(0);
+    let own = (std::process::id() % SLICES) * SLICE;
     for _ in 0..1000 {
-        // A small linear congruential step is enough: this is spreading
-        // draws out, not randomness anybody relies on.
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let port = 20000 + u16::try_from((seed >> 33) % 10000).expect("below 10000");
+        let drawn = DRAWN.fetch_add(1, Ordering::Relaxed);
+        let port = u16::try_from(FIRST + (own + drawn) % (SLICES * SLICE)).expect("below 32768");
         if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
-    panic!("no free loopback port in 20000..30000");
+    panic!("no free loopback port in 10000..32700");
 }
 
 /// Three real daemons of one domain: one certificate authority, three
