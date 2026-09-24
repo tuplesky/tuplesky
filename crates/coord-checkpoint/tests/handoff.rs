@@ -394,3 +394,83 @@ fn the_certificate_round_trips_and_is_its_own_record() {
         .is_err()
     );
 }
+
+/// Only voters that sealed prove the certificate.
+///
+/// The failing sequence, with old voters A, B and C: A and B seal, so
+/// the seal certificate's signers are {A, B}. C has not sealed, reports
+/// a terminal state selected over {B, C} without a command X that A
+/// accepted, and can then still accept X, which {A, C} chose. Counting
+/// C's report would certify a terminal state that omits a chosen
+/// command. C counts only once its own seal is in evidence -- certified
+/// again with its record among the stances.
+#[test]
+fn a_certificate_is_proved_only_by_voters_that_sealed() {
+    let voters = old_voters();
+    let seal_ab = sealed();
+    assert_eq!(seal_ab.signers(), &BTreeSet::from([r(0), r(1)]));
+    let without_x = state(&[1]);
+    assert_eq!(
+        select_certificate(
+            &voters,
+            &seal_ab,
+            &[(r(1), without_x.clone()), (r(2), without_x.clone())]
+        ),
+        Err(TrimError::Handoff(HandoffError::ReporterNotSealed {
+            replica: r(2)
+        }))
+    );
+
+    // C seals late: the seal certified over its record too makes it a
+    // signer, and its report then counts.
+    let stances: Vec<StanceRecord> = (0..3)
+        .map(|i| StanceRecord {
+            voter: r(i),
+            transition: transition(),
+            stance: Stance::Sealed,
+        })
+        .collect();
+    let seal_abc = seal(&voters, transition(), &stances).unwrap();
+    let certificate = select_certificate(
+        &voters,
+        &seal_abc,
+        &[(r(1), without_x.clone()), (r(2), without_x)],
+    )
+    .expect("both reporters are fenced");
+    assert_eq!(certificate.signers, BTreeSet::from([r(1), r(2)]));
+}
+
+/// The closure binds what was selected, not the ballot the selection ran
+/// under.
+///
+/// A replacement coordinator repeating the same terminal recovery after
+/// its predecessor died runs it under a higher ballot. The commands,
+/// their phases, dependencies, paths and the source they were selected
+/// from are the same, so the old voters must agree on one root rather
+/// than be refused as mixed evidence.
+#[test]
+fn the_closure_binds_the_selection_and_not_the_recovery_ballot() {
+    let first = selection(&[1, 2]);
+    let mut replacement = first.clone();
+    replacement.ballot = ballot(12);
+    assert_eq!(closure_root(&first), closure_root(&replacement));
+
+    let mut state_first = state(&[1, 2]);
+    state_first.closure_root = closure_root(&first);
+    let mut state_replacement = state(&[1, 2]);
+    state_replacement.closure_root = closure_root(&replacement);
+    select_certificate(
+        &old_voters(),
+        &sealed(),
+        &[(r(0), state_first), (r(1), state_replacement)],
+    )
+    .expect("one terminal state, whoever asked for it");
+
+    // What the selection decided still moves it.
+    let mut source = first.clone();
+    source.source_ballot = ballot(4);
+    assert_ne!(closure_root(&first), closure_root(&source));
+    let mut reproposed = first.clone();
+    reproposed.reproposed.insert(command(7));
+    assert_ne!(closure_root(&first), closure_root(&reproposed));
+}

@@ -109,9 +109,20 @@ pub struct TerminalStateV1 {
 /// completion represented across the configurations: a command that was
 /// chosen immediately before the fence is in the selection, and a
 /// terminal state that omitted it would have a different root.
+///
+/// What is bound is the selection's content -- the adopted entries, the
+/// commands left for re-proposal and the synchronized ballot they were
+/// selected from -- and not `ballot`, the ballot the recovery ran
+/// under. That one is the coordinator's choice: a replacement repeating
+/// the same terminal recovery after its predecessor died picks a higher
+/// ballot and selects the same commands, and two old voters agreeing on
+/// every command must produce the same root however many coordinators
+/// asked them.
 pub fn closure_root(decision: &SyncDecision) -> Digest32 {
-    let encoded = postcard::to_allocvec(decision).unwrap_or_default();
-    HashDomain::HandoffClosure.digest(&[&encoded])
+    let source = postcard::to_allocvec(&decision.source_ballot).unwrap_or_default();
+    let entries = postcard::to_allocvec(&decision.entries).unwrap_or_default();
+    let reproposed = postcard::to_allocvec(&decision.reproposed).unwrap_or_default();
+    HashDomain::HandoffClosure.digest(&[&source, &entries, &reproposed])
 }
 
 impl TerminalStateV1 {
@@ -204,7 +215,10 @@ impl TerminalCertificateV1 {
 /// old voters reported.
 ///
 /// The quorum rule is [`select_terminal`]'s and the seal is required by
-/// its signature, so there is no selection before the fence. What this
+/// its signature, so there is no selection before the fence, and every
+/// reporter must be one of the seal's signers: the certificate is a
+/// majority of *fenced* voters, never a majority some unfenced one
+/// completes (see [`select_terminal`]). What this
 /// adds is the state itself: the reports carry roots, and a certificate
 /// has to carry what the root is *of*, so the caller supplies the
 /// states and every one of them must produce the root its reporter
