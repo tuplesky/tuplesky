@@ -1570,6 +1570,66 @@ fn an_observer_or_a_foreign_promise_is_refused_rather_than_counted() {
     }
 }
 
+/// Competing images at the floor position are resolved by the read when
+/// a majority of the voters in it is ready for one of them, and only
+/// then.
+///
+/// With three voters, SELF and LAGGARD ready for A certify it and PEER is
+/// ready for B at the same position. A read of all three holds a
+/// majority for A, which is enough to certify A and leaves B
+/// uncertifiable there, so the replica installs A. A majority read of
+/// {SELF, PEER} or {PEER, LAGGARD} sees one report for each: the
+/// position is right, the image is not identified, and the replica stops
+/// rather than guessing.
+#[test]
+fn a_read_that_holds_a_majority_for_one_image_names_it_and_a_split_read_stops() {
+    let voters = floor_voters();
+    let a = |voter| readiness(voter);
+    let b = |voter| CheckpointReadinessV1 {
+        root: Digest32([0x6b; 32]),
+        ..readiness(voter)
+    };
+    assert_ne!(a(PEER).subject(), b(PEER).subject());
+    let behind = pos(FLOOR_POSITION - 1);
+
+    let wide = [
+        RecoveryReport::promised(a(SELF)),
+        RecoveryReport::promised(b(PEER)),
+        RecoveryReport::promised(a(LAGGARD)),
+    ];
+    assert_eq!(
+        recovery_obligation(&voters, &wide, behind).unwrap(),
+        RecoveryObligation::Install {
+            position: pos(FLOOR_POSITION),
+            subject: a(SELF).subject(),
+        }
+    );
+
+    for split in [
+        [
+            RecoveryReport::promised(a(SELF)),
+            RecoveryReport::promised(b(PEER)),
+        ],
+        [
+            RecoveryReport::promised(b(PEER)),
+            RecoveryReport::promised(a(LAGGARD)),
+        ],
+    ] {
+        assert_eq!(
+            recovery_obligation(&voters, &split, behind).unwrap(),
+            RecoveryObligation::Ambiguous {
+                position: pos(FLOOR_POSITION),
+            }
+        );
+    }
+
+    // A replica already at the floor owes nothing, whichever image it is.
+    assert_eq!(
+        recovery_obligation(&voters, &wide, pos(FLOOR_POSITION)).unwrap(),
+        RecoveryObligation::None
+    );
+}
+
 /// A recovery reads a majority, honours the highest floor it finds, and
 /// refuses to answer from a narrower read.
 #[test]

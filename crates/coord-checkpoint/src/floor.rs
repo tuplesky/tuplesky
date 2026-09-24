@@ -504,9 +504,11 @@ pub enum RecoveryObligation {
         subject: Digest32,
     },
     /// A majority reports promises at one position for checkpoints they
-    /// do not agree on, and nothing here certifies which. At most one of
-    /// them can ever be certified, so this is not a choice to make: the
-    /// replica stops rather than guessing.
+    /// do not agree on, and no one of them holds a majority of the
+    /// voters within the read. At most one of them can ever be
+    /// certified, so this is not a choice to make: the replica stops
+    /// rather than guessing, and a wider read (or the certificate) is
+    /// what resolves it.
     Ambiguous {
         /// The contested position.
         position: ExecutionPosition,
@@ -603,7 +605,16 @@ pub fn recovery_obligation(
     if executed_through >= discovered.position {
         return Ok(RecoveryObligation::None);
     }
-    match discovered.subject() {
+    // One subject is the image. Competing subjects at the position are
+    // resolved by the read itself when a majority of the voters in it is
+    // ready for one of them: that majority is enough to certify it, and
+    // uniqueness leaves no other subject certifiable there. Anything
+    // less is not evidence that nothing was certified, only that this
+    // read cannot tell which, and the replica stops rather than guesses.
+    match discovered
+        .subject()
+        .or_else(|| discovered.certified(voters))
+    {
         Some(subject) => Ok(RecoveryObligation::Install {
             position: discovered.position,
             subject,
