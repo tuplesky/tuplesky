@@ -7,10 +7,12 @@ use std::collections::BTreeMap;
 
 use coord_core::effect::ApplyBase;
 use coord_state::planner::{apply_leases, apply_to_map};
+use coord_state::policy::{Authorization, GrantRecord, PolicyRule, SessionRecord, TrustRule};
 use coord_state::{
     ApplyPlan, InternalCommand, KvEntry, LeaseRecord, Mutation, PlanLimits, ReadView, plan,
     plan_internal,
 };
+use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::*;
 
@@ -111,6 +113,10 @@ pub struct Fixture {
     pub current: BTreeMap<Vec<u8>, KvEntry>,
     pub leases: BTreeMap<LeaseId, LeaseRecord>,
     pub lease_authority: LeaseAuthorityEpoch,
+    pub sessions: BTreeMap<SessionId, SessionRecord>,
+    pub grants: BTreeMap<Digest32, GrantRecord>,
+    pub trust_rules: BTreeMap<TrustRuleId, TrustRule>,
+    pub policy_rules: BTreeMap<(PrincipalId, PolicyRuleId), PolicyRule>,
     pub revision: u64,
     pub position: u64,
     pub limits: PlanLimits,
@@ -128,6 +134,10 @@ impl Fixture {
             current: BTreeMap::new(),
             leases: BTreeMap::new(),
             lease_authority: LeaseAuthorityEpoch::ZERO,
+            sessions: BTreeMap::new(),
+            grants: BTreeMap::new(),
+            trust_rules: BTreeMap::new(),
+            policy_rules: BTreeMap::new(),
             revision: 0,
             position: 0,
             limits: PlanLimits::default(),
@@ -151,7 +161,42 @@ impl Fixture {
         for l in self.leases.keys() {
             v.lease_keys.entry(*l).or_default();
         }
+        v.sessions = self.sessions.clone();
+        v.grants = self.grants.clone();
+        v.trust_rules = self.trust_rules.clone();
         v
+    }
+
+    /// The view a client request under `session` executes with: the
+    /// principal comes from the session and the authorization context is
+    /// loaded (deny by default when the session is unknown).
+    pub fn view_for_session(&self, session: &SessionId) -> ReadView {
+        let record = self.sessions.get(session).cloned();
+        let principal = record
+            .as_ref()
+            .map_or(PrincipalId([0; 16]), |s| s.principal);
+        let mut v = self.view(principal);
+        v.authorization = Some(Authorization {
+            trust_rule: record
+                .as_ref()
+                .and_then(|s| self.trust_rules.get(&s.trust_rule).cloned()),
+            rules: self
+                .policy_rules
+                .iter()
+                .filter(|((p, _), r)| {
+                    Some(*p) == record.as_ref().map(|s| s.principal) && r.namespace == NS
+                })
+                .map(|(_, r)| r.clone())
+                .collect(),
+            session: record,
+        });
+        v
+    }
+
+    pub fn run_session(&mut self, session: &SessionId, r: &LogicalRequest) -> ApplyPlan {
+        let v = self.view_for_session(session);
+        let p = plan(r, &v, &self.limits).unwrap();
+        self.apply(p)
     }
 
     fn apply(&mut self, p: ApplyPlan) -> ApplyPlan {
@@ -159,8 +204,35 @@ impl Fixture {
         apply_to_map(&mut self.current, &p);
         apply_leases(&mut self.leases, &p);
         for m in &p.mutations {
-            if let Mutation::LeaseAuthority { epoch } = m {
-                self.lease_authority = *epoch;
+            match m {
+                Mutation::LeaseAuthority { epoch } => self.lease_authority = *epoch,
+                Mutation::SessionWrite { session, record } => match record {
+                    Some(r) => {
+                        self.sessions.insert(*session, r.clone());
+                    }
+                    None => {
+                        self.sessions.remove(session);
+                    }
+                },
+                Mutation::GrantWrite { commitment, record } => {
+                    self.grants.insert(*commitment, record.clone());
+                }
+                Mutation::PolicyRuleWrite {
+                    principal,
+                    rule,
+                    record,
+                } => match record {
+                    Some(r) => {
+                        self.policy_rules.insert((*principal, *rule), r.clone());
+                    }
+                    None => {
+                        self.policy_rules.remove(&(*principal, *rule));
+                    }
+                },
+                Mutation::TrustRuleWrite { rule, record } => {
+                    self.trust_rules.insert(*rule, record.clone());
+                }
+                _ => {}
             }
         }
         self.position += 1;

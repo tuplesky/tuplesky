@@ -2,10 +2,11 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use coord_types::error::ValidationError;
-use coord_types::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId};
+use coord_types::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId};
 use coord_types::logical_v1::{
     BranchOp, CanonicalOperation, Compare, CompareOperand, CompareResult, CompareTarget,
     DeleteRangeOp, KeyRange, KineCreateOp, KineDeleteOp, KineUpdateOp, LogicalRequest, PutOp,
@@ -17,6 +18,9 @@ use crate::lease::{LeasePurpose, LeaseRecord, LeaseStatus, attachment_cost};
 use crate::limits::PlanLimits;
 use crate::plan::{
     ApplyPlan, KineKv, KvEvent, KvEventKind, Mutation, Outcome, RangeItem, Response,
+};
+use crate::policy::{
+    Action, Authorization, GrantKind, GrantRecord, GrantState, KeyInterval, SessionRecord,
 };
 use crate::view::{KvEntry, ReadView};
 
@@ -61,6 +65,172 @@ impl From<PlanError> for Abort {
 /// A recorded failure outcome that aborts the plan.
 fn fail(outcome: Outcome) -> Abort {
     Abort::Fail(Box::new(outcome))
+}
+
+fn interval_of(range: &KeyRange) -> KeyInterval {
+    match &range.range_end {
+        None => KeyInterval::exact(&range.key),
+        Some(end) => KeyInterval {
+            lower: range.key.clone(),
+            upper: Some(end.clone()),
+        },
+    }
+}
+
+/// Require `action` over `interval` under `auth`; a trusted context (no
+/// authorization) permits everything.
+fn check_permission(
+    auth: Option<&Authorization>,
+    namespace: &NamespaceId,
+    action: Action,
+    interval: &KeyInterval,
+) -> Result<(), Abort> {
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    if auth.valid_session().is_none() {
+        return Err(fail(Outcome::ErrSessionInvalid));
+    }
+    if !auth.permits(namespace, action, interval) {
+        return Err(fail(Outcome::ErrPermissionDenied));
+    }
+    Ok(())
+}
+
+/// Require `action` over `interval` under the view's authorization.
+fn authorize(view: &ReadView, action: Action, interval: &KeyInterval) -> Result<(), Abort> {
+    check_permission(
+        view.authorization.as_ref(),
+        &view.namespace,
+        action,
+        interval,
+    )
+}
+
+/// The permissions one branch operation needs. An operation that returns
+/// existing values (`prev_kv`) needs `Read` besides its own action: a
+/// write-only principal never learns what it overwrote or deleted.
+fn branch_op_permissions(op: &BranchOp) -> Vec<(Action, KeyInterval)> {
+    match op {
+        BranchOp::Range(r) => vec![(Action::Read, interval_of(&r.range))],
+        BranchOp::Put(p) => put_permissions(p),
+        BranchOp::DeleteRange(d) => delete_permissions(d),
+    }
+}
+
+fn put_permissions(p: &PutOp) -> Vec<(Action, KeyInterval)> {
+    let interval = KeyInterval::exact(&p.key);
+    let mut out = vec![(Action::Write, interval.clone())];
+    if p.lease.is_some() {
+        out.push((Action::LeaseAttach, interval.clone()));
+    }
+    if p.prev_kv {
+        out.push((Action::Read, interval));
+    }
+    out
+}
+
+fn delete_permissions(d: &DeleteRangeOp) -> Vec<(Action, KeyInterval)> {
+    let interval = interval_of(&d.range);
+    let mut out = vec![(Action::Delete, interval.clone())];
+    if d.prev_kv {
+        out.push((Action::Read, interval));
+    }
+    out
+}
+
+/// The permissions `request` needs, given the branch `txn_succeeded`
+/// selects for a transaction (`None`: both branches, for a request whose
+/// branch is not yet known). Comparisons read their keys; Kine update and
+/// delete return the entry they saw and so read it; a revocation deletes
+/// its attachments, which are checked against the loaded index by the
+/// planner and are not enumerable here.
+fn request_permissions(
+    request: &LogicalRequest,
+    txn_succeeded: Option<bool>,
+) -> Vec<(Action, KeyInterval)> {
+    match &request.operation {
+        CanonicalOperation::Range(r) => vec![(Action::Read, interval_of(&r.range))],
+        CanonicalOperation::Put(p) => put_permissions(p),
+        CanonicalOperation::DeleteRange(d) => delete_permissions(d),
+        CanonicalOperation::Txn(t) => {
+            let mut out: Vec<(Action, KeyInterval)> = t
+                .compares
+                .iter()
+                .map(|c| (Action::Read, KeyInterval::exact(&c.key)))
+                .collect();
+            let branches: &[&Vec<BranchOp>] = match txn_succeeded {
+                Some(true) => &[&t.success],
+                Some(false) => &[&t.failure],
+                None => &[&t.success, &t.failure],
+            };
+            for branch in branches {
+                for op in branch.iter() {
+                    out.extend(branch_op_permissions(op));
+                }
+            }
+            out
+        }
+        CanonicalOperation::Compact { .. } => vec![(Action::Compact, KeyInterval::all())],
+        CanonicalOperation::LeaseGrant { .. } => vec![(Action::LeaseGrant, KeyInterval::all())],
+        CanonicalOperation::LeaseRevoke { .. } => vec![(Action::LeaseRevoke, KeyInterval::all())],
+        CanonicalOperation::LeaseTimeToLive { .. } => {
+            vec![(Action::LeaseInspect, KeyInterval::all())]
+        }
+        CanonicalOperation::LeaseKeepAlive { .. } => vec![(Action::LeaseRenew, KeyInterval::all())],
+        CanonicalOperation::KineCreate(c) => vec![(Action::Write, KeyInterval::exact(&c.key))],
+        CanonicalOperation::KineUpdate(u) => vec![
+            (Action::Write, KeyInterval::exact(&u.key)),
+            (Action::Read, KeyInterval::exact(&u.key)),
+        ],
+        CanonicalOperation::KineDelete(d) => vec![
+            (Action::Delete, KeyInterval::exact(&d.key)),
+            (Action::Read, KeyInterval::exact(&d.key)),
+        ],
+    }
+}
+
+fn authorize_all(
+    view: &ReadView,
+    permissions: impl IntoIterator<Item = (Action, KeyInterval)>,
+) -> Result<(), Abort> {
+    for (action, interval) in permissions {
+        authorize(view, action, &interval)?;
+    }
+    Ok(())
+}
+
+/// Whether a retained result of `request` (with `outcome`) may be handed
+/// out again under `auth` now: the session must still be executable and
+/// the principal must still hold every permission the request needed,
+/// exactly as the planner checks a fresh execution. A denial is the
+/// recorded outcome the planner would produce. A revocation's deleted
+/// attachments are no longer enumerable; its result is a count, which
+/// reveals no value, so the revoke permission suffices for it.
+///
+/// The retained result reveals what the request returned, so losing the
+/// permission that produced it (a read rule removed, a session retired)
+/// protects it from that point on even though the identity executed.
+pub fn authorize_retained(
+    auth: &Authorization,
+    namespace: &NamespaceId,
+    request: &LogicalRequest,
+    outcome: &Outcome,
+) -> Result<(), Outcome> {
+    let succeeded = match outcome {
+        Outcome::Txn { succeeded, .. } => Some(*succeeded),
+        // A retained denial reveals nothing about the store; replaying it
+        // is what a fresh execution would record again.
+        Outcome::ErrPermissionDenied | Outcome::ErrSessionInvalid => return Ok(()),
+        _ => None,
+    };
+    for (action, interval) in request_permissions(request, succeeded) {
+        if let Err(Abort::Fail(denied)) = check_permission(Some(auth), namespace, action, &interval)
+        {
+            return Err(*denied);
+        }
+    }
+    Ok(())
 }
 
 impl From<ValidationError> for PlanError {
@@ -205,7 +375,19 @@ fn outcome_cost(outcome: &Outcome) -> usize {
         | Outcome::LeaseExpired { .. }
         | Outcome::ExpireStale
         | Outcome::LeaseAuthorityEstablished { .. }
-        | Outcome::ErrStaleAuthority => 0,
+        | Outcome::ErrStaleAuthority
+        | Outcome::ErrSessionInvalid
+        | Outcome::ErrPermissionDenied
+        | Outcome::SessionCreated { .. }
+        | Outcome::SessionRetired
+        | Outcome::ErrReceiptConsumed
+        | Outcome::ErrTrustRuleInvalid
+        | Outcome::GrantCommitted
+        | Outcome::ErrGrantExists
+        | Outcome::ErrGrantUnavailable
+        | Outcome::RefreshAdvanced { .. }
+        | Outcome::ErrRefreshReuse
+        | Outcome::PolicyUpdated => 0,
     }
 }
 
@@ -469,6 +651,11 @@ fn revoke(
     if record.owner != overlay.view.principal {
         return Err(fail(Outcome::ErrLeasePermission));
     }
+    // Revoking deletes every attached key: owning the lease does not
+    // bypass the current delete policy over those keys.
+    for key in attached_keys(overlay.view, &lease_id, &record)? {
+        authorize(overlay.view, Action::Delete, &KeyInterval::exact(&key))?;
+    }
     let deleted = end_lease(
         overlay,
         lease_id,
@@ -547,13 +734,35 @@ fn plan_operation(
     // Only a branch that emits events consumes the next revision; every
     // other operation plans without one.
     let next_revision = || next_revision.ok_or(PlanError::CounterOverflow);
+    // Any request needs an executable session; the specific permission is
+    // checked per operation (and per selected branch) below.
+    if let Some(auth) = &view.authorization
+        && auth.valid_session().is_none()
+    {
+        return Err(fail(Outcome::ErrSessionInvalid));
+    }
     Ok(match &request.operation {
-        CanonicalOperation::Range(r) => read(view, overlay, r, limits)?,
-        CanonicalOperation::Put(p) => put(overlay, p, next_revision()?, limits, mutations, events)?,
-        CanonicalOperation::DeleteRange(d) => delete(overlay, d, limits, mutations, events)?,
+        CanonicalOperation::Range(r) => {
+            authorize(view, Action::Read, &interval_of(&r.range))?;
+            read(view, overlay, r, limits)?
+        }
+        CanonicalOperation::Put(p) => {
+            authorize_all(view, put_permissions(p))?;
+            put(overlay, p, next_revision()?, limits, mutations, events)?
+        }
+        CanonicalOperation::DeleteRange(d) => {
+            authorize_all(view, delete_permissions(d))?;
+            delete(overlay, d, limits, mutations, events)?
+        }
         CanonicalOperation::Txn(t) => {
+            for c in &t.compares {
+                authorize(view, Action::Read, &KeyInterval::exact(&c.key))?;
+            }
             let succeeded = t.compares.iter().all(|c| compare(overlay, c));
             let branch = if succeeded { &t.success } else { &t.failure };
+            for op in branch {
+                authorize_all(view, branch_op_permissions(op))?;
+            }
             let mut results = Vec::with_capacity(branch.len());
             for op in branch {
                 results.push(match op {
@@ -567,6 +776,7 @@ fn plan_operation(
             Outcome::Txn { succeeded, results }
         }
         CanonicalOperation::Compact { revision } => {
+            authorize(view, Action::Compact, &KeyInterval::all())?;
             let target = (*revision).min(view.kv_revision);
             if target > view.compact_floor {
                 mutations.push(Mutation::CompactTo { revision: target });
@@ -576,21 +786,37 @@ fn plan_operation(
         CanonicalOperation::LeaseGrant {
             lease_id,
             ttl_seconds,
-        } => grant(overlay, *lease_id, *ttl_seconds)?,
+        } => {
+            authorize(view, Action::LeaseGrant, &KeyInterval::all())?;
+            grant(overlay, *lease_id, *ttl_seconds)?
+        }
         CanonicalOperation::LeaseRevoke { lease_id } => {
+            authorize(view, Action::LeaseRevoke, &KeyInterval::all())?;
             revoke(overlay, *lease_id, mutations, events)?
         }
         CanonicalOperation::LeaseTimeToLive { lease_id, keys } => {
+            authorize(view, Action::LeaseInspect, &KeyInterval::all())?;
             time_to_live(overlay, *lease_id, *keys, limits)?
         }
-        CanonicalOperation::LeaseKeepAlive { lease_id } => keep_alive(overlay, *lease_id)?,
+        CanonicalOperation::LeaseKeepAlive { lease_id } => {
+            authorize(view, Action::LeaseRenew, &KeyInterval::all())?;
+            keep_alive(overlay, *lease_id)?
+        }
         CanonicalOperation::KineCreate(c) => {
+            authorize(view, Action::Write, &KeyInterval::exact(&c.key))?;
             kine_create(overlay, c, next_revision()?, limits, mutations, events)?
         }
         CanonicalOperation::KineUpdate(u) => {
+            // The result returns the entry seen, matched or not.
+            authorize(view, Action::Write, &KeyInterval::exact(&u.key))?;
+            authorize(view, Action::Read, &KeyInterval::exact(&u.key))?;
             kine_update(overlay, u, next_revision()?, limits, mutations, events)?
         }
-        CanonicalOperation::KineDelete(d) => kine_delete(overlay, d, mutations, events)?,
+        CanonicalOperation::KineDelete(d) => {
+            authorize(view, Action::Delete, &KeyInterval::exact(&d.key))?;
+            authorize(view, Action::Read, &KeyInterval::exact(&d.key))?;
+            kine_delete(overlay, d, mutations, events)?
+        }
     })
 }
 
@@ -867,6 +1093,204 @@ fn plan_internal_command(
             )?;
             Ok(Outcome::LeaseExpired { deleted })
         }
+        InternalCommand::ConsumeAdmission {
+            receipt,
+            code,
+            refresh_family,
+            window,
+            ..
+        } => {
+            // Single use: a consumed receipt or an existing session identity
+            // never creates a second session.
+            if view.grants.contains_key(&receipt.receipt_id)
+                || view.sessions.contains_key(&receipt.session)
+            {
+                return Err(fail(Outcome::ErrReceiptConsumed));
+            }
+            // Current replicated policy decides, not the verifier.
+            match view.trust_rules.get(&receipt.trust_rule) {
+                Some(r) if r.enabled && r.generation == receipt.rule_generation => {}
+                _ => return Err(fail(Outcome::ErrTrustRuleInvalid)),
+            }
+            let mut writes = Vec::new();
+            if let Some(code) = code {
+                match view.grants.get(code) {
+                    Some(g) if g.kind == GrantKind::Code && g.state == GrantState::Pending => {
+                        writes.push((
+                            *code,
+                            GrantRecord {
+                                state: GrantState::Consumed,
+                                session: Some(receipt.session),
+                                ..g.clone()
+                            },
+                        ));
+                    }
+                    _ => return Err(fail(Outcome::ErrGrantUnavailable)),
+                }
+            }
+            if let Some(family) = refresh_family {
+                match view.grants.get(family) {
+                    Some(g)
+                        if g.kind == GrantKind::RefreshFamily
+                            && g.state == GrantState::Pending
+                            && g.session.is_none() =>
+                    {
+                        writes.push((
+                            *family,
+                            GrantRecord {
+                                session: Some(receipt.session),
+                                ..g.clone()
+                            },
+                        ));
+                    }
+                    _ => return Err(fail(Outcome::ErrGrantUnavailable)),
+                }
+            }
+            for (commitment, record) in writes {
+                mutations.push(Mutation::GrantWrite { commitment, record });
+            }
+            mutations.push(Mutation::GrantWrite {
+                commitment: receipt.receipt_id,
+                record: GrantRecord {
+                    kind: GrantKind::Receipt,
+                    state: GrantState::Consumed,
+                    generation: 0,
+                    current_secret: None,
+                    session: Some(receipt.session),
+                },
+            });
+            mutations.push(Mutation::SessionWrite {
+                session: receipt.session,
+                record: Some(SessionRecord {
+                    principal: receipt.principal,
+                    scope_ceiling: receipt.scope_ceiling,
+                    trust_rule: receipt.trust_rule,
+                    rule_generation: receipt.rule_generation,
+                    active: true,
+                    window: *window,
+                    receipt_id: receipt.receipt_id,
+                }),
+            });
+            Ok(Outcome::SessionCreated {
+                session: receipt.session,
+            })
+        }
+        InternalCommand::RetireSession { session, .. } => match view.sessions.get(session) {
+            Some(record) if record.active => {
+                mutations.push(Mutation::SessionWrite {
+                    session: *session,
+                    record: Some(SessionRecord {
+                        active: false,
+                        ..record.clone()
+                    }),
+                });
+                Ok(Outcome::SessionRetired)
+            }
+            _ => Err(fail(Outcome::ErrSessionInvalid)),
+        },
+        InternalCommand::CommitGrant {
+            commitment, kind, ..
+        } => {
+            if view.grants.contains_key(commitment) || *kind == GrantKind::Receipt {
+                return Err(fail(Outcome::ErrGrantExists));
+            }
+            mutations.push(Mutation::GrantWrite {
+                commitment: *commitment,
+                record: GrantRecord {
+                    kind: *kind,
+                    state: GrantState::Pending,
+                    generation: 0,
+                    current_secret: (*kind == GrantKind::RefreshFamily).then_some(*commitment),
+                    session: None,
+                },
+            });
+            Ok(Outcome::GrantCommitted)
+        }
+        InternalCommand::AdvanceRefresh {
+            family,
+            presented,
+            next,
+            ..
+        } => {
+            let record = match view.grants.get(family) {
+                Some(g) if g.kind == GrantKind::RefreshFamily && g.state != GrantState::Revoked => {
+                    g.clone()
+                }
+                _ => return Err(fail(Outcome::ErrGrantUnavailable)),
+            };
+            if record.current_secret != Some(*presented) {
+                // A retired (or unknown) secret: the family is compromised.
+                // Revoke it and retire its session at this position.
+                mutations.push(Mutation::GrantWrite {
+                    commitment: *family,
+                    record: GrantRecord {
+                        state: GrantState::Revoked,
+                        ..record.clone()
+                    },
+                });
+                if let Some(session) = record.session
+                    && let Some(s) = view.sessions.get(&session)
+                    && s.active
+                {
+                    mutations.push(Mutation::SessionWrite {
+                        session,
+                        record: Some(SessionRecord {
+                            active: false,
+                            ..s.clone()
+                        }),
+                    });
+                }
+                return Ok(Outcome::ErrRefreshReuse);
+            }
+            let generation = record
+                .generation
+                .checked_add(1)
+                .ok_or(Abort::Error(PlanError::CounterOverflow))?;
+            mutations.push(Mutation::GrantWrite {
+                commitment: *family,
+                record: GrantRecord {
+                    generation,
+                    current_secret: Some(*next),
+                    ..record
+                },
+            });
+            Ok(Outcome::RefreshAdvanced { generation })
+        }
+        InternalCommand::PutPolicyRule {
+            principal,
+            rule,
+            record,
+            ..
+        } => {
+            if let Some(r) = record
+                && r.principal != *principal
+            {
+                return Err(PlanError::Invalid(ValidationError::RequestTooLarge).into());
+            }
+            mutations.push(Mutation::PolicyRuleWrite {
+                principal: *principal,
+                rule: *rule,
+                record: record.clone(),
+            });
+            Ok(Outcome::PolicyUpdated)
+        }
+        InternalCommand::PutTrustRule { rule, record, .. } => {
+            // Generations only advance (or stay, to disable or re-enable
+            // the current one): a stale write carrying an older generation
+            // would silently revalidate every session admitted under it.
+            if view
+                .trust_rules
+                .get(rule)
+                .is_some_and(|current| record.generation < current.generation)
+            {
+                return Err(fail(Outcome::ErrTrustRuleInvalid));
+            }
+            mutations.push(Mutation::TrustRuleWrite {
+                rule: *rule,
+                record: record.clone(),
+            });
+            Ok(Outcome::PolicyUpdated)
+        }
     }
 }
 
@@ -1015,6 +1439,10 @@ pub fn apply_to_map(current: &mut BTreeMap<Vec<u8>, KvEntry>, plan: &ApplyPlan) 
             | Mutation::LeaseDetach { .. }
             | Mutation::LeaseWrite { .. }
             | Mutation::LeaseAuthority { .. }
+            | Mutation::SessionWrite { .. }
+            | Mutation::GrantWrite { .. }
+            | Mutation::PolicyRuleWrite { .. }
+            | Mutation::TrustRuleWrite { .. }
             | Mutation::CompactTo { .. } => {}
         }
     }

@@ -102,6 +102,41 @@ pub fn plan_to_batch(
                     value: None,
                 });
             }
+            Mutation::SessionWrite { session, record } => {
+                updates.push(StoreUpdate {
+                    collection: Collection::SessionV1.id(),
+                    key: codecs::session_key(session),
+                    value: record.as_ref().map(codecs::encode_session).transpose()?,
+                });
+            }
+            Mutation::GrantWrite { commitment, record } => {
+                updates.push(StoreUpdate {
+                    collection: Collection::AuthGrantV1.id(),
+                    key: codecs::grant_key(commitment),
+                    value: Some(codecs::encode_grant(record)?),
+                });
+            }
+            Mutation::PolicyRuleWrite {
+                principal,
+                rule,
+                record,
+            } => {
+                updates.push(StoreUpdate {
+                    collection: Collection::PolicyV1.id(),
+                    key: codecs::policy_rule_key(principal, rule),
+                    value: record
+                        .as_ref()
+                        .map(codecs::encode_policy_rule)
+                        .transpose()?,
+                });
+            }
+            Mutation::TrustRuleWrite { rule, record } => {
+                updates.push(StoreUpdate {
+                    collection: Collection::PolicyV1.id(),
+                    key: codecs::trust_rule_key(rule),
+                    value: Some(codecs::encode_trust_rule(record)?),
+                });
+            }
             Mutation::LeaseAuthority { epoch } => {
                 updates.push(StoreUpdate {
                     collection: Collection::MetaV1.id(),
