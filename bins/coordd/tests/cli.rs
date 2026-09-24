@@ -111,8 +111,32 @@ fn genesis(dir: &Path) {
 
 /// This node's credentials: a certificate carrying the node-identity URI
 /// SAN the issuer binds, because that -- not a setting -- is what says
-/// which replica a process is.
+/// which replica a process is. It is issued by an authority the trust
+/// bundle holds, because a certificate nothing trusted issued is not an
+/// identity at all.
 fn credentials(dir: &Path, replica: u8, role: coord_types::wire_v1::PeerRole) {
+    let (authority, issuer) = authority();
+    issue(dir, &issuer, replica, role);
+    std::fs::write(dir.join("roots.pem"), pem("CERTIFICATE", authority.der())).expect("roots");
+}
+
+/// An issuing authority: its certificate, for a trust bundle, and the
+/// issuer that signs with it.
+fn authority() -> (rcgen::Certificate, rcgen::Issuer<'static, rcgen::KeyPair>) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let certificate = params.self_signed(&key).expect("ca");
+    (certificate, rcgen::Issuer::new(params, key))
+}
+
+/// Write a node certificate and key `issuer` signed.
+fn issue(
+    dir: &Path,
+    issuer: &rcgen::Issuer<'static, rcgen::KeyPair>,
+    replica: u8,
+    role: coord_types::wire_v1::PeerRole,
+) {
     let identity = coord_node_issuer::NodeIdentity {
         cluster: coord_types::ids::ClusterId(CLUSTER),
         node: coord_types::ids::ReplicaId([replica; 16]),
@@ -121,17 +145,16 @@ fn credentials(dir: &Path, replica: u8, role: coord_types::wire_v1::PeerRole) {
     };
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.subject_alt_names = vec![rcgen::SanType::URI(
         coord_node_issuer::node_uri(&identity)
             .try_into()
             .expect("uri"),
     )];
-    let certificate = params.self_signed(&key).expect("self-signed");
+    let certificate = params.signed_by(&key, issuer).expect("issued");
 
     std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", certificate.der())).expect("cert");
-    std::fs::write(dir.join("roots.pem"), pem("CERTIFICATE", certificate.der())).expect("roots");
     let key_path = dir.join("node.key");
+    let _ = std::fs::remove_file(&key_path);
     std::fs::write(&key_path, pem("PRIVATE KEY", &key.serialize_der())).expect("key");
     #[cfg(unix)]
     {
@@ -443,5 +466,201 @@ fn a_certificate_of_another_cluster_never_reaches_this_domains_store() {
     assert!(
         !dir.join("state").exists(),
         "a foreign node initialized this domain's store"
+    );
+}
+
+/// Start `coordd` and report whether it came up, stopping it if it did.
+///
+/// A daemon that starts holds its listeners and parks, so "it came up"
+/// is its own report of the phase it reached, read as it is printed; a
+/// daemon that refuses exits, and that is reported as a refusal.
+fn start(config: &Path) -> Result<String, Run> {
+    use std::io::BufRead;
+
+    let mut child = Command::new(binary())
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("coordd started");
+    let stdout = child.stdout.take().expect("stdout");
+    let (lines, seen) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut out = String::new();
+    loop {
+        match seen.recv_timeout(Duration::from_millis(20)) {
+            Ok(line) => {
+                out.push_str(&line);
+                out.push('\n');
+                if line.starts_with("coordd phase=") {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(out);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let output = child.wait_with_output().expect("output");
+                return Err(Run {
+                    code: output.status.code(),
+                    out,
+                    err: String::from_utf8_lossy(&output.stderr).into_owned(),
+                });
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("coordd neither came up nor stopped within 30s: {out}");
+        }
+    }
+}
+
+/// The genesis a node was initialized under is the only one it serves
+/// under.
+///
+/// The manifest is a file, re-read on every start, and a file can be
+/// edited. A node that re-adopted whatever it said would vote by the
+/// operator's latest edit -- another set of voters, another policy,
+/// under the same cluster and domain -- rather than by the configuration
+/// every replica agreed on. So `init` pins it, and a start handed any
+/// other manifest is a genesis quarantine.
+#[test]
+fn a_node_serves_only_under_the_genesis_it_was_initialized_with() {
+    let dir = workspace("pinned");
+    let path = config(&dir);
+    let init = run(&path, &["init"]);
+    assert_eq!(init.code, Some(0), "{}{}", init.out, init.err);
+
+    // Under the manifest it was initialized with, it starts.
+    if let Err(refused) = start(&path) {
+        panic!(
+            "the node refused its own genesis: {}{}",
+            refused.out, refused.err
+        );
+    }
+
+    // The same cluster and domain, and this node still a voter; the third
+    // voter swapped for a stranger.
+    let manifest = std::fs::read_to_string(dir.join("genesis.json")).expect("read");
+    std::fs::write(
+        dir.join("genesis.json"),
+        manifest.replace(&hex(&[3; 16]), &hex(&[4; 16])),
+    )
+    .expect("swap a voter");
+    let refused =
+        start(&path).expect_err("a node started under a genesis it was not initialized with");
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("genesis quarantine"),
+        "the refusal did not say why: {}",
+        refused.err
+    );
+
+    // Initializing again is not a way round it: the store is this node's,
+    // under the genesis it was pinned to.
+    let again = run(&path, &["init"]);
+    assert_eq!(again.code, Some(2), "{}{}", again.out, again.err);
+    assert!(again.err.contains("already exists"), "{}", again.err);
+
+    // And the original manifest is still this node's.
+    std::fs::write(dir.join("genesis.json"), manifest).expect("restore");
+    if let Err(refused) = start(&path) {
+        panic!(
+            "the node refused its restored genesis: {}{}",
+            refused.out, refused.err
+        );
+    }
+}
+
+/// An initialization that stopped after it created the store and before
+/// it pinned the genesis is refused by a start -- which would otherwise
+/// pin whatever it was handed -- and finished by `init`, since a store
+/// that was never pinned was never served either.
+#[test]
+fn an_unfinished_initialization_is_finished_by_init_and_refused_by_a_start() {
+    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_store_api::registry::{Collection, meta_fields};
+
+    let dir = workspace("unpinned");
+    let path = config(&dir);
+    let init = run(&path, &["init"]);
+    assert_eq!(init.code, Some(0), "{}{}", init.out, init.err);
+
+    // The state an initialization interrupted between the two leaves.
+    {
+        let mut generation = coord_storage_redb::lifecycle::Generation::open_existing(
+            &dir.join("state"),
+            coord_storage_redb::lifecycle::StoreIdentity {
+                cluster_id: coord_types::ids::ClusterId(CLUSTER),
+                domain_id: coord_types::ids::DomainId(DOMAIN),
+                replica_id: coord_types::ids::ReplicaId([1; 16]),
+                incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            },
+            coord_storage_redb::lifecycle::OpenOptions::default(),
+        )
+        .expect("the store opens");
+        let mut txn = generation.engine().begin_write().expect("write");
+        txn.delete(Collection::MetaV1.id(), meta_fields::GENESIS_DIGEST)
+            .expect("unpin");
+        txn.commit_durable().expect("commit");
+    }
+
+    let refused = start(&path).expect_err("an unpinned store was served");
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("never pinned") && refused.err.contains("coordd init"),
+        "the refusal did not say what to do: {}",
+        refused.err
+    );
+
+    let finished = run(&path, &["init"]);
+    assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
+    if let Err(refused) = start(&path) {
+        panic!(
+            "a finished initialization did not start: {}{}",
+            refused.out, refused.err
+        );
+    }
+}
+
+/// A certificate is an identity only if the trust bundle's authority
+/// issued it. The replica a node is comes out of its certificate, so a
+/// leaf anybody could sign would let anybody open -- or initialize --
+/// a voter's store under that voter's name.
+#[test]
+fn a_certificate_the_trust_bundle_did_not_issue_is_not_an_identity() {
+    let dir = workspace("untrusted");
+    let path = config(&dir);
+
+    // A leaf naming a committed voter, signed by an authority the bundle
+    // does not hold.
+    let (_, stranger) = authority();
+    issue(&dir, &stranger, 1, coord_types::wire_v1::PeerRole::Voter);
+
+    let checked = run(&path, &["--check"]);
+    assert_eq!(checked.code, Some(2), "{}{}", checked.out, checked.err);
+    assert!(
+        checked.err.contains("not issued by the trust bundle"),
+        "the refusal did not say why: {}",
+        checked.err
+    );
+    let refused = run(&path, &["init"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        !dir.join("state").exists(),
+        "an untrusted certificate initialized a voter's store"
     );
 }

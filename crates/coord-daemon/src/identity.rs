@@ -17,6 +17,10 @@
 //!   this process's control. Reading it and carrying on would make the
 //!   configuration's promise -- that credentials are held under the
 //!   process's own account -- untrue and unremarked.
+//! * A certificate that does not chain to the trust bundle, or whose key
+//!   this process does not hold ([`verify`]), is not an identity at all:
+//!   the node's replica is read out of it, so a leaf nothing trusted
+//!   issued could claim to be any voter.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,8 +28,10 @@ use std::sync::Arc;
 use coord_transport::LocalIdentity;
 use coord_types::ids::{ClusterId, DomainId};
 use rustls::RootCertStore;
+use rustls::server::WebPkiClientVerifier;
+use rustls::sign::CertifiedKey;
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 
 use crate::config::IdentityConfig;
 
@@ -68,6 +74,19 @@ pub enum IdentityError {
         /// The mode as found, so an operator can see what to change.
         mode: u32,
     },
+    /// The node certificate does not chain to the trust bundle, so
+    /// nothing this domain trusts vouches for the identity it names.
+    NotIssuedByTrustBundle {
+        /// The certificate's path, as configured.
+        path: String,
+        /// Why the chain did not verify.
+        reason: String,
+    },
+    /// The private key is not the key the node certificate certifies.
+    KeyDoesNotMatchCertificate {
+        /// The key's path, as configured.
+        path: String,
+    },
 }
 
 impl core::fmt::Display for IdentityError {
@@ -88,6 +107,14 @@ impl core::fmt::Display for IdentityError {
             IdentityError::KeyIsShared { path, mode } => write!(
                 f,
                 "the private key at {path} is readable beyond this account (mode {mode:o})"
+            ),
+            IdentityError::NotIssuedByTrustBundle { path, reason } => write!(
+                f,
+                "the certificate at {path} is not issued by the trust bundle: {reason}"
+            ),
+            IdentityError::KeyDoesNotMatchCertificate { path } => write!(
+                f,
+                "the private key at {path} is not the key the node certificate certifies"
             ),
         }
     }
@@ -126,6 +153,49 @@ pub fn load(
         roots: Arc::new(store),
         capabilities,
     })
+}
+
+/// Check that `identity` is one this domain vouches for: its leaf chains
+/// to its own trust bundle, and its private key is the leaf's.
+///
+/// The node's replica and incarnation are read out of its certificate,
+/// so the certificate is only an identity once something trusted issued
+/// it. A self-signed leaf that merely claims a voter's node URI would
+/// otherwise open, or initialize, that voter's store before any peer ever
+/// saw the handshake that would have refused it; and a leaf whose key
+/// this process does not hold would pass every local check and fail only
+/// at the first handshake, where it reads as a peer problem. `config`
+/// names the files, for the refusal.
+pub fn verify(identity: &LocalIdentity, config: &IdentityConfig) -> Result<(), IdentityError> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let not_issued = |reason: String| IdentityError::NotIssuedByTrustBundle {
+        path: config.node_certificate.clone(),
+        reason,
+    };
+    let (leaf, intermediates) = identity.chain.split_first().ok_or(IdentityError::Empty {
+        what: "node certificate",
+        path: config.node_certificate.clone(),
+    })?;
+    // The same verifier the transport authenticates peers with, so a
+    // certificate this accepts is one every peer holding the same bundle
+    // accepts too.
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(identity.roots.clone(), provider.clone())
+            .build()
+            .map_err(|e| not_issued(e.to_string()))?;
+    verifier
+        .verify_client_cert(leaf, intermediates, UnixTime::now())
+        .map_err(|e| not_issued(e.to_string()))?;
+    let mismatch = || IdentityError::KeyDoesNotMatchCertificate {
+        path: config.node_key.clone(),
+    };
+    let certified =
+        CertifiedKey::from_der(identity.chain.clone(), identity.key.clone_key(), &provider)
+            .map_err(|_| mismatch())?;
+    // `from_der` lets through a key whose public half it cannot derive;
+    // here that is a question that must be answered, so an unknown is a
+    // refusal too.
+    certified.keys_match().map_err(|_| mismatch())
 }
 
 /// Every certificate in a PEM file, refusing a file that holds none.

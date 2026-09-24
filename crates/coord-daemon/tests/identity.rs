@@ -224,3 +224,71 @@ fn a_missing_file_and_a_wrong_one_are_told_apart() {
         "a certificate was accepted as a private key"
     );
 }
+
+/// An issuing authority and a leaf it signed, as the node issuer would
+/// hand them out: the bundle holds the authority, the node holds the
+/// leaf and its key.
+fn issued() -> (rcgen::Certificate, rcgen::KeyPair, Vec<u8>, Vec<u8>) {
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).expect("ca");
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let params = rcgen::CertificateParams::new(vec!["node.local".into()]).expect("leaf params");
+    let leaf = params.signed_by(&key, &issuer).expect("leaf");
+    let leaf_pem = pem("CERTIFICATE", leaf.der());
+    let key_pem = pem("PRIVATE KEY", &key.serialize_der());
+    (ca, key, leaf_pem, key_pem)
+}
+
+fn verified(config: &IdentityConfig) -> Result<(), IdentityError> {
+    let identity = load(config, CLUSTER, DOMAIN, Vec::new()).expect("the credentials load");
+    coord_daemon::identity::verify(&identity, config)
+}
+
+/// A certificate is an identity only once the trust bundle vouches for
+/// it and this process holds its key. The node's replica is read out of
+/// the certificate, so a leaf nothing trusted issued -- or one whose key
+/// is somebody else's -- could otherwise claim to be any voter and open
+/// that voter's store.
+#[test]
+fn a_certificate_is_an_identity_only_if_the_bundle_issued_it_and_the_key_is_its_own() {
+    let dir = dir();
+    let (ca, _, leaf, key) = issued();
+    let good = IdentityConfig {
+        trust_bundle: write(&dir, "issuer.pem", &pem("CERTIFICATE", ca.der()), 0o644),
+        node_certificate: write(&dir, "leaf.pem", &leaf, 0o644),
+        node_key: write(&dir, "leaf.key", &key, 0o600),
+    };
+    assert_eq!(verified(&good), Ok(()));
+
+    // The same shape of leaf, signed by an authority the bundle does not
+    // hold.
+    let (_, _, stranger, stranger_key) = issued();
+    let untrusted = IdentityConfig {
+        node_certificate: write(&dir, "stranger.pem", &stranger, 0o644),
+        node_key: write(&dir, "stranger.key", &stranger_key, 0o600),
+        ..good.clone()
+    };
+    assert!(
+        matches!(
+            verified(&untrusted),
+            Err(IdentityError::NotIssuedByTrustBundle { .. })
+        ),
+        "a leaf of an untrusted issuer was accepted"
+    );
+
+    // The trusted leaf, presented with a key that is not its own.
+    let foreign_key = IdentityConfig {
+        node_key: write(&dir, "other.key", &stranger_key, 0o600),
+        ..good.clone()
+    };
+    assert!(
+        matches!(
+            verified(&foreign_key),
+            Err(IdentityError::KeyDoesNotMatchCertificate { .. })
+        ),
+        "a certificate was accepted with a key it does not certify"
+    );
+}

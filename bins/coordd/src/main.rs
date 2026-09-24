@@ -10,7 +10,14 @@
 //! when it failed to find one would turn a lost disk, an unmounted
 //! volume or a mistyped path into a fresh, empty, valid node -- which
 //! would then vote, having forgotten everything it had promised.
+//!
+//! Initialization also pins the genesis manifest it was run under, and
+//! every later start requires the same one (see `genesis`): the manifest
+//! is a file, and a node that re-adopted whatever the file said on each
+//! start would vote by the operator's latest edit rather than by the
+//! configuration every replica agreed on.
 
+mod genesis;
 mod membership;
 mod store;
 
@@ -82,6 +89,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The identity above was read out of the certificate, so the
+    // certificate has to be one this domain issued, held by this
+    // process, before any store is opened under it: a self-signed leaf
+    // claiming a voter's node URI would otherwise open that voter's store.
+    if let Err(e) = coord_daemon::load_identity(
+        &config.identity,
+        placed.membership.cluster(),
+        placed.membership.domain(),
+        Vec::new(),
+    )
+    .and_then(|identity| coord_daemon::verify_identity(&identity, &config.identity))
+    {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
     println!(
         "node replica={} incarnation={} role={:?} voters={}",
         short(&placed.replica.0),
@@ -91,15 +113,53 @@ fn main() -> ExitCode {
     );
 
     if let Some(Command::Init) = cli.command {
-        return match store::open(
+        let opened = store::open(
             &config,
             store::Intent::Initialize,
             placed.membership.cluster(),
             placed.membership.domain(),
             placed.replica,
             placed.incarnation,
+        );
+        let mut generation = match opened {
+            Ok(generation) => generation,
+            // An initialization that created the generation and stopped
+            // before it pinned the manifest is finished here rather than
+            // refused: the generation has never been served, since a start
+            // refuses an unpinned store, so there is no history to lose,
+            // and refusing both commands would leave the node with no way
+            // forward but deleting its store by hand.
+            Err(already @ store::StoreError::AlreadyInitialized { .. }) => {
+                match store::open(
+                    &config,
+                    store::Intent::Serve,
+                    placed.membership.cluster(),
+                    placed.membership.domain(),
+                    placed.replica,
+                    placed.incarnation,
+                )
+                .ok()
+                .and_then(|mut generation| {
+                    (genesis::unfinished(&mut generation) == Some(true)).then_some(generation)
+                }) {
+                    Some(generation) => generation,
+                    None => {
+                        eprintln!("{already}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        };
+        return match genesis::check(
+            &mut generation,
+            &placed.manifest,
+            genesis::Intent::Initialize,
         ) {
-            Ok(generation) => {
+            Ok(_) => {
                 println!("initialized {}", generation.directory().display());
                 ExitCode::SUCCESS
             }
@@ -120,7 +180,7 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
-    let generation = match store::open(
+    let mut generation = match store::open(
         &config,
         store::Intent::Serve,
         placed.membership.cluster(),
@@ -135,6 +195,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The store is this node's only under the manifest it was
+    // initialized with. Anything else -- another set of voters, another
+    // policy, under the same cluster and domain -- is a genesis
+    // quarantine, not a new configuration to adopt.
+    if let Err(e) = genesis::check(&mut generation, &placed.manifest, genesis::Intent::Serve) {
+        lifecycle.quarantine(e.quarantine_reason());
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
     println!("store {}", generation.directory().display());
     lifecycle.observe(Readiness {
         storage_ready: true,

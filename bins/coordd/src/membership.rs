@@ -13,7 +13,11 @@
 //! same replica identity would each open that replica's store, each vote
 //! under it, and between them break the one thing a replica promises.
 //! The certificate cannot be handed round that way, because the peers
-//! that matter check it.
+//! that matter check it -- and so does this process, before it opens a
+//! store under the identity: `main` refuses a certificate the trust
+//! bundle did not issue, or whose key it does not hold, since reading an
+//! identity out of a leaf anybody could sign would be the same as being
+//! told it.
 
 use coord_membership::genesis::GenesisManifest;
 use coord_membership::membership::Membership;
@@ -102,6 +106,9 @@ fn hex(bytes: &[u8]) -> String {
 
 /// This node, placed in its domain.
 pub struct Placed {
+    /// The manifest the configuration was read from, which the store
+    /// pins at initialization and matches on every later start.
+    pub manifest: GenesisManifest,
     /// The committed configuration this node starts from.
     pub membership: Membership,
     /// The replica this node is, as its own certificate says.
@@ -153,6 +160,7 @@ pub fn place(
         });
     }
     Ok(Placed {
+        manifest,
         membership,
         replica: identity.node,
         incarnation: identity.incarnation,

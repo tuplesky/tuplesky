@@ -64,7 +64,7 @@ pub mod supervise;
 pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
 pub use fanout::{Dispatched, PeerFanOut, dispatch};
-pub use identity::{IdentityError, load as load_identity};
+pub use identity::{IdentityError, load as load_identity, verify as verify_identity};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use node::{DriveError, Machine, Node, Outbound};

@@ -1078,6 +1078,7 @@ dependencies = [
  "coord-membership",
  "coord-node-issuer",
  "coord-storage-redb",
+ "coord-store-api",
  "coord-types",
  "rcgen",
  "rustls-pki-types",

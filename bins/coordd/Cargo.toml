@@ -28,6 +28,7 @@ clap.workspace = true
 
 [dev-dependencies]
 coord-node-issuer.workspace = true
+coord-store-api.workspace = true
 coord-types.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true
