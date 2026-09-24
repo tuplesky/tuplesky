@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"sync"
@@ -64,6 +65,14 @@ type serverBehavior struct {
 	pending atomic.Bool
 	// requests seen.
 	requests atomic.Int64
+	// expectToken: when non-empty, a Bind must present exactly this token
+	// to be acknowledged with session; any other Bind is answered with a
+	// Close.
+	expectToken string
+	session     [16]byte
+	binds       atomic.Int64
+	// refuseHello answers the negotiation with a Close instead of an ack.
+	refuseHello atomic.Bool
 }
 
 // runServer starts an in-process quic-go frontend. It reads the control
@@ -108,16 +117,55 @@ func serveConn(ctx context.Context, conn *quic.Conn, b *serverBehavior) {
 		}
 		if first {
 			first = false
-			// Drain the Hello; do not answer a body.
-			go func() { _, _ = readFramePayload(stream) }()
+			// Answer the Hello with the lane it declared, as the native
+			// endpoint does, and leave the control stream open.
+			go func(s *quic.Stream) {
+				frame, err := readFramePayload(s)
+				if err != nil {
+					return
+				}
+				msg, err := wire.Decode(frame)
+				if err != nil {
+					return
+				}
+				hello, ok := msg.(wire.Hello)
+				if !ok {
+					return
+				}
+				if b.refuseHello.Load() {
+					out, _ := wire.Encode(wire.Close{Code: 2, Reason: []byte("lane")})
+					_, _ = s.Write(out)
+					return
+				}
+				out, _ := wire.Encode(wire.HelloAck{Capabilities: hello.Capabilities, MaxInflight: 64})
+				_, _ = s.Write(out)
+			}(stream)
 			continue
 		}
 		go func(s *quic.Stream) {
-			b.requests.Add(1)
 			frame, err := readFramePayload(s)
 			if err != nil {
 				return
 			}
+			if frame.Kind == uint16(wire.KindBind) {
+				b.binds.Add(1)
+				bind, err := wire.DecodeBind(frame)
+				var out []byte
+				if err == nil && b.expectToken != "" && string(bind.Token) == b.expectToken {
+					out, _ = wire.EncodeBindAck(wire.BindAck{
+						Session:        b.session,
+						ExpiresAt:      uint64(time.Now().Add(time.Hour).Unix()),
+						Scope:          1,
+						RuleGeneration: 1,
+					})
+				} else {
+					out, _ = wire.Encode(wire.Close{Code: 2, Reason: []byte("bind refused")})
+				}
+				_, _ = s.Write(out)
+				_ = s.Close()
+				return
+			}
+			b.requests.Add(1)
 			msg, err := wire.Decode(frame)
 			if err != nil {
 				return
@@ -421,4 +469,110 @@ func TestStreamPoolIsBounded(t *testing.T) {
 	}
 	stop()
 	wg.Wait()
+}
+
+type staticTokens string
+
+func (s staticTokens) Token(context.Context) (string, error) { return string(s), nil }
+
+// A configured token source presents the token once per connection in a
+// Bind frame and learns the acknowledged session; a refused binding
+// never yields a usable connection.
+func TestBindPresentsTokenOnceAndLearnsSession(t *testing.T) {
+	cert, pool := testCert(t)
+	b := &serverBehavior{expectToken: "svc-token", session: [16]byte{7, 7}}
+	addr, stop := runServer(t, cert, b)
+	defer stop()
+	c := New(addr, Config{TLS: clientTLS(pool), Tokens: staticTokens("svc-token"), FrameTimeout: 2 * time.Second})
+	if _, ok := c.Session(); ok {
+		t.Fatal("session before binding")
+	}
+	inst := instance()
+	for seq := uint64(1); seq <= 2; seq++ {
+		inv, _ := inst.Allocate([]byte("op"), command(seq), 1000)
+		out, err := c.Do(context.Background(), inv.Frame)
+		if err != nil || out.Unknown {
+			t.Fatalf("seq %d: %v %+v", seq, err, out)
+		}
+	}
+	if got := b.binds.Load(); got != 1 {
+		t.Fatalf("binds %d, want 1 per connection", got)
+	}
+	if s, ok := c.Session(); !ok || s != b.session {
+		t.Fatalf("session %v %v", s, ok)
+	}
+	c.mu.Lock()
+	current := c.conn
+	c.mu.Unlock()
+	c.drop(current)
+	wrong := New(addr, Config{TLS: clientTLS(pool), Tokens: staticTokens("other"), FrameTimeout: 2 * time.Second})
+	inv, _ := inst.Allocate([]byte("op"), command(3), 1000)
+	if _, err := wrong.Do(context.Background(), inv.Frame); !errors.Is(err, ErrBindRejected) {
+		t.Fatalf("refused binding: %v", err)
+	}
+	if _, ok := wrong.Session(); ok {
+		t.Fatal("session after refusal")
+	}
+}
+
+// AllocateFor derives the payload from the allocated retry key and binds
+// the resulting identity; a failing build consumes no sequence.
+func TestAllocateForBindsDerivedIdentity(t *testing.T) {
+	inst := instance()
+	_, err := inst.AllocateFor(1, func(wire.RetryKey) ([]byte, [32]byte, error) {
+		return nil, [32]byte{}, errors.New("no")
+	})
+	if err == nil {
+		t.Fatal("build error swallowed")
+	}
+	var seen wire.RetryKey
+	inv, err := inst.AllocateFor(1, func(key wire.RetryKey) ([]byte, [32]byte, error) {
+		seen = key
+		return []byte("p"), command(9), nil
+	})
+	if err != nil || inv.Sequence != 1 || seen.RequestSequence != 1 || seen.ClientInstance != [16]byte{4} {
+		t.Fatalf("%v %+v %+v", err, inv, seen)
+	}
+	if _, err := inst.Retry(1, []byte("p"), command(8), 1); !errors.Is(err, ErrPayloadConflict) {
+		t.Fatalf("conflict: %v", err)
+	}
+	if _, err := inst.Retry(1, []byte("p"), command(9), 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A released sequence no longer retains its binding, is not reused, and
+// can no longer be retried: the instance holds one entry per request in
+// flight, not one per request the process ever made.
+func TestReleaseForgetsTheBindingWithoutReusingTheSequence(t *testing.T) {
+	inst := instance()
+	for seq := uint64(1); seq <= 3; seq++ {
+		if _, err := inst.Allocate([]byte("op"), command(seq), 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(inst.bound) != 3 {
+		t.Fatalf("bindings retained before release: %d", len(inst.bound))
+	}
+	inst.Release(1)
+	inst.Release(2)
+	if len(inst.bound) != 1 {
+		t.Fatalf("bindings retained after release: %d", len(inst.bound))
+	}
+	if _, err := inst.Retry(1, []byte("op"), command(1), 1); !errors.Is(err, ErrUnknownSequence) {
+		t.Fatalf("retry of a released sequence: %v", err)
+	}
+	if _, err := inst.Retry(3, []byte("op"), command(3), 1); err != nil {
+		t.Fatalf("retry of a retained sequence: %v", err)
+	}
+	inv, err := inst.Allocate([]byte("op"), command(4), 1)
+	if err != nil || inv.Sequence != 4 {
+		t.Fatalf("allocation after release reused a sequence: %v %+v", err, inv)
+	}
+	// Releasing an unknown or already released sequence is harmless.
+	inst.Release(1)
+	inst.Release(99)
+	if len(inst.bound) != 2 {
+		t.Fatalf("bindings retained: %d", len(inst.bound))
+	}
 }

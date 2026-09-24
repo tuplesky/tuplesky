@@ -19,16 +19,16 @@ type Instance struct {
 
 	mu    sync.Mutex
 	next  uint64
-	bound map[uint64]binding // sequence -> what the sequence was bound to
+	bound map[uint64]allocation // sequence -> what the sequence was bound to
 }
 
-// binding is what an allocated sequence is bound to: the command id and
+// allocation is what an allocated sequence is bound to: the command id and
 // a digest of the canonical frame, so a retry that keeps the command id
 // but changes the logical bytes or the deadline is refused as a conflict
 // rather than emitted as a different frame under the same retry key. The
 // digest, not the frame, is kept so a bound sequence does not retain its
 // payload.
-type binding struct {
+type allocation struct {
 	commandID [32]byte
 	frame     [sha256.Size]byte
 }
@@ -49,7 +49,7 @@ func NewInstance(cfg InstanceConfig) *Instance {
 		session:  cfg.Session,
 		instance: cfg.Instance,
 		next:     1,
-		bound:    make(map[uint64]binding),
+		bound:    make(map[uint64]allocation),
 	}
 }
 
@@ -83,7 +83,31 @@ func (i *Instance) Allocate(logical []byte, commandID [32]byte, deadlineMs uint3
 		return Invocation{}, err
 	}
 	i.next = seq + 1
-	i.bound[seq] = binding{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
+	i.bound[seq] = allocation{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
+	return inv, nil
+}
+
+// AllocateFor allocates the next sequence and lets `build` derive the
+// canonical payload and command identity from the resulting retry key
+// (a Kine write's hidden binding is a function of that key). The
+// sequence is consumed only when `build` succeeds.
+func (i *Instance) AllocateFor(
+	deadlineMs uint32,
+	build func(key wire.RetryKey) (logical []byte, commandID [32]byte, err error),
+) (Invocation, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	seq := i.next
+	logical, commandID, err := build(i.retryKey(seq))
+	if err != nil {
+		return Invocation{}, err
+	}
+	inv, err := i.build(seq, logical, commandID, deadlineMs)
+	if err != nil {
+		return Invocation{}, err
+	}
+	i.next = seq + 1
+	i.bound[seq] = allocation{commandID: commandID, frame: sha256.Sum256(inv.Frame)}
 	return inv, nil
 }
 
@@ -109,6 +133,21 @@ func (i *Instance) Retry(seq uint64, logical []byte, commandID [32]byte, deadlin
 		return Invocation{}, ErrPayloadConflict
 	}
 	return inv, nil
+}
+
+// Release forgets an allocated sequence's binding once its outcome is
+// final and the caller will not retry it. The binding exists so that a
+// retry is the same invocation and never a different payload under the
+// same key; a request that is complete (established, or given up on and
+// reported as unknown so the caller issues a new invocation) is never
+// retried, and keeping its binding would grow the instance by one entry
+// per request for the life of the process. The sequence is not reused:
+// `next` has already moved past it, so a later Retry of it is refused as
+// unknown rather than rebuilt.
+func (i *Instance) Release(seq uint64) {
+	i.mu.Lock()
+	delete(i.bound, seq)
+	i.mu.Unlock()
 }
 
 func (i *Instance) build(seq uint64, logical []byte, commandID [32]byte, deadlineMs uint32) (Invocation, error) {

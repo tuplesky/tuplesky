@@ -96,14 +96,31 @@ Two ALPNs, neither a registered standard, separate the planes:
 | `coord-peer/1` | internal peer plane | `Voter`, `Observer`, `Learner` (incarnation required) |
 
 The first frame on the first bidirectional stream (the control stream) is
-`Hello`; the acceptor answers `HelloAck` or closes. `Hello` must name the
-acceptor's cluster and domain, a role of the connection's class, and be
-bound to the TLS peer certificate by the runtime's identity binder. The
+`Hello`; the acceptor answers `HelloAck` or closes, and the dialer reads
+that answer before it sends anything else. `Hello` must name the
+acceptor's cluster and domain and a role of the connection's class. The
 control stream then carries only `Close`. Every other stream carries
 exactly one frame and ends: peer evidence on unidirectional streams, unary
-requests and their responses on bidirectional streams. Mutual TLS 1.3 with
-the explicit AWS-LC provider, no application early data, no server-side
+requests and their responses on bidirectional streams. TLS 1.3 with the
+explicit AWS-LC provider, no application early data, no server-side
 migration.
+
+Client authentication differs per plane, and the acceptor enforces the
+difference after the ALPN and `Hello` are known:
+
+* `coord-peer/1` is mutually authenticated. A peer-class connection
+  without a client certificate is rejected, and the presented chain is
+  bound to the declared role, cluster, domain and incarnation by the
+  runtime's identity binder.
+* `coord-api/1` authenticates the acceptor, and a client certificate is
+  optional. `Frontend` and `KineCollector` act for other principals and
+  are still rejected without one; `Client` speaks only for itself and its
+  authority is the session binding below, so it may negotiate without a
+  certificate and can do nothing until a `Bind` is acknowledged.
+
+A certificate that is presented is always validated against the same
+trust anchors on both planes: only its presence is optional, never its
+validity.
 
 | Kind | Value | Payload |
 |---|---|---|
@@ -182,3 +199,17 @@ rejected by class within a bounded read). A schema change requires
 reviewed fixtures on both sides. No Serde reflection, cgo, protobuf or Go
 voting state machine is introduced; the collector and configuration
 evidence schemas are reserved for later client integration (task-m02).
+
+task-46 extends the mirror with the Kine subset of two schemas the
+adapter must produce and consume, and the raw binding kinds: the
+`logical_v1` operations `Range`, `KineCreate`, `KineUpdate` and
+`KineDelete` (encoder and decoder, verified against
+`crates/coord-types/fixtures/command_ids_v1.json`), the
+`coord_state::Response` outcomes a Kine request can receive (decoder,
+verified against `crates/coord-state/fixtures/kine_responses_v1.json`;
+every other `Outcome` variant is refused as unexpected), the command-id
+and Kine-binding derivations (BLAKE3 derive-key contexts of
+`HashDomain`, verified against `command_ids_v1.json` and
+`kine_bindings_v1.json`), and `Bind`/`BindAck` (raw kinds, not part of
+the typed registry). A schema change on either side requires reviewed
+fixtures on both.

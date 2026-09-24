@@ -13,7 +13,7 @@ candidates. Every deviation from a candidate is listed under
 | Declared MSRV | `rust-version = "1.90"`; verified by `cargo xtask msrv` and the `msrv` CI job with `1.90.0` | `Cargo.toml` |
 | Rust edition | 2024 | `Cargo.toml` |
 | Cargo resolver | 3 | `Cargo.toml` |
-| Go | `go 1.26.0` directive; CI installs it from `go.mod` | `adapters/kine/go.mod` |
+| Go | `go 1.26.5` directive; CI installs it from `go.mod` | `adapters/kine/go.mod` |
 | cargo-deny | 0.18.9 (sha256 in manifest) | `tools/manifest.toml` |
 | cargo-nextest | 0.9.99 (sha256 in manifest) | `tools/manifest.toml` |
 | mermaid-cli | 11.17.0 (npm lockfile integrity) | `tools/mermaid/package-lock.json` |
@@ -55,6 +55,26 @@ claimed as qualification (Section 22.2).
 Candidates not yet consumed by any crate (quinn, rustls, tokio, fjall, the
 OIDC/JWT/HTTP stack, keyring stores, telemetry, loom, criterion, fuzzing) are
 added by the tasks that first use them, with the same exact-pin rule.
+
+## Pinned Go modules (`adapters/kine`)
+
+Go requirements are exact by construction (`go.mod` names one version per
+module and `go.sum` records its checksum; `go mod verify` runs in
+`cargo xtask check-deps` and CI). Direct requirements:
+
+| Module | Pin | Role | Notes |
+|---|---|---|---|
+| github.com/quic-go/quic-go | v0.62.0 | native QUIC client (task-45) | requires Go 1.26 |
+| github.com/k3s-io/kine | v0.17.1-0.20260909185625-746ef418669e | frozen Kine server bridge and driver registry (task-46) | the pseudo-version of the design's compatibility reference commit `746ef418669e2131e1d4447024ac7489ee2bb5d0` (Section 6.6); its `go.mod` declares `go 1.26.5`, which raised the adapter's directive; only `pkg/server`, `pkg/drivers` and `pkg/tls` are linked, so no SQL driver, TTL worker, NATS, etcd server or Kubernetes module reaches the build graph |
+| go.etcd.io/etcd/api/v3, go.etcd.io/etcd/client/v3 | v3.7.1 | etcd error metadata (`rpctypes`) and the bridge tests' client | the versions Kine's pin resolves |
+| google.golang.org/grpc | v1.83.2 | the edge's gRPC server and credentials | the version Kine's pin resolves |
+| lukechampine.com/blake3 | v1.4.1 | BLAKE3 derive-key for command and binding identities | pure Go, no assembly requirement; verified against the Rust fixtures |
+
+Interface drift in Kine is resolved at this one explicit pin (plan gate
+checklist): `server.Backend` at the pin carries `Watch(ctx, key, end,
+revision)`, `Compact` and `WaitForSyncTo(revision)`, and `Get`/`List` take
+`keysOnly`; task-47 selects the production Kine/Kubernetes pin for watch
+and progress plumbing.
 
 ## Dependency policy enforced by `cargo xtask check-deps`
 
@@ -116,7 +136,7 @@ Observed transitive facts to carry into task-j02:
 
 | Candidate (Section 16) | Resolution | Reason |
 |---|---|---|
-| Go toolchain unspecified | `go 1.26.0` | quic-go v0.62.0 requires Go 1.26; `go mod tidy` raised the directive |
+| Go toolchain unspecified | `go 1.26.5` | quic-go v0.62.0 requires Go 1.26 and the pinned Kine revision declares `go 1.26.5`; `go mod tidy` raised the directive (task-45, task-46) |
 | Rust minimum 1.90 | MSRV stays 1.90; exact toolchain 1.94.1 | raft-engine's own `rust-version` is 1.85; all workspace crates check with 1.90.0 |
 | fjall 3.1.10, openidconnect 4.0.1, reqwest 0.12.28 and the other unused candidates | Not added yet | Added by first consuming task with exact pins; presence in the index was confirmed on 2026-09-18 |
 | rustls 0.23.44 | Pinned at `=0.23.45` | RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries) is patched in 0.23.45; quinn 0.11.11 and quinn-proto 0.11.17 accept it, and no other selection changes |

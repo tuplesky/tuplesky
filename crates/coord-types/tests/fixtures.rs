@@ -307,3 +307,68 @@ fn command_id_vectors_are_frozen() {
         },
     );
 }
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct KineBindingVector {
+    name: String,
+    cluster_id: String,
+    domain_id: String,
+    session_id: String,
+    client_instance_id: String,
+    request_sequence: u64,
+    binding_id: String,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct KineBindingFixture {
+    schema: String,
+    hash_context: String,
+    vectors: Vec<KineBindingVector>,
+}
+
+/// The hidden Kine binding identity is a function of the retry key alone
+/// (task-46): a retry reproduces it, the next sequence names a fresh one.
+#[test]
+fn kine_binding_vectors_are_frozen() {
+    let key = RetryKey {
+        cluster_id: ClusterId(*b"cluster-00000001"),
+        domain_id: DomainId(*b"domain-000000001"),
+        session_id: SessionId(*b"session-00000001"),
+        client_instance_id: ClientInstanceId(*b"client-000000001"),
+        request_sequence: RequestSequence::new(1).unwrap(),
+    };
+    let next = RetryKey {
+        request_sequence: RequestSequence::new(2).unwrap(),
+        ..key
+    };
+    let other_instance = RetryKey {
+        client_instance_id: ClientInstanceId(*b"client-000000002"),
+        ..key
+    };
+    let vector = |name: &str, key: RetryKey| KineBindingVector {
+        name: name.to_owned(),
+        cluster_id: hex(key.cluster_id.as_bytes()),
+        domain_id: hex(key.domain_id.as_bytes()),
+        session_id: hex(key.session_id.as_bytes()),
+        client_instance_id: hex(key.client_instance_id.as_bytes()),
+        request_sequence: key.request_sequence.get(),
+        binding_id: hex(coord_types::kine_binding_id(&key).as_bytes()),
+    };
+    let vectors = vec![
+        vector("sequence-1", key),
+        vector("sequence-1-retry", key),
+        vector("sequence-2", next),
+        vector("other-instance", other_instance),
+    ];
+    assert_eq!(vectors[0].binding_id, vectors[1].binding_id);
+    assert_ne!(vectors[0].binding_id, vectors[2].binding_id);
+    assert_ne!(vectors[0].binding_id, vectors[3].binding_id);
+    write_or_compare(
+        "kine_bindings_v1.json",
+        &KineBindingFixture {
+            schema: "kine_bindings_v1".to_owned(),
+            hash_context: coord_types::HashDomain::KineBinding.context().to_owned(),
+            vectors,
+        },
+    );
+}

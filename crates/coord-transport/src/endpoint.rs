@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, CloseV1, Frame, HelloAckV1, HelloV1, MessageV1, PeerRole, decode,
+    BoundedBytes, BoundedVec, CloseV1, Frame, HelloAckV1, HelloV1, KIND_SESSION_BIND, MessageV1,
+    PeerRole, SESSION_BIND_VERSION, decode,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{RecvStream, SendStream, VarInt};
@@ -197,22 +198,7 @@ impl Responder {
     /// this lane exists to enforce.
     pub async fn respond(mut self, frame: Vec<u8>) -> Result<(), SendError> {
         let bytes = frame.len();
-        for budget in [&self.link.budget, self.node.as_ref()] {
-            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(self.lane, bytes) {
-                return Err(SendError::TooLarge { bytes, limit });
-            }
-        }
-        let dest = self
-            .link
-            .budget
-            .acquire(self.lane, bytes)
-            .await
-            .map_err(|_| SendError::NotConnected)?;
-        let node = self
-            .node
-            .acquire(self.lane, bytes)
-            .await
-            .map_err(|_| SendError::NotConnected)?;
+        let (dest, node) = self.admit(bytes).await?;
         timeout(self.deadline, async {
             self.send
                 .write_all(&frame)
@@ -231,6 +217,69 @@ impl Responder {
             let _ = stopped.await;
         });
         Ok(())
+    }
+
+    /// Write one frame and leave the stream open.
+    ///
+    /// A watch is not a request with a long answer: the caller opens one
+    /// stream and the frontend writes events, progress and finally a
+    /// close onto it over the life of the subscription. [`respond`] ends
+    /// the stream, so it can serve only the unary shape; this is the same
+    /// admission for a stream that continues.
+    ///
+    /// The difference is what the admitted bytes are held against. A
+    /// unary reply keeps its budget until the peer acknowledges it, which
+    /// bounds what one process can have in flight. A watch stream is
+    /// alive for as long as the subscription, so holding each frame's
+    /// budget until the stream ends would let one slow consumer consume
+    /// the lane's whole allowance and never return it. Here the budget is
+    /// held until the write completes, which is itself bounded: the write
+    /// does not complete until QUIC's flow control has room, so a
+    /// consumer that stops reading blocks this frame rather than
+    /// accumulating more.
+    ///
+    /// [`respond`]: Responder::respond
+    pub async fn push(&mut self, frame: &[u8]) -> Result<(), SendError> {
+        let (dest, node) = self.admit(frame.len()).await?;
+        let written = timeout(self.deadline, self.send.write_all(frame))
+            .await
+            .map_err(|_| SendError::Timeout)?;
+        drop((dest, node));
+        written.map_err(|e| SendError::Stream(e.to_string()))
+    }
+
+    /// End the stream, having written what there was to write.
+    ///
+    /// A stream that is dropped instead is reset, which a peer reads as a
+    /// failure rather than the orderly end of a subscription.
+    pub fn finish(mut self) -> Result<(), SendError> {
+        self.send
+            .finish()
+            .map_err(|e| SendError::Stream(e.to_string()))
+    }
+
+    /// Admit `bytes` under the destination and node budgets.
+    async fn admit(
+        &self,
+        bytes: usize,
+    ) -> Result<(crate::budget::BytesPermit, crate::budget::BytesPermit), SendError> {
+        for budget in [&self.link.budget, self.node.as_ref()] {
+            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(self.lane, bytes) {
+                return Err(SendError::TooLarge { bytes, limit });
+            }
+        }
+        let dest = self
+            .link
+            .budget
+            .acquire(self.lane, bytes)
+            .await
+            .map_err(|_| SendError::NotConnected)?;
+        let node = self
+            .node
+            .acquire(self.lane, bytes)
+            .await
+            .map_err(|_| SendError::NotConnected)?;
+        Ok((dest, node))
     }
 }
 
@@ -513,9 +562,36 @@ impl Transport {
         binder: Arc<dyn IdentityBinder>,
         limits: Limits,
     ) -> Result<Transport, TransportError> {
+        Transport::with_socket(std::net::UdpSocket::bind(addr)?, local, binder, limits)
+    }
+
+    /// Serve on a socket the caller already bound.
+    ///
+    /// A process decides whether it can serve at all by binding its
+    /// listeners, and that decision must be made once: binding here as
+    /// well would either fail with the caller's own socket still open, or
+    /// leave a window in which the port was free for someone else to
+    /// take. The daemon binds every listener up front (its `Live` phase
+    /// is defined by that) and hands the socket over here, so the address
+    /// the process reported is the address it serves on.
+    pub fn with_socket(
+        socket: std::net::UdpSocket,
+        local: LocalIdentity,
+        binder: Arc<dyn IdentityBinder>,
+        limits: Limits,
+    ) -> Result<Transport, TransportError> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        // One endpoint serves both ALPNs, and rustls decides client
+        // authentication before the negotiated ALPN is visible to the
+        // verifier, so presence is relaxed here and the plane's contract
+        // is enforced in `negotiate_incoming`: a peer-class connection,
+        // and every API role that acts for others, is rejected without a
+        // certificate. `allow_unauthenticated` relaxes presence only: a
+        // certificate that is presented is still chained to `local.roots`
+        // by the same verifier, so peer authentication is unchanged.
         let verifier =
             WebPkiClientVerifier::builder_with_provider(local.roots.clone(), provider.clone())
+                .allow_unauthenticated()
                 .build()
                 .map_err(tls_err)?;
         let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -568,7 +644,14 @@ impl Transport {
         };
         let client_tls = [client_for(ALPN_API)?, client_for(ALPN_PEER)?];
 
-        let mut endpoint = quinn::Endpoint::server(server_config, addr)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TransportError::Tls("no async runtime for the endpoint".into()))?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )?;
         let mut default_client = quinn::ClientConfig::new(client_tls[1].clone());
         default_client.transport_config(lane_transport[Lane::Control.index()].clone());
         endpoint.set_default_client_config(default_client);
@@ -617,6 +700,37 @@ impl Transport {
     /// Negotiated connections currently open.
     pub fn connections(&self) -> usize {
         self.shared.peers.lock().unwrap().len()
+    }
+
+    /// Close `connection` with `code`, because the runtime above decided
+    /// it may not continue.
+    ///
+    /// The transport refuses what it can judge by itself -- framing,
+    /// negotiation, lane -- but whether a bound session may still send is
+    /// not one of those things, and a connection whose binding was
+    /// refused or has expired must stop being served rather than have its
+    /// frames quietly ignored. `reason` is a short fixed string; it
+    /// crosses the wire, so nothing derived from a caller's data belongs
+    /// in it.
+    ///
+    /// Returns whether a connection by that identifier was open.
+    pub fn disconnect(&self, connection: ConnectionId, code: CloseCode, reason: &str) -> bool {
+        let peer = self.shared.peers.lock().unwrap().get(&connection).cloned();
+        let Some(peer) = peer else {
+            return false;
+        };
+        // The recorded reason is this endpoint's own: it is what the
+        // `Closed` event will carry, so a close taken here is
+        // distinguishable afterwards from one the peer took.
+        *peer.close_reason.lock().unwrap() = Some(match code {
+            CloseCode::Rejected => CloseReason::Rejected(reason.to_owned()),
+            CloseCode::Timeout => CloseReason::Timeout,
+            CloseCode::Shutdown => CloseReason::Shutdown,
+            _ => CloseReason::Malformed(reason.to_owned()),
+        });
+        peer.conn
+            .close(VarInt::from_u32(code as u32), reason.as_bytes());
+        true
     }
 
     /// The next owned event, lanes in priority order (control first);
@@ -1137,7 +1251,18 @@ async fn negotiate_incoming(
     conn: &quinn::Connection,
 ) -> Result<Negotiated, (CloseReason, Option<SendStream>)> {
     let class = negotiated_class(conn).map_err(|r| (r, None))?;
-    let certs = peer_certs(conn).map_err(|r| (r, None))?;
+    // The peer plane is mutually authenticated. The native API plane
+    // authenticates this server and authorizes work by the session
+    // binding a client presents above this layer, so a client
+    // certificate is optional there; which roles that covers is decided
+    // once `Hello` declares one.
+    let certs = match peer_certs(conn) {
+        Ok(certs) => Some(certs),
+        Err(reason) => match class {
+            Class::Api => None,
+            Class::Peer => return Err((reason, None)),
+        },
+    };
     let (mut send, recv) = match timeout(shared.limits.handshake_timeout, conn.accept_bi()).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err((CloseReason::Transport(e.to_string()), None)),
@@ -1174,9 +1299,29 @@ async fn negotiate_incoming(
         Ok(l) => l,
         Err(e) => return Err((CloseReason::Rejected(format!("lane {e:?}")), Some(send))),
     };
-    let bound = match shared.binder.bind(&certs, &hello) {
-        Ok(b) => b,
-        Err(e) => return Err((CloseReason::Rejected(format!("{e:?}")), Some(send))),
+    let bound = match &certs {
+        Some(certs) => match shared.binder.bind(certs, &hello) {
+            Ok(b) => b,
+            Err(e) => return Err((CloseReason::Rejected(format!("{e:?}")), Some(send))),
+        },
+        // Without a certificate only `Client` is admissible: a frontend
+        // or Kine collector acts for other principals and must prove
+        // that with mutual TLS. An anonymous client is bound to nothing
+        // but its connection; every request it makes is refused until a
+        // session binding authorizes it, and no replica identity or
+        // provenance is ever derived from it.
+        None if hello.role == PeerRole::Client => BoundIdentity {
+            role: PeerRole::Client,
+            replica: None,
+            incarnation: None,
+            capabilities: Vec::new(),
+        },
+        None => {
+            return Err((
+                CloseReason::Rejected("client certificate".into()),
+                Some(send),
+            ));
+        }
     };
     let mut granted: Vec<u16> = hello
         .capabilities
@@ -1420,13 +1565,26 @@ async fn read_request(
             // frame, a server-origin message or a handshake message as an
             // API request would make the malformed-frame contract the duty
             // of every consumer downstream.
-            let reason = match decode(&frame) {
-                Ok(m) if client_request(&m) => None,
-                Ok(m) => Some(CloseReason::Malformed(format!(
-                    "api frame {:?} is not a request",
-                    m.kind()
-                ))),
-                Err(e) => Some(CloseReason::Malformed(format!("{e:?}"))),
+            //
+            // The session binding is the one exception, and an enumerated
+            // one: it is a raw kind whose payload belongs to
+            // `coord-session`, so this crate cannot decode it and checks
+            // the kind and version instead. Admitting it here is what lets
+            // a connection bind at all; everything else still has to
+            // decode to a client request.
+            let reason = if frame.kind == KIND_SESSION_BIND {
+                (frame.version != SESSION_BIND_VERSION).then(|| {
+                    CloseReason::Malformed(format!("bind frame version {}", frame.version))
+                })
+            } else {
+                match decode(&frame) {
+                    Ok(m) if client_request(&m) => None,
+                    Ok(m) => Some(CloseReason::Malformed(format!(
+                        "api frame {:?} is not a request",
+                        m.kind()
+                    ))),
+                    Err(e) => Some(CloseReason::Malformed(format!("{e:?}"))),
+                }
             };
             if let Some(reason) = reason {
                 *peer.close_reason.lock().unwrap() = Some(reason.clone());

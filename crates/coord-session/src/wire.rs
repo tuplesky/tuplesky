@@ -6,13 +6,15 @@ use coord_types::ids::SessionId;
 use coord_types::wire_v1::{BoundedBytes, Frame, WireError, encode_frame};
 use serde::{Deserialize, Serialize};
 
-/// A client binds a session.
-pub const KIND_BIND: u16 = 0x0105;
+/// A client binds a session. The number belongs to the shared wire
+/// vocabulary, so that the transport boundary that admits the frame and
+/// this module that answers it cannot drift apart.
+pub const KIND_BIND: u16 = coord_types::wire_v1::KIND_SESSION_BIND;
 /// The frontend acknowledges a binding.
-pub const KIND_BIND_ACK: u16 = 0x0106;
+pub const KIND_BIND_ACK: u16 = coord_types::wire_v1::KIND_SESSION_BIND_ACK;
 /// Largest accepted token.
 pub const MAX_TOKEN_BYTES: usize = 8 * 1024;
-const VERSION: u16 = 1;
+const VERSION: u16 = coord_types::wire_v1::SESSION_BIND_VERSION;
 
 /// The binding request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
