@@ -146,6 +146,53 @@ class DocsChecks(unittest.TestCase):
         self.assertEqual(self.tree.run(), 1)
 
 
+class MermaidRender(unittest.TestCase):
+    """A render is retried once: a crash that passes on retry is not an
+    error, and a block that fails both attempts is."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.calls = self.dir / "calls"
+
+    def fake_mmdc(self, failures: int) -> str:
+        """An mmdc that fails its first `failures` calls, then renders."""
+        script = self.dir / "mmdc"
+        script.write_text(
+            "#!/bin/sh\n"
+            f'echo x >> "{self.calls}"\n'
+            f'if [ "$(wc -l < "{self.calls}")" -le {failures} ]; then\n'
+            '  echo "Error: Protocol error (Target.closed)" >&2; exit 1\n'
+            "fi\n"
+            'while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\n'
+            'echo "<svg/>" > "$out"\n'
+        )
+        script.chmod(0o755)
+        return str(script)
+
+    def render(self, failures: int) -> cd.Report:
+        report = cd.Report()
+        cd.render_mermaid(self.fake_mmdc(failures), None, Path("doc.md"), 3, "flowchart TD\n  A --> B", report)
+        return report
+
+    def calls_made(self) -> int:
+        return len(self.calls.read_text().splitlines())
+
+    def test_a_render_that_passes_first_time_runs_once(self):
+        self.assertEqual(self.render(0).errors, [])
+        self.assertEqual(self.calls_made(), 1)
+
+    def test_a_render_that_crashes_once_passes_on_retry(self):
+        self.assertEqual(self.render(1).errors, [])
+        self.assertEqual(self.calls_made(), 2)
+
+    def test_a_render_that_fails_twice_is_an_error(self):
+        errors = self.render(2).errors
+        self.assertEqual(len(errors), 1)
+        self.assertIn("mermaid render failed twice", errors[0])
+        self.assertEqual(self.calls_made(), 2)
+
+
 class RepositoryDocs(unittest.TestCase):
     def test_repository_documentation_passes(self):
         self.assertEqual(cd.main(["--root", str(REPO)]), 0)

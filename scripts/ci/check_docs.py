@@ -278,10 +278,18 @@ def render_mermaid(mmdc: str, puppeteer_config: str | None, path: Path, lineno: 
         cmd = [mmdc, "-i", str(src), "-o", str(out), "--quiet"]
         if puppeteer_config:
             cmd += ["-p", puppeteer_config]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0 or not out.exists():
-            detail = (proc.stderr or proc.stdout).strip().splitlines()
-            report.error(path, lineno, "mermaid render failed: " + (detail[-1] if detail else "no output"))
+        # One retry. mmdc drives a headless Chrome, which occasionally
+        # dies mid-render on a block that renders on every other run; a
+        # block that is really malformed fails both attempts the same way.
+        for attempt in (1, 2):
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and out.exists():
+                if attempt > 1:
+                    print(f"{path}:{lineno}: mermaid render passed on retry", file=sys.stderr)
+                return
+            out.unlink(missing_ok=True)
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        report.error(path, lineno, "mermaid render failed twice: " + (detail[-1] if detail else "no output"))
 
 
 def main(argv=None) -> int:
