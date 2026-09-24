@@ -588,29 +588,46 @@ fn initializing_is_deliberate_and_happens_exactly_once() {
     assert!(dir.join("state").join("gen-000001").is_dir());
 }
 
-/// An initialization that created the journal and then failed to create
-/// the projection can be run again, and finishes.
+/// An initialization that failed before it finished can be run again,
+/// and finishes -- including one that left a journal and no projection.
 ///
 /// The two are separate directories, so no one write makes both exist.
-/// Without this the node was left with a journal and no projection: `init`
-/// refused because a store existed, a start refused because none did, and
-/// the only way out was deleting the journal by hand.
+/// Initialization now selects the projection before it creates the
+/// journal (task-59), so one that cannot create the projection leaves
+/// nothing behind. A journal and no projection is what an initialization
+/// that created the journal first left (task-j08): without reusing it
+/// the node was left with a journal and no projection, `init` refused
+/// because a store existed, a start refused because none did, and the
+/// only way out was deleting the journal by hand.
 #[test]
 fn an_initialization_that_stopped_between_the_journal_and_the_projection_can_be_finished() {
     let dir = workspace("half-init");
     let path = config(&dir);
 
     // Something that is not a directory where the projection goes: the
-    // journal is created, and then the projection cannot be.
+    // projection cannot be created, and so neither is the journal.
     std::fs::write(dir.join("state"), b"not a directory").expect("obstruct");
     let failed = run(&path, &["init"]);
     assert_eq!(failed.code, Some(2), "{}{}", failed.out, failed.err);
     assert!(
-        dir.join("journal").is_dir(),
-        "the journal was not created first, so this is not the case under test"
+        !dir.join("journal").exists(),
+        "a journal was created for a projection that was never selected"
+    );
+    std::fs::remove_file(dir.join("state")).expect("clear");
+
+    // The journal an initialization that created it first left behind.
+    drop(
+        coord_journal_raft_engine::journal::RaftEngineJournal::create(
+            &dir.join("journal"),
+            coord_journal_raft_engine::journal::JournalIdentity {
+                cluster: coord_types::ids::ClusterId(CLUSTER),
+                replica: coord_types::ids::ReplicaId([1; 16]),
+            },
+            &coord_journal_raft_engine::journal::JournalOptions::default(),
+        )
+        .expect("a journal with no history"),
     );
 
-    std::fs::remove_file(dir.join("state")).expect("clear");
     let finished = run(&path, &["init"]);
     assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
     let report = start_and_report(&path);
