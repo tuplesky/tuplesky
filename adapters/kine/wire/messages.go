@@ -38,7 +38,27 @@ type RetryKey struct {
 // Message is one decoded wire_v1 message.
 type Message interface {
 	kind() uint16
+	// validate applies the same schema bounds and discriminant checks the
+	// decoder does, so a DTO built directly by a caller is refused here
+	// rather than by the peer after it has crossed the wire.
+	validate() error
 	encode(w *writer)
+}
+
+// checkBytes refuses a byte field longer than its schema bound.
+func checkBytes(b []byte, limit int) error {
+	if len(b) > limit {
+		return ErrMalformedPayload
+	}
+	return nil
+}
+
+// checkCapabilities refuses a capability list longer than its bound.
+func checkCapabilities(caps []uint16) error {
+	if len(caps) > maxCapabilities {
+		return ErrMalformedPayload
+	}
+	return nil
 }
 
 // Hello is the first frame on a connection.
@@ -51,6 +71,12 @@ type Hello struct {
 }
 
 func (Hello) kind() uint16 { return uint16(KindHello) }
+func (m Hello) validate() error {
+	if m.Role > RoleLearner {
+		return ErrMalformedPayload
+	}
+	return checkCapabilities(m.Capabilities)
+}
 func (m Hello) encode(w *writer) {
 	w.varint(uint64(m.Role))
 	w.raw(m.ClusterID[:])
@@ -73,7 +99,8 @@ type HelloAck struct {
 	MaxInflight  uint32
 }
 
-func (HelloAck) kind() uint16 { return uint16(KindHelloAck) }
+func (HelloAck) kind() uint16      { return uint16(KindHelloAck) }
+func (m HelloAck) validate() error { return checkCapabilities(m.Capabilities) }
 func (m HelloAck) encode(w *writer) {
 	w.varint(uint64(len(m.Capabilities)))
 	for _, c := range m.Capabilities {
@@ -88,7 +115,8 @@ type Close struct {
 	Reason []byte
 }
 
-func (Close) kind() uint16 { return uint16(KindClose) }
+func (Close) kind() uint16      { return uint16(KindClose) }
+func (m Close) validate() error { return checkBytes(m.Reason, maxReasonBytes) }
 func (m Close) encode(w *writer) {
 	w.varint(uint64(m.Code))
 	w.boundedBytes(m.Reason)
@@ -109,7 +137,8 @@ type Request struct {
 	DeadlineMs uint32
 }
 
-func (Request) kind() uint16 { return uint16(KindRequest) }
+func (Request) kind() uint16      { return uint16(KindRequest) }
+func (m Request) validate() error { return checkBytes(m.Logical, maxRequestBytes) }
 func (m Request) encode(w *writer) {
 	encodeRetryKey(w, m.RetryKey)
 	w.boundedBytes(m.Logical)
@@ -141,6 +170,20 @@ type Response struct {
 }
 
 func (Response) kind() uint16 { return uint16(KindResponse) }
+func (m Response) validate() error {
+	switch m.Tag {
+	case OutcomeOk:
+		return checkBytes(m.Result, maxResultBytes)
+	case OutcomeErr:
+		return checkBytes(m.Detail, maxReasonBytes)
+	case OutcomePending, OutcomeUnknown:
+		return nil
+	default:
+		// An unknown tag would otherwise be written with no body, which
+		// the peer reads as a malformed payload.
+		return ErrMalformedPayload
+	}
+}
 func (m Response) encode(w *writer) {
 	w.raw(m.CommandID[:])
 	w.varint(uint64(m.Tag))
@@ -165,7 +208,8 @@ type ResolveRequest struct {
 	CommandID [digestBytes]byte
 }
 
-func (ResolveRequest) kind() uint16 { return uint16(KindResolveRequest) }
+func (ResolveRequest) kind() uint16    { return uint16(KindResolveRequest) }
+func (ResolveRequest) validate() error { return nil }
 func (m ResolveRequest) encode(w *writer) {
 	encodeRetryKey(w, m.RetryKey)
 	w.raw(m.CommandID[:])
@@ -183,6 +227,15 @@ type WatchOpen struct {
 }
 
 func (WatchOpen) kind() uint16 { return uint16(KindWatchOpen) }
+func (m WatchOpen) validate() error {
+	if err := checkBytes(m.Key, maxKeyBytes); err != nil {
+		return err
+	}
+	if m.RangeEnd != nil {
+		return checkBytes(*m.RangeEnd, maxKeyBytes)
+	}
+	return nil
+}
 func (m WatchOpen) encode(w *writer) {
 	w.varint(m.WatchID)
 	w.raw(m.Namespace[:])
@@ -232,6 +285,28 @@ type WatchEvents struct {
 }
 
 func (WatchEvents) kind() uint16 { return uint16(KindWatchEvents) }
+func (m WatchEvents) validate() error {
+	if len(m.Events) > maxEventsPerBatch {
+		return ErrMalformedPayload
+	}
+	for _, e := range m.Events {
+		if e.Kind > EventDelete {
+			return ErrMalformedPayload
+		}
+		if err := checkBytes(e.Key, maxKeyBytes); err != nil {
+			return err
+		}
+		if err := checkBytes(e.Value, maxValueBytes); err != nil {
+			return err
+		}
+		if e.PrevValue != nil {
+			if err := checkBytes(*e.PrevValue, maxValueBytes); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
 func (m WatchEvents) encode(w *writer) {
 	w.varint(m.WatchID)
 	w.varint(m.Revision)
@@ -259,7 +334,8 @@ type WatchProgress struct {
 	Revision uint64
 }
 
-func (WatchProgress) kind() uint16 { return uint16(KindWatchProgress) }
+func (WatchProgress) kind() uint16    { return uint16(KindWatchProgress) }
+func (WatchProgress) validate() error { return nil }
 func (m WatchProgress) encode(w *writer) {
 	w.varint(m.WatchID)
 	w.varint(m.Revision)
@@ -285,6 +361,12 @@ type WatchClose struct {
 }
 
 func (WatchClose) kind() uint16 { return uint16(KindWatchClose) }
+func (m WatchClose) validate() error {
+	if m.Reason > WatchSourceLost {
+		return ErrMalformedPayload
+	}
+	return nil
+}
 func (m WatchClose) encode(w *writer) {
 	w.varint(m.WatchID)
 	w.varint(uint64(m.Reason))

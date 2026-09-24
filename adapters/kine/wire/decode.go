@@ -374,8 +374,14 @@ func decodeWatchClose(r *reader) (Message, error) {
 	return m, nil
 }
 
-// Encode encodes a message into a complete frame (version 1).
+// Encode encodes a message into a complete frame (version 1). It refuses,
+// with ErrMalformedPayload, any DTO whose fields Decode would refuse, so a
+// value the Rust peer cannot read never leaves the process; the frame
+// class limit alone is far looser than the per-field bounds.
 func Encode(m Message) ([]byte, error) {
+	if err := m.validate(); err != nil {
+		return nil, err
+	}
 	var w writer
 	m.encode(&w)
 	return EncodeFrame(m.kind(), 1, w.buf)
