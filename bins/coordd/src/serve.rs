@@ -761,9 +761,14 @@ const PARKED_HOLD: core::time::Duration = core::time::Duration::from_secs(1);
 const PARKED_EVIDENCE: usize = 256;
 
 /// One piece of evidence waiting for the submission that places it.
-struct Parked {
+///
+/// Generic over the provenance only so the hold's timing can be tested
+/// without minting a voter's provenance here: that constructor is
+/// confined to the voter runtime, and nothing about when a hold runs out
+/// depends on whose evidence it is.
+struct Parked<P = PeerProvenance> {
     command: CommandId,
-    provenance: PeerProvenance,
+    provenance: P,
     bytes: Vec<u8>,
     /// When it was parked, so the hold above can be applied to it.
     since: std::time::Instant,
@@ -778,7 +783,7 @@ struct Parked {
 /// not be said, until unrelated traffic arrived. Registered here, the
 /// loop takes a turn when the oldest hold runs out, and that turn lets
 /// it go -- which moves this deadline on to the next oldest, or away.
-impl Deadline for VecDeque<Parked> {
+impl<P> Deadline for VecDeque<Parked<P>> {
     fn next_deadline(&self) -> Option<std::time::Instant> {
         self.front().map(|oldest| oldest.since + PARKED_HOLD)
     }
@@ -788,14 +793,11 @@ impl Deadline for VecDeque<Parked> {
 /// `origin_of` names, in the order it was parked, and let go of what has
 /// waited the whole hold without one. Returns the ready frames and how
 /// many were let go.
-fn route_held(
-    parked: &mut VecDeque<Parked>,
+fn route_held<P>(
+    parked: &mut VecDeque<Parked<P>>,
     now: std::time::Instant,
     origin_of: impl Fn(&CommandId) -> Option<coord_daemon::voter::Origin>,
-) -> (
-    Vec<(coord_daemon::voter::Origin, PeerProvenance, Vec<u8>)>,
-    u64,
-) {
+) -> (Vec<(coord_daemon::voter::Origin, P, Vec<u8>)>, u64) {
     let mut still_waiting = VecDeque::with_capacity(parked.len());
     let mut ready = Vec::new();
     let mut unclaimed = 0;
@@ -2700,10 +2702,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let held = |n: u8, since| Parked {
             command: coord_types::CommandId(Digest32([n; 32])),
-            provenance: coord_core::event::PeerProvenance::from_local_voter(
-                ReplicaId([1; 16]),
-                ReplicaIncarnation::new(1).expect("positive"),
-            ),
+            provenance: (),
             bytes: vec![n],
             since,
         };
