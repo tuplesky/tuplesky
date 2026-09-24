@@ -5,9 +5,16 @@
 
 use alloc::vec::Vec;
 
+use coord_types::CommandId;
 use coord_types::error::DecodeError;
+use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ReplicaId};
 use serde::{Deserialize, Serialize};
+
+use crate::vote::{FastAck, SlowAck};
+
+/// Per-key path digests through one command, in key order.
+pub type PathAnchors = Vec<(Vec<u8>, Digest32)>;
 
 /// A peer message of the ballot/promise increment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -27,6 +34,28 @@ pub enum ProtocolMessage {
         synced: Ballot,
         /// Promising replica.
         replica: ReplicaId,
+    },
+    /// The leader's proposal for a command (`MFastAck` from the leader,
+    /// carrying its sequence number and the per-key path anchors a
+    /// follower feeds to `CommandTable::record_leader_path`).
+    Proposal(FastAck),
+    /// A follower's fast acknowledgement (`MFastAck`).
+    FastAck(FastAck),
+    /// A follower's adoption acknowledgement (`MLightSlowAck`).
+    SlowAck(SlowAck),
+    /// The leader's reply to the frontend used for learning (`MReply`):
+    /// the proposal's evidence; never a result.
+    LeaderReply {
+        /// Ballot.
+        ballot: Ballot,
+        /// Command.
+        command: CommandId,
+        /// Leader sequence number.
+        seqnum: u64,
+        /// Dependencies the leader ordered.
+        deps: Vec<CommandId>,
+        /// Dependency-path evidence.
+        path: Digest32,
     },
 }
 

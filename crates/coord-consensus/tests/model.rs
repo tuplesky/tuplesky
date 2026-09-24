@@ -73,9 +73,18 @@ fn fast(
         ballot: b,
         command: c,
         deps: deps.to_vec(),
+        paths: alloc_paths(path),
         path: Digest32([path; 32]),
         seqnum: seq,
     })
+}
+
+/// The single conservative key's anchor behind a combined digest.
+fn alloc_paths(path: u8) -> Vec<(Vec<u8>, Digest32)> {
+    vec![(
+        coord_consensus::CONSERVATIVE_KEY.to_vec(),
+        Digest32([path; 32]),
+    )]
 }
 
 fn slow(replica: u8, b: Ballot, c: CommandId) -> Vote {
@@ -144,7 +153,7 @@ fn explore(
     let mut first_learned: Vec<Learned> = Vec::new();
     let perms = permutations(votes);
     for perm in &perms {
-        let mut set = VoteSet::new(cfg, c);
+        let mut set = VoteSet::new(cfg.clone(), c);
         let mut rejected = BTreeMap::new();
         let mut latched: Option<Learned> = None;
         for (label, v) in perm {
