@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use coord_core::effect::CollectionId;
 use coord_store_api::engine::{LocalEngine, OrderedRead, ScanRequest, SnapshotSource, WriteTxn};
-use coord_store_api::registry::Collection;
+use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::identity::Digest32;
 use rand_chacha::ChaCha12Rng;
 use rand_core::{Rng, SeedableRng};
@@ -142,6 +142,24 @@ pub struct ReplayOutcome {
 /// engine holding at most a few thousand rows never approaches it.
 const MAX_REPLAY_PAGES: u32 = 1 << 16;
 
+/// Rows an engine writes for itself and that no scenario step produces: the
+/// identity and profile records under `meta_v1` (design Section 17.4). Only
+/// these are outside the logical comparison; every other row of every
+/// collection, referenced by the scenario or not, must match the oracle.
+fn is_engine_private(collection: u16, key: &[u8]) -> bool {
+    collection == Collection::MetaV1.id().0
+        && [
+            meta_fields::CLUSTER_ID,
+            meta_fields::DOMAIN_ID,
+            meta_fields::REPLICA_ID,
+            meta_fields::INCARNATION,
+            meta_fields::FORMAT_VERSION,
+            meta_fields::ENGINE,
+            meta_fields::PROFILE,
+        ]
+        .contains(&key)
+}
+
 fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
     let view = engine.reader().snapshot().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -171,6 +189,9 @@ fn read_all<E: LocalEngine>(engine: &E) -> Result<FlatRows, String> {
                     ));
                 }
                 last_key = Some(r.key.clone());
+                if is_engine_private(c.id().0, &r.key) {
+                    continue;
+                }
                 out.push((c.id().0, r.key.clone(), r.value.clone()));
             }
             if page.exhausted {
