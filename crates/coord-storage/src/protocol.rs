@@ -37,7 +37,7 @@ pub fn read_promise<V: OrderedRead>(
 /// epoch, the Sync selections bound in it, the payloads of the recovered
 /// commands and the executed identities. Volatile knowledge (votes held in
 /// memory, commit notifications, timers) is deliberately absent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveredProtocol {
     /// Promised and synchronized ballots.
     pub promise: Option<PromiseRecordV1>,
@@ -49,17 +49,56 @@ pub struct RecoveredProtocol {
     /// payload row is missing is a corrupt projection, reported as such).
     pub payloads: Vec<(CommandId, PayloadRecordV1)>,
     /// Executed identities with their positions, in position order.
+    ///
+    /// Trimming may remove the dependency rows of executed commands, so
+    /// this is what still has rows, not the whole executed history.
     pub executed: Vec<(CommandId, ExecutionPosition)>,
+    /// The durable execution frontier: how far this store has actually
+    /// executed, whatever protocol rows survive.
+    pub frontier: ExecutionPosition,
+}
+
+impl Default for RecoveredProtocol {
+    fn default() -> Self {
+        RecoveredProtocol {
+            promise: None,
+            records: Vec::new(),
+            syncs: Vec::new(),
+            payloads: Vec::new(),
+            executed: Vec::new(),
+            frontier: ExecutionPosition::ZERO,
+        }
+    }
 }
 
 impl RecoveredProtocol {
     /// The highest executed position among the executed identities.
+    /// The highest executed position among the executed identities that
+    /// still have protocol rows.
+    ///
+    /// This is evidence from the surviving rows, not the store's
+    /// execution frontier: trimming removes the rows of an executed
+    /// prefix and leaves the frontier where it was. A caller asking how
+    /// far this store has executed wants
+    /// [`RecoveredProtocol::execution_frontier`]; this one is for
+    /// comparing the rows against it.
     pub fn executed_through(&self) -> ExecutionPosition {
         self.executed
             .iter()
             .map(|(_, p)| *p)
             .max()
             .unwrap_or(ExecutionPosition::ZERO)
+    }
+
+    /// How far this store has executed, from the durable baseline.
+    ///
+    /// Independent of which protocol rows survive, so a trimmed executed
+    /// prefix does not move it: deriving the frontier from the rows
+    /// reported zero, or an older position, on a store that had executed
+    /// well past it, and the next command would then be planned at a
+    /// position already used.
+    pub const fn execution_frontier(&self) -> ExecutionPosition {
+        self.frontier
     }
 
     /// The Sync this replica bound for a ballot it leads and still holds
@@ -198,11 +237,15 @@ pub fn read_protocol<V: OrderedRead>(
         }
     }
     executed.sort_by_key(|(_, p)| *p);
+    let frontier = crate::lowering::DurableMeta::read(view)?
+        .frontier
+        .execution_position;
     Ok(RecoveredProtocol {
         promise,
         records,
         syncs,
         payloads,
         executed,
+        frontier,
     })
 }

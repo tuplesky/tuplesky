@@ -1,6 +1,6 @@
 [package]
 name = "coord-checkpoint"
-description = "SharedCheckpointV1: canonical bounded export of common logical state from one pinned view, chunked and hashed, and its verification"
+description = "SharedCheckpointV1: canonical bounded export of common logical state from one pinned view, chunked and hashed, its verification, its installation into an inactive generation and conservative all-voter protocol trimming"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,7 @@ role = "production"
 [dependencies]
 coord-types.workspace = true
 coord-core.workspace = true
+coord-consensus.workspace = true
 coord-store-api.workspace = true
 coord-storage.workspace = true
 coord-storage-redb.workspace = true
