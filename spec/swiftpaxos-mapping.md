@@ -100,6 +100,19 @@ must be re-checked against the paper text at the task-19 review.
 | `r.status != NORMAL -> return` in `handlePropose` | A higher promise stops proposing; unreleased proposals under the old ballot are fenced | `Leader::is_leading`, outbox release with `BallotState::promised` | `tests/leader.rs::a_higher_promise_stops_proposing_and_fences_unreleased_proposals` |
 | `commonCaseFastAck` / `handleLightSlowAck` on the leader | Acknowledgements are collected per command; learning is not decided here (task-24) | `Leader::collect` -> `VoteSet` | `tests/leader.rs::votes_are_collected_but_never_learned_here` |
 
+## Follower vote and adoption handlers (task-23)
+
+| Source handler / rule | Rule | Rust item | Test |
+|---|---|---|---|
+| `handlePropose` on a follower: `!r.FQ.Contains(r.Id) -> no MFastAck`; else `MFastAck{Dep, Checksum}` | Only a fast-set member votes fast; the vote is published to every other voter and the frontend once payload, dependencies and path evidence are durable (Section 5.1) | `follower::Follower::on_admitted`, `PendingSend.requires = [batch]` | `tests/follower.rs::fast_votes_wait_for_durable_payload_dependencies_and_path` |
+| `fastAckFromLeader`: `afterPropagate.Call` (waits for `desc.propose`) | A leader proposal before the payload is held; the placeholder is invisible to lookups and guards | `Follower::on_proposal` -> `CommandTable::expect`, `HeldProposal` | `tests/follower.rs::a_proposal_before_the_payload_is_held_against_an_invisible_placeholder` |
+| `fastAckFromLeader`: `desc.phase = ACCEPT`, `desc.dep = dep` when `neq`; `TODO` guard | Adoption of the leader's order requires every dependency at least ACCEPT (explicit guard); the adopted order is persisted before the slow acknowledgement | `Follower::advance_pending` -> `CommandTable::accept`, `dependency_update` | same, and `tests/follower.rs::equal_direct_dependencies_are_not_learning_and_guards_are_explicit` |
+| `MLightSlowAck` after adoption (`sendSlowAck`) | The slow acknowledgement goes to every other voter and the frontend requiring the adoption batch | `ProtocolMessage::SlowAck`, `Follower::publish_to_voters_and_frontend` | proposal-before-payload test |
+| `recordLeaderHash` on the leader's `MFastAck` | The leader's per-key path digests synchronize the follower's logs when the proposal arrives | `FastAck::paths`, `CommandTable::record_leader_path` | `tests/follower.rs::conflict_arrival_permutations_converge_on_the_leader_order` |
+| `commonCaseFastAck`: `msg.Ballot != r.ballot -> return`; leader identity by `r.leader()` | A proposal from a non-leader or another ballot is foreign | `FollowerRejection::ForeignProposal` | same |
+| (volatile descriptors) | `[EXT]` after a crash the table is rebuilt from durable dependency rows; a durable vote is a fact, an undurable one was never sent (Section 4.7) | `CommandTable::restore`, `Follower::recover` | `tests/follower.rs::a_crash_between_state_and_vote_preserves_the_learning_obligation` |
+| `acceptFastAndSlowAck` dep equality | Equal direct dependencies are collected as evidence, never acted on; learning is task-24 | `Follower::collect` -> `VoteSet` | equal-direct-deps test |
+
 ## Durable publication obligations (design Section 5.1)
 
 | Publication | Required durable records | Rust item |

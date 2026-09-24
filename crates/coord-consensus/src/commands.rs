@@ -36,8 +36,14 @@ pub struct CommandRecord {
     pub keys: Vec<Vec<u8>>,
     /// Digest of the bound payload (`None` for a placeholder).
     pub payload: Option<Digest32>,
-    /// Per-key path digests through this command at initialization.
+    /// Per-key path digests through this command: the local ones at
+    /// initialization, replaced by the leader's once its order is
+    /// recorded, so a record restored after a crash resumes its logs at
+    /// the synchronized anchor rather than a stale local digest.
     pub paths: Vec<(Vec<u8>, Digest32)>,
+    /// Leader sequence number the paths were synchronized at, if the
+    /// leader's order has been recorded for this command.
+    pub synced_seq: Option<u64>,
     /// Combined path evidence (what a fast acknowledgement carries).
     pub path: Digest32,
 }
@@ -113,6 +119,64 @@ impl CommandTable {
         }
     }
 
+    /// Rebuild a table from complete authoritative dependency rows
+    /// (design Section 4.7: derived indexes come from the records, never
+    /// from receipt order). The conflict index names, per key, the record
+    /// no other record of that key depends on; path logs resume at that
+    /// record's digest.
+    pub fn restore(
+        capacity: Option<usize>,
+        records: impl IntoIterator<Item = (CommandId, CommandRecord)>,
+    ) -> Self {
+        let mut table = CommandTable {
+            records: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            executed: BTreeSet::new(),
+            capacity,
+        };
+        for (c, r) in records {
+            table.records.insert(c, r);
+        }
+        let mut per_key: BTreeMap<Vec<u8>, Vec<CommandId>> = BTreeMap::new();
+        for (c, r) in &table.records {
+            if r.payload.is_none() {
+                continue;
+            }
+            for key in &r.keys {
+                per_key.entry(key.clone()).or_default().push(*c);
+            }
+        }
+        for (key, members) in per_key {
+            let depended: alloc::collections::BTreeSet<CommandId> = members
+                .iter()
+                .flat_map(|c| table.records[c].deps.iter().copied())
+                .collect();
+            let last = members
+                .iter()
+                .copied()
+                .filter(|c| !depended.contains(c))
+                .max();
+            let mut state = KeyState::default();
+            if let Some(last) = last {
+                let digest = table.records[&last]
+                    .paths
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, d)| *d)
+                    .unwrap_or_else(crate::graph::empty_path);
+                state.last = Some(last);
+                state.log = PathLog::resumed(digest);
+            }
+            table.keys.insert(key, state);
+        }
+        table
+    }
+
+    /// Every initialized record.
+    pub fn records(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
+        self.records.iter().filter(|(_, r)| r.payload.is_some())
+    }
+
     fn full(&self) -> bool {
         self.capacity.is_some_and(|c| self.records.len() >= c)
     }
@@ -135,6 +199,7 @@ impl CommandTable {
                 keys: Vec::new(),
                 payload: None,
                 paths: Vec::new(),
+                synced_seq: None,
                 path: crate::graph::empty_path(),
             },
         );
@@ -186,6 +251,7 @@ impl CommandTable {
                 keys,
                 payload: Some(payload),
                 paths: paths.clone(),
+                synced_seq: None,
                 path,
             },
         );
@@ -212,6 +278,20 @@ impl CommandTable {
                 .or_default()
                 .log
                 .sync(command, seqnum, *digest);
+        }
+        // Record the synchronized anchors so the durable row written when
+        // the order is adopted carries them: a restored log then resumes
+        // where the live one stands.
+        if let Some(record) = self.records.get_mut(&command)
+            && record.synced_seq.is_none_or(|s| seqnum >= s)
+        {
+            record.synced_seq = Some(seqnum);
+            for (key, digest) in paths {
+                match record.paths.iter_mut().find(|(k, _)| k == key) {
+                    Some(entry) => entry.1 = *digest,
+                    None => record.paths.push((key.clone(), *digest)),
+                }
+            }
         }
     }
 
