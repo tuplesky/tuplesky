@@ -430,26 +430,8 @@ fn restore(
             }),
         },
     );
-    let mut opened = match storage {
+    let opened = match storage {
         Ok(o) => o,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-    };
-    // The successor's genesis is pinned as `init` pins it, before the
-    // projection is attached: the restored node serves only under the
-    // manifest it was restored under.
-    if let Err(e) = genesis::check(
-        &mut opened.generation,
-        &placed.manifest,
-        genesis::Intent::Initialize,
-    ) {
-        eprintln!("{e}");
-        return ExitCode::from(2);
-    }
-    let mut storage = match opened.attach() {
-        Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
@@ -459,19 +441,28 @@ fn restore(
         eprintln!("the restore never reached this node's projection");
         return ExitCode::from(2);
     };
-    // The successor's own genesis policy, exactly as `init` writes it.
-    // The backup deliberately carried none: the old cluster's trust
-    // rules and permissions are its authority, not this one's.
-    if let Err(e) = write_genesis_policy(config, &mut storage, placed.incarnation) {
-        eprintln!("{e}");
-        return ExitCode::from(2);
-    }
+    // The rest is `init`'s, in `init`'s order: attach, the successor's
+    // own genesis policy, and the successor's genesis pinned last. The
+    // backup deliberately carried no policy -- the old cluster's trust
+    // rules and permissions are its authority, not this one's -- and a
+    // restore that stops anywhere before the pin leaves a store a start
+    // refuses and `coordd init` finishes, with the restored rows in it.
+    // Pinned before the policy, a stop between the two left a restored
+    // node that served, trusting nothing and granting nothing, and that
+    // nothing would finish.
+    let directory = match finish_initialization(config, placed, opened) {
+        Ok(directory) => directory,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     println!(
         "restored rows={} detached={} commits={} into {}",
         restored.receipt.rows,
         restored.receipt.detached,
         restored.commits,
-        storage.generation.display(),
+        directory.display(),
     );
     for (collection, rows) in &restored.receipt.dropped {
         println!("dropped collection={collection} rows={rows}");

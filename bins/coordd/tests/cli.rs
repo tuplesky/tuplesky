@@ -3613,6 +3613,130 @@ async fn a_backup_restores_a_new_cluster_and_refuses_to_restore_the_old_one() {
     assert_eq!(again.code, Some(2), "{}", again.out);
 }
 
+/// A restore that stopped after its policy and before its pin is refused
+/// by a start and finished by `init`, which keeps the restored rows and
+/// writes none of the policy twice (task-59).
+///
+/// A restore ends as `init` does: attach, the successor's genesis
+/// policy, and the successor's genesis pinned last. Pinned before the
+/// policy, a stop between the two left a restored node that served,
+/// trusting nothing and granting nothing, and that nothing would finish.
+/// The state a stop just before the pin leaves is a finished restore
+/// without its pin, made here by removing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_that_stopped_before_its_pin_is_finished_by_init() {
+    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_store_api::registry::{Collection, meta_fields};
+
+    let dir = workspace("restore-unpinned");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x59; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+    }
+    let out = dir.join("backup");
+    let taken = run(&path, &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(taken.code, Some(0), "{}", taken.err);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("backup.json")).expect("manifest"))
+            .expect("json");
+
+    let new_dir = workspace("restore-unpinned-successor");
+    let new_cluster = [0xc6u8; 16];
+    let new_ca = credentials_of_cluster(
+        &new_dir,
+        new_cluster,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+    );
+    genesis_of_cluster(&new_dir, new_cluster, &new_ca.node_spki);
+    let _ = sts_keys(&new_dir);
+    let new_path = config_only(&new_dir);
+    let attestation = fencing_file(
+        &dir,
+        "fencing.json",
+        CLUSTER,
+        new_cluster,
+        &manifest["root"],
+    );
+    let restored = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(restored.code, Some(0), "{}", restored.err);
+    // The policy is written before the pin, so the restore that finished
+    // wrote all of it.
+    assert!(
+        restored.out.contains(" present=0") && !restored.out.contains("genesis policy rows=0"),
+        "the restore did not write the successor's policy before its pin:\n{}",
+        restored.out
+    );
+
+    // Stopped just before the pin.
+    {
+        let mut generation = coord_storage_redb::lifecycle::Generation::open_existing(
+            &new_dir.join("state"),
+            coord_storage_redb::lifecycle::StoreIdentity {
+                cluster_id: coord_types::ids::ClusterId(new_cluster),
+                domain_id: coord_types::ids::DomainId(DOMAIN),
+                replica_id: coord_types::ids::ReplicaId([1; 16]),
+                incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            },
+            coord_storage_redb::lifecycle::OpenOptions::default(),
+        )
+        .expect("the restored store opens");
+        let mut txn = generation.engine().begin_write().expect("write");
+        txn.delete(Collection::MetaV1.id(), meta_fields::GENESIS_DIGEST)
+            .expect("unpin");
+        txn.commit_durable().expect("commit");
+    }
+
+    let refused = run(&new_path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("never pinned") && refused.err.contains("coordd init"),
+        "the refusal did not say what to do: {}",
+        refused.err
+    );
+
+    let finished = run(&new_path, &["init"]);
+    assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
+    assert!(
+        finished.out.contains("genesis policy rows=0 present=")
+            && !finished.out.contains("present=0"),
+        "finishing rewrote a policy the restore had written:\n{}",
+        finished.out
+    );
+    assert!(
+        !new_dir.join("state").join("gen-000002").exists(),
+        "finishing the restore made a second generation"
+    );
+
+    // The finished node comes up on the restored state.
+    let report = start_and_report(&new_path);
+    assert!(
+        report.contains("phase=live") && report.contains("owed=0"),
+        "the finished restore did not come up:\n{report}"
+    );
+    assert!(
+        !report.contains("journaled_through=None"),
+        "the finished restore came up on no restored state:\n{report}"
+    );
+}
+
 /// A genesis for another cluster, as a successor deployment has it.
 fn genesis_of_cluster(dir: &Path, cluster: [u8; 16], voter_one_key: &[u8]) {
     let manifest = serde_json::json!({

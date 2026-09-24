@@ -1419,7 +1419,9 @@ and their keys; the policy rows are the authorization decisions made
 under them. Carrying either would leave the abandoned cluster deciding
 things here. Membership comes from the successor's own genesis
 (task-42), and `coordd restore` writes the successor's genesis policy
-afterwards exactly as `init` does.
+afterwards exactly as `init` does, before the successor's genesis pin,
+so a restore that stops before the pin is refused by a start and
+finished by `init` rather than served without a policy.
 
 The execution frontier goes the same way. The position and the KV
 revision continue, so the new cluster's own history is not rewound

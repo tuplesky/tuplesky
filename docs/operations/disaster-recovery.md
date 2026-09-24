@@ -196,6 +196,15 @@ journal) and to restore again (it has a store). Remove the state root
 and the journal root and run the restore again; nothing in them has
 been served.
 
+Once the journal exists the restore finishes the way `coordd init`
+does, in the same order: it attaches the generation, writes the
+successor's genesis policy, and pins the successor's genesis last. A
+crash anywhere in that stretch leaves a restored store with no pin,
+which `coordd` refuses to serve ("never pinned"). Run `coordd --config
+<successor.toml> init` to finish it: it keeps the restored rows, writes
+whatever of the policy is missing and pins the genesis. Do not run the
+restore again; the node already has a store and it is refused.
+
 ## 6. Afterwards
 
 * **Callers re-establish everything.** Sessions, leases and watches are
