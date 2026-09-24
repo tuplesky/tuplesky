@@ -646,6 +646,26 @@ pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
 /// Turns between two asks for a missing payload.
 const ASK_EVERY: u64 = 16;
 
+/// Something in a domain that has work due at a time rather than on an
+/// event.
+///
+/// The domain loop otherwise waits only on its sockets, so work that
+/// becomes due while nothing arrives -- a lease whose deadline passes on
+/// a quiet domain -- would wait for unrelated traffic to be noticed. The
+/// loop instead sleeps until the earliest deadline any component
+/// registers ([`Domain::next_deadline`]) and gives the voter a turn when
+/// it passes. Lease expiry is the first component; the collector's
+/// re-offers and the expiry of held evidence are meant to register here
+/// in the same way rather than add arms of their own to the loop.
+pub trait Deadline {
+    /// The earliest instant this component has work due, if it has any.
+    ///
+    /// It must move past a deadline once the turn that deadline wakes has
+    /// done the work due at it; a deadline that stays in the past would
+    /// wake the loop again at once, for ever.
+    fn next_deadline(&self) -> Option<std::time::Instant>;
+}
+
 /// Where this node's local recovery images live, and when it makes one.
 ///
 /// A local checkpoint is not a replicated fact and not a protocol step:
@@ -876,6 +896,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // nowhere else, so an api connection and a peer connection
             // can share a number. Handling them through one arm would
             // let a caller's closing stream look like a voter's.
+            // Work due at a time rather than on an event. Last in the
+            // order, so it never holds up a frame that is already here;
+            // when it fires the loop simply takes another turn, which is
+            // where the component whose deadline it was does its work.
+            let wake = self.next_deadline();
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                wake.unwrap_or_else(std::time::Instant::now),
+            ));
             let arrived = tokio::select! {
                 biased;
                 // Voter work that is still outstanding pre-empts waiting
@@ -885,6 +913,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 () = std::future::ready(()), if progressed => continue,
                 peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                 event = transport.next_event() => event.map(Arrived::Api),
+                () = sleep, if wake.is_some() => continue,
             };
             match arrived {
                 Some(Arrived::Api(event)) => self.on_transport(transport, event, &clock).await,
@@ -898,6 +927,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     pub fn with_expiry(mut self, expiry: crate::leases::Expiry) -> Self {
         self.expiry = Some(expiry);
         self
+    }
+
+    /// The earliest deadline any component of this domain has
+    /// registered: when the loop has to take a turn even if nothing
+    /// arrives (see [`Deadline`]).
+    ///
+    /// Expiry counts only where this replica leads, because only then
+    /// does a turn run it; a follower's driver has nothing due. Further
+    /// components are folded into the same minimum.
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        let expiry = match &self.backing {
+            Backing::Voting(voter) if voter.leads() => {
+                self.expiry.as_ref().and_then(Deadline::next_deadline)
+            }
+            _ => None,
+        };
+        [expiry].into_iter().flatten().min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases
@@ -944,7 +990,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         if voter.leads()
             && let Some(expiry) = self.expiry.as_mut()
         {
-            let frames = expiry.due(voter.node().applier().store());
+            let applied = voter.node().executed;
+            let frames = expiry.due(voter.node().applier().store(), applied);
             for frame in frames {
                 out.absorb(voter.propose_service(&frame)?);
             }

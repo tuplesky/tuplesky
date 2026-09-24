@@ -92,6 +92,9 @@ pub enum Rejection {
     /// A proposal batch was definitely rejected and is being presented
     /// again unchanged under a new barrier.
     ProposalRetried(CommandId),
+    /// A service command presented again while still unlearned: its
+    /// proposal was published to the other voters again, unchanged.
+    ProposalRepublished(CommandId),
     /// The leader stopped leading; a new election recovers the role.
     Fenced(FenceReason),
     /// A peer message was rejected.
@@ -794,7 +797,84 @@ impl Leader {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
         }
+        if let Some(effects) = self.republish_service(frame) {
+            return effects;
+        }
         self.propose(frame, None)
+    }
+
+    /// Publish the proposal of a service command presented again while
+    /// it is still unlearned, and say so; `None` for anything else, which
+    /// [`Leader::propose`] then handles as a first presentation or a
+    /// duplicate.
+    ///
+    /// A service command has no caller and no collector to retry it:
+    /// its scheduler presenting the same frame again is the only thing
+    /// that can ever get it to a quorum after its first proposal was
+    /// lost on the way -- a failed send, a peer that was not connected
+    /// yet. Refusing that presentation as a duplicate, as a client's
+    /// repeat is refused, would leave the command bound here and heard
+    /// nowhere else, for as long as this leader leads. So the sends are
+    /// published again: the same proposal, at the same ballot, sequence
+    /// number and dependencies, under the barrier that already carries
+    /// its rows, which are not written a second time. A voter that did
+    /// receive the first copy acknowledges the same thing again. A
+    /// command already learned needs no proposal and is left to the
+    /// duplicate path.
+    fn republish_service(&mut self, frame: &[u8]) -> Option<Vec<Effect>> {
+        let boot = self.boot?;
+        if !self.is_leading() {
+            return None;
+        }
+        let request = match decode_stream(frame).ok()?.as_slice() {
+            [MessageV1::Request(r)] => r.clone(),
+            _ => return None,
+        };
+        let logical = request.logical().ok()?;
+        let command = CommandId::derive(&request.retry_key, &logical).ok()?;
+        if self.bindings.get(&request.retry_key) != Some(&command) {
+            return None;
+        }
+        let proposal = self.proposals.get(&command)?;
+        if proposal.executed || self.table.phase_of(&command) >= Some(Phase::Commit) {
+            return None;
+        }
+        let admission = self
+            .table
+            .record(&command)
+            .and_then(|r| r.payload)
+            .unwrap_or_else(|| admission_digest(None));
+        let ballot = self.config.quorum.ballot();
+        let ack = FastAck {
+            replica: self.config.identity.replica,
+            ballot,
+            command,
+            deps: proposal.deps.clone(),
+            paths: proposal.paths.clone(),
+            path: proposal.path,
+            admission,
+            seqnum: Some(proposal.seqnum),
+        };
+        let barrier = proposal.barrier;
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut()?;
+        for voter in &self.config.identity.voters {
+            if *voter == self.config.identity.replica {
+                continue;
+            }
+            outbox.publish(PendingSend {
+                context,
+                requires: alloc::vec![barrier],
+                to: PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: ProtocolMessage::Proposal(ack.clone()).encode(),
+            });
+        }
+        self.rejections
+            .push(Rejection::ProposalRepublished(command));
+        Some(self.release())
     }
 
     fn propose(&mut self, frame: &[u8], admission: Option<AdmissionFacts>) -> Vec<Effect> {

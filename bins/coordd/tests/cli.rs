@@ -4262,7 +4262,8 @@ async fn two_callers_at_once_are_both_served_by_a_quorum() {
 /// The wait is generous on purpose. Expiry is allowed to be late --
 /// the deadline waits `(1 + rho) * TTL` local ticks and the scheduler
 /// reads committed state on an interval -- and it is not allowed to be
-/// early, which the first read is there to check.
+/// early, which the first read is there to check. Nothing but the
+/// deadline may make it happen, which is why the wait is idle.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_under_a_time_to_live_stops_being_readable() {
     let dir = workspace("ttl");
@@ -4349,25 +4350,24 @@ async fn a_key_under_a_time_to_live_stops_being_readable() {
         .expect("the daemon never answered the read");
     assert_eq!(rows(&present), 1, "the key was gone before its time");
 
-    // And gone once the deadline passes. Polled rather than slept
-    // through: what is being tested is that it goes, not when.
-    let mut sequence = 3;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let answer = ask(&caller.connection, &read(sequence))
-            .await
-            .expect("the daemon never answered the read");
-        if rows(&answer) == 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the key was still readable a minute after a one-second time to live:\n{}",
-            daemon.said()
-        );
-        sequence += 1;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // And gone once the deadline passes -- on a domain nobody touched
+    // meanwhile. The wait is idle on purpose, followed by one read: the
+    // expiry has to happen because its deadline passed, not because
+    // traffic arrived, and a read that arrived first and was ordered
+    // ahead of the expiry would see the key. Five seconds covers the
+    // one-second time to live, the clock-rate margin, the scan interval
+    // and the time to order the expiry, with room to spare on a slow
+    // host.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let answer = ask(&caller.connection, &read(3))
+        .await
+        .expect("the daemon never answered the read");
+    assert_eq!(
+        rows(&answer),
+        0,
+        "the key was still readable after an idle wait well past its time to live:\n{}",
+        daemon.said()
+    );
 }
 
 /// A caller naming one of the service's own operations is refused,

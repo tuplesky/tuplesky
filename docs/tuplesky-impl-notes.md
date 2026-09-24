@@ -1949,6 +1949,27 @@ leader on an interval, and execution waits at the command it cannot run
 rather than failing the node -- which is what it used to do, taking the
 whole process down with it.
 
+*Review found the path correct on a busy, loss-free domain and wrong
+everywhere else, in four ways.* The daemon loop waited only on sockets,
+so a deadline that passed on a quiet domain was noticed when unrelated
+traffic arrived -- and the request that woke it was ordered ahead of the
+expiry and read the key. The loop now also sleeps until the earliest
+deadline any component registers through a small `Deadline` trait
+(`next_deadline()`), and expiry registers its armed deadlines, its next
+scan while there is something new to observe, and its retries; the
+collector's re-offers and held-evidence expiry are meant to register the
+same way. Second, a candidate whose proposal never reached a quorum
+stayed "in flight" for ever: the driver now presents any proposal that
+committed state has not shown resolving within a retry interval again.
+Third, presenting it again did nothing, because the leader refused a
+bound retry key as a duplicate; for a service command that is bound but
+not yet learned it now publishes the same proposal to the voters again,
+which is the only retry such a command can have -- nobody else will ever
+submit it. And the expiry's invocation identity left out the renewal
+sequence, so after a renewal ordered ahead of a due expiry the lease's
+next candidate was a second payload for a bound invocation, refused as an
+identity conflict every time. The key now carries it.
+
 All of them had been invisible for a structural reason worth stating. The
 Kine backend holds one session and issues one invocation at a time, and
 the Go suite's etcd-level rows spend fewer requests than the old bound

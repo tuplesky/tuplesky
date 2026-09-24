@@ -860,3 +860,99 @@ fn the_seal_report_waits_for_an_acceptance_batch_still_in_flight() {
     }));
     assert_eq!(released.iter().filter(|e| is_seal_report(e)).count(), 1);
 }
+
+/// A service command whose proposal never reached the other voters is
+/// proposed to them again when its scheduler presents it again.
+///
+/// A service command -- an authority epoch, an expiry candidate -- has no
+/// caller and no collector to retry it, so a proposal whose peer sends
+/// were lost would otherwise sit bound at the leader, heard by nobody,
+/// and every later presentation would be refused as a duplicate. Here
+/// the first proposal's sends are released and dropped, as a failed
+/// send drops them; presenting the same frame again publishes the same
+/// proposal to every other voter and writes nothing again.
+#[test]
+fn a_service_command_presented_again_is_proposed_to_the_voters_again() {
+    let service = |operation: CanonicalOperation, seq: u64| {
+        let mut logical = LogicalRequest::new(NamespaceId([5; 16]), operation);
+        logical.canonicalize();
+        let key = RetryKey {
+            session_id: SessionId([0; 16]),
+            client_instance_id: ClientInstanceId([0; 16]),
+            ..retry_key(seq)
+        };
+        let command = CommandId::derive(&key, &logical).unwrap();
+        let frame = MessageV1::Request(RequestV1::new(key, &logical, 0).unwrap())
+            .encode()
+            .unwrap();
+        (frame, command)
+    };
+    let proposals_to_peers = |effects: &[Effect], command: CommandId| -> BTreeSet<ReplicaId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::SendWhenDurable { to, frame, .. } => match ProtocolMessage::decode(frame) {
+                    Ok(ProtocolMessage::Proposal(ack)) if ack.command == command => {
+                        Some(to.replica)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    let peers: BTreeSet<ReplicaId> = [r(1), r(2)].into();
+
+    for (operation, seq) in [
+        (
+            CanonicalOperation::EstablishLeaseAuthority {
+                epoch: LeaseAuthorityEpoch::new(1).unwrap(),
+            },
+            1,
+        ),
+        (
+            CanonicalOperation::ExpireLease {
+                lease_id: LeaseId([7; 16]),
+                generation: LeaseGeneration::new(1).unwrap(),
+                expected_renewal_sequence: 3,
+                authority_epoch: LeaseAuthorityEpoch::new(1).unwrap(),
+            },
+            2,
+        ),
+    ] {
+        let mut leader = booted();
+        let (frame, command) = service(operation, seq);
+        let first = leader.propose_service(&frame);
+        assert!(
+            matches!(first.as_slice(), [Effect::Persist(_)]),
+            "the first presentation did not persist the proposal: {first:?}"
+        );
+        // Durable, so the proposal is released to the voters -- and lost
+        // on the way: nothing is done with these sends.
+        let mut released = Vec::new();
+        for event in durable(&first, 1) {
+            released.extend(leader.step(event));
+        }
+        assert_eq!(proposals_to_peers(&released, command), peers);
+
+        // Presented again: the same proposal goes to every other voter
+        // again, and no row is written a second time.
+        let again = leader.propose_service(&frame);
+        assert!(
+            !again.iter().any(|e| matches!(e, Effect::Persist(_))),
+            "a second presentation wrote the proposal again: {again:?}"
+        );
+        assert_eq!(
+            proposals_to_peers(&again, command),
+            peers,
+            "the proposal was not published to the voters again: {again:?}"
+        );
+        assert!(
+            leader
+                .take_rejections()
+                .contains(&Rejection::ProposalRepublished(command)),
+            "the republication was not reported"
+        );
+        assert_eq!(leader.proposal(&command).unwrap().seqnum, 0);
+    }
+}
