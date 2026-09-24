@@ -3129,7 +3129,6 @@ fn genesis_of_incarnation(dir: &Path, voter_one_key: &[u8], incarnation: u64) {
 /// that had not; the next start had nothing to carry from, allocated a
 /// fresh stream, and refused the projection as materialized past it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "a replacement is committed here by editing genesis.json, which the genesis pin (task-j08) now quarantines; it needs a committed reconfiguration path to be exercised end to end"]
 async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_start() {
     let dir = workspace("replace-interrupted");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
@@ -3190,6 +3189,101 @@ async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_st
     );
 }
 
+/// A replacement that stopped after its genesis was re-pinned and before
+/// anything was adopted finishes on the next start (task-58).
+///
+/// The re-pin is the first durable step of an admitted replacement, so
+/// this is the one state it can leave that the old pin cannot: a pin
+/// that already matches the presented manifest over a store still
+/// stamped with the previous incarnation. The next start finds nothing
+/// to re-pin and finishes the adoption through the interrupted-adoption
+/// path. The stop is made here by re-pinning as the start does -- the
+/// manifest and its digest in one transaction -- and not starting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_that_stopped_after_its_re_pin_finishes_on_the_next_start() {
+    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_store_api::registry::{Collection, meta_fields};
+
+    let dir = workspace("replace-repinned");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x5b; 16]).await;
+        let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+        response_of(&answer)
+    };
+
+    let (next, key) = ca.issue_at(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+        2,
+    );
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
+    write_key(&dir.join("node.key"), &key.serialize_der());
+    genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+
+    // Re-pinned, and stopped before the adoption.
+    {
+        let manifest: coord_membership::genesis::GenesisManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("genesis.json")).expect("manifest"))
+                .expect("a manifest");
+        let mut generation = coord_storage_redb::lifecycle::Generation::open_existing(
+            &dir.join("state"),
+            coord_storage_redb::lifecycle::StoreIdentity {
+                cluster_id: coord_types::ids::ClusterId(CLUSTER),
+                domain_id: coord_types::ids::DomainId(DOMAIN),
+                replica_id: coord_types::ids::ReplicaId([1; 16]),
+                incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            },
+            coord_storage_redb::lifecycle::OpenOptions::default(),
+        )
+        .expect("the store is still stamped with the previous incarnation");
+        let mut txn = generation.engine().begin_write().expect("write");
+        txn.put(
+            Collection::MetaV1.id(),
+            meta_fields::GENESIS_MANIFEST,
+            &serde_json::to_vec(&manifest).expect("canonical"),
+        )
+        .expect("manifest");
+        txn.put(
+            Collection::MetaV1.id(),
+            meta_fields::GENESIS_DIGEST,
+            &manifest.digest().0,
+        )
+        .expect("digest");
+        txn.commit_durable().expect("commit");
+    }
+
+    let report = start_and_report(&path);
+    assert!(
+        !report.contains("genesis re-pinned"),
+        "a pin that already matched was re-pinned:\n{report}"
+    );
+    assert!(
+        report.contains("adopted this node's durable state from incarnation 1 under 2"),
+        "the start did not finish the adoption:\n{report}"
+    );
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x5b; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the finished replacement did not serve\n{}", daemon.said()));
+    let again = response_of(&answer);
+    assert_eq!(again.command_id, first.command_id);
+    assert_eq!(
+        again.outcome, first.outcome,
+        "a replacement finished after its re-pin came back on other state"
+    );
+}
+
 /// An authorized key replacement keeps this node's durable state, and a
 /// disk that was left behind by one does not come back (task-58; design
 /// Sections 10.4, 20.4).
@@ -3202,7 +3296,6 @@ async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_st
 /// cloned or restored from *before* a replacement is not the current
 /// replica at all, and serving from it is a replaced voter voting.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "a replacement is committed here by editing genesis.json, which the genesis pin (task-j08) now quarantines; it needs a committed reconfiguration path to be exercised end to end"]
 async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_not() {
     let dir = workspace("replace");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
@@ -3249,6 +3342,18 @@ async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_n
         report.contains("adopted this node's durable state from incarnation 1 under 2"),
         "the replacement did not adopt this node's state:\n{report}"
     );
+    // The manifest was re-pinned first: the pin admits a forward
+    // replacement, and it is durable before anything is adopted.
+    let repinned = report
+        .find("genesis re-pinned for a replacement: voter=01010101 incarnation 1 -> 2")
+        .unwrap_or_else(|| panic!("the replacement was not re-pinned:\n{report}"));
+    assert!(
+        repinned
+            < report
+                .find("adopted this node's durable state")
+                .expect("adopted"),
+        "the store was adopted before the genesis was re-pinned:\n{report}"
+    );
     let daemon = start(&path);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x58; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
@@ -3290,16 +3395,20 @@ async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_n
     );
 }
 
-/// A replacement handed to a node as an edited genesis manifest is a
-/// genesis quarantine, and it is refused before anything is adopted.
+/// A replacement handed to a node in a genesis manifest that was edited
+/// in any other way as well is a genesis quarantine, and it is refused
+/// before anything is adopted.
 ///
-/// Adoption is durable and one-way: it carries the journal's stream and
-/// advances the projection's manifest, after which the previous
-/// credential is fenced. A start that adopted first and checked the pin
-/// afterwards would be refused *and* have moved the store, so restoring
-/// the manifest the node was initialized under would leave it fenced
-/// under its own credential. The pin is checked on the generation as it
-/// is stamped, so restoring the manifest and the credential serves the
+/// The pin admits a forward replacement of existing voters and nothing
+/// else, so the same replacement beside one more edit -- here, another
+/// admin principal -- is refused as a whole. Adoption is durable and
+/// one-way: it carries the journal's stream and advances the
+/// projection's manifest, after which the previous credential is
+/// fenced. A start that adopted first and checked the pin afterwards
+/// would be refused *and* have moved the store, so restoring the
+/// manifest the node was initialized under would leave it fenced under
+/// its own credential. The pin is checked on the generation as it is
+/// stamped, so restoring the manifest and the credential serves the
 /// same answer as before.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_adopted() {
@@ -3332,6 +3441,13 @@ async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_ad
     std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
     write_key(&dir.join("node.key"), &key.serialize_der());
     genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+    let edited = std::fs::read_to_string(dir.join("genesis.json")).expect("manifest");
+    assert!(edited.contains(&hex(&[0xa; 16])), "the fixture changed");
+    std::fs::write(
+        dir.join("genesis.json"),
+        edited.replace(&hex(&[0xa; 16]), &hex(&[0xb; 16])),
+    )
+    .expect("edit the admin as well");
 
     let refused = run(&path, &[]);
     assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
