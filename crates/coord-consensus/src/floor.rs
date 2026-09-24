@@ -419,7 +419,7 @@ impl Discovered {
     /// when no subject reaches a majority within the read, which is not
     /// evidence that nothing was certified -- only that this read
     /// cannot tell which.
-    pub fn certified(&self, voters: &FloorVoters) -> Option<Digest32> {
+    pub fn certified(&self, voters: &EpochVoters) -> Option<Digest32> {
         self.subjects.iter().copied().find(|subject| {
             self.ready_for(*subject)
                 .iter()
