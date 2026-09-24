@@ -364,3 +364,46 @@ fn a_store_outside_this_builds_window_is_refused_rather_than_guessed_at() {
         );
     }
 }
+
+/// A store whose manifest records a different collection registry is
+/// refused before a single row is rewritten, and its selection is left
+/// exactly as it was: a registry change is outside what a migration
+/// does, and the refusal says so rather than converting half a store.
+#[test]
+fn a_store_with_another_collection_registry_is_refused_before_any_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    seeded(dir.path());
+    let selected = selected_schema(dir.path()).unwrap();
+    let path = dir
+        .path()
+        .join(format!("gen-{:06}", selected.generation))
+        .join("manifest.v1");
+    let mut older = selected.clone();
+    older.collections.pop();
+    older.write(&path).unwrap();
+    let before = generations(dir.path());
+
+    let refused = rewrite_into_new_generation(
+        dir.path(),
+        identity(),
+        options(),
+        &Unchanged {
+            from: MANIFEST_FORMAT,
+            to: MANIFEST_FORMAT,
+        },
+        &limits(),
+    );
+    match refused {
+        Err(MigrateError::Open(reason)) => assert!(
+            reason.contains("collection registry"),
+            "the refusal did not name the registry: {reason}"
+        ),
+        other => panic!("a store with another registry was migrated: {other:?}"),
+    }
+    assert_eq!(
+        selected_schema(dir.path()).unwrap().generation,
+        selected.generation,
+        "the selection moved"
+    );
+    assert_eq!(generations(dir.path()), before, "a staging was left behind");
+}

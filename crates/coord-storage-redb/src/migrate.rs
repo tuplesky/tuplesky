@@ -35,6 +35,25 @@
 //! * **No identity change.** The migration keeps the cluster, domain,
 //!   replica and incarnation it found, so a migration can never be a
 //!   quiet re-enrolment.
+//! * **No collection-registry change.** The source is opened through
+//!   [`Generation::open_existing`] and the staging checks its
+//!   predecessor the same way, and both require the selected manifest's
+//!   collection registry to equal this build's. A schema change that
+//!   adds, removes or renumbers a collection is therefore refused before
+//!   any [`SchemaMigration::rewrite`] runs. That is safe today because
+//!   the `StoreSchema` window is one version wide, so no admitted store
+//!   can carry another registry; the release that first changes the
+//!   registry has to verify the source against the registry its own
+//!   manifest records, not this build's, before this can migrate it.
+//! * **No store larger than memory.** Every row of the source is read
+//!   and held before the staging is created, because the source and the
+//!   staging are two generations of one root under one lock and the
+//!   source's engine is closed before the root is extended.
+//!   [`MigrateLimits`] shapes each page read and each write
+//!   transaction; it does not bound what is retained, so peak memory is
+//!   the size of the whole store. Streaming the source into the staging
+//!   would need the lifecycle to hold both engines open under the one
+//!   lock, which it deliberately does not.
 
 use std::path::Path;
 
