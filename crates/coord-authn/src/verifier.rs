@@ -178,6 +178,12 @@ impl Registry {
     }
 
     /// The key cache of `name`.
+    /// The key cache of `name`, mutably (refresh bookkeeping).
+    pub fn cache_mut(&mut self, name: &str) -> Option<&mut KeyCache> {
+        self.caches.get_mut(name)
+    }
+
+    /// The key cache of `name`.
     pub fn cache(&self, name: &str) -> Option<&KeyCache> {
         self.caches.get(name)
     }
@@ -244,7 +250,12 @@ impl Registry {
                     jwks_url: config.jwks_url.clone(),
                 };
             }
-            KeyLookup::Unknown => return Decision::Denied(VerifyError::UnknownKey),
+            // Out of refresh budget with nothing known about the key is
+            // a denial like any other unknown key: a flood of distinct
+            // unknown kids must not turn into a flood of fetches.
+            KeyLookup::Unknown | KeyLookup::Throttled => {
+                return Decision::Denied(VerifyError::UnknownKey);
+            }
             KeyLookup::Stale => return Decision::Denied(VerifyError::KeysStale),
         };
         if key.key.family() != header.alg.family() || key.algorithm.is_some_and(|a| a != header.alg)
