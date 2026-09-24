@@ -7,6 +7,18 @@
 // timeout and warm reconnect. Unknown outcomes stay explicit; there is
 // no exactly-once guarantee across a lost upstream identity, and
 // epoch-aware collection is task-m02.
+//
+// The session binding handshake is not on this branch. A connection here
+// sends only the Hello and then closes its side of the control stream: it
+// reads no HelloAck, sends no Bind, and awaits no BindAck, and the token
+// the Provider obtains is checked for availability and then dropped
+// rather than presented. The Rust frontend answers every frame on an
+// unbound connection with NotBound, so this client is exercised only
+// against the in-process test server, which performs no binding check.
+// The handshake lands in task-46: "task-46: implement Kine driver
+// registration and CRUD/range backend" presents the token once in a Bind
+// frame and reads the BindAck, and "task-46: address review findings"
+// keeps the control stream open and reads the HelloAck before binding.
 package client
 
 import (

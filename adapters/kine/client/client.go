@@ -51,7 +51,9 @@ type Config struct {
 	// TLS binds trust and origin: the server certificate is validated
 	// against RootCAs and the ServerName; the native API ALPN is offered.
 	TLS *tls.Config
-	// Provider supplies the service token presented at the Hello.
+	// Provider supplies the service token. On this branch a connection
+	// only requires that a token can be obtained; presenting it in a Bind
+	// frame is deferred to task-46 (see the package documentation).
 	Provider *Provider
 	// Cluster and Domain identify the origin.
 	Cluster [16]byte
@@ -169,7 +171,9 @@ func (c *Client) dialAndBind(ctx context.Context) (*quic.Conn, error) {
 	return conn, nil
 }
 
-// bind opens the control stream and sends the Hello with the token.
+// bind obtains a token, opens the control stream and sends the Hello. The
+// Hello has no token field and no Bind follows it here, so the token is
+// not presented; the Bind/BindAck exchange is deferred to task-46.
 func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
 	if c.cfg.Provider != nil {
 		if _, err := c.cfg.Provider.Token(ctx); err != nil {
@@ -192,8 +196,10 @@ func (c *Client) bind(ctx context.Context, conn *quic.Conn) error {
 	if err := writeFrame(stream, hello); err != nil {
 		return err
 	}
-	// The control stream stays open; the client reads no HelloAck body in
-	// this preview (negotiation detail is exercised by the Rust adapter).
+	// The client closes its side of the control stream without reading the
+	// HelloAck, and publishes the connection as ready without binding a
+	// session. The real frontend refuses such a connection's requests with
+	// NotBound; task-46 keeps the stream open, reads the HelloAck and binds.
 	_ = stream.Close()
 	return nil
 }
