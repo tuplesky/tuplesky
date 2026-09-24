@@ -27,12 +27,21 @@ pub struct ViewBudget {
     pub max_bytes: u32,
 }
 
+impl ViewBudget {
+    /// The budget the execution path uses. It is part of the schema, the
+    /// same on every replica and every build, because a command that
+    /// overruns it is rejected as a replicated result: a locally tunable
+    /// number here would make one node's resource setting another node's
+    /// history.
+    pub const SCHEMA: ViewBudget = ViewBudget {
+        max_rows: 10_000,
+        max_bytes: 16 * 1024 * 1024,
+    };
+}
+
 impl Default for ViewBudget {
     fn default() -> Self {
-        ViewBudget {
-            max_rows: 10_000,
-            max_bytes: 16 * 1024 * 1024,
-        }
+        ViewBudget::SCHEMA
     }
 }
 
