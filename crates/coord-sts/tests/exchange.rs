@@ -437,3 +437,47 @@ fn a_downscoped_token_creates_a_session_at_the_scope_it_was_granted() {
         Action::Read.bit() | Action::Write.bit() | Action::Delete.bit()
     );
 }
+
+#[test]
+fn a_renewal_never_outlives_the_session_it_renews() {
+    // A renewal signs a fresh token inside an existing session. Taking
+    // only the STS lifetime let a session admitted on a short-lived
+    // credential be renewed indefinitely, outliving that credential by
+    // any amount.
+    let k8s = k8s_issuer();
+    let mut sts = sts(&k8s, "https://k8s/keys", KubernetesMode::Offline, 300);
+    sts.verifier_mut()
+        .registry_mut()
+        .install_keys("k8s", &k8s.jwks, NOW)
+        .unwrap();
+    // A session whose admission ends well inside one STS lifetime.
+    let record = coord_state::policy::SessionRecord {
+        principal: PRINCIPAL,
+        scope_ceiling: Action::Read.bit(),
+        trust_rule: RULE,
+        rule_generation: 3,
+        active: true,
+        window: 8,
+        receipt_id: coord_types::identity::Digest32([1; 32]),
+        expires_at: NOW + 40,
+    };
+    let session = coord_types::ids::SessionId([7; 16]);
+    let r = sts.renew(session, &record, &clock()).unwrap();
+    assert_eq!(
+        r.expires_in, 40,
+        "the token ends with the session, not one STS lifetime later"
+    );
+    // Once the session's own deadline has passed there is nothing to
+    // renew, however healthy the clock and however active the record.
+    let late = ClockHealth::healthy(NOW + 41, 0);
+    assert_eq!(
+        sts.renew(session, &record, &late),
+        Err(ExchangeError::InvalidGrant("session expired"))
+    );
+    // A session with room left still gets the STS bound.
+    let long = coord_state::policy::SessionRecord {
+        expires_at: NOW + 10_000,
+        ..record
+    };
+    assert_eq!(sts.renew(session, &long, &clock()).unwrap().expires_in, 300);
+}

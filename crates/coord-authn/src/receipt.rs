@@ -185,6 +185,9 @@ pub fn mint(
             scope_ceiling: rule.scope_ceiling,
             trust_rule: rule.id,
             rule_generation: rule.generation,
+            // The session ends when the credential that admitted it
+            // does, whatever it is later renewed to.
+            expires_at: valid_until,
         },
         session,
         valid_until,

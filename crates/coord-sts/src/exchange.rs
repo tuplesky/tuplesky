@@ -17,9 +17,11 @@ use coord_authn::{
     VerifyError, WifVerifier, mint,
 };
 use coord_state::plan::Outcome;
+use coord_state::policy::SessionRecord;
 use coord_state::{InternalCommand, Response};
-use coord_types::identity::Digest32;
+use coord_types::identity::{Digest32, HashDomain};
 use coord_types::ids::NamespaceId;
+use coord_types::ids::SessionId;
 use serde::{Deserialize, Serialize};
 
 use crate::keys::KeyRing;
@@ -79,6 +81,10 @@ pub struct ExchangeResponse {
     pub expires_in: u64,
     /// Granted scope.
     pub scope: String,
+    /// A refresh token, when a refresh family was bound to the session
+    /// (browser and device logins; never for workload exchanges).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
 /// Why an exchange failed (RFC 6749 Section 5.2 vocabulary).
@@ -296,17 +302,19 @@ impl Sts {
             }
             Decision::Denied(_) => return Err(ExchangeError::InvalidGrant("assertion rejected")),
         };
-        self.issue(&identity, None, requested, clock, entropy, creator)
+        self.issue(&identity, None, None, requested, clock, entropy, creator)
     }
 
     /// Admit a verified identity through the trust rules and issue a
     /// service token once replicated state created the session: the
     /// receipt is consumed together with `code` (a browser or device
     /// login's grant commitment) when one is given.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue(
         &mut self,
         identity: &VerifiedIdentity,
         code: Option<Digest32>,
+        refresh_family: Option<Digest32>,
         requested: Option<u32>,
         clock: &ClockHealth,
         entropy: &[u8; 32],
@@ -334,7 +342,7 @@ impl Sts {
                 namespace: self.config.namespace,
                 receipt: granted,
                 code,
-                refresh_family: None,
+                refresh_family,
                 window: self.config.session_window,
             })
             .map_err(|e| match e {
@@ -388,6 +396,63 @@ impl Sts {
             token_type: "Bearer".into(),
             expires_in: exp - clock.now,
             scope: scope_string(scope),
+            refresh_token: None,
+        })
+    }
+
+    /// Sign a fresh service token for an existing, active session (a
+    /// refresh): the session's immutable principal, ceiling and rule
+    /// binding, with the STS lifetime bound.
+    pub fn renew(
+        &mut self,
+        session: SessionId,
+        record: &SessionRecord,
+        clock: &ClockHealth,
+    ) -> Result<ExchangeResponse, ExchangeError> {
+        if !record.active {
+            return Err(ExchangeError::InvalidGrant("session retired"));
+        }
+        if !clock.healthy {
+            return Err(ExchangeError::Unavailable("clock health"));
+        }
+        // A renewal signs a fresh token inside an existing session; it
+        // never extends the session. Without the session's own deadline
+        // a session admitted on a short-lived credential could be
+        // renewed indefinitely, outliving the credential that admitted
+        // it by any amount.
+        if record.expires_at <= clock.now {
+            return Err(ExchangeError::InvalidGrant("session expired"));
+        }
+        let exp = clock
+            .now
+            .saturating_add(self.config.max_token_lifetime_secs)
+            .min(record.expires_at);
+        let claims = ServiceClaims {
+            iss: self.config.issuer.clone(),
+            sub: hex(&record.principal.0),
+            aud: self.config.resource.clone(),
+            sid: hex(&session.0),
+            scope: record.scope_ceiling,
+            rule: hex(&record.trust_rule.0),
+            generation: record.rule_generation,
+            jti: hex(&HashDomain::AdmissionReceipt
+                .digest(&[&session.0, &clock.now.to_be_bytes()])
+                .0),
+            iat: clock.now,
+            exp,
+        };
+        let access_token = self
+            .ring
+            .sign(&claims)
+            .map_err(|_| ExchangeError::Server("signing"))?;
+        self.issued += 1;
+        Ok(ExchangeResponse {
+            access_token,
+            issued_token_type: TOKEN_TYPE_ACCESS.into(),
+            token_type: "Bearer".into(),
+            expires_in: exp - clock.now,
+            scope: scope_string(record.scope_ceiling),
+            refresh_token: None,
         })
     }
 }

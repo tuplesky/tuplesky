@@ -38,6 +38,7 @@ fn receipt(id: u8, session: SessionId, principal: PrincipalId, ceiling: u32) -> 
         scope_ceiling: ceiling,
         trust_rule: RULE,
         rule_generation: 1,
+        expires_at: u64::MAX,
     }
 }
 
@@ -868,6 +869,7 @@ proptest! {
                 active: true,
                 window: 8,
                 receipt_id: digest(1),
+                expires_at: u64::MAX,
             });
         }
         if !active {

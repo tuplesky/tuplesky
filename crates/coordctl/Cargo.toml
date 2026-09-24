@@ -1,0 +1,46 @@
+[package]
+name = "coordctl"
+description = "Operator CLI: browser and device login, refresh families with reuse revocation, logout, and explicit OS secure credential stores"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[features]
+default = []
+# Apple keychain store (macOS only; explicit opt-in).
+keychain = ["dep:apple-native-keyring-store"]
+# Linux Secret Service store over D-Bus (explicit opt-in).
+secret-service = ["dep:zbus-secret-service-keyring-store"]
+
+[dependencies]
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+keyring-core.workspace = true
+apple-native-keyring-store = { workspace = true, optional = true }
+zbus-secret-service-keyring-store = { workspace = true, optional = true }
+reqwest.workspace = true
+rustls.workspace = true
+oauth2.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+clap.workspace = true
+
+[dev-dependencies]
+coord-login.workspace = true
+coord-sts.workspace = true
+coord-authn.workspace = true
+coord-state.workspace = true
+coord-storage.workspace = true
+coord-store-api.workspace = true
+coord-store-testkit.workspace = true
+coord-core.workspace = true
+coord-types.workspace = true
+axum.workspace = true
+jsonwebtoken.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true

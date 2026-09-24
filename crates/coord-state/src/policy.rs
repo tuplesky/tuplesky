@@ -146,6 +146,11 @@ pub struct SessionRecord {
     pub window: u32,
     /// Receipt the session was created from.
     pub receipt_id: Digest32,
+    /// Absolute deadline of the session, from its admission. Renewal
+    /// signs fresh tokens within the session; it never moves this, so a
+    /// session cannot be renewed indefinitely past the credential that
+    /// admitted it.
+    pub expires_at: u64,
 }
 
 /// The canonical admission receipt as the state machine consumes it: what
@@ -164,6 +169,9 @@ pub struct AdmissionReceiptV1 {
     pub trust_rule: TrustRuleId,
     /// Generation of that rule the verifier saw.
     pub rule_generation: u64,
+    /// Absolute deadline the admitted credential allows: the session
+    /// created from this receipt ends here, whatever it is renewed to.
+    pub expires_at: u64,
 }
 
 /// What a grant commitment stands for.
