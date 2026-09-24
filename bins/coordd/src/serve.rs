@@ -769,6 +769,50 @@ struct Parked {
     since: std::time::Instant,
 }
 
+/// Held evidence is due to be let go when the oldest of it has waited
+/// the whole hold.
+///
+/// The hold is applied only when a turn runs, and on a domain that has
+/// gone quiet nothing else would run one: evidence parked just before
+/// the last submission would sit past the hold, and `unclaimed` would
+/// not be said, until unrelated traffic arrived. Registered here, the
+/// loop takes a turn when the oldest hold runs out, and that turn lets
+/// it go -- which moves this deadline on to the next oldest, or away.
+impl Deadline for VecDeque<Parked> {
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.front().map(|oldest| oldest.since + PARKED_HOLD)
+    }
+}
+
+/// Take out what can be routed at `now`: every frame whose submitter
+/// `origin_of` names, in the order it was parked, and let go of what has
+/// waited the whole hold without one. Returns the ready frames and how
+/// many were let go.
+fn route_held(
+    parked: &mut VecDeque<Parked>,
+    now: std::time::Instant,
+    origin_of: impl Fn(&CommandId) -> Option<coord_daemon::voter::Origin>,
+) -> (
+    Vec<(coord_daemon::voter::Origin, PeerProvenance, Vec<u8>)>,
+    u64,
+) {
+    let mut still_waiting = VecDeque::with_capacity(parked.len());
+    let mut ready = Vec::new();
+    let mut unclaimed = 0;
+    for held in core::mem::take(parked) {
+        match origin_of(&held.command) {
+            Some(origin) => ready.push((origin, held.provenance, held.bytes)),
+            // Past the window the race takes, so the submission is not
+            // late, it is not coming. Let it go rather than hold it until
+            // something newer needs the room.
+            None if now.duration_since(held.since) >= PARKED_HOLD => unclaimed += 1,
+            None => still_waiting.push_back(held),
+        }
+    }
+    *parked = still_waiting;
+    (ready, unclaimed)
+}
+
 /// How often a node repeats a request for a payload it is waiting on.
 ///
 /// Bounded by time rather than by events for the same reason the ask
@@ -785,9 +829,9 @@ const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// a quiet domain -- would wait for unrelated traffic to be noticed. The
 /// loop instead sleeps until the earliest deadline any component
 /// registers ([`Domain::next_deadline`]) and gives the voter a turn when
-/// it passes. Lease expiry is the first component; the collector's
-/// re-offers and the expiry of held evidence are meant to register here
-/// in the same way rather than add arms of their own to the loop.
+/// it passes. Lease expiry and the expiry of held evidence register
+/// here; the collector's re-offers are meant to register in the same way
+/// rather than add arms of their own to the loop.
 pub trait Deadline {
     /// The earliest instant this component has work due, if it has any.
     ///
@@ -1252,16 +1296,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// arrives (see [`Deadline`]).
     ///
     /// Expiry counts only where this replica leads, because only then
-    /// does a turn run it; a follower's driver has nothing due. Further
-    /// components are folded into the same minimum.
+    /// does a turn run it; a follower's driver has nothing due. Held
+    /// evidence counts on any voter, since every voter's turn applies
+    /// the hold. Further components are folded into the same minimum.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        let expiry = match &self.backing {
-            Backing::Voting(voter) if voter.leads() => {
-                self.expiry.as_ref().and_then(Deadline::next_deadline)
-            }
-            _ => None,
+        let (expiry, parked) = match &self.backing {
+            Backing::Voting(voter) => (
+                self.expiry
+                    .as_ref()
+                    .filter(|_| voter.leads())
+                    .and_then(Deadline::next_deadline),
+                Deadline::next_deadline(&self.parked),
+            ),
+            Backing::Serving(_) => (None, None),
         };
-        [expiry].into_iter().flatten().min()
+        [expiry, parked].into_iter().flatten().min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases
@@ -1307,7 +1356,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // the gap, however long it ran.
             //
             // What says the last ask was answered is the count of
-            // answers, not the count of what is still missing. The
+            // answers to it -- the machine counts an answer only when it
+            // names a command the outstanding ask named, and once -- not
+            // the count of what is still missing. The
             // missing count moves for two reasons -- a payload arrived,
             // or a command arrived by identity -- and under load the
             // second happens on nearly every turn, so a replica pacing
@@ -1628,8 +1679,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// let go of what has waited longer than the race can take.
     ///
     /// Called after submissions are taken in, which is the only thing
-    /// that can supply the answer, and on every local turn, which is
-    /// what makes the hold expire on a node nobody is submitting to.
+    /// that can supply the answer, and at the end of every turn. On a
+    /// node nobody is submitting to no turn would come, so the oldest
+    /// evidence's hold is registered as a deadline (see [`Deadline`]):
+    /// the loop wakes when it runs out and the turn it takes lets that
+    /// evidence go and says `unclaimed`.
     fn route_parked(&mut self, api: &Transport) {
         if self.parked.is_empty() {
             return;
@@ -1637,27 +1691,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &self.backing else {
             return;
         };
-        let now = std::time::Instant::now();
-        let mut still_waiting = VecDeque::with_capacity(self.parked.len());
-        let mut ready = Vec::new();
-        for held in core::mem::take(&mut self.parked) {
-            match voter.origin_of(&held.command) {
-                Some(origin) => ready.push((origin, held.provenance, held.bytes)),
-                // Past the window the race takes, so the submission is
-                // not late, it is not coming. Let it go rather than
-                // hold it until something newer needs the room.
-                None if now.duration_since(held.since) >= PARKED_HOLD => {
-                    self.frontend.counts.unclaimed += 1;
-                    if self.frontend.counts.unclaimed == 1 {
-                        eprintln!(
-                            "this voter let go of evidence no submission named inside the window"
-                        );
-                    }
-                }
-                None => still_waiting.push_back(held),
+        let (ready, unclaimed) =
+            route_held(&mut self.parked, std::time::Instant::now(), |command| {
+                voter.origin_of(command)
+            });
+        if unclaimed > 0 {
+            if self.frontend.counts.unclaimed == 0 {
+                eprintln!("this voter let go of evidence no submission named inside the window");
             }
+            self.frontend.counts.unclaimed += unclaimed;
         }
-        self.parked = still_waiting;
         for (origin, provenance, bytes) in ready {
             match origin {
                 coord_daemon::voter::Origin::Connection(id) => {
@@ -2641,6 +2684,62 @@ mod tests {
         ask_for_payloads_now, payload_batch_size, poll_api_first,
     };
 
+    /// Held evidence registers when it is due to be let go, and the turn
+    /// that deadline wakes lets it go and moves the deadline on.
+    ///
+    /// The hold is applied only when a turn runs. Without a deadline an
+    /// idle voter never runs one, so evidence parked just before the
+    /// domain went quiet sat past the hold and `unclaimed` was not said
+    /// until unrelated traffic arrived. A deadline that stayed put after
+    /// its turn would instead wake the loop for ever.
+    #[test]
+    fn held_evidence_is_due_when_its_hold_runs_out_and_its_turn_lets_it_go() {
+        use super::{Deadline, PARKED_HOLD, Parked, route_held};
+        use coord_types::identity::Digest32;
+
+        let t0 = std::time::Instant::now();
+        let held = |n: u8, since| Parked {
+            command: coord_types::CommandId(Digest32([n; 32])),
+            provenance: coord_core::event::PeerProvenance::from_local_voter(
+                ReplicaId([1; 16]),
+                ReplicaIncarnation::new(1).expect("positive"),
+            ),
+            bytes: vec![n],
+            since,
+        };
+        let mut parked = std::collections::VecDeque::new();
+        assert_eq!(parked.next_deadline(), None, "nothing held, nothing due");
+        let later = t0 + std::time::Duration::from_millis(300);
+        parked.push_back(held(1, t0));
+        parked.push_back(held(2, later));
+        let due = t0 + PARKED_HOLD;
+        assert_eq!(parked.next_deadline(), Some(due), "due with the oldest");
+
+        // A turn before the deadline lets nothing go and leaves it.
+        let early = due - std::time::Duration::from_millis(1);
+        let (ready, unclaimed) = route_held(&mut parked, early, |_| None);
+        assert!(ready.is_empty());
+        assert_eq!(unclaimed, 0);
+        assert_eq!(parked.next_deadline(), Some(due));
+
+        // The turn the deadline wakes lets the oldest go, as unclaimed,
+        // and the deadline moves on to the next oldest -- in the future.
+        let (ready, unclaimed) = route_held(&mut parked, due, |_| None);
+        assert!(ready.is_empty());
+        assert_eq!(unclaimed, 1);
+        let next = parked.next_deadline().expect("one still held");
+        assert_eq!(next, later + PARKED_HOLD);
+        assert!(
+            next > due,
+            "a deadline in the past would wake the loop for ever"
+        );
+
+        // And once nothing is held nothing is due.
+        let (_, unclaimed) = route_held(&mut parked, next, |_| None);
+        assert_eq!(unclaimed, 1);
+        assert_eq!(parked.next_deadline(), None);
+    }
+
     /// The peer plane's priority is a budget, not a licence.
     ///
     /// Without the budget a busy domain keeps the peer plane ready on
@@ -2748,9 +2847,14 @@ mod tests {
         // interval. This is what lets a replica behind by more than one
         // batch catch up at a batch per round trip.
         assert!(ask_for_payloads_now(asked, 8, t0));
-        // More than eight, because an earlier ask's answers arrived
-        // late: still answered in full.
-        assert!(ask_for_payloads_now(asked, 12, t0));
+        // A late or duplicated answer -- to an ask the retry floor
+        // repeated, or one a later ask superseded -- never reaches the
+        // count: the machine counts only answers to the outstanding ask,
+        // each once (coord-consensus's
+        // `a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask`).
+        // So the count cannot pass the ask's own size, and a duplicate of
+        // the seventh answer is still seven.
+        assert!(!ask_for_payloads_now(asked, 7, t0));
         // Not answered, but the interval has passed: ask again, so a
         // batch the peer cannot answer does not stop the asking.
         assert!(ask_for_payloads_now(

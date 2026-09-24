@@ -740,6 +740,89 @@ fn payload_transfer_is_bounded_in_both_directions_and_still_covers_everything() 
     );
 }
 
+/// A payload answer counts only when it answers the outstanding ask, and
+/// once.
+///
+/// The count paces a replica catching up: its next ask goes the moment
+/// the last one was answered in full. Counted on arrival, a late or
+/// duplicated answer -- to an ask the retry floor repeated before the
+/// first answers landed, or to one a later ask superseded -- satisfied
+/// the next ask's threshold, so two asks were in flight instead of one
+/// and the bulk lane carried about twice what one ask puts on it. The
+/// late answers are still taken; they are only not counted.
+#[test]
+fn a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask() {
+    let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
+    let mut l = leader();
+    let mut f = follower(2);
+    let wanted = bound * 2;
+    for seq in 1..=wanted as u64 {
+        let (event, _) = admitted(seq, 1);
+        let effects = l.step(event);
+        for durable in durable_of(&effects) {
+            let released = l.step(durable);
+            for (to, message) in sends(&released) {
+                if to == r(2) && matches!(message, ProtocolMessage::Proposal(_)) {
+                    f.step(peer(0, message));
+                }
+            }
+        }
+    }
+    assert_eq!(f.missing_payloads().len(), wanted);
+    let answers = |l: &mut Leader, ask: &ProtocolMessage| {
+        sends(&l.step(peer(2, ask.clone())))
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect::<Vec<_>>()
+    };
+    let ask = |f: &mut Follower| {
+        let sent = sends(&f.request_payloads(r(0)));
+        assert_eq!(sent.len(), 1, "one request frame per ask");
+        sent[0].1.clone()
+    };
+
+    // Batch A is asked for, and before its answers land the retry floor
+    // asks again -- for batch B, the next part of the missing set.
+    let first = ask(&mut f);
+    let late = answers(&mut l, &first);
+    assert_eq!(late.len(), bound);
+    let second = ask(&mut f);
+    let ProtocolMessage::PayloadRequest { commands: b } = &second else {
+        panic!("not a payload request: {second:?}");
+    };
+    let current = answers(&mut l, &second);
+    assert_eq!(current.len(), b.len());
+
+    // A's answers arrive late. They are taken -- the payloads are no
+    // longer missing -- and they do not answer B.
+    for m in &late {
+        f.step(peer(0, m.clone()));
+    }
+    assert_eq!(f.missing_payloads().len(), wanted - bound);
+    assert_eq!(
+        f.payloads_answered(),
+        0,
+        "late answers to a superseded ask counted as answering the current one"
+    );
+
+    // B's own answers count, one each.
+    for m in &current {
+        f.step(peer(0, m.clone()));
+    }
+    assert_eq!(f.payloads_answered(), b.len() as u64);
+
+    // And duplicates of them -- the answers to a repeated ask -- do not
+    // count again.
+    for m in &current {
+        f.step(peer(0, m.clone()));
+    }
+    assert_eq!(
+        f.payloads_answered(),
+        b.len() as u64,
+        "a duplicated answer counted twice"
+    );
+}
+
 /// The two payload-transfer messages are recognized from the byte the
 /// encoder writes, and nothing else is.
 ///

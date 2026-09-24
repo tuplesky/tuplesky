@@ -214,7 +214,18 @@ pub struct Follower {
     /// and the missing count cannot say: under load it moves because
     /// new commands arrive by identity, whether or not anything came
     /// back. This only moves when a peer sent a payload.
+    ///
+    /// And only a payload that answers the outstanding ask: one named in
+    /// `payloads_asked` that this replica now holds. A delayed or
+    /// duplicated answer -- to an ask the retry floor already repeated,
+    /// or to one a later ask superseded -- is still taken if it is new,
+    /// but it does not count, so it cannot satisfy the next ask's
+    /// threshold and put a second batch on the lane while one is
+    /// outstanding.
     payloads_answered: u64,
+    /// The commands the outstanding payload ask named that have not been
+    /// answered yet. Each ask replaces it.
+    payloads_asked: alloc::collections::BTreeSet<CommandId>,
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
@@ -323,6 +334,7 @@ impl Follower {
             served_payloads: payloads.keys().copied().collect(),
             payload_cursor: 0,
             payloads_answered: 0,
+            payloads_asked: alloc::collections::BTreeSet::new(),
             payloads,
             durable_payloads: BTreeMap::new(),
             ledger,
@@ -419,6 +431,7 @@ impl Follower {
             served_payloads: state.served_payloads,
             payload_cursor: 0,
             payloads_answered: 0,
+            payloads_asked: alloc::collections::BTreeSet::new(),
             ledger: state.ledger,
             learner: state.learner,
             deferred: BTreeMap::new(),
@@ -1028,6 +1041,7 @@ impl Follower {
         if commands.is_empty() {
             return Vec::new();
         }
+        self.payloads_asked = commands.iter().copied().collect();
         // Payload transfer is not a voting transition: it is published
         // under the promised ballot so a promise for a higher ballot never
         // fences it (the candidate needs payloads to recover).
@@ -1048,7 +1062,8 @@ impl Follower {
         self.release()
     }
 
-    /// How many payload transfers a peer has answered this replica with.
+    /// How many payload transfers a peer has answered this replica with,
+    /// counting only answers to the outstanding ask, each once.
     pub const fn payloads_answered(&self) -> u64 {
         self.payloads_answered
     }
@@ -1725,8 +1740,14 @@ impl Follower {
                 self.serve_payloads(from.replica, &commands)
             }
             ProtocolMessage::PayloadResponse { command, payload } => {
-                self.payloads_answered = self.payloads_answered.saturating_add(1);
+                let asked = self.payloads_asked.contains(&command);
                 let mut out = self.on_payload(command, payload);
+                // Counted only as an answer to the outstanding ask, and
+                // once: see `payloads_answered`.
+                if asked && self.payloads.contains_key(&command) {
+                    self.payloads_asked.remove(&command);
+                    self.payloads_answered = self.payloads_answered.saturating_add(1);
+                }
                 if self.campaign.is_some() {
                     // A campaign waiting for this payload can bind now.
                     out.extend(self.advance_campaign());

@@ -2045,9 +2045,9 @@ traffic arrived -- and the request that woke it was ordered ahead of the
 expiry and read the key. The loop now also sleeps until the earliest
 deadline any component registers through a small `Deadline` trait
 (`next_deadline()`), and expiry registers its armed deadlines, its next
-scan while there is something new to observe, and its retries; the
-collector's re-offers and held-evidence expiry are meant to register the
-same way. Second, a candidate whose proposal never reached a quorum
+scan while there is something new to observe, and its retries; held
+evidence registers the same way, and the collector's re-offers are
+meant to. Second, a candidate whose proposal never reached a quorum
 stayed "in flight" for ever: the driver now presents any proposal that
 committed state has not shown resolving within a retry interval again.
 Third, presenting it again did nothing, because the leader refused a
@@ -2416,6 +2416,16 @@ other side. The floor is still there for the case the answer-driven rule
 cannot cover, which is part of a batch the peer does not hold durably
 yet and so will never send.
 
+The count first moved on *every* payload response, before the machine
+looked at it. On a link whose round trip exceeds the retry floor -- the
+WAN rows -- the floor re-asked before the first answers landed, the
+second ask's answers were all refused as already held and still counted,
+and they satisfied the next ask's threshold: two asks in flight instead
+of one. The follower now records the commands its outstanding ask named
+and counts a response only when it names one of them and the payload is
+then held, removing it as it counts, so a duplicate or an answer to a
+superseded ask is taken if it is new and never counted.
+
 Measured over five trials each, 1500 operations per trial through three
 frontends:
 
@@ -2537,6 +2547,14 @@ of room, and that every voter did release held evidence on the window,
 so a run where the hold has stopped expiring fails rather than passing
 on its way to the bound. A bound of 4 fails the first; a window of 600
 seconds fails the second.
+
+The window was first applied only when a turn happened to run, and on a
+voter that has gone quiet no turn runs: evidence parked just before the
+last submission sat past the hold, and `unclaimed` was not said, until
+unrelated traffic arrived. The held evidence now registers the oldest
+hold's end through the loop's `Deadline` mechanism, like lease expiry,
+so the loop takes a turn when it runs out and that turn lets the
+evidence go.
 
 **What it did not fix.** The fan-out. A submission a peer's lane cannot
 queue leaves that command on a bare quorum, and nothing says so beyond a
