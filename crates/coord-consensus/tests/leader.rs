@@ -593,12 +593,22 @@ fn a_higher_promise_stops_proposing_and_fences_unreleased_proposals() {
     assert!(released.is_empty());
     assert_eq!(leader.ballots().promised(), ballot(1, 2));
     let released = leader.step(durable(&effects1, 2).remove(0));
-    assert_eq!(released.len(), 1, "only the promise reply");
+    assert_eq!(
+        released.len(),
+        2,
+        "the promise reply and the report owed to the candidate"
+    );
     assert!(matches!(
         &released[0],
         Effect::SendWhenDurable { to, frame, .. }
             if to.replica == r(2)
                 && matches!(ProtocolMessage::decode(frame).unwrap(), ProtocolMessage::Promise { .. })
+    ));
+    assert!(matches!(
+        &released[1],
+        Effect::SendWhenDurable { to, frame, .. }
+            if to.replica == r(2)
+                && matches!(ProtocolMessage::decode(frame).unwrap(), ProtocolMessage::ReportPage(_))
     ));
     assert_eq!(leader.pending_sends(), 0);
     assert_eq!(
