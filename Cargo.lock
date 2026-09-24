@@ -178,6 +178,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-store-api"
+version = "0.1.0"
+dependencies = [
+ "coord-core",
+ "coord-types",
+ "postcard",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "coord-types"
 version = "0.1.0"
 dependencies = [
