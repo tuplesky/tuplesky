@@ -3,7 +3,9 @@
 use alloc::vec::Vec;
 
 use coord_core::effect::ApplyBase;
-use coord_types::ids::{ExecutionPosition, KvRevision, LeaseGeneration, LeaseId};
+use coord_types::ids::{
+    ExecutionPosition, KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::lease::LeaseRecord;
@@ -93,6 +95,34 @@ pub enum Outcome {
     ErrLeasePermission,
     /// Attachment count or deletion/event byte quota exceeded.
     ErrLeaseQuota,
+    /// A replicated renewal committed (Section 7.1): the new renewal
+    /// sequence is the anchor a scheduler rearms from.
+    LeaseKeptAlive {
+        /// Lease identity.
+        lease_id: LeaseId,
+        /// Ownership generation.
+        generation: LeaseGeneration,
+        /// Renewal sequence after this renewal.
+        renewal_sequence: u64,
+        /// Granted TTL in seconds.
+        ttl_seconds: u32,
+    },
+    /// A conditional expiration matched and deleted the attachments.
+    LeaseExpired {
+        /// Keys deleted.
+        deleted: u64,
+    },
+    /// A conditional expiration did not match (the lease was renewed,
+    /// revoked, already ended or never existed): nothing changed.
+    ExpireStale,
+    /// A new lease expiry authority epoch was established.
+    LeaseAuthorityEstablished {
+        /// The epoch now in force.
+        epoch: LeaseAuthorityEpoch,
+    },
+    /// The command carried an authority epoch that is not the current one
+    /// (a former leader's expiration, or a stale establishment).
+    ErrStaleAuthority,
 }
 
 /// Response to the client: header revision plus outcome.
@@ -168,6 +198,11 @@ pub enum Mutation {
         lease: LeaseId,
         /// Complete new record.
         record: LeaseRecord,
+    },
+    /// Establish the lease expiry authority epoch.
+    LeaseAuthority {
+        /// New epoch.
+        epoch: LeaseAuthorityEpoch,
     },
     /// Advance the MVCC retention floor.
     CompactTo {

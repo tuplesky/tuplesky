@@ -48,6 +48,9 @@
 //!   batch as the entries they govern, and [`views`] loads the lease
 //!   records a request names or its entries reference plus, for a
 //!   revocation, the reverse index and the entries it points at.
+//!   task-16 adds the `lease_authority` frontier row, the internal-command
+//!   view (`build_internal_view`) for conditional expiration and the
+//!   paginated `active_leases` listing a recovering scheduler arms from.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -68,8 +71,8 @@ pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};
 pub use retry::{Admission, Resolution, RetryBinding};
 pub use view::{GatedReader, GatedView, ViewError};
 pub use views::{
-    StoredEvent, ViewBudget, ViewBuildError, build_read_view, events_at, scan_current_page,
-    stored_events_at,
+    ActiveLeasePage, StoredEvent, ViewBudget, ViewBuildError, active_leases, active_leases_page,
+    build_internal_view, build_read_view, events_at, scan_current_page, stored_events_at,
 };
 pub use watch::{CloseReason, WatchBatch, WatchHub, WatchId, WatchItem, WatchSpec};
 pub use worker::{FlushOutcome, GroupLimits, StoreWorker, SubmitError, WorkerState};

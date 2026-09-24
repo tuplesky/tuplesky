@@ -238,6 +238,14 @@ checked_counter!(
     ReplicaIncarnation,
     max = u64::MAX
 );
+checked_counter!(
+    /// Replicated lease expiry authority epoch (Section 7.2): a recovered
+    /// leader establishes a new one before scheduling expiration, and a
+    /// conditional expiration from an older epoch is rejected. `ZERO` means
+    /// no authority has been established yet.
+    LeaseAuthorityEpoch,
+    max = u64::MAX
+);
 
 /// Ballot: leadership and the source-defined fast set, subordinate to an
 /// epoch. Ballots in different epochs are incomparable; ordering within an

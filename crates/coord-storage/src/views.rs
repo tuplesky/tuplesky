@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::ops::Bound;
 
-use coord_state::KvEvent;
+use coord_state::lease::{LeaseRecord, LeaseStatus};
 use coord_state::view::{HistoricalView, KvEntry, ReadView};
+use coord_state::{InternalCommand, KvEvent};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
 use coord_types::ids::{KvRevision, LeaseId, NamespaceId, PrincipalId};
@@ -220,6 +221,178 @@ fn history_bounds(namespace: &NamespaceId, touch: &Touch) -> (Vec<u8>, Bound<Vec
     }
 }
 
+/// Load the reverse index of `lease` in `namespace` and the current entries
+/// it points at into `read_view`.
+fn load_attachments<V: OrderedRead>(
+    view: &V,
+    namespace: NamespaceId,
+    lease: LeaseId,
+    read_view: &mut ReadView,
+    budget: &mut Budget,
+) -> Result<(), ViewBuildError> {
+    let prefix = codecs::lease_key_prefix(&lease, &namespace);
+    let upper = prefix_upper(&prefix);
+    let mut keys = BTreeSet::new();
+    for (row_key, _) in scan_all(view, Collection::LeaseKeysV1, prefix, upper, budget)? {
+        let (_, ns, key) = codecs::decode_lease_key_row(&row_key)?;
+        if ns != namespace {
+            continue;
+        }
+        if !read_view.current.contains_key(&key) {
+            let current = codecs::current_key(&namespace, &key);
+            if let Some(value) = view.get(Collection::KvCurrentV1.id(), &current)? {
+                budget.charge(1, current.len() + value.len())?;
+                read_view
+                    .current
+                    .insert(key.clone(), codecs::decode_current(&value)?);
+            }
+        }
+        keys.insert(key);
+    }
+    read_view.lease_keys.insert(lease, keys);
+    Ok(())
+}
+
+/// Load the records of `lease_ids` that exist into `read_view`.
+fn load_leases<V: OrderedRead>(
+    view: &V,
+    lease_ids: impl IntoIterator<Item = LeaseId>,
+    read_view: &mut ReadView,
+    budget: &mut Budget,
+) -> Result<(), ViewBuildError> {
+    for id in lease_ids {
+        let row = codecs::lease_row_key(&id);
+        if let Some(value) = view.get(Collection::LeaseV1.id(), &row)? {
+            budget.charge(1, row.len() + value.len())?;
+            read_view.leases.insert(id, codecs::decode_lease(&value)?);
+        }
+    }
+    Ok(())
+}
+
+/// Build the view an internal command needs: the authority epoch and, for
+/// an expiration, the lease record, its reverse index and the entries it
+/// points at.
+pub fn build_internal_view<V: OrderedRead>(
+    gated: &GatedView<V>,
+    command: &InternalCommand,
+    budget: ViewBudget,
+) -> Result<ReadView, ViewBuildError> {
+    let view = gated.view();
+    let mut budget = Budget {
+        rows: budget.max_rows,
+        bytes: budget.max_bytes,
+    };
+    let namespace = command.namespace();
+    let kv_revision = codecs::read_kv_revision(view)?;
+    let mut read_view = ReadView::empty(
+        gated.meta().frontier.as_base(),
+        namespace,
+        PrincipalId([0; 16]),
+        kv_revision,
+    );
+    read_view.compact_floor = codecs::read_retention_floor(view)?;
+    read_view.lease_authority = codecs::read_lease_authority(view)?;
+    if let Some(lease) = command.lease() {
+        load_attachments(view, namespace, lease, &mut read_view, &mut budget)?;
+        let mut ids: BTreeSet<LeaseId> = BTreeSet::from([lease]);
+        ids.extend(read_view.current.values().filter_map(|e| e.lease));
+        load_leases(view, ids, &mut read_view, &mut budget)?;
+    }
+    Ok(read_view)
+}
+
+/// One page of the active-lease recovery scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveLeasePage {
+    /// Active records found on this page, in lease id order.
+    pub leases: Vec<(LeaseId, LeaseRecord)>,
+    /// Last lease row examined (active or tombstone); pass it back as
+    /// `after` to continue. `None` when the collection is exhausted.
+    pub next: Option<LeaseId>,
+}
+
+/// One page of the active leases a recovering scheduler arms: every
+/// `lease_v1` row after `after`, in lease id order, examined within
+/// `budget`, keeping the active ones. Revoked and expired leases remain as
+/// tombstones and count against the budget, so a page may carry few or no
+/// active leases while still advancing; the caller continues from `next`
+/// until it is `None`. The budget bounds one page, never the recovery, so
+/// a lease table of any size is recovered in bounded steps.
+pub fn active_leases_page<V: OrderedRead>(
+    view: &V,
+    after: Option<LeaseId>,
+    budget: ViewBudget,
+) -> Result<ActiveLeasePage, ViewBuildError> {
+    let mut budget = Budget {
+        rows: budget.max_rows,
+        bytes: budget.max_bytes,
+    };
+    let mut request = ScanRequest {
+        lower: Bound::Unbounded,
+        upper: Bound::Unbounded,
+        direction: Direction::Forward,
+        resume_after: after.map(|id| codecs::lease_row_key(&id)),
+        max_rows: NonZeroU32::new(256).expect("nonzero"),
+        max_bytes: NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?,
+    };
+    let mut leases = Vec::new();
+    let mut last: Option<LeaseId> = None;
+    loop {
+        request.max_rows =
+            NonZeroU32::new(budget.rows.min(256)).ok_or(ViewBuildError::BudgetExceeded)?;
+        request.max_bytes = NonZeroU32::new(budget.bytes).ok_or(ViewBuildError::BudgetExceeded)?;
+        let page = view.scan_page(Collection::LeaseV1.id(), &request)?;
+        for row in &page.rows {
+            if budget.charge(1, row.key.len() + row.value.len()).is_err() {
+                // The page is full: stop before this row, which the next
+                // page examines first.
+                return match last {
+                    Some(_) => Ok(ActiveLeasePage { leases, next: last }),
+                    None => Err(ViewBuildError::BudgetExceeded),
+                };
+            }
+            let id = LeaseId::from_slice(&row.key)
+                .map_err(|_| EngineError::new(ErrorClass::Corrupt, "lease row key"))?;
+            let record = codecs::decode_lease(&row.value)?;
+            if record.status == LeaseStatus::Active {
+                leases.push((id, record));
+            }
+            last = Some(id);
+        }
+        if page.exhausted {
+            return Ok(ActiveLeasePage { leases, next: None });
+        }
+        if budget.rows == 0 || budget.bytes == 0 {
+            return match last {
+                Some(_) => Ok(ActiveLeasePage { leases, next: last }),
+                None => Err(ViewBuildError::BudgetExceeded),
+            };
+        }
+        request.resume_after = last.map(|id| codecs::lease_row_key(&id));
+    }
+}
+
+/// Every active lease record (what a recovering scheduler arms), in lease
+/// id order, collected page by page with `budget` bounding each page (see
+/// [`active_leases_page`]). The result holds only the active records; the
+/// tombstones the scan passes over are not retained.
+pub fn active_leases<V: OrderedRead>(
+    view: &V,
+    budget: ViewBudget,
+) -> Result<Vec<(LeaseId, LeaseRecord)>, ViewBuildError> {
+    let mut out = Vec::new();
+    let mut after = None;
+    loop {
+        let page = active_leases_page(view, after, budget)?;
+        out.extend(page.leases);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(out),
+        }
+    }
+}
+
 /// Build the owned view a request needs from a gated snapshot.
 ///
 /// Current entries cover every touched key/interval. When the request reads
@@ -251,6 +424,7 @@ pub fn build_read_view<V: OrderedRead>(
         kv_revision,
     );
     read_view.compact_floor = compact_floor;
+    read_view.lease_authority = codecs::read_lease_authority(view)?;
     let touched = touches(&request.operation);
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     for touch in &touched {
@@ -272,37 +446,12 @@ pub fn build_read_view<V: OrderedRead>(
     // Attached keys of a lease the request revokes or lists, and their
     // current entries (so a revocation deletes exactly what is attached).
     if let Some(lease) = needs_attachments(&request.operation) {
-        let prefix = codecs::lease_key_prefix(&lease, &namespace);
-        let upper = prefix_upper(&prefix);
-        let mut keys = BTreeSet::new();
-        for (row_key, _) in scan_all(view, Collection::LeaseKeysV1, prefix, upper, &mut budget)? {
-            let (_, ns, key) = codecs::decode_lease_key_row(&row_key)?;
-            if ns != namespace {
-                continue;
-            }
-            if !read_view.current.contains_key(&key) {
-                let current = codecs::current_key(&namespace, &key);
-                if let Some(value) = view.get(Collection::KvCurrentV1.id(), &current)? {
-                    budget.charge(1, current.len() + value.len())?;
-                    read_view
-                        .current
-                        .insert(key.clone(), codecs::decode_current(&value)?);
-                }
-            }
-            keys.insert(key);
-        }
-        read_view.lease_keys.insert(lease, keys);
+        load_attachments(view, namespace, lease, &mut read_view, &mut budget)?;
     }
     // Lease records: named by the request or referenced by loaded entries.
     let mut lease_ids: BTreeSet<LeaseId> = named_leases(&request.operation).into_iter().collect();
     lease_ids.extend(read_view.current.values().filter_map(|e| e.lease));
-    for id in lease_ids {
-        let row = codecs::lease_row_key(&id);
-        if let Some(value) = view.get(Collection::LeaseV1.id(), &row)? {
-            budget.charge(1, row.len() + value.len())?;
-            read_view.leases.insert(id, codecs::decode_lease(&value)?);
-        }
-    }
+    load_leases(view, lease_ids, &mut read_view, &mut budget)?;
     // One historical snapshot per explicit revision the request reads, top
     // level or inside a transaction branch, covering every range that reads
     // that revision. Revisions outside the retained window get no snapshot:
