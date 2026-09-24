@@ -1035,3 +1035,37 @@ fn a_mapping_that_keeps_its_key_keeps_its_shard() {
     let (_, mappings) = reopened.mappings().unwrap();
     assert_eq!(mappings, vec![carried], "only the generation moved");
 }
+
+#[test]
+fn a_carried_stream_opens_before_its_new_generation_has_written() {
+    // An authorized replacement carries the stream forward and only then
+    // appends under the new generation. A node that stops in between has a
+    // mapping at the new generation over a head the old one wrote, and the
+    // open check required the two to be equal, so the journal refused to
+    // open at all. A head past the mapping is still refused.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (mut journal, allocator, mut streams) = create(&root, Arc::new(DefaultFileSystem), &[1]);
+    let records = streams[0].next(vec![transition(1, 16)]);
+    journal
+        .append_group(&group(vec![(barrier(1), streams[0].id, records)]))
+        .unwrap();
+    let mapping = *allocator.usable(streams[0].id).unwrap();
+    let carried = StreamMappingV1 {
+        key: StreamKey {
+            incarnation: ReplicaIncarnation::new(2).unwrap(),
+            ..mapping.key
+        },
+        ..mapping
+    };
+    journal
+        .persist_mapping(allocator.high_water(), &carried)
+        .expect("an authorized replacement carries the stream forward");
+    drop(journal);
+
+    let reopened = RaftEngineJournal::open_existing(&root, identity(), &options())
+        .expect("a carried stream whose new generation has not written yet opens");
+    let (_, mappings) = reopened.mappings().unwrap();
+    assert_eq!(mappings, vec![carried]);
+    assert_eq!(read_all(&reopened, streams[0].id).len(), 2);
+}

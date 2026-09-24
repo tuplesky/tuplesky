@@ -314,6 +314,15 @@ const OPEN_VERIFY_BYTES: usize = 8 * 1024 * 1024;
 /// vouch for the head, and appends would extend a broken chain. The first
 /// retained entry's predecessor is taken from the entry itself unless it is
 /// the genesis position, because the record it names has been retired.
+///
+/// `origin.incarnation` is the generation the stream's mapping serves now,
+/// and it bounds the records from above rather than naming each one's
+/// generation: an authorized replacement carries a stream forward
+/// (task-58), so its prefix keeps the generation that wrote it and the
+/// records after the adoption carry the new one -- and a node that stops
+/// before the new generation appends anything comes back to a stream
+/// written entirely under the old one. The generation still never
+/// decreases along the stream and never exceeds the mapping's.
 fn verify_retained<F: FileSystem>(
     engine: &Engine<F>,
     region: u64,
@@ -342,10 +351,13 @@ fn verify_retained<F: FileSystem>(
             return Err(corrupt(format!("entry {begin} missing")));
         }
         for record in &records {
-            let current = match expect {
+            let mut current = match expect {
                 Some(e) => e,
                 None => RecordExpectation {
-                    origin,
+                    origin: RecordOrigin {
+                        incarnation: record.origin().incarnation.min(origin.incarnation),
+                        ..origin
+                    },
                     seq: LocalJournalSeq::new(begin)
                         .map_err(|_| corrupt("first index".to_owned()))?,
                     predecessor: if begin == 1 {
@@ -355,6 +367,10 @@ fn verify_retained<F: FileSystem>(
                     },
                 },
             };
+            let written_at = record.origin().incarnation;
+            if written_at >= current.origin.incarnation && written_at <= origin.incarnation {
+                current.origin.incarnation = written_at;
+            }
             record
                 .verify(&current)
                 .map_err(|e| corrupt(format!("retained record: {e}")))?;

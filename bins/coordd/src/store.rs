@@ -157,6 +157,9 @@ pub fn open(
                     reason: format!("{other:?}"),
                 },
             })?;
+            // The journal's stream has already been carried forward by
+            // `open_storage`, before this advances the manifest; see there
+            // for why that order is the one a crash can be recovered from.
             if let Some(previous) = adopted {
                 // On stdout, with the rest of the startup report: an
                 // adoption is a durable, one-way step and the operator
@@ -222,19 +225,18 @@ pub struct Storage {
 /// while it is still only this node's store and not yet the journal's
 /// materialization.
 pub struct Opened {
-    journal: RaftEngineJournal,
+    /// The journal-first coordinator, open over the journal with nothing
+    /// attached to it yet (and, for an authorized replacement, this
+    /// node's stream already carried forward).
+    store: JournaledStore<RaftEngineJournal, RedbEngine>,
     journal_root: PathBuf,
     /// The projection's generation, matched to this node's identity.
     pub generation: Generation,
-    cluster: ClusterId,
     domain_id: DomainId,
     replica: ReplicaId,
-    incarnation: ReplicaIncarnation,
+    boot: BootId,
     /// Where this node's local recovery checkpoints are published.
     checkpoint_root: PathBuf,
-    /// The incarnation whose durable state this start adopted, if an
-    /// authorized replacement is coming back on it (task-58).
-    adopted: Option<ReplicaIncarnation>,
 }
 
 /// Open the journal and the projection, for `intent`.
@@ -297,18 +299,77 @@ pub fn open_storage(
         },
     })?;
 
-    let (generation, adopted) = open(config, intent, cluster, domain_id, replica, incarnation)?;
-    let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
-    Ok(Opened {
+    let boot = BootId(boot_of(replica, incarnation));
+    let mut store = JournaledStore::open(
         journal,
-        journal_root,
-        generation,
         cluster,
-        domain_id,
         replica,
         incarnation,
+        boot,
+        JournalLimits::default(),
+    )
+    .map_err(|e| StoreError::Refused {
+        root: show(&journal_root),
+        reason: format!("{e:?}"),
+    })?;
+
+    // An authorized replacement carries this node's stream forward with
+    // the rest of its durable state (task-58). The stream is keyed by
+    // the incarnation that allocated it, so a replaced node would
+    // otherwise attach to a fresh stream whose durable head is zero
+    // while its projection is materialized far past that -- the shape
+    // of a lost prefix, which `attach` refuses. Its records each carry
+    // the incarnation that wrote them, so nothing about provenance is
+    // blurred by keeping the stream.
+    //
+    // It is carried *before* the projection's manifest is advanced, and
+    // that order is the whole of crash safety here. The generation to
+    // carry from is recorded only in the manifest, and advancing the
+    // manifest overwrites it: stream-then-manifest leaves, after a crash
+    // between them, a manifest still behind, so the next start reads the
+    // same generation and finishes (carrying the stream again is a no-op
+    // once it is this incarnation's). Manifest-then-stream left a
+    // manifest that had moved and a stream that had not, which the next
+    // start could not tell from a fresh node, and quarantined.
+    if intent == Intent::Serve {
+        let root = config.state.root_path(&config.state_directory);
+        let projection = StoreIdentity {
+            cluster_id: cluster,
+            domain_id,
+            replica_id: replica,
+            incarnation,
+        };
+        let pending = Generation::adoption_pending(&root, projection).map_err(|e| match e {
+            OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
+                StoreError::NotInitialized { root: show(&root) }
+            }
+            other => StoreError::Refused {
+                root: show(&root),
+                reason: format!("{other:?}"),
+            },
+        })?;
+        if let Some(previous) = pending {
+            store
+                .adopt_stream(domain_id, previous)
+                .map_err(|e| StoreError::Refused {
+                    root: show(&journal_root),
+                    reason: format!(
+                        "this node's journal stream could not be carried forward: {e:?}"
+                    ),
+                })?;
+        }
+    }
+
+    let (generation, _adopted) = open(config, intent, cluster, domain_id, replica, incarnation)?;
+    let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
+    Ok(Opened {
+        store,
+        journal_root,
+        generation,
+        domain_id,
+        replica,
+        boot,
         checkpoint_root,
-        adopted,
     })
 }
 
@@ -322,32 +383,17 @@ impl Opened {
     /// already acknowledged.
     pub fn attach(self) -> Result<Storage, StoreError> {
         let Opened {
-            journal,
+            mut store,
             journal_root,
             generation,
-            cluster,
             domain_id,
             replica,
-            incarnation,
+            boot,
             checkpoint_root,
-            adopted,
         } = self;
         let directory = generation.directory().to_path_buf();
         let (engine, _lock, _manifest) = generation.into_parts();
 
-        let boot = BootId(boot_of(replica, incarnation));
-        let mut store = JournaledStore::open(
-            journal,
-            cluster,
-            replica,
-            incarnation,
-            boot,
-            JournalLimits::default(),
-        )
-        .map_err(|e| StoreError::Refused {
-            root: show(&journal_root),
-            reason: format!("{e:?}"),
-        })?;
         // The local checkpoint directory, and what the journal says the
         // baseline is. Both are read before the domain is attached: the
         // baseline is a fact of the stream, not of the projection, and an
@@ -371,25 +417,6 @@ impl Opened {
                 root: show(&checkpoint_root),
                 reason: format!("{e}"),
             })?;
-        }
-
-        // An authorized replacement carries this node's stream forward with
-        // the rest of its durable state (task-58). The stream is keyed by
-        // the incarnation that allocated it, so a replaced node would
-        // otherwise attach to a fresh stream whose durable head is zero
-        // while its projection is materialized far past that -- the shape
-        // of a lost prefix, which `attach` refuses. Its records each carry
-        // the incarnation that wrote them, so nothing about provenance is
-        // blurred by keeping the stream.
-        if let Some(previous) = adopted {
-            store
-                .adopt_stream(domain_id, previous)
-                .map_err(|e| StoreError::Refused {
-                    root: show(&journal_root),
-                    reason: format!(
-                        "this node's journal stream could not be carried forward: {e:?}"
-                    ),
-                })?;
         }
 
         // Shard 0 for the single-domain preview; task-j07 is where a node

@@ -59,6 +59,16 @@ impl PeerBinder {
     /// A membership of another cluster or domain is not a handoff of
     /// this one and is refused: the binder's origin is fixed by the
     /// genesis it started from.
+    ///
+    /// It governs the handshakes that follow and nothing already bound.
+    /// A connection is bound once, at its handshake, and its deadline is
+    /// fixed then from its own leaf's `notAfter` and the age cap; this
+    /// holds no connection and ends none, so a peer bound under a key the
+    /// new membership replaces keeps its session until that deadline,
+    /// not until the rotation overlap (`RenewalPolicy::retire_at`) ends.
+    /// Nothing in production calls this yet: re-arming or disconnecting
+    /// such a peer belongs with the caller that installs memberships into
+    /// a running node, the membership-activation task (task-m03).
     pub fn install(&self, membership: Membership) -> bool {
         if membership.cluster() != self.cluster || membership.domain() != self.domain {
             return false;

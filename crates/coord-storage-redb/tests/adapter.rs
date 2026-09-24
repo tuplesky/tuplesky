@@ -447,6 +447,15 @@ fn an_authorized_replacement_adopts_the_state_and_a_stale_one_is_fenced() {
         Generation::open_existing(dir.path(), replaced, options()),
         Err(OpenError::IdentityMismatch("incarnation"))
     ));
+    // What would be adopted is readable without adopting it, and reading
+    // it writes nothing: the journal's stream is carried from it first,
+    // so a crash before the manifest moves reads the same answer again.
+    for _ in 0..2 {
+        assert_eq!(
+            Generation::adoption_pending(dir.path(), replaced).unwrap(),
+            Some(ReplicaIncarnation::new(1).unwrap())
+        );
+    }
     assert_eq!(
         Generation::adopt(dir.path(), replaced).unwrap(),
         Some(ReplicaIncarnation::new(1).unwrap()),
@@ -454,6 +463,10 @@ fn an_authorized_replacement_adopts_the_state_and_a_stale_one_is_fenced() {
     );
     // Idempotent: a restart after an adoption adopts nothing further.
     assert_eq!(Generation::adopt(dir.path(), replaced).unwrap(), None);
+    assert_eq!(
+        Generation::adoption_pending(dir.path(), replaced).unwrap(),
+        None
+    );
 
     // And the state is the node's own, not a fresh root.
     let mut generation = Generation::open_existing(dir.path(), replaced, options()).unwrap();

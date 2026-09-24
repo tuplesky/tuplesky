@@ -341,7 +341,11 @@ impl Generation {
     /// a way to acquire a generation by asserting a number.
     ///
     /// Only the manifest is written, and it is written atomically, so
-    /// adoption is one step with nothing to interrupt halfway. The
+    /// this half of adoption is one step with nothing to interrupt
+    /// halfway. It is not the whole of a node's adoption: the journal's
+    /// stream is the other half, and it has to be carried forward
+    /// *before* this runs (see [`Generation::adoption_pending`]), since
+    /// this overwrites the generation it would be carried from. The
     /// projection database is deliberately untouched: a write here
     /// would commit whatever the last run left uncommitted in it, and
     /// the journal-first invariant is that the materialized frontier
@@ -359,6 +363,49 @@ impl Generation {
         identity: StoreIdentity,
     ) -> Result<Option<ReplicaIncarnation>, OpenError> {
         let _lock = RootLock::acquire(root, false)?;
+        let (directory, manifest) = Self::stamped(root, &identity)?;
+        if manifest.incarnation == identity.incarnation {
+            return Ok(None);
+        }
+        let previous = manifest.incarnation;
+        let adopted = StoreManifestV1 {
+            incarnation: identity.incarnation,
+            ..manifest
+        };
+        adopted.write(&directory.join(MANIFEST))?;
+        Ok(Some(previous))
+    }
+
+    /// What [`Generation::adopt`] would adopt from, without adopting it:
+    /// the generation the root is stamped with where it is behind
+    /// `identity`, `None` where it is already `identity`'s, and the same
+    /// refusals.
+    ///
+    /// Adoption is two durable steps in two places -- this manifest and
+    /// the journal's stream mapping -- and the order is what makes a
+    /// crash between them recoverable. The stream has to be carried
+    /// forward first, and carrying it needs the generation it is carried
+    /// *from*, which only the manifest records and which advancing the
+    /// manifest overwrites. So the caller reads it here, carries the
+    /// stream (idempotent once done), and only then adopts: a crash in
+    /// between leaves the manifest behind, and the next start reads the
+    /// same answer and finishes.
+    pub fn adoption_pending(
+        root: &Path,
+        identity: StoreIdentity,
+    ) -> Result<Option<ReplicaIncarnation>, OpenError> {
+        let _lock = RootLock::acquire(root, false)?;
+        let (_, manifest) = Self::stamped(root, &identity)?;
+        Ok((manifest.incarnation < identity.incarnation).then_some(manifest.incarnation))
+    }
+
+    /// The selected generation's directory and manifest, checked as
+    /// belonging to `identity`'s replica at a generation no later than
+    /// its own. The caller holds the root lock.
+    fn stamped(
+        root: &Path,
+        identity: &StoreIdentity,
+    ) -> Result<(PathBuf, StoreManifestV1), OpenError> {
         let current = match std::fs::read(root.join(CURRENT)) {
             Ok(bytes) => String::from_utf8(bytes)
                 .map_err(|_| OpenError::Corrupt("CURRENT is not UTF-8".into()))?,
@@ -390,16 +437,7 @@ impl Generation {
         if manifest.incarnation > identity.incarnation {
             return Err(OpenError::IdentityMismatch("incarnation"));
         }
-        if manifest.incarnation == identity.incarnation {
-            return Ok(None);
-        }
-        let previous = manifest.incarnation;
-        let adopted = StoreManifestV1 {
-            incarnation: identity.incarnation,
-            ..manifest
-        };
-        adopted.write(&directory.join(MANIFEST))?;
-        Ok(Some(previous))
+        Ok((directory, manifest))
     }
 
     /// The engine.

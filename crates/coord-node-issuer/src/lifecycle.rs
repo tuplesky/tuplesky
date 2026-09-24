@@ -30,6 +30,14 @@
 //! generation and key, and a generation or key change is a committed
 //! configuration transition -- `coord_membership::Membership` says which
 //! is which.
+//!
+//! This is the arithmetic, not a driver. On this branch the serving
+//! daemon consults it only through `coordd inspect`: nothing in a running
+//! node sleeps until [`Renewal::Wait`], enrolls at the issuer when due, or
+//! reloads its endpoint identity, so a node is renewed by restarting it on
+//! a renewed leaf. It fails safe -- at `notAfter` its peers close its warm
+//! connections and its own handshakes fail -- and the plan entry for
+//! task-58 records the driver as not yet owned.
 
 /// One issued leaf, as the holder sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

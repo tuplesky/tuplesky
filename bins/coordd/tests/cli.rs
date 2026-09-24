@@ -3118,6 +3118,77 @@ fn genesis_of_incarnation(dir: &Path, voter_one_key: &[u8], incarnation: u64) {
     .expect("write manifest");
 }
 
+/// A replacement interrupted between its two durable steps finishes on
+/// the next start instead of quarantining the node.
+///
+/// Adoption carries the journal's stream forward and advances the
+/// projection's manifest, and the generation to carry the stream from is
+/// recorded only in the manifest. With the manifest advanced first, any
+/// failure before the stream was carried -- here, a checkpoint directory
+/// that cannot be opened -- left a manifest that had moved and a stream
+/// that had not; the next start had nothing to carry from, allocated a
+/// fresh stream, and refused the projection as materialized past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_start() {
+    let dir = workspace("replace-interrupted");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    checkpoint_after(&path, 1);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x59; 16]).await;
+        let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+        response_of(&answer)
+    };
+
+    let (next, key) = ca.issue_at(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+        2,
+    );
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
+    write_key(&dir.join("node.key"), &key.serialize_der());
+    genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+
+    // The replacement's first start stops partway: something that is not
+    // a directory where its checkpoints are, which it finds after the
+    // adoption has begun.
+    let checkpoints = dir.join("checkpoints");
+    let aside = dir.join("checkpoints.aside");
+    std::fs::rename(&checkpoints, &aside).expect("move the checkpoints aside");
+    std::fs::write(&checkpoints, b"not a directory").expect("obstruct");
+    let stopped = run(&path, &[]);
+    assert_eq!(stopped.code, Some(2), "{}{}", stopped.out, stopped.err);
+    assert!(
+        stopped.err.contains("checkpoint directory"),
+        "the start did not stop where this test stops it: {}",
+        stopped.err
+    );
+
+    // The next start finishes the adoption and serves the same answer.
+    std::fs::remove_file(&checkpoints).expect("clear");
+    std::fs::rename(&aside, &checkpoints).expect("restore the checkpoints");
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x59; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the finished replacement did not serve\n{}", daemon.said()));
+    let again = response_of(&answer);
+    assert_eq!(again.command_id, first.command_id);
+    assert_eq!(
+        again.outcome, first.outcome,
+        "an interrupted replacement came back on other state"
+    );
+}
+
 /// An authorized key replacement keeps this node's durable state, and a
 /// disk that was left behind by one does not come back (task-58; design
 /// Sections 10.4, 20.4).
