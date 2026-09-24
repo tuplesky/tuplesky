@@ -36,7 +36,7 @@ use coord_types::{CommandId, RetryKey};
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::campaign::Campaign;
 use crate::commands::{CommandRecord, CommandTable, InitError};
-use crate::learner::{AppliedOutcome, LearnError, Learner};
+use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::ProtocolMessage;
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -315,7 +315,7 @@ impl Follower {
             self.table.restore_executed(&c);
             self.adopted.entry(c).or_insert((u64::MAX, true));
         }
-        self.learner = Learner::new(through);
+        self.learner = Learner::with_mode(through, self.learner.mode());
         self
     }
 
@@ -810,6 +810,16 @@ impl Follower {
             }
             for command in ready {
                 let entry = self.sync_pending.remove(&command).expect("ready");
+                // Installing the selection means installing its whole
+                // evidence, not only the combined digest: the per-key
+                // logs are realigned to the selected order first, so a
+                // later command derives its dependencies from the chosen
+                // tail rather than this replica's pre-accept one. The
+                // realignment is idempotent and monotone in the sequence
+                // number, so it also runs for a record already committed
+                // here, whose dependencies are then left alone.
+                self.table
+                    .record_leader_path(command, entry.seqnum, &entry.paths);
                 // The selected order replaces a local one that is merely
                 // accepted: an ACCEPT record from a lower synchronized
                 // ballot may legally disagree with the chosen entry, and
@@ -817,7 +827,10 @@ impl Follower {
                 // graph than the replicas that installed the selection.
                 // Committed and executed records keep their dependencies.
                 if self.table.phase_of(&command) < Some(Phase::Commit)
-                    && self.table.accept(command, entry.deps.clone()).is_err()
+                    && self
+                        .table
+                        .adopt(command, entry.deps.clone(), Some(&entry.paths), entry.path)
+                        .is_err()
                 {
                     continue;
                 }
@@ -932,7 +945,18 @@ impl Follower {
     }
 
     fn learn(&mut self) {
-        Learner::commit_learned(&mut self.table, &self.votes);
+        self.learner.commit_learned(&mut self.table, &self.votes);
+    }
+
+    /// Choose the learning predicates (full, or the forced slow path for
+    /// comparison runs); carried across role changes and restarts.
+    pub const fn set_learning(&mut self, mode: LearningMode) {
+        self.learner.set_mode(mode);
+    }
+
+    /// The learning mode in effect.
+    pub const fn learning(&self) -> LearningMode {
+        self.learner.mode()
     }
 
     /// A fresh follower with nothing durable.
@@ -1231,7 +1255,12 @@ impl Follower {
                 if self.table.phase_of(&command) < Some(Phase::Commit)
                     && self
                         .table
-                        .accept(command, held.proposal.deps.clone())
+                        .adopt(
+                            command,
+                            held.proposal.deps.clone(),
+                            Some(&held.proposal.paths),
+                            held.proposal.path,
+                        )
                         .is_err()
                 {
                     continue;

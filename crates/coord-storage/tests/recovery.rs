@@ -28,7 +28,7 @@ use std::sync::Arc;
 use coord_consensus::rows::{dependency_update, payload_update};
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader,
-    LeaderConfig, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole, SyncDecision,
+    LeaderConfig, LearningMode, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole, SyncDecision,
 };
 use coord_consensus::{CONSERVATIVE_KEY, CommandRecord};
 use coord_core::capability::{AdmissionReceipt, EstablishedResult, VerifierToken};
@@ -233,7 +233,7 @@ fn bootstrap_updates() -> Vec<coord_core::effect::StoreUpdate> {
     updates
 }
 
-fn fresh_node(me: usize) -> Node {
+fn fresh_node(me: usize, learning: LearningMode) -> Node {
     let (backend, shared) = FaultBackend::new(Vec::new(), FaultPlan::default());
     let engine = RedbEngine::create_on_backend(backend, CACHE).unwrap();
     let boot = boot_id(me, 1);
@@ -279,6 +279,11 @@ fn fresh_node(me: usize) -> Node {
             executed_through,
         ))
     };
+    let mut role = role;
+    match &mut role {
+        Role::Leader(m) => m.set_learning(learning),
+        Role::Follower(m) => m.set_learning(learning),
+    }
     let mut node = Node {
         role: Some(role),
         applier: Some(applier),
@@ -321,6 +326,10 @@ struct Cluster {
     cut: Vec<(u8, u8)>,
     /// Sync frames between these pairs are dropped (everything else flows).
     drop_sync: Vec<(u8, u8)>,
+    /// Leader proposals between these pairs are dropped (acknowledgements
+    /// still flow: the leader may learn fast while no follower adopts).
+    drop_proposals: Vec<(u8, u8)>,
+    learning: LearningMode,
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
     crash_point: Option<CrashPoint>,
     /// Crash points that fired.
@@ -333,11 +342,17 @@ struct Cluster {
 
 impl Cluster {
     fn new(seed: u64) -> Self {
+        Self::new_with(seed, LearningMode::Full)
+    }
+
+    fn new_with(seed: u64, learning: LearningMode) -> Self {
         Cluster {
-            nodes: (0..3).map(fresh_node).collect(),
+            nodes: (0..3).map(|me| fresh_node(me, learning)).collect(),
             seed,
             cut: Vec::new(),
             drop_sync: Vec::new(),
+            drop_proposals: Vec::new(),
+            learning,
             frontend: Vec::new(),
             crash_point: None,
             fired: Vec::new(),
@@ -419,6 +434,14 @@ impl Cluster {
                         && matches!(
                             ProtocolMessage::decode(&frame).unwrap(),
                             ProtocolMessage::Sync(_)
+                        )
+                    {
+                        continue;
+                    }
+                    if self.drop_proposals.contains(&(i as u8, dest))
+                        && matches!(
+                            ProtocolMessage::decode(&frame).unwrap(),
+                            ProtocolMessage::Proposal(_)
                         )
                     {
                         continue;
@@ -538,6 +561,13 @@ impl Cluster {
 
     /// The frontend admits a request to every live node.
     fn admit(&mut self, seq: u64, op: CanonicalOperation) -> CommandId {
+        let all: Vec<usize> = (0..self.nodes.len()).collect();
+        self.admit_to(seq, op, &all)
+    }
+
+    /// The frontend admits a request to the given live nodes (a partial
+    /// fan-out, or a fan-out whose arrival order differs per node).
+    fn admit_to(&mut self, seq: u64, op: CanonicalOperation, nodes: &[usize]) -> CommandId {
         let mut request = LogicalRequest::new(NS, op.clone());
         request.canonicalize();
         let key = retry_key(seq);
@@ -551,7 +581,7 @@ impl Cluster {
                 .invoke(seq as u32, 1, self.tick, Some(seq), op.clone());
             self.ops.push((seq, op, command));
         }
-        for i in 0..self.nodes.len() {
+        for &i in nodes {
             if !self.nodes[i].alive {
                 continue;
             }
@@ -626,6 +656,7 @@ impl Cluster {
         )
         .restore_execution(frontier, executed)
         .restore_payloads(recovered.payloads.clone());
+        f.set_learning(self.learning);
         f.step(Event::Boot {
             boot_id: boot,
             incarnation: inc(),
@@ -1391,6 +1422,114 @@ fn follower_restarts_at_every_persist_boundary_reproduce_the_acknowledged_outcom
         }
     }
     assert_eq!(covered as u64, total * 2);
+}
+
+#[test]
+fn forced_slow_and_fast_learning_yield_equal_results() {
+    let run = |mode: LearningMode| {
+        let mut cluster = Cluster::new_with(11, mode);
+        for (seq, op) in base_history() {
+            cluster.admit(seq, op);
+            cluster.settle();
+        }
+        cluster.admit(7, put(b"a", b"7"));
+        cluster.settle();
+        cluster.observe(0);
+        let fast = cluster.nodes[0]
+            .established
+            .iter()
+            .filter(|e| e.fast_path())
+            .count();
+        for i in 1..3 {
+            assert_eq!(cluster.nodes[i].executed, cluster.nodes[0].executed);
+            assert_eq!(cluster.rows(i), cluster.rows(0));
+        }
+        (
+            cluster.nodes[0].executed.clone(),
+            cluster.rows(0),
+            cluster.retry_records(0),
+            acknowledged(&cluster.nodes[0]),
+            fast,
+            check_history(&cluster.history).ok(),
+        )
+    };
+    let slow = run(LearningMode::SlowOnly);
+    let full = run(LearningMode::Full);
+    assert_eq!(slow.0, full.0, "same order");
+    assert_eq!(slow.1, full.1, "same rows");
+    assert_eq!(slow.2, full.2, "same retained results and digests");
+    assert_eq!(slow.3, full.3, "same established positions and digests");
+    assert_eq!(
+        slow.4, 0,
+        "the forced slow path never reports fast learning"
+    );
+    assert!(full.4 > 0, "full learning took the fast path at least once");
+    assert!(slow.5 && full.5);
+}
+
+#[test]
+fn a_fast_result_followed_by_a_leader_crash_before_commit_propagation_recovers_the_same_outcome() {
+    for seed in [3u64, 5, 8, 13] {
+        let mut cluster = Cluster::new_with(seed, LearningMode::Full);
+        // The leader's proposals never leave it: no follower adopts its
+        // order, and the fast-set member r1 acknowledges with the same
+        // path evidence the leader computed.
+        cluster.drop_proposals = vec![(0, 1), (0, 2)];
+        // r2 sees the two conflicting writes in the opposite order.
+        let c1 = cluster.admit_to(1, put(b"a", b"1"), &[0, 1]);
+        let c2 = cluster.admit_to(2, put(b"a", b"2"), &[0, 1, 2]);
+        cluster.admit_to(1, put(b"a", b"1"), &[2]);
+        cluster.settle();
+        assert_eq!(cluster.nodes[0].executed, vec![c1, c2], "seed {seed}");
+        assert!(
+            cluster.nodes[0].established.iter().all(|e| e.fast_path()),
+            "seed {seed}: both replied on the fast path"
+        );
+        assert!(cluster.nodes[1].executed.is_empty());
+        assert!(cluster.nodes[2].executed.is_empty());
+        let acked = acknowledged(&cluster.nodes[0]);
+        cluster.observe(0);
+        // The leader is lost before any COMMIT could propagate. Recovery
+        // from r1's pre-accepted order (r2's own differs) reproduces the
+        // leader's order and results.
+        cluster.crash(0, Tail::None);
+        cluster.drop_proposals.clear();
+        cluster.campaign(2, ballot(1, 2));
+        cluster.settle();
+        assert_eq!(cluster.leaders(), vec![2], "seed {seed}");
+        let decision = cluster.recovered(2).syncs[0].1.clone();
+        assert_eq!(decision.entries[&c1].deps, vec![], "seed {seed}");
+        assert_eq!(decision.entries[&c2].deps, vec![c1], "seed {seed}");
+        assert!(decision.reproposed.is_empty());
+        for i in [1usize, 2] {
+            assert_eq!(
+                cluster.nodes[i].executed,
+                vec![c1, c2],
+                "seed {seed}: node {i}"
+            );
+            assert_eq!(
+                acknowledged(&cluster.nodes[i]),
+                acked,
+                "seed {seed}: node {i} reproduces the fast results"
+            );
+            assert!(
+                cluster.nodes[i].established.iter().all(|e| !e.fast_path()),
+                "recovered results are slow-path results"
+            );
+        }
+        cluster.observe_retries(2, 100);
+        let verdict = check_history(&cluster.history);
+        assert!(verdict.ok(), "seed {seed}: {:?}", verdict.violations);
+        // A restart of the new leader after binding republishes the same
+        // selection: the persisted choice is stable.
+        cluster.crash(2, Tail::All);
+        cluster.revive(2);
+        cluster.settle();
+        let after = cluster.recovered(2).syncs;
+        assert_eq!(after.len(), 1, "seed {seed}");
+        assert_eq!(after[0].1, decision, "seed {seed}");
+        assert_eq!(cluster.leaders(), vec![2]);
+    }
 }
 
 #[test]
