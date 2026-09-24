@@ -211,6 +211,9 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "coord-core",
+ "coord-oracle",
+ "coord-redb-faultkit",
+ "coord-state",
  "coord-storage-redb",
  "coord-store-api",
  "coord-store-testkit",
