@@ -515,6 +515,61 @@ fn mapping_is_durable_before_use_and_survives_reopen() {
     assert!(reopened.durable_head(unmapped).is_err());
 }
 
+/// A well-framed record below the head that breaks the predecessor chain
+/// passes the engine's checksums; the open-time walk over the retained
+/// suffix must still refuse it rather than vouch for the intact head.
+#[test]
+fn reopen_refuses_a_chain_break_below_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (mut journal, _, mut streams) = create(&root, Arc::new(DefaultFileSystem), &[1]);
+    let s = &mut streams[0];
+    let records = s.next(vec![transition(1, 8), transition(2, 8), transition(3, 8)]);
+    journal
+        .append_group(&group(vec![(barrier(1), s.id, records.clone())]))
+        .unwrap();
+    drop(journal);
+    // The untouched journal reopens with its head.
+    let reopened = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
+    assert_eq!(reopened.durable_head(s.id).unwrap(), s.seq);
+    drop(reopened);
+
+    // Replace entry 2 with a correctly sealed record for the same position
+    // and predecessor but another body, and keep the original 3 and 4: the
+    // head and every digest are self-consistent, only the link from 3 to
+    // the forged 2 is broken.
+    let forged = JournalRecordV1::seal(RecordDraft {
+        origin: s.origin,
+        seq: records[1].seq(),
+        predecessor: records[0].digest(),
+        body: transition(9, 8),
+    })
+    .unwrap();
+    assert_ne!(forged.digest(), records[1].digest());
+    {
+        let engine = raft_engine::Engine::open(raft_engine::Config {
+            dir: root.to_str().unwrap().to_owned(),
+            target_file_size: raft_engine::ReadableSize(options().target_file_size_bytes),
+            purge_threshold: raft_engine::ReadableSize(options().purge_threshold_bytes),
+            ..raft_engine::Config::default()
+        })
+        .unwrap();
+        let mut batch = raft_engine::LogBatch::default();
+        batch
+            .add_entries_with::<coord_journal_raft_engine::RecordExt, RecordCodec>(
+                s.id.get(),
+                &[forged, records[2].clone(), records[3].clone()],
+            )
+            .unwrap();
+        engine.write(&mut batch, true).unwrap();
+        assert_eq!(engine.last_index(s.id.get()), Some(s.seq.get()));
+    }
+    assert!(matches!(
+        RaftEngineJournal::open_existing(&root, identity(), &options()),
+        Err(OpenError::Corrupt(_))
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------

@@ -16,7 +16,12 @@
 //! journal mutex is poisoned, and every later call reports a fail-stop
 //! error. An ordinary error returned after submission is treated the same
 //! way (the shared engine state is uncertain). Recovery is a fresh open,
-//! which derives the actual valid records and heads from the log files.
+//! which derives the actual valid records and heads from the log files:
+//! every retained entry of every stream is decoded and verified against
+//! the stream's origin, its index, the predecessor chain and its digest
+//! before the journal is assembled, so a well-framed record that breaks the
+//! chain anywhere in the retained suffix refuses the open rather than
+//! letting the head be vouched for and extended.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -294,6 +299,80 @@ fn config(dir: &Path, options: &JournalOptions) -> Result<Config, OpenError> {
     })
 }
 
+/// Entries fetched per step of the open-time walk over a stream.
+const OPEN_VERIFY_ENTRIES: u64 = 256;
+
+/// Bytes fetched per step of the open-time walk; the engine still returns
+/// at least one entry, so a single maximal record makes progress.
+const OPEN_VERIFY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Verify every retained entry of `region` against the stream's origin, its
+/// index, the predecessor chain and its re-derived digest, and return the
+/// head's sequence and digest. The engine's checksums catch physical damage
+/// at open but not a well-framed record that breaks the chain; without this
+/// walk such a record below the head would go unseen, `durable_head` would
+/// vouch for the head, and appends would extend a broken chain. The first
+/// retained entry's predecessor is taken from the entry itself unless it is
+/// the genesis position, because the record it names has been retired.
+fn verify_retained<F: FileSystem>(
+    engine: &Engine<F>,
+    region: u64,
+    origin: RecordOrigin,
+    first: u64,
+    last: u64,
+) -> Result<(LocalJournalSeq, Digest32), OpenError> {
+    let corrupt = |what: String| OpenError::Corrupt(format!("stream {region} {what}"));
+    let mut expect: Option<RecordExpectation> = None;
+    let mut head: Option<(LocalJournalSeq, Digest32)> = None;
+    let mut begin = first;
+    let mut records: Vec<JournalRecordV1> = Vec::new();
+    while begin <= last {
+        let end = last.min(begin.saturating_add(OPEN_VERIFY_ENTRIES - 1)) + 1;
+        records.clear();
+        engine
+            .fetch_entries_to_with::<RecordExt, RecordCodec>(
+                region,
+                begin,
+                end,
+                Some(OPEN_VERIFY_BYTES),
+                &mut records,
+            )
+            .map_err(|e| corrupt(format!("retained entries: {}", redact(&e))))?;
+        if records.is_empty() {
+            return Err(corrupt(format!("entry {begin} missing")));
+        }
+        for record in &records {
+            let current = match expect {
+                Some(e) => e,
+                None => RecordExpectation {
+                    origin,
+                    seq: LocalJournalSeq::new(begin)
+                        .map_err(|_| corrupt("first index".to_owned()))?,
+                    predecessor: if begin == 1 {
+                        GENESIS_PREDECESSOR
+                    } else {
+                        record.predecessor()
+                    },
+                },
+            };
+            record
+                .verify(&current)
+                .map_err(|e| corrupt(format!("retained record: {e}")))?;
+            expect = Some(
+                current
+                    .after(record)
+                    .map_err(|_| corrupt("sequence".to_owned()))?,
+            );
+            head = Some((record.seq(), record.digest()));
+        }
+        begin = begin.saturating_add(records.len() as u64);
+    }
+    match head {
+        Some((seq, digest)) if seq.get() == last => Ok((seq, digest)),
+        _ => Err(corrupt("head index disagrees with its record".to_owned())),
+    }
+}
+
 fn put_value(
     batch: &mut LogBatch,
     region: u64,
@@ -477,26 +556,14 @@ impl<F: FileSystem> RaftEngineJournal<F> {
                 }
                 continue;
             };
-            let record = engine
-                .get_entry_with::<RecordExt, RecordCodec>(region, last)
-                .map_err(|e| OpenError::Corrupt(format!("stream {region} head: {}", redact(&e))))?
-                .ok_or_else(|| OpenError::Corrupt(format!("stream {region} head missing")))?;
-            let origin = *record.origin();
-            if origin.stream != stream
-                || origin.cluster != row.cluster
-                || origin.replica != row.replica
-                || origin.domain != mapping.key.domain
-                || origin.incarnation != mapping.key.incarnation
-            {
-                return Err(OpenError::Corrupt(format!(
-                    "stream {region} origin does not match its mapping"
-                )));
-            }
-            if record.seq().get() != last {
-                return Err(OpenError::Corrupt(format!(
-                    "stream {region} head index disagrees with its record"
-                )));
-            }
+            let origin = RecordOrigin {
+                cluster: row.cluster,
+                domain: mapping.key.domain,
+                replica: row.replica,
+                incarnation: mapping.key.incarnation,
+                stream,
+            };
+            let (durable, last_digest) = verify_retained(&engine, region, origin, first, last)?;
             let pointer = match engine.get(region, POINTER_KEY) {
                 None => None,
                 Some(bytes) => match decode_value(&bytes) {
@@ -516,8 +583,8 @@ impl<F: FileSystem> RaftEngineJournal<F> {
                     origin: Some(origin),
                     first: LocalJournalSeq::new(first)
                         .map_err(|_| OpenError::Corrupt("first index".to_owned()))?,
-                    durable: record.seq(),
-                    last_digest: record.digest(),
+                    durable,
+                    last_digest,
                     pointer,
                 },
             );
