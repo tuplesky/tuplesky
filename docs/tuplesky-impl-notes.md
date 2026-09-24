@@ -1183,13 +1183,20 @@ being replaced is the situation the whole protocol exists for.
 
 Two rules keep the phases from being forgeable:
 
-* **An installation record comes from a receipt.** `record_install`
-  takes the `InstalledCheckpointV1` of the install that produced it and
-  requires its verified root and boundary to be the certificate's. A
-  coordinator cannot write one on a replica's behalf, and a replica
-  cannot write one for state it does not have. "The new quorum installs
-  identical terminal state" is then a fact about what is on the disks,
-  not a message anybody sent.
+* **An installation record comes from a receipt, on the installing
+  store.** `record_install` takes the `InstalledCheckpointV1` of the
+  install that produced it and requires its verified root and boundary
+  to be the certificate's, and the installer's replica *and*
+  incarnation to be the certificate's entry, so an obsolete incarnation
+  cannot claim its successor's slot. The receipt is node-private and
+  names no replica, so that identity is the caller's statement;
+  `record_local_install` is the form a driver uses, reading the
+  identity from the installing store's own `meta_v1` and the receipt
+  from the same store, so one receipt is one record for the replica
+  that performed the install and cannot be relabelled as a majority. A
+  replica cannot write one for state it does not have, and "the new
+  quorum installs identical terminal state" is then a fact about what
+  is on the disks, not a message anybody sent.
 * **The successor set comes from the certificate.**
   `activate_successor` reads it out of the certificate rather than
   taking it as an argument, so there is no call site that could activate
@@ -1198,7 +1205,12 @@ Two rules keep the phases from being forgeable:
 `publish_handoff_activation` accepts the identical activation and
 refuses any other, so a coordinator retrying after a lost reply is a
 no-op rather than a second grant of authority. The same pattern as the
-terminal certificate, for the same reason.
+terminal certificate, for the same reason. It takes the certificate as
+well, and refuses even a first publication whose transition or root is
+not the certificate's or whose installers are not a majority of its
+successor: the row is what `resume` later reads as `Served` without
+recounting, so it must not be publishable from an activation assembled
+by hand rather than by `activate_successor`.
 
 **Still missing:** the wire. Nothing asks the old voters for their
 terminal states, moves the checkpoint to the successor, or tells a

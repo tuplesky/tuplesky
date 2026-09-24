@@ -493,6 +493,11 @@ fn successor_voters() -> EpochVoters {
     EpochVoters::new(epoch(NEW), successors().keys().copied().collect()).unwrap()
 }
 
+/// Successor replica `i` at the incarnation the certificate names.
+fn installer(i: u8) -> (ReplicaId, ReplicaIncarnation) {
+    (r(i), successors().get(&r(i)).copied().unwrap_or(inc(1)))
+}
+
 /// The receipt a successor replica has after installing the terminal
 /// state.
 fn receipt() -> InstalledCheckpointV1 {
@@ -561,7 +566,7 @@ fn an_installation_record_comes_from_a_receipt_and_only_from_the_successor() {
     // that activates, and counting it would let a bystander stand in
     // for a member holding nothing.
     assert_eq!(
-        record_install(&certificate, r(0), &receipt()),
+        record_install(&certificate, installer(0), &receipt()),
         Err(TrimError::Handoff(HandoffError::NotAVoter {
             replica: r(0)
         }))
@@ -581,13 +586,13 @@ fn an_installation_record_comes_from_a_receipt_and_only_from_the_successor() {
         let mut wrong = receipt();
         mutate(&mut wrong);
         assert_eq!(
-            record_install(&certificate, r(3), &wrong),
+            record_install(&certificate, installer(3), &wrong),
             Err(TrimError::Handoff(HandoffError::WrongTerminalRoot))
         );
     }
 
     // The right receipt writes the record, under the replica's own key.
-    let update = record_install(&certificate, r(3), &receipt()).unwrap();
+    let update = record_install(&certificate, installer(3), &receipt()).unwrap();
     assert_eq!(update.key, install_key(&r(3)));
     assert!(update.key.starts_with(INSTALL_KEY_PREFIX));
     let record = TerminalInstallV1::decode(update.value.as_ref().unwrap()).unwrap();
@@ -682,13 +687,13 @@ fn every_phase_of_the_handoff_resumes_from_the_rows_and_reuses_its_decisions() {
 
     // One successor replica installs, and the coordinator dies. Still
     // installing: one of three is not a majority.
-    let update = record_install(&published, r(3), &receipt()).unwrap();
+    let update = record_install(&published, installer(3), &receipt()).unwrap();
     apply(&mut engine, &[update]);
     assert_eq!(stage_of(&engine), Stage::Installing);
 
     // The second installs. Now a majority holds the state and the
     // activation is owed, but it is not granted until it is durable.
-    let update = record_install(&published, r(4), &receipt()).unwrap();
+    let update = record_install(&published, installer(4), &receipt()).unwrap();
     apply(&mut engine, &[update]);
     assert_eq!(stage_of(&engine), Stage::Activating);
     let view = engine.reader().snapshot().unwrap();
@@ -704,7 +709,7 @@ fn every_phase_of_the_handoff_resumes_from_the_rows_and_reuses_its_decisions() {
         BTreeSet::from([r(3), r(4)])
     );
     let activation = activate_successor(&published, &installs).unwrap();
-    let update = publish_handoff_activation(&activation, None).unwrap();
+    let update = publish_handoff_activation(&published, &activation, None).unwrap();
     assert_eq!(update.key, HANDOFF_ACTIVATION_KEY);
     drop(view);
     apply(&mut engine, &[update]);
@@ -714,7 +719,8 @@ fn every_phase_of_the_handoff_resumes_from_the_rows_and_reuses_its_decisions() {
     // authority: the coordinator that lost its reply retries safely.
     let view = engine.reader().snapshot().unwrap();
     let published_activation = published_activation(&view).unwrap().expect("activated");
-    publish_handoff_activation(&activation, Some(&published_activation)).expect("idempotent");
+    publish_handoff_activation(&published, &activation, Some(&published_activation))
+        .expect("idempotent");
     assert_eq!(published_activation, activation);
 
     // And an activation of another history never replaces it.
@@ -723,7 +729,7 @@ fn every_phase_of_the_handoff_resumes_from_the_rows_and_reuses_its_decisions() {
         ..activation.clone()
     };
     assert_eq!(
-        publish_handoff_activation(&other, Some(&published_activation)),
+        publish_handoff_activation(&published, &other, Some(&published_activation)),
         Err(TrimError::Handoff(HandoffError::WrongTerminalRoot))
     );
     let elsewhere = HandoffActivationV1 {
@@ -734,7 +740,7 @@ fn every_phase_of_the_handoff_resumes_from_the_rows_and_reuses_its_decisions() {
         ..activation
     };
     assert_eq!(
-        publish_handoff_activation(&elsewhere, Some(&published_activation)),
+        publish_handoff_activation(&published, &elsewhere, Some(&published_activation)),
         Err(TrimError::Handoff(HandoffError::WrongTransition))
     );
 
@@ -760,8 +766,8 @@ fn one_absent_old_voter_does_not_stop_the_handoff() {
         &mut engine,
         &[
             publish_certificate(&certificate, None).unwrap(),
-            record_install(&certificate, r(2), &receipt()).unwrap(),
-            record_install(&certificate, r(3), &receipt()).unwrap(),
+            record_install(&certificate, installer(2), &receipt()).unwrap(),
+            record_install(&certificate, installer(3), &receipt()).unwrap(),
         ],
     );
     // Replica 2 is in the successor, which is the point of the overlap:
@@ -787,4 +793,154 @@ fn one_absent_old_voter_does_not_stop_the_handoff() {
     );
     let view = engine.reader().snapshot().unwrap();
     assert!(read_installs(&view, &TrimLimits::default()).is_err());
+}
+
+/// A store holding the install of successor `replica` at `incarnation`.
+fn installing_store(replica: ReplicaId, incarnation: ReplicaIncarnation) -> ModelEngine {
+    use coord_store_api::registry::meta_fields;
+    let mut engine = store();
+    let meta = Collection::MetaV1.id();
+    apply(
+        &mut engine,
+        &[
+            StoreUpdate {
+                collection: meta,
+                key: meta_fields::REPLICA_ID.to_vec(),
+                value: Some(replica.as_bytes().to_vec()),
+            },
+            StoreUpdate {
+                collection: meta,
+                key: meta_fields::INCARNATION.to_vec(),
+                value: Some(incarnation.get().to_be_bytes().to_vec()),
+            },
+            StoreUpdate {
+                collection: Collection::CheckpointV1.id(),
+                key: coord_checkpoint::install::INSTALLED_KEY.to_vec(),
+                value: Some(receipt().encode().unwrap()),
+            },
+        ],
+    );
+    engine
+}
+
+/// An installation record is bound to the incarnation that installed.
+///
+/// The failing sequences: one node holding one valid receipt writes a
+/// record under each successor identity in turn and manufactures a
+/// majority alone; and an obsolete incarnation of a successor member
+/// claims the slot the certificate gave its current incarnation. The
+/// incarnation is compared with the certificate's, and the local form
+/// reads the identity from the installing store, so one receipt yields
+/// one record for the replica that performed the install.
+#[test]
+fn an_installation_record_is_bound_to_the_installing_incarnation() {
+    let certificate = certificate();
+
+    // An obsolete incarnation of a member is not the member.
+    assert_eq!(
+        record_install(&certificate, (r(4), inc(6)), &receipt()),
+        Err(TrimError::Handoff(HandoffError::NotAVoter {
+            replica: r(4)
+        }))
+    );
+
+    // The installing store names itself: its one receipt is one record,
+    // under its own key, whoever asks.
+    let engine = installing_store(r(3), inc(1));
+    let view = engine.reader().snapshot().unwrap();
+    let update = coord_checkpoint::handoff::record_local_install(&certificate, &view).unwrap();
+    assert_eq!(update.key, install_key(&r(3)));
+    let record = TerminalInstallV1::decode(update.value.as_ref().unwrap()).unwrap();
+    assert_eq!(record.replica, r(3));
+    drop(view);
+
+    // A store of the obsolete incarnation writes nothing.
+    let engine = installing_store(r(4), inc(6));
+    let view = engine.reader().snapshot().unwrap();
+    assert_eq!(
+        coord_checkpoint::handoff::record_local_install(&certificate, &view),
+        Err(TrimError::Handoff(HandoffError::NotAVoter {
+            replica: r(4)
+        }))
+    );
+    drop(view);
+
+    // And a store with no completed install has nothing to record.
+    let empty = store();
+    let view = empty.reader().snapshot().unwrap();
+    assert!(coord_checkpoint::handoff::record_local_install(&certificate, &view).is_err());
+}
+
+/// An activation is published only as the certificate's activation.
+///
+/// The failing sequence: an activation assembled by hand, with an
+/// arbitrary root and an empty or minority installer set, published as
+/// the first activation and then resumed from as `Served`. The first
+/// publication is checked against the certificate like every later one.
+#[test]
+fn an_activation_is_published_only_as_the_certificates() {
+    let certificate = certificate();
+    let installs: Vec<TerminalInstallV1> = [3, 4]
+        .into_iter()
+        .map(|i| TerminalInstallV1 {
+            replica: r(i),
+            transition: transition(),
+            terminal_root: certificate.terminal_root(),
+        })
+        .collect();
+    let activation = activate_successor(&certificate, &installs).unwrap();
+    publish_handoff_activation(&certificate, &activation, None).expect("the real one");
+
+    let forged = |root: Digest32, installers: &[u8]| HandoffActivationV1 {
+        transition: transition(),
+        terminal_root: root,
+        installers: installers.iter().map(|i| r(*i)).collect(),
+    };
+    assert_eq!(
+        publish_handoff_activation(&certificate, &forged(Digest32([0; 32]), &[]), None),
+        Err(TrimError::Handoff(HandoffError::WrongTerminalRoot))
+    );
+    assert_eq!(
+        publish_handoff_activation(
+            &certificate,
+            &forged(certificate.terminal_root(), &[]),
+            None
+        ),
+        Err(TrimError::Handoff(HandoffError::NoQuorum {
+            have: 0,
+            need: 2
+        }))
+    );
+    assert_eq!(
+        publish_handoff_activation(
+            &certificate,
+            &forged(certificate.terminal_root(), &[3]),
+            None
+        ),
+        Err(TrimError::Handoff(HandoffError::NoQuorum {
+            have: 1,
+            need: 2
+        }))
+    );
+    assert_eq!(
+        publish_handoff_activation(
+            &certificate,
+            &forged(certificate.terminal_root(), &[3, 9]),
+            None
+        ),
+        Err(TrimError::Handoff(HandoffError::NotAVoter {
+            replica: r(9)
+        }))
+    );
+    let elsewhere = HandoffActivationV1 {
+        transition: Transition {
+            subject: Digest32([0xb2; 32]),
+            ..transition()
+        },
+        ..activation
+    };
+    assert_eq!(
+        publish_handoff_activation(&certificate, &elsewhere, None),
+        Err(TrimError::Handoff(HandoffError::WrongTransition))
+    );
 }

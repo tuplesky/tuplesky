@@ -47,7 +47,8 @@
 //! Task-57 continues in the same file: [`record_install`] is one
 //! successor replica's durable record that it *holds* the terminal
 //! state, written only from an install receipt whose verified root is
-//! the certificate's, and [`activate_successor`] turns a majority of
+//! the certificate's, for the certified incarnation, and read off the
+//! installing store itself by [`record_local_install`]; and [`activate_successor`] turns a majority of
 //! those into the authority to serve. [`LocalEvidence`] is what one
 //! store can answer about a handoff, for
 //! [`coord_consensus::handoff::resume`] to decide where a replacement
@@ -68,12 +69,12 @@ use coord_consensus::quorum::EpochVoters;
 use coord_consensus::recovery::SyncDecision;
 use coord_core::effect::StoreUpdate;
 use coord_store_api::engine::{Direction, EngineError, OrderedRead, ScanRequest};
-use coord_store_api::registry::Collection;
+use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::identity::{Digest32, HashDomain};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use serde::{Deserialize, Serialize};
 
-use crate::install::InstalledCheckpointV1;
+use crate::install::{INSTALLED_KEY, InstalledCheckpointV1};
 use crate::manifest::CheckpointBoundary;
 use crate::trim::{TrimError, TrimLimits, corrupt, decode_record, encode_record};
 
@@ -363,7 +364,7 @@ pub fn install_key(replica: &ReplicaId) -> Vec<u8> {
     key
 }
 
-/// The update recording that `replica` installed the certificate's
+/// The update recording that `installer` installed the certificate's
 /// terminal state, from the receipt of the install that did it.
 ///
 /// The receipt's verified root must be the certificate's `state_root`
@@ -372,15 +373,27 @@ pub fn install_key(replica: &ReplicaId) -> Vec<u8> {
 /// cannot be written from a coordinator saying so, only from an install
 /// this replica actually performed and verified.
 ///
-/// A replica outside the successor set writes nothing: it is not part
-/// of the quorum that activates, and counting it would let a bystander
-/// stand in for a member that holds nothing.
+/// `installer` is the replica *and* incarnation, and both must be the
+/// certificate's entry: a replica outside the successor set is not part
+/// of the quorum that activates, and an obsolete incarnation of a member
+/// is not the member the old quorum certified -- counting either would
+/// let something that holds nothing stand in for one that must.
+///
+/// The receipt is node-private and names no replica, so the identity
+/// here is the caller's statement. [`record_local_install`] is the form
+/// that does not take it on trust: it reads the identity and the receipt
+/// from the installing store itself, which is how a runtime driver must
+/// produce the record. This form exists for a caller that has already
+/// read both from that store; handed one receipt and a list of successor
+/// identities it would write a record for each, which is exactly what a
+/// driver must never do.
 pub fn record_install(
     certificate: &TerminalCertificateV1,
-    replica: ReplicaId,
+    installer: (ReplicaId, ReplicaIncarnation),
     receipt: &InstalledCheckpointV1,
 ) -> Result<StoreUpdate, TrimError> {
-    if !certificate.state.successors.contains_key(&replica) {
+    let (replica, incarnation) = installer;
+    if certificate.state.successors.get(&replica) != Some(&incarnation) {
         return Err(TrimError::Handoff(HandoffError::NotAVoter { replica }));
     }
     if receipt.root != certificate.state.state_root
@@ -398,6 +411,39 @@ pub fn record_install(
         key: install_key(&replica),
         value: Some(record.encode()?),
     })
+}
+
+/// The update recording the install this store performed, with the
+/// installer's identity read from the store rather than supplied.
+///
+/// The replica and incarnation are the store's own `meta_v1` identity,
+/// the one the install kept (the artifact carries none), and the
+/// receipt is the store's own. One receipt therefore yields one record,
+/// for the replica and incarnation that performed the install, and
+/// cannot be relabelled as another successor's.
+pub fn record_local_install<V: OrderedRead>(
+    certificate: &TerminalCertificateV1,
+    installing: &V,
+) -> Result<StoreUpdate, TrimError> {
+    let meta = Collection::MetaV1.id();
+    let replica = installing
+        .get(meta, meta_fields::REPLICA_ID)?
+        .ok_or_else(|| corrupt("installing store has no replica identity"))
+        .and_then(|b| ReplicaId::from_slice(&b).map_err(|_| corrupt("replica identity")))?;
+    let incarnation = installing
+        .get(meta, meta_fields::INCARNATION)?
+        .ok_or_else(|| corrupt("installing store has no incarnation"))
+        .and_then(|b| {
+            <[u8; 8]>::try_from(b.as_slice())
+                .ok()
+                .and_then(|b| ReplicaIncarnation::new(u64::from_be_bytes(b)).ok())
+                .ok_or_else(|| corrupt("incarnation"))
+        })?;
+    let receipt = installing
+        .get(Collection::CheckpointV1.id(), INSTALLED_KEY)?
+        .ok_or(TrimError::Handoff(HandoffError::WrongTerminalRoot))
+        .and_then(|b| Ok(InstalledCheckpointV1::decode(&b)?))?;
+    record_install(certificate, (replica, incarnation), &receipt)
 }
 
 /// The installation records this node durably holds, in replica order.
@@ -515,16 +561,48 @@ pub fn published_activation<V: OrderedRead>(
     }
 }
 
-/// The update publishing `next`.
+/// The update publishing `next`, the activation of `certificate`.
 ///
 /// An activation is reused, never recomputed: the identical one
 /// republishes and any other is refused. A duplicate activation is
 /// therefore a no-op rather than a second grant of authority, which is
 /// what a coordinator retrying after a lost reply needs it to be.
+///
+/// The first publication is checked against the certificate too, since
+/// the row is what [`LocalEvidence`] later hands to `resume` as the
+/// answer: its transition and root must be the certificate's and its
+/// installers a majority of the certificate's successor. That keeps an
+/// activation assembled by hand -- the fields are public, so the type
+/// can be built without [`activate_successor`] -- from being published
+/// over an empty or minority installer set. The installers are the
+/// activation's claim; that each of them holds the root is what
+/// [`activate_successor`] checked from their records, which is why it is
+/// the constructor a driver uses.
 pub fn publish_handoff_activation(
+    certificate: &TerminalCertificateV1,
     next: &HandoffActivationV1,
     published: Option<&HandoffActivationV1>,
 ) -> Result<StoreUpdate, TrimError> {
+    if next.transition != certificate.transition() {
+        return Err(TrimError::Handoff(HandoffError::WrongTransition));
+    }
+    if next.terminal_root != certificate.terminal_root() {
+        return Err(TrimError::Handoff(HandoffError::WrongTerminalRoot));
+    }
+    let successor = certificate
+        .successor_voters()
+        .ok_or(TrimError::Handoff(HandoffError::WrongTransition))?;
+    if let Some(stranger) = next.installers.iter().find(|r| !successor.is_voter(r)) {
+        return Err(TrimError::Handoff(HandoffError::NotAVoter {
+            replica: *stranger,
+        }));
+    }
+    if next.installers.len() < successor.majority() {
+        return Err(TrimError::Handoff(HandoffError::NoQuorum {
+            have: next.installers.len(),
+            need: successor.majority(),
+        }));
+    }
     if let Some(current) = published {
         if current.transition != next.transition {
             return Err(TrimError::Handoff(HandoffError::WrongTransition));

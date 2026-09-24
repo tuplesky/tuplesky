@@ -87,7 +87,7 @@ pub use floor::{
 pub use handoff::{
     HandoffActivationV1, LocalEvidence, TerminalCertificateV1, TerminalInstallV1, TerminalStateV1,
     activate_successor, publish_certificate, publish_handoff_activation, published_certificate,
-    read_installs, record_install, select_certificate,
+    read_installs, record_install, record_local_install, select_certificate,
 };
 pub use maintain::{BaselineError, LocalBaseline, Publication};
 pub use store::{LocalCheckpointStore, StoreError};
