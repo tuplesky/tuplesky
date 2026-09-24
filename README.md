@@ -11,6 +11,9 @@ These are proposed engineering work, not implemented or verified features. The d
 The workspace is locked to exact toolchains and dependency versions; see
 [docs/build/toolchain.md](docs/build/toolchain.md) for the pins and the
 dependency audit and [docs/build/ci.md](docs/build/ci.md) for CI routing.
+Operator procedures live under `docs/operations/`; see
+[disaster recovery](docs/operations/disaster-recovery.md) for isolating a
+cluster and restoring from a backup.
 
 ```text
 cargo xtask check-tools --install   # pinned cargo-deny, cargo-nextest, mermaid-cli

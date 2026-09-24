@@ -588,29 +588,46 @@ fn initializing_is_deliberate_and_happens_exactly_once() {
     assert!(dir.join("state").join("gen-000001").is_dir());
 }
 
-/// An initialization that created the journal and then failed to create
-/// the projection can be run again, and finishes.
+/// An initialization that failed before it finished can be run again,
+/// and finishes -- including one that left a journal and no projection.
 ///
 /// The two are separate directories, so no one write makes both exist.
-/// Without this the node was left with a journal and no projection: `init`
-/// refused because a store existed, a start refused because none did, and
-/// the only way out was deleting the journal by hand.
+/// Initialization now selects the projection before it creates the
+/// journal (task-59), so one that cannot create the projection leaves
+/// nothing behind. A journal and no projection is what an initialization
+/// that created the journal first left (task-j08): without reusing it
+/// the node was left with a journal and no projection, `init` refused
+/// because a store existed, a start refused because none did, and the
+/// only way out was deleting the journal by hand.
 #[test]
 fn an_initialization_that_stopped_between_the_journal_and_the_projection_can_be_finished() {
     let dir = workspace("half-init");
     let path = config(&dir);
 
     // Something that is not a directory where the projection goes: the
-    // journal is created, and then the projection cannot be.
+    // projection cannot be created, and so neither is the journal.
     std::fs::write(dir.join("state"), b"not a directory").expect("obstruct");
     let failed = run(&path, &["init"]);
     assert_eq!(failed.code, Some(2), "{}{}", failed.out, failed.err);
     assert!(
-        dir.join("journal").is_dir(),
-        "the journal was not created first, so this is not the case under test"
+        !dir.join("journal").exists(),
+        "a journal was created for a projection that was never selected"
+    );
+    std::fs::remove_file(dir.join("state")).expect("clear");
+
+    // The journal an initialization that created it first left behind.
+    drop(
+        coord_journal_raft_engine::journal::RaftEngineJournal::create(
+            &dir.join("journal"),
+            coord_journal_raft_engine::journal::JournalIdentity {
+                cluster: coord_types::ids::ClusterId(CLUSTER),
+                replica: coord_types::ids::ReplicaId([1; 16]),
+            },
+            &coord_journal_raft_engine::journal::JournalOptions::default(),
+        )
+        .expect("a journal with no history"),
     );
 
-    std::fs::remove_file(dir.join("state")).expect("clear");
     let finished = run(&path, &["init"]);
     assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
     let report = start_and_report(&path);
@@ -3368,5 +3385,410 @@ fn write_key(path: &Path, der: &[u8]) {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+}
+
+/// A backup restores a new cluster and refuses to restore the old one
+/// (task-59; design Sections 5.4, 7.4, 17.16).
+///
+/// The whole runbook end to end on a real node: back up a running
+/// domain's state, verify the backup off the disk, refuse the restore
+/// without a fencing attestation and under the source identity, and
+/// then restore a *different* cluster from the same bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backup_restores_a_new_cluster_and_refuses_to_restore_the_old_one() {
+    let dir = workspace("backup");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    // Something worth restoring.
+    {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x59; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+    }
+
+    let out = dir.join("backup");
+    let taken = run(&path, &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(taken.code, Some(0), "{}", taken.err);
+    assert!(
+        taken.out.contains("recovery_point position="),
+        "the backup did not state its recovery point:\n{}",
+        taken.out
+    );
+
+    // A backup is never written over one. For the duration of an
+    // overwrite there would be neither the old backup nor a complete
+    // new one, and a backup is exactly the thing that must not be
+    // unavailable at the moment it is wanted.
+    let twice = run(&path, &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(
+        twice.code,
+        Some(2),
+        "a backup was written over an existing one:\n{}",
+        twice.out
+    );
+
+    // A backup is verified from anywhere, including from a machine
+    // whose own store is the one that was lost.
+    let verified = run(&path, &["verify", "--dir", out.to_str().unwrap()]);
+    assert_eq!(verified.code, Some(0), "{}", verified.err);
+    assert!(verified.out.contains("backup verified chunks="));
+
+    // And from a machine that is a voter of no cluster: the recovery
+    // host's certificate need not be one the committed configuration
+    // names, because nothing about a backup's integrity depends on who
+    // is asking. Placement refuses this configuration; verification
+    // does not go through placement.
+    let elsewhere = workspace("backup-elsewhere");
+    let elsewhere_config = config(&elsewhere);
+    credentials(&elsewhere, 9, coord_types::wire_v1::PeerRole::Voter);
+    let stranger = run(&elsewhere_config, &["--check"]);
+    assert_eq!(
+        stranger.code,
+        Some(2),
+        "the recovery host is placeable, so this proves nothing:\n{}",
+        stranger.out
+    );
+    let verified = run(
+        &elsewhere_config,
+        &["verify", "--dir", out.to_str().unwrap()],
+    );
+    assert_eq!(
+        verified.code,
+        Some(0),
+        "a backup could not be verified from a machine that is not a voter:\n{}",
+        verified.err
+    );
+    assert!(verified.out.contains("backup verified chunks="));
+
+    // A backup index repointed at different bytes fails verification
+    // rather than at the restore.
+    let tampered = dir.join("tampered");
+    copy_tree(&out, &tampered);
+    let chunk = tampered.join("chunk-000000");
+    let mut bytes = std::fs::read(&chunk).expect("chunk");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&chunk, &bytes).expect("chunk");
+    let refused = run(&path, &["verify", "--dir", tampered.to_str().unwrap()]);
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+
+    // The manifest an operator reads, and the attestation they write
+    // from it.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("backup.json")).expect("manifest"))
+            .expect("json");
+    let root = manifest["root"].clone();
+
+    // The successor: a different cluster, with its own genesis and its
+    // own credentials.
+    let new_dir = workspace("backup-successor");
+    let new_cluster = [0xc5u8; 16];
+    let new_ca = credentials_of_cluster(
+        &new_dir,
+        new_cluster,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+    );
+    genesis_of_cluster(&new_dir, new_cluster, &new_ca.node_spki);
+    let _ = sts_keys(&new_dir);
+    let new_path = config_only(&new_dir);
+
+    // Without an attestation there is nothing to restore under: the
+    // isolation is an action outside this system and the restore will
+    // not assume it happened.
+    let unfenced = dir.join("unfenced.json");
+    std::fs::write(&unfenced, b"{}").expect("write");
+    let refused = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            unfenced.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(refused.code, Some(2), "{}", refused.out);
+
+    // An attestation for the old cluster's own identity is a restore in
+    // place, which is the one thing that makes a rewound history
+    // indistinguishable from the live one.
+    let in_place = fencing_file(&dir, "in-place.json", CLUSTER, CLUSTER, &root);
+    let refused = run(
+        &path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            in_place.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        refused.code,
+        Some(2),
+        "a restore in place was carried out:\n{}",
+        refused.out
+    );
+
+    // The real one. Planning writes nothing and says what will be lost.
+    let attestation = fencing_file(&dir, "fencing.json", CLUSTER, new_cluster, &root);
+    let planned = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+            "--plan",
+        ],
+    );
+    assert_eq!(planned.code, Some(0), "{}", planned.err);
+    assert!(
+        planned.out.contains("nothing was written"),
+        "a planned restore wrote something:\n{}",
+        planned.out
+    );
+    assert!(
+        planned.out.contains(
+            "disposition kv=restored-at-boundary retries=restored-at-boundary \
+             configurations=not-carried sessions=invalidated leases=revoked \
+             watches=resynchronized"
+        ),
+        "the plan did not state every disposition:\n{}",
+        planned.out
+    );
+    assert!(!new_dir.join("state").exists(), "the plan created a store");
+
+    let restored = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(restored.code, Some(0), "{}", restored.err);
+    assert!(
+        restored.out.contains("restored rows="),
+        "the restore said nothing about what it wrote:\n{}",
+        restored.out
+    );
+
+    // And the new cluster comes up on the restored state, under its
+    // own identity: the generation attaches to its journal, the
+    // frontiers agree and it reports itself live.
+    let report = start_and_report(&new_path);
+    assert!(
+        report.contains("phase=live"),
+        "the restored cluster did not come up:\n{report}"
+    );
+    assert!(
+        report.contains("journaled_through="),
+        "the restored projection never attached:\n{report}"
+    );
+
+    // Restoring a second time onto the same node is refused: a restore
+    // writes a whole cluster's state and has nothing to merge with.
+    let again = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(again.code, Some(2), "{}", again.out);
+}
+
+/// A restore that stopped after its policy and before its pin is refused
+/// by a start and finished by `init`, which keeps the restored rows and
+/// writes none of the policy twice (task-59).
+///
+/// A restore ends as `init` does: attach, the successor's genesis
+/// policy, and the successor's genesis pinned last. Pinned before the
+/// policy, a stop between the two left a restored node that served,
+/// trusting nothing and granting nothing, and that nothing would finish.
+/// The state a stop just before the pin leaves is a finished restore
+/// without its pin, made here by removing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_that_stopped_before_its_pin_is_finished_by_init() {
+    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_store_api::registry::{Collection, meta_fields};
+
+    let dir = workspace("restore-unpinned");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x59; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+    }
+    let out = dir.join("backup");
+    let taken = run(&path, &["backup", "--out", out.to_str().unwrap()]);
+    assert_eq!(taken.code, Some(0), "{}", taken.err);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("backup.json")).expect("manifest"))
+            .expect("json");
+
+    let new_dir = workspace("restore-unpinned-successor");
+    let new_cluster = [0xc6u8; 16];
+    let new_ca = credentials_of_cluster(
+        &new_dir,
+        new_cluster,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+    );
+    genesis_of_cluster(&new_dir, new_cluster, &new_ca.node_spki);
+    let _ = sts_keys(&new_dir);
+    let new_path = config_only(&new_dir);
+    let attestation = fencing_file(
+        &dir,
+        "fencing.json",
+        CLUSTER,
+        new_cluster,
+        &manifest["root"],
+    );
+    let restored = run(
+        &new_path,
+        &[
+            "restore",
+            "--dir",
+            out.to_str().unwrap(),
+            "--fencing",
+            attestation.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(restored.code, Some(0), "{}", restored.err);
+    // The policy is written before the pin, so the restore that finished
+    // wrote all of it.
+    assert!(
+        restored.out.contains(" present=0") && !restored.out.contains("genesis policy rows=0"),
+        "the restore did not write the successor's policy before its pin:\n{}",
+        restored.out
+    );
+
+    // Stopped just before the pin.
+    {
+        let mut generation = coord_storage_redb::lifecycle::Generation::open_existing(
+            &new_dir.join("state"),
+            coord_storage_redb::lifecycle::StoreIdentity {
+                cluster_id: coord_types::ids::ClusterId(new_cluster),
+                domain_id: coord_types::ids::DomainId(DOMAIN),
+                replica_id: coord_types::ids::ReplicaId([1; 16]),
+                incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            },
+            coord_storage_redb::lifecycle::OpenOptions::default(),
+        )
+        .expect("the restored store opens");
+        let mut txn = generation.engine().begin_write().expect("write");
+        txn.delete(Collection::MetaV1.id(), meta_fields::GENESIS_DIGEST)
+            .expect("unpin");
+        txn.commit_durable().expect("commit");
+    }
+
+    let refused = run(&new_path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("never pinned") && refused.err.contains("coordd init"),
+        "the refusal did not say what to do: {}",
+        refused.err
+    );
+
+    let finished = run(&new_path, &["init"]);
+    assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
+    assert!(
+        finished.out.contains("genesis policy rows=0 present=")
+            && !finished.out.contains("present=0"),
+        "finishing rewrote a policy the restore had written:\n{}",
+        finished.out
+    );
+    assert!(
+        !new_dir.join("state").join("gen-000002").exists(),
+        "finishing the restore made a second generation"
+    );
+
+    // The finished node comes up on the restored state.
+    let report = start_and_report(&new_path);
+    assert!(
+        report.contains("phase=live") && report.contains("owed=0"),
+        "the finished restore did not come up:\n{report}"
+    );
+    assert!(
+        !report.contains("journaled_through=None"),
+        "the finished restore came up on no restored state:\n{report}"
+    );
+}
+
+/// A genesis for another cluster, as a successor deployment has it.
+fn genesis_of_cluster(dir: &Path, cluster: [u8; 16], voter_one_key: &[u8]) {
+    let manifest = serde_json::json!({
+        "cluster": hex(&cluster),
+        "domain": hex(&DOMAIN),
+        "epoch": 1,
+        "voters": [{
+            "node": hex(&[1u8; 16]),
+            "incarnation": 1,
+            "public_key": b64url(voter_one_key),
+        }],
+        "issuer_roots": [b64url(&[0xca; 8])],
+        "wif_rules": [{ "issuer": "test" }],
+        "admin": hex(&[0xa; 16]),
+        "protocol_version": 1,
+    });
+    std::fs::write(
+        dir.join("genesis.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest"),
+    )
+    .expect("write manifest");
+}
+
+/// An operator's fencing attestation, as the runbook has them write it.
+fn fencing_file(
+    dir: &Path,
+    name: &str,
+    abandoned: [u8; 16],
+    successor: [u8; 16],
+    backup_root: &serde_json::Value,
+) -> PathBuf {
+    let path = dir.join(name);
+    let attestation = serde_json::json!({
+        "abandoned": abandoned,
+        "successor": successor,
+        "backup": backup_root,
+        "action": "revoked the old cluster's node certificates, ticket DR-91",
+        "at": 1_700_000_600u64,
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&attestation).expect("json"),
+    )
+    .expect("write");
+    path
+}
+
+/// Copy a backup directory, for the tampering case.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("dir");
+    for entry in std::fs::read_dir(from).expect("read") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
     }
 }

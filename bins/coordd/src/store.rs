@@ -32,7 +32,9 @@ use coord_journal_raft_engine::journal::{
 use coord_storage::JournaledDomain;
 use coord_storage::journaled::{JournalLimits, JournaledStore};
 use coord_storage_redb::RedbEngine;
-use coord_storage_redb::lifecycle::{Generation, OpenError, OpenOptions, StoreIdentity};
+use coord_storage_redb::lifecycle::{
+    Generation, InactiveGeneration, OpenError, OpenOptions, StoreIdentity,
+};
 use coord_types::ids::{
     Ballot, ClusterId, DomainId, LocalJournalSeq, ReplicaId, ReplicaIncarnation,
 };
@@ -115,29 +117,7 @@ pub fn open(
         cache_bytes: config.state.cache_bytes,
     };
     match intent {
-        Intent::Initialize => {
-            // The parent has to exist; the root itself is the lifecycle's
-            // to create, because creating it here would make an
-            // interrupted initialization indistinguishable from a
-            // complete one.
-            if let Some(parent) = root.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| StoreError::Refused {
-                    root: show(&root),
-                    reason: e.to_string(),
-                })?;
-            }
-            Generation::create(&root, identity, options)
-                .map_err(|e| match e {
-                    OpenError::AlreadyInitialized => {
-                        StoreError::AlreadyInitialized { root: show(&root) }
-                    }
-                    other => StoreError::Refused {
-                        root: show(&root),
-                        reason: format!("{other:?}"),
-                    },
-                })
-                .map(|g| (g, None))
-        }
+        Intent::Initialize => initialize(&root, identity, options, |_| Ok(())).map(|g| (g, None)),
         Intent::Serve => {
             // An authorized replacement keeps this node's durable state
             // (task-58). `place` has already established that this
@@ -175,6 +155,75 @@ pub fn open(
             Ok((generation, pending))
         }
     }
+}
+
+/// Create this node's first generation, filled by `fill`, and select it
+/// only once `fill` has returned.
+///
+/// The generation is staged, not created selected: `CURRENT` is written
+/// by the activation that follows a successful fill and by nothing
+/// earlier. A fill that fails, or a process that dies while filling,
+/// therefore leaves a root with no selection -- which every later start
+/// reads as `NotInitialized` -- rather than a selected generation holding
+/// part of what was being written. For `init` the fill is empty and this
+/// is the same empty generation it always was; for a restore (task-59) the
+/// fill is the whole backup, and the receipt it commits last is in the
+/// generation before anything can select it.
+fn initialize(
+    root: &Path,
+    identity: StoreIdentity,
+    options: OpenOptions,
+    fill: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
+) -> Result<Generation, StoreError> {
+    let refused = |e: &dyn core::fmt::Debug| StoreError::Refused {
+        root: show(root),
+        reason: format!("{e:?}"),
+    };
+    // The parent has to exist; the root itself is the lifecycle's to
+    // create, because creating it here would make an interrupted
+    // initialization indistinguishable from a complete one.
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StoreError::Refused {
+            root: show(root),
+            reason: e.to_string(),
+        })?;
+    }
+    // A selected generation is a node's history, whatever it holds.
+    // Staging would validate it as a predecessor, which is the install
+    // path's question; initialization's is only whether one is there.
+    if root.join("CURRENT").exists() {
+        return Err(StoreError::AlreadyInitialized { root: show(root) });
+    }
+    let mut staged = InactiveGeneration::stage(root, identity, options).map_err(|e| match e {
+        OpenError::AlreadyInitialized => StoreError::AlreadyInitialized { root: show(root) },
+        other => refused(&other),
+    })?;
+    if staged.previous().is_some() {
+        // Selected between the check above and the lock: the same answer.
+        staged.abandon().map_err(|e| refused(&e))?;
+        return Err(StoreError::AlreadyInitialized { root: show(root) });
+    }
+    if let Err(e) = fill(staged.engine()) {
+        // Nothing was selected, so the root is exactly as uninitialized
+        // as before. Removing the staging is housekeeping, not safety: an
+        // unselected directory is never opened, and the next staging
+        // takes the next number, so the fill's own error is the one
+        // reported even if the removal fails.
+        let _ = staged.abandon();
+        return Err(e);
+    }
+    let generation = staged.activate().map_err(|e| refused(&e))?;
+    // A staging a crashed attempt left behind is unreferenced now that
+    // this one is selected. Failing to reclaim it costs disk, not
+    // correctness, and must not undo a selection that is already
+    // durable, so it is reported and not returned.
+    if let Err(e) = generation.prune_unselected() {
+        eprintln!(
+            "an abandoned staging under {} could not be removed: {e}",
+            show(root)
+        );
+    }
+    Ok(generation)
 }
 
 fn show(path: &Path) -> String {
@@ -248,10 +297,12 @@ struct Adoption {
 
 /// Open the journal and the projection, for `intent`.
 ///
-/// The order is the durability order. The journal is opened first
-/// because it is the authority; the projection is then opened (or, for
-/// `coordd init`, created) under this node's identity, and handed back
-/// unattached. Attaching it is [`Opened::attach`].
+/// The order is the durability order. To serve, the journal is opened
+/// first because it is the authority, and the projection is then opened
+/// under this node's identity; to initialize, the projection is created
+/// and selected first and the journal created after it (see
+/// [`open_storage_with`]). Either way both are handed back unattached.
+/// Attaching them is [`Opened::attach`].
 pub fn open_storage(
     config: &Config,
     intent: Intent,
@@ -260,40 +311,46 @@ pub fn open_storage(
     replica: ReplicaId,
     incarnation: ReplicaIncarnation,
 ) -> Result<Opened, StoreError> {
+    open_storage_with(
+        config,
+        intent,
+        cluster,
+        domain_id,
+        replica,
+        incarnation,
+        |_| Ok(()),
+    )
+}
+
+/// The same, running `before_attach` against the generation's engine
+/// before it is attached to the journal.
+///
+/// That window is the install lifecycle's (task-50) and the restore's
+/// (task-59): a whole store's worth of rows is written directly, which
+/// is admissible precisely because nothing has attached the projection
+/// to the journal yet and therefore no frontier exists to violate.
+/// Every other write to a projection goes through the journal.
+///
+/// Under [`Intent::Initialize`] the engine is a staged generation that
+/// nothing selects: it is selected only after `before_attach` returns
+/// `Ok`, and the journal is created only after that. An error from
+/// `before_attach`, or a crash while it runs, leaves no selected
+/// generation and no journal, so the node refuses to serve and the same
+/// initialization can simply be run again.
+pub fn open_storage_with(
+    config: &Config,
+    intent: Intent,
+    cluster: ClusterId,
+    domain_id: DomainId,
+    replica: ReplicaId,
+    incarnation: ReplicaIncarnation,
+    before_attach: impl FnOnce(&mut RedbEngine) -> Result<(), StoreError>,
+) -> Result<Opened, StoreError> {
     let journal_root = root_path(&config.state_directory, &config.journal.root);
     let identity = JournalIdentity { cluster, replica };
     let options = JournalOptions::default();
 
-    let journal = match intent {
-        Intent::Initialize => {
-            if let Some(parent) = journal_root.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| StoreError::Refused {
-                    root: show(&journal_root),
-                    reason: e.to_string(),
-                })?;
-            }
-            match RaftEngineJournal::create(&journal_root, identity, &options) {
-                Err(JournalOpenError::AlreadyInitialized) => {
-                    let projection = StoreIdentity {
-                        cluster_id: cluster,
-                        domain_id,
-                        replica_id: replica,
-                        incarnation,
-                    };
-                    left_by_an_interrupted_initialization(
-                        config,
-                        projection,
-                        &journal_root,
-                        identity,
-                        &options,
-                    )
-                }
-                created => created,
-            }
-        }
-        Intent::Serve => RaftEngineJournal::open_existing(&journal_root, identity, &options),
-    }
-    .map_err(|e| match e {
+    let journal_error = |e: JournalOpenError| match e {
         JournalOpenError::AlreadyInitialized => StoreError::AlreadyInitialized {
             root: show(&journal_root),
         },
@@ -304,7 +361,76 @@ pub fn open_storage(
             root: show(&journal_root),
             reason: format!("{other:?}"),
         },
-    })?;
+    };
+
+    let (generation, pending, journal) = match intent {
+        Intent::Initialize => {
+            // Refused before anything is written if the journal is already
+            // there, so a restore is not carried out in full only to be
+            // refused by its journal -- unless it is the journal an
+            // initialization left before it created the projection, which
+            // is reused (see `left_by_an_interrupted_initialization`).
+            let occupied = std::fs::read_dir(&journal_root)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+            let identity_of_store = StoreIdentity {
+                cluster_id: cluster,
+                domain_id,
+                replica_id: replica,
+                incarnation,
+            };
+            let reused = if occupied {
+                Some(
+                    left_by_an_interrupted_initialization(
+                        config,
+                        identity_of_store,
+                        &journal_root,
+                        identity,
+                        &options,
+                    )
+                    .map_err(journal_error)?,
+                )
+            } else {
+                None
+            };
+            let options_of_store = OpenOptions {
+                cache_bytes: config.state.cache_bytes,
+            };
+            let generation = initialize(
+                &config.state.root_path(&config.state_directory),
+                identity_of_store,
+                options_of_store,
+                before_attach,
+            )?;
+            // The journal is created only once the generation is selected.
+            // A journal is what makes a root servable and what a second
+            // attempt is refused by, so creating it first would leave a
+            // failed restore both unservable and unretryable; created
+            // last, a failure anywhere before it leaves nothing at all.
+            let journal = match reused {
+                Some(journal) => journal,
+                None => {
+                    if let Some(parent) = journal_root.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| StoreError::Refused {
+                            root: show(&journal_root),
+                            reason: e.to_string(),
+                        })?;
+                    }
+                    RaftEngineJournal::create(&journal_root, identity, &options)
+                        .map_err(journal_error)?
+                }
+            };
+            (generation, None, journal)
+        }
+        Intent::Serve => {
+            let journal = RaftEngineJournal::open_existing(&journal_root, identity, &options)
+                .map_err(journal_error)?;
+            let (mut generation, pending) =
+                open(config, intent, cluster, domain_id, replica, incarnation)?;
+            before_attach(generation.engine())?;
+            (generation, pending, journal)
+        }
+    };
 
     let boot = BootId(boot_of(replica, incarnation));
     let store = JournaledStore::open(
@@ -320,7 +446,6 @@ pub fn open_storage(
         reason: format!("{e:?}"),
     })?;
 
-    let (generation, pending) = open(config, intent, cluster, domain_id, replica, incarnation)?;
     let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
     let adoption = pending.map(|previous| Adoption {
         previous,
@@ -594,6 +719,8 @@ fn root_path(state_directory: &str, root: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_store_api::registry::Collection;
 
     /// A configuration whose store lives under `dir`, with a genesis
     /// policy to record (so the journal holds something a fresh stream
@@ -744,6 +871,88 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             serve(&config, 1).is_err(),
             "the replaced generation could still open the store"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fill that fails after it has durably committed rows -- a restore
+    /// that dies between two of its bounded transactions -- selects
+    /// nothing and creates no journal: the node refuses to serve the
+    /// partial generation, and the same initialization then succeeds.
+    #[test]
+    fn a_fill_that_fails_after_committing_rows_selects_nothing() {
+        let dir = workspace("partial-fill");
+        let config = config(&dir);
+        let failed = open_storage_with(
+            &config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+            |engine| {
+                let mut txn = engine.begin_write().expect("write");
+                txn.put(Collection::KvCurrentV1.id(), b"partial", b"row")
+                    .expect("put");
+                txn.commit_durable().expect("commit");
+                Err(StoreError::Refused {
+                    root: "fill".into(),
+                    reason: "the restore stopped half way".into(),
+                })
+            },
+        );
+        match failed {
+            Err(StoreError::Refused { reason, .. }) => {
+                assert_eq!(reason, "the restore stopped half way");
+            }
+            Err(other) => panic!("the fill's own error was not reported: {other}"),
+            Ok(_) => panic!("a failed fill initialized a node"),
+        }
+        assert!(
+            !dir.join("state").join("CURRENT").exists(),
+            "a partially filled generation was selected"
+        );
+        assert!(
+            std::fs::read_dir(dir.join("journal")).map_or(true, |mut e| e.next().is_none()),
+            "a journal was created for a generation that was never selected"
+        );
+        match open_storage(
+            &config,
+            Intent::Serve,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        ) {
+            Err(StoreError::NotInitialized { .. }) => {}
+            Err(other) => panic!("the partial generation was not read as absent: {other}"),
+            Ok(_) => panic!("a node served a partially filled generation"),
+        }
+
+        let retried = open_storage(
+            &config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        );
+        assert!(
+            retried.is_ok(),
+            "the same initialization was refused after a failed fill: {:?}",
+            retried.err().map(|e| e.to_string())
+        );
+        drop(retried);
+        match open_storage(
+            &config,
+            Intent::Serve,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        ) {
+            Ok(_) => {}
+            Err(e) => panic!("the initialized node did not open: {e}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
