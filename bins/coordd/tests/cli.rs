@@ -3129,6 +3129,7 @@ fn genesis_of_incarnation(dir: &Path, voter_one_key: &[u8], incarnation: u64) {
 /// that had not; the next start had nothing to carry from, allocated a
 /// fresh stream, and refused the projection as materialized past it.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "a replacement is committed here by editing genesis.json, which the genesis pin (task-j08) now quarantines; it needs a committed reconfiguration path to be exercised end to end"]
 async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_start() {
     let dir = workspace("replace-interrupted");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
@@ -3201,6 +3202,7 @@ async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_st
 /// cloned or restored from *before* a replacement is not the current
 /// replica at all, and serving from it is a replaced voter voting.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "a replacement is committed here by editing genesis.json, which the genesis pin (task-j08) now quarantines; it needs a committed reconfiguration path to be exercised end to end"]
 async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_not() {
     let dir = workspace("replace");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
@@ -3285,6 +3287,79 @@ async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_n
         report.out.contains("state=stale committed=2 presented=1"),
         "inspect did not name the left-behind credential:\n{}",
         report.out
+    );
+}
+
+/// A replacement handed to a node as an edited genesis manifest is a
+/// genesis quarantine, and it is refused before anything is adopted.
+///
+/// Adoption is durable and one-way: it carries the journal's stream and
+/// advances the projection's manifest, after which the previous
+/// credential is fenced. A start that adopted first and checked the pin
+/// afterwards would be refused *and* have moved the store, so restoring
+/// the manifest the node was initialized under would leave it fenced
+/// under its own credential. The pin is checked on the generation as it
+/// is stamped, so restoring the manifest and the credential serves the
+/// same answer as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_adopted() {
+    let dir = workspace("replace-pinned");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x5a; 16]).await;
+        let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+        response_of(&answer)
+    };
+
+    let manifest = std::fs::read(dir.join("genesis.json")).expect("manifest");
+    let retired = std::fs::read(dir.join("node.pem")).expect("cert");
+    let retired_key = std::fs::read(dir.join("node.key")).expect("key");
+    let (next, key) = ca.issue_at(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+        2,
+    );
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
+    write_key(&dir.join("node.key"), &key.serialize_der());
+    genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("genesis quarantine"),
+        "the refusal did not say why: {}",
+        refused.err
+    );
+    assert!(
+        !refused.out.contains("adopted"),
+        "a start adopted under a genesis it then refused:\n{}",
+        refused.out
+    );
+
+    std::fs::write(dir.join("genesis.json"), manifest).expect("restore the manifest");
+    std::fs::write(dir.join("node.pem"), &retired).expect("cert");
+    // Already PEM, and the file keeps the permissions `write_key` gave it.
+    std::fs::write(dir.join("node.key"), &retired_key).expect("key");
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x5a; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the restored node did not serve\n{}", daemon.said()));
+    let again = response_of(&answer);
+    assert_eq!(again.command_id, first.command_id);
+    assert_eq!(
+        again.outcome, first.outcome,
+        "the refused replacement moved this node's state"
     );
 }
 
