@@ -956,3 +956,23 @@ pub fn fuzz_entry(data: &[u8]) {
         }
     }
 }
+
+/// Frozen error codes of [`OutcomeV1::Err`] produced at the trusted
+/// boundary (task-33/task-34; design Section 4.4). Append-only. Pending
+/// and unknown outcomes are the `Pending` and `Unknown` outcomes, never
+/// codes.
+pub mod codes {
+    /// The retry key is bound to another payload
+    /// (`RequestIdentityConflict`).
+    pub const REQUEST_IDENTITY_CONFLICT: u16 = 0x0001;
+    /// The frontend or the domain is at its collection bound; retry later
+    /// with the same identity.
+    pub const BACKPRESSURE: u16 = 0x0002;
+    /// The request did not decode as a canonical request.
+    pub const MALFORMED_REQUEST: u16 = 0x0003;
+    /// The caller may not submit this request (role, cluster, domain or
+    /// session mismatch).
+    pub const NOT_ADMITTED: u16 = 0x0004;
+    /// The established result does not fit the response bound.
+    pub const RESULT_TOO_LARGE: u16 = 0x0005;
+}
