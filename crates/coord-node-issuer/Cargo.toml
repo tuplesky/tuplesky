@@ -1,0 +1,29 @@
+[package]
+name = "coord-node-issuer"
+description = "Independent WIF node issuer: protected reference CA signer, configured external trust, CSR possession and policy-constructed node identities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+coord-authn.workspace = true
+rcgen.workspace = true
+x509-parser.workspace = true
+rustls-pki-types.workspace = true
+time.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+coord-sts.workspace = true
+jsonwebtoken.workspace = true
+x509-parser.workspace = true
