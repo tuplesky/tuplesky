@@ -389,6 +389,16 @@ pub enum HandoffError {
     /// An installation names a terminal root other than the
     /// certificate's.
     WrongTerminalRoot,
+    /// A terminal report came from a voter that is not among the seal's
+    /// signers. Its own fence is not in evidence, so it may still be
+    /// accepting work and what it calls terminal is not; counted, it
+    /// could complete a majority that omits a command chosen by it and a
+    /// sealed voter. A voter that sealed after the certificate was
+    /// formed counts once the seal is certified again over its record.
+    ReporterNotSealed {
+        /// The reporter.
+        replica: ReplicaId,
+    },
     /// A seal and a cancellation both certified one transition. The
     /// stance rules make this unreachable, so finding it is a reason to
     /// stop rather than to choose.
@@ -567,10 +577,19 @@ impl TerminalCertificate {
 /// it, a majority reporting the same root is the terminal state, and
 /// any majority a later attempt reads intersects this one in a voter
 /// that reported once and will report nothing else -- so a coordinator
-/// that dies here is replaced by one that selects the same root rather
-/// than a competing destination. Reports are counted as given; that each
-/// came from its voter's [`StanceLedger::report_terminal`] is what makes
-/// them one per voter.
+/// that dies here is replaced by one that selects the same certificate
+/// rather than a competing destination. Reports are counted as given;
+/// that each came from its voter's [`StanceLedger::report_terminal`] is
+/// what makes them one per voter.
+///
+/// "After the fence" is about each reporter, not only about the
+/// configuration: every report must come from one of `seal`'s signers.
+/// A majority sealing does not fence the rest, and a voter outside the
+/// signers can still accept a command after reporting, so a certificate
+/// it helped prove could omit a command chosen by it together with a
+/// sealed voter -- the latent old completion the certificate exists to
+/// keep. A voter that sealed late is counted by certifying the seal
+/// again with its record among the stances.
 ///
 /// `successor` is copied into the certificate unchecked, because
 /// nothing here can compare it with the transition's opaque subject.
@@ -595,6 +614,11 @@ pub fn select_terminal(
         }
         if report.transition != transition {
             return Err(HandoffError::WrongTransition);
+        }
+        if !seal.signers().contains(&report.voter) {
+            return Err(HandoffError::ReporterNotSealed {
+                replica: report.voter,
+            });
         }
         roots
             .entry(report.terminal_root)

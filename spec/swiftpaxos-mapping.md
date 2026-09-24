@@ -316,6 +316,22 @@ fence.
 | A seal cleared by a timeout, a missing local row or a retry | `[EXT]` rejected | Section 10.3.2; no method clears one |
 | A seal trimmed as settled history | `[EXT]` rejected | Section 17.16.5; the row is retained like a promise |
 
+The terminal certificate is task-56: `coord_checkpoint::handoff`.
+`TerminalStateV1::terminal_root` binds the boundary, the shared
+checkpoint root of the terminal common state, a digest of the
+source-defined selection over the reports at the seal cut, the activated
+floor lineage and the exact successor incarnations -- so "mixed
+evidence" is not a judgement call and racing successor sets cannot both
+be certified, because a different successor set is a different root.
+
+| Item | Status | Where |
+|---|---|---|
+| `TerminalStateV1`, bound by one root | `[EXT]` | Sections 4.8, 10.3.2 |
+| `closure_root` over the `SyncDecision` at the seal cut | `[EXT]` on top of the source selection | Section 4.9; a latent old completion stays represented |
+| `select_certificate`: a majority of sealed old voters, one root | `[EXT]` | delegates the quorum rule to `handoff::select_terminal` |
+| `publish_certificate`: republishes, never becomes another | `[EXT]` | Section 10.3.2: reuse an already selected certificate |
+| A full KV snapshot as the terminal state | `[EXT]` rejected | Section 17.6: complete bytes alone prove nothing |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the

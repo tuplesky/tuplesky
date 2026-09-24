@@ -83,6 +83,13 @@ pub enum HashDomain {
     /// The subject of a checkpoint floor: what every signer of a
     /// quorum-certified floor must have agreed on exactly (task-53).
     CheckpointFloorSubject,
+    /// The terminal root of a membership handoff: the whole of what a
+    /// successor inherits (task-56).
+    HandoffTerminalRoot,
+    /// The closure evidence a terminal certificate binds: the
+    /// source-defined selection over the reports at the seal cut
+    /// (task-56).
+    HandoffClosure,
 }
 
 impl HashDomain {
@@ -107,6 +114,8 @@ impl HashDomain {
             HashDomain::CheckpointFloorSubject => {
                 "tuplesky coord.v1 2026-09 checkpoint-floor-subject"
             }
+            HashDomain::HandoffTerminalRoot => "tuplesky coord.v1 2026-09 handoff-terminal-root",
+            HashDomain::HandoffClosure => "tuplesky coord.v1 2026-09 handoff-closure",
             HashDomain::ConfigurationActivation => {
                 "tuplesky coord.v1 2026-09 configuration-activation"
             }

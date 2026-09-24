@@ -1034,6 +1034,8 @@ pub enum TrimError {
         /// The voter that answered twice.
         voter: ReplicaId,
     },
+    /// The handoff rules refused the evidence (task-56).
+    Handoff(coord_consensus::handoff::HandoffError),
 }
 
 impl fmt::Display for TrimError {
