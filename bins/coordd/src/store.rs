@@ -513,14 +513,15 @@ impl Opened {
         {
             use coord_store_api::engine::{LocalEngine, SnapshotSource};
             let directory = generation.directory().to_path_buf();
-            let view = generation
-                .engine()
-                .reader()
-                .snapshot()
-                .map_err(|e| StoreError::Refused {
-                    root: show(&directory),
-                    reason: format!("the activation record could not be read: {e}"),
-                })?;
+            let view =
+                generation
+                    .engine()
+                    .reader()
+                    .snapshot()
+                    .map_err(|e| StoreError::Refused {
+                        root: show(&directory),
+                        reason: format!("the activation record could not be read: {e}"),
+                    })?;
             coord_checkpoint::feature::admit(&view).map_err(|e| StoreError::Refused {
                 root: show(&directory),
                 reason: format!("{e}"),
