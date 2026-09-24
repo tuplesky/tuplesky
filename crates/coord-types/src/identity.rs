@@ -52,6 +52,8 @@ pub enum HashDomain {
     SharedCheckpointRoot,
     /// Root of a `LocalRecoveryCheckpointV1`.
     LocalCheckpointRoot,
+    /// Digest of one encoded `SharedCheckpointV1` chunk (task-49).
+    SharedCheckpointChunk,
     /// Chain digest of a finalized frame (task-o01).
     FinalizedFrame,
     /// One-time grant/code commitments stored in `auth_grant_v1`.
@@ -85,6 +87,9 @@ impl HashDomain {
             HashDomain::JournalBatch => "tuplesky coord.v1 2026-09 journal-batch",
             HashDomain::SharedCheckpointRoot => "tuplesky coord.v1 2026-09 shared-checkpoint-root",
             HashDomain::LocalCheckpointRoot => "tuplesky coord.v1 2026-09 local-checkpoint-root",
+            HashDomain::SharedCheckpointChunk => {
+                "tuplesky coord.v1 2026-09 shared-checkpoint-chunk"
+            }
             HashDomain::FinalizedFrame => "tuplesky coord.v1 2026-09 finalized-frame",
             HashDomain::AuthGrantCommitment => "tuplesky coord.v1 2026-09 auth-grant-commitment",
             HashDomain::DependencyPath => "tuplesky coord.v1 2026-09 dependency-path",
