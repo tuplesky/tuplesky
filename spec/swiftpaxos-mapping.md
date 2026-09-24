@@ -332,6 +332,16 @@ be certified, because a different successor set is a different root.
 | `publish_certificate`: republishes, never becomes another | `[EXT]` | Section 10.3.2: reuse an already selected certificate |
 | A full KV snapshot as the terminal state | `[EXT]` rejected | Section 17.6: complete bytes alone prove nothing |
 
+Activation is task-57, in the same module:
+
+| Item | Status | Where |
+|---|---|---|
+| `TerminalInstallV1`, written only from an install receipt with the certificate's root and boundary | `[EXT]` | Section 10.3.2; evidence of holding the state |
+| `activate_successor`: the successor set comes from the certificate, not from a caller | `[EXT]` | an activation cannot name a successor the old quorum did not certify |
+| `publish_handoff_activation`: republishes, never becomes another | `[EXT]` | a duplicate activation is a no-op, not a second grant |
+| `LocalEvidence`: what one store answers, combined with gathered stances | `[EXT]` | Section 10.3.2; `resume` decides, from records |
+| A coordinator's assurance that a replica installed | `[EXT]` rejected | Section 17.6 |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the

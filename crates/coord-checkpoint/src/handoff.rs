@@ -44,26 +44,39 @@
 //! is the root of a verified checkpoint plus the selection, and neither
 //! can be produced by copying files.
 //!
+//! Task-57 continues in the same file: [`record_install`] is one
+//! successor replica's durable record that it *holds* the terminal
+//! state, written only from an install receipt whose verified root is
+//! the certificate's, for the certified incarnation, and read off the
+//! installing store itself by [`record_local_install`]; and [`activate_successor`] turns a majority of
+//! those into the authority to serve. [`LocalEvidence`] is what one
+//! store can answer about a handoff, for
+//! [`coord_consensus::handoff::resume`] to decide where a replacement
+//! coordinator carries on.
+//!
 //! The module writes rows and computes digests; it drives nothing.
-//! Asking the old voters for their reports and telling the successor to
-//! install are task-57's.
+//! Asking the old voters for their reports, moving the checkpoint to
+//! the successor and telling anyone to install are the runtime's.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use coord_consensus::handoff::{
-    HandoffError, SealCertificate, TerminalReport, Transition, select_terminal,
+    ActivationCertificate, HandoffError, InstallRecord, SealCertificate, TerminalCertificate,
+    TerminalReport, Transition, activate, select_terminal,
 };
 use coord_consensus::quorum::EpochVoters;
 use coord_consensus::recovery::SyncDecision;
 use coord_core::effect::StoreUpdate;
-use coord_store_api::engine::{EngineError, OrderedRead};
-use coord_store_api::registry::Collection;
+use coord_store_api::engine::{Direction, EngineError, OrderedRead, ScanRequest};
+use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::identity::{Digest32, HashDomain};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use serde::{Deserialize, Serialize};
 
+use crate::install::{INSTALLED_KEY, InstalledCheckpointV1};
 use crate::manifest::CheckpointBoundary;
-use crate::trim::{TrimError, decode_record, encode_record};
+use crate::trim::{TrimError, TrimLimits, corrupt, decode_record, encode_record};
 
 /// Record kind of the published terminal certificate.
 pub const TERMINAL_RECORD_KIND: u16 = 0x0006;
@@ -289,4 +302,372 @@ pub fn publish_certificate(
         key: TERMINAL_KEY.to_vec(),
         value: Some(next.encode()?),
     })
+}
+
+// ---------------------------------------------------------------------
+// task-57: installing the terminal state and activating the successor.
+// ---------------------------------------------------------------------
+
+/// Record kind of a successor replica's installation record.
+pub const INSTALL_RECORD_KIND: u16 = 0x0007;
+/// Record kind of the published handoff activation.
+pub const HANDOFF_ACTIVATION_RECORD_KIND: u16 = 0x0008;
+/// Key prefix of the installation records; the replica identity follows.
+pub const INSTALL_KEY_PREFIX: &[u8] = b"handoff_install_v1/";
+/// Key of the published handoff activation.
+pub const HANDOFF_ACTIVATION_KEY: &[u8] = b"handoff_activation_v1";
+
+/// One successor replica's durable record that it holds the terminal
+/// state the certificate names.
+///
+/// Written only from an install receipt whose verified root is the
+/// certificate's `state_root`, so it is evidence of *having* the state
+/// rather than of having been told to say so. Complete bytes are not
+/// the same as the right bytes, and a coordinator's assurance is
+/// neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalInstallV1 {
+    /// The installing replica.
+    pub replica: ReplicaId,
+    /// The transition it is part of.
+    pub transition: Transition,
+    /// The terminal root it installed.
+    pub terminal_root: Digest32,
+}
+
+impl TerminalInstallV1 {
+    /// Encode as a `checkpoint_v1` row value.
+    pub fn encode(&self) -> Result<Vec<u8>, EngineError> {
+        encode_record(INSTALL_RECORD_KIND, self, "handoff install encode")
+    }
+
+    /// Decode a `checkpoint_v1` row value.
+    pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
+        decode_record(INSTALL_RECORD_KIND, bytes, "handoff install")
+    }
+
+    /// What this record is, in the consensus vocabulary.
+    pub const fn record(&self) -> InstallRecord {
+        InstallRecord {
+            replica: self.replica,
+            transition: self.transition,
+            terminal_root: self.terminal_root,
+        }
+    }
+}
+
+/// `checkpoint_v1` key of one successor replica's installation record.
+pub fn install_key(replica: &ReplicaId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(INSTALL_KEY_PREFIX.len() + ReplicaId::LEN);
+    key.extend_from_slice(INSTALL_KEY_PREFIX);
+    key.extend_from_slice(replica.as_bytes());
+    key
+}
+
+/// The update recording that `installer` installed the certificate's
+/// terminal state, from the receipt of the install that did it.
+///
+/// The receipt's verified root must be the certificate's `state_root`
+/// and its boundary the certificate's boundary. That is what "the new
+/// quorum installs *identical* terminal state" means here: the record
+/// cannot be written from a coordinator saying so, only from an install
+/// this replica actually performed and verified.
+///
+/// `installer` is the replica *and* incarnation, and both must be the
+/// certificate's entry: a replica outside the successor set is not part
+/// of the quorum that activates, and an obsolete incarnation of a member
+/// is not the member the old quorum certified -- counting either would
+/// let something that holds nothing stand in for one that must.
+///
+/// The receipt is node-private and names no replica, so the identity
+/// here is the caller's statement. [`record_local_install`] is the form
+/// that does not take it on trust: it reads the identity and the receipt
+/// from the installing store itself, which is how a runtime driver must
+/// produce the record. This form exists for a caller that has already
+/// read both from that store; handed one receipt and a list of successor
+/// identities it would write a record for each, which is exactly what a
+/// driver must never do.
+pub fn record_install(
+    certificate: &TerminalCertificateV1,
+    installer: (ReplicaId, ReplicaIncarnation),
+    receipt: &InstalledCheckpointV1,
+) -> Result<StoreUpdate, TrimError> {
+    let (replica, incarnation) = installer;
+    if certificate.state.successors.get(&replica) != Some(&incarnation) {
+        return Err(TrimError::Handoff(HandoffError::NotAVoter { replica }));
+    }
+    if receipt.root != certificate.state.state_root
+        || receipt.boundary != certificate.state.boundary
+    {
+        return Err(TrimError::Handoff(HandoffError::WrongTerminalRoot));
+    }
+    let record = TerminalInstallV1 {
+        replica,
+        transition: certificate.transition(),
+        terminal_root: certificate.terminal_root(),
+    };
+    Ok(StoreUpdate {
+        collection: Collection::CheckpointV1.id(),
+        key: install_key(&replica),
+        value: Some(record.encode()?),
+    })
+}
+
+/// The update recording the install this store performed, with the
+/// installer's identity read from the store rather than supplied.
+///
+/// The replica and incarnation are the store's own `meta_v1` identity,
+/// the one the install kept (the artifact carries none), and the
+/// receipt is the store's own. One receipt therefore yields one record,
+/// for the replica and incarnation that performed the install, and
+/// cannot be relabelled as another successor's.
+pub fn record_local_install<V: OrderedRead>(
+    certificate: &TerminalCertificateV1,
+    installing: &V,
+) -> Result<StoreUpdate, TrimError> {
+    let meta = Collection::MetaV1.id();
+    let replica = installing
+        .get(meta, meta_fields::REPLICA_ID)?
+        .ok_or_else(|| corrupt("installing store has no replica identity"))
+        .and_then(|b| ReplicaId::from_slice(&b).map_err(|_| corrupt("replica identity")))?;
+    let incarnation = installing
+        .get(meta, meta_fields::INCARNATION)?
+        .ok_or_else(|| corrupt("installing store has no incarnation"))
+        .and_then(|b| {
+            <[u8; 8]>::try_from(b.as_slice())
+                .ok()
+                .and_then(|b| ReplicaIncarnation::new(u64::from_be_bytes(b)).ok())
+                .ok_or_else(|| corrupt("incarnation"))
+        })?;
+    let receipt = installing
+        .get(Collection::CheckpointV1.id(), INSTALLED_KEY)?
+        .ok_or(TrimError::Handoff(HandoffError::WrongTerminalRoot))
+        .and_then(|b| Ok(InstalledCheckpointV1::decode(&b)?))?;
+    record_install(certificate, (replica, incarnation), &receipt)
+}
+
+/// The installation records this node durably holds, in replica order.
+pub fn read_installs<V: OrderedRead>(
+    view: &V,
+    limits: &TrimLimits,
+) -> Result<Vec<TerminalInstallV1>, TrimError> {
+    limits.validate()?;
+    let mut out: Vec<TerminalInstallV1> = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            Collection::CheckpointV1.id(),
+            &ScanRequest {
+                lower: Bound::Included(INSTALL_KEY_PREFIX.to_vec()),
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.clone(),
+                max_rows: limits.page_rows(),
+                max_bytes: limits.page_bytes(),
+            },
+        )?;
+        let mut past_prefix = false;
+        for row in &page.rows {
+            let Some(suffix) = row.key.strip_prefix(INSTALL_KEY_PREFIX) else {
+                past_prefix = true;
+                break;
+            };
+            if out.len() as u32 >= limits.max_acknowledgements {
+                return Err(TrimError::AcknowledgementBudget {
+                    limit: limits.max_acknowledgements,
+                });
+            }
+            let replica = ReplicaId::from_slice(suffix).map_err(|_| corrupt("install key"))?;
+            let record = TerminalInstallV1::decode(&row.value)?;
+            if record.replica != replica {
+                return Err(TrimError::Engine(corrupt(
+                    "install replica differs from its key",
+                )));
+            }
+            out.push(record);
+        }
+        match page.rows.last() {
+            Some(last) if !past_prefix && !page.exhausted => resume = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The successor's authority to serve, durably.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffActivationV1 {
+    /// The transition it completes.
+    pub transition: Transition,
+    /// The terminal state the successor installed.
+    pub terminal_root: Digest32,
+    /// The successor replicas that installed it.
+    pub installers: BTreeSet<ReplicaId>,
+}
+
+impl HandoffActivationV1 {
+    /// Encode as a `checkpoint_v1` row value.
+    pub fn encode(&self) -> Result<Vec<u8>, EngineError> {
+        encode_record(
+            HANDOFF_ACTIVATION_RECORD_KIND,
+            self,
+            "handoff activation encode",
+        )
+    }
+
+    /// Decode a `checkpoint_v1` row value.
+    pub fn decode(bytes: &[u8]) -> Result<Self, EngineError> {
+        decode_record(HANDOFF_ACTIVATION_RECORD_KIND, bytes, "handoff activation")
+    }
+}
+
+/// Activate the successor of `certificate` from its installations.
+///
+/// A majority of the successor set must have durably installed that
+/// exact terminal root. The quorum rule and the root check are
+/// task-54's; what this adds is that the successor set comes from the
+/// certificate rather than from a caller, so an activation cannot be
+/// computed against a different successor than the one the old quorum
+/// certified.
+pub fn activate_successor(
+    certificate: &TerminalCertificateV1,
+    installs: &[TerminalInstallV1],
+) -> Result<HandoffActivationV1, TrimError> {
+    let successor = certificate
+        .successor_voters()
+        .ok_or(TrimError::Handoff(HandoffError::WrongTransition))?;
+    let terminal = TerminalCertificate::recovered(
+        certificate.transition(),
+        certificate.terminal_root(),
+        successor.voters().clone(),
+        certificate.signers.clone(),
+    );
+    let records: Vec<InstallRecord> = installs.iter().map(TerminalInstallV1::record).collect();
+    let activation = activate(&successor, &terminal, &records).map_err(TrimError::Handoff)?;
+    Ok(HandoffActivationV1 {
+        transition: activation.transition(),
+        terminal_root: activation.terminal_root(),
+        installers: activation.installers().clone(),
+    })
+}
+
+/// The published activation, if this node has one.
+pub fn published_activation<V: OrderedRead>(
+    view: &V,
+) -> Result<Option<HandoffActivationV1>, TrimError> {
+    match view.get(Collection::CheckpointV1.id(), HANDOFF_ACTIVATION_KEY)? {
+        None => Ok(None),
+        Some(bytes) => Ok(Some(HandoffActivationV1::decode(&bytes)?)),
+    }
+}
+
+/// The update publishing `next`, the activation of `certificate`.
+///
+/// An activation is reused, never recomputed: the identical one
+/// republishes and any other is refused. A duplicate activation is
+/// therefore a no-op rather than a second grant of authority, which is
+/// what a coordinator retrying after a lost reply needs it to be.
+///
+/// The first publication is checked against the certificate too, since
+/// the row is what [`LocalEvidence`] later hands to `resume` as the
+/// answer: its transition and root must be the certificate's and its
+/// installers a majority of the certificate's successor. That keeps an
+/// activation assembled by hand -- the fields are public, so the type
+/// can be built without [`activate_successor`] -- from being published
+/// over an empty or minority installer set. The installers are the
+/// activation's claim; that each of them holds the root is what
+/// [`activate_successor`] checked from their records, which is why it is
+/// the constructor a driver uses.
+pub fn publish_handoff_activation(
+    certificate: &TerminalCertificateV1,
+    next: &HandoffActivationV1,
+    published: Option<&HandoffActivationV1>,
+) -> Result<StoreUpdate, TrimError> {
+    if next.transition != certificate.transition() {
+        return Err(TrimError::Handoff(HandoffError::WrongTransition));
+    }
+    if next.terminal_root != certificate.terminal_root() {
+        return Err(TrimError::Handoff(HandoffError::WrongTerminalRoot));
+    }
+    let successor = certificate
+        .successor_voters()
+        .ok_or(TrimError::Handoff(HandoffError::WrongTransition))?;
+    if let Some(stranger) = next.installers.iter().find(|r| !successor.is_voter(r)) {
+        return Err(TrimError::Handoff(HandoffError::NotAVoter {
+            replica: *stranger,
+        }));
+    }
+    if next.installers.len() < successor.majority() {
+        return Err(TrimError::Handoff(HandoffError::NoQuorum {
+            have: next.installers.len(),
+            need: successor.majority(),
+        }));
+    }
+    if let Some(current) = published {
+        if current.transition != next.transition {
+            return Err(TrimError::Handoff(HandoffError::WrongTransition));
+        }
+        if current.terminal_root != next.terminal_root {
+            return Err(TrimError::Handoff(HandoffError::WrongTerminalRoot));
+        }
+    }
+    Ok(StoreUpdate {
+        collection: Collection::CheckpointV1.id(),
+        key: HANDOFF_ACTIVATION_KEY.to_vec(),
+        value: Some(next.encode()?),
+    })
+}
+
+/// What one node's store durably says about a transition.
+///
+/// Deliberately not the whole of [`Evidence`]: the old voters' stances
+/// live on the old voters, and a coordinator gathers them over the
+/// wire. This is what a store can answer for itself, and a caller
+/// combines it with the stances it collected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalEvidence {
+    /// The selected certificate, if published here.
+    pub certificate: Option<TerminalCertificateV1>,
+    /// Installation records held here.
+    pub installs: Vec<TerminalInstallV1>,
+    /// The activation, if published here.
+    pub activation: Option<HandoffActivationV1>,
+}
+
+impl LocalEvidence {
+    /// Read everything this store holds about a handoff.
+    pub fn read<V: OrderedRead>(view: &V, limits: &TrimLimits) -> Result<Self, TrimError> {
+        Ok(LocalEvidence {
+            certificate: published_certificate(view)?,
+            installs: read_installs(view, limits)?,
+            activation: published_activation(view)?,
+        })
+    }
+
+    /// The consensus-level records, for [`coord_consensus::handoff::resume`].
+    pub fn records(
+        &self,
+    ) -> (
+        Option<TerminalCertificate>,
+        Vec<InstallRecord>,
+        Option<ActivationCertificate>,
+    ) {
+        let certificate = self.certificate.as_ref().and_then(|c| {
+            Some(TerminalCertificate::recovered(
+                c.transition(),
+                c.terminal_root(),
+                c.successor_voters()?.voters().clone(),
+                c.signers.clone(),
+            ))
+        });
+        let installs = self
+            .installs
+            .iter()
+            .map(TerminalInstallV1::record)
+            .collect();
+        let activation = self.activation.as_ref().map(|a| {
+            ActivationCertificate::recovered(a.transition, a.terminal_root, a.installers.clone())
+        });
+        (certificate, installs, activation)
+    }
 }
