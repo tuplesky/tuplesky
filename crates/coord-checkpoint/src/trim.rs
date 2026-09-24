@@ -23,7 +23,14 @@
 //!   refused outright: observers hold catch-up state, not obligations, and
 //!   supply no trim votes.
 //! * [`TrimmedFloorV1`], published in `checkpoint_v1` **before** the first
-//!   deletion and never lowered. It is the fence: once it is durable, a
+//!   deletion and never lowered. [`plan_trim`] enforces the first half: it
+//!   refuses to plan any deletion unless the store it reads already holds a
+//!   durable floor at or above the one it is given, so deletions can never
+//!   be committed ahead of, or in the same batch as, their fence.
+//!   [`publish_floor_in`] enforces the second: it re-reads the floor inside
+//!   the write transaction that replaces it, so a publication planned from
+//!   a stale snapshot cannot lower a floor committed meanwhile. It is the
+//!   fence: once it is durable, a
 //!   delayed message about state at or below it is answered from the
 //!   retained common outcome ([`TrimFence`]) instead of re-creating the
 //!   protocol rows that trimming removed, and a late acknowledgement of an
@@ -38,9 +45,13 @@
 //!   bounded by the number of epochs, and stays.
 //! * a bound **Sync row**. Section 4.9 requires a selection to be reused
 //!   after a crash, never reselected.
-//! * anything for a command that is not executed at or below the floor, or
-//!   whose record is not in [`Phase::Executed`]: an unresolved obligation is
-//!   never evicted, under any pressure.
+//! * anything for a command that `executed_v1` does not place at or below
+//!   the floor: an unresolved obligation is never evicted, under any
+//!   pressure. The dependency row's own phase is not consulted, because
+//!   execution is never written back into it: normal execution records the
+//!   `executed_v1` identity and leaves the durable row at `Accept` or
+//!   `Commit`, and recovery restores the executed phase from `executed_v1`
+//!   too.
 //! * anything a retained command still names as a direct dependency. The
 //!   retained command's own record survives with its dependency identities,
 //!   and the trimmed dependency's outcome stays in the common collections;
@@ -67,13 +78,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Bound;
 
-use coord_consensus::phase::Phase;
 use coord_consensus::rows::{
     DEPENDENCY_TAG, PROPOSAL_TAG, SYNC_TAG, decode_dependency, decode_proposal,
 };
 use coord_core::effect::StoreUpdate;
 use coord_storage::codecs;
-use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
+use coord_store_api::engine::{
+    Direction, EngineError, ErrorClass, OrderedRead, ScanRequest, WriteTxn,
+};
 use coord_store_api::envelope::StoreEnvelopeV1;
 use coord_store_api::registry::Collection;
 use coord_types::CommandId;
@@ -422,6 +434,29 @@ pub fn publish_floor(
     })
 }
 
+/// Publish `floor` inside `txn`, checked against the floor the transaction
+/// itself reads.
+///
+/// [`publish_floor`] compares against whatever `published` value the caller
+/// read, and the engine applies a put unconditionally, so a caller that
+/// planned from an older snapshot (a retry after an indeterminate commit is
+/// the realistic one) could commit a floor below one that landed meanwhile,
+/// and rows already deleted under the newer floor would lose their fence.
+/// Reading `FLOOR_KEY` through the write transaction, which is the store's
+/// only writer, makes the regression check hold at the moment of the write.
+/// On an error nothing is written; the caller aborts or commits whatever
+/// else the transaction holds.
+pub fn publish_floor_in<T: WriteTxn>(txn: &mut T, floor: &TrimFloor) -> Result<(), TrimError> {
+    let current = published_floor(txn)?;
+    let update = publish_floor(floor, current.as_ref())?;
+    let value = update
+        .value
+        .as_ref()
+        .ok_or_else(|| corrupt("trim floor update without a value"))?;
+    txn.put(update.collection, &update.key, value)?;
+    Ok(())
+}
+
 /// What a delayed message may still do once a floor is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FenceDecision {
@@ -647,6 +682,12 @@ pub struct TrimPlan {
 /// [`TrimError::ExaminationBudget`] and deletes nothing, which is why the
 /// backpressure bound is required to be strictly smaller.
 ///
+/// The floor must already be durable in `view`: a store whose published
+/// floor is absent, or below `floor`, is refused with
+/// [`TrimError::FloorNotDurable`] and nothing is planned. Deletions planned
+/// here therefore always follow their fence into the store; a crash after
+/// them finds the floor that rejects delayed traffic for what they removed.
+///
 /// Deleting the batch is idempotent and retryable: the rows are gone, so
 /// the next step surveys what is left. A crash between the published floor
 /// and the deletions leaves the floor in force and the rows still there.
@@ -657,6 +698,7 @@ pub fn plan_trim<V: OrderedRead>(
 ) -> Result<TrimPlan, TrimError> {
     limits.validate()?;
     check_store_origin(view, floor)?;
+    check_floor_durable(view, floor)?;
     let boundary = floor.boundary.execution_position;
     // Every epoch at or below the floor's, through its Sync rows; epochs
     // above the floor are outside the acknowledged history entirely.
@@ -777,6 +819,34 @@ fn check_store_origin<V: OrderedRead>(view: &V, floor: &TrimmedFloorV1) -> Resul
     Ok(())
 }
 
+/// The store must already hold a published floor that covers `floor`: same
+/// origin, a configuration and execution position at or above it, and the
+/// same root when it names the same boundary. A durable floor above the
+/// offered one is fine, since planning under the lower one deletes less.
+fn check_floor_durable<V: OrderedRead>(view: &V, floor: &TrimmedFloorV1) -> Result<(), TrimError> {
+    let Some(durable) = published_floor(view)? else {
+        return Err(TrimError::FloorNotDurable);
+    };
+    if durable.cluster != floor.cluster {
+        return Err(TrimError::FloorOriginMismatch { field: "cluster" });
+    }
+    if durable.domain != floor.domain {
+        return Err(TrimError::FloorOriginMismatch { field: "domain" });
+    }
+    if durable.configuration < floor.configuration
+        || durable.boundary.execution_position < floor.boundary.execution_position
+    {
+        return Err(TrimError::FloorNotDurable);
+    }
+    if durable.configuration == floor.configuration
+        && durable.boundary == floor.boundary
+        && durable.root != floor.root
+    {
+        return Err(TrimError::FloorConflict);
+    }
+    Ok(())
+}
+
 /// What one protocol row is for trimming.
 enum Verdict {
     /// Keep it, and keep whatever it depends on.
@@ -802,13 +872,15 @@ fn classify<V: OrderedRead>(
         return Ok(Verdict::Retain);
     };
     match tag {
-        // A dependency row is eligible only when the record itself says the
-        // command executed and `executed_v1` places that execution at or
-        // below the boundary. Anything else is an obligation.
+        // A dependency row is eligible only when `executed_v1` places the
+        // command's execution at or below the boundary. Anything else is an
+        // obligation. The row's own phase says nothing either way: the
+        // durable row stays at `Accept` or `Commit` after execution, which
+        // is recorded only in `executed_v1`.
         DEPENDENCY_TAG if key.len() == 41 => {
             let command = command_of(key)?;
             let record = decode_dependency(value)?;
-            if record.phase == Phase::Executed && executed_within(view, &command, boundary)? {
+            if executed_within(view, &command, boundary)? {
                 Ok(Verdict::Eligible(command, record.deps))
             } else {
                 Ok(Verdict::RetainPinning(record.deps))
@@ -894,6 +966,9 @@ pub enum TrimError {
     /// Two different roots for the same boundary in the same configuration:
     /// a disagreement about history, not a republication.
     FloorConflict,
+    /// The store holds no published floor at or above the one offered for
+    /// trimming. Deletions are planned only behind a durable fence.
+    FloorNotDurable,
     /// The floor names another cluster or domain than the published one, or
     /// than the store it would be applied to.
     FloorOriginMismatch {

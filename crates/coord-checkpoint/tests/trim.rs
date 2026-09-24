@@ -15,7 +15,7 @@ use coord_checkpoint::manifest::{CheckpointBoundary, SharedManifestV1};
 use coord_checkpoint::trim::{
     ACK_KEY_PREFIX, CheckpointAckV1, FLOOR_KEY, FenceDecision, TrimError, TrimFence, TrimFloor,
     TrimLimits, TrimPlan, TrimmedFloorV1, ack_key, ack_update, establish_floor, plan_trim,
-    publish_floor, published_floor, read_acks, trim_backpressure,
+    publish_floor, publish_floor_in, published_floor, read_acks, trim_backpressure,
 };
 use coord_consensus::recovery::SyncDecision;
 use coord_consensus::rows::{
@@ -282,11 +282,15 @@ fn protocol_rows() -> Vec<Row> {
         })
         .unwrap(),
     );
+    // Executed commands keep the phase their durable row had before
+    // execution, as in production: execution is recorded only in
+    // `executed_v1`, never written back into the dependency row.
+    //
     // Settled below the boundary, depending on each other in a chain.
     for (n, deps) in [(1u8, &[][..]), (2, &[1][..]), (3, &[2][..])] {
         put(
             dependency_key(e, &command(n)),
-            encode_dependency(&record(Phase::Executed, deps)).unwrap(),
+            encode_dependency(&record(Phase::Accept, deps)).unwrap(),
         );
         put(
             proposal_key(e, &command(n)),
@@ -295,10 +299,10 @@ fn protocol_rows() -> Vec<Row> {
     }
     // Settled below the boundary and named by nothing: these are what a
     // trim can actually reclaim once the chain above is pinned.
-    for n in [7u8, 8] {
+    for (n, phase) in [(7u8, Phase::Accept), (8, Phase::Commit)] {
         put(
             dependency_key(e, &command(n)),
-            encode_dependency(&record(Phase::Executed, &[])).unwrap(),
+            encode_dependency(&record(phase, &[])).unwrap(),
         );
         put(
             proposal_key(e, &command(n)),
@@ -317,7 +321,7 @@ fn protocol_rows() -> Vec<Row> {
     // Executed beyond the boundary.
     put(
         dependency_key(e, &command(5)),
-        encode_dependency(&record(Phase::Executed, &[])).unwrap(),
+        encode_dependency(&record(Phase::Commit, &[])).unwrap(),
     );
     // Committed but not executed.
     put(
@@ -328,7 +332,7 @@ fn protocol_rows() -> Vec<Row> {
     // acknowledged history entirely.
     put(
         dependency_key(epoch(EPOCH + 1), &command(1)),
-        encode_dependency(&record(Phase::Executed, &[])).unwrap(),
+        encode_dependency(&record(Phase::Accept, &[])).unwrap(),
     );
     rows
 }
@@ -380,6 +384,21 @@ fn voter_store() -> ModelEngine {
         .chain(identity_rows())
         .collect();
     seed(&mut engine, rows);
+    engine
+}
+
+/// Publish the fixture's floor durably, as trimming requires before it
+/// plans any deletion.
+fn publish<E: LocalEngine>(engine: &mut E) {
+    let mut tx = engine.begin_write().unwrap();
+    publish_floor_in(&mut tx, &floor()).unwrap();
+    tx.commit_durable().unwrap();
+}
+
+/// A voter's store with the unanimous floor already published.
+fn trimmable_store() -> ModelEngine {
+    let mut engine = voter_store();
+    publish(&mut engine);
     engine
 }
 
@@ -634,7 +653,7 @@ fn a_missing_voter_stops_trimming_with_bounded_backpressure_instead_of_evicting_
 
 #[test]
 fn trimming_deletes_only_settled_below_floor_protocol_rows_and_keeps_every_obligation() {
-    let mut engine = voter_store();
+    let mut engine = trimmable_store();
     let before = protocol_keys(&engine);
     let limits = TrimLimits::default();
 
@@ -696,7 +715,7 @@ fn trimming_deletes_only_settled_below_floor_protocol_rows_and_keeps_every_oblig
 
 #[test]
 fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
-    let engine = voter_store();
+    let engine = trimmable_store();
     let plan = step(&engine, &TrimLimits::default());
     let e = epoch(EPOCH);
 
@@ -735,7 +754,7 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
     rows.push((
         Collection::ProtocolV1,
         dependency_key(e, &command(4)),
-        encode_dependency(&record(Phase::Executed, &[3])).unwrap(),
+        encode_dependency(&record(Phase::Accept, &[3])).unwrap(),
     ));
     rows.push((
         Collection::ExecutedV1,
@@ -748,6 +767,7 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
         .unwrap(),
     ));
     seed(&mut settled, rows);
+    publish(&mut settled);
     let plan = step(&settled, &TrimLimits::default());
     let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| u.key.clone()).collect();
     assert_eq!(plan.pinned, 0);
@@ -758,8 +778,8 @@ fn a_retained_command_pins_the_protocol_rows_of_the_dependencies_it_names() {
 
 #[test]
 fn a_trim_step_is_bounded_and_repeating_it_converges_on_the_same_retained_state() {
-    let mut whole = voter_store();
-    let mut piecemeal = voter_store();
+    let mut whole = trimmable_store();
+    let mut piecemeal = trimmable_store();
     let limits = TrimLimits::default();
 
     assert_eq!(trim_to_completion(&mut whole, &limits), 1);
@@ -773,7 +793,7 @@ fn a_trim_step_is_bounded_and_repeating_it_converges_on_the_same_retained_state(
 
     // A survey that cannot complete deletes nothing at all: no row can be
     // shown to be unpinned from a partial view of the epoch.
-    let engine = voter_store();
+    let engine = trimmable_store();
     let view = engine.reader().snapshot().unwrap();
     let cramped = TrimLimits {
         max_protocol_rows: 2,
@@ -799,10 +819,12 @@ fn a_trim_step_is_bounded_and_repeating_it_converges_on_the_same_retained_state(
 
 #[test]
 fn a_delayed_message_cannot_revive_state_below_the_published_floor() {
-    let mut engine = voter_store();
+    let mut engine = trimmable_store();
     trim_to_completion(&mut engine, &TrimLimits::default());
-    let fence = TrimFence::new(published());
     let view = engine.reader().snapshot().unwrap();
+    // The fence is built from the floor the store holds, as a restarted
+    // node builds it, not from a value that was never persisted.
+    let fence = TrimFence::new(published_floor(&view).unwrap().unwrap());
 
     // A command executed at or below the floor is settled: its protocol
     // rows are gone and the retained execution record answers for it.
@@ -891,7 +913,7 @@ fn the_published_floor_never_moves_backwards_under_a_late_acknowledgement() {
         publish_floor(&foreign, Some(&current)),
         Err(TrimError::FloorOriginMismatch { field: "cluster" })
     );
-    let engine = voter_store();
+    let engine = trimmable_store();
     let view = engine.reader().snapshot().unwrap();
     let mut elsewhere = published();
     elsewhere.domain = DomainId([9; 16]);
@@ -903,7 +925,7 @@ fn the_published_floor_never_moves_backwards_under_a_late_acknowledgement() {
 
 #[test]
 fn trimming_leaves_public_mvcc_common_state_and_the_local_journal_stamp_untouched() {
-    let mut engine = voter_store();
+    let mut engine = trimmable_store();
     let common: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Collection::ALL
         .iter()
         .filter(|c| **c != Collection::ProtocolV1)
@@ -953,7 +975,7 @@ fn mvcc_collection_and_protocol_trimming_decide_different_retention() {
     // collection deletes history under the replicated retention floor and
     // never a protocol row; trimming deletes protocol rows under the
     // all-voter floor and never a history row.
-    let mut engine = voter_store();
+    let mut engine = trimmable_store();
     let protocol_before = protocol_keys(&engine);
 
     let gc = plan_gc(
@@ -1017,6 +1039,7 @@ fn an_unrecognized_protocol_row_is_retained_rather_than_deleted() {
         b"future".to_vec(),
     ));
     seed(&mut engine, rows);
+    publish(&mut engine);
 
     let plan = step(&engine, &TrimLimits::default());
     let deleted: BTreeSet<Vec<u8>> = plan.updates.iter().map(|u| u.key.clone()).collect();
@@ -1052,6 +1075,7 @@ fn a_corrupt_protocol_or_execution_record_stops_the_trim_without_deleting_anythi
         rows.retain(|(c, k, _)| !(*c == collection && *k == key));
         rows.push((collection, key.clone(), value));
         seed(&mut engine, rows);
+        publish(&mut engine);
         let before = protocol_keys(&engine);
         let view = engine.reader().snapshot().unwrap();
         assert!(
@@ -1108,7 +1132,7 @@ fn recovery_after_a_trim_knows_how_far_the_store_executed() {
     // the durable applied position, so a store whose executed prefix has
     // been fully trimmed reported zero: the next command would be
     // planned at a position the store had already used.
-    let mut engine = voter_store();
+    let mut engine = trimmable_store();
     let before = {
         let view = engine.reader().snapshot().unwrap();
         read_protocol(&view, epoch(EPOCH), ViewBudget::default())
@@ -1167,7 +1191,7 @@ fn a_trim_keeps_every_dependency_a_retained_command_can_reach() {
     // so closure traversal after a restart stopped at a command it could
     // not resolve. The chain in the fixture is 4 -> 3 -> 2 -> 1, with 4
     // unresolved.
-    let mut engine = voter_store();
+    let mut engine = trimmable_store();
     trim_to_completion(&mut engine, &TrimLimits::default());
     let remaining = protocol_keys(&engine);
     let e = epoch(EPOCH);
@@ -1190,4 +1214,135 @@ fn a_trim_keeps_every_dependency_a_retained_command_can_reach() {
             );
         }
     }
+}
+
+#[test]
+fn a_plan_is_refused_until_its_floor_is_durable() {
+    // Deletions committed ahead of their floor, or in the same batch, leave
+    // a crash with rows gone and no fence to reject delayed traffic for
+    // them. Planning therefore reads the floor from the store it plans
+    // against, never from the caller.
+    let mut engine = voter_store();
+    let before = protocol_keys(&engine);
+    let limits = TrimLimits::default();
+    {
+        let view = engine.reader().snapshot().unwrap();
+        assert_eq!(
+            plan_trim(&view, &published(), &limits),
+            Err(TrimError::FloorNotDurable),
+            "no floor is durable yet"
+        );
+    }
+
+    // A durable floor below the offered one does not cover it; planning
+    // under the durable floor itself is fine.
+    let mut lower = floor();
+    lower.boundary.execution_position = pos(FLOOR_POSITION - 1);
+    lower.root = Digest32([0x77; 32]);
+    let mut tx = engine.begin_write().unwrap();
+    publish_floor_in(&mut tx, &lower).unwrap();
+    tx.commit_durable().unwrap();
+    {
+        let view = engine.reader().snapshot().unwrap();
+        assert_eq!(
+            plan_trim(&view, &published(), &limits),
+            Err(TrimError::FloorNotDurable)
+        );
+        assert!(plan_trim(&view, &lower.published(), &limits).is_ok());
+    }
+    assert_eq!(protocol_keys(&engine), before, "nothing was deleted");
+
+    // Once the offered floor is durable the plan proceeds, and a floor that
+    // names the same boundary with another root is still refused.
+    publish(&mut engine);
+    let view = engine.reader().snapshot().unwrap();
+    assert!(
+        !plan_trim(&view, &published(), &limits)
+            .unwrap()
+            .updates
+            .is_empty()
+    );
+    let mut conflicting = published();
+    conflicting.root = Digest32([0xee; 32]);
+    assert_eq!(
+        plan_trim(&view, &conflicting, &limits),
+        Err(TrimError::FloorConflict)
+    );
+}
+
+#[test]
+fn an_executed_command_is_trimmed_whatever_phase_its_durable_row_records() {
+    // Execution is recorded in `executed_v1` only; the durable dependency
+    // row keeps the phase it had before, normally `Accept` or `Commit`.
+    // Requiring `Executed` in the row retained every real command forever.
+    let e = epoch(EPOCH);
+    for phase in [Phase::Accept, Phase::Commit, Phase::Executed] {
+        let mut engine = ModelEngine::new();
+        let rows: Vec<Row> = common_rows()
+            .into_iter()
+            .chain(identity_rows())
+            .chain([
+                (
+                    Collection::ProtocolV1,
+                    dependency_key(e, &command(7)),
+                    encode_dependency(&record(phase, &[])).unwrap(),
+                ),
+                (
+                    Collection::ProtocolV1,
+                    proposal_key(e, &command(7)),
+                    encode_proposal(&proposal(&[])).unwrap(),
+                ),
+                // Committed but not executed: an obligation in any phase.
+                (
+                    Collection::ProtocolV1,
+                    dependency_key(e, &command(6)),
+                    encode_dependency(&record(Phase::Commit, &[])).unwrap(),
+                ),
+            ])
+            .collect();
+        seed(&mut engine, rows);
+        publish(&mut engine);
+        trim_to_completion(&mut engine, &TrimLimits::default());
+        let after = protocol_keys(&engine);
+        assert!(
+            !after.contains(&dependency_key(e, &command(7))),
+            "an executed command's {phase:?} row is trimmed"
+        );
+        assert!(!after.contains(&proposal_key(e, &command(7))));
+        assert!(after.contains(&dependency_key(e, &command(6))));
+    }
+}
+
+#[test]
+fn a_floor_publication_planned_from_a_stale_snapshot_cannot_lower_the_floor() {
+    let mut engine = voter_store();
+    // A maintenance attempt reads the floor (none yet) and is delayed.
+    let stale = {
+        let view = engine.reader().snapshot().unwrap();
+        published_floor(&view).unwrap()
+    };
+    assert_eq!(stale, None);
+
+    // Meanwhile a newer floor lands.
+    let mut newer = floor();
+    newer.boundary.execution_position = pos(FLOOR_POSITION + 1);
+    newer.root = Digest32([0x77; 32]);
+    let mut tx = engine.begin_write().unwrap();
+    publish_floor_in(&mut tx, &newer).unwrap();
+    tx.commit_durable().unwrap();
+
+    // Checked against its stale read, the older floor looks publishable;
+    // checked inside the write, it is a regression and nothing is written.
+    assert!(publish_floor(&floor(), stale.as_ref()).is_ok());
+    let mut tx = engine.begin_write().unwrap();
+    assert_eq!(
+        publish_floor_in(&mut tx, &floor()),
+        Err(TrimError::FloorRegressed {
+            published: pos(FLOOR_POSITION + 1),
+            offered: pos(FLOOR_POSITION)
+        })
+    );
+    tx.abort().unwrap();
+    let view = engine.reader().snapshot().unwrap();
+    assert_eq!(published_floor(&view).unwrap(), Some(newer.published()));
 }

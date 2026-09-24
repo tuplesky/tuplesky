@@ -45,10 +45,11 @@
 //!   when every configured voter acknowledged the identical
 //!   `(configuration, boundary, root)`, and an acknowledgement from a
 //!   replica outside the voter set is refused, so observers supply no trim
-//!   votes. [`trim::publish_floor`] makes the floor durable before any
-//!   deletion and never lowers it, [`trim::TrimFence`] answers delayed
-//!   below-floor traffic from retained common state instead of re-creating
-//!   protocol rows, and [`trim::plan_trim`] emits bounded batches of
+//!   votes. [`trim::publish_floor_in`] makes the floor durable, re-checked
+//!   inside the write so it never lowers, [`trim::TrimFence`] answers
+//!   delayed below-floor traffic from retained common state instead of
+//!   re-creating protocol rows, and [`trim::plan_trim`] refuses to plan
+//!   until that floor is durable and then emits bounded batches of
 //!   `protocol_v1` deletions for commands executed at or below the floor,
 //!   never a promise, a bound Sync, an unresolved obligation or a row a
 //!   retained command depends on. A missing voter stops trimming and
@@ -80,7 +81,7 @@ pub use manifest::{
 pub use trim::{
     CheckpointAckV1, FenceDecision, TrimBackpressure, TrimError, TrimFence, TrimFloor, TrimLimits,
     TrimPlan, TrimmedFloorV1, ack_key, ack_update, establish_floor, plan_trim, publish_floor,
-    published_floor, read_acks, trim_backpressure,
+    publish_floor_in, published_floor, read_acks, trim_backpressure,
 };
 pub use verify::{VerifyError, verify_shared};
 
