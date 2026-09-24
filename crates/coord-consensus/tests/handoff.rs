@@ -19,10 +19,14 @@
 //! * **A seal and a cancellation never both certify.** One voter, one
 //!   stance, never reversed; so the two majorities that would be needed
 //!   cannot both form.
-//! * **One successor, one terminal state.** A terminal certificate is
-//!   selected only after the seal and only from a majority agreeing on
-//!   one root, so a replacement coordinator selects the certificate the
-//!   dead one selected rather than a competing destination.
+//! * **One terminal state.** A terminal certificate is selected only
+//!   after the seal and only from a majority agreeing on one root, and
+//!   each sealed voter reports one root once; so a replacement
+//!   coordinator that asks for another root is refused, and no two
+//!   certificates for one transition name different roots.
+//! * **A cancellation outlives its replacement.** A voter that
+//!   cancelled this transition, then cancelled another, still refuses a
+//!   late seal for this one.
 //! * **Resume is monotone.** Evidence only accumulates, and the stage
 //!   it justifies never goes backwards.
 //! * **An activated successor is reused, never recomputed.**
@@ -35,8 +39,8 @@ use std::path::PathBuf;
 
 use coord_consensus::handoff::{
     Evidence, HandoffError, InstallRecord, Stage, Stance, StanceError, StanceLedger, StanceRecord,
-    TerminalCertificate, TerminalReport, Transition, activate, cancel, resume, seal,
-    select_terminal, stances_of,
+    TerminalCertificate, TerminalReport, TerminalReportError, Transition, activate, cancel, resume,
+    seal, select_terminal, stances_of,
 };
 use coord_consensus::quorum::EpochVoters;
 use coord_types::identity::Digest32;
@@ -110,6 +114,13 @@ fn stance_scripts() -> Vec<Vec<(u8, Stance)>> {
         // already decided about this one.
         vec![(THIS, Stance::Sealed), (OTHER, Stance::Sealed)],
         vec![(THIS, Stance::Cancelled), (OTHER, Stance::Sealed)],
+        // A cancellation replaced by another, then a delayed seal for
+        // the first: the cancelled transition must stay cancelled.
+        vec![
+            (THIS, Stance::Cancelled),
+            (OTHER, Stance::Cancelled),
+            (THIS, Stance::Sealed),
+        ],
     ]
 }
 
@@ -159,6 +170,11 @@ struct World {
     refusals: Vec<StanceError>,
     fenced: BTreeSet<ReplicaId>,
     reports: Vec<TerminalReport>,
+    /// Reports a replacement coordinator obtained by asking the same
+    /// voters for a second root. Must stay empty wherever a voter already
+    /// reported.
+    late_reports: Vec<TerminalReport>,
+    terminal_refusals: Vec<TerminalReportError>,
     terminal: Option<TerminalCertificate>,
     installs: Vec<InstallRecord>,
     activation: Option<coord_consensus::handoff::ActivationCertificate>,
@@ -195,18 +211,24 @@ fn run(assignment: &[usize], progress: usize) -> World {
     let fenced = ever_sealed;
     let stances = stances_of(&ledgers);
 
-    // Stage 1: terminal reports, but only from voters whose own seal is
-    // durable. A report from an unsealed voter is not terminal, so the
-    // coordinator never collects one.
+    // Stage 1: terminal reports, made through each voter's ledger, so
+    // only a voter whose own seal is durable reports at all. Then a
+    // replacement coordinator asks the same voters for a second root:
+    // the two-root script. Whatever it obtains is kept apart, and the
+    // sweep checks that no majority of everything reported certifies a
+    // root other than the first.
     let mut reports = Vec::new();
+    let mut late_reports = Vec::new();
+    let mut terminal_refusals = Vec::new();
     if progress >= 1 {
-        for record in stances.iter().filter(|s| s.transition == transition(THIS)) {
-            if record.stance == Stance::Sealed {
-                reports.push(TerminalReport {
-                    voter: record.voter,
-                    transition: transition(THIS),
-                    terminal_root: root(0x77),
-                });
+        for (attempt, terminal_root) in [root(0x77), root(0x88)].into_iter().enumerate() {
+            for ledger in &mut ledgers {
+                match ledger.report_terminal(transition(THIS), terminal_root) {
+                    Ok(report) if attempt == 0 => reports.push(report),
+                    Ok(report) => late_reports.push(report),
+                    Err(TerminalReportError::NotSealed) => {}
+                    Err(e) => terminal_refusals.push(e),
+                }
             }
         }
     }
@@ -247,6 +269,8 @@ fn run(assignment: &[usize], progress: usize) -> World {
         refusals,
         fenced,
         reports,
+        late_reports,
+        terminal_refusals,
         terminal,
         installs,
         activation,
@@ -293,6 +317,9 @@ fn every_world_of_the_handoff_resumes_from_evidence_and_never_clears_a_fence() {
     for (assignment, progress) in &all {
         let world = run(assignment, *progress);
         for e in &world.refusals {
+            refusals.insert(format!("{e:?}"));
+        }
+        for e in &world.terminal_refusals {
             refusals.insert(format!("{e:?}"));
         }
         let stage = resume(&old, &new, transition(THIS), world.evidence(true));
@@ -366,8 +393,53 @@ fn every_world_of_the_handoff_resumes_from_evidence_and_never_clears_a_fence() {
             }
         }
 
-        // One successor and one terminal state: whatever the reports,
-        // a certificate names the successor the transition named.
+        // One terminal state: no voter reported two roots, and no
+        // majority of everything any coordinator obtained certifies a
+        // second one. Without the once-only report the replacement's
+        // requests would succeed and a majority of them would select
+        // root 88 beside the first coordinator's 77.
+        assert!(
+            world.late_reports.is_empty(),
+            "a voter reported a second terminal root: {:?}",
+            world.late_reports
+        );
+        let every_report: Vec<TerminalReport> = world
+            .reports
+            .iter()
+            .chain(&world.late_reports)
+            .copied()
+            .collect();
+        let mut roots_by_voter: BTreeMap<ReplicaId, BTreeSet<Digest32>> = BTreeMap::new();
+        for report in &every_report {
+            roots_by_voter
+                .entry(report.voter)
+                .or_default()
+                .insert(report.terminal_root);
+        }
+        assert!(roots_by_voter.values().all(|roots| roots.len() == 1));
+        let mine: Vec<StanceRecord> = world
+            .stances
+            .iter()
+            .filter(|s| s.transition == transition(THIS))
+            .copied()
+            .collect();
+        if let Ok(sealed) = seal(&old, transition(THIS), &mine) {
+            let mut selected: BTreeSet<Digest32> = BTreeSet::new();
+            for subset in subsets(&every_report) {
+                if let Ok(certificate) = select_terminal(&old, &sealed, new.voters(), &subset) {
+                    selected.insert(certificate.terminal_root());
+                }
+            }
+            assert!(
+                selected.len() <= 1,
+                "two terminal roots were certified for one transition: {selected:?}"
+            );
+        }
+
+        // A certificate names the successor its caller passed -- the
+        // module cannot check it against the transition's subject, so
+        // this is the caller's obligation rather than a property -- and
+        // it exists only after a seal.
         if let Some(certificate) = &world.terminal {
             assert_eq!(certificate.successor(), new.voters());
             assert_eq!(certificate.transition(), transition(THIS));
@@ -406,6 +478,20 @@ fn every_world_of_the_handoff_resumes_from_evidence_and_never_clears_a_fence() {
             refusals,
         },
     );
+}
+
+/// Every subset of `items`.
+fn subsets<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    let mut out: Vec<Vec<T>> = vec![Vec::new()];
+    for item in items {
+        let mut next = out.clone();
+        for mut subset in out {
+            subset.push(item.clone());
+            next.push(subset);
+        }
+        out = next;
+    }
+    out
 }
 
 /// Evidence only accumulates, and the stage it justifies only moves
@@ -469,11 +555,11 @@ fn accumulating_evidence_never_moves_the_stage_backwards() {
                 .record(&old, transition(THIS), Stance::Sealed)
                 .unwrap(),
         );
-        reports.push(TerminalReport {
-            voter: r(i),
-            transition: transition(THIS),
-            terminal_root: root(0x77),
-        });
+        reports.push(
+            ledgers[i as usize]
+                .report_terminal(transition(THIS), root(0x77))
+                .unwrap(),
+        );
         observe(
             resume(
                 &old,
@@ -766,6 +852,92 @@ fn removing_a_handoff_rule_produces_the_counterexample_it_exists_for() {
         refused: format!("{refused_root:?}"),
     });
 
+    // 6. A replaced cancellation may be overwritten.
+    //
+    // Voters 0 and 1 cancel this transition, then cancel another that
+    // replaced it, then receive a delayed seal for this one. A ledger
+    // that forgot the first cancellation would record both stances for
+    // it: the cancellation certified earlier and the seal certifying
+    // now, with the replacement fenced behind the resurrected one.
+    let mut ledgers: Vec<StanceLedger> = (0..3)
+        .map(|i| StanceLedger::new(r(i), epoch(OLD)))
+        .collect();
+    let mut first = Vec::new();
+    for ledger in &mut ledgers[..2] {
+        first.push(
+            ledger
+                .record(&old, transition(THIS), Stance::Cancelled)
+                .unwrap(),
+        );
+        ledger
+            .record(&old, transition(OTHER), Stance::Cancelled)
+            .unwrap();
+    }
+    let certified = cancel(&old, transition(THIS), &first).expect("a majority cancelled");
+    let refused_late = ledgers[0]
+        .record(&old, transition(THIS), Stance::Sealed)
+        .expect_err("a cancelled transition stays cancelled");
+    assert_eq!(
+        refused_late,
+        StanceError::Reversal {
+            held: Stance::Cancelled
+        }
+    );
+    out.push(Counterexample {
+        name: "a_replaced_cancellation_is_forgotten",
+        rule_removed: "StanceLedger keeps every cancelled transition as a tombstone",
+        witness: format!(
+            "voters {:?} cancel a1, cancel b2, then seal a1: a1 is both cancelled and sealed, and              b2 is fenced behind it",
+            certified.signers().iter().map(|v| v.0[0]).collect::<Vec<_>>()
+        ),
+        refused: format!("{refused_late:?}"),
+    });
+
+    // 7. A sealed voter may report a second terminal root.
+    //
+    // One coordinator reads voters 0 and 1 and selects root 77; its
+    // replacement reads 1 and 2 and asks for root 88. If voter 1 could
+    // answer again, both majorities would certify and the transition
+    // would have two terminal states.
+    let mut ledgers: Vec<StanceLedger> = (0..3)
+        .map(|i| StanceLedger::new(r(i), epoch(OLD)))
+        .collect();
+    let stances: Vec<StanceRecord> = ledgers
+        .iter_mut()
+        .map(|l| l.record(&old, transition(THIS), Stance::Sealed).unwrap())
+        .collect();
+    let sealed = seal(&old, transition(THIS), &stances).unwrap();
+    let first: Vec<TerminalReport> = ledgers[..2]
+        .iter_mut()
+        .map(|l| l.report_terminal(transition(THIS), root(0x77)).unwrap())
+        .collect();
+    let chosen = select_terminal(&old, &sealed, new.voters(), &first).unwrap();
+    let refused_second = ledgers[1]
+        .report_terminal(transition(THIS), root(0x88))
+        .expect_err("one report per voter");
+    assert_eq!(
+        refused_second,
+        TerminalReportError::Conflicting { held: root(0x77) }
+    );
+    let second = vec![
+        ledgers[2]
+            .report_terminal(transition(THIS), root(0x88))
+            .unwrap(),
+    ];
+    assert_eq!(
+        select_terminal(&old, &sealed, new.voters(), &second),
+        Err(HandoffError::NoQuorum { have: 1, need: 2 })
+    );
+    out.push(Counterexample {
+        name: "a_voter_reports_two_terminal_roots",
+        rule_removed: "StanceLedger::report_terminal records one root per sealed voter",
+        witness: format!(
+            "voters 0 and 1 report root {:02x}, then voters 1 and 2 report root 88: two terminal              certificates for one transition, with voter 1 in both",
+            chosen.terminal_root().0[0]
+        ),
+        refused: format!("{refused_second:?}"),
+    });
+
     fixture("handoff_counterexamples.json", &out);
 }
 
@@ -933,7 +1105,8 @@ fn a_sealed_voter_finishes_the_transition_it_sealed() {
     assert!(ledger.fenced());
 
     // A cancelled transition releases the domain: another one may
-    // start, and the cancellation has nothing left to fence.
+    // start. The cancellation is kept, so a late seal for it is still a
+    // reversal and a repeated refusal is still the same refusal.
     let mut released = StanceLedger::new(r(1), epoch(OLD));
     released
         .record(&old, transition(THIS), Stance::Cancelled)
@@ -942,6 +1115,49 @@ fn a_sealed_voter_finishes_the_transition_it_sealed() {
         .record(&old, transition(OTHER), Stance::Sealed)
         .expect("a cancelled transition frees the domain");
     assert!(released.fenced());
+    assert_eq!(released.cancelled(), &[transition(THIS)].into());
+    assert_eq!(
+        released.record(&old, transition(THIS), Stance::Cancelled),
+        Ok(StanceRecord {
+            voter: r(1),
+            transition: transition(THIS),
+            stance: Stance::Cancelled,
+        })
+    );
+    assert_eq!(
+        released.record(&old, transition(THIS), Stance::Sealed),
+        Err(StanceError::Reversal {
+            held: Stance::Cancelled
+        })
+    );
+    assert_eq!(
+        stances_of(std::slice::from_ref(&released)),
+        vec![
+            StanceRecord {
+                voter: r(1),
+                transition: transition(THIS),
+                stance: Stance::Cancelled,
+            },
+            StanceRecord {
+                voter: r(1),
+                transition: transition(OTHER),
+                stance: Stance::Sealed,
+            },
+        ]
+    );
+    // The row survives recovery with its tombstones and its report.
+    let report = released
+        .report_terminal(transition(OTHER), root(0x77))
+        .unwrap();
+    let recovered = StanceLedger::recovered(
+        r(1),
+        epoch(OLD),
+        released.held(),
+        released.cancelled().clone(),
+        released.terminal(),
+    );
+    assert_eq!(recovered, released);
+    assert_eq!(recovered.terminal(), Some(report));
 
     // Evidence about another transition is not evidence about this one.
     let stray = [StanceRecord {
@@ -971,5 +1187,102 @@ fn a_sealed_voter_finishes_the_transition_it_sealed() {
             }]
         ),
         Err(HandoffError::NotAVoter { replica: r(9) })
+    );
+}
+
+/// The reviewer-shaped sequence end to end: voters 0 and 1 cancel this
+/// transition, then cancel its replacement, then receive a delayed seal
+/// for the first. The seal is refused, so no seal certifies beside the
+/// cancellation and the replacement is not fenced behind a resurrected
+/// transition.
+#[test]
+fn a_cancelled_transition_is_not_resurrected_by_a_late_seal() {
+    let old = old_voters();
+    let new = successor();
+    let mut ledgers: Vec<StanceLedger> = (0..3)
+        .map(|i| StanceLedger::new(r(i), epoch(OLD)))
+        .collect();
+    for ledger in &mut ledgers[..2] {
+        ledger
+            .record(&old, transition(THIS), Stance::Cancelled)
+            .unwrap();
+        ledger
+            .record(&old, transition(OTHER), Stance::Cancelled)
+            .unwrap();
+        assert_eq!(
+            ledger.record(&old, transition(THIS), Stance::Sealed),
+            Err(StanceError::Reversal {
+                held: Stance::Cancelled
+            })
+        );
+        assert!(!ledger.fenced());
+    }
+    let stances = stances_of(&ledgers);
+    assert!(cancel(&old, transition(THIS), &mine(&stances, THIS)).is_ok());
+    assert!(seal(&old, transition(THIS), &mine(&stances, THIS)).is_err());
+    let evidence = |stances| Evidence {
+        authorized: true,
+        stances,
+        reports: &[],
+        terminal: None,
+        installs: &[],
+        activation: None,
+    };
+    assert_eq!(
+        resume(&old, &new, transition(THIS), evidence(&stances)),
+        Ok(Stage::Stable)
+    );
+    assert_eq!(
+        resume(&old, &new, transition(OTHER), evidence(&stances)),
+        Ok(Stage::Stable)
+    );
+}
+
+fn mine(stances: &[StanceRecord], subject: u8) -> Vec<StanceRecord> {
+    stances
+        .iter()
+        .filter(|s| s.transition == transition(subject))
+        .copied()
+        .collect()
+}
+
+/// Terminal reports are one per voter and only after its own seal.
+#[test]
+fn a_terminal_report_is_made_once_and_only_after_the_voters_seal() {
+    let old = old_voters();
+    let mut ledger = StanceLedger::new(r(0), epoch(OLD));
+    assert_eq!(
+        ledger.report_terminal(transition(THIS), root(0x77)),
+        Err(TerminalReportError::NotSealed)
+    );
+    ledger
+        .record(&old, transition(THIS), Stance::Sealed)
+        .unwrap();
+    assert_eq!(
+        ledger.report_terminal(transition(OTHER), root(0x77)),
+        Err(TerminalReportError::NotSealed)
+    );
+    let report = ledger
+        .report_terminal(transition(THIS), root(0x77))
+        .unwrap();
+    // A retry after a lost reply is the same report.
+    assert_eq!(
+        ledger.report_terminal(transition(THIS), root(0x77)),
+        Ok(report)
+    );
+    assert_eq!(
+        ledger.report_terminal(transition(THIS), root(0x88)),
+        Err(TerminalReportError::Conflicting { held: root(0x77) })
+    );
+    assert_eq!(ledger.terminal(), Some(report));
+
+    // A cancelling voter reports nothing.
+    let mut refusing = StanceLedger::new(r(1), epoch(OLD));
+    refusing
+        .record(&old, transition(THIS), Stance::Cancelled)
+        .unwrap();
+    assert_eq!(
+        refusing.report_terminal(transition(THIS), root(0x77)),
+        Err(TerminalReportError::NotSealed)
     );
 }

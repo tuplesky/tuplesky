@@ -143,7 +143,7 @@ pub use graph::{
 pub use handoff::{
     ActivationCertificate, CancellationCertificate, Evidence, HandoffError, InstallRecord,
     SealCertificate, Stage, Stance, StanceError, StanceLedger, StanceRecord, TerminalCertificate,
-    TerminalReport, Transition, cancel, resume, seal, select_terminal,
+    TerminalReport, TerminalReportError, Transition, cancel, resume, seal, select_terminal,
 };
 pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal, Rejection,

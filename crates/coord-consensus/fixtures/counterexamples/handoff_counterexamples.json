@@ -28,5 +28,17 @@
     "rule_removed": "activate refuses an installation naming a root other than the certificate's",
     "witness": "the whole successor installs root 99 and activates under a certificate binding another state",
     "refused": "WrongTerminalRoot"
+  },
+  {
+    "name": "a_replaced_cancellation_is_forgotten",
+    "rule_removed": "StanceLedger keeps every cancelled transition as a tombstone",
+    "witness": "voters [0, 1] cancel a1, cancel b2, then seal a1: a1 is both cancelled and sealed, and              b2 is fenced behind it",
+    "refused": "Reversal { held: Cancelled }"
+  },
+  {
+    "name": "a_voter_reports_two_terminal_roots",
+    "rule_removed": "StanceLedger::report_terminal records one root per sealed voter",
+    "witness": "voters 0 and 1 report root 77, then voters 1 and 2 report root 88: two terminal              certificates for one transition, with voter 1 in both",
+    "refused": "Conflicting { held: Digest32(7777777777777777777777777777777777777777777777777777777777777777) }"
   }
 ]

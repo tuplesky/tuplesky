@@ -30,20 +30,31 @@
 //!   fence refuses the certificate outright, because cancellation is
 //!   what happens before the seal and nothing else.
 //! * [`TerminalCertificate`]: after the seal, a majority of the old
-//!   voters report the same terminal root and the same successor. Mixed
-//!   roots are refused rather than merged, and there is no selection
-//!   without a seal -- an applied KV view or a closed frontend defines
-//!   no terminal state.
+//!   voters report the same terminal root. Each sealed voter reports
+//!   once and never reports another root ([`StanceLedger::report_terminal`]),
+//!   so two majorities cannot certify two roots. Mixed roots are refused
+//!   rather than merged, and there is no selection without a seal -- an
+//!   applied KV view or a closed frontend defines no terminal state.
 //! * [`ActivationCertificate`]: a majority of the *successor* set have
 //!   durably installed that exact terminal root. A new majority formed
 //!   without old authority is disaster recovery, not handoff, and this
 //!   module has no way to express it.
 //!
 //! Three things are structurally impossible here rather than checked
-//! for: a fence cleared by a retry (a stance never reverses), a second
-//! successor (one certificate per transition, selected by an old
-//! majority after the seal), and a return to `Stable` once any voter
-//! has sealed ([`resume`] has no path to it).
+//! for: a fence cleared by a retry (a stance never reverses, and a
+//! cancelled transition stays cancelled after another one replaces it),
+//! a second terminal root (one report per sealed voter, selected by an
+//! old majority after the seal), and a return to `Stable` once any
+//! voter has sealed ([`resume`] has no path to it).
+//!
+//! The successor is not in that list. The transition's subject binds
+//! it, but as a digest this module cannot open, and a terminal report
+//! carries only the root; so [`select_terminal`] names whatever
+//! successor its caller passes. Binding the successor to what the old
+//! majority reported is the caller's obligation: the caller derives it
+//! from the reported terminal state and makes the root cover it
+//! (task-56 hashes the successor set into the terminal root), so racing
+//! successor sets become mixed roots and are refused here.
 //!
 //! The module is pure: no I/O, no clock, no row encoding. Where the
 //! stances live, what the terminal root is computed over and how a
@@ -123,12 +134,38 @@ pub enum StanceError {
     },
 }
 
+/// Why a voter could not report a terminal root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum TerminalReportError {
+    /// This voter has not durably sealed the transition. Before its own
+    /// fence it can still accept work, so what it would report is not
+    /// terminal.
+    NotSealed,
+    /// This voter already reported another root. One voter in two
+    /// majorities for two roots is exactly how two terminal certificates
+    /// would form, so the first report is the only one.
+    Conflicting {
+        /// The root it already reported.
+        held: Digest32,
+    },
+}
+
 /// One old voter's durable stance row.
+///
+/// Besides the current stance it keeps every transition this voter
+/// cancelled in the epoch, and once it has sealed, the one terminal root
+/// it reported. A cancellation is not released by being replaced: a
+/// delayed seal request for a cancelled transition names the same
+/// subject, and a voter that had forgotten its refusal would record both
+/// stances for it. The tombstones grow by one per cancelled transition
+/// and are dropped with the epoch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StanceLedger {
     voter: ReplicaId,
     epoch: ConfigurationEpoch,
     held: Option<StanceRecord>,
+    cancelled: BTreeSet<Transition>,
+    terminal: Option<TerminalReport>,
 }
 
 impl StanceLedger {
@@ -138,21 +175,58 @@ impl StanceLedger {
             voter,
             epoch,
             held: None,
+            cancelled: BTreeSet::new(),
+            terminal: None,
         }
     }
 
-    /// Rebuild from a durable row.
+    /// Rebuild from a durable row: the current stance, the transitions
+    /// cancelled earlier in the epoch, and the terminal report if one
+    /// was made.
     pub const fn recovered(
         voter: ReplicaId,
         epoch: ConfigurationEpoch,
         held: Option<StanceRecord>,
+        cancelled: BTreeSet<Transition>,
+        terminal: Option<TerminalReport>,
     ) -> Self {
-        StanceLedger { voter, epoch, held }
+        StanceLedger {
+            voter,
+            epoch,
+            held,
+            cancelled,
+            terminal,
+        }
     }
 
     /// What this voter holds, if anything.
     pub const fn held(&self) -> Option<StanceRecord> {
         self.held
+    }
+
+    /// Transitions this voter cancelled before the one it holds.
+    pub const fn cancelled(&self) -> &BTreeSet<Transition> {
+        &self.cancelled
+    }
+
+    /// The terminal report this voter made, if any.
+    pub const fn terminal(&self) -> Option<TerminalReport> {
+        self.terminal
+    }
+
+    /// Every stance this voter has recorded in the epoch: the retained
+    /// cancellations and the current stance.
+    pub fn records(&self) -> Vec<StanceRecord> {
+        self.cancelled
+            .iter()
+            .filter(|t| self.held.is_none_or(|h| h.transition != **t))
+            .map(|t| StanceRecord {
+                voter: self.voter,
+                transition: *t,
+                stance: Stance::Cancelled,
+            })
+            .chain(self.held)
+            .collect()
     }
 
     /// Whether this voter's ordinary voting is fenced.
@@ -168,12 +242,13 @@ impl StanceLedger {
 
     /// Record `stance` about `transition`.
     ///
-    /// Repeating what is already held succeeds and changes nothing,
+    /// Repeating what is already recorded succeeds and changes nothing,
     /// which is what makes a retry after a lost reply safe. Everything
     /// else that would change a decision is refused: the fence is the
     /// one thing in the lifecycle that nothing may undo, and the reason
     /// a seal and a cancellation cannot both certify is that this
-    /// refusal happens in one voter, once.
+    /// refusal happens in one voter, once -- including for a transition
+    /// it cancelled before the one it holds now.
     pub fn record(
         &mut self,
         voters: &EpochVoters,
@@ -196,18 +271,75 @@ impl StanceLedger {
             Some(held) if held.transition == transition => {
                 return Err(StanceError::Reversal { held: held.stance });
             }
+            _ => {}
+        }
+        // A transition cancelled earlier stays cancelled. Its tombstone
+        // answers a repeated refusal and refuses a late seal, which is
+        // the same subject arriving after another transition replaced
+        // it, not a new attempt.
+        if self.cancelled.contains(&transition) {
+            return match stance {
+                Stance::Cancelled => Ok(record),
+                Stance::Sealed => Err(StanceError::Reversal {
+                    held: Stance::Cancelled,
+                }),
+            };
+        }
+        match self.held {
             Some(held) if held.stance == Stance::Sealed => {
                 return Err(StanceError::Sealed {
                     held: held.transition,
                 });
             }
             // A cancelled transition released the domain, so another one
-            // may start. Its record replaces the cancellation, which
-            // has nothing left to fence.
-            _ => {}
+            // may start. Its cancellation moves to the tombstones rather
+            // than being overwritten.
+            Some(held) => {
+                self.cancelled.insert(held.transition);
+            }
+            None => {}
         }
         self.held = Some(record);
         Ok(record)
+    }
+
+    /// Report `terminal_root` as the terminal state of `transition`,
+    /// which this voter must have durably sealed.
+    ///
+    /// Once only. Repeating the same root succeeds and changes nothing,
+    /// for the same retry reason as [`StanceLedger::record`]; any other
+    /// root is refused. That refusal is what [`select_terminal`]'s
+    /// intersection argument rests on: a voter that could report two
+    /// roots would sit in one majority for each, and two coordinators
+    /// could select two terminal certificates for one transition.
+    pub fn report_terminal(
+        &mut self,
+        transition: Transition,
+        terminal_root: Digest32,
+    ) -> Result<TerminalReport, TerminalReportError> {
+        let sealed = StanceRecord {
+            voter: self.voter,
+            transition,
+            stance: Stance::Sealed,
+        };
+        if self.held != Some(sealed) {
+            return Err(TerminalReportError::NotSealed);
+        }
+        let report = TerminalReport {
+            voter: self.voter,
+            transition,
+            terminal_root,
+        };
+        match self.terminal {
+            Some(held) if held == report => Ok(report),
+            Some(held) => Err(TerminalReportError::Conflicting {
+                held: held.terminal_root,
+            }),
+            None => {
+                self.terminal = Some(report);
+                Ok(report)
+            }
+        }
     }
 }
 
@@ -382,7 +514,8 @@ pub fn cancel(
 }
 
 /// One old voter's report of the terminal state, made after its own
-/// seal is durable.
+/// seal is durable and at most once per voter
+/// ([`StanceLedger::report_terminal`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalReport {
     /// The reporting voter.
@@ -432,9 +565,17 @@ impl TerminalCertificate {
 /// reason sealing exists: before the fence, an old voter can still
 /// accept work, so what it reports as terminal is not terminal. After
 /// it, a majority reporting the same root is the terminal state, and
-/// any majority a later attempt reads intersects this one -- so a
-/// coordinator that dies here is replaced by one that selects the same
-/// certificate rather than a competing destination.
+/// any majority a later attempt reads intersects this one in a voter
+/// that reported once and will report nothing else -- so a coordinator
+/// that dies here is replaced by one that selects the same root rather
+/// than a competing destination. Reports are counted as given; that each
+/// came from its voter's [`StanceLedger::report_terminal`] is what makes
+/// them one per voter.
+///
+/// `successor` is copied into the certificate unchecked, because
+/// nothing here can compare it with the transition's opaque subject.
+/// The caller derives it from the reported terminal state, whose root
+/// must cover it, so a different successor is a different root.
 pub fn select_terminal(
     voters: &EpochVoters,
     seal: &SealCertificate,
@@ -706,13 +847,13 @@ pub fn resume(
     Ok(Stage::Stable)
 }
 
-/// Every stance a set of ledgers holds, for a coordinator assembling
-/// evidence.
+/// Every stance a set of ledgers holds, retained cancellations
+/// included, for a coordinator assembling evidence.
 ///
 /// Deliberately unfiltered. A coordinator that collected only its own
 /// transition's stances would hand [`resume`] evidence that cannot show
 /// it a fence another transition left, and that fence is the whole
 /// reason its transition has nothing to resume.
 pub fn stances_of(ledgers: &[StanceLedger]) -> Vec<StanceRecord> {
-    ledgers.iter().filter_map(StanceLedger::held).collect()
+    ledgers.iter().flat_map(StanceLedger::records).collect()
 }
