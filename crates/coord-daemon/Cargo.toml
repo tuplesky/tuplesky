@@ -15,8 +15,23 @@ role = "production"
 coord-types.workspace = true
 coord-transport.workspace = true
 coord-membership.workspace = true
+coord-store-api.workspace = true
+coord-collector.workspace = true
+coord-consensus.workspace = true
+coord-core.workspace = true
+coord-session.workspace = true
+coord-storage.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde = { workspace = true, features = ["std"] }
 toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+coord-state.workspace = true
+rcgen.workspace = true
+coord-storage-redb.workspace = true
+coord-store-testkit.workspace = true
+coord-transport-testkit.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+serde_json.workspace = true

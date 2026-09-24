@@ -58,6 +58,113 @@ pub struct Capability {
     pub max_live_subscriptions: usize,
 }
 
+/// The state engine this build serves in production, and the durability
+/// profile it must have been created under (design Section 19.3).
+pub const STATE_ENGINE: &str = "redb";
+/// Profile of [`STATE_ENGINE`].
+pub const STATE_PROFILE: &str = "strict-single-store-v1";
+/// The journal engine this build serves, and its profile: journal the
+/// authoritative transition first, then apply atomically (Section 17.3).
+pub const JOURNAL_ENGINE: &str = "raft-engine";
+/// Profile of [`JOURNAL_ENGINE`].
+pub const JOURNAL_PROFILE: &str = "journaled-strict-v1";
+/// An engine that is built and tested but carries no production support:
+/// it reports its own platforms, and task-s03's review boundary keeps it
+/// out of a production graph. Named here so configuring it is refused for
+/// the reason it actually is, rather than as an unknown name.
+pub const EXPERIMENTAL_ENGINE: &str = "fjall";
+
+/// The projection this node keeps its logical state in.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    /// Engine name, which must match the generation's own manifest.
+    #[serde(default = "state_engine")]
+    pub engine: String,
+    /// Durability profile, likewise.
+    #[serde(default = "state_profile")]
+    pub profile: String,
+    /// Root directory, relative to `state_directory` unless absolute.
+    pub root: String,
+    /// Engine page cache.
+    #[serde(default = "default_cache_bytes")]
+    pub cache_bytes: usize,
+}
+
+fn state_engine() -> String {
+    STATE_ENGINE.to_owned()
+}
+
+fn state_profile() -> String {
+    STATE_PROFILE.to_owned()
+}
+
+fn default_cache_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+impl StateConfig {
+    /// Where this node's projection actually lives.
+    ///
+    /// A relative root is relative to `state_directory`, so one setting
+    /// moves a whole node; an absolute one is taken as given, so a
+    /// projection can be put on its own device without moving anything
+    /// else. Resolving it here rather than at each use is what stops two
+    /// call sites disagreeing about which of those a given string was.
+    pub fn root_path(&self, state_directory: &str) -> std::path::PathBuf {
+        let root = std::path::Path::new(&self.root);
+        if root.is_absolute() {
+            return root.to_path_buf();
+        }
+        std::path::Path::new(state_directory).join(root)
+    }
+}
+
+/// The journal this node makes transitions durable in.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalConfig {
+    /// Engine name, which must match the journal's own metadata.
+    #[serde(default = "journal_engine")]
+    pub engine: String,
+    /// Durability profile.
+    #[serde(default = "journal_profile")]
+    pub profile: String,
+    /// Root directory, relative to `state_directory` unless absolute.
+    pub root: String,
+    /// Shards this node writes.
+    #[serde(default = "one_shard")]
+    pub shards: u16,
+}
+
+fn journal_engine() -> String {
+    JOURNAL_ENGINE.to_owned()
+}
+
+fn journal_profile() -> String {
+    JOURNAL_PROFILE.to_owned()
+}
+
+fn one_shard() -> u16 {
+    1
+}
+
+/// Where this node's own credentials and trust anchors are.
+///
+/// They are paths, not material: nothing here is a secret, and a
+/// diagnostics snapshot may name them. The files behind them are read
+/// once at startup, under the process's own account (Section 22.2).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityConfig {
+    /// PEM bundle of the roots this node validates peers against.
+    pub trust_bundle: String,
+    /// This node's certificate chain, issued by the node issuer.
+    pub node_certificate: String,
+    /// Its private key.
+    pub node_key: String,
+}
+
 /// The daemon configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +181,12 @@ pub struct Config {
     pub state_directory: String,
     /// Listeners.
     pub listen: ListenConfig,
+    /// The logical-state projection.
+    pub state: StateConfig,
+    /// The durable journal.
+    pub journal: JournalConfig,
+    /// Credentials and trust anchors.
+    pub identity: IdentityConfig,
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
@@ -110,6 +223,29 @@ pub enum ConfigError {
     ZeroRttEnabled,
     /// The production graph would include test keys or bypasses.
     TestBypassEnabled,
+    /// An engine or profile this build does not serve. A node never opens
+    /// durable state under a name it does not implement: the manifest is
+    /// what says what the bytes are, and a mismatch is a different store,
+    /// not a compatible one.
+    UnsupportedEngine {
+        /// Which section.
+        section: &'static str,
+        /// What the configuration asked for.
+        named: String,
+        /// What this build serves.
+        supported: &'static str,
+    },
+    /// An experimental engine in a production configuration. It reports
+    /// its own platforms and carries no production support, so naming it
+    /// here is refused rather than quietly honoured.
+    ExperimentalEngine {
+        /// The engine named.
+        named: String,
+    },
+    /// A path a required file or directory would be read from is empty.
+    EmptyPath(&'static str),
+    /// A node must write at least one journal shard.
+    NoJournalShards,
 }
 
 /// Supported configuration schema version.
@@ -193,6 +329,60 @@ impl Config {
             return Err(ConfigError::InvalidListener("admin_http"));
         }
         capability_covers(&self.capability, &self.limits)?;
+        // Durable state is opened under the name this build implements or
+        // it is not opened at all. A name this build does not serve is a
+        // different store, not a compatible one, and the manifest is what
+        // says which -- so the refusal happens here, before anything has
+        // been read, rather than as a surprise inside an engine.
+        engine_named("state", &self.state.engine, STATE_ENGINE)?;
+        engine_named("state.profile", &self.state.profile, STATE_PROFILE)?;
+        engine_named("journal", &self.journal.engine, JOURNAL_ENGINE)?;
+        engine_named("journal.profile", &self.journal.profile, JOURNAL_PROFILE)?;
+        // A node that journals nothing has no authoritative transition to
+        // apply from, so zero shards is a configuration that cannot serve.
+        if self.journal.shards == 0 {
+            return Err(ConfigError::NoJournalShards);
+        }
+        // An empty path is not a default: it resolves to the working
+        // directory, which is where a process would silently create a
+        // second, empty generation beside the real one.
+        for (name, path) in [
+            ("state_directory", &self.state_directory),
+            ("state.root", &self.state.root),
+            ("journal.root", &self.journal.root),
+            ("cluster_manifest", &self.cluster_manifest),
+            ("identity.trust_bundle", &self.identity.trust_bundle),
+            ("identity.node_certificate", &self.identity.node_certificate),
+            ("identity.node_key", &self.identity.node_key),
+        ] {
+            if path.trim().is_empty() {
+                return Err(ConfigError::EmptyPath(name));
+            }
+        }
         Ok(())
     }
+}
+
+/// Refuse an engine or profile this build does not serve.
+fn engine_named(
+    section: &'static str,
+    named: &str,
+    supported: &'static str,
+) -> Result<(), ConfigError> {
+    if named == supported {
+        return Ok(());
+    }
+    // An experimental engine gets its own refusal rather than being
+    // counted with typos: it exists, it is built, and naming it is a
+    // deliberate act that is nevertheless not supported in production.
+    if named == EXPERIMENTAL_ENGINE {
+        return Err(ConfigError::ExperimentalEngine {
+            named: named.to_owned(),
+        });
+    }
+    Err(ConfigError::UnsupportedEngine {
+        section,
+        named: named.to_owned(),
+        supported,
+    })
 }

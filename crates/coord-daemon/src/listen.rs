@@ -1,10 +1,17 @@
 //! Binding the configured listeners (design Section 19.2).
 //!
-//! The preview has no serving runtime yet, but binding is the step that
-//! decides whether a node can serve at all, and the lifecycle's `Live`
-//! phase is defined by it. Doing it for real means a configuration that
-//! cannot bind fails where an operator sees it, rather than passing
-//! validation and failing later.
+//! Binding is the step that decides whether a node can serve at all, and
+//! the lifecycle's `Live` phase is defined by it. Doing it for real means
+//! a configuration that cannot bind fails where an operator sees it,
+//! rather than passing validation and failing later.
+//!
+//! It also has to happen exactly once. The QUIC endpoint serves on a
+//! socket rather than an address (`coord_transport::Transport::with_socket`), so the
+//! sockets bound here are handed over with [`BoundListeners::take_api`]
+//! and [`BoundListeners::take_peer`]: binding again from the address
+//! this module reported would either collide with the socket it is
+//! still holding, or leave a window in which the port was free for
+//! another process to take.
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
@@ -25,6 +32,16 @@ pub struct BoundListeners {
 }
 
 impl BoundListeners {
+    /// Take the native API socket, to serve a QUIC endpoint on it.
+    pub fn take_api(&mut self) -> Option<UdpSocket> {
+        self.api_quic.take()
+    }
+
+    /// Take the peer-plane socket, to serve a QUIC endpoint on it.
+    pub fn take_peer(&mut self) -> Option<UdpSocket> {
+        self.peer_quic.take()
+    }
+
     /// The addresses actually bound, for diagnostics. A configured port
     /// of zero resolves here, so what is reported is what is listening.
     pub fn addresses(&self) -> Vec<(&'static str, SocketAddr)> {

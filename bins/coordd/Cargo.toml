@@ -17,4 +17,18 @@ path = "src/main.rs"
 
 [dependencies]
 coord-daemon.workspace = true
+coord-membership.workspace = true
+coord-node-issuer.workspace = true
+coord-storage-redb.workspace = true
+rustls-pki-types.workspace = true
+serde_json.workspace = true
+x509-parser.workspace = true
+coord-types.workspace = true
 clap.workspace = true
+
+[dev-dependencies]
+coord-node-issuer.workspace = true
+coord-store-api.workspace = true
+coord-types.workspace = true
+rcgen.workspace = true
+serde_json.workspace = true

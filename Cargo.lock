@@ -660,11 +660,26 @@ dependencies = [
 name = "coord-daemon"
 version = "0.1.0"
 dependencies = [
+ "coord-collector",
+ "coord-consensus",
+ "coord-core",
  "coord-membership",
+ "coord-session",
+ "coord-state",
+ "coord-storage",
+ "coord-storage-redb",
+ "coord-store-api",
+ "coord-store-testkit",
  "coord-transport",
+ "coord-transport-testkit",
  "coord-types",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "toml",
 ]
 
@@ -1060,6 +1075,15 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "coord-daemon",
+ "coord-membership",
+ "coord-node-issuer",
+ "coord-storage-redb",
+ "coord-store-api",
+ "coord-types",
+ "rcgen",
+ "rustls-pki-types",
+ "serde_json",
+ "x509-parser",
 ]
 
 [[package]]

@@ -99,6 +99,9 @@ fn manifest(cluster: ClusterId, domain: DomainId, voters: &[&Node]) -> GenesisMa
             .map(|v| VoterSeed {
                 node: hex_id(&v.id.0),
                 incarnation: v.incarnation.get(),
+                // Genesis commits each voter's key, so a certificate the
+                // issuer signs for a committed node is not by itself
+                // that voter (task-42).
                 public_key: b64url(v.key.public_key_raw()),
             })
             .collect(),
@@ -106,7 +109,7 @@ fn manifest(cluster: ClusterId, domain: DomainId, voters: &[&Node]) -> GenesisMa
         wif_rules: vec![serde_json::json!({
             "issuer": "k8s",
             "namespace": "voters",
-            "serviceaccount": "voter-1",
+            "serviceaccount": "voter",
             "scope_ceiling": 7,
         })],
         admin: hex_id(&[9; 16]),

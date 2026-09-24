@@ -31,6 +31,18 @@ admin_http = "127.0.0.1:7446"
 writer_queue_bytes = 16777216
 buffer_bytes_per_subscription = 8388608
 max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+shards = 1
+
+[identity]
+trust_bundle = "/etc/coord/roots.pem"
+node_certificate = "/etc/coord/node.pem"
+node_key = "/etc/coord/node.key"
 "#
     )
 }
@@ -95,6 +107,17 @@ admin_http = "127.0.0.1:1"
 writer_queue_bytes = 16777216
 buffer_bytes_per_subscription = 8388608
 max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+
+[identity]
+trust_bundle = "/r.pem"
+node_certificate = "/n.pem"
+node_key = "/n.key"
 "#;
     assert_eq!(
         Config::parse(auth_only),
@@ -359,4 +382,278 @@ fn a_process_is_live_only_once_its_listeners_are_bound() {
         https: None,
     });
     assert!(clash.is_err(), "the address is already held");
+}
+
+/// The socket a process bound is the socket it serves on.
+///
+/// Binding is what decides whether a node can serve, and the `Live`
+/// phase is defined by it, so it has to happen once. Handing the bound
+/// socket to the QUIC endpoint is what makes the address an operator was
+/// told about the address that answers: re-binding from that address
+/// would either collide with the socket still held here, or leave the
+/// port free for another process in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_a_process_bound_is_the_socket_it_serves_on() {
+    use coord_transport::{Limits as TransportLimits, Transport};
+    use coord_transport_testkit::{TestBinder, TestCa};
+    use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
+    use coord_types::wire_v1::PeerRole;
+
+    const CLUSTER: ClusterId = ClusterId([0x11; 16]);
+    const DOMAIN: DomainId = DomainId([0x22; 16]);
+
+    // Port zero, so the bound address is only knowable after binding.
+    let mut bound = bind_listeners(&ListenConfig {
+        api_quic: Some("127.0.0.1:0".into()),
+        peer_quic: None,
+        admin_http: None,
+        https: None,
+    })
+    .expect("bind");
+    let reported = bound
+        .addresses()
+        .into_iter()
+        .find(|(name, _)| *name == "api_quic")
+        .expect("an api listener was bound")
+        .1;
+
+    let socket = bound.take_api().expect("the api socket is handed over");
+    assert!(
+        bound.take_api().is_none(),
+        "a socket is handed over once, not cloned"
+    );
+
+    let ca = TestCa::new();
+    let frontend = ca.issue(
+        "frontend.local",
+        ReplicaId([1; 16]),
+        ReplicaIncarnation::new(1).expect("positive"),
+        PeerRole::Frontend,
+    );
+    let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+    binder.register(&frontend);
+    let transport = Transport::with_socket(
+        socket,
+        frontend.local(&ca, CLUSTER, DOMAIN, vec![]),
+        std::sync::Arc::new(binder),
+        TransportLimits::default(),
+    )
+    .expect("serve on the handed-over socket");
+
+    assert_eq!(
+        transport.local_addr().expect("bound"),
+        reported,
+        "the endpoint serves on the address the process reported"
+    );
+    // And the port is not free in between: binding it again fails while
+    // the endpoint holds it.
+    assert!(
+        std::net::UdpSocket::bind(reported).is_err(),
+        "the port was released between binding and serving"
+    );
+}
+
+/// A node opens durable state only under the engine and profile this
+/// build implements. The name in the configuration is the name the
+/// generation's own manifest must carry, so a mismatch is a different
+/// store rather than a compatible one, and it is refused before anything
+/// has been opened.
+#[test]
+fn durable_state_is_only_opened_under_a_name_this_build_serves() {
+    use coord_daemon::config::{
+        EXPERIMENTAL_ENGINE, JOURNAL_ENGINE, JOURNAL_PROFILE, STATE_ENGINE, STATE_PROFILE,
+    };
+
+    // Omitted engine and profile mean this build's own: a configuration
+    // need not repeat what the binary can only do one way.
+    let config = Config::parse(&base_config("")).unwrap();
+    assert_eq!(config.state.engine, STATE_ENGINE);
+    assert_eq!(config.state.profile, STATE_PROFILE);
+    assert_eq!(config.journal.engine, JOURNAL_ENGINE);
+    assert_eq!(config.journal.profile, JOURNAL_PROFILE);
+    // Naming them explicitly is equally fine, and equally binding.
+    let spelled = base_config("").replace(
+        "[state]\nroot = \"state\"",
+        &format!(
+            "[state]\nengine = \"{STATE_ENGINE}\"\nprofile = \"{STATE_PROFILE}\"\nroot = \"state\""
+        ),
+    );
+    assert_eq!(Config::parse(&spelled).unwrap().state, config.state);
+
+    // Each of the four names is checked, and the refusal says which one
+    // and what this build does serve -- an operator who mis-set a profile
+    // should not have to guess which section was refused.
+    for (find, replace, section, supported) in [
+        (
+            "[state]\nroot",
+            "[state]\nengine = \"sled\"\nroot",
+            "state",
+            STATE_ENGINE,
+        ),
+        (
+            "[state]\nroot",
+            "[state]\nprofile = \"loose-v0\"\nroot",
+            "state.profile",
+            STATE_PROFILE,
+        ),
+        (
+            "[journal]\nroot",
+            "[journal]\nengine = \"append-file\"\nroot",
+            "journal",
+            JOURNAL_ENGINE,
+        ),
+        (
+            "[journal]\nroot",
+            "[journal]\nprofile = \"journaled-loose-v1\"\nroot",
+            "journal.profile",
+            JOURNAL_PROFILE,
+        ),
+    ] {
+        let text = base_config("").replace(find, replace);
+        let error = Config::parse(&text).unwrap_err();
+        let ConfigError::UnsupportedEngine {
+            section: refused,
+            supported: serves,
+            ..
+        } = &error
+        else {
+            panic!("{section} should be refused as unsupported: {error:?}");
+        };
+        assert_eq!(*refused, section);
+        assert_eq!(*serves, supported);
+    }
+
+    // The experimental engine is built and tested, so naming it is a
+    // deliberate act rather than a typo. It is still refused, and it is
+    // refused for the reason it actually is.
+    let fjall = base_config("").replace(
+        "[state]\nroot",
+        &format!("[state]\nengine = \"{EXPERIMENTAL_ENGINE}\"\nroot"),
+    );
+    assert_eq!(
+        Config::parse(&fjall),
+        Err(ConfigError::ExperimentalEngine {
+            named: EXPERIMENTAL_ENGINE.to_owned()
+        })
+    );
+}
+
+/// A node that journals nothing has no authoritative transition to apply
+/// from, and a path that is empty is not a default: it resolves to the
+/// working directory, which is where a process would quietly create a
+/// second, empty generation beside the real one.
+#[test]
+fn a_configuration_that_could_not_find_its_own_state_is_refused() {
+    let no_shards = base_config("").replace("shards = 1", "shards = 0");
+    assert_eq!(Config::parse(&no_shards), Err(ConfigError::NoJournalShards));
+    // Omitting the count entirely is the single-shard node, not zero.
+    let default_shards = base_config("").replace("shards = 1\n", "");
+    assert_eq!(Config::parse(&default_shards).unwrap().journal.shards, 1);
+
+    for (find, replace, name) in [
+        (
+            "state_directory = \"/var/lib/coord/a\"",
+            "state_directory = \"\"",
+            "state_directory",
+        ),
+        (
+            "[state]\nroot = \"state\"",
+            "[state]\nroot = \"  \"",
+            "state.root",
+        ),
+        (
+            "[journal]\nroot = \"journal\"",
+            "[journal]\nroot = \"\"",
+            "journal.root",
+        ),
+        (
+            "cluster_manifest = \"/etc/coord/genesis.json\"",
+            "cluster_manifest = \"\"",
+            "cluster_manifest",
+        ),
+        (
+            "trust_bundle = \"/etc/coord/roots.pem\"",
+            "trust_bundle = \"\"",
+            "identity.trust_bundle",
+        ),
+        (
+            "node_certificate = \"/etc/coord/node.pem\"",
+            "node_certificate = \"\"",
+            "identity.node_certificate",
+        ),
+        (
+            "node_key = \"/etc/coord/node.key\"",
+            "node_key = \"\"",
+            "identity.node_key",
+        ),
+    ] {
+        let text = base_config("").replace(find, replace);
+        assert_ne!(text, base_config(""), "{name}: the fixture did not change");
+        assert_eq!(
+            Config::parse(&text),
+            Err(ConfigError::EmptyPath(name)),
+            "{name}"
+        );
+    }
+
+    // Credentials are paths, not material: a configuration that names
+    // them is not itself a secret, and nothing here reads the files.
+    let config = Config::parse(&base_config("")).unwrap();
+    assert_eq!(config.identity.node_key, "/etc/coord/node.key");
+}
+
+/// The names in the configuration are the engine's own names.
+///
+/// A configuration says `engine = "redb"` and the generation's manifest
+/// says `engine = "redb"`, and validation here is only worth anything if
+/// those are the same string. They live in different crates, so nothing
+/// but this makes them stay so: a rename in the engine that left this
+/// constant behind would refuse every real store while still passing its
+/// own tests.
+#[test]
+fn the_configured_state_engine_names_are_the_engine_crates_own() {
+    use coord_daemon::config::{STATE_ENGINE, STATE_PROFILE};
+    use coord_storage_redb::manifest::{ENGINE_NAME, PROFILE_NAME};
+
+    assert_eq!(STATE_ENGINE, ENGINE_NAME);
+    assert_eq!(STATE_PROFILE, PROFILE_NAME);
+}
+
+/// A relative projection root is relative to the node's state
+/// directory; an absolute one is taken as given.
+///
+/// One setting moves a whole node, and a projection can still be put on
+/// its own device without moving anything else. Resolving it in one
+/// place is what stops two call sites disagreeing about which kind of
+/// path a given string was -- and a disagreement there means two
+/// generations of the same node's state, in two directories, both
+/// looking correct.
+#[test]
+fn where_the_projection_lives_is_resolved_in_one_place() {
+    let config = Config::parse(&base_config("")).unwrap();
+    assert_eq!(
+        config.state.root_path(&config.state_directory),
+        std::path::Path::new("/var/lib/coord/a/state")
+    );
+
+    let absolute = base_config("").replace(
+        "[state]\nroot = \"state\"",
+        "[state]\nroot = \"/mnt/fast/projection\"",
+    );
+    let absolute = Config::parse(&absolute).unwrap();
+    assert_eq!(
+        absolute.state.root_path(&absolute.state_directory),
+        std::path::Path::new("/mnt/fast/projection"),
+        "an absolute root is not joined onto the state directory"
+    );
+    // A nested relative root stays under the state directory rather than
+    // escaping it by accident.
+    let nested = base_config("").replace("root = \"state\"", "root = \"projection/current\"");
+    let nested = Config::parse(&nested).unwrap();
+    assert!(
+        nested
+            .state
+            .root_path(&nested.state_directory)
+            .starts_with("/var/lib/coord/a")
+    );
 }
