@@ -75,7 +75,7 @@ fn fast(
         deps: deps.to_vec(),
         paths: alloc_paths(path),
         path: Digest32([path; 32]),
-        admission: coord_core::capability::admission_digest(None),
+        admission: coord_core::capability::admission_digest(None, 0),
         seqnum: seq,
     })
 }
@@ -93,7 +93,7 @@ fn slow(replica: u8, b: Ballot, c: CommandId) -> Vote {
         replica: r(replica),
         ballot: b,
         command: c,
-        admission: coord_core::capability::admission_digest(None),
+        admission: coord_core::capability::admission_digest(None, 0),
     })
 }
 

@@ -102,6 +102,7 @@ fn retry_key(seq: u64) -> RetryKey {
 
 fn binding(seq: u64, request: &LogicalRequest) -> RetryBinding {
     RetryBinding {
+        retires: None,
         retry_key: retry_key(seq),
         command_id: CommandId::derive(&retry_key(seq), request).unwrap(),
     }

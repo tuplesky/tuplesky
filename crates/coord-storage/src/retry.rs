@@ -36,6 +36,34 @@ use crate::codecs::{self, ExecutedRecordV1, RetryFloorV1, RetryRecordV1};
 /// Default outstanding window when a session does not specify one.
 pub const DEFAULT_WINDOW: u32 = 1024;
 
+/// The largest number of invocation identities one command's
+/// acknowledgement retires.
+///
+/// A client acknowledges on every request, so the ordinary advance is
+/// one sequence and this bound never binds. It exists for the client
+/// that was stalled and then acknowledged a long prefix at once: without
+/// it, that single command's batch would carry up to a whole window of
+/// deletes. The floor still reaches the acknowledged value, a step per
+/// command, because every request after it repeats the acknowledgement.
+pub const MAX_RETIRE_PER_COMMAND: u64 = 64;
+
+/// The prefix of a client's sequences that executing one command
+/// retires: the floor it moves from and the floor it moves to. Resolved
+/// against the view at execution, so it is a function of the durable
+/// state and the accepted payload and therefore the same on every
+/// replica.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retirement {
+    /// Floor the client's instance stands at.
+    pub from: RequestSequence,
+    /// Floor it moves to; strictly above `from`.
+    pub through: RequestSequence,
+    /// The window width to keep on the floor row. Carried rather than
+    /// re-read, because the row this writes replaces the one the width
+    /// came from.
+    pub width: u32,
+}
+
 /// Binding of a plan to its invocation identity, persisted with it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryBinding {
@@ -43,6 +71,16 @@ pub struct RetryBinding {
     pub retry_key: RetryKey,
     /// Command identity (retry key plus canonical payload).
     pub command_id: CommandId,
+    /// What this command's acknowledgement retires, if anything.
+    ///
+    /// Resolved by [`retirement`] from the accepted payload's
+    /// `ack_through` and the floor in the view at execution, and applied
+    /// in the same atomic batch as the command: the floor moves exactly
+    /// when the command that acknowledged it becomes durable, never
+    /// before and never as a separate write that a crash could lose or
+    /// duplicate.
+    #[serde(default)]
+    pub retires: Option<Retirement>,
 }
 
 /// Admission decision for a presented invocation.
@@ -179,8 +217,10 @@ pub fn lookup<V: OrderedRead>(
 
 /// Decide how to treat a presented invocation. Checked at execution time
 /// against the durable state, so retirement and session changes ordered
-/// earlier are honored. A retained result is handed out only when
-/// `authorize` accepts it under the current policy (see
+/// earlier are honored, and against the retirement the binding itself
+/// carries, so an acknowledgement that reopens the window is admitted
+/// with the request it rides on. A retained result is handed out only
+/// when `authorize` accepts it under the current policy (see
 /// [`coord_state::authorize_retained`]); otherwise the admission is
 /// [`Admission::Unauthorized`].
 pub fn admit<V: OrderedRead>(
@@ -203,7 +243,20 @@ pub fn admit<V: OrderedRead>(
     if key.request_sequence <= floor.floor {
         return Ok(Admission::TooOld { floor: floor.floor });
     }
-    if key.request_sequence.get() - floor.floor.get() > u64::from(floor.width) {
+    // The window is measured from the floor this command's own
+    // acknowledgement establishes, not from the floor it found. The
+    // retirement rides on the request and lands in the same batch, so
+    // once the command is durable that is the floor; checking the
+    // window against the older one would refuse the very request that
+    // moves it. A client that filled its whole window before any result
+    // came back acknowledged nothing on those frames; the first frame
+    // past the window is the one that acknowledges them all, and a
+    // window that refused it could never be reopened, since nothing but
+    // an admitted request advances the floor. The binding's retirement
+    // is resolved from the same view (see [`retirement`]), so this
+    // stays a function of the durable state and the accepted payload.
+    let reopened = binding.retires.map_or(floor.floor, |r| r.through);
+    if key.request_sequence.get() - reopened.get() > u64::from(floor.width) {
         return Ok(Admission::OutOfWindow {
             floor: floor.floor,
             width: floor.width,
@@ -286,7 +339,7 @@ pub fn binding_updates(
         revision,
         result_digest: digest,
     };
-    Ok(vec![
+    let mut updates = vec![
         StoreUpdate {
             collection: Collection::RetryV1.id(),
             key: codecs::retry_key(&binding.retry_key),
@@ -297,7 +350,100 @@ pub fn binding_updates(
             key: codecs::executed_key(&binding.command_id),
             value: Some(codecs::encode_executed(&executed)?),
         },
-    ])
+    ];
+    if let Some(retires) = binding.retires {
+        updates.extend(retirement_updates(&binding.retry_key, retires)?);
+    }
+    Ok(updates)
+}
+
+/// Rows applying a [`Retirement`]: the retained result of every sequence
+/// it covers is removed and the client's floor is written.
+///
+/// The removals are unconditional rather than checked against the view.
+/// A sequence in the range either has a retained result, in which case
+/// this is the removal, or it has none -- a sequence allocated and never
+/// executed, or one whose result an earlier retirement already took --
+/// in which case removing it is a no-op in every engine. Reading first
+/// to find out would cost a lookup per sequence to decide something the
+/// write settles.
+fn retirement_updates(
+    key: &RetryKey,
+    retires: Retirement,
+) -> Result<Vec<StoreUpdate>, EngineError> {
+    let mut updates = Vec::new();
+    let mut seq = retires.from;
+    while seq < retires.through {
+        seq = seq.checked_next().map_err(|_| {
+            EngineError::new(
+                coord_store_api::engine::ErrorClass::Limit,
+                "sequence exhausted",
+            )
+        })?;
+        let retired = RetryKey {
+            request_sequence: seq,
+            ..*key
+        };
+        updates.push(StoreUpdate {
+            collection: Collection::RetryV1.id(),
+            key: codecs::retry_key(&retired),
+            value: None,
+        });
+    }
+    updates.push(StoreUpdate {
+        collection: Collection::RetryFloorV1.id(),
+        key: codecs::retry_floor_key(&key.session_id, &key.client_instance_id),
+        value: Some(codecs::encode_retry_floor(&RetryFloorV1 {
+            floor: retires.through,
+            width: retires.width,
+        })?),
+    });
+    Ok(updates)
+}
+
+/// What a command acknowledging `ack_through` retires, against the
+/// floor in `view`: `None` when it retires nothing.
+///
+/// Every bound is applied here rather than trusted from the payload,
+/// because the payload is the caller's:
+///
+/// * A client cannot acknowledge its own invocation or anything after
+///   it -- it has not received those results, by construction -- so the
+///   acknowledgement is capped at the sequence below this command's.
+/// * An acknowledgement at or below the floor retires nothing.
+/// * One command retires at most [`MAX_RETIRE_PER_COMMAND`] sequences;
+///   the rest follow on the next command, which repeats the same
+///   acknowledgement.
+///
+/// The result is a function of the durable view and the accepted
+/// payload, so every replica computes the same retirement for the same
+/// command at the same position.
+pub fn retirement<V: OrderedRead>(
+    view: &V,
+    key: &RetryKey,
+    ack_through: u64,
+) -> Result<Option<Retirement>, EngineError> {
+    if ack_through == 0 {
+        return Ok(None);
+    }
+    let Some(state) = session_state(view, &key.session_id)? else {
+        return Ok(None);
+    };
+    let current = floor(view, &key.session_id, &key.client_instance_id, state.window)?;
+    // Nothing a client may acknowledge reaches its own sequence.
+    let capped = ack_through.min(key.request_sequence.get().saturating_sub(1));
+    let capped = capped.min(current.floor.get().saturating_add(MAX_RETIRE_PER_COMMAND));
+    if capped <= current.floor.get() {
+        return Ok(None);
+    }
+    let Ok(through) = RequestSequence::new(capped) else {
+        return Ok(None);
+    };
+    Ok(Some(Retirement {
+        from: current.floor,
+        through,
+        width: current.width,
+    }))
 }
 
 /// Rows retiring every retained result of the client at or below

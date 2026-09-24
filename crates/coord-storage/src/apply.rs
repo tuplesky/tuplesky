@@ -203,6 +203,10 @@ impl<P: Persistence> Applier<P> {
         let binding = RetryBinding {
             retry_key: payload.retry_key,
             command_id: command,
+            // Resolved per attempt against the view the attempt plans
+            // against, in `apply_bound`. Nothing is retired for a
+            // command the frontend originated.
+            retires: None,
         };
         // Which planner runs is decided by the admission the command was
         // *accepted* under, never by the operation alone.
@@ -248,7 +252,7 @@ impl<P: Persistence> Applier<P> {
             (_, Some(facts)) if facts.attested.session != payload.retry_key.session_id => {
                 self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
             }
-            _ => self.apply_bound(&request, &binding),
+            _ => self.apply_bound(&request, &binding, payload.ack_through),
         }
     }
 
@@ -443,6 +447,7 @@ impl<P: Persistence> Applier<P> {
         &mut self,
         request: &LogicalRequest,
         binding: &RetryBinding,
+        payload_ack: u64,
     ) -> Result<AppliedOutcome, ApplyError> {
         let namespace: NamespaceId = request.namespace;
         let session = binding.retry_key.session_id;
@@ -453,6 +458,23 @@ impl<P: Persistence> Applier<P> {
             // it produced, exactly as it would a fresh execution.
             let authorized = |record: &crate::codecs::RetryRecordV1| {
                 retained_is_authorized(gated.view(), &session, request, record)
+            };
+            // What this command's acknowledgement retires, resolved
+            // against the same view the plan is built on and applied in
+            // the same batch. A client that is never told its results
+            // were received cannot be told to stop asking for them:
+            // nothing else advances the floor, so a client instance
+            // would serve exactly one window of requests and then be
+            // refused for ever. It is resolved before admission because
+            // admission measures the window from the floor this very
+            // acknowledgement establishes: the frame that first crosses
+            // a filled window is the one that acknowledges everything
+            // in it, and refusing it would leave the window shut for
+            // good.
+            let retires = retry::retirement(gated.view(), &binding.retry_key, payload_ack)?;
+            let binding = &RetryBinding {
+                retires,
+                ..binding.clone()
             };
             match retry::admit(gated.view(), binding, authorized)? {
                 Admission::New => {}

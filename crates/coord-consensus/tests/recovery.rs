@@ -126,7 +126,7 @@ fn admitted(seq: u64, key: u8) -> (Event, CommandId) {
         }),
     );
     let command = CommandId::derive(&retry_key(seq), &request).unwrap();
-    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
+    let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0, 0).unwrap())
         .encode()
         .unwrap();
     let receipt = AdmissionReceipt::submitting(
@@ -178,18 +178,21 @@ fn sends(effects: &[Effect]) -> Vec<(ReplicaId, ProtocolMessage)> {
 
 /// The admission every request these tests admit is submitted under.
 fn admitted_under() -> Digest32 {
-    coord_core::capability::admission_digest(Some(&coord_core::capability::AdmissionFacts {
-        attested: AttestedAdmission {
-            cluster: ClusterId([1; 16]),
-            domain: DomainId([2; 16]),
-            session: SessionId([3; 16]),
-            rule_generation: 1,
-            scope_ceiling: u32::MAX,
-            receipt_id: Digest32([9; 32]),
-            admitted_at_ticks: 0,
-        },
-        establishing: None,
-    }))
+    coord_core::capability::admission_digest(
+        Some(&coord_core::capability::AdmissionFacts {
+            attested: AttestedAdmission {
+                cluster: ClusterId([1; 16]),
+                domain: DomainId([2; 16]),
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: None,
+        }),
+        0,
+    )
 }
 
 fn proposal_from(table: &CommandTable, c: CommandId, seqnum: u64) -> ProtocolMessage {
@@ -753,6 +756,7 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
     let response = ProtocolMessage::PayloadResponse {
         command,
         payload: coord_consensus::PayloadRecordV1 {
+            ack_through: 0,
             retry_key: retry_key(1),
             logical: vec![1, 2, 3],
             admission: None,

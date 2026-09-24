@@ -143,7 +143,7 @@ func (b *Backend) Watch(ctx context.Context, key, end string, revision int64) se
 	case wire.OutcomeErrCompacted:
 		return failed(current, revision, server.ErrCompacted)
 	default:
-		return failed(current, 0, mapOutcomeError(res.Kind))
+		return failed(current, 0, mapOutcomeError(res))
 	}
 	wctx, cancel := context.WithCancel(ctx)
 	b.wmu.Lock()
@@ -451,7 +451,7 @@ func (b *Backend) Compact(ctx context.Context, revision int64) (int64, error) {
 		return 0, err
 	}
 	if res.Kind != wire.OutcomeCompacted {
-		return 0, mapOutcomeError(res.Kind)
+		return 0, mapOutcomeError(res)
 	}
 	header, err := toInt64(res.Revision)
 	if err != nil {

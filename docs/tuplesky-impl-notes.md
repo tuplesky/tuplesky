@@ -1743,7 +1743,7 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-eight things. All eight are fixed here, and each became findable
+ten things. All ten are fixed here, and each became findable
 only once the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
@@ -2242,6 +2242,133 @@ the load that put the replica behind, which is a protocol question
 rather than a bound to adjust, and it belongs with
 [task-j07](design/tuplesky-prs-plan.md#task-j07) beside the leader's
 per-command memory.
+
+**A refusal the domain had a word for arrived as "internal error".**
+This one the Kubernetes overhead benchmark found rather than the matrix,
+and it is not a consensus defect at all: it is a codec that stopped one
+variant short. `coord_state::Outcome::ErrRejected { reason }` is the
+planner's deterministic refusal -- the request exceeded a replicated
+budget, or claimed a sequence that is not its session's, or carried an
+admission that does not authorize it. It is a *result*: the command
+holds its position, every replica reaches the same reason, and there is
+nothing to re-run. The Go `wire.DecodeResult` knew eleven outcomes and
+not that one, so the adapter answered `codes.Internal`, "undecodable
+result: unexpected outcome". An API server reads that as a bug in its
+storage backend and retries, which is the one thing a deterministic
+refusal will never reward.
+
+Three things were wrong at once and only the first of them was the
+decoder. The gRPC code was wrong: `Internal` says "this is our fault,
+try again", where the reasons span `InvalidArgument`,
+`ResourceExhausted`, `FailedPrecondition`, `Unimplemented`, `Aborted`,
+`Unauthenticated` and `PermissionDenied`, and none of them is
+`Unavailable`. The message was wrong: it named a discriminant where the
+domain had a sentence. And the failure was silent in the only place it
+mattered -- the decoder's fallback arm said "unexpected outcome" without
+saying which, so the number 35 had to be recovered from the Rust variant
+order by hand before anyone could tell whether it was a variant added
+upstream or a request the bridge had mapped to an operation it did not
+mean.
+
+So the fix is the reason table, not the discriminant. `RejectionReason`
+is spelled out in Go with all fourteen variants and a `String()` for
+each, bounded on decode -- a reason past the table is refused rather
+than kept as an integer, because a backend that cannot map a reason
+cannot choose a status for it either. `mapOutcomeError` now takes the
+whole `wire.Result` rather than the discriminant, since it is the reason
+and not the outcome that decides what an API server should do.
+`crates/coord-state/fixtures/kine_responses_v1.json` gained a vector per
+reason, so the fourteen encodings are frozen on the Rust side, and
+`every_rejection_reason_is_covered` is an exhaustive match over a value
+the fixture generator names: a reason added upstream fails to compile
+there rather than shipping bytes no adapter can read.
+`TestRejectionReasonsAreCovered` walks the same fixture from Go and
+fails if any reason decodes to "unknown reason", which is the other half
+of the same freeze. Reverting the decode arm reproduces exactly what the
+benchmark printed -- `unexpected outcome: discriminant 35` -- and
+reverting the bound accepts a fifteenth reason that does not exist.
+
+What made it findable was the third arm. The backend arm and the edge
+arm offer the same shaped work to the same domain; the backend arm
+completed every operation of every row and the edge arm, five rows in,
+refused every one. Two arms differing on one domain is a much narrower
+question than one arm failing, and it is the question the overhead
+benchmark exists to ask.
+
+**And a session that stopped serving after a thousand requests.** Once
+the refusal was legible it said what it was:
+`ResourceExhausted: command rejected: retry key outside the window`, on
+every operation of every row after the third, for ever.
+
+An invocation carries a sequence, and the domain retains the result of
+every sequence above a per-client *floor* so that a retry of a lost
+request is answered from what it did rather than executed twice. The
+floor is what bounds that retention, and the window -- 1024 sequences
+-- is how far past the floor an invocation may be. Design Section 12 is
+explicit about what moves it: *"Retain an acknowledgement floor and
+bounded outstanding results for concurrency. Advance the floor only
+after all results through that sequence are received."*
+
+Nothing moved it. `coord_storage::retry::retire_updates` was written for
+task-12, and it is called from tests and from nothing else. The floor
+sat at zero for the life of every client instance, so every client
+instance served exactly 1024 invocations and was refused for ever after.
+The Kubernetes storage edge funnels every operation an API server makes
+through one instance; it died in about a minute. The eight-caller
+benchmark arms held eight windows between them and so lasted eight times
+as long, which is the only reason this looked like an edge problem
+rather than a domain one.
+
+*What the client had to say, and why it has to be part of the command.*
+The half that was missing is the client's: the domain cannot retire what
+it was never told reached the caller. So a request now carries
+`ack_through`, the highest sequence of that client instance whose result
+the client has received, and executing the command retires the
+identities at or below it. The client advances it over its *contiguous
+finished prefix* -- a sequence still outstanding may yet be retried
+under its own identity, and retiring it is exactly giving up the
+retained result a retry would have been answered from. A caller that has
+reported a failure upward and will never ask again says so through
+`Lifecycle::abandon`, and the prefix moves on; the Go backend does this
+at the end of every exchange, because when its exchange returns it is
+finished with the sequence either way.
+
+The acknowledgement is not part of the command's identity: a retry is
+the same command whatever it acknowledges, exactly as a rotated
+credential does not change identity. But it *is* part of what the
+command durably is, for the reason the admission facts are. Retirement
+is state. Two replicas that accepted one command under different
+acknowledged floors would retire different prefixes of one client's
+sequences, and a later invocation would then be `TooOld` on one replica
+and new work on another. So the floor is recorded in `PayloadRecordV1`
+beside the admission and folded into the digest every acknowledgement
+carries, and a proposal naming a different one is a conflict rather than
+an update -- `a_proposal_that_acknowledges_a_different_floor_is_refused`
+fails the moment the digest stops covering it. The client fixes the
+value when the invocation is first built and repeats it byte for byte on
+every retry, so the frame a retry sends is the frame it sent.
+
+Every bound on the acknowledgement is applied at execution rather than
+trusted from the payload, because the payload is the caller's: it cannot
+reach this command's own sequence or past it, since those results do not
+exist yet; it retires nothing at or below the floor; and one command
+retires at most 64 sequences, so a client that stalled and then
+acknowledged a long prefix does not turn one command's batch into a
+whole window of deletes -- the floor catches up a step per command,
+since every request after it repeats the acknowledgement. The
+retirement is resolved against the same view the plan is built on and
+applied in the same atomic batch, so the floor moves exactly when the
+command that acknowledged it becomes durable.
+
+`a_client_that_acknowledges_keeps_its_window_and_one_that_does_not_loses_it`
+runs four windows' worth of invocations through the real admit-plan-apply
+path with a window of four, asserting at each step that the floor tracks
+the acknowledgement exactly and that what it retired is gone, and then
+runs a second instance that acknowledges nothing and meets
+`OutOfWindow` at the window's edge. Reverting the retirement rows fails
+it at the second invocation. On the composed path the difference is the
+whole benchmark: the rows that refused 230 of 300 and then 300 of 300
+complete 300 of 300.
 
 ### What the benchmark harness had to get right to find these
 

@@ -328,7 +328,7 @@ impl Cluster {
         request.canonicalize();
         let key = retry_key(seq);
         let command = CommandId::derive(&key, &request).unwrap();
-        let frame = MessageV1::Request(RequestV1::new(key, &request, 0).unwrap())
+        let frame = MessageV1::Request(RequestV1::new(key, &request, 0, 0).unwrap())
             .encode()
             .unwrap();
         for i in 0..self.nodes.len() {

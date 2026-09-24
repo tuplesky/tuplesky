@@ -228,18 +228,44 @@ func stsClient(caFile string) (*http.Client, error) {
 
 // New is the registered constructor: it never elects a leader (the
 // domain's voters do), and returns the native backend.
-func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
+// Opened is the constructed native path of one DSN: the backend Kine
+// serves through, and the two pieces beneath it a measurement has to be
+// able to ask questions of. Nothing here is a second composition -- it
+// is the one [New] registers, handed back whole so that a benchmark
+// measures the deployed path rather than a rebuilt likeness of it.
+type Opened struct {
+	// Backend is what Kine's bridge calls.
+	Backend *backend.Backend
+	// Client is the bounded native client beneath it.
+	Client *client.Client
+	// Credentials is the workload credential provider. Its exchange
+	// count answers whether the path federates per operation.
+	Credentials *client.Provider
+	// DSN is what the endpoint parsed to.
+	DSN DSN
+}
+
+// Open builds the native path of a coord:// DSN. [New] is this function
+// with the pieces dropped; anything that needs them -- the overhead
+// measurement of task-63 is the one caller -- takes this instead of
+// assembling its own client, which would measure an assembly nothing
+// deploys.
+//
+// `observer`, when it is not nil, receives one event per native
+// invocation the backend performs. It is the trace that says how many
+// commands one storage operation costs.
+func Open(cfg *drivers.Config, observer func(backend.Event)) (*Opened, error) {
 	dsn, err := ParseDSN(cfg.DataSourceName)
 	if err != nil {
-		return false, nil, err
+		return nil, err
 	}
 	pool, err := trustRoot(cfg)
 	if err != nil {
-		return false, nil, err
+		return nil, err
 	}
 	stsHTTP, err := stsClient(dsn.STSCAFile)
 	if err != nil {
-		return false, nil, err
+		return nil, err
 	}
 	provider := client.NewProvider(client.ProviderConfig{
 		TokenFile: dsn.AssertionFile,
@@ -267,9 +293,19 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		Session:        dsn.Session,
 		ClientInstance: dsn.ClientInstance,
 		DeadlineMs:     dsn.DeadlineMs,
+		Observer:       observer,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &Opened{Backend: b, Client: native, Credentials: provider, DSN: dsn}, nil
+}
+
+// New is the registry entry point: Kine asks for a backend and gets one.
+func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
+	opened, err := Open(cfg, nil)
 	if err != nil {
 		return false, nil, err
 	}
-	return false, b, nil
+	return false, opened.Backend, nil
 }

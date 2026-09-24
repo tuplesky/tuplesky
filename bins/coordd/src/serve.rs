@@ -1452,6 +1452,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 &RetryBinding {
                     retry_key: key,
                     command_id: command,
+                    retires: None,
                 },
                 |record| {
                     coord_storage::apply::retained_is_authorized(

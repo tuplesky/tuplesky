@@ -1199,7 +1199,7 @@ impl Caller {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()
@@ -1220,7 +1220,7 @@ impl Caller {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()
@@ -1234,7 +1234,13 @@ async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types
     let (mut send, mut recv) = connection.open_bi().await.expect("request stream");
     send.write_all(frame).await.expect("written");
     send.finish().expect("finished");
-    let bytes = tokio::time::timeout(Duration::from_secs(20), async {
+    // Generous on purpose. Every caller of this helper asserts that an
+    // answer arrived, never that one arrived quickly: the timeout is
+    // here so a wedged domain fails the test instead of hanging it, and
+    // a sustained-load test sharing a machine with the rest of the suite
+    // can legitimately take tens of seconds for one request without
+    // anything being wrong.
+    let bytes = tokio::time::timeout(Duration::from_secs(90), async {
         let mut bytes = Vec::new();
         let mut buf = [0u8; 4096];
         while let Some(n) = recv.read(&mut buf).await.expect("readable") {
@@ -4295,7 +4301,7 @@ async fn a_key_under_a_time_to_live_stops_being_readable() {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()
@@ -4314,7 +4320,7 @@ async fn a_key_under_a_time_to_live_stops_being_readable() {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(caller.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()
@@ -4413,7 +4419,7 @@ async fn a_caller_cannot_expire_a_lease_however_it_spells_it() {
         );
         logical.canonicalize();
         let frame = coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(caller.invocation(n as u64 + 1), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(caller.invocation(n as u64 + 1), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()

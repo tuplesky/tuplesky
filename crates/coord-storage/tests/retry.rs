@@ -53,6 +53,7 @@ fn put(k: &[u8], v: &[u8]) -> LogicalRequest {
 
 fn binding(seq: u64, request: &LogicalRequest) -> RetryBinding {
     RetryBinding {
+        retires: None,
         retry_key: key(seq),
         command_id: CommandId::derive(&key(seq), request).unwrap(),
     }
@@ -148,6 +149,61 @@ impl<E: LocalEngine> Domain<E> {
         .unwrap();
         drop(gated);
         self.admin(updates);
+    }
+
+    /// The whole path a client's request takes, acknowledging the floor
+    /// its frame carries: the retirement is resolved against the view
+    /// the plan is built on, before admission so the window is measured
+    /// from the floor it establishes, and applied in the same batch,
+    /// which is exactly what `Applier::apply_bound` does.
+    fn submit_acking(
+        &mut self,
+        seq: u64,
+        request: &LogicalRequest,
+        ack_through: u64,
+    ) -> (Admission, Option<coord_state::Response>) {
+        let mut b = binding(seq, request);
+        let gated = self.worker.reader().snapshot().unwrap();
+        b.retires = retry::retirement(gated.view(), &b.retry_key, ack_through).unwrap();
+        let admission = retry::admit(gated.view(), &b, |_| true).unwrap();
+        if admission != Admission::New {
+            return (admission, None);
+        }
+        let view = build_read_view(
+            &gated,
+            NS,
+            PrincipalId([0xaa; 16]),
+            request,
+            ViewBudget::default(),
+        )
+        .unwrap();
+        let planned = plan(request, &view, &PlanLimits::default()).unwrap();
+        drop(gated);
+        match apply_plan(
+            &mut self.worker,
+            self.alloc.allocate(),
+            NS,
+            &planned,
+            Some(&b),
+        )
+        .unwrap()
+        {
+            ApplyOutcome::Applied(_) => (admission, Some(planned.response)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn floor(&self) -> u64 {
+        let gated = self.worker.reader().snapshot().unwrap();
+        retry::floor(gated.view(), &SESSION, &CLIENT, 0)
+            .unwrap()
+            .floor
+            .get()
+    }
+
+    fn retained(&self, seq: u64) -> bool {
+        let gated = self.worker.reader().snapshot().unwrap();
+        retry::lookup(gated.view(), &key(seq)).unwrap().is_some()
     }
 
     fn kv_revision(&self) -> u64 {
@@ -531,4 +587,144 @@ fn acknowledgements_beyond_the_active_window_are_rejected() {
         )
         .is_ok()
     );
+}
+
+/// A client that says what it has received keeps serving past its
+/// window; one that says nothing is refused at the window and stays
+/// refused.
+///
+/// The floor is the only thing that moves the outstanding window, and
+/// nothing but a client's own acknowledgement moves the floor. Before
+/// the acknowledgement rode on the request, nothing in the serving path
+/// called `retire_updates` at all, so every client instance was refused
+/// for ever after exactly `window` invocations -- a Kubernetes API
+/// server's storage edge, which funnels every operation through one
+/// instance, died in under a minute.
+#[test]
+fn a_client_that_acknowledges_keeps_its_window_and_one_that_does_not_loses_it() {
+    const WINDOW: u32 = 4;
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(WINDOW);
+    // Four times the window, acknowledging the previous sequence each
+    // time, which is what a client with one request in flight sends.
+    for seq in 1..=u64::from(WINDOW) * 4 {
+        let request = put(format!("k{seq}").as_bytes(), b"v");
+        let (admission, response) = d.submit_acking(seq, &request, seq - 1);
+        assert_eq!(admission, Admission::New, "sequence {seq}");
+        assert!(response.is_some(), "sequence {seq}");
+        // The floor tracks the acknowledgement exactly: a command
+        // retires the prefix its frame named and nothing beyond it.
+        assert_eq!(d.floor(), seq - 1, "floor after {seq}");
+        // And what it retired is gone, so retention stays bounded.
+        if seq > 1 {
+            assert!(!d.retained(seq - 1), "result of {} kept", seq - 1);
+        }
+        assert!(d.retained(seq), "result of {seq} not kept");
+    }
+
+    // The negative control, on a second instance of the same session
+    // that acknowledges nothing.
+    let mut quiet = Domain::new(ModelEngine::new());
+    quiet.activate_session(WINDOW);
+    for seq in 1..=u64::from(WINDOW) {
+        let request = put(format!("q{seq}").as_bytes(), b"v");
+        let (admission, _) = quiet.submit_acking(seq, &request, 0);
+        assert_eq!(admission, Admission::New, "sequence {seq}");
+    }
+    assert_eq!(quiet.floor(), 0);
+    let beyond = u64::from(WINDOW) + 1;
+    let request = put(b"qx", b"v");
+    let (admission, _) = quiet.submit_acking(beyond, &request, 0);
+    assert_eq!(
+        admission,
+        Admission::OutOfWindow {
+            floor: RequestSequence::ZERO,
+            width: WINDOW,
+        }
+    );
+}
+
+/// An acknowledgement is bounded by what a client can possibly have
+/// received, whatever it claims.
+#[test]
+fn an_acknowledgement_never_retires_more_than_the_client_can_have_received() {
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(1024);
+    let request = put(b"k", b"v");
+    d.submit_acking(1, &request, 0);
+    // A command cannot acknowledge itself: it has no result yet.
+    let gated = d.worker.reader().snapshot().unwrap();
+    assert_eq!(
+        retry::retirement(gated.view(), &key(2), 2).unwrap(),
+        retry::retirement(gated.view(), &key(2), 1).unwrap(),
+        "acknowledging its own sequence is capped at the one below"
+    );
+    // Nor anything after itself.
+    assert_eq!(
+        retry::retirement(gated.view(), &key(2), u64::MAX)
+            .unwrap()
+            .map(|r| r.through.get()),
+        Some(1)
+    );
+    // And one command retires a bounded prefix however far the client
+    // has run ahead, so a batch stays a batch.
+    assert_eq!(
+        retry::retirement(gated.view(), &key(10_000), u64::MAX)
+            .unwrap()
+            .map(|r| r.through.get()),
+        Some(retry::MAX_RETIRE_PER_COMMAND)
+    );
+    // Acknowledging nothing, or what is already retired, retires
+    // nothing rather than rewriting the row.
+    assert_eq!(retry::retirement(gated.view(), &key(5), 0).unwrap(), None);
+}
+
+/// A client that fills its whole window before any result comes back
+/// acknowledges nothing on those frames, because it has received
+/// nothing; the first frame past the window is the one that acknowledges
+/// them all. That frame is admitted, since the floor it establishes is
+/// the one its window is measured from. Measured from the floor it
+/// found instead, it would be refused as out of window, and so would
+/// every frame after it: the window can only be reopened by an admitted
+/// request, so a client with a window's worth of concurrency would be
+/// shut out for the life of its instance the first time it used it.
+#[test]
+fn a_filled_window_is_reopened_by_the_frame_that_first_crosses_it() {
+    const WINDOW: u32 = 4;
+    let mut d = Domain::new(ModelEngine::new());
+    d.activate_session(WINDOW);
+    // A window's worth in flight at once, none of them able to
+    // acknowledge anything yet.
+    for seq in 1..=u64::from(WINDOW) {
+        let request = put(format!("k{seq}").as_bytes(), b"v");
+        let (admission, _) = d.submit_acking(seq, &request, 0);
+        assert_eq!(admission, Admission::New, "sequence {seq}");
+    }
+    assert_eq!(d.floor(), 0);
+
+    // Every result is back; the next frame says so.
+    let beyond = u64::from(WINDOW) + 1;
+    let request = put(b"kx", b"v");
+    let (admission, response) = d.submit_acking(beyond, &request, u64::from(WINDOW));
+    assert_eq!(admission, Admission::New, "the acknowledging frame");
+    assert!(response.is_some());
+    assert_eq!(d.floor(), u64::from(WINDOW));
+    for seq in 1..=u64::from(WINDOW) {
+        assert!(!d.retained(seq), "result of {seq} kept");
+    }
+    assert!(d.retained(beyond));
+
+    // And the window is a window still: a frame that acknowledges the
+    // same floor but stands more than a window past it is refused.
+    let too_far = u64::from(WINDOW) * 2 + 2;
+    let request = put(b"ky", b"v");
+    let (admission, _) = d.submit_acking(too_far, &request, u64::from(WINDOW));
+    assert_eq!(
+        admission,
+        Admission::OutOfWindow {
+            floor: RequestSequence::new(u64::from(WINDOW)).unwrap(),
+            width: WINDOW,
+        }
+    );
+    assert_eq!(d.floor(), u64::from(WINDOW), "a refusal moves nothing");
 }

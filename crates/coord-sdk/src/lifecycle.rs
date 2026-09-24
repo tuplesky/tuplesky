@@ -428,6 +428,35 @@ impl<P: CredentialProvider> Client<P> {
         outcome
     }
 
+    /// Give up on a request for good, retiring its identity even if its
+    /// outcome was never established.
+    ///
+    /// [`Self::forget`] keeps the binding of an unknown outcome so the
+    /// caller may still ask again. That is the right default and it has
+    /// a cost: the acknowledged floor is a contiguous prefix, so one
+    /// request abandoned in silence holds the floor where it is, and the
+    /// outstanding window closes around it a window later. A caller that
+    /// has reported the failure upward and will never ask again says so
+    /// here, and the prefix moves on.
+    ///
+    /// What is given up is the retained result: a sequence retired this
+    /// way is `TooOld` if it is ever presented again, not a replay of
+    /// whatever it did. So this is for a request the caller has finished
+    /// with, never for one it merely stopped waiting on.
+    pub fn abandon(&mut self, request: RequestId) -> Option<Outcome> {
+        let e = self.requests.remove(&request)?;
+        if let Some(p) = e.permit {
+            self.pool.release(p);
+        }
+        let outcome = match e.state {
+            RequestState::Done(o) => Some(o),
+            _ => Some(Outcome::Unknown),
+        };
+        self.finished.insert(request.0);
+        self.retire_finished_prefix();
+        outcome
+    }
+
     /// Retire the identity bindings of every finished sequence below the
     /// first gap. A gap is a sequence still tracked, or one allocated and
     /// never completed, and its binding has to survive for a retry.

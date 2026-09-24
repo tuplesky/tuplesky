@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use coord_state::{KineKv, KvEntry, Outcome, RangeItem, Response};
+use coord_state::{KineKv, KvEntry, Outcome, RangeItem, RejectionReason, Response};
 use coord_types::ids::{KvRevision, LeaseGeneration, LeaseId};
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +84,87 @@ fn vector(name: &str, revision: u64, outcome: Outcome) -> ResponseVector {
         response,
         payload_hex: hex(&payload),
     }
+}
+
+/// Every `RejectionReason`, named for the fixture and in discriminant
+/// order. Adding a reason upstream without extending this list fails
+/// `every_rejection_reason_is_covered` rather than silently shipping an
+/// encoding no adapter can read.
+const REJECTIONS: [(&str, RejectionReason); 14] = [
+    ("err-rejected-invalid", RejectionReason::Invalid),
+    (
+        "err-rejected-namespace-mismatch",
+        RejectionReason::NamespaceMismatch,
+    ),
+    (
+        "err-rejected-response-too-large",
+        RejectionReason::ResponseTooLarge,
+    ),
+    (
+        "err-rejected-too-many-events",
+        RejectionReason::TooManyEvents,
+    ),
+    (
+        "err-rejected-too-many-deletes",
+        RejectionReason::TooManyDeletes,
+    ),
+    (
+        "err-rejected-counter-overflow",
+        RejectionReason::CounterOverflow,
+    ),
+    ("err-rejected-unsupported", RejectionReason::Unsupported),
+    ("err-rejected-view-too-large", RejectionReason::ViewTooLarge),
+    (
+        "err-rejected-retry-conflict",
+        RejectionReason::RetryConflict,
+    ),
+    ("err-rejected-retry-too-old", RejectionReason::RetryTooOld),
+    (
+        "err-rejected-retry-out-of-window",
+        RejectionReason::RetryOutOfWindow,
+    ),
+    (
+        "err-rejected-session-invalid",
+        RejectionReason::SessionInvalid,
+    ),
+    (
+        "err-rejected-retry-unauthorized",
+        RejectionReason::RetryUnauthorized,
+    ),
+    (
+        "err-rejected-admission-mismatch",
+        RejectionReason::AdmissionMismatch,
+    ),
+];
+
+/// The reason table above is exhaustive. The match is over a value this
+/// test names, so a reason added upstream stops compiling here, which is
+/// the point: the list cannot drift silently.
+#[test]
+fn every_rejection_reason_is_covered() {
+    for (_, reason) in REJECTIONS {
+        // Exhaustive by construction: a new variant fails to compile.
+        match reason {
+            RejectionReason::Invalid
+            | RejectionReason::NamespaceMismatch
+            | RejectionReason::ResponseTooLarge
+            | RejectionReason::TooManyEvents
+            | RejectionReason::TooManyDeletes
+            | RejectionReason::CounterOverflow
+            | RejectionReason::Unsupported
+            | RejectionReason::ViewTooLarge
+            | RejectionReason::RetryConflict
+            | RejectionReason::RetryTooOld
+            | RejectionReason::RetryOutOfWindow
+            | RejectionReason::SessionInvalid
+            | RejectionReason::RetryUnauthorized
+            | RejectionReason::AdmissionMismatch => {}
+        }
+    }
+    let mut names: Vec<&str> = REJECTIONS.iter().map(|(n, _)| *n).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), REJECTIONS.len(), "duplicate fixture name");
 }
 
 /// The Kine-facing outcomes and their exact postcard bytes are frozen.
@@ -214,6 +295,16 @@ fn kine_response_vectors_are_frozen() {
         vector("err-session-invalid", 20, Outcome::ErrSessionInvalid),
         vector("err-lease-exists", 20, Outcome::ErrLeaseExists),
     ];
+    // Every rejection reason, in discriminant order. A rejection is an
+    // executed outcome like any other and reaches a Kine caller through
+    // the same bytes, so the reason table is part of the frozen
+    // encoding rather than an internal detail: a reader that does not
+    // know a reason turns a diagnosable refusal into an undecodable
+    // result.
+    let mut vectors = vectors;
+    for (name, reason) in REJECTIONS {
+        vectors.push(vector(name, 20, Outcome::ErrRejected { reason }));
+    }
     write_or_compare(
         "kine_responses_v1.json",
         &ResponseFixture {

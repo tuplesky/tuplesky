@@ -219,6 +219,11 @@ pub fn speculate<E: LocalEngine>(
     let binding = RetryBinding {
         retry_key: payload.retry_key,
         command_id: request.command,
+        // Speculation never writes: it plans against an overlay to have
+        // the plan ready, and the applier is what makes anything durable.
+        // Retiring a prefix here would move the floor on evidence that is
+        // not yet a decision.
+        retires: None,
     };
     let gated = worker.reader().snapshot()?;
     // Only new work is speculated. A presented invocation the retry layer

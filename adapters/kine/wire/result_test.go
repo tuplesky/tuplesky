@@ -62,6 +62,27 @@ func (k *jsonKineKv) kv(*testing.T) *KineKv {
 	}
 }
 
+// rejectionReasons maps the Rust variant name to this package's
+// discriminant. It is spelled out rather than derived so that a reason
+// renamed or reordered upstream fails the fixture comparison instead of
+// decoding to a neighbouring reason and a different gRPC status.
+var rejectionReasons = map[string]RejectionReason{
+	"Invalid":           RejectedInvalid,
+	"NamespaceMismatch": RejectedNamespaceMismatch,
+	"ResponseTooLarge":  RejectedResponseTooLarge,
+	"TooManyEvents":     RejectedTooManyEvents,
+	"TooManyDeletes":    RejectedTooManyDeletes,
+	"CounterOverflow":   RejectedCounterOverflow,
+	"Unsupported":       RejectedUnsupported,
+	"ViewTooLarge":      RejectedViewTooLarge,
+	"RetryConflict":     RejectedRetryConflict,
+	"RetryTooOld":       RejectedRetryTooOld,
+	"RetryOutOfWindow":  RejectedRetryOutOfWindow,
+	"SessionInvalid":    RejectedSessionInvalid,
+	"RetryUnauthorized": RejectedRetryUnauthorized,
+	"AdmissionMismatch": RejectedAdmissionMismatch,
+}
+
 var unitOutcomes = map[string]OutcomeKind{
 	"Compacted":           OutcomeCompacted,
 	"KineCreated":         OutcomeKineCreated,
@@ -132,6 +153,20 @@ func expected(t *testing.T, v responseVector) Result {
 		res.Kind, res.Deleted, res.Prev = OutcomeKineDeleted, d.Deleted, d.Prev.kv(t)
 		return res
 	}
+	if raw, ok := variants["ErrRejected"]; ok {
+		var e struct {
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(raw, &e); err != nil {
+			t.Fatal(err)
+		}
+		reason, ok := rejectionReasons[e.Reason]
+		if !ok {
+			t.Fatalf("%s: rejection reason %q is not named here", v.Name, e.Reason)
+		}
+		res.Kind, res.Reason = OutcomeErrRejected, reason
+		return res
+	}
 	t.Fatalf("%s: outcome not in the Kine subset", v.Name)
 	return res
 }
@@ -189,6 +224,70 @@ func TestResultRefusesOutcomesOutsideTheSubset(t *testing.T) {
 	}
 	if _, err := (Result{Kind: 99}).Encode(); !errors.Is(err, ErrUnexpectedOutcome) {
 		t.Fatalf("encode of unknown kind: %v", err)
+	}
+}
+
+// A rejection decodes to its reason, and every reason the Rust enum has
+// is covered by a vector. The planner's refusal is an ordinary executed
+// outcome; before this it decoded as "unexpected outcome", which reached
+// an API server as an internal error and told an operator nothing.
+func TestRejectionReasonsAreCovered(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Clean(responseFixture))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var f struct {
+		Vectors []responseVector `json:"vectors"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	seen := map[RejectionReason]bool{}
+	for _, v := range f.Vectors {
+		var variants map[string]json.RawMessage
+		if json.Unmarshal(v.Response.Outcome, &variants) != nil {
+			continue
+		}
+		if _, ok := variants["ErrRejected"]; !ok {
+			continue
+		}
+		payload, _ := hex.DecodeString(v.PayloadHex)
+		got, err := DecodeResult(payload)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", v.Name, err)
+		}
+		if got.Kind != OutcomeErrRejected {
+			t.Fatalf("%s: decoded kind %d", v.Name, got.Kind)
+		}
+		want := expected(t, v)
+		if got.Reason != want.Reason {
+			t.Fatalf("%s: reason %d, want %d", v.Name, got.Reason, want.Reason)
+		}
+		if got.Reason.String() == "unknown reason" {
+			t.Fatalf("%s: reason %d is not named", v.Name, got.Reason)
+		}
+		seen[got.Reason] = true
+	}
+	for r := RejectionReason(0); r < rejectedBeyond; r++ {
+		if !seen[r] {
+			t.Fatalf("no vector covers reason %d (%s)", r, r)
+		}
+	}
+	if len(seen) != int(rejectedBeyond) {
+		t.Fatalf("covered %d reasons, this package names %d", len(seen), rejectedBeyond)
+	}
+}
+
+// A reason beyond the table is refused rather than kept as an integer:
+// decoding it would hand the backend a reason it cannot map.
+func TestRejectionReasonBeyondTheTableIsRefused(t *testing.T) {
+	// revision 20, discriminant 35, reason one past the last.
+	payload := []byte{20, 35, byte(rejectedBeyond)}
+	if _, err := DecodeResult(payload); !errors.Is(err, ErrUnexpectedOutcome) {
+		t.Fatalf("out-of-range reason accepted: %v", err)
+	}
+	if _, err := (Result{Kind: OutcomeErrRejected, Reason: rejectedBeyond}).Encode(); !errors.Is(err, ErrUnexpectedOutcome) {
+		t.Fatalf("out-of-range reason encoded: %v", err)
 	}
 }
 
