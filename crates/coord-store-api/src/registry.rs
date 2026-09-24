@@ -161,12 +161,6 @@ pub mod meta_fields {
     /// another manifest quarantines rather than reinitializing
     /// (design Section 10.5).
     pub const GENESIS_DIGEST: &[u8] = b"genesis_digest";
-    /// The canonical genesis manifest whose digest is
-    /// [`GENESIS_DIGEST`], kept beside it so that a later boot handed a
-    /// different manifest can say *how* it differs: the one change a pin
-    /// admits, a forward replacement of existing voters, is decided field
-    /// by field against this, never against the digest alone.
-    pub const GENESIS_MANIFEST: &[u8] = b"genesis_manifest";
 }
 
 #[cfg(test)]

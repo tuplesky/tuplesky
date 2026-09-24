@@ -1340,28 +1340,3 @@ replaces its key, and asserts the same invocation gets the same command
 identifier and the same outcome afterwards -- and then puts the retired
 credential back and asserts the node refuses to start and `inspect`
 names it `state=stale committed=2 presented=1`.
-
-### What the genesis pin admits, and why a replacement passes it
-
-The genesis pin (task-43-compose) quarantines a start under any manifest
-but the one the node was initialized under, and a replacement on this
-branch is committed by handing the node an edited `genesis.json` in
-which its voter entry moves to the next incarnation with its new key.
-The two collided, and the decision is that the pin admits exactly one
-kind of change: a forward replacement of existing voters. Every field
-must be identical -- cluster, domain, epoch, the same voters in the same
-order, issuer roots, workload-identity rules, admin, protocol version --
-except that one or more voters' `(incarnation, public_key)` entries have
-moved to a strictly higher incarnation. Anything else, a backward move
-or a new key at the same incarnation, stays a genesis quarantine,
-including the same replacement beside any other edit.
-
-Deciding that needs the pinned manifest and not only its digest, so
-`init` records the canonical manifest beside the pin
-(`meta_fields::GENESIS_MANIFEST`, written before the digest). An
-admitted replacement is re-pinned -- manifest and digest in one durable
-transaction -- before anything is adopted, so a stop before the re-pin
-leaves the old pin and nothing adopted, and a stop after it finishes the
-adoption on the next start. This is a stopgap for committing a
-replacement through the manifest; once a committed reconfiguration path
-carries replacements, the pin can go back to admitting nothing.
