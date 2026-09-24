@@ -1142,6 +1142,27 @@ impl Caller {
         .encode()
         .expect("bounded")
     }
+
+    /// One `Range` of exactly `key`, as a client would send it.
+    fn range(&self, sequence: u64, key: &[u8]) -> Vec<u8> {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            coord_types::ids::NamespaceId([0x5e; 16]),
+            coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
+                range: coord_types::logical_v1::KeyRange::exact(key.to_vec()),
+                revision: None,
+                limit: 0,
+                keys_only: false,
+                count_only: false,
+            }),
+        );
+        logical.canonicalize();
+        coord_types::wire_v1::MessageV1::Request(
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0)
+                .expect("bounded"),
+        )
+        .encode()
+        .expect("bounded")
+    }
 }
 
 /// Write `frame` on a fresh stream and read the answer the daemon
@@ -1381,6 +1402,59 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     assert_eq!(
         again.outcome, first.outcome,
         "the same invocation was answered differently by the next process"
+    );
+}
+
+/// A read retried after a restart is answered with its retained result,
+/// not refused.
+///
+/// A read's output is gated on the request's namespace and keys, which
+/// the frontend records when its dispatcher accepts a live request. A
+/// retry answered from the durable record never reaches the dispatcher,
+/// and the process that recorded them is gone -- so without recording
+/// them from the retry itself, every read-bearing retry after a restart
+/// was answered as not admitted while the session and its permissions
+/// were unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_retried_after_a_restart_gets_its_retained_result() {
+    let dir = workspace("read-retry");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .expect("the daemon answered the write");
+        let answer = ask(&caller.connection, &caller.range(2, b"k"))
+            .await
+            .expect("the daemon answered the read");
+        response_of(&answer)
+    };
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &first.outcome else {
+        panic!("the read was not answered with a result: {first:?}");
+    };
+    let read: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the read's result decodes");
+    assert!(
+        !matches!(read.outcome, coord_state::Outcome::ErrPermissionDenied),
+        "the read itself was denied, so this is not the case under test: {read:?}"
+    );
+
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
+    let answer = ask(&caller.connection, &caller.range(2, b"k"))
+        .await
+        .unwrap_or_else(|| panic!("the daemon answered the retry\n{}", daemon.said()));
+    let again = response_of(&answer);
+    assert_eq!(again.command_id, first.command_id);
+    assert_eq!(
+        again.outcome, first.outcome,
+        "a read retried after a restart was not given its retained result"
     );
 }
 

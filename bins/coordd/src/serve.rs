@@ -844,14 +844,28 @@ impl<P: Persistence> Domain<P> {
     }
 
     /// The answer this domain's durable record already holds for the
-    /// invocation `frame` names, if it holds one for this exact command
-    /// and this caller may have it.
+    /// invocation `frame` names, if it holds one for this exact command.
+    ///
+    /// It is answered under the same authorization a live result is.
+    /// The record is resolved through `retry::resolve`, which refuses a
+    /// session that can no longer execute -- retired, or its rule
+    /// disabled or regenerated -- and a result the request would no
+    /// longer be authorized for (`retained_is_authorized`, the rule
+    /// execution applies to a retained result too). Those are answered
+    /// with a refusal rather than the result, and rather than submitted
+    /// again: the command has executed, so there is nothing new to order.
+    /// What is handed out then goes through the frontend's output gate
+    /// with the request's own metadata, which is recorded from this
+    /// request because a retry answered here never reached the
+    /// dispatcher that records it for a live one.
     fn retained(
         &mut self,
         health: &ClockHealth,
         connection: u64,
         frame: &Frame,
     ) -> Option<Vec<u8>> {
+        use coord_storage::retry::{Resolution, RetryBinding};
+
         let MessageV1::Request(request) = decode(frame).ok()? else {
             return None;
         };
@@ -864,18 +878,47 @@ impl<P: Persistence> Domain<P> {
         if !binding.active(health) || binding.session != key.session_id {
             return None;
         }
-        let command = coord_types::CommandId::derive(&key, &request.logical().ok()?).ok()?;
-        let record = {
+        let logical = request.logical().ok()?;
+        let command = coord_types::CommandId::derive(&key, &logical).ok()?;
+        let resolved = {
             let gated = self.backing.applier().store().reader().snapshot().ok()?;
-            coord_storage::retry::lookup(gated.view(), &key).ok()?
-        }?;
-        // Only for the command this frame is of: a retry key bound to
-        // another payload is a conflict, which is replicated execution's
-        // to decide at that command's own position, not this node's to
-        // answer from a record that belongs to something else.
-        if record.command_id != command {
-            return None;
-        }
+            coord_storage::retry::resolve(
+                gated.view(),
+                &RetryBinding {
+                    retry_key: key,
+                    command_id: command,
+                },
+                |record| {
+                    coord_storage::apply::retained_is_authorized(
+                        gated.view(),
+                        &key.session_id,
+                        &logical,
+                        record,
+                    )
+                },
+            )
+            .ok()?
+        };
+        let record = match resolved {
+            Resolution::Result(record) => record,
+            // The command executed, and this caller may not have what it
+            // produced -- or may not execute at all any more. The same
+            // refusal the output gate gives a live result it will not
+            // disclose; the command is not proposed a second time.
+            Resolution::NoSession => {
+                return refusal(command, "the session may no longer execute");
+            }
+            Resolution::Unauthorized => {
+                return refusal(command, "output not authorized by current policy");
+            }
+            // Not executed, retired below the floor, or a retry key bound
+            // to another payload: replicated execution decides each of
+            // those at the command's own position, not this node from a
+            // record that is not this command's.
+            Resolution::Pending | Resolution::Retired { .. } | Resolution::Conflict { .. } => {
+                return None;
+            }
+        };
         let response = coord_types::wire_v1::ResponseV1 {
             command_id: command,
             outcome: coord_types::wire_v1::OutcomeV1::Ok {
@@ -892,7 +935,11 @@ impl<P: Persistence> Domain<P> {
             store: self.backing.applier().store(),
             budget: ViewBudget::default(),
         };
-        match self.frontend.frontend.deliver(delivery, &policy) {
+        match self
+            .frontend
+            .frontend
+            .deliver_retained(delivery, command, &logical, &policy)
+        {
             Delivered::Answer(delivery) => Some(delivery.frame),
             Delivered::Unbound { .. } => None,
         }
@@ -1321,6 +1368,18 @@ fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
             })?;
     reader.finish()?;
     Ok(frame)
+}
+
+/// A refusal of a retained result, in the shape the output gate refuses
+/// a live one it will not disclose.
+fn refusal(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    MessageV1::Response(coord_collector::codes::error_response(
+        command,
+        coord_collector::codes::NOT_ADMITTED,
+        detail,
+    ))
+    .encode()
+    .ok()
 }
 
 /// The invocation a frame names, where it names one.

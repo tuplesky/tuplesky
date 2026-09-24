@@ -187,6 +187,22 @@ impl<E: LocalEngine> Domain<E> {
         .unwrap()
     }
 
+    /// Resolve under the rule a frontend answers a retry from the record
+    /// with: the same one execution applies to a retained result.
+    fn resolve_as_a_frontend(
+        &self,
+        session: SessionId,
+        seq: u64,
+        request: &LogicalRequest,
+    ) -> Resolution {
+        let gated = self.worker.reader().snapshot().unwrap();
+        let view = gated.view();
+        retry::resolve(view, &binding(session, seq, request), |record| {
+            coord_storage::apply::retained_is_authorized(view, &session, request, record)
+        })
+        .unwrap()
+    }
+
     fn position(&self) -> u64 {
         self.worker.application_base().execution_position.get()
     }
@@ -328,4 +344,56 @@ fn a_lost_permission_protects_the_retained_result_of_an_executed_request() {
         d.run(S1, 1, &put(b"a", b"secret")).0,
         Admission::Retry(_)
     ));
+}
+
+/// A result answered from the durable record is authorized the way a
+/// live one is.
+///
+/// A pure mutation acknowledgement carries no key the output gate would
+/// check, so the record path is the only place a lost permission, a
+/// retired session or a disabled rule can protect it. Resolved under the
+/// rule execution applies to a retained result, a retry of a `Put` is
+/// refused once the write permission is gone, and once the session can no
+/// longer execute -- exactly where a fresh command on the same connection
+/// would be.
+#[test]
+fn a_retained_result_is_resolved_under_the_authorization_a_live_one_gets() {
+    let (backend, _) = FaultBackend::new(Vec::new(), FaultPlan::default());
+    let mut d = Domain::new(RedbEngine::create_on_backend(backend, 4 << 20).unwrap());
+    d.run_internal(&trust(true));
+    d.run_internal(&admit(1, S1));
+    d.run_internal(&allow_write(1, b"a", b"c"));
+    let request = put(b"a", b"1");
+    let (_, r) = d.run(S1, 1, &request);
+    assert_eq!(r.unwrap().outcome, Outcome::Put { prev: None });
+    assert!(matches!(
+        d.resolve_as_a_frontend(S1, 1, &request),
+        Resolution::Result(_)
+    ));
+
+    // The write permission is revoked: the result it produced is not
+    // handed out again.
+    d.run_internal(&InternalCommand::PutPolicyRule {
+        namespace: NS,
+        principal: ALICE,
+        rule: PolicyRuleId([1; 16]),
+        record: None,
+    });
+    assert_eq!(
+        d.resolve_as_a_frontend(S1, 1, &request),
+        Resolution::Unauthorized
+    );
+
+    // Restored, and then the rule that admitted the session is disabled:
+    // the session cannot execute, so it cannot read what it executed.
+    d.run_internal(&allow_write(1, b"a", b"c"));
+    assert!(matches!(
+        d.resolve_as_a_frontend(S1, 1, &request),
+        Resolution::Result(_)
+    ));
+    d.run_internal(&trust(false));
+    assert_eq!(
+        d.resolve_as_a_frontend(S1, 1, &request),
+        Resolution::NoSession
+    );
 }

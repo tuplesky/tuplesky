@@ -34,6 +34,31 @@ use crate::views::{
 };
 use crate::watch::{PublishError, WatchHub};
 
+/// Whether `session` may still have the result `record` retained for
+/// `request`, under the policy `view` holds now.
+///
+/// The one rule for a retained result, wherever it is handed out: at
+/// execution, when an already-executed command is presented again, and at
+/// a frontend that answers a retry from the durable record before
+/// submitting anything. Losing a permission protects what it produced,
+/// exactly as it would a fresh execution's, and a result that cannot be
+/// decoded or authorized is not handed out.
+pub fn retained_is_authorized<V: coord_store_api::engine::OrderedRead>(
+    view: &V,
+    session: &coord_types::ids::SessionId,
+    request: &LogicalRequest,
+    record: &crate::codecs::RetryRecordV1,
+) -> bool {
+    let namespace = request.namespace;
+    let Ok(auth) = load_authorization(view, namespace, session, ViewBudget::default()) else {
+        return false;
+    };
+    let Ok(stored) = postcard::from_bytes::<coord_state::Response>(&record.response) else {
+        return false;
+    };
+    authorize_retained(&auth, &namespace, request, &stored.outcome).is_ok()
+}
+
 /// Why a command could not be applied.
 #[derive(Debug)]
 pub enum ApplyError {
@@ -384,16 +409,7 @@ impl<P: Persistence> Applier<P> {
             // still be authorized now: losing a permission protects what
             // it produced, exactly as it would a fresh execution.
             let authorized = |record: &crate::codecs::RetryRecordV1| {
-                let Ok(auth) =
-                    load_authorization(gated.view(), namespace, &session, ViewBudget::default())
-                else {
-                    return false;
-                };
-                let Ok(stored) = postcard::from_bytes::<coord_state::Response>(&record.response)
-                else {
-                    return false;
-                };
-                authorize_retained(&auth, &namespace, request, &stored.outcome).is_ok()
+                retained_is_authorized(gated.view(), &session, request, record)
             };
             match retry::admit(gated.view(), binding, authorized)? {
                 Admission::New => {}

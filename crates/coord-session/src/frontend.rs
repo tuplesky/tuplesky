@@ -448,6 +448,40 @@ impl BoundFrontend {
         Delivered::Answer(self.gate(delivery, session, scope, policy))
     }
 
+    /// Gate a result the durable record retained for `delivery`'s retry
+    /// key, answering a retry of `logical` (whose command is `command`).
+    ///
+    /// A retained result is gated exactly as a live one is, and the gate
+    /// needs the request's namespace and keys to authorize read output
+    /// and previous values. A live request's are recorded when the
+    /// dispatcher accepts it; a retry answered from the record never
+    /// reaches the dispatcher, and after a restart (or once the entry has
+    /// been evicted) nothing else recorded them, so every read-bearing
+    /// retry would be denied. They are recorded here from the request
+    /// being answered, which the caller has already matched to the
+    /// record's command. The record decides which command the key is
+    /// bound to, so an entry this key holds for another command is
+    /// replaced rather than used to authorize output it did not produce.
+    pub fn deliver_retained(
+        &mut self,
+        delivery: Delivery,
+        command: coord_types::CommandId,
+        logical: &LogicalRequest,
+        policy: &dyn PolicySource,
+    ) -> Delivered {
+        let key = delivery.retry_key;
+        if self
+            .requests
+            .get(&key)
+            .is_some_and(|i| i.command != command)
+        {
+            self.requests.remove(&key);
+            self.order.retain(|k| *k != key);
+        }
+        self.remember(key, command, logical);
+        self.deliver(delivery, policy)
+    }
+
     fn gate(
         &mut self,
         delivery: Delivery,
