@@ -179,12 +179,22 @@ coordd --config <successor.toml> restore --dir <backup/> --fencing <fencing.json
 
 The same invocation without `--plan`, on the same node.
 
-The restore writes into a fresh generation of the *successor* cluster
-and selects nothing until it has finished, so a failure or a crash at
-any point leaves a store that simply was never restored. The receipt it
-writes last is the only evidence a restore completed; a restored store
-can always say which cluster it came from, at which boundary, what was
-dropped and what you told it had been done.
+The restore writes into a staged generation of the *successor*
+cluster and selects nothing until it has finished: the generation is
+selected only after the transaction carrying the receipt has committed,
+and the node's journal is created only after that. A failure or a
+crash before the selection leaves a store that simply was never
+restored -- `coordd` refuses to serve it as "no store", and the same
+restore command can be run again. The receipt it writes last is the
+only evidence a restore completed; a restored store can always say
+which cluster it came from, at which boundary, what was dropped and
+what you told it had been done.
+
+The one narrow window left is a crash after the selection and before
+the journal is created. The node then refuses both to serve (it has no
+journal) and to restore again (it has a store). Remove the state root
+and the journal root and run the restore again; nothing in them has
+been served.
 
 ## 6. Afterwards
 

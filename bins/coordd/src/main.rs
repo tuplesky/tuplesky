@@ -397,13 +397,16 @@ fn restore(
     // has frontiers, and writing behind them is what quarantines a
     // node.
     //
-    // A restore that fails is reported *as* the storage failure, not
-    // beside it. The callback's error is what stops `open_storage_with`
-    // before the journal is opened and the projection attached, so a
-    // generation holding part of a backup never acquires a journal
-    // stream in this process and the error an operator reads is the
-    // restore's own. Returning `Ok` here and reporting the failure
-    // afterwards would attach the partial projection first.
+    // The generation is filled while staged and selected only after the
+    // callback returns `Ok`, which is after the restore's last
+    // transaction has committed the receipt; the journal is created
+    // after that. So a restore that fails, in this process or by the
+    // process dying, leaves no selected generation and no journal: the
+    // node refuses to serve it and the restore can be run again. The
+    // callback's error is reported *as* the storage failure, so the
+    // error an operator reads is the restore's own; returning `Ok` here
+    // and reporting the failure afterwards would select the partial
+    // generation first.
     let mut outcome = None;
     let storage = store::open_storage_with(
         config,
