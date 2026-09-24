@@ -65,6 +65,7 @@ serde_json = "=1.0.151"
 rand_chacha = { version = "=0.10.0", default-features = false }
 rand_core = { version = "=0.10.0", default-features = false }
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+loom = "=0.7.2"
 tempfile = "=3.27.0"
 
 [profile.release]

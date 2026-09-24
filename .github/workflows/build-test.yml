@@ -65,6 +65,8 @@ jobs:
         run: cargo xtask check-deps
       - name: Test
         run: cargo xtask test ${{ inputs.full && '--extended' || '' }}
+      - name: Loom model checks (local concurrency boundaries)
+        run: cargo xtask loom
       - name: Record compiler and feature trees
         run: |
           rustc -Vv

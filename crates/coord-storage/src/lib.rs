@@ -31,6 +31,12 @@
 //!   a fixed revision selecting versions before limits, compaction floor)
 //!   plus bounded pages and per-revision event sets from a gated snapshot.
 //!   Physical engines never implement MVCC themselves.
+//! * [`watch`] (task-13): the watch hub with a subscribe-first registration
+//!   frontier (replay strictly through the frontier, live strictly after),
+//!   whole-revision batches, bounded per-watch queues that close slow
+//!   consumers with a resume point instead of skipping, progress that never
+//!   overtakes delivered events, per-output authorization and resumable
+//!   cancellation. [`sync`] swaps its primitives for loom under `cfg(loom)`.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -38,15 +44,21 @@ pub mod codecs;
 pub mod lowering;
 pub mod materialize;
 pub mod retry;
+pub mod sync;
 pub mod view;
 pub mod views;
+pub mod watch;
 pub mod worker;
 
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{ApplyOutcome, apply_plan, plan_to_batch};
 pub use retry::{Admission, Resolution, RetryBinding};
 pub use view::{GatedReader, GatedView, ViewError};
-pub use views::{ViewBudget, ViewBuildError, build_read_view, events_at, scan_current_page};
+pub use views::{
+    StoredEvent, ViewBudget, ViewBuildError, build_read_view, events_at, scan_current_page,
+    stored_events_at,
+};
+pub use watch::{CloseReason, WatchBatch, WatchHub, WatchId, WatchItem, WatchSpec};
 pub use worker::{FlushOutcome, GroupLimits, StoreWorker, SubmitError, WorkerState};
 
 /// Crate role marker used by the dependency-policy check.
