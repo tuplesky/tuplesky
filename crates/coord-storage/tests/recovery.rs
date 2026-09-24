@@ -120,7 +120,7 @@ enum Role {
 
 struct Node {
     role: Option<Role>,
-    applier: Option<Applier<RedbEngine>>,
+    applier: Option<Applier<StoreWorker<RedbEngine>>>,
     shared: Arc<Shared>,
     /// The durable image while the node is down.
     image: Vec<u8>,
@@ -200,14 +200,14 @@ impl Node {
             Role::Follower(_) => None,
         }
     }
-    fn applier(&mut self) -> &mut Applier<RedbEngine> {
+    fn applier(&mut self) -> &mut Applier<StoreWorker<RedbEngine>> {
         self.applier.as_mut().unwrap()
     }
     fn view(&self) -> coord_storage::GatedView<coord_storage_redb::RedbView> {
         self.applier
             .as_ref()
             .unwrap()
-            .worker()
+            .store()
             .reader()
             .snapshot()
             .unwrap()
@@ -427,8 +427,8 @@ impl Cluster {
                         });
                     }
                     let node = &mut self.nodes[i];
-                    node.applier().worker_mut().submit(batch).unwrap();
-                    node.applier().worker_mut().flush().unwrap();
+                    node.applier().store_mut().submit(batch).unwrap();
+                    node.applier().store_mut().flush().unwrap();
                     if let Some(cp) = self.crash_due(i, false) {
                         self.fire(i, cp);
                         return;
@@ -496,7 +496,7 @@ impl Cluster {
             let payload = leader.payload(&request.command).expect("proposed").clone();
             let node = &mut self.nodes[i];
             let outcome = speculate(
-                node.applier.as_ref().unwrap().worker(),
+                node.applier.as_ref().unwrap().store(),
                 &mut node.overlay,
                 &SpeculationLimits::default(),
                 &request,
@@ -1607,8 +1607,13 @@ fn released_results_precede_materialization_and_equal_the_established_ones() {
         let seq = cluster.ops.iter().find(|(_, _, cc)| cc == c).unwrap().0;
         assert_eq!(records[&seq].response, r.response());
     }
-    // The lease grant and the leased put were declined and never released
-    // early; materialization alone establishes them.
+    // The lease grant and the leased put were declined by the
+    // speculation companion: nothing about them was disclosed early.
+    // They are still answered, on the final path -- after they have
+    // executed and materialized, marked as not speculative, carrying the
+    // result materialization established. A declined command that was
+    // never released at all would leave its caller waiting on a
+    // disclosure nothing was going to assemble.
     let lease_ops: Vec<CommandId> = cluster
         .ops
         .iter()
@@ -1618,13 +1623,21 @@ fn released_results_precede_materialization_and_equal_the_established_ones() {
     assert_eq!(lease_ops.len(), 2);
     for c in &lease_ops {
         assert!(leader.declined.contains(c), "{c:?} declined");
-        assert!(
-            leader
-                .released
-                .iter()
-                .all(|(r, _, _)| r.established().command() != *c)
-        );
-        assert!(by_command.contains_key(c));
+        let released: Vec<&(coord_core::capability::ReleasedResult, bool, u64)> = leader
+            .released
+            .iter()
+            .filter(|(r, _, _)| r.established().command() == *c)
+            .collect();
+        assert_eq!(released.len(), 1, "{c:?} released exactly once");
+        let (r, before, _) = released[0];
+        assert!(!r.speculative(), "{c:?} was disclosed as speculative");
+        assert!(!*before, "{c:?} was disclosed before it executed");
+        let e = by_command[c];
+        assert_eq!(r.established().position(), e.position());
+        assert_eq!(r.established().result_digest(), e.result_digest());
+        assert_eq!(r.established().revision(), e.revision());
+        let seq = cluster.ops.iter().find(|(_, _, cc)| cc == c).unwrap().0;
+        assert_eq!(records[&seq].response, r.response());
     }
     // Followers release nothing; every node converges; the overlay drained.
     assert!(cluster.nodes[1].released.is_empty());

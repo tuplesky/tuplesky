@@ -19,16 +19,38 @@ path = "src/main.rs"
 coord-daemon.workspace = true
 coord-membership.workspace = true
 coord-node-issuer.workspace = true
+coord-authn.workspace = true
+coord-collector.workspace = true
+coord-consensus.workspace = true
+coord-core.workspace = true
+coord-session.workspace = true
+coord-transport.workspace = true
+coord-journal-api.workspace = true
+coord-journal-raft-engine.workspace = true
+coord-storage.workspace = true
 coord-storage-redb.workspace = true
 rustls-pki-types.workspace = true
 serde_json.workspace = true
+postcard.workspace = true
 x509-parser.workspace = true
+quinn.workspace = true
 coord-types.workspace = true
 clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
+coord-state.workspace = true
+postcard.workspace = true
+jsonwebtoken.workspace = true
 coord-node-issuer.workspace = true
+coord-membership.workspace = true
+coord-session.workspace = true
 coord-store-api.workspace = true
+coord-sts.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+x509-parser.workspace = true
 coord-types.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true

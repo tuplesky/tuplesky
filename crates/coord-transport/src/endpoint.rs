@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, CloseV1, Frame, HelloAckV1, HelloV1, KIND_SESSION_BIND, MessageV1,
-    PeerRole, SESSION_BIND_VERSION, decode,
+    BoundedBytes, BoundedVec, COLLECTOR_SUBMIT_VERSION, CloseV1, Frame, HelloAckV1, HelloV1,
+    KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1, PeerRole, SESSION_BIND_VERSION, decode,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{RecvStream, SendStream, VarInt};
 use rustls::server::WebPkiClientVerifier;
-use rustls_pki_types::CertificateDer;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::time::timeout;
 
@@ -140,6 +140,15 @@ pub enum TransportEvent {
         lane: Lane,
         /// Bound identity of the peer.
         identity: BoundIdentity,
+        /// Provenance bound at negotiation, when the peer is a replica.
+        ///
+        /// A delivery is output addressed to this node, and when the
+        /// node that addressed it is a voter, that is evidence: it is
+        /// counted by voter identity, and a runtime given only the bytes
+        /// would have no way to say whose they are. `None` for a peer
+        /// that holds no replica identity -- a client's, which a caller
+        /// of this kind never has.
+        provenance: Option<PeerProvenance>,
         /// The delivered frame.
         frame: Frame,
     },
@@ -443,6 +452,9 @@ impl Link {
 struct Shared {
     cluster: ClusterId,
     domain: DomainId,
+    /// This node's own replica identity, where it has one. Used for one
+    /// decision only: see [`Shared::survivor`].
+    replica: Option<ReplicaId>,
     capabilities: Vec<u16>,
     limits: Limits,
     binder: Arc<dyn IdentityBinder>,
@@ -485,23 +497,68 @@ impl Shared {
     fn register(self: &Arc<Self>, peer: Arc<Peer>) {
         self.peers.lock().unwrap().insert(peer.id, peer.clone());
         let link = self.link(Self::link_key(&peer));
+        // One connection per lane. A second one for the same lane either
+        // takes the slot, closing the connection it displaces, or is
+        // itself closed -- and which of the two happens is decided by
+        // `survivor`, never by arrival order alone. Leaving both open
+        // would keep two receive loops, two sets of streams and two
+        // windows alive, so repeated dials would multiply exactly the
+        // capacity the lane bounds; and two sender loops would drain one
+        // queue between them.
         let displaced = {
             let mut state = link.lanes[peer.lane.index()].lock().unwrap();
-            state.peer.replace(peer.clone())
+            match state.peer.as_ref() {
+                Some(held) if held.id != peer.id && !self.survivor(held, &peer) => {
+                    drop(state);
+                    close_losing(&peer);
+                    return;
+                }
+                _ => state.peer.replace(peer.clone()),
+            }
         };
-        // One connection per lane: a second dial of the same lane takes
-        // the slot, and the connection it displaces is closed here.
-        // Leaving it open would keep its receive loop, streams and
-        // windows alive, so repeated dials would multiply exactly the
-        // capacity the lane bounds.
         if let Some(old) = displaced
             && old.id != peer.id
         {
-            *old.close_reason.lock().unwrap() = Some(CloseReason::Replaced);
-            old.conn
-                .close(VarInt::from_u32(CloseCode::Orderly as u32), b"replaced");
+            close_losing(&old);
         }
         tokio::spawn(sender_loop(self.clone(), link, peer));
+    }
+
+    /// Whether `newcomer` takes the lane slot `held` currently has.
+    ///
+    /// Both ends of a peer pair dial, so a link is routinely offered two
+    /// connections: the one this node opened and the one the peer
+    /// opened. One lane holds one connection, so one of the two has to
+    /// go -- and both ends have to choose the *same* one. "The newer
+    /// wins" looks symmetric and is not: each end then closes the
+    /// connection the other kept, and the pair goes dead while both
+    /// sides believe they are connected.
+    ///
+    /// So the committed identities decide. The surviving connection is
+    /// the one whose *dialler* has the lower replica identity, which
+    /// both ends compute from the same two identities and therefore
+    /// agree on without asking each other.
+    ///
+    /// Two connections dialled by the *same* identity are not a
+    /// collision but a redial, and there the newcomer takes the slot: a
+    /// peer whose path has gone black-holed has to be able to replace
+    /// its own connection, and a rule that refused would leave the link
+    /// held by a connection that no longer carries anything. That is
+    /// also what happens where either identity is absent -- an endpoint
+    /// with no replica of its own, or an API-class peer, whose links are
+    /// per-connection and never collide.
+    fn survivor(&self, held: &Peer, newcomer: &Peer) -> bool {
+        let dialler = |peer: &Peer| {
+            if peer.accepted {
+                peer.identity.replica
+            } else {
+                self.replica
+            }
+        };
+        match (dialler(held), dialler(newcomer)) {
+            (Some(held), Some(newcomer)) => newcomer <= held,
+            _ => true,
+        }
     }
 
     fn deregister(&self, peer: &Peer) {
@@ -600,7 +657,11 @@ impl Transport {
             .with_client_cert_verifier(verifier)
             .with_single_cert(local.chain.clone(), local.key.clone_key())
             .map_err(tls_err)?;
-        server.alpn_protocols = vec![ALPN_API.to_vec(), ALPN_PEER.to_vec()];
+        server.alpn_protocols = match local.serves {
+            Some(Class::Api) => vec![ALPN_API.to_vec()],
+            Some(Class::Peer) => vec![ALPN_PEER.to_vec()],
+            None => vec![ALPN_API.to_vec(), ALPN_PEER.to_vec()],
+        };
         server.max_early_data_size = TlsProfile::FIXED.max_early_data_size;
         let quic_server = QuicServerConfig::try_from(server).map_err(tls_err)?;
 
@@ -629,12 +690,21 @@ impl Transport {
             .migration(TlsProfile::FIXED.server_migration)
             .max_incoming(limits.max_connections);
 
-        let client_for = |alpn: &[u8]| -> Result<Arc<QuicClientConfig>, TransportError> {
+        // Which principal this endpoint dials as. The peer plane is
+        // always the node itself; an API-class dial may be somebody
+        // else, because a certificate binds one role and a process that
+        // runs a voter *and* that domain's collector is two principals.
+        // What it serves as is unaffected: a caller validating this
+        // node's server certificate still sees the node.
+        let client_for = |alpn: &[u8],
+                          chain: &[CertificateDer<'static>],
+                          key: &PrivateKeyDer<'static>|
+         -> Result<Arc<QuicClientConfig>, TransportError> {
             let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])
                 .map_err(tls_err)?
                 .with_root_certificates(local.roots.clone())
-                .with_client_auth_cert(local.chain.clone(), local.key.clone_key())
+                .with_client_auth_cert(chain.to_vec(), key.clone_key())
                 .map_err(tls_err)?;
             client.alpn_protocols = vec![alpn.to_vec()];
             client.enable_early_data = TlsProfile::FIXED.client_early_data;
@@ -642,7 +712,14 @@ impl Transport {
                 QuicClientConfig::try_from(client).map_err(tls_err)?,
             ))
         };
-        let client_tls = [client_for(ALPN_API)?, client_for(ALPN_PEER)?];
+        let (api_chain, api_key) = match &local.api_client {
+            Some(other) => (other.chain.as_slice(), &other.key),
+            None => (local.chain.as_slice(), &local.key),
+        };
+        let client_tls = [
+            client_for(ALPN_API, api_chain, api_key)?,
+            client_for(ALPN_PEER, &local.chain, &local.key)?,
+        ];
 
         let runtime = quinn::default_runtime()
             .ok_or_else(|| TransportError::Tls("no async runtime for the endpoint".into()))?;
@@ -664,6 +741,7 @@ impl Transport {
         let shared = Arc::new(Shared {
             cluster: local.cluster,
             domain: local.domain,
+            replica: local.replica,
             capabilities: local.capabilities,
             limits,
             binder,
@@ -850,7 +928,20 @@ impl Transport {
             .await
             .map_err(|_| CloseReason::Timeout)?
             .map_err(|e| CloseReason::Transport(e.to_string()))?;
-        let mut capabilities = shared.capabilities.clone();
+        // Exactly one lane, and it is this connection's.
+        //
+        // The endpoint's own capabilities say which lanes it grants --
+        // a voter grants control and bulk, a collector grants three --
+        // but a `Hello` declares the lane *being opened*, and a peer
+        // that saw two would have no way to tell which stream is which.
+        // So the endpoint's other lanes are filtered out here rather
+        // than announced alongside.
+        let mut capabilities: Vec<u16> = shared
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|c| Lane::of_capability(*c).is_none())
+            .collect();
         capabilities.push(lane.capability());
         capabilities.sort_unstable();
         capabilities.dedup();
@@ -1000,6 +1091,25 @@ impl Transport {
         stats.queued = state.queue.len();
         stats.rtt = state.peer.as_ref().map_or(Duration::ZERO, |p| p.conn.rtt());
         Some(stats)
+    }
+
+    /// Whether a connection currently holds `lane` of the link to
+    /// `replica` at `incarnation`.
+    ///
+    /// This is what "reachable" means to a sender: the link exists *and*
+    /// a connection is holding the lane. Who dialled it is not part of
+    /// the answer -- both ends of a peer pair dial, exactly one of the
+    /// two connections survives, and either one makes the voter
+    /// reachable from here.
+    pub fn linked(&self, replica: ReplicaId, incarnation: ReplicaIncarnation, lane: Lane) -> bool {
+        let link = self
+            .shared
+            .links
+            .lock()
+            .unwrap()
+            .get(&LinkKey::Replica(replica, incarnation))
+            .cloned();
+        link.is_some_and(|link| link.lanes[lane.index()].lock().unwrap().peer.is_some())
     }
 
     /// Bytes in flight to a replica now, and the most ever.
@@ -1509,6 +1619,18 @@ async fn read_uni(
     }
 }
 
+/// Close a connection that lost its lane slot.
+///
+/// It is reported as `Replaced` whichever way it lost: from the far
+/// end's point of view a connection that lost the slot and a connection
+/// that was displaced are the same event, and a peer that dialled again
+/// finds the link held by the connection both ends agreed on.
+fn close_losing(peer: &Peer) {
+    *peer.close_reason.lock().unwrap() = Some(CloseReason::Replaced);
+    peer.conn
+        .close(VarInt::from_u32(CloseCode::Orderly as u32), b"replaced");
+}
+
 /// Whether a client may open a request stream with this message. Replies
 /// and handshake messages never originate at a client.
 const fn client_request(message: &MessageV1) -> bool {
@@ -1536,6 +1658,13 @@ async fn read_delivery(
                 .emit(TransportEvent::ApiDelivery {
                     connection: peer.id,
                     lane: peer.lane,
+                    // The same binding the connection was admitted
+                    // under, not anything the frame says.
+                    provenance: peer.identity.replica.and_then(|replica| {
+                        peer.identity.incarnation.map(|incarnation| {
+                            PeerProvenance::from_transport(replica, incarnation, peer.id.0)
+                        })
+                    }),
                     identity: peer.identity.clone(),
                     frame,
                 })
@@ -1576,6 +1705,28 @@ async fn read_request(
                 (frame.version != SESSION_BIND_VERSION).then(|| {
                     CloseReason::Malformed(format!("bind frame version {}", frame.version))
                 })
+            } else if frame.kind == KIND_COLLECTOR_SUBMIT {
+                // A trusted collector's submission: the second
+                // enumerated raw kind, and the only one whose admission
+                // depends on who is asking. Its payload carries
+                // admission claims minted for somebody else's session,
+                // so a peer that may not speak for other principals may
+                // not open the stream at all -- and the role that
+                // decides is the bound one from the peer's certificate,
+                // never anything the frame says. The claims are still
+                // checked, and the receipt still minted, at the
+                // collector boundary; this only keeps the stream itself
+                // out of reach of a client.
+                if !peer.identity.role.may_submit_for_clients() {
+                    Some(CloseReason::Rejected("submit".into()))
+                } else if frame.version != COLLECTOR_SUBMIT_VERSION {
+                    Some(CloseReason::Malformed(format!(
+                        "submit frame version {}",
+                        frame.version
+                    )))
+                } else {
+                    None
+                }
             } else {
                 match decode(&frame) {
                     Ok(m) if client_request(&m) => None,

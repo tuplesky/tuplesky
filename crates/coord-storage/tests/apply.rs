@@ -62,7 +62,7 @@ fn put(key: &[u8], value: &[u8]) -> LogicalRequest {
 }
 
 /// An applier over a model engine with Alice's session and full policy.
-fn applier(engine: ModelEngine) -> Applier<ModelEngine> {
+fn applier(engine: ModelEngine) -> Applier<StoreWorker<ModelEngine>> {
     let boot = coord_core::effect::BootId([1; 16]);
     let inc = ReplicaIncarnation::new(1).unwrap();
     let mut worker = StoreWorker::open(engine, boot, inc, GroupLimits::default()).unwrap();
@@ -119,7 +119,7 @@ fn a_terminal_semantic_rejection_is_a_result_and_never_blocks_successors() {
     assert_eq!(again.position, outcome.position);
     assert_eq!(again.result_digest, outcome.result_digest);
     // The recorded result names the rejection.
-    let gated = applier.worker().reader().snapshot().unwrap();
+    let gated = applier.store().reader().snapshot().unwrap();
     let stored = coord_storage::retry::lookup(gated.view(), &retry_key(1))
         .unwrap()
         .expect("retained");
@@ -145,7 +145,7 @@ fn a_terminal_semantic_rejection_is_a_result_and_never_blocks_successors() {
 /// Write `count` current entries directly, in one administrative batch:
 /// the planner counts them, and seeding them one command at a time would
 /// spend thousands of executions on setup.
-fn seed_keys(applier: &mut Applier<ModelEngine>, count: u32) {
+fn seed_keys(applier: &mut Applier<StoreWorker<ModelEngine>>, count: u32) {
     let entry = coord_state::KvEntry {
         value: b"v".to_vec(),
         create_revision: KvRevision::new(1).unwrap(),
@@ -161,17 +161,17 @@ fn seed_keys(applier: &mut Applier<ModelEngine>, count: u32) {
             value: Some(coord_storage::codecs::encode_current(&entry).unwrap()),
         })
         .collect();
-    let base = applier.worker().application_base();
+    let base = applier.store().application_base();
     let barrier = applier.alloc().allocate();
     applier
-        .worker_mut()
+        .store_mut()
         .submit(PersistBatch {
             barrier,
             base: Some(base),
             updates,
         })
         .unwrap();
-    applier.worker_mut().flush().unwrap();
+    applier.store_mut().flush().unwrap();
 }
 
 /// The planner's delete limit, read from its defaults.
@@ -201,7 +201,7 @@ fn a_commit_established_by_reconciliation_still_reaches_open_watches() {
     applier.hub().replay_complete(registration.id).unwrap();
     // A write whose commit takes effect but is acknowledged as unknown.
     applier
-        .worker_mut()
+        .store_mut()
         .engine_mut()
         .script_commit(CommitScript::Indeterminate { applied: true });
     let (command, record) = payload(1, &put(b"a", b"1"));
@@ -256,7 +256,7 @@ fn a_view_too_large_to_build_is_a_rejection_and_never_blocks_successors() {
     let again = applier.apply(command, &record).unwrap();
     assert_eq!(again.position, outcome.position);
     assert_eq!(again.result_digest, outcome.result_digest);
-    let gated = applier.worker().reader().snapshot().unwrap();
+    let gated = applier.store().reader().snapshot().unwrap();
     let stored = coord_storage::retry::lookup(gated.view(), &retry_key(1))
         .unwrap()
         .expect("retained");
@@ -305,7 +305,7 @@ fn the_overlay_bound_is_checked_against_the_plan_it_would_hold() {
         command,
         prefix: vec![],
         position: ExecutionPosition::new(
-            applier.worker().application_base().execution_position.get() + 1,
+            applier.store().application_base().execution_position.get() + 1,
         )
         .unwrap(),
     };
@@ -313,7 +313,7 @@ fn the_overlay_bound_is_checked_against_the_plan_it_would_hold() {
     // the response it holds, not zero.
     let mut overlay = Overlay::new();
     let outcome = speculate(
-        applier.worker(),
+        applier.store(),
         &mut overlay,
         &SpeculationLimits {
             max_commands: 8,
@@ -338,7 +338,7 @@ fn the_overlay_bound_is_checked_against_the_plan_it_would_hold() {
     // refused, even though the overlay was empty.
     let mut tight = Overlay::new();
     let refused = speculate(
-        applier.worker(),
+        applier.store(),
         &mut tight,
         &SpeculationLimits {
             max_commands: 8,
@@ -363,11 +363,11 @@ fn the_overlay_bound_is_checked_against_the_plan_it_would_hold() {
 /// Fixture construction: it lets the obsolete versions below be written
 /// at revisions genuinely below the current one, as a replica that has
 /// been running for a while would hold them.
-fn set_kv_revision(applier: &mut Applier<ModelEngine>, revision: u64) {
-    let base = applier.worker().application_base();
+fn set_kv_revision(applier: &mut Applier<StoreWorker<ModelEngine>>, revision: u64) {
+    let base = applier.store().application_base();
     let barrier = applier.alloc().allocate();
     applier
-        .worker_mut()
+        .store_mut()
         .submit(PersistBatch {
             barrier,
             base: Some(base),
@@ -378,7 +378,7 @@ fn set_kv_revision(applier: &mut Applier<ModelEngine>, revision: u64) {
             }],
         })
         .unwrap();
-    applier.worker_mut().flush().unwrap();
+    applier.store_mut().flush().unwrap();
 }
 
 /// Seed `versions` obsolete stored versions of `key`, every one strictly
@@ -388,7 +388,7 @@ fn set_kv_revision(applier: &mut Applier<ModelEngine>, revision: u64) {
 /// replica that has collected them holds only the current entry. Nothing
 /// logical distinguishes the two.
 fn seed_obsolete_versions(
-    applier: &mut Applier<ModelEngine>,
+    applier: &mut Applier<StoreWorker<ModelEngine>>,
     key: &[u8],
     versions: u32,
     current: u64,
@@ -421,17 +421,17 @@ fn seed_obsolete_versions(
             }
         })
         .collect();
-    let base = applier.worker().application_base();
+    let base = applier.store().application_base();
     let barrier = applier.alloc().allocate();
     applier
-        .worker_mut()
+        .store_mut()
         .submit(PersistBatch {
             barrier,
             base: Some(base),
             updates,
         })
         .unwrap();
-    applier.worker_mut().flush().unwrap();
+    applier.store_mut().flush().unwrap();
 }
 
 #[test]
@@ -474,8 +474,8 @@ fn local_garbage_collection_progress_never_changes_a_replicated_outcome() {
         .expect("a result, not a local failure");
     let collected_outcome = collected.apply(command, &record).expect("a result");
 
-    let stored_response = |a: &mut Applier<ModelEngine>| {
-        let gated = a.worker().reader().snapshot().unwrap();
+    let stored_response = |a: &mut Applier<StoreWorker<ModelEngine>>| {
+        let gated = a.store().reader().snapshot().unwrap();
         let record = coord_storage::retry::lookup(gated.view(), &retry_key(2))
             .unwrap()
             .expect("retained");
@@ -520,7 +520,7 @@ fn an_admission_refusal_finishes_the_command_it_refuses() {
         .apply(command, &record)
         .expect("a result, not an error");
     assert_eq!(outcome.revision, None, "a refusal writes nothing");
-    let gated = applier.worker().reader().snapshot().unwrap();
+    let gated = applier.store().reader().snapshot().unwrap();
     // The refusal writes no retry record: the key it names is not bound
     // to it, so no other command's result can be overwritten.
     assert!(
@@ -559,7 +559,7 @@ fn a_planner_valid_response_always_fits_its_retry_record() {
     let outcome = applier
         .apply(command, &record)
         .expect("a result, not a storage error");
-    let gated = applier.worker().reader().snapshot().unwrap();
+    let gated = applier.store().reader().snapshot().unwrap();
     let stored = coord_storage::retry::lookup(gated.view(), &retry_key(10))
         .unwrap()
         .expect("the result is retained, whatever it is");

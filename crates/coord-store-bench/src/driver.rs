@@ -153,7 +153,7 @@ pub struct PinnedRead {
 
 /// One replica's common paths over the engine under test.
 pub struct Domain<E: LocalEngine> {
-    applier: Applier<E>,
+    applier: Applier<StoreWorker<E>>,
     holds: RetentionHolds,
     watch: WatchId,
     outcomes: BTreeMap<u64, (Option<KvRevision>, Digest32)>,
@@ -189,7 +189,7 @@ impl<E: LocalEngine> Domain<E> {
         Domain::with(Applier::new(worker, alloc)?)
     }
 
-    fn with(applier: Applier<E>) -> Result<Domain<E>, DriveError> {
+    fn with(applier: Applier<StoreWorker<E>>) -> Result<Domain<E>, DriveError> {
         let watch = applier
             .hub()
             .register(WatchSpec {
@@ -307,7 +307,7 @@ impl<E: LocalEngine> Domain<E> {
         if matches!(request.operation, CanonicalOperation::Compact { .. }) {
             // The hub's retention floor follows the replicated floor so a
             // watch below it is closed rather than served from gaps.
-            let gated = self.applier.worker().reader().snapshot()?;
+            let gated = self.applier.store().reader().snapshot()?;
             let floor = coord_storage::codecs::read_retention_floor(gated.view())?;
             drop(gated);
             self.applier.hub().set_retention_floor(floor);
@@ -343,20 +343,20 @@ impl<E: LocalEngine> Domain<E> {
     /// One bounded maintenance step. Returns whether collection is
     /// complete at the current effective floor.
     pub fn maintenance_step(&mut self, budget: GcBudget) -> Result<bool, DriveError> {
-        let gated = self.applier.worker().reader().snapshot()?;
+        let gated = self.applier.store().reader().snapshot()?;
         let step = plan_gc(gated.view(), &self.holds, budget)?;
         drop(gated);
         if !step.updates.is_empty() {
             let barrier = self.applier.alloc().allocate();
             self.applier
-                .worker_mut()
+                .store_mut()
                 .submit(PersistBatch {
                     barrier,
                     base: None,
                     updates: step.updates,
                 })
                 .map_err(|e| DriveError::Apply(format!("gc batch: {e:?}")))?;
-            self.applier.worker_mut().flush()?;
+            self.applier.store_mut().flush()?;
         }
         Ok(step.done)
     }
@@ -371,7 +371,7 @@ impl<E: LocalEngine> Domain<E> {
     ) -> Result<(T, PinnedRead), DriveError> {
         let revision = self.applier.kv_revision()?;
         let hold = self.holds.hold(revision);
-        let pinned = self.applier.worker().reader().snapshot()?;
+        let pinned = self.applier.store().reader().snapshot()?;
         let collections = [Collection::KvCurrentV1, Collection::KvHistoryV1];
         let first = std::time::Instant::now();
         let before = digest_of(pinned.view(), &collections)?;
@@ -401,7 +401,7 @@ impl<E: LocalEngine> Domain<E> {
         &mut self,
         reopen: &mut dyn FnMut(&mut E) -> Result<(), EngineError>,
     ) -> Result<(), DriveError> {
-        reopen(self.applier.worker_mut().engine_mut())?;
+        reopen(self.applier.store_mut().engine_mut())?;
         Ok(())
     }
 
@@ -412,7 +412,7 @@ impl<E: LocalEngine> Domain<E> {
 
     /// The logical state a comparison checks.
     pub fn observable(&self) -> Result<Observable, DriveError> {
-        let gated = self.applier.worker().reader().snapshot()?;
+        let gated = self.applier.store().reader().snapshot()?;
         let view = gated.view();
         let count = |c: Collection| -> Result<u64, EngineError> { Ok(rows(view, c)?.len() as u64) };
         let common: Vec<Collection> = Collection::ALL

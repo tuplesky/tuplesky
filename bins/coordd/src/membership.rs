@@ -62,6 +62,12 @@ pub enum IdentityError {
         /// The incarnation it names.
         incarnation: ReplicaIncarnation,
     },
+    /// The committed configuration names this node as a voter, but
+    /// commits to a different key than the one it holds.
+    NotTheCommittedKey {
+        /// The replica the certificate names.
+        replica: ReplicaId,
+    },
 }
 
 impl core::fmt::Display for IdentityError {
@@ -93,6 +99,12 @@ impl core::fmt::Display for IdentityError {
                  {} at incarnation {} as a voter",
                 hex(&replica.0),
                 incarnation.get()
+            ),
+            IdentityError::NotTheCommittedKey { replica } => write!(
+                f,
+                "the committed configuration names {} as a voter but commits to a \
+                 different key than this node holds: no peer would accept it",
+                hex(&replica.0)
             ),
         }
     }
@@ -144,7 +156,7 @@ pub fn place(
             reason: format!("{e:?}"),
         })?;
 
-    let identity = leaf_identity(certificate_path)?;
+    let (identity, leaf) = leaf_identity(certificate_path)?;
     // The cluster is checked here and not only at the handshake: a node
     // of another cluster would otherwise open this domain's store under
     // its own identity before any peer ever saw its certificate.
@@ -153,11 +165,24 @@ pub fn place(
             path: certificate_path.to_owned(),
         });
     }
-    if votes && !membership.is_current_voter(&identity.node, identity.incarnation) {
-        return Err(IdentityError::NotACommittedVoter {
-            replica: identity.node,
-            incarnation: identity.incarnation,
-        });
+    if votes {
+        if !membership.is_current_voter(&identity.node, identity.incarnation) {
+            return Err(IdentityError::NotACommittedVoter {
+                replica: identity.node,
+                incarnation: identity.incarnation,
+            });
+        }
+        // Genesis commits to the key, not merely to the name. A voter
+        // holding some other key starts perfectly well -- nothing it
+        // does alone checks this -- and is then refused by every peer it
+        // meets, which looks like a network problem. It is this node's
+        // own problem and it is knowable here.
+        let presented = spki(&leaf);
+        if !membership.is_current_voter_key(&identity.node, identity.incarnation, &presented) {
+            return Err(IdentityError::NotTheCommittedKey {
+                replica: identity.node,
+            });
+        }
     }
     Ok(Placed {
         manifest,
@@ -168,8 +193,18 @@ pub fn place(
     })
 }
 
-/// The node identity in the leaf certificate's URI SAN.
-fn leaf_identity(path: &str) -> Result<coord_node_issuer::NodeIdentity, IdentityError> {
+/// A certificate's SubjectPublicKeyInfo, which is what genesis commits
+/// to for a voter and what a peer compares against.
+fn spki(leaf: &CertificateDer<'_>) -> Vec<u8> {
+    x509_parser::certificate::X509Certificate::from_der(leaf)
+        .map(|(_, x509)| x509.public_key().raw.to_vec())
+        .unwrap_or_default()
+}
+
+/// The node identity in the leaf certificate's URI SAN, and the leaf.
+fn leaf_identity(
+    path: &str,
+) -> Result<(coord_node_issuer::NodeIdentity, CertificateDer<'static>), IdentityError> {
     let leaf = CertificateDer::pem_file_iter(path)
         .map_err(|e| IdentityError::Manifest {
             path: path.to_owned(),
@@ -196,7 +231,7 @@ fn leaf_identity(path: &str) -> Result<coord_node_issuer::NodeIdentity, Identity
         if let x509_parser::extensions::GeneralName::URI(uri) = name
             && let Some(identity) = parse_node_uri(uri)
         {
-            return Ok(identity);
+            return Ok((identity, leaf.clone()));
         }
     }
     Err(IdentityError::NoNodeIdentity {

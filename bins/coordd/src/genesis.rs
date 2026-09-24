@@ -83,11 +83,15 @@ impl core::error::Error for GenesisError {}
 
 /// The node's durable history, as durable initialization asks after it.
 ///
-/// On this build a node's history is its store generation and nothing
-/// else: there is no separate journal yet. By the time the pin is
-/// checked, `store::open` has already found the generation and matched
-/// it to this node's identity (and created it, for `coordd init`), so
-/// the history exists and establishing it is already done.
+/// On this build a node's history is its journal and the projection
+/// generation attached to it. By the time the pin is checked,
+/// `store::open_storage` has already opened both and matched them to
+/// this node's identity (and created them, for `coordd init`, or reused
+/// the journal an interrupted one left with no history in it), so the
+/// history exists and establishing it is already done. The pin lives on
+/// the generation, in its `meta_v1` beside the identity the lifecycle
+/// wrote there, and is checked before the generation is attached to the
+/// journal.
 struct GenerationHistory;
 
 impl NodeJournal for GenerationHistory {
@@ -126,7 +130,8 @@ pub fn check(
         }
     }
     let mut startup = Startup::new();
-    // `store::open` has matched the generation to this node's identity,
+    // `store::open_storage` has matched the journal and the generation
+    // to this node's identity,
     // and the caller has verified the credentials that identity came
     // from, before this is reached.
     startup.storage_validated().map_err(GenesisError::Startup)?;

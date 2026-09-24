@@ -21,7 +21,11 @@ use coord_types::wire_v1::{Frame, RequestV1, WireError, encode_frame};
 use serde::{Deserialize, Serialize};
 
 /// A collector submits an admitted, canonical request to a voter.
-pub const KIND_SUBMIT: u16 = 0x0103;
+///
+/// The registry's number, not a second one: the transport admits
+/// exactly this kind on a request stream, and this is the boundary that
+/// mints a receipt from what arrives.
+pub use coord_types::wire_v1::KIND_COLLECTOR_SUBMIT as KIND_SUBMIT;
 /// The leader publishes a released result to the collector. It is in the
 /// collector-evidence range, not the API range: an established result may
 /// be as large as `MAX_RESULT_BYTES`, which the API class cannot carry,

@@ -26,9 +26,20 @@
 //!   transport liveness from *fresh-quorum* consensus readiness: a voter
 //!   that only has cached leadership is not ready to serve. Disk
 //!   quarantine drains and stops rather than serving corrupt state.
-//! * [`fanout`]: sending a planned submission to every committed voter,
+//! * [`fanout`]: offering a planned submission to every committed voter,
 //!   at the incarnation the configuration names rather than one the plan
-//!   carries.
+//!   carries, over the wire or -- for a voter running here -- through its
+//!   own ingress.
+//! * [`mailbox`]: that ingress: a voter's bounded local queue, built
+//!   from the committed membership by the runtime that runs the voter,
+//!   so a co-located frontend can skip the network without skipping
+//!   anything the network established.
+//! * [`voter`]: the door in front of one voter: a submission from a
+//!   collector on the peer plane and one from a collector in this very
+//!   process are parsed by the same reader, admitted by the same
+//!   boundary and stepped through the same machine, and the voter's own
+//!   evidence reaches the collector as a frame with its committed
+//!   identity on it rather than as a local success.
 //! * [`node`]: driving one voter -- events into the protocol machine,
 //!   and the effects it returns carried out: batches persisted, sends
 //!   held until their barriers are durable and their boot still holds,
@@ -54,25 +65,31 @@ pub mod fanout;
 pub mod identity;
 pub mod lifecycle;
 pub mod listen;
+pub mod mailbox;
 pub mod node;
 pub mod pending;
 pub mod role;
 pub mod serve;
 pub mod startup;
 pub mod supervise;
+pub mod voter;
 
 pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
-pub use fanout::{Dispatched, PeerFanOut, dispatch};
+pub use fanout::{
+    Dispatched, LocalIngress, NotQueued, PeerFanOut, Queued, Route, Saturated, dispatch,
+};
 pub use identity::{IdentityError, load as load_identity, verify as verify_identity};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
+pub use mailbox::{Ingress, IngressBudget, LocalRoute};
 pub use node::{DriveError, Machine, Node, Outbound};
 pub use pending::{Pending, Undeliverable};
 pub use role::{Role, RoleSet};
 pub use serve::{Step, step};
 pub use startup::{NodeJournal, Startup, StartupError, StartupPhase, StoreGenesis};
 pub use supervise::{RestartBudget, Supervisor, WorkerError, WorkerId};
+pub use voter::{Refused, Voter};
 
 /// Crate role marker used by the dependency-policy check.
 pub const CRATE_ROLE: &str = "production";

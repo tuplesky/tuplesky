@@ -108,9 +108,10 @@ impl Machine {
 
 struct Node {
     machine: Machine,
-    applier: Applier<ModelEngine>,
+    applier: Applier<StoreWorker<ModelEngine>>,
     inbox: VecDeque<(ReplicaId, Vec<u8>)>,
     established: Vec<EstablishedResult>,
+    released: Vec<coord_core::capability::ReleasedResult>,
     executed: Vec<CommandId>,
 }
 
@@ -191,6 +192,7 @@ fn node(n: u8, me: u8) -> Node {
         applier,
         inbox: VecDeque::new(),
         established: Vec::new(),
+        released: Vec::new(),
         executed: Vec::new(),
     };
     node.machine.step(Event::Boot {
@@ -237,8 +239,8 @@ impl Cluster {
                     // Protocol rows are persisted through the node's own
                     // worker so the projection carries them.
                     let node = &mut self.nodes[i];
-                    node.applier.worker_mut().submit(batch).unwrap();
-                    node.applier.worker_mut().flush().unwrap();
+                    node.applier.store_mut().submit(batch).unwrap();
+                    node.applier.store_mut().flush().unwrap();
                     let more = node
                         .machine
                         .step(Event::Storage(StorageEvent::JournalDurable {
@@ -261,6 +263,15 @@ impl Cluster {
                     self.nodes[dest].inbox.push_back((from, frame));
                 }
                 Effect::Established(result) => self.nodes[i].established.push(result),
+                // The leader's final-path release: a command that was
+                // never speculated is disclosed once, after it has
+                // executed and become durable. These tests drive no
+                // speculation companion, so every release here is that
+                // one, and it is the leader's alone.
+                Effect::Released(released) => {
+                    assert!(!released.speculative());
+                    self.nodes[i].released.push(released);
+                }
                 other => panic!("unexpected effect {other:?}"),
             }
         }
@@ -337,7 +348,7 @@ impl Cluster {
     }
 
     fn rows(&self, i: usize) -> BTreeMap<(u16, Vec<u8>), Vec<u8>> {
-        let gated = self.nodes[i].applier.worker().reader().snapshot().unwrap();
+        let gated = self.nodes[i].applier.store().reader().snapshot().unwrap();
         let mut out = BTreeMap::new();
         for c in [
             Collection::KvCurrentV1,
@@ -453,7 +464,7 @@ fn to_oracle(o: &Outcome) -> OracleOutcome {
 fn responses(cluster: &Cluster, i: usize, commands: &[(u64, CommandId)]) -> Vec<Response> {
     let gated = cluster.nodes[i]
         .applier
-        .worker()
+        .store()
         .reader()
         .snapshot()
         .unwrap();
@@ -555,7 +566,7 @@ fn run_history(n: u8, seed: u64) {
     assert_eq!(published, cluster.nodes[0].applier.kv_revision().unwrap());
     let gated = cluster.nodes[0]
         .applier
-        .worker()
+        .store()
         .reader()
         .snapshot()
         .unwrap();
@@ -646,7 +657,7 @@ fn watch_events_follow_irrevocable_application() {
     // Each delivered revision is durable on the follower that delivered it.
     let gated = cluster.nodes[1]
         .applier
-        .worker()
+        .store()
         .reader()
         .snapshot()
         .unwrap();

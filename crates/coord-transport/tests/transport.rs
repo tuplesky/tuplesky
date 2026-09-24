@@ -18,8 +18,9 @@ use coord_transport::{
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedVec, CloseV1, HEADER_LEN, HelloV1, KIND_SESSION_BIND, KIND_SESSION_BIND_ACK, MessageV1,
-    PeerRole, SESSION_BIND_VERSION, encode_frame,
+    BoundedVec, COLLECTOR_SUBMIT_VERSION, CloseV1, HEADER_LEN, HelloV1, KIND_COLLECTOR_SUBMIT,
+    KIND_SESSION_BIND, KIND_SESSION_BIND_ACK, MessageV1, PeerRole, SESSION_BIND_VERSION,
+    encode_frame,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::time::timeout;
@@ -814,6 +815,20 @@ async fn negotiated(
     role: PeerRole,
     pipelined: &[u8],
 ) -> (quinn::Endpoint, quinn::Connection, quinn::SendStream) {
+    negotiated_on(f, id, alpn, acceptor, role, Lane::Control, pipelined).await
+}
+
+/// The same, on a chosen lane: a role that may not open control has to
+/// declare one it may.
+async fn negotiated_on(
+    f: &Fixture,
+    id: &TestIdentity,
+    alpn: &[u8],
+    acceptor: &mut Transport,
+    role: PeerRole,
+    lane: Lane,
+    pipelined: &[u8],
+) -> (quinn::Endpoint, quinn::Connection, quinn::SendStream) {
     let client = raw_client(f, id, alpn);
     let conn = client
         .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
@@ -821,7 +836,7 @@ async fn negotiated(
         .await
         .unwrap();
     let (mut send, _recv) = conn.open_bi().await.unwrap();
-    let mut first = hello(role, CLUSTER, Some(inc(1)));
+    let mut first = hello_with(role, CLUSTER, Some(inc(1)), vec![1, lane.capability()]);
     first.extend_from_slice(pipelined);
     send.write_all(&first).await.unwrap();
     match event(acceptor).await {
@@ -917,6 +932,260 @@ async fn api_streams_carry_only_client_originated_requests() {
             _ => {}
         }
     }
+}
+
+/// A collector's submission is the other undecodable kind an API stream
+/// may carry, and the only one whose admission depends on who is asking.
+///
+/// Its payload carries admission claims minted for somebody else's
+/// session, so the stream is open to a principal that may act for other
+/// principals and to nobody else. The role that decides is the bound
+/// one, from the peer's certificate; the receipt is still minted at the
+/// collector boundary, and this only keeps the stream itself out of a
+/// client's reach.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_submission_stream_is_open_to_a_collector_and_to_nobody_else() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend, PeerRole::Client]);
+    let mut acceptor = bind(&f, 0);
+
+    // A collector's submission arrives as a request frame, undecoded.
+    let (_client, conn, _control) = negotiated(
+        &f,
+        &f.ids[1],
+        ALPN_API,
+        &mut acceptor,
+        PeerRole::Frontend,
+        &[],
+    )
+    .await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(
+        &encode_frame(
+            KIND_COLLECTOR_SUBMIT,
+            COLLECTOR_SUBMIT_VERSION,
+            &[0x02, 0xaa, 0xbb],
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    loop {
+        match event(&mut acceptor).await {
+            TransportEvent::ApiRequest {
+                frame, identity, ..
+            } => {
+                assert_eq!(frame.kind, KIND_COLLECTOR_SUBMIT);
+                assert_eq!(identity.role, PeerRole::Frontend);
+                break;
+            }
+            TransportEvent::Closed { reason, .. } => panic!("submission refused: {reason:?}"),
+            _ => {}
+        }
+    }
+
+    // The same frame from a client is refused, and refused as an
+    // authorization failure rather than as a malformed frame: there is
+    // nothing wrong with the bytes, and there is everything wrong with
+    // who sent them.
+    let (_client, conn, _control) = negotiated_on(
+        &f,
+        &f.ids[2],
+        ALPN_API,
+        &mut acceptor,
+        PeerRole::Client,
+        Lane::Unary,
+        &[],
+    )
+    .await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(
+        &encode_frame(
+            KIND_COLLECTOR_SUBMIT,
+            COLLECTOR_SUBMIT_VERSION,
+            &[0x02, 0xaa, 0xbb],
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    loop {
+        match event(&mut acceptor).await {
+            TransportEvent::ApiRequest { .. } => {
+                panic!("a client opened a submission stream")
+            }
+            TransportEvent::Closed { reason, .. } => {
+                assert!(
+                    matches!(reason, CloseReason::Rejected(ref m) if m.contains("submit")),
+                    "{reason:?}"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // And the exception is enumerated at one version, like the binding's.
+    let (_client, conn, _control) = negotiated(
+        &f,
+        &f.ids[1],
+        ALPN_API,
+        &mut acceptor,
+        PeerRole::Frontend,
+        &[],
+    )
+    .await;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send.write_all(
+        &encode_frame(
+            KIND_COLLECTOR_SUBMIT,
+            COLLECTOR_SUBMIT_VERSION + 1,
+            &[0x02, 0xaa, 0xbb],
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    loop {
+        match event(&mut acceptor).await {
+            TransportEvent::ApiRequest { .. } => panic!("another submission version was admitted"),
+            TransportEvent::Closed { reason, .. } => {
+                assert!(matches!(reason, CloseReason::Malformed(_)), "{reason:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Both ends of a peer pair may dial, and the pair still holds a link.
+///
+/// A lane holds one connection, so when two arrive one has to go -- and
+/// both ends have to close the *same* one. If each end decided locally
+/// ("the newer wins") each would close the connection the other kept
+/// and the pair would go dead while both sides believed they were
+/// connected. The committed identities decide instead, so the answer is
+/// the same at both ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_ends_may_dial_and_the_pair_still_holds_one_link() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut a = bind(&f, 0);
+    let mut b = bind(&f, 1);
+
+    // Each dials the other on the same lane, so each link is offered two
+    // connections. The dial that loses the collision is closed, so its
+    // caller may well see an error -- that is not a failure to reach the
+    // peer, and what follows is the check that it was not.
+    let dial = async |from: &Transport, to: &Transport, to_id: &TestIdentity| {
+        let addr = to.local_addr().unwrap();
+        let _ = from
+            .connect(
+                addr,
+                &to_id.name,
+                PeerRole::Voter,
+                Some(inc(1)),
+                Lane::Control,
+                to_id.expected(),
+            )
+            .await;
+    };
+    //
+    // At the same time, which is the case that matters: each end
+    // registers its own dial before the other's arrives, so each has an
+    // incumbent to choose against. Dialled one after the other there is
+    // never a choice to get wrong.
+    tokio::join!(dial(&a, &b, &f.ids[1]), dial(&b, &a, &f.ids[0]));
+
+    // Let both ends see every connection settle, including the one that
+    // loses its slot.
+    for _ in 0..3 {
+        let _ = timeout(Duration::from_millis(500), a.next_event()).await;
+        let _ = timeout(Duration::from_millis(500), b.next_event()).await;
+    }
+
+    assert!(
+        a.linked(r(1), inc(1), Lane::Control),
+        "the pair closed both of its connections at this end"
+    );
+    assert!(
+        b.linked(r(0), inc(1), Lane::Control),
+        "the pair closed both of its connections at the other end"
+    );
+
+    // And the surviving connection carries traffic each way, which is
+    // the only thing the link was for.
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"a").unwrap(),
+    )
+    .unwrap();
+    b.send(
+        dest(0, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"b").unwrap(),
+    )
+    .unwrap();
+    for (side, want) in [(&mut b, b"a"), (&mut a, b"b")] {
+        loop {
+            match event(side).await {
+                TransportEvent::PeerFrame { payload, .. } => {
+                    assert_eq!(payload, want);
+                    break;
+                }
+                TransportEvent::Closed { reason, .. } => {
+                    assert!(matches!(reason, CloseReason::Replaced), "{reason:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A listener that serves one plane offers that plane's ALPN and no
+/// other.
+///
+/// The two planes' events are read in different places, so a frame that
+/// arrived on the wrong listener is not merely misrouted: it is never
+/// served at all, and the caller waits for an answer nobody is going to
+/// give. Keeping a listener's ALPN to its own plane is what makes an
+/// address a hint -- a dialler that guessed the wrong one of a node's
+/// two addresses fails to negotiate and tries the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listener_of_one_plane_refuses_the_other_planes_alpn() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Frontend]);
+    let mut local = f.ids[0].local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]);
+    local.serves = Some(Class::Peer);
+    let acceptor = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        local,
+        f.binder.clone(),
+        limits(),
+    )
+    .unwrap();
+
+    let client = raw_client(&f, &f.ids[1], ALPN_API);
+    let refused = client
+        .connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+        .unwrap()
+        .await;
+
+    assert!(
+        refused.is_err(),
+        "a peer listener negotiated an api-plane connection"
+    );
+
+    // The plane it does serve still negotiates, so this is a refusal of
+    // the ALPN and not of the endpoint.
+    let peer = raw_client(&f, &f.ids[0], ALPN_PEER);
+    assert!(
+        peer.connect(acceptor.local_addr().unwrap(), &f.ids[0].name)
+            .unwrap()
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1514,4 +1783,48 @@ async fn the_runtime_can_close_a_connection_the_transport_would_have_allowed() {
     // A connection that is not open is reported as such rather than
     // silently succeeding: the caller learns its close did nothing.
     assert!(!acceptor.disconnect(connection, CloseCode::Rejected, "again"));
+}
+
+/// An endpoint that grants several lanes still opens exactly one.
+///
+/// A node's endpoint grants the lanes its role may use -- a voter grants
+/// control and bulk, a collector grants three -- and a `Hello` declares
+/// the lane *being opened*. Announcing the endpoint's whole set would
+/// declare several lanes on one connection, which the acceptor refuses
+/// outright: a peer that saw two would have no way to tell which stream
+/// is which.
+///
+/// The transport's own tests granted capabilities that are not lanes, so
+/// nothing here dialled with more than one until a daemon did.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_granting_several_lanes_declares_only_the_one_it_opens() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let granted: Vec<u16> = coord_transport::role_lanes(PeerRole::Voter)
+        .iter()
+        .map(|lane| lane.capability())
+        .collect();
+    assert!(granted.len() > 1, "a voter grants more than one lane");
+
+    let a = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        f.ids[0].local(&f.ca, CLUSTER, DOMAIN, granted.clone()),
+        f.binder.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut b = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        f.ids[1].local(&f.ca, CLUSTER, DOMAIN, granted),
+        f.binder.clone(),
+        limits(),
+    )
+    .unwrap();
+
+    connect_lane(&a, &b, &f.ids[1], Lane::Control).await;
+
+    let TransportEvent::Connected { lane, identity, .. } = event(&mut b).await else {
+        panic!("the acceptor refused a connection from an endpoint granting several lanes");
+    };
+    assert_eq!(lane, Lane::Control, "the lane the dialer opened");
+    assert_eq!(identity.replica, Some(r(0)));
 }
