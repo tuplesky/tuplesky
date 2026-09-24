@@ -379,6 +379,23 @@ rewound.
 | An automatic minority force-new-cluster preserving identity | `[EXT]` rejected | Section 5.4 |
 | A zero-loss promise beyond the backup's RPO | `[EXT]` rejected | Section 5.4; the plan states the recovery point |
 
+Format and capability upgrades are task-60. The paper has one version of
+everything and no upgrade, so these are all extensions; what they share
+is that no version or capability is ever guessed at.
+
+| Item | Status | Where |
+|---|---|---|
+| `Format`: nine independently versioned formats with decoder windows | `[EXT]` | Section 11.2; an upgraded transport never changes a retry identity |
+| A version outside the window is refused in the direction it is outside | `[EXT]` | Section 17.7: unsupported format fails before admission |
+| Unanimity of the configured voters to activate a feature | `[EXT]` | Section 13; a minority that cannot take part is not behind, it is incapable |
+| A majority of support reports | `[EXT]` rejected | contrast `floor::activate`, where a majority is right |
+| Silence counted as support, or a report that shrinks | `[EXT]` rejected | the silent voter is the one that might be an old binary |
+| An active feature a build does not know, decoded to a smaller set | `[EXT]` rejected | it would conclude it may serve when it may not |
+| Offline migration: stage, rewrite, activate, `CURRENT` last | `[EXT]` | Section 17.7; an interruption preserves the valid selection |
+| A migration carries this node's `protocol_v1`; an install refuses it | `[EXT]` | Section 17.10; a promise is not something to be replaced |
+| Cross-engine migration, or a live voter savepoint rollback | `[EXT]` rejected | Sections 17.7, 17.13 |
+| Any operation that lowers a format or deactivates a feature | `[EXT]` rejected | rollback is the old binary, or a restore |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the

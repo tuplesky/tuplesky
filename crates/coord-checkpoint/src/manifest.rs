@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 
 /// Artifact format version. Bumped only by a reviewed schema change;
 /// unrelated to the record, wire and local checkpoint formats.
-pub const SHARED_CHECKPOINT_FORMAT_V1: u16 = 1;
+pub const SHARED_CHECKPOINT_FORMAT_V1: u16 =
+    coord_types::formats::Format::SharedCheckpoint.current() as u16;
 /// Target encoded size of one chunk (design Section 17.6).
 pub const CHUNK_TARGET_BYTES: usize = 1024 * 1024;
 /// Largest encoded chunk accepted: the target plus one maximal row.

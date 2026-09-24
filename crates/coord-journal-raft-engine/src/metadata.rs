@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Region holding journal-wide metadata. Zero is never a stream.
 pub const METADATA_REGION: u64 = 0;
 /// Journal directory format version.
-pub const JOURNAL_FORMAT_V1: u16 = 1;
+pub const JOURNAL_FORMAT_V1: u16 = coord_types::formats::Format::JournalMetadata.current() as u16;
 /// Largest metadata value accepted.
 pub const MAX_METADATA_VALUE_BYTES: usize = 256;
 

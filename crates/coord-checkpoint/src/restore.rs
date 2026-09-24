@@ -72,7 +72,7 @@ use crate::manifest::{CheckpointBoundary, ChunkV1, SharedManifestV1};
 use crate::verify::{VerifyError, verify_shared};
 
 /// Format of a backup manifest.
-pub const BACKUP_FORMAT_V1: u16 = 1;
+pub const BACKUP_FORMAT_V1: u16 = coord_types::formats::Format::Backup.current() as u16;
 /// Record kind of the restore receipt inside `checkpoint_v1`.
 pub const RESTORED_RECORD_KIND: u16 = 0x0009;
 /// Schema version of the restore receipt.

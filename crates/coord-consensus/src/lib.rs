@@ -119,6 +119,7 @@ extern crate alloc;
 pub mod ballot;
 pub mod campaign;
 pub mod commands;
+pub mod feature;
 pub mod floor;
 pub mod follower;
 pub mod graph;
