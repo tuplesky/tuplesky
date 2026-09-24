@@ -1091,6 +1091,23 @@ The differences, and why each one is the way round it is:
   be asked again. Silence would have been the dangerous shape: an
   initiator that could not tell "refused" from "no reply" would be
   tempted to infer one from a timeout.
+* **A promise ends one ballot's voting when a higher one takes over; a
+  seal ends the current ballot's too.** Refusing new ballots alone would
+  leave the ballot already being served running, so `Leader::is_leading`
+  and the follower's `may_vote` both read the seal, and a leader or
+  follower recovered from the row proposes, adopts and acknowledges
+  nothing. The fence starts at the cut, while the row is still in
+  flight, because the report was built over the batches outstanding at
+  that moment and a vote cast after it is one the report does not show.
+* **The cut is every batch, not every proposal.** The leader writes a
+  proposal's ACCEPT row in a batch of its own, in the same turn the
+  proposal batch becomes durable, so the leader's cut is its proposal
+  batches together with every batch its durable ledger still has staged.
+* **A retry is the same row.** A second request for the recorded
+  transition while the first row is in flight writes the same record
+  under another barrier and keeps both in flight; the first to land
+  seals, and a copy that fails reports `SealFailed` only when no other
+  copy landed or is still pending.
 
 ### Where the row lives, and why that tag
 

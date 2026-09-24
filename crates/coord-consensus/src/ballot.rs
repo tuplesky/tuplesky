@@ -211,8 +211,12 @@ pub struct BallotState {
     elections: u64,
     /// The durable seal, once it exists. Nothing in this type clears it.
     sealed: Option<SealRecordV1>,
-    /// A seal persisted and not yet durable, with its barrier.
-    sealing: Option<(BarrierId, SealRecordV1)>,
+    /// Every seal row persisted and not yet durable, with its barrier.
+    /// Retries of one transition are kept side by side like promises in
+    /// flight rather than replacing each other: each row is the same
+    /// record, whichever lands first seals the replica, and a later
+    /// failure of another copy can neither hide that nor undo it.
+    sealing: Vec<(BarrierId, SealRecordV1)>,
 }
 
 impl BallotState {
@@ -251,7 +255,7 @@ impl BallotState {
             in_flight: Vec::new(),
             elections: 0,
             sealed: seal,
-            sealing: None,
+            sealing: Vec::new(),
         }
     }
 
@@ -260,9 +264,32 @@ impl BallotState {
         self.sealed.as_ref()
     }
 
-    /// Whether ordinary voting is over here.
+    /// Whether the seal row is durable here.
     pub const fn is_sealed(&self) -> bool {
         self.sealed.is_some()
+    }
+
+    /// The transition this replica is sealed for or sealing for: the
+    /// durable seal, or else a seal row still in flight.
+    pub fn seal_held(&self) -> Option<Transition> {
+        self.sealed
+            .iter()
+            .chain(self.sealing.iter().map(|(_, r)| r))
+            .map(|r| r.transition)
+            .next()
+    }
+
+    /// Whether ordinary voting is over here: the seal is durable, or a
+    /// seal row is in flight.
+    ///
+    /// The fence starts at the cut, not at durability. The seal report
+    /// was built over the batches outstanding when the seal was asked
+    /// for, so a vote cast after that and before the row lands is one
+    /// the report does not cover, and an initiator counting the report
+    /// would count a fence this replica had already voted past. If the
+    /// row fails nothing was fenced, and voting resumes with it.
+    pub fn is_fenced(&self) -> bool {
+        self.sealed.is_some() || !self.sealing.is_empty()
     }
 
     /// Seal this configuration for `transition`.
@@ -312,10 +339,19 @@ impl BallotState {
                 });
             }
         }
-        let record = SealRecordV1 {
-            transition,
-            at: self.promised,
-        };
+        // A retry of the recorded transition writes the recorded row
+        // again, not a new one: a promise that advanced in between must
+        // not give the same seal two different cuts on disk.
+        let record = self
+            .sealed
+            .iter()
+            .chain(self.sealing.iter().map(|(_, r)| r))
+            .next()
+            .copied()
+            .unwrap_or(SealRecordV1 {
+                transition,
+                at: self.promised,
+            });
         let barrier = alloc.allocate();
         let update = seal_update(self.identity.epoch, &record).map_err(|_: EngineError| {
             SealRejection::WrongEpoch {
@@ -336,12 +372,12 @@ impl BallotState {
             to,
             frame: ProtocolMessage::Sealed {
                 transition,
-                at: self.promised,
+                at: record.at,
                 replica: self.identity.replica,
             }
             .encode(),
         };
-        self.sealing = Some((barrier, record));
+        self.sealing.push((barrier, record));
         Ok(SealEffects { persist, report })
     }
 
@@ -418,11 +454,11 @@ impl BallotState {
         outstanding: &[BarrierId],
     ) -> Result<PromiseEffects, PromiseRejection> {
         // The seal comes first. A higher ballot is not an exception to
-        // a fence; it is the thing a fence exists to stop.
-        if let Some(held) = self.sealed {
-            return Err(PromiseRejection::Sealed {
-                transition: held.transition,
-            });
+        // a fence; it is the thing a fence exists to stop. A seal row in
+        // flight already binds: the report's cut is taken, and a promise
+        // made after it is one the report does not show.
+        if let Some(transition) = self.seal_held() {
+            return Err(PromiseRejection::Sealed { transition });
         }
         let candidate = from;
         let from = candidate.replica;
@@ -489,18 +525,27 @@ impl BallotState {
     /// failed one is dropped while the earlier promise, and every other
     /// promise in flight, stay in force.
     pub fn on_storage(&mut self, event: &StorageEvent) -> Option<PromiseOutcome> {
-        if let Some((barrier, record)) = self.sealing
-            && Some(barrier) == event.barrier()
+        if let Some(index) = self
+            .sealing
+            .iter()
+            .position(|(b, _)| Some(*b) == event.barrier())
         {
             return match event {
                 StorageEvent::JournalDurable { .. } => {
-                    self.sealing = None;
-                    self.sealed = Some(record);
-                    Some(PromiseOutcome::Sealed(record.transition))
+                    let (_, record) = self.sealing.remove(index);
+                    // The first durable copy seals; a later one is the
+                    // same record and changes nothing.
+                    let sealed = *self.sealed.get_or_insert(record);
+                    Some(PromiseOutcome::Sealed(sealed.transition))
                 }
                 StorageEvent::Failed { .. } => {
-                    self.sealing = None;
-                    Some(PromiseOutcome::SealFailed(record.transition))
+                    let (_, record) = self.sealing.remove(index);
+                    // One failed copy is a failed seal only when no other
+                    // copy is durable or still in flight: a retry's row
+                    // failing says nothing about a row that already
+                    // landed, and must not report this replica unfenced.
+                    (self.sealed.is_none() && self.sealing.is_empty())
+                        .then_some(PromiseOutcome::SealFailed(record.transition))
                 }
                 StorageEvent::Materialized { .. }
                 | StorageEvent::LocalCheckpointPublished { .. } => None,

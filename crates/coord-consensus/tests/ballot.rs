@@ -775,3 +775,95 @@ fn a_seal_binds_its_own_configuration_and_only_a_voter_writes_one() {
         );
     }
 }
+
+/// A retry of the same seal while the first row is still in flight is the
+/// same seal, whatever order the two rows resolve in.
+///
+/// The sequence this exists for: the report of the first request is lost,
+/// the initiator asks again before the first row lands, the first row
+/// becomes durable and the second fails. The replica is sealed -- the row
+/// is on disk -- and a failure of the redundant copy must neither hide
+/// that nor report the replica unfenced. The other order, first copy
+/// failing while the retry is still in flight, is not a failed seal
+/// either until the retry has also resolved.
+#[test]
+fn a_seal_retried_before_its_row_lands_is_the_same_seal() {
+    let b = boot(1);
+    let failed = |barrier| StorageEvent::Failed {
+        barrier_id: barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    };
+    let barrier_of = |effects: &coord_consensus::SealEffects| {
+        let Effect::Persist(batch) = &effects.persist else {
+            panic!("a seal persists first")
+        };
+        (batch.barrier, batch.updates.clone())
+    };
+
+    // First durable, retry failed.
+    let mut a = alloc(b);
+    let mut state = voter();
+    let (first, first_rows) =
+        barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    let (retry, retry_rows) = barrier_of(
+        &state
+            .seal(transition(), peer(2), b, &mut a, &[])
+            .expect("the same seal again, while in flight"),
+    );
+    assert_ne!(first, retry);
+    assert_eq!(first_rows, retry_rows, "the same row, not a second seal");
+    assert!(state.is_fenced(), "the cut is taken: voting has stopped");
+    assert_eq!(
+        state.on_storage(&durable(first, 1)),
+        Some(PromiseOutcome::Sealed(transition()))
+    );
+    assert_eq!(
+        state.on_storage(&failed(retry)),
+        None,
+        "a redundant copy failing is not a failed seal"
+    );
+    assert!(state.is_sealed());
+    assert_eq!(
+        state.on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[]),
+        Err(PromiseRejection::Sealed {
+            transition: transition()
+        })
+    );
+
+    // First failed while the retry is in flight, then the retry lands.
+    let mut a = alloc(b);
+    let mut state = voter();
+    let (first, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    let (retry, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    assert_eq!(
+        state.on_storage(&failed(first)),
+        None,
+        "another copy is still in flight"
+    );
+    assert!(state.is_fenced());
+    assert_eq!(
+        state.on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[]),
+        Err(PromiseRejection::Sealed {
+            transition: transition()
+        }),
+        "a row in flight already binds"
+    );
+    assert_eq!(
+        state.on_storage(&durable(retry, 2)),
+        Some(PromiseOutcome::Sealed(transition()))
+    );
+    assert!(state.is_sealed());
+
+    // Both fail: only then is the replica unsealed, and it says so once.
+    let mut a = alloc(b);
+    let mut state = voter();
+    let (first, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    let (retry, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    assert_eq!(state.on_storage(&failed(first)), None);
+    assert_eq!(
+        state.on_storage(&failed(retry)),
+        Some(PromiseOutcome::SealFailed(transition()))
+    );
+    assert!(!state.is_sealed());
+    assert!(!state.is_fenced());
+}
