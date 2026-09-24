@@ -944,7 +944,7 @@ fn a_service_command_presented_again_is_proposed_to_the_voters_again() {
             ..retry_key(seq)
         };
         let command = CommandId::derive(&key, &logical).unwrap();
-        let frame = MessageV1::Request(RequestV1::new(key, &logical, 0).unwrap())
+        let frame = MessageV1::Request(RequestV1::new(key, &logical, 0, 0).unwrap())
             .encode()
             .unwrap();
         (frame, command)

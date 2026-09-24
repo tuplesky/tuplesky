@@ -1220,7 +1220,7 @@ impl Caller {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0)
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
                 .expect("bounded"),
         )
         .encode()

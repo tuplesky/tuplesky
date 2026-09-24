@@ -854,7 +854,7 @@ impl Leader {
             .table
             .record(&command)
             .and_then(|r| r.payload)
-            .unwrap_or_else(|| admission_digest(None));
+            .unwrap_or_else(|| admission_digest(None, 0));
         let ballot = self.config.quorum.ballot();
         let ack = FastAck {
             replica: self.config.identity.replica,
