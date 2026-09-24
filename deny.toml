@@ -47,6 +47,11 @@ allow = [
     # webpki-roots (the Mozilla root store data reqwest's selected
     # `rustls-tls-webpki-roots-no-provider` feature bundles; task-35).
     "CDLA-Permissive-2.0",
+    # xxhash-rust (Boost Software License) and varint-rs (Zero-Clause BSD),
+    # reached only through the experimental fjall pin of the test-only
+    # coord-storage-fjall crate (task-s03); both are permissive.
+    "BSL-1.0",
+    "0BSD",
 ]
 confidence-threshold = 0.9
 exceptions = []

@@ -40,7 +40,8 @@ claimed as qualification (Section 22.2).
 | postcard | =1.1.3 | alloc (no default) | wire and journal codecs |
 | bytes | =1.12.1 | default | |
 | blake3 | =1.8.7 | default | domain-separated identity hashing |
-| redb | =4.2.0 | std (no default) | production state engine; not yet linked by a crate |
+| redb | =4.2.0 | std (no default) | production state engine (coord-storage-redb) |
+| fjall | =3.1.10 | lz4 (no default; audited) | experimental state engine (task-s03); linked only by the test-only coord-storage-fjall crate, listed as an external test-only crate in the dependency policy so no production, core or tool crate can reach it |
 | raft-engine | git `097c499a19fbb38754c73aa2f31532329df7c0c6` | none (no default) | shared journal candidate; see audit below |
 | thiserror | =2.0.20 | no default | |
 | anyhow | =1.0.104 | default | binaries/tooling only |
@@ -84,10 +85,11 @@ and progress plumbing.
   quinn, rustls, getrandom, rand, rand_chacha, rand_core, reqwest, axum,
   hyper or mio through normal or build dependencies (Sections 11, 16.3, 18.2).
 * No `core`, `production` or `tool` crate reaches a `test-only` workspace
-  crate (coord-sim, later coord-store-testkit) or an external test aid
-  (proptest, loom, arbitrary, libfuzzer-sys, criterion, quickcheck) through
-  normal or build dependencies. Simulator entropy and model engines therefore
-  cannot be linked into production artifacts.
+  crate (coord-sim, coord-store-testkit, coord-storage-fjall) or an external
+  test aid (proptest, loom, arbitrary, libfuzzer-sys, criterion, quickcheck,
+  fjall) through normal or build dependencies. Simulator entropy, model
+  engines and the experimental state engine therefore cannot be linked into
+  production artifacts.
 * openssl, openssl-sys, native-tls and hyper-tls are forbidden anywhere in
   the resolved graph.
 * Boundary constructors that cast plain data into a sealed capability
@@ -96,7 +98,8 @@ and progress plumbing.
   `coord-transport`) or of test-only crates; the scan ignores comments and
   integration tests.
 * Git sources are limited to the reviewed raft-engine revision.
-* Feature audit: raft-engine must resolve with an empty feature set.
+* Feature audit: raft-engine must resolve with an empty feature set; fjall
+  must resolve exactly `lz4`.
 * `cargo deny check` applies `deny.toml` (advisories, licenses, bans,
   sources). `--offline` skips only the advisory database fetch.
 
@@ -138,7 +141,8 @@ Observed transitive facts to carry into task-j02:
 |---|---|---|
 | Go toolchain unspecified | `go 1.26.5` | quic-go v0.62.0 requires Go 1.26 and the pinned Kine revision declares `go 1.26.5`; `go mod tidy` raised the directive (task-45, task-46) |
 | Rust minimum 1.90 | MSRV stays 1.90; exact toolchain 1.94.1 | raft-engine's own `rust-version` is 1.85; all workspace crates check with 1.90.0 |
-| fjall 3.1.10, openidconnect 4.0.1, reqwest 0.12.28 and the other unused candidates | Not added yet | Added by first consuming task with exact pins; presence in the index was confirmed on 2026-09-18 |
+| openidconnect 4.0.1, reqwest 0.12.28 and the other unused candidates | Not added yet | Added by first consuming task with exact pins; presence in the index was confirmed on 2026-09-18 |
+| fjall 3.1.10 | Pinned at `=3.1.10` with `default-features = false, features = ["lz4"]` (task-s03) | The candidate resolves as pinned; its graph adds xxhash-rust (BSL-1.0) and varint-rs (0BSD), both permissive and now allowed in `deny.toml` with the reason recorded there. Fjall 3 has no `open_existing`: `Database::open` creates a missing database, so the adapter's lifecycle checks the directory and version marker itself before opening (opening never initializes) |
 | rustls 0.23.44 | Pinned at `=0.23.45` | RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries) is patched in 0.23.45; quinn 0.11.11 and quinn-proto 0.11.17 accept it, and no other selection changes |
 | `toml` requirement `=1.1.6` | Kept | Resolves to `1.1.6+spec-1.1.0` |
 | Workspace license `FSL-1.1-ALv2` | `deny.toml` ignores private (`publish = false`) crates | Not an SPDX identifier; not a third-party dependency |
