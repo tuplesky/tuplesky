@@ -248,6 +248,33 @@ fn command_id_vectors_are_frozen() {
             revision: KvRevision::new(1000).unwrap(),
         },
     );
+    let binding = LeaseId(*b"kine-bind-000001");
+    let kine_create = LogicalRequest::new(
+        ns,
+        CanonicalOperation::KineCreate(KineCreateOp {
+            key: b"/registry/pods/p".to_vec(),
+            value: b"pod".to_vec(),
+            ttl_seconds: 60,
+            binding: Some(binding),
+        }),
+    );
+    let kine_update = LogicalRequest::new(
+        ns,
+        CanonicalOperation::KineUpdate(KineUpdateOp {
+            key: b"/registry/pods/p".to_vec(),
+            value: b"pod2".to_vec(),
+            expected_mod_revision: KvRevision::new(7).unwrap(),
+            ttl_seconds: 0,
+            binding: None,
+        }),
+    );
+    let kine_delete = LogicalRequest::new(
+        ns,
+        CanonicalOperation::KineDelete(KineDeleteOp {
+            key: b"/registry/pods/p".to_vec(),
+            expected_mod_revision: Some(KvRevision::new(8).unwrap()),
+        }),
+    );
     let mut key2 = key;
     key2.request_sequence = RequestSequence::new(2).unwrap();
 
@@ -260,6 +287,9 @@ fn command_id_vectors_are_frozen() {
         vector("delete-prev-kv", key, delete),
         vector("txn-canonical", key, txn),
         vector("lease-grant", key, grant),
+        vector("kine-create-ttl", key, kine_create),
+        vector("kine-update-cas-no-ttl", key, kine_update),
+        vector("kine-delete-conditional", key, kine_delete),
         vector("lease-keepalive", key, keepalive),
         vector("lease-revoke", key, revoke),
         vector("lease-ttl", key, ttl),

@@ -39,7 +39,12 @@ field order and variant order are frozen. Allowed evolution: append variants
 at the end of an enum. Anything else is `logical_v2`.
 
 Variant order of `CanonicalOperation`: `Range`, `Put`, `DeleteRange`, `Txn`,
-`LeaseGrant`, `LeaseKeepAlive`, `LeaseRevoke`, `LeaseTimeToLive`, `Compact`.
+`LeaseGrant`, `LeaseKeepAlive`, `LeaseRevoke`, `LeaseTimeToLive`, `Compact`,
+then the appended Kine primitives `KineCreate`, `KineUpdate`, `KineDelete`
+(design Section 6.6): one logical operation each, returning every revision
+and conflict fact from one execution point. A Kine TTL is `ttl_seconds`
+plus a hidden binding identity derived from the stable request, present
+exactly when the TTL is positive; it is never a native lease ID.
 
 Normalization: transaction comparisons form a conjunction, so they are
 sorted and de-duplicated before encoding; a non-canonical transaction is
@@ -50,7 +55,9 @@ Limits (rejected before encoding): key 1..=8 KiB, value <= 1 MiB, request
 <= 2 MiB of key/value bytes, transaction work (comparisons plus branch
 operations) <= 128, one write per key per branch, no nested transactions,
 half-open ranges with `range_end > key`, lease TTL 1..=604800 seconds,
-positive compaction revision, page limit <= 10000.
+Kine TTL 0..=604800 seconds with a binding exactly when positive, positive
+expected modification revisions, positive compaction revision, page limit
+<= 10000.
 
 ## Ordered keys
 

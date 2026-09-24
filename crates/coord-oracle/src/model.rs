@@ -237,7 +237,10 @@ impl KvModel {
             CanonicalOperation::LeaseGrant { .. }
             | CanonicalOperation::LeaseKeepAlive { .. }
             | CanonicalOperation::LeaseRevoke { .. }
-            | CanonicalOperation::LeaseTimeToLive { .. } => ModelResponse {
+            | CanonicalOperation::LeaseTimeToLive { .. }
+            | CanonicalOperation::KineCreate(_)
+            | CanonicalOperation::KineUpdate(_)
+            | CanonicalOperation::KineDelete(_) => ModelResponse {
                 revision: self.revision,
                 outcome: Outcome::Unsupported,
             },
