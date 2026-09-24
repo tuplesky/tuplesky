@@ -320,7 +320,7 @@ impl RedbEngine {
 
 /// Verify every table's checksums; a repair or an inconsistency is
 /// corruption (nothing is repaired into a different state silently).
-fn check_integrity(db: &mut redb::Database) -> Result<(), EngineError> {
+pub(crate) fn check_integrity(db: &mut redb::Database) -> Result<(), EngineError> {
     match db.check_integrity() {
         Ok(true) => Ok(()),
         Ok(false) => Err(EngineError::new(

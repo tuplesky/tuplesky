@@ -16,6 +16,7 @@ coord-types.workspace = true
 coord-core.workspace = true
 coord-store-api.workspace = true
 coord-storage.workspace = true
+coord-storage-redb.workspace = true
 serde = { workspace = true, features = ["std"] }
 postcard.workspace = true
 
@@ -23,6 +24,5 @@ postcard.workspace = true
 coord-redb-faultkit.workspace = true
 coord-state.workspace = true
 coord-store-testkit.workspace = true
-coord-storage-redb.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

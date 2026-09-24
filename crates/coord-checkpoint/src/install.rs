@@ -6,7 +6,13 @@
 //! every failure and every crash leaves the previously selected state
 //! untouched; the physical selection (directory sync, manifest, active
 //! pointer) belongs to the storage lifecycle and happens only after this
-//! returns success.
+//! returns success. [`select_installed`] is the selection step for an
+//! install: it consumes the [`Installed`] a successful install returned and
+//! re-reads the receipt from the staged generation before activating it, so
+//! a generation whose install failed, was interrupted or never ran cannot
+//! be selected through it. `InactiveGeneration::activate` itself stays
+//! receipt-agnostic, because an offline migration selects a generation that
+//! no install filled.
 //!
 //! What is checked before a single row is written:
 //!
@@ -56,6 +62,8 @@ use std::fmt;
 
 use coord_storage::codecs;
 use coord_storage::lowering::{DurableMeta, ExecutionFrontier};
+use coord_storage_redb::lifecycle::InactiveGeneration;
+use coord_storage_redb::{Generation, OpenError};
 use coord_store_api::engine::{
     CollectionId, CommitFailure, EngineError, LocalEngine, OrderedRead, ScanRequest,
     SnapshotSource, WriteTxn,
@@ -357,10 +365,75 @@ pub fn installed_baseline<V: OrderedRead>(
     }
 }
 
+/// Why [`select_installed`] did not select a staged generation.
+#[derive(Debug)]
+pub enum SelectError {
+    /// The staged generation carries no install receipt: its install never
+    /// completed there. The staging was abandoned.
+    NotInstalled,
+    /// The staged generation's receipt is not the one the install returned,
+    /// so the [`Installed`] belongs to another generation. The staging was
+    /// abandoned.
+    ReceiptMismatch,
+    /// The receipt could not be read or decoded. The staging was abandoned.
+    Receipt(InstallError),
+    /// The lifecycle refused or failed the activation itself.
+    Activate(OpenError),
+}
+
+impl fmt::Display for SelectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SelectError::NotInstalled => f.write_str("staged generation holds no install receipt"),
+            SelectError::ReceiptMismatch => {
+                f.write_str("staged generation's receipt differs from the completed install")
+            }
+            SelectError::Receipt(e) => write!(f, "install receipt: {e}"),
+            SelectError::Activate(e) => write!(f, "activate: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SelectError {}
+
+/// Select a staged generation that an install completed into.
+///
+/// `installed` is only produced by a successful [`install_shared`], so a
+/// caller that caught a failed or indeterminate install has nothing to pass
+/// here. The receipt is still re-read from the staged engine and must equal
+/// the one returned: a receipt from another staging, or a staging whose
+/// final commit never landed, is refused. A refused staging is abandoned,
+/// since nothing may ever select it; if removing its directory fails, it
+/// stays unreferenced, which is the state a crash before activation leaves
+/// and which the next staging steps over.
+pub fn select_installed(
+    mut staged: InactiveGeneration,
+    installed: Installed,
+) -> Result<Generation, SelectError> {
+    let durable = staged
+        .engine()
+        .reader()
+        .snapshot()
+        .map_err(InstallError::from)
+        .and_then(|view| installed_baseline(&view));
+    let refusal = match durable {
+        Ok(Some(receipt)) if receipt == installed.receipt => None,
+        Ok(Some(_)) => Some(SelectError::ReceiptMismatch),
+        Ok(None) => Some(SelectError::NotInstalled),
+        Err(e) => Some(SelectError::Receipt(e)),
+    };
+    if let Some(refusal) = refusal {
+        let _ = staged.abandon();
+        return Err(refusal);
+    }
+    staged.activate().map_err(SelectError::Activate)
+}
+
 /// Install a verified artifact into the engine of an inactive generation.
 ///
 /// On success the generation holds exactly the artifact's common state at
-/// its boundary plus the receipt; the caller may then select it. On any
+/// its boundary plus the receipt; the caller may then select it with
+/// [`select_installed`]. On any
 /// error nothing may be selected: the staged generation is abandoned and
 /// the previously selected one remains in force.
 pub fn install_shared<E: LocalEngine>(

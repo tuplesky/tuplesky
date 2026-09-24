@@ -376,3 +376,51 @@ fn profile_identity_record_is_verified_on_open() {
         Err(OpenError::IdentityRecordMismatch("profile"))
     ));
 }
+
+/// Staging over a selected generation applies the checks an open does: a
+/// database swapped in under an intact manifest is refused, and nothing is
+/// staged, rather than the generation being silently replaced and pruned.
+#[test]
+fn staging_refuses_a_selected_generation_that_open_would_refuse() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Generation::create(dir.path(), identity(), options()).unwrap());
+    let db_path = dir.path().join("gen-000001").join("domain.redb");
+
+    // A database created for another domain, with an empty protocol_v1,
+    // swapped in under identity's intact manifest.
+    let other = tempfile::tempdir().unwrap();
+    let mut other_identity = identity();
+    other_identity.domain_id = DomainId([7; 16]);
+    drop(Generation::create(other.path(), other_identity, options()).unwrap());
+    std::fs::copy(
+        other.path().join("gen-000001").join("domain.redb"),
+        &db_path,
+    )
+    .unwrap();
+    assert!(matches!(
+        Generation::open_existing(dir.path(), identity(), options()),
+        Err(OpenError::IdentityRecordMismatch("domain_id"))
+    ));
+    let staged = coord_storage_redb::InactiveGeneration::stage(dir.path(), identity(), options());
+    assert!(
+        matches!(staged, Err(OpenError::IdentityRecordMismatch("domain_id"))),
+        "staging accepted a generation open refuses"
+    );
+    assert!(!dir.path().join("gen-000002").exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("CURRENT")).unwrap(),
+        b"gen-000001"
+    );
+
+    // With the original database back, staging proceeds as before.
+    let fresh = tempfile::tempdir().unwrap();
+    drop(Generation::create(fresh.path(), identity(), options()).unwrap());
+    std::fs::copy(
+        fresh.path().join("gen-000001").join("domain.redb"),
+        &db_path,
+    )
+    .unwrap();
+    let staged =
+        coord_storage_redb::InactiveGeneration::stage(dir.path(), identity(), options()).unwrap();
+    assert_eq!(staged.generation(), 2);
+}

@@ -33,7 +33,7 @@ use coord_store_api::registry::{Collection, meta_fields};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition};
 
-use crate::engine::{RedbEngine, table_definition};
+use crate::engine::{RedbEngine, check_integrity, table_definition};
 use crate::manifest::{ENGINE_NAME, ManifestError, PROFILE_NAME, StoreManifestV1};
 
 /// Identity a generation must carry.
@@ -312,68 +312,8 @@ impl Generation {
             ));
         }
         let db_path = directory.join(DATABASE);
-        let meta = match std::fs::metadata(&db_path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(OpenError::MissingDatabase);
-            }
-            Err(e) => return Err(OpenError::Io(e)),
-        };
-        if meta.len() == 0 {
-            return Err(OpenError::EmptyDatabase);
-        }
-        let db = redb::Database::builder()
-            .set_cache_size(options.cache_bytes)
-            .open(&db_path)
-            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-        // Every registered table must exist, and the identity record must
-        // agree with the manifest.
-        {
-            let txn = db
-                .begin_read()
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-            for c in Collection::ALL {
-                txn.open_table(table_definition(c))
-                    .map_err(|e| OpenError::Corrupt(format!("table {}: {e}", c.name())))?;
-            }
-            let meta_table = txn
-                .open_table(table_definition(Collection::MetaV1))
-                .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-            let check =
-                |field: &'static str, key: &[u8], expected_bytes: &[u8]| -> Result<(), OpenError> {
-                    let value = meta_table
-                        .get(key)
-                        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
-                    match value {
-                        Some(v) if v.value() == expected_bytes => Ok(()),
-                        _ => Err(OpenError::IdentityRecordMismatch(field)),
-                    }
-                };
-            check(
-                "cluster_id",
-                meta_fields::CLUSTER_ID,
-                &manifest.cluster_id.0,
-            )?;
-            check("domain_id", meta_fields::DOMAIN_ID, &manifest.domain_id.0)?;
-            check(
-                "replica_id",
-                meta_fields::REPLICA_ID,
-                &manifest.replica_id.0,
-            )?;
-            check(
-                "incarnation",
-                meta_fields::INCARNATION,
-                &manifest.incarnation.to_be_bytes(),
-            )?;
-            check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
-            check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
-        }
-        // Damage outside the meta pages does not stop `open`; verify every
-        // table before the generation is returned, and quarantine on failure.
-        let mut engine = RedbEngine::from_database(db, db_path, options.cache_bytes);
-        engine
-            .verify_integrity()
-            .map_err(|e| OpenError::Corrupt(format!("integrity: {e}")))?;
+        let db = open_verified_database(&db_path, &manifest, &options)?;
+        let engine = RedbEngine::from_database(db, db_path, options.cache_bytes);
         Ok(Generation {
             engine,
             manifest,
@@ -522,6 +462,79 @@ fn initialize_database(
             .map_err(|e| OpenError::Corrupt(e.to_string()))?;
     }
     Ok((db, db_path))
+}
+
+/// Open the database of a generation whose manifest has already been
+/// verified, and apply the in-database checks every selected generation
+/// must pass before anything reads or replaces it: the file exists and is
+/// not empty, every registered table exists, the `meta_v1` identity rows
+/// agree with the manifest (so a copied manifest cannot lend identity to a
+/// foreign database), and every table's checksums verify.
+fn open_verified_database(
+    db_path: &Path,
+    manifest: &StoreManifestV1,
+    options: &OpenOptions,
+) -> Result<redb::Database, OpenError> {
+    let meta = match std::fs::metadata(db_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(OpenError::MissingDatabase);
+        }
+        Err(e) => return Err(OpenError::Io(e)),
+    };
+    if meta.len() == 0 {
+        return Err(OpenError::EmptyDatabase);
+    }
+    let mut db = redb::Database::builder()
+        .set_cache_size(options.cache_bytes)
+        .open(db_path)
+        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+    // Every registered table must exist, and the identity record must
+    // agree with the manifest.
+    {
+        let txn = db
+            .begin_read()
+            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        for c in Collection::ALL {
+            txn.open_table(table_definition(c))
+                .map_err(|e| OpenError::Corrupt(format!("table {}: {e}", c.name())))?;
+        }
+        let meta_table = txn
+            .open_table(table_definition(Collection::MetaV1))
+            .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+        let check =
+            |field: &'static str, key: &[u8], expected_bytes: &[u8]| -> Result<(), OpenError> {
+                let value = meta_table
+                    .get(key)
+                    .map_err(|e| OpenError::Corrupt(e.to_string()))?;
+                match value {
+                    Some(v) if v.value() == expected_bytes => Ok(()),
+                    _ => Err(OpenError::IdentityRecordMismatch(field)),
+                }
+            };
+        check(
+            "cluster_id",
+            meta_fields::CLUSTER_ID,
+            &manifest.cluster_id.0,
+        )?;
+        check("domain_id", meta_fields::DOMAIN_ID, &manifest.domain_id.0)?;
+        check(
+            "replica_id",
+            meta_fields::REPLICA_ID,
+            &manifest.replica_id.0,
+        )?;
+        check(
+            "incarnation",
+            meta_fields::INCARNATION,
+            &manifest.incarnation.to_be_bytes(),
+        )?;
+        check("engine", meta_fields::ENGINE, ENGINE_NAME.as_bytes())?;
+        check("profile", meta_fields::PROFILE, PROFILE_NAME.as_bytes())?;
+    }
+    // Damage outside the meta pages does not stop `open`; verify every
+    // table before the database is used, and fail closed on damage.
+    check_integrity(&mut db).map_err(|e| OpenError::Corrupt(format!("integrity: {e}")))?;
+    Ok(db)
 }
 
 /// The generation directories under a root, by number.
@@ -791,12 +804,13 @@ fn read_selected(
     if manifest.incarnation > identity.incarnation {
         return Err(OpenError::RootIdentityMismatch("incarnation"));
     }
+    // The database must pass the same checks an open applies: a selected
+    // generation that open would refuse (a swapped or foreign database, a
+    // missing table, damaged pages) fails closed here too, rather than being
+    // silently replaced and later pruned.
+    let db = open_verified_database(&directory.join(DATABASE), &manifest, options)?;
     // The selected generation must hold no protocol obligations: promises and
     // votes are never replaced or reset by an install.
-    let db = redb::Database::builder()
-        .set_cache_size(options.cache_bytes)
-        .open(directory.join(DATABASE))
-        .map_err(|e| OpenError::Corrupt(e.to_string()))?;
     let txn = db
         .begin_read()
         .map_err(|e| OpenError::Corrupt(e.to_string()))?;

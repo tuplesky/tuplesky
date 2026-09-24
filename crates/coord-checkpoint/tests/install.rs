@@ -11,7 +11,8 @@
 
 use coord_checkpoint::export::{CheckpointOrigin, ExportLimits, export_shared};
 use coord_checkpoint::install::{
-    ChunkSet, InstallError, InstallLimits, InstallRequirements, install_shared, installed_baseline,
+    ChunkSet, InstallError, InstallLimits, InstallRequirements, SelectError, install_shared,
+    installed_baseline, select_installed,
 };
 use coord_checkpoint::manifest::{SharedCheckpointV1, SharedManifestV1};
 use coord_checkpoint::verify::VerifyError;
@@ -1120,6 +1121,82 @@ fn a_crash_at_each_activation_step_leaves_a_valid_selection() {
             }
         }
     }
+}
+
+/// Selection through `select_installed` requires the staged generation's
+/// own durable receipt: a staging whose install stopped after writing rows,
+/// or a receipt that belongs to another staging, is refused and abandoned,
+/// and the previous selection stays in force.
+#[test]
+fn only_a_generation_holding_its_own_install_receipt_is_selected() {
+    let donor = donor_checkpoint();
+    let dir = tempfile::tempdir().unwrap();
+
+    // A completed install into another root yields a genuine receipt.
+    let elsewhere = dir.path().join("elsewhere");
+    drop(Generation::create(&elsewhere, identity(LEARNER, 3), options()).unwrap());
+    let mut other = InactiveGeneration::stage(&elsewhere, identity(LEARNER, 3), options()).unwrap();
+    let other_installed = install_shared(
+        other.engine(),
+        &donor.manifest,
+        chunk_set(&donor),
+        &requirements(),
+        &install_limits(),
+    )
+    .unwrap();
+    other.abandon().unwrap();
+
+    // A staging that holds rows but no receipt, as an install whose final
+    // commit failed leaves it, cannot be selected with that receipt.
+    let root = learner_root(dir.path());
+    let mut staged = InactiveGeneration::stage(&root, identity(LEARNER, 3), options()).unwrap();
+    let mut tx = staged.engine().begin_write().unwrap();
+    tx.put(Collection::KvCurrentV1.id(), b"partial", b"row")
+        .unwrap();
+    tx.commit_durable().unwrap();
+    let Err(err) = select_installed(staged, other_installed.clone()) else {
+        panic!("selected a generation without its own receipt");
+    };
+    assert!(matches!(err, SelectError::NotInstalled), "{err}");
+    assert_eq!(current_pointer(&root), "gen-000001");
+    assert!(
+        !root.join("gen-000002").exists(),
+        "the staging is abandoned"
+    );
+
+    // A complete install is still refused under a receipt that is not its
+    // own.
+    let mut staged = InactiveGeneration::stage(&root, identity(LEARNER, 3), options()).unwrap();
+    let mut installed = install_shared(
+        staged.engine(),
+        &donor.manifest,
+        chunk_set(&donor),
+        &requirements(),
+        &install_limits(),
+    )
+    .unwrap();
+    installed.receipt.rows += 1;
+    let Err(err) = select_installed(staged, installed) else {
+        panic!("selected a generation without its own receipt");
+    };
+    assert!(matches!(err, SelectError::ReceiptMismatch), "{err}");
+    assert_eq!(current_pointer(&root), "gen-000001");
+
+    // Its own receipt selects it.
+    let mut staged = InactiveGeneration::stage(&root, identity(LEARNER, 3), options()).unwrap();
+    let installed = install_shared(
+        staged.engine(),
+        &donor.manifest,
+        chunk_set(&donor),
+        &requirements(),
+        &install_limits(),
+    )
+    .unwrap();
+    let number = staged.generation();
+    let mut generation = select_installed(staged, installed.clone()).unwrap();
+    assert_eq!(current_pointer(&root), format!("gen-{number:06}"));
+    let view = generation.engine().reader().snapshot().unwrap();
+    assert_eq!(installed_baseline(&view).unwrap(), Some(installed.receipt));
 }
 
 #[test]

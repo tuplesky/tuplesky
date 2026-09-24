@@ -52,7 +52,7 @@ pub mod verify;
 pub use export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
 pub use install::{
     ChunkSet, InstallError, InstallLimits, InstallRequirements, Installed, InstalledCheckpointV1,
-    install_shared, installed_baseline,
+    SelectError, install_shared, installed_baseline, select_installed,
 };
 pub use manifest::{
     CheckpointBoundary, ChunkDescriptorV1, ChunkV1, CollectionSummaryV1, MAX_CHUNKS,
