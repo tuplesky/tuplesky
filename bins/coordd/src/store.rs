@@ -33,7 +33,9 @@ use coord_storage::JournaledDomain;
 use coord_storage::journaled::{JournalLimits, JournaledStore};
 use coord_storage_redb::RedbEngine;
 use coord_storage_redb::lifecycle::{Generation, OpenError, OpenOptions, StoreIdentity};
-use coord_types::ids::{Ballot, ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{
+    Ballot, ClusterId, DomainId, LocalJournalSeq, ReplicaId, ReplicaIncarnation,
+};
 
 /// What this node's projection is being opened for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +161,15 @@ pub struct Storage {
     /// The journal-first coordinator: one shared journal, this node's
     /// domain attached to it.
     pub domain: Persistence,
+    /// Where this node's local recovery checkpoints are published.
+    pub checkpoints: coord_checkpoint::LocalCheckpointStore,
+    /// The baseline the journal selects, if one was ever published.
+    ///
+    /// Read and validated at startup rather than when it is needed: an
+    /// image this node published and can no longer load is the loss of
+    /// a durable prefix, and finding that out at the moment it is
+    /// needed is finding it out too late.
+    pub baseline: Option<coord_journal_api::CheckpointPointerV1>,
     /// Where the projection's generation lives, for diagnostics.
     pub generation: PathBuf,
     /// The boot this storage was opened under.
@@ -185,6 +196,8 @@ pub struct Opened {
     domain_id: DomainId,
     replica: ReplicaId,
     incarnation: ReplicaIncarnation,
+    /// Where this node's local recovery checkpoints are published.
+    checkpoint_root: PathBuf,
 }
 
 /// Open the journal and the projection, for `intent`.
@@ -248,6 +261,7 @@ pub fn open_storage(
     })?;
 
     let generation = open(config, intent, cluster, domain_id, replica, incarnation)?;
+    let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
     Ok(Opened {
         journal,
         journal_root,
@@ -256,6 +270,7 @@ pub fn open_storage(
         domain_id,
         replica,
         incarnation,
+        checkpoint_root,
     })
 }
 
@@ -276,6 +291,7 @@ impl Opened {
             domain_id,
             replica,
             incarnation,
+            checkpoint_root,
         } = self;
         let directory = generation.directory().to_path_buf();
         let (engine, _lock, _manifest) = generation.into_parts();
@@ -293,11 +309,41 @@ impl Opened {
             root: show(&journal_root),
             reason: format!("{e:?}"),
         })?;
+        // The local checkpoint directory, and what the journal says the
+        // baseline is. Both are read before the domain is attached: the
+        // baseline is a fact of the stream, not of the projection, and an
+        // image that no longer loads has to stop the node here rather than
+        // when a recovery needs it.
+        let checkpoints =
+            coord_checkpoint::LocalCheckpointStore::open(&checkpoint_root).map_err(|e| {
+                StoreError::Refused {
+                    root: show(&checkpoint_root),
+                    reason: format!("the local checkpoint directory could not be opened: {e}"),
+                }
+            })?;
+        let baseline = store
+            .recovery_baseline(domain_id)
+            .map_err(|e| StoreError::Refused {
+                root: show(&journal_root),
+                reason: format!("the local recovery baseline could not be read: {e}"),
+            })?;
+        if let Some(pointer) = &baseline {
+            checkpoints.load(pointer).map_err(|e| StoreError::Refused {
+                root: show(&checkpoint_root),
+                reason: format!("{e}"),
+            })?;
+        }
+
         // Shard 0 for the single-domain preview; task-j07 is where a node
         // spreads domains over a shard set.
         let shard = ShardId::new(0).expect("shard zero");
+        // The baseline goes in with the projection. `C` recovered at zero
+        // would count the whole retained stream as unreclaimed, and the
+        // housekeeping that watches that number would publish a full image
+        // on every restart of a node that had once crossed its threshold.
+        let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
         store
-            .attach(domain_id, shard, engine)
+            .attach_with_baseline(domain_id, shard, engine, represented)
             .map_err(|e| StoreError::Refused {
                 root: show(&directory),
                 reason: format!("the projection could not be attached to the journal: {e:?}"),
@@ -318,6 +364,8 @@ impl Opened {
         let domain = JournaledDomain::new(store, domain_id, ballot).expect("just attached");
         Ok(Storage {
             domain,
+            checkpoints,
+            baseline,
             generation: directory,
             boot,
         })

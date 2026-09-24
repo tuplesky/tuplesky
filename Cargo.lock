@@ -601,6 +601,7 @@ version = "0.1.0"
 dependencies = [
  "coord-consensus",
  "coord-core",
+ "coord-journal-api",
  "coord-redb-faultkit",
  "coord-state",
  "coord-storage",
@@ -1076,6 +1077,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "coord-authn",
+ "coord-checkpoint",
  "coord-collector",
  "coord-consensus",
  "coord-core",

@@ -446,6 +446,26 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
     path
 }
 
+/// Rewrite `config` so this node publishes a recovery checkpoint once
+/// the journal is `after` records past its baseline.
+///
+/// The trigger is a local setting precisely so that it can be one: no
+/// replicated result depends on when a node images its own storage, so
+/// a test may ask for the cycle to happen now instead of waiting out
+/// the four thousand records the default tolerates.
+fn checkpoint_after(config: &Path, after: u64) {
+    let mut text = std::fs::read_to_string(config).expect("read config");
+    text.push_str(&format!(
+        "\n[limits]\n\
+         max_request_bytes = 2097152\n\
+         max_response_bytes = 8388608\n\
+         max_outstanding_per_session = 256\n\
+         max_live_subscriptions = 4096\n\
+         checkpoint_after_records = {after}\n"
+    ));
+    std::fs::write(config, text).expect("write config");
+}
+
 struct Run {
     code: Option<i32>,
     out: String,
@@ -2864,4 +2884,108 @@ fn response_of_frame(frame: &coord_types::wire_v1::Frame) -> coord_types::wire_v
         Ok(coord_types::wire_v1::MessageV1::Response(r)) => r,
         other => panic!("not a response: {other:?}"),
     }
+}
+
+/// A running node publishes its own recovery baseline, reclaims the
+/// journal prefix it represents, and comes back on it.
+///
+/// This is task-j04's composition on the serving path rather than in a
+/// harness: the image is of the projection this daemon actually
+/// materialized, the pointer goes into the journal this daemon actually
+/// writes, and the prefix that is retired is the one it no longer needs.
+/// Every piece is checked separately in `coord-checkpoint`; what this
+/// holds is that a running daemon does it at all, and that having done
+/// it the node still serves.
+///
+/// The last part is the one worth having. Retiring a prefix is the only
+/// operation in the system that deliberately destroys durable history,
+/// so the question a test has to answer is not "did it publish" but
+/// "does the node still know what it promised afterwards" -- and the
+/// evidence for that is the same invocation being answered the same
+/// way by a process that started from the image plus what the journal
+/// still holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
+    let dir = workspace("baseline");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    checkpoint_after(&path, 1);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+        let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+        // The cycle ran, and it ran all the way: the pointer is durable
+        // and the prefix it represents is gone from the journal. A
+        // publication that could not retire would say `retired=false`,
+        // which is a legitimate outcome of the operation and not of
+        // this one -- nothing here fails the compaction.
+        assert!(
+            daemon.waits_to_say("retired=true"),
+            "the daemon never published a recovery checkpoint\n{}",
+            daemon.said()
+        );
+        response_of(&answer)
+    };
+
+    // One image, not one per publication. Step 5 of the publication
+    // order reclaims what a newer baseline supersedes, and a node that
+    // published without reclaiming would fill its disk with the
+    // history it had just decided it did not need.
+    //
+    // Images only. A `.pending-` directory is a write that was
+    // interrupted -- which is exactly what stopping the daemon does to
+    // one -- and it is not an image: nothing selects it, and the next
+    // publication reclaims it along with the superseded images.
+    let images: Vec<_> = std::fs::read_dir(dir.join("checkpoints"))
+        .expect("the daemon created its checkpoint directory")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with(".pending-"))
+        .collect();
+    assert_eq!(
+        images.len(),
+        1,
+        "the checkpoint directory holds something other than one image: {images:?}"
+    );
+
+    // A different process, on a journal whose prefix has been retired.
+    // It says which baseline it recovers from, and it says it before it
+    // serves -- an image this node published and can no longer load is
+    // the loss of a durable prefix, and the startup line is where that
+    // has to surface.
+    let report = start_and_report(&path);
+    let baseline = report
+        .lines()
+        .find_map(|line| line.split("baseline=").nth(1))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("the daemon reported no baseline:\n{report}"));
+    assert!(
+        baseline > 0,
+        "the daemon came back on no baseline at all:\n{report}"
+    );
+
+    // And it still knows what it promised. The retained record that
+    // answers this retry was materialized into the projection before
+    // the image was taken, so it is inside the image; the journal no
+    // longer holds the records that produced it.
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the daemon answered the retry\n{}", daemon.said()));
+    let again = response_of(&answer);
+    assert_eq!(
+        again.command_id, first.command_id,
+        "the same invocation became a different command after a reclaimed prefix"
+    );
+    assert_eq!(
+        again.outcome, first.outcome,
+        "the node answered differently once its journal prefix was reclaimed"
+    );
 }

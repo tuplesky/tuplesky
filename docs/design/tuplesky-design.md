@@ -1577,6 +1577,8 @@ After crash derive actual valid suffix/J, not volatile head or old completion to
 4. Only afterward may a later durable compaction batch retire entries actually represented through C. Explicitly sync compaction; a convenience unsynced truncation is insufficient.
 5. Reclaim files/delete old checkpoints only when surviving publication chain and suffix suffice. Cleanup is retryable/idempotent; never remove the only published baseline early.
 
+When a node publishes is a local operational decision, bounded by a configured tolerance of `J - C`, and never a replicated one: two replicas of one domain may publish at different rates or not at all, and every replicated result is identical either way. A publication that fails at any step leaves the prior baseline selected and the journal holding more history than it needs; that direction is always safe and never quarantines, but repeated failure is an operational fault and must surface as one.
+
 Publication record is newer than C and stays in suffix until a later checkpoint covers it. Preserve unresolved post-C records; older obligations remain in checkpoint until source-safe semantic forgetting. Truncation must not include records merely because files happened to be copied later.
 
 <a id="s17-16-4"></a>

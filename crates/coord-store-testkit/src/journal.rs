@@ -254,6 +254,13 @@ impl JournalEngine for ModelJournal {
             .map_or(LocalJournalSeq::ZERO, Stream::head))
     }
 
+    fn retained_from(&self, stream: StorageStreamId) -> Result<LocalJournalSeq, JournalError> {
+        Ok(self
+            .streams
+            .get(&stream)
+            .map_or(LocalJournalSeq::ZERO, |s| s.retired))
+    }
+
     fn read_suffix(
         &self,
         stream: StorageStreamId,

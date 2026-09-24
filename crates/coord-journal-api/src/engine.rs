@@ -70,6 +70,20 @@ pub trait JournalEngine {
     /// (`LocalJournalSeq::ZERO` for an empty stream).
     fn durable_head(&self, stream: StorageStreamId) -> Result<LocalJournalSeq, JournalError>;
 
+    /// The sequence the retained suffix begins after: entries at or
+    /// below it are retired, so a read from it returns the whole of what
+    /// the stream still holds.
+    ///
+    /// `LocalJournalSeq::ZERO` for a stream nothing was retired from, so
+    /// a caller that always starts here reads the whole stream when
+    /// there is one and the retained suffix when there is not. Recovery
+    /// needs it because the pointer that selects a baseline is itself in
+    /// the suffix: it has to read the stream without knowing in advance
+    /// where the prefix was reclaimed to, and a read that silently
+    /// skipped retired entries would be indistinguishable from a stream
+    /// that never had them.
+    fn retained_from(&self, stream: StorageStreamId) -> Result<LocalJournalSeq, JournalError>;
+
     /// Read records strictly after `after`, bounded by `budget`.
     fn read_suffix(
         &self,

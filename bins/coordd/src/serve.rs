@@ -14,6 +14,8 @@
 //! opportunities for one of them to answer the wrong caller.
 
 use coord_authn::ClockHealth;
+use coord_checkpoint::local::LocalLimits;
+use coord_checkpoint::{LocalBaseline, LocalCheckpointStore};
 use coord_collector::ingress::is_collector;
 use coord_collector::wire::{
     KIND_EVIDENCE, KIND_RELEASE, KIND_SUBMIT, decode_evidence, decode_release,
@@ -261,6 +263,16 @@ impl<P: Persistence> Backing<P> {
     pub fn applier(&self) -> &Applier<P> {
         match self {
             Backing::Voting(v) => v.node().applier(),
+            Backing::Serving(a) => a,
+        }
+    }
+
+    /// The applier, mutably. One store, one writer: this is the same
+    /// handle, and local maintenance goes through it rather than
+    /// through a second one.
+    pub fn applier_mut(&mut self) -> &mut Applier<P> {
+        match self {
+            Backing::Voting(v) => v.node_mut().applier_mut(),
             Backing::Serving(a) => a,
         }
     }
@@ -556,6 +568,8 @@ impl CollectorLinks {
 pub struct Domain<P: Persistence> {
     backing: Backing<P>,
     frontend: Frontend,
+    /// This node's own recovery baseline, where it keeps one.
+    housekeeping: Option<Housekeeping>,
     /// The other voters, where this process votes. `None` for a process
     /// that does not, and for a domain with nobody else in it.
     plane: Option<PeerPlane>,
@@ -566,16 +580,60 @@ pub struct Domain<P: Persistence> {
     budgets: Budgets,
 }
 
-impl<P: Persistence> Domain<P> {
+/// Where this node's local recovery images live, and when it makes one.
+///
+/// A local checkpoint is not a replicated fact and not a protocol step:
+/// it is how this node stops its own journal growing without bound. So
+/// the trigger is a local setting, the work happens between turns, and
+/// a failure costs disk rather than correctness.
+struct Housekeeping {
+    images: LocalCheckpointStore,
+    /// Journal records past the baseline that this node tolerates
+    /// before publishing a new one. Zero never publishes.
+    after: u64,
+    /// The gap this node next attempts at.
+    ///
+    /// `after` normally, and raised past the current gap after a
+    /// failure. Without it a node that cannot publish -- a full disk is
+    /// the obvious way -- would attempt a complete export on every turn
+    /// for as long as the condition lasted, which is the one shape of
+    /// housekeeping that can make an incident worse. Raised, it retries
+    /// as the journal grows instead.
+    floor: u64,
+    limits: LocalLimits,
+    /// Publications and failures so far (diagnostic).
+    done: (u64, u64),
+}
+
+impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Compose `frontend` over `backing`.
     pub fn new(frontend: Frontend, backing: Backing<P>, budgets: Budgets) -> Self {
         Domain {
             backing,
             frontend,
+            housekeeping: None,
             plane: None,
             links: CollectorLinks::new(Vec::new()),
             budgets,
         }
+    }
+
+    /// Publish this node's recovery baseline into `images` once the
+    /// journal has run `after` records past the last one.
+    pub fn with_checkpoints(mut self, images: LocalCheckpointStore, after: u64) -> Self {
+        self.housekeeping = Some(Housekeeping {
+            images,
+            after,
+            floor: after,
+            limits: LocalLimits::default(),
+            done: (0, 0),
+        });
+        self
+    }
+
+    /// Baselines published, and cycles that failed.
+    pub fn checkpoints(&self) -> (u64, u64) {
+        self.housekeeping.as_ref().map_or((0, 0), |h| h.done)
     }
 
     /// Submit to the other voters over `links`.
@@ -692,6 +750,7 @@ impl<P: Persistence> Domain<P> {
     /// Returns whether anything happened, which is what tells the loop
     /// to come back rather than wait.
     async fn turn(&mut self, api: &Transport) -> Result<bool, DriveError> {
+        self.maintain();
         let Backing::Voting(voter) = &mut self.backing else {
             return Ok(false);
         };
@@ -702,6 +761,64 @@ impl<P: Persistence> Domain<P> {
         self.frontend.counts.refused += refused.len() as u64;
         self.carry(api, out, provenance);
         Ok(did)
+    }
+
+    /// Keep this node's own recovery baseline current.
+    ///
+    /// Checked every turn and almost always a comparison: the trigger
+    /// is `J - C`, which the store already knows, and only crossing it
+    /// spends any I/O. Deliberately not counted as progress -- a
+    /// publication is not work a caller is waiting for, and a loop that
+    /// treated it as such would keep itself awake to do housekeeping.
+    ///
+    /// Nothing here can fail the node. An image that could not be
+    /// written or a pointer that was refused leaves the previous
+    /// baseline selected and the journal holding a longer prefix than
+    /// it needs, so the failure is reported on stderr and the domain
+    /// goes on serving. The one thing it must not do is go quiet: a
+    /// node whose checkpoints have been failing for a week is a node
+    /// whose disk is filling, and that is an operator's to see.
+    fn maintain(&mut self) {
+        let Some(housekeeping) = &self.housekeeping else {
+            return;
+        };
+        if housekeeping.after == 0 {
+            return;
+        }
+        let (after, floor, limits) = (housekeeping.after, housekeeping.floor, housekeeping.limits);
+        let gap = self.backing.applier().store().unreclaimed();
+        if gap < floor {
+            return;
+        }
+        let images = housekeeping.images.clone();
+        let outcome = self
+            .backing
+            .applier_mut()
+            .store_mut()
+            .publish_local(&images, &limits);
+        let housekeeping = self.housekeeping.as_mut().expect("just borrowed");
+        match outcome {
+            Ok(Some(published)) => {
+                housekeeping.done.0 += 1;
+                housekeeping.floor = after;
+                eprintln!(
+                    "checkpoint represented={} retired={} reclaimed={}",
+                    published.represented.get(),
+                    published.retired,
+                    published.reclaimed
+                );
+            }
+            // Nothing new to represent: the projection has materialized
+            // nothing since the last baseline, so an image would select
+            // the same state and retire nothing. Not a failure, and not
+            // worth a line.
+            Ok(None) => housekeeping.floor = after,
+            Err(e) => {
+                housekeeping.done.1 += 1;
+                housekeeping.floor = gap.saturating_add(after);
+                eprintln!("this node could not publish a recovery checkpoint: {e}");
+            }
+        }
     }
 
     /// Carry out what a voter's round asked for.

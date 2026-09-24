@@ -839,6 +839,19 @@ impl<F: FileSystem> JournalEngine for RaftEngineJournal<F> {
             .map_or(LocalJournalSeq::ZERO, |s| s.durable))
     }
 
+    fn retained_from(&self, stream: StorageStreamId) -> Result<LocalJournalSeq, JournalError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .streams
+            .get(&stream)
+            .map_or(LocalJournalSeq::ZERO, |state| {
+                // `first` is the first retained sequence, so what a read
+                // must start *after* is the one below it.
+                LocalJournalSeq::new(state.first.get().saturating_sub(1))
+                    .unwrap_or(LocalJournalSeq::ZERO)
+            }))
+    }
+
     fn read_suffix(
         &self,
         stream: StorageStreamId,
