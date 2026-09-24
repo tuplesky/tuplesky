@@ -1021,6 +1021,15 @@ pub enum TrimError {
         /// The offering replica.
         replica: ReplicaId,
     },
+    /// One voter appears more than once in a recovery read, and not with
+    /// the same answer each time (task-53). A voter holds one promise at
+    /// a time, so two answers are not two pieces of evidence: counted
+    /// both ways, one voter could make up a majority for a subject it
+    /// cannot certify. The read is refused rather than resolved.
+    ConflictingReports {
+        /// The voter that answered twice.
+        voter: ReplicaId,
+    },
 }
 
 impl fmt::Display for TrimError {

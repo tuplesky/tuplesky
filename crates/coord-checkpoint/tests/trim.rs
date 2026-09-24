@@ -1580,7 +1580,8 @@ fn an_observer_or_a_foreign_promise_is_refused_rather_than_counted() {
 /// uncertifiable there, so the replica installs A. A majority read of
 /// {SELF, PEER} or {PEER, LAGGARD} sees one report for each: the
 /// position is right, the image is not identified, and the replica stops
-/// rather than guessing.
+/// rather than guessing. A voter that answers twice with different
+/// answers is refused, so no voter counts towards two images.
 #[test]
 fn a_read_that_holds_a_majority_for_one_image_names_it_and_a_split_read_stops() {
     let voters = floor_voters();
@@ -1622,6 +1623,60 @@ fn a_read_that_holds_a_majority_for_one_image_names_it_and_a_split_read_stops() 
             }
         );
     }
+
+    // A voter counts once. Listed under both images, PEER would make
+    // {SELF, PEER} a majority for A and stop being a split; two answers
+    // from one voter are refused instead, and so is an answer beside a
+    // report of no promise. The same answer twice is one answer.
+    let twice = [
+        RecoveryReport::promised(a(SELF)),
+        RecoveryReport::promised(b(PEER)),
+        RecoveryReport::promised(a(PEER)),
+    ];
+    assert_eq!(
+        recovery_obligation(&voters, &twice, behind),
+        Err(TrimError::ConflictingReports { voter: PEER })
+    );
+    assert_eq!(
+        recovery_obligation(
+            &voters,
+            &[
+                RecoveryReport::promised(a(SELF)),
+                RecoveryReport::unpromised(PEER),
+                RecoveryReport::promised(b(PEER)),
+            ],
+            behind
+        ),
+        Err(TrimError::ConflictingReports { voter: PEER })
+    );
+    assert_eq!(
+        recovery_obligation(
+            &voters,
+            &[
+                RecoveryReport::promised(a(SELF)),
+                RecoveryReport::promised(b(PEER)),
+                RecoveryReport::promised(b(PEER)),
+            ],
+            behind
+        )
+        .unwrap(),
+        RecoveryObligation::Ambiguous {
+            position: pos(FLOOR_POSITION),
+        }
+    );
+    // A voter repeated with its one answer is still one voter towards
+    // the majority read.
+    assert_eq!(
+        recovery_obligation(
+            &voters,
+            &[
+                RecoveryReport::promised(a(SELF)),
+                RecoveryReport::promised(a(SELF)),
+            ],
+            behind
+        ),
+        Err(TrimError::NoQuorum { have: 1, need: 2 })
+    );
 
     // A replica already at the floor owes nothing, whichever image it is.
     assert_eq!(

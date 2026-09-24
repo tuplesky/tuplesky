@@ -562,20 +562,43 @@ impl RecoveryReport {
 /// counts towards the majority read and contributes nothing to the
 /// floor; a promise from another configuration is refused, as it is
 /// everywhere else, because a delayed report from a prior epoch is
-/// evidence about a voter set this one need not intersect.
+/// evidence about a voter set this one need not intersect. A voter that
+/// appears more than once counts once, and one that appears with
+/// differing answers is refused with [`TrimError::ConflictingReports`]:
+/// readiness records are not signed, so the read cannot tell which answer
+/// is the voter's, and counting both would let one voter stand in for two
+/// in the majority that names an image.
 pub fn recovery_obligation(
     voters: &EpochVoters,
     reports: &[RecoveryReport],
     executed_through: ExecutionPosition,
 ) -> Result<RecoveryObligation, TrimError> {
-    let mut reporting: BTreeSet<ReplicaId> = BTreeSet::new();
-    let mut promises: Vec<Readiness> = Vec::new();
+    // One answer per voter. A repeated identical answer is the same
+    // evidence twice and counts once; differing answers from one voter
+    // are refused, because counting each would let a single voter supply
+    // two members of the majority `certified` looks for.
+    let mut answered: BTreeMap<ReplicaId, Option<CheckpointReadinessV1>> = BTreeMap::new();
     for report in reports {
         if !voters.is_voter(&report.voter) {
             continue;
         }
-        if let Some(readiness) = &report.readiness {
-            if readiness.voter != report.voter {
+        match answered.get(&report.voter) {
+            Some(earlier) if *earlier == report.readiness => continue,
+            Some(_) => {
+                return Err(TrimError::ConflictingReports {
+                    voter: report.voter,
+                });
+            }
+            None => {
+                answered.insert(report.voter, report.readiness);
+            }
+        }
+    }
+    let mut reporting: BTreeSet<ReplicaId> = BTreeSet::new();
+    let mut promises: Vec<Readiness> = Vec::new();
+    for (voter, readiness) in &answered {
+        if let Some(readiness) = readiness {
+            if readiness.voter != *voter {
                 return Err(TrimError::Engine(corrupt(
                     "recovery report voter differs from its promise",
                 )));
@@ -590,7 +613,7 @@ pub fn recovery_obligation(
                 candidate: readiness.candidate(),
             });
         }
-        reporting.insert(report.voter);
+        reporting.insert(*voter);
     }
     let need = voters.majority();
     if reporting.len() < need {
