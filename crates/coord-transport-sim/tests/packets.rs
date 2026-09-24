@@ -42,23 +42,38 @@ fn fixture(roles: &[PeerRole]) -> Fixture {
     Fixture { ca, ids }
 }
 
-/// A fixture whose node identities are the registered ones (the world
-/// presents exactly the certificates the binder knows).
+/// A world whose node identities are the fixture's own, registered with
+/// the binder (the world presents exactly the certificates the binder
+/// knows).
+///
+/// The fixture's identities, not freshly issued ones. The world is a
+/// function of its seed *and* of the certificates it is handed, and a
+/// certificate is not a fixed size: its serial number is random, and
+/// about one issue in two hundred encodes it a byte shorter. Issuing
+/// again for every world made two worlds on the same seed present
+/// different handshakes one run in fifty or so, which read as the
+/// simulator failing to reproduce when it was being given different
+/// input.
 fn registered_world(f: &Fixture, seed: u8, limits: Limits) -> (PacketWorld, Vec<BoundIdentity>) {
     let mut binder = TestBinder::new(CLUSTER, DOMAIN);
-    let mut nodes = Vec::new();
     let mut expected = Vec::new();
     for id in &f.ids {
-        let issued = f.ca.issue(&id.name, id.replica, id.incarnation, id.role);
-        binder.register(&issued);
-        expected.push(issued.expected());
-        nodes.push((issued, id.role));
+        binder.register(id);
+        expected.push(id.expected());
     }
     let binder = Arc::new(binder);
-    let configs = nodes
-        .into_iter()
-        .map(|(identity, _)| NodeConfig {
-            identity,
+    let configs = f
+        .ids
+        .iter()
+        .map(|id| NodeConfig {
+            identity: TestIdentity {
+                name: id.name.clone(),
+                replica: id.replica,
+                incarnation: id.incarnation,
+                role: id.role,
+                chain: id.chain.clone(),
+                key: id.key.clone_key(),
+            },
             roots: f.ca.roots(),
             cluster: CLUSTER,
             domain: DOMAIN,
@@ -79,9 +94,8 @@ fn connected(events: &[SimEvent]) -> usize {
 
 /// Two voters exchange frames both ways over a control lane under the
 /// given link faults; returns the world after every frame arrived.
-fn exchange(seed: u8, faults: LinkFaults, frames: usize) -> PacketWorld {
-    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
-    let (mut w, expected) = registered_world(&f, seed, Limits::default());
+fn exchange(f: &Fixture, seed: u8, faults: LinkFaults, frames: usize) -> PacketWorld {
+    let (mut w, expected) = registered_world(f, seed, Limits::default());
     w.set_default_faults(faults);
     w.connect(
         0,
@@ -131,7 +145,10 @@ fn exchange(seed: u8, faults: LinkFaults, frames: usize) -> PacketWorld {
 
 #[test]
 fn loss_reorder_duplication_and_mtu_schedules_reproduce_and_keep_the_visible_outcome() {
-    let baseline = exchange(1, LinkFaults::default(), 8);
+    // One set of identities for every run below: a schedule reproduces
+    // only when it is replayed against the same certificates.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let baseline = exchange(&f, 1, LinkFaults::default(), 8);
     let expected = baseline.visible_outcome();
     let faults = [
         LinkFaults {
@@ -157,7 +174,7 @@ fn loss_reorder_duplication_and_mtu_schedules_reproduce_and_keep_the_visible_out
     ];
     for (k, fault) in faults.iter().enumerate() {
         let seed = 10 + k as u8;
-        let first = exchange(seed, *fault, 8);
+        let first = exchange(&f, seed, *fault, 8);
         let (delivered, dropped) = first.datagrams();
         assert!(delivered > 0);
         if fault.loss_ppm > 0 {
@@ -174,14 +191,14 @@ fn loss_reorder_duplication_and_mtu_schedules_reproduce_and_keep_the_visible_out
         assert_eq!(got, want, "schedule {k} changes the visible outcome");
         // The same seed reproduces the same datagram trace; another seed
         // under the same faults does not.
-        let again = exchange(seed, *fault, 8);
+        let again = exchange(&f, seed, *fault, 8);
         assert_eq!(
             again.trace_digest(),
             first.trace_digest(),
             "schedule {k} is reproducible"
         );
         assert_eq!(again.datagrams(), first.datagrams());
-        let other = exchange(seed + 40, *fault, 8);
+        let other = exchange(&f, seed + 40, *fault, 8);
         assert_ne!(other.trace_digest(), first.trace_digest());
     }
 }
