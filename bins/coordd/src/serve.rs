@@ -23,6 +23,7 @@ use coord_collector::wire::{
 use coord_collector::{Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher};
 use coord_core::event::PeerProvenance;
 use coord_daemon::mailbox::LocalRoute;
+use coord_daemon::metrics::Stage;
 use coord_daemon::node::DriveError;
 use coord_daemon::pending::Pending;
 use coord_daemon::serve::{Step, step};
@@ -578,6 +579,40 @@ pub struct Domain<P: Persistence> {
     /// collector credential to submit with.
     links: CollectorLinks,
     budgets: Budgets,
+    /// This run's stage accounting (task-61), shared with the voter's
+    /// node so the journal and materialization points record into the
+    /// same cells the snapshot reads.
+    recorder: std::sync::Arc<coord_daemon::metrics::Recorder>,
+}
+
+/// The stages this daemon has an instrumentation point for (task-61).
+///
+/// Admission is recorded where the frontend decides a caller's frame;
+/// the journal and materialization are recorded by the voter's node,
+/// around the flush of a round's protocol transitions and around the
+/// application of each executable command. Every other stage has no
+/// point in this build and is reported as not instrumented rather than
+/// as a zero: a count nobody took is not a count of nothing.
+pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 3] = [
+    coord_daemon::metrics::Stage::Admission,
+    coord_daemon::metrics::Stage::Journal,
+    coord_daemon::metrics::Stage::Materialization,
+];
+
+/// A recorder for this daemon: nothing observed yet, and the stages it
+/// does not instrument stated as such.
+///
+/// What is instrumented follows what runs here, not the roles alone. The
+/// journal and materialization points are the voter's node's, so a
+/// process with no voter (`voting` false) records neither, and reports
+/// both as not instrumented rather than as observed zeroes -- which they
+/// would be the day its serving applier materializes something.
+pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
+    if voting {
+        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED)
+    } else {
+        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED[..1])
+    }
 }
 
 /// Where this node's local recovery images live, and when it makes one.
@@ -607,7 +642,13 @@ struct Housekeeping {
 
 impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Compose `frontend` over `backing`.
-    pub fn new(frontend: Frontend, backing: Backing<P>, budgets: Budgets) -> Self {
+    pub fn new(frontend: Frontend, mut backing: Backing<P>, budgets: Budgets) -> Self {
+        let recorder = std::sync::Arc::new(recorder(matches!(backing, Backing::Voting(_))));
+        if let Backing::Voting(voter) = &mut backing {
+            voter
+                .node_mut()
+                .record_into(std::sync::Arc::clone(&recorder));
+        }
         Domain {
             backing,
             frontend,
@@ -615,6 +656,77 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             plane: None,
             links: CollectorLinks::new(Vec::new()),
             budgets,
+            recorder,
+        }
+    }
+
+    /// A bounded, secret-free metrics snapshot of this node (task-61).
+    ///
+    /// Assembled from what the store and the transport already measure,
+    /// rather than from a parallel set of counters: a second accounting
+    /// of the same work is a second thing that can be wrong, and the
+    /// one an operator reads would be the one nobody validates.
+    ///
+    /// Everything this node does not have reports *why*, never zero. A
+    /// gap in a dashboard is a question; a zero is an answer, and a
+    /// wrong one. The stage counts are this domain's own recorder,
+    /// which the frontend and the voter's node record into as they work
+    /// (see [`INSTRUMENTED`]).
+    pub fn metrics(
+        &self,
+        roles: &coord_daemon::role::RoleSet,
+    ) -> coord_daemon::metrics::MetricsSnapshot {
+        let recorder = &*self.recorder;
+        use coord_daemon::metrics::{
+            Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, ShardIndex, ShardReading,
+            Unavailable,
+        };
+
+        let frontiers = match self.backing.applier().store().frontiers() {
+            Some((journal, materialized, checkpoint)) => Measure::Observed(Frontiers {
+                journal,
+                materialized,
+                checkpoint,
+            }),
+            None => Measure::Unavailable(Unavailable::Quarantined),
+        };
+        // The transport does not account per lane in this build: no
+        // wait is timed and no frame is counted. So every lane reading
+        // is "not instrumented" -- "no samples" would claim the lane was
+        // measured and idle, and a zero count that it carried nothing,
+        // on a node that may have served all day.
+        let lanes = Lane::ALL
+            .iter()
+            .map(|lane| LaneReading {
+                lane: *lane,
+                queue_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+                credit_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+                frames: Measure::Unavailable(Unavailable::NotInstrumented),
+                refused: Measure::Unavailable(Unavailable::NotInstrumented),
+                headroom: Measure::Unavailable(Unavailable::NoBound),
+            })
+            .collect();
+        // Shard zero for the single-domain preview; task-j07 is where a
+        // node spreads domains over a shard set and reports each.
+        let shards = ShardIndex::new(0)
+            .map(|shard| {
+                vec![ShardReading {
+                    shard,
+                    headroom: Measure::Unavailable(Unavailable::NoBound),
+                    pressure_permille: Measure::Unavailable(Unavailable::NoBound),
+                }]
+            })
+            .unwrap_or_default();
+        MetricsSnapshot {
+            stages: recorder.snapshot_stages(roles),
+            lanes,
+            shards,
+            // Neither the three durability quantities nor the age of a
+            // pinned view is timed by this build, whatever the node did.
+            durability: Measure::Unavailable(Unavailable::NotInstrumented),
+            frontiers,
+            view_age: Measure::Unavailable(Unavailable::NotInstrumented),
+            engine_pressure: Measure::Unavailable(Unavailable::NoBound),
         }
     }
 
@@ -1158,6 +1270,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     store: self.backing.applier().store(),
                     budget: ViewBudget::default(),
                 };
+                // Admission is the frontend's decision about this frame:
+                // verified and admitted, answered, or refused at the door.
+                self.recorder.entered(Stage::Admission);
+                let started = std::time::Instant::now();
                 let ingress = self.frontend.frontend.on_frame(
                     &health,
                     connection.0,
@@ -1166,6 +1282,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     &policy,
                 );
                 let decided = step(ingress, retry_key);
+                if matches!(decided, Step::Close { .. }) {
+                    self.recorder.refused(Stage::Admission);
+                } else {
+                    self.recorder.completed(Stage::Admission, started.elapsed());
+                }
                 self.carry_out(transport, connection, decided, responder)
                     .await;
             }
@@ -1713,5 +1834,46 @@ mod tests {
             None,
             "replica 9 is not a committed voter of this domain"
         );
+    }
+
+    /// The stages a recorder reports as instrumented follow what runs
+    /// in the process. An observer journals and materializes its own
+    /// storage, so both stages apply to it, but only a voter's node
+    /// records them; without a voter they are not instrumented, not
+    /// observed zeroes.
+    #[test]
+    fn journal_and_materialization_are_instrumented_only_where_a_voter_records_them() {
+        use coord_daemon::metrics::{Measure, Stage, Unavailable};
+        use coord_daemon::role::RoleSet;
+
+        let reading = |voting: bool, roles: &str, stage: Stage| {
+            super::recorder(voting)
+                .snapshot_stages(&RoleSet::parse(roles).expect("roles"))
+                .into_iter()
+                .find(|r| r.stage == stage)
+                .expect("every stage is reported")
+                .metrics
+        };
+        for stage in [Stage::Journal, Stage::Materialization] {
+            assert!(
+                matches!(
+                    reading(true, "voter-frontend-observer", stage),
+                    Measure::Observed(_)
+                ),
+                "{stage:?} is recorded by a voter"
+            );
+            for roles in ["frontend-observer", "observer"] {
+                assert_eq!(
+                    reading(false, roles, stage),
+                    Measure::Unavailable(Unavailable::NotInstrumented),
+                    "{stage:?} reported as observed with no voter to record it ({roles})"
+                );
+            }
+        }
+        // Admission is the frontend's, and is recorded wherever one runs.
+        assert!(matches!(
+            reading(false, "frontend-observer", Stage::Admission),
+            Measure::Observed(_)
+        ));
     }
 }

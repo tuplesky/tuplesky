@@ -536,3 +536,89 @@ fn a_vote_rests_on_the_record_being_durable_not_on_the_projection() {
         "the projection was not actually behind"
     );
 }
+
+/// A voter that serves a write records the journal and materialization
+/// work it did (task-61), and the snapshot built from that recorder
+/// reports those stages with non-zero counts rather than zeroes.
+///
+/// A single-voter domain, so the leader's own record is the quorum and
+/// the put is ordered and applied in this process: the snapshot then
+/// describes work that demonstrably happened.
+#[test]
+fn a_voter_that_served_a_write_reports_the_stages_it_passed_through() {
+    use coord_daemon::metrics::{Recorder, Stage, Unavailable};
+    use coord_daemon::role::RoleSet;
+
+    let boot = BootId([7; 16]);
+    let applier = store(boot);
+    let bootstrapped = applier.store().application_base().execution_position;
+    let alone = ConfigurationIdentity {
+        voters: vec![r(0)].into_iter().collect(),
+        ..identity(0)
+    };
+    let quorum = BallotConfiguration::c2(
+        epoch(),
+        ballot(),
+        [r(0)].into_iter().collect(),
+        [r(0)].into_iter().collect(),
+    )
+    .unwrap();
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: alone,
+            quorum,
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    let recorder = std::sync::Arc::new(Recorder::instrumenting(&[
+        Stage::Journal,
+        Stage::Materialization,
+    ]));
+    node.record_into(std::sync::Arc::clone(&recorder));
+
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("admitted");
+    node.execute(&ballot()).expect("execute");
+    assert!(node.executed >= 1, "the put was never applied");
+
+    let stages = recorder.snapshot_stages(&RoleSet::parse("voter").expect("roles"));
+    for stage in [Stage::Journal, Stage::Materialization] {
+        let metrics = stages
+            .iter()
+            .find(|r| r.stage == stage)
+            .and_then(|r| r.metrics.observed())
+            .unwrap_or_else(|| panic!("{} was not observed", stage.name()));
+        assert!(
+            metrics.entered > 0 && metrics.completed > 0,
+            "{} reported {metrics:?} for a voter that served a write",
+            stage.name()
+        );
+        assert_eq!(metrics.refused, 0, "{} refused work", stage.name());
+        assert!(
+            metrics.latency.measure().is_observed(),
+            "{} has counts but no latency",
+            stage.name()
+        );
+    }
+    // A stage the voter has but nothing records says so, rather than
+    // reporting the zero a voter that did no fan-out would.
+    let fan_out = stages
+        .iter()
+        .find(|r| r.stage == Stage::FanOut)
+        .expect("every stage is reported");
+    assert_eq!(fan_out.metrics.why(), Some(Unavailable::NotInstrumented));
+}

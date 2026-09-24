@@ -396,6 +396,21 @@ is that no version or capability is ever guessed at.
 | Cross-engine migration, or a live voter savepoint rollback | `[EXT]` rejected | Sections 17.7, 17.13 |
 | Any operation that lowers a format or deactivates a feature | `[EXT]` rejected | rollback is the old binary, or a restore |
 
+Observability is task-61. The paper measures nothing; everything here is
+an extension, and the shared property is that a reading never claims
+more than was observed.
+
+| Item | Status | Where |
+|---|---|---|
+| `Measure`: every reading is observed or says why it is not | `[EXT]` | Section 22.3: retain missing metrics as unavailable |
+| A zero for an unavailable metric | `[EXT]` rejected | a zero commit latency during an outage reads as "fast" |
+| `Stage`: the twelve stages instrumented separately | `[EXT]` | Section 22.3; one end-to-end latency cannot attribute a spike |
+| Bounded labels by construction: `Stage`, `Lane`, `ShardIndex` | `[EXT]` | Section 13; no key, command, session or principal can be one |
+| A per-domain series on a multi-tenant node | `[EXT]` rejected | it grows with the tenants and discloses which domains exist |
+| `Durability`: sync, commit-return and backpressure kept apart | `[EXT]` | Section 22.3: report whole-operation queue and commit-return |
+| `Frontiers`: `J`, `M` and `C` reported separately | `[EXT]` | Section 17.16.2; the gap is the number that matters |
+| `Recorder`: atomics only, no lock to take | `[EXT]` | diagnostics that could block consensus are a liability |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the

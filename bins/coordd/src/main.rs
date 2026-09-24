@@ -470,6 +470,77 @@ fn restore(
     ExitCode::SUCCESS
 }
 
+/// Print this node's bounded metrics snapshot (task-61).
+///
+/// Built from what the store already measures rather than from a
+/// parallel set of counters: a second accounting of the same work is a
+/// second thing that can be wrong, and the one an operator reads would
+/// be the one nobody validates.
+fn report_metrics(
+    roles: &coord_daemon::role::RoleSet,
+    storage: &store::Storage,
+    domain: coord_types::ids::DomainId,
+) {
+    use coord_daemon::metrics::{
+        Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, ShardIndex, ShardReading,
+        Unavailable,
+    };
+
+    let frontiers = match storage.domain.store().frontiers(domain) {
+        Some(held) => Measure::Observed(Frontiers {
+            journal: held.durable().get(),
+            materialized: held.materialized().get(),
+            checkpoint: held.checkpoint().get(),
+        }),
+        // A domain whose projection is not attached has no frontiers to
+        // report, and saying so is the point: three zeroes would read
+        // as an empty but healthy store.
+        None => Measure::Unavailable(Unavailable::Quarantined),
+    };
+    // The transport does not account per lane in this build, so every
+    // lane reading is "not instrumented", the same as on the shutdown
+    // snapshot: "no samples" would claim a measurement, and a zero
+    // count that the lane carried nothing.
+    let lanes = Lane::ALL
+        .iter()
+        .map(|lane| LaneReading {
+            lane: *lane,
+            queue_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+            credit_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+            frames: Measure::Unavailable(Unavailable::NotInstrumented),
+            refused: Measure::Unavailable(Unavailable::NotInstrumented),
+            headroom: Measure::Unavailable(Unavailable::NoBound),
+        })
+        .collect();
+    // Shard zero for the single-domain preview; task-j07 is where a
+    // node spreads domains over a shard set and reports each.
+    let shards = ShardIndex::new(0)
+        .map(|shard| {
+            vec![ShardReading {
+                shard,
+                headroom: Measure::Unavailable(Unavailable::NoBound),
+                pressure_permille: Measure::Unavailable(Unavailable::NoBound),
+            }]
+        })
+        .unwrap_or_default();
+    let snapshot = MetricsSnapshot {
+        // Nothing has been recorded before the first turn, but which
+        // stages this daemon records is already known, and the ones it
+        // does not are stated as such rather than as zeroes.
+        stages: serve::recorder(roles.votes()).snapshot_stages(roles),
+        lanes,
+        shards,
+        durability: Measure::Unavailable(Unavailable::NotInstrumented),
+        frontiers,
+        view_age: Measure::Unavailable(Unavailable::NotInstrumented),
+        engine_pressure: Measure::Unavailable(Unavailable::NoBound),
+    };
+    match serde_json::to_string(&snapshot) {
+        Ok(rendered) => println!("metrics {rendered}"),
+        Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
@@ -801,6 +872,12 @@ fn main() -> ExitCode {
         // image was opened above, before the domain was attached.
         storage.baseline.as_ref().map_or(0, |p| p.represented.get()),
     );
+    // The bounded snapshot (task-61), on the startup report where an
+    // operator already looks. Rendered whole: every field is a number
+    // or a frozen enum, so there is nothing in it to redact, and every
+    // reading this node does not have says *why* rather than reporting
+    // a zero somebody would act on.
+    report_metrics(&roles, &storage, placed.membership.domain());
     lifecycle.observe(Readiness {
         storage_ready: true,
         ..Readiness::default()
@@ -1001,6 +1078,15 @@ fn main() -> ExitCode {
         );
         let (published, failed) = domain.checkpoints();
         eprintln!("checkpoints published={published} failed={failed}");
+        // The bounded snapshot (task-61). Rendered whole, because every
+        // field is a number or a frozen enum: there is nothing in it to
+        // redact, and an absent reading says why it is absent rather
+        // than reporting a zero an operator would act on.
+        let snapshot = domain.metrics(&roles);
+        match serde_json::to_string(&snapshot) {
+            Ok(rendered) => eprintln!("metrics {rendered}"),
+            Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
+        }
         let counts = domain.counts();
         eprintln!(
             "the api plane ended: queued_local={} queued_remote={} not_a_voter={} \

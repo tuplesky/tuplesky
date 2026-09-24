@@ -3879,3 +3879,117 @@ fn write_activation(dir: &Path, features: &[u16]) {
     .expect("put");
     tx.commit_durable().expect("commit");
 }
+
+/// A running node reports a bounded, secret-free metrics snapshot, and
+/// what it does not have says why rather than reporting zero (task-61;
+/// design Sections 13, 22.3).
+///
+/// The snapshot is the operator-facing artifact of the whole
+/// observability task, so the test is about the two properties an
+/// operator relies on: it describes this node's actual storage, and it
+/// contains nothing that could not safely be shipped off the host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_reports_bounded_secret_free_metrics() {
+    let dir = workspace("metrics");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    // Serve a write, so the node has a journal position to report, and
+    // then restart: the snapshot on the startup report is of the state
+    // this process actually recovered to.
+    {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x61; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .unwrap_or_else(|| panic!("the daemon answered\n{}", daemon.said()));
+    }
+    let said = start_and_report(&path);
+
+    let rendered = said
+        .lines()
+        .find_map(|line| line.strip_prefix("metrics "))
+        .unwrap_or_else(|| panic!("the daemon never reported metrics:\n{said}"));
+    let snapshot: serde_json::Value = serde_json::from_str(rendered).expect("valid json");
+
+    // It describes this node's actual storage: a node that served a
+    // write has a journal position, and the three frontiers are
+    // reported separately because they are three different facts.
+    let frontiers = snapshot
+        .pointer("/frontiers/Observed")
+        .expect("the frontiers are observed on a node with a store");
+    assert!(
+        frontiers["journal"].as_u64().expect("a journal head") > 0,
+        "a node that served a write reported an empty journal: {frontiers}"
+    );
+    assert!(frontiers.get("materialized").is_some());
+    assert!(frontiers.get("checkpoint").is_some());
+
+    // What it does not have says why, never zero. This build times no
+    // view and no durability quantity, and configures no engine bound,
+    // and each is a stated absence.
+    for (field, reason) in [
+        ("/view_age/Unavailable", "NotInstrumented"),
+        ("/engine_pressure/Unavailable", "NoBound"),
+        ("/durability/Unavailable", "NotInstrumented"),
+    ] {
+        assert_eq!(
+            snapshot.pointer(field).and_then(|v| v.as_str()),
+            Some(reason),
+            "{field} was not a stated absence:\n{rendered}"
+        );
+    }
+
+    // Every stage is present, and this node's roles decide which are
+    // observed: a missing series is always a stated absence.
+    let stages = snapshot["stages"].as_array().expect("stages");
+    assert_eq!(stages.len(), 12, "a stage was dropped rather than stated");
+    // The stages this daemon records are observed, and the ones nothing
+    // in it records say so rather than reporting counts nobody took.
+    let reading = |name: &str| {
+        stages
+            .iter()
+            .find(|s| s["stage"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("no {name} reading:\n{rendered}"))["metrics"]
+            .clone()
+    };
+    for recorded in ["Admission", "Journal", "Materialization"] {
+        assert!(
+            reading(recorded).get("Observed").is_some(),
+            "{recorded} is recorded by this daemon but was not observed:\n{rendered}"
+        );
+    }
+    for unrecorded in ["FanOut", "ClientTransit", "EvidenceLearning"] {
+        assert_eq!(
+            reading(unrecorded)
+                .pointer("/Unavailable")
+                .and_then(|v| v.as_str()),
+            Some("NotInstrumented"),
+            "{unrecorded} has no instrumentation point but was reported:\n{rendered}"
+        );
+    }
+
+    // And nothing in it could not be shipped off the host. The scan is
+    // the one design Section 22.3 asks for; it finds nothing because
+    // nothing of that kind is ever recorded.
+    for pattern in [
+        "BEGIN", "PRIVATE", "Bearer", "eyJ", "secret", "token", "password",
+    ] {
+        assert!(
+            !rendered.contains(pattern),
+            "the snapshot contains {pattern:?}:\n{rendered}"
+        );
+    }
+    let longest = rendered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        longest <= 20,
+        "the snapshot carries a {longest}-character run, which is identity-shaped:\n{rendered}"
+    );
+}
