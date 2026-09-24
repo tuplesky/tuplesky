@@ -36,6 +36,7 @@ use coord_session::{BindingConfig, BoundFrontend, Delivered, StorePolicySource};
 use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_transport::{Responder, Transport, TransportEvent};
+use coord_types::ids::ReplicaId;
 use coord_types::wire_v1::{Frame, MessageV1, decode};
 use coord_types::{CommandId, RetryKey};
 
@@ -157,9 +158,24 @@ pub struct Counts {
     /// Evidence this voter produced for a command whose submitter it did
     /// not know yet, held until it does.
     pub parked: u64,
-    /// Held evidence dropped because the submission it was waiting for
-    /// never arrived here.
+    /// Held evidence let go because the submission naming it did not
+    /// arrive inside the window the race can take.
+    ///
+    /// Ordinary under load, and the ordinary cause is named: a
+    /// collector's fan-out that the peer's lane could not queue is
+    /// dropped by the transport, so this voter is never told where that
+    /// command's evidence belongs. The command is decided and durable
+    /// on a quorum that did get the submission, and the caller resolves
+    /// it by identity.
     pub unclaimed: u64,
+    /// Held evidence dropped because the hold itself was full.
+    ///
+    /// Not ordinary. The hold is bounded by the commands that can be in
+    /// this state at once, and reaching it means more were than the
+    /// bound allows for -- an operator wants to know that the bound and
+    /// the traffic have diverged, which is a different thing from a
+    /// submission that never came.
+    pub crowded_out: u64,
 }
 
 impl Frontend {
@@ -655,15 +671,33 @@ pub struct Domain<P: Persistence> {
     /// and proposing one is a leader's.
     expiry: Option<crate::leases::Expiry>,
     /// When this node last asked for a payload it lacks, and how many
-    /// it was missing when it did. A time and not a turn count: a
-    /// domain with nothing else happening takes no turns, and that is
-    /// exactly when the asking has to go on. The count beside it makes
-    /// the ask a window rather than a rate: an answer moves the number,
-    /// and the next ask goes at once.
-    asked: Option<(std::time::Instant, usize)>,
+    /// payload transfers a peer had answered it with by then. A time
+    /// and not a turn count: a domain with nothing else happening takes
+    /// no turns, and that is exactly when the asking has to go on. The
+    /// count beside it makes the ask a window rather than a rate -- a
+    /// batch answered in full moves it, and the next ask goes at once
+    /// -- and it counts answers rather than what is missing, because
+    /// what is missing also moves when a command arrives by identity,
+    /// which under load is every turn. The third field is how many
+    /// that ask was for, so a partial answer is not mistaken for a
+    /// complete one.
+    asked: Option<(std::time::Instant, u64, u64)>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
-    parked: VecDeque<(CommandId, PeerProvenance, Vec<u8>)>,
+    parked: VecDeque<Parked>,
+    /// Peers this node currently cannot queue a frame for, and how many
+    /// frames it has dropped for each since it last could. Kept so the
+    /// condition is said once when it starts and once when it ends,
+    /// rather than once per frame.
+    undeliverable: BTreeMap<ReplicaId, u64>,
+    /// Whether this node has already said it has no peer plane. The
+    /// same reason: it is a standing condition, not an event.
+    no_plane_said: bool,
+    /// Refusals this node keeps saying, so that it says them less.
+    recurring: Recurring,
+    /// Peer events taken since the last caller's event, so the peer
+    /// plane's priority cannot become the caller plane's starvation.
+    peer_streak: u32,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -701,13 +735,85 @@ pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
     }
 }
 
+/// How long evidence waits for the submission that says where it goes.
+///
+/// The race this covers is short: the submission and the proposal leave
+/// the collector's node at nearly the same moment, and the proposal
+/// arriving first is a matter of scheduling, not of distance. What the
+/// window must not be is open-ended, because the other way a submission
+/// fails to arrive is that it never will -- a fan-out the peer's lane
+/// could not queue is dropped by the transport, and no retry of that
+/// presentation is coming. Holding those until the depth bound evicts
+/// them makes an ordinary consequence of backpressure look like a bound
+/// that is wrong.
+///
+/// A second is orders of magnitude past the race and still short enough
+/// that a loaded voter holds one second's evidence rather than a whole
+/// depth of it.
+const PARKED_HOLD: core::time::Duration = core::time::Duration::from_secs(1);
+
 /// How much evidence a node holds for want of a submitter.
 ///
-/// The window is one frame per command between this voter acknowledging
-/// it and the submission naming it arriving here, so the depth that
-/// matters is the commands in flight at once. This is comfortably past
-/// the command table's own capacity.
+/// With the hold above this is a ceiling rather than the working bound:
+/// what is normally in here is one second's worth of a race that is won
+/// in microseconds. Reaching it is a signal in its own right, counted
+/// and said apart from the hold expiring.
 const PARKED_EVIDENCE: usize = 256;
+
+/// One piece of evidence waiting for the submission that places it.
+///
+/// Generic over the provenance only so the hold's timing can be tested
+/// without minting a voter's provenance here: that constructor is
+/// confined to the voter runtime, and nothing about when a hold runs out
+/// depends on whose evidence it is.
+struct Parked<P = PeerProvenance> {
+    command: CommandId,
+    provenance: P,
+    bytes: Vec<u8>,
+    /// When it was parked, so the hold above can be applied to it.
+    since: std::time::Instant,
+}
+
+/// Held evidence is due to be let go when the oldest of it has waited
+/// the whole hold.
+///
+/// The hold is applied only when a turn runs, and on a domain that has
+/// gone quiet nothing else would run one: evidence parked just before
+/// the last submission would sit past the hold, and `unclaimed` would
+/// not be said, until unrelated traffic arrived. Registered here, the
+/// loop takes a turn when the oldest hold runs out, and that turn lets
+/// it go -- which moves this deadline on to the next oldest, or away.
+impl<P> Deadline for VecDeque<Parked<P>> {
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.front().map(|oldest| oldest.since + PARKED_HOLD)
+    }
+}
+
+/// Take out what can be routed at `now`: every frame whose submitter
+/// `origin_of` names, in the order it was parked, and let go of what has
+/// waited the whole hold without one. Returns the ready frames and how
+/// many were let go.
+fn route_held<P>(
+    parked: &mut VecDeque<Parked<P>>,
+    now: std::time::Instant,
+    origin_of: impl Fn(&CommandId) -> Option<coord_daemon::voter::Origin>,
+) -> (Vec<(coord_daemon::voter::Origin, P, Vec<u8>)>, u64) {
+    let mut still_waiting = VecDeque::with_capacity(parked.len());
+    let mut ready = Vec::new();
+    let mut unclaimed = 0;
+    for held in core::mem::take(parked) {
+        match origin_of(&held.command) {
+            Some(origin) => ready.push((origin, held.provenance, held.bytes)),
+            // Past the window the race takes, so the submission is not
+            // late, it is not coming. Let it go rather than hold it until
+            // something newer needs the room.
+            None if now.duration_since(held.since) >= PARKED_HOLD => unclaimed += 1,
+            None => still_waiting.push_back(held),
+        }
+    }
+    *parked = still_waiting;
+    (ready, unclaimed)
+}
 
 /// How often a node repeats a request for a payload it is waiting on.
 ///
@@ -725,9 +831,9 @@ const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// a quiet domain -- would wait for unrelated traffic to be noticed. The
 /// loop instead sleeps until the earliest deadline any component
 /// registers ([`Domain::next_deadline`]) and gives the voter a turn when
-/// it passes. Lease expiry is the first component; the collector's
-/// re-offers and the expiry of held evidence are meant to register here
-/// in the same way rather than add arms of their own to the loop.
+/// it passes. Lease expiry and the expiry of held evidence register
+/// here; the collector's re-offers are meant to register in the same way
+/// rather than add arms of their own to the loop.
 pub trait Deadline {
     /// The earliest instant this component has work due, if it has any.
     ///
@@ -735,6 +841,137 @@ pub trait Deadline {
     /// done the work due at it; a deadline that stays in the past would
     /// wake the loop again at once, for ever.
     fn next_deadline(&self) -> Option<std::time::Instant>;
+}
+
+/// How many times a recurring condition is said in full before it is
+/// said only at each doubling.
+const SAID_IN_FULL: u64 = 8;
+
+/// How many distinct recurring reasons this node tracks separately.
+///
+/// The reasons come from bounded enums, so this is headroom rather than
+/// a policy. Past it everything new is folded together, because a map
+/// keyed by something a peer influences is a map a peer can grow.
+const RECURRING_REASONS: usize = 64;
+
+/// Conditions this node says over and over, kept so that it says them
+/// less.
+///
+/// A refusal under sustained load is not an event, it is a condition,
+/// and the loop that produces it runs as fast as the runtime turns. A
+/// line each time is a line every few microseconds: it fills a disk, it
+/// buries the line an operator was meant to read, and it costs the node
+/// the turns it should be spending on the work that would end the
+/// condition. One voter of three wrote a 106 MB log saying
+/// `Backpressure` while the payloads it was waiting for went
+/// undelivered, which is the failure this exists to stop being part of.
+///
+/// Each reason is said in full the first `SAID_IN_FULL` times -- an
+/// operator debugging a handful of refusals wants all of them -- and
+/// after that at each doubling, so the lines are logarithmic in the
+/// occurrences and the last one is within a factor of two of the truth.
+#[derive(Default)]
+struct Recurring {
+    counts: BTreeMap<String, u64>,
+}
+
+impl Recurring {
+    /// Record one occurrence of `reason`, and say how many there have
+    /// been if this one should be printed.
+    fn seen(&mut self, reason: &str) -> Option<u64> {
+        // The head, because a reason carrying a command identity is a
+        // different string every time and would defeat the point.
+        let head = reason.split('(').next().unwrap_or(reason);
+        let key = if self.counts.contains_key(head) || self.counts.len() < RECURRING_REASONS {
+            head
+        } else {
+            "other"
+        };
+        let n = self.counts.entry(key.to_string()).or_insert(0);
+        *n += 1;
+        (*n <= SAID_IN_FULL || n.is_power_of_two()).then_some(*n)
+    }
+}
+
+/// How many frames this node must fail to queue for one peer before it
+/// says so.
+///
+/// A queue that fills and drains again is what backpressure looks like
+/// when it is working, and saying so would be a line per turn about a
+/// domain that is fine. What an operator needs to hear about is a lane
+/// that stays full, which is a peer too far behind to take what this
+/// node has for it.
+const UNDELIVERABLE_SAID_AT: u64 = 64;
+
+/// How many peer events in a row are taken before the caller's plane is
+/// polled first for one turn.
+///
+/// High enough that the ordering still holds in the case it is for -- a
+/// burst of votes for one command is a handful of frames, and a
+/// recovery summary is not much more -- and low enough that a caller's
+/// request waits for a bounded number of peer frames rather than for
+/// the domain to go quiet.
+const PEER_BEFORE_API: u32 = 64;
+
+/// Whether the caller's plane is polled before the peer plane this
+/// turn, given how many peer events have been taken since the last
+/// caller's event.
+///
+/// The peer plane keeps its priority -- it is what lets a caller's
+/// request finish -- but only for a bounded run. A priority with
+/// nothing behind it is starvation, and on a busy domain the peer plane
+/// is ready on every poll, so a loop that always prefers it never polls
+/// the caller's plane at all.
+const fn poll_api_first(peer_streak: u32) -> bool {
+    peer_streak >= PEER_BEFORE_API
+}
+
+/// How many payloads one ask is for, given how many are missing.
+///
+/// The protocol's own bound, applied here so the runtime knows what a
+/// complete answer to its ask looks like without the machine having to
+/// tell it.
+const fn payload_batch_size(missing: usize) -> u64 {
+    let bound = coord_consensus::messages::MAX_PAYLOAD_TRANSFER;
+    if missing < bound {
+        missing as u64
+    } else {
+        bound as u64
+    }
+}
+
+/// Whether a replica lacking payloads should ask for them now.
+///
+/// `asked` is what the last ask was: when it went, how many payload
+/// transfers had been answered by then, and how many it was for.
+/// `answered` is how many have been answered since boot.
+///
+/// Two rules, and the second is the one that was missing. The ask goes
+/// again at once when the last one was answered **in full**, so a
+/// replica behind by more than one batch catches up at a batch per
+/// round trip rather than a batch per interval. And it goes again on
+/// the interval when it was not, so an ask nobody could answer -- part
+/// of a batch the peer does not hold durably yet -- does not stop the
+/// asking for good.
+///
+/// What it must not do is treat *part* of an answer as the whole. An
+/// ask is worth up to `MAX_PAYLOAD_TRANSFER` frames on the bulk lane,
+/// so re-asking when the first of them lands puts a fresh batch of
+/// eight on that lane for every payload that arrives. On a peer that is
+/// already behind -- which is the only peer that asks -- the lane fills,
+/// the answers are dropped, and the replica falls further behind for
+/// having asked: the loop `MAX_PAYLOAD_TRANSFER` exists to prevent, one
+/// lane over. The same goes for pacing by how many payloads are still
+/// missing, which moves whenever a command arrives by identity and so,
+/// under load, moves on nearly every turn.
+fn ask_for_payloads_now(
+    asked: Option<(std::time::Instant, u64, u64)>,
+    answered: u64,
+    now: std::time::Instant,
+) -> bool {
+    asked.is_none_or(|(last, then, batch)| {
+        answered >= then.saturating_add(batch) || now.duration_since(last) >= PAYLOAD_RETRY
+    })
 }
 
 /// Where this node's local recovery images live, and when it makes one.
@@ -780,6 +1017,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             expiry: None,
             asked: None,
             parked: VecDeque::new(),
+            undeliverable: BTreeMap::new(),
+            no_plane_said: false,
+            recurring: Recurring::default(),
+            peer_streak: 0,
             budgets,
             recorder,
         }
@@ -989,21 +1230,58 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 Backing::Voting(v) => v.awaiting().is_some() || v.missing_payloads() > 0,
                 Backing::Serving(_) => false,
             };
-            let arrived = tokio::select! {
-                biased;
-                // Voter work that is still outstanding pre-empts waiting
-                // on anything. This branch is taken only when the last
-                // turn actually did something, so a voter that cannot
-                // progress waits rather than spins.
-                () = std::future::ready(()), if progressed => continue,
-                () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
-                peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
-                event = transport.next_event() => event.map(Arrived::Api),
-                () = sleep, if wake.is_some() => continue,
+            // The peer plane goes first, and not for ever. A vote, an
+            // adoption or a recovery summary is the work that lets a
+            // caller's request finish, so a frontend under load must
+            // not be able to hold it up -- but a biased select is a
+            // priority, and a priority with nothing behind it is
+            // starvation. A busy domain keeps the peer plane ready on
+            // every poll, and this loop then never polls the caller's
+            // plane at all: measured on a three-voter domain, one
+            // voter served 4560 api events and then not one more while
+            // its peer arm took another 80000, so every caller bound
+            // to that frontend waited out its deadline against a node
+            // that was working perfectly.
+            //
+            // So the bias is a budget. After `PEER_BEFORE_API`
+            // consecutive peer events the caller's plane is polled
+            // first for one turn, which is enough to guarantee it a
+            // share without giving up the ordering that makes the
+            // domain progress.
+            let api_first = poll_api_first(self.peer_streak);
+            let arrived = if api_first {
+                tokio::select! {
+                    biased;
+                    // Voter work that is still outstanding pre-empts
+                    // waiting on anything. This branch is taken only
+                    // when the last turn actually did something, so a
+                    // voter that cannot progress waits rather than
+                    // spins.
+                    () = std::future::ready(()), if progressed => continue,
+                    () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
+                    event = transport.next_event() => event.map(Arrived::Api),
+                    peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                    () = sleep, if wake.is_some() => continue,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    () = std::future::ready(()), if progressed => continue,
+                    () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
+                    peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                    event = transport.next_event() => event.map(Arrived::Api),
+                    () = sleep, if wake.is_some() => continue,
+                }
             };
             match arrived {
-                Some(Arrived::Api(event)) => self.on_transport(transport, event, &clock).await,
-                Some(Arrived::Peer(event)) => self.on_peer_plane(transport, event),
+                Some(Arrived::Api(event)) => {
+                    self.peer_streak = 0;
+                    self.on_transport(transport, event, &clock).await;
+                }
+                Some(Arrived::Peer(event)) => {
+                    self.peer_streak = self.peer_streak.saturating_add(1);
+                    self.on_peer_plane(transport, event);
+                }
                 None => return,
             }
         }
@@ -1020,16 +1298,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// arrives (see [`Deadline`]).
     ///
     /// Expiry counts only where this replica leads, because only then
-    /// does a turn run it; a follower's driver has nothing due. Further
-    /// components are folded into the same minimum.
+    /// does a turn run it; a follower's driver has nothing due. Held
+    /// evidence counts on any voter, since every voter's turn applies
+    /// the hold. Further components are folded into the same minimum.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
-        let expiry = match &self.backing {
-            Backing::Voting(voter) if voter.leads() => {
-                self.expiry.as_ref().and_then(Deadline::next_deadline)
-            }
-            _ => None,
+        let (expiry, parked) = match &self.backing {
+            Backing::Voting(voter) => (
+                self.expiry
+                    .as_ref()
+                    .filter(|_| voter.leads())
+                    .and_then(Deadline::next_deadline),
+                Deadline::next_deadline(&self.parked),
+            ),
+            Backing::Serving(_) => (None, None),
         };
-        [expiry].into_iter().flatten().min()
+        [expiry, parked].into_iter().flatten().min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases
@@ -1073,10 +1356,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // that many per interval -- and a replica behind by more
             // than the domain produces in an interval would never close
             // the gap, however long it ran.
-            if self.asked.is_none_or(|(last, then)| {
-                then != missing || now.duration_since(last) >= PAYLOAD_RETRY
-            }) {
-                self.asked = Some((now, missing));
+            //
+            // What says the last ask was answered is the count of
+            // answers to it -- the machine counts an answer only when it
+            // names a command the outstanding ask named, and once -- not
+            // the count of what is still missing. The
+            // missing count moves for two reasons -- a payload arrived,
+            // or a command arrived by identity -- and under load the
+            // second happens on nearly every turn, so a replica pacing
+            // itself by it asks continuously. That is not a wasted
+            // message: an ask is answered with up to
+            // `MAX_PAYLOAD_TRANSFER` payload frames on the bulk lane,
+            // so asking on every turn fills that lane with answers to
+            // asks already superseded, the lane drops them, and the
+            // replica falls further behind for having asked -- the same
+            // loop `MAX_PAYLOAD_TRANSFER` exists to prevent, one lane
+            // over.
+            let answered = voter.payloads_answered();
+            let want = payload_batch_size(missing);
+            if ask_for_payloads_now(self.asked, answered, now) {
+                self.asked = Some((now, answered, want));
                 out.absorb(voter.request_payloads()?);
             }
         } else {
@@ -1099,9 +1398,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // A refusal at the voter's door is silent to the caller, whose
         // stream is held for an answer that is not coming. The reason is
         // a bounded enum, so this node says it rather than leaving an
-        // operator with a counter.
+        // operator with a counter -- and says it less as it repeats, so
+        // a domain under sustained backpressure is described rather
+        // than transcribed.
         for why in &refused {
-            eprintln!("this voter refused a submission: {why:?}");
+            let said = format!("{why:?}");
+            if let Some(n) = self.recurring.seen(&said) {
+                eprintln!("this voter refused a submission: {said} ({n} so far)");
+            }
         }
         self.frontend.counts.refused += refused.len() as u64;
         // What the protocol machine itself refused. Drained every turn
@@ -1109,7 +1413,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // that lives as long as the process and a reason an operator
         // never sees.
         for why in voter.take_rejections() {
-            eprintln!("this voter's machine refused: {why}");
+            if let Some(n) = self.recurring.seen(&why) {
+                eprintln!("this voter's machine refused: {why} ({n} so far)");
+            }
         }
         self.carry(api, out, provenance);
         // A submission is the only thing that can say where this voter's
@@ -1210,7 +1516,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // Admitted to the lane's queue. Not a vote and not a
                 // delivery: what the peer does with it is the peer's,
                 // and the collector counts the evidence.
-                Some(Ok(())) => self.frontend.counts.queued_remote += 1,
+                Some(Ok(())) => {
+                    self.frontend.counts.queued_remote += 1;
+                    // Coming back is as much an operator's business as
+                    // going away, and it is what closes the episode
+                    // above. Said only when the going away was said,
+                    // so a lane that fills and drains inside one turn
+                    // -- ordinary backpressure -- stays quiet in both
+                    // directions.
+                    if let Some(lost) = self.undeliverable.remove(&to.replica)
+                        && lost >= UNDELIVERABLE_SAID_AT
+                    {
+                        eprintln!(
+                            "this voter can send to {} again, after {lost} frames it could not",
+                            hex4(&to.replica)
+                        );
+                    }
+                }
                 // No route right now. The voter contributes nothing
                 // through this process until there is one; the quorum
                 // rule decides what that costs.
@@ -1219,12 +1541,35 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // could not send is the difference between a quorum
                 // that forms and one that does not, and it is invisible
                 // from every other node.
+                //
+                // Not once per frame, though, and not once per
+                // episode either. A lane that is full stays full for as
+                // long as the peer is behind, and this loop runs as
+                // fast as the runtime turns: a line each time is a line
+                // every few microseconds, which fills a disk and buries
+                // the line an operator was meant to read. A lane that
+                // fills and drains inside a turn is ordinary
+                // backpressure and says nothing at all, and once an
+                // episode is long enough to matter it is said at each
+                // doubling -- so the lines are logarithmic in the
+                // frames lost and the last one an operator reads is
+                // within a factor of two of the truth.
                 Some(Err(e)) => {
-                    eprintln!("this voter could not send to {}: {e:?}", hex4(&to.replica));
+                    let lost = self.undeliverable.entry(to.replica).or_insert(0);
+                    *lost += 1;
+                    if *lost >= UNDELIVERABLE_SAID_AT && lost.is_power_of_two() {
+                        eprintln!(
+                            "this voter could not send to {}: {e:?} ({lost} frames and counting)",
+                            hex4(&to.replica)
+                        );
+                    }
                     self.frontend.counts.unavailable += 1;
                 }
                 None => {
-                    eprintln!("this voter has no peer plane to send on");
+                    if !self.no_plane_said {
+                        self.no_plane_said = true;
+                        eprintln!("this voter has no peer plane to send on");
+                    }
                     self.frontend.counts.unavailable += 1;
                 }
             }
@@ -1306,7 +1651,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// coming; the command is decided and durable either way, and the
     /// caller resolves it by identity.
     fn park(&mut self, command: CommandId, provenance: PeerProvenance, bytes: &[u8]) {
-        self.parked.push_back((command, provenance, bytes.to_vec()));
+        self.parked.push_back(Parked {
+            command,
+            provenance,
+            bytes: bytes.to_vec(),
+            since: std::time::Instant::now(),
+        });
         self.frontend.counts.parked += 1;
         // Said once, not once per frame. That this happens at all is
         // ordinary -- it is a command this voter heard about from a
@@ -1317,19 +1667,25 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
         while self.parked.len() > PARKED_EVIDENCE {
             self.parked.pop_front();
-            self.frontend.counts.unclaimed += 1;
-            // This one is not ordinary: a caller's collector is one
-            // acknowledgement short and will not be told why.
-            if self.frontend.counts.unclaimed == 1 {
-                eprintln!("this voter dropped evidence no submission ever claimed");
+            self.frontend.counts.crowded_out += 1;
+            // Said once, and not the same thing as the hold expiring:
+            // this is the bound itself being reached, which it should
+            // not be while the hold is doing the releasing.
+            if self.frontend.counts.crowded_out == 1 {
+                eprintln!("this voter dropped held evidence for want of room");
             }
         }
     }
 
-    /// Deliver held evidence whose submitter this voter now knows.
+    /// Deliver held evidence whose submitter this voter now knows, and
+    /// let go of what has waited longer than the race can take.
     ///
     /// Called after submissions are taken in, which is the only thing
-    /// that can supply the answer.
+    /// that can supply the answer, and at the end of every turn. On a
+    /// node nobody is submitting to no turn would come, so the oldest
+    /// evidence's hold is registered as a deadline (see [`Deadline`]):
+    /// the loop wakes when it runs out and the turn it takes lets that
+    /// evidence go and says `unclaimed`.
     fn route_parked(&mut self, api: &Transport) {
         if self.parked.is_empty() {
             return;
@@ -1337,15 +1693,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &self.backing else {
             return;
         };
-        let mut still_waiting = VecDeque::with_capacity(self.parked.len());
-        let mut ready = Vec::new();
-        for (command, provenance, bytes) in core::mem::take(&mut self.parked) {
-            match voter.origin_of(&command) {
-                Some(origin) => ready.push((origin, provenance, bytes)),
-                None => still_waiting.push_back((command, provenance, bytes)),
+        let (ready, unclaimed) =
+            route_held(&mut self.parked, std::time::Instant::now(), |command| {
+                voter.origin_of(command)
+            });
+        if unclaimed > 0 {
+            if self.frontend.counts.unclaimed == 0 {
+                eprintln!("this voter let go of evidence no submission named inside the window");
             }
+            self.frontend.counts.unclaimed += unclaimed;
         }
-        self.parked = still_waiting;
         for (origin, provenance, bytes) in ready {
             match origin {
                 coord_daemon::voter::Origin::Connection(id) => {
@@ -1764,7 +2121,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // submitter was known -- so what was held is tried again
             // either way.
             Ok(Err(why)) => {
-                eprintln!("this voter refused a collector's submission: {why:?}");
+                let said = format!("{why:?}");
+                if let Some(n) = self.recurring.seen(&said) {
+                    eprintln!("this voter refused a collector's submission: {said} ({n} so far)");
+                }
                 self.frontend.counts.refused += 1;
             }
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
@@ -2321,7 +2681,213 @@ mod tests {
     use coord_membership::genesis::{GenesisManifest, VoterSeed};
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 
-    use super::addressed;
+    use super::{
+        PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed,
+        ask_for_payloads_now, payload_batch_size, poll_api_first,
+    };
+
+    /// Held evidence registers when it is due to be let go, and the turn
+    /// that deadline wakes lets it go and moves the deadline on.
+    ///
+    /// The hold is applied only when a turn runs. Without a deadline an
+    /// idle voter never runs one, so evidence parked just before the
+    /// domain went quiet sat past the hold and `unclaimed` was not said
+    /// until unrelated traffic arrived. A deadline that stayed put after
+    /// its turn would instead wake the loop for ever.
+    #[test]
+    fn held_evidence_is_due_when_its_hold_runs_out_and_its_turn_lets_it_go() {
+        use super::{Deadline, PARKED_HOLD, Parked, route_held};
+        use coord_types::identity::Digest32;
+
+        let t0 = std::time::Instant::now();
+        let held = |n: u8, since| Parked {
+            command: coord_types::CommandId(Digest32([n; 32])),
+            provenance: (),
+            bytes: vec![n],
+            since,
+        };
+        let mut parked = std::collections::VecDeque::new();
+        assert_eq!(parked.next_deadline(), None, "nothing held, nothing due");
+        let later = t0 + std::time::Duration::from_millis(300);
+        parked.push_back(held(1, t0));
+        parked.push_back(held(2, later));
+        let due = t0 + PARKED_HOLD;
+        assert_eq!(parked.next_deadline(), Some(due), "due with the oldest");
+
+        // A turn before the deadline lets nothing go and leaves it.
+        let early = due - std::time::Duration::from_millis(1);
+        let (ready, unclaimed) = route_held(&mut parked, early, |_| None);
+        assert!(ready.is_empty());
+        assert_eq!(unclaimed, 0);
+        assert_eq!(parked.next_deadline(), Some(due));
+
+        // The turn the deadline wakes lets the oldest go, as unclaimed,
+        // and the deadline moves on to the next oldest -- in the future.
+        let (ready, unclaimed) = route_held(&mut parked, due, |_| None);
+        assert!(ready.is_empty());
+        assert_eq!(unclaimed, 1);
+        let next = parked.next_deadline().expect("one still held");
+        assert_eq!(next, later + PARKED_HOLD);
+        assert!(
+            next > due,
+            "a deadline in the past would wake the loop for ever"
+        );
+
+        // And once nothing is held nothing is due.
+        let (_, unclaimed) = route_held(&mut parked, next, |_| None);
+        assert_eq!(unclaimed, 1);
+        assert_eq!(parked.next_deadline(), None);
+    }
+
+    /// The peer plane's priority is a budget, not a licence.
+    ///
+    /// Without the budget a busy domain keeps the peer plane ready on
+    /// every poll and the caller's plane is never polled: measured on a
+    /// three-voter domain under the benchmark's load, one voter served
+    /// 4560 api events and then not one more while its peer arm took
+    /// another 80000, and every caller bound to that frontend waited
+    /// out its deadline against a node that was otherwise working.
+    #[test]
+    fn the_peer_planes_priority_is_bounded_so_a_caller_is_never_starved() {
+        // Ordinary: the peer plane goes first, which is the ordering
+        // that makes a caller's own request finish.
+        assert!(!poll_api_first(0));
+        assert!(!poll_api_first(1));
+        assert!(!poll_api_first(PEER_BEFORE_API - 1));
+        // And a run of peer events cannot go on for ever.
+        assert!(poll_api_first(PEER_BEFORE_API));
+        assert!(poll_api_first(u32::MAX));
+        // The budget is big enough that the ordering still holds for
+        // what it is for -- a burst of votes for one command, or a
+        // recovery summary -- and small enough that a caller waits for
+        // a bounded number of frames rather than for the domain to go
+        // quiet.
+        assert!((8..=1024).contains(&PEER_BEFORE_API));
+    }
+
+    /// A condition that keeps happening is said in full a few times and
+    /// then logarithmically, so a node under sustained backpressure
+    /// describes itself instead of transcribing itself.
+    ///
+    /// The number that matters is the last one: 100_000 occurrences
+    /// must cost tens of lines, not 100_000. A voter of three spent a
+    /// 106 MB log and the turns it needed to catch up saying
+    /// `Backpressure` once per refusal, and the domain lost it.
+    #[test]
+    fn a_condition_that_keeps_happening_is_said_less_as_it_does() {
+        let mut said = Recurring::default();
+        let mut lines = 0;
+        let mut last = 0;
+        for _ in 0..100_000 {
+            if let Some(n) = said.seen("Backpressure") {
+                lines += 1;
+                last = n;
+            }
+        }
+        assert!(
+            lines < 32,
+            "100000 occurrences cost {lines} lines, which is not logarithmic"
+        );
+        assert!(
+            last * 2 > 100_000,
+            "the last line said {last}, which is not within a factor of two of 100000"
+        );
+        // The first few are said in full, because an operator chasing a
+        // handful of refusals wants all of them.
+        let mut fresh = Recurring::default();
+        for n in 1..=SAID_IN_FULL {
+            assert_eq!(fresh.seen("Duplicate"), Some(n));
+        }
+    }
+
+    /// Reasons are counted apart, and a reason carrying a command
+    /// identity is still one reason.
+    #[test]
+    fn a_reason_is_its_head_and_the_set_of_them_is_bounded() {
+        let mut said = Recurring::default();
+        // Two reasons, counted separately.
+        assert_eq!(said.seen("Backpressure"), Some(1));
+        assert_eq!(said.seen("Duplicate(CommandIdDigest32(aa))"), Some(1));
+        assert_eq!(said.seen("Backpressure"), Some(2));
+        // A different digest is the same reason, which is the whole
+        // point: keyed by the full string this would never repeat and
+        // would never be folded.
+        assert_eq!(said.seen("Duplicate(CommandIdDigest32(bb))"), Some(2));
+        // And a build that started producing unbounded reason heads
+        // costs a fold rather than a growing map.
+        let mut many = Recurring::default();
+        for n in 0..(RECURRING_REASONS * 4) {
+            many.seen(&format!("reason{n}"));
+        }
+        assert!(many.counts.len() <= RECURRING_REASONS + 1);
+    }
+
+    /// A replica catching up asks a batch at a time, and a partial
+    /// answer is not a complete one.
+    ///
+    /// The negative control is the third case: with the old rule -- ask
+    /// again as soon as anything came back -- it is true, and one
+    /// payload landing puts another whole batch on the bulk lane. That
+    /// is what made a replica behind by a few hundred commands ask
+    /// thousands of times a second, fill the lane its answers travel
+    /// on, and never catch up.
+    #[test]
+    fn a_replica_asks_again_when_its_batch_is_answered_in_full_and_not_before() {
+        let t0 = std::time::Instant::now();
+        // Nothing asked yet: ask.
+        assert!(ask_for_payloads_now(None, 0, t0));
+        // A batch of eight asked, none answered, no time passed.
+        let asked = Some((t0, 0, 8));
+        assert!(!ask_for_payloads_now(asked, 0, t0));
+        // Seven of eight back. Still outstanding -- this is the case
+        // the old rule got wrong.
+        assert!(!ask_for_payloads_now(asked, 7, t0));
+        // All eight back: ask again at once, without waiting out the
+        // interval. This is what lets a replica behind by more than one
+        // batch catch up at a batch per round trip.
+        assert!(ask_for_payloads_now(asked, 8, t0));
+        // A late or duplicated answer -- to an ask the retry floor
+        // repeated, or one a later ask superseded -- never reaches the
+        // count: the machine counts only answers to the outstanding ask,
+        // each once (coord-consensus's
+        // `a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask`).
+        // So the count cannot pass the ask's own size, and a duplicate of
+        // the seventh answer is still seven.
+        assert!(!ask_for_payloads_now(asked, 7, t0));
+        // Not answered, but the interval has passed: ask again, so a
+        // batch the peer cannot answer does not stop the asking.
+        assert!(ask_for_payloads_now(
+            asked,
+            3,
+            t0 + PAYLOAD_RETRY + std::time::Duration::from_millis(1)
+        ));
+    }
+
+    /// One ask is for at most the protocol's bound, and for no more
+    /// than is missing -- so a replica missing three does not wait for
+    /// eight answers that are not coming.
+    #[test]
+    fn an_ask_is_for_what_is_missing_up_to_the_protocol_bound() {
+        assert_eq!(payload_batch_size(0), 0);
+        assert_eq!(payload_batch_size(3), 3);
+        assert_eq!(
+            payload_batch_size(coord_consensus::messages::MAX_PAYLOAD_TRANSFER),
+            coord_consensus::messages::MAX_PAYLOAD_TRANSFER as u64
+        );
+        assert_eq!(
+            payload_batch_size(10_000),
+            coord_consensus::messages::MAX_PAYLOAD_TRANSFER as u64
+        );
+        // And a short ask is answered in full by its own size, not by
+        // the bound: a replica missing three that gets three asks again
+        // at once.
+        let t0 = std::time::Instant::now();
+        assert!(ask_for_payloads_now(
+            Some((t0, 0, payload_batch_size(3))),
+            3,
+            t0
+        ));
+    }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()

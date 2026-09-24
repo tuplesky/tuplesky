@@ -1743,8 +1743,9 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-ten things. All ten are fixed here, and each became findable
-only once the ones before it were.
+thirteen things. Twelve are fixed here and the thirteenth is stated
+below with what is known about it, and each became findable only once
+the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counted the watch and dropped the responder.
@@ -2044,9 +2045,9 @@ traffic arrived -- and the request that woke it was ordered ahead of the
 expiry and read the key. The loop now also sleeps until the earliest
 deadline any component registers through a small `Deadline` trait
 (`next_deadline()`), and expiry registers its armed deadlines, its next
-scan while there is something new to observe, and its retries; the
-collector's re-offers and held-evidence expiry are meant to register the
-same way. Second, a candidate whose proposal never reached a quorum
+scan while there is something new to observe, and its retries; held
+evidence registers the same way, and the collector's re-offers are
+meant to. Second, a candidate whose proposal never reached a quorum
 stayed "in flight" for ever: the driver now presents any proposal that
 committed state has not shown resolving within a retry interval again.
 Third, presenting it again did nothing, because the leader refused a
@@ -2230,18 +2231,19 @@ on it rather than a fix.
 
 *And what is left, stated plainly.* A replica that falls behind now
 recovers instead of stopping, and nothing is lost or refused that was
-not lost or refused before it fell behind. It does not recover
-*quickly*: on the re-run matrix the read-heavy rows lose about three
-operations in ten to the ten-second deadline, all of them belonging to
-the callers bound to one frontend, at every offered rate including the
-closed loop. Those are reads held pending on a projection that has not
-caught up, not reads refused, and they are published in
-[the results](operations/wan-results.md#the-finding-this-run-exposed)
-rather than tuned away. Closing it means a catch-up path that outruns
-the load that put the replica behind, which is a protocol question
-rather than a bound to adjust, and it belongs with
-[task-j07](design/tuplesky-prs-plan.md#task-j07) beside the leader's
-per-command memory.
+not lost or refused before it fell behind. It did not recover
+*quickly*: on the matrix of the time the read-heavy rows lost about
+three operations in ten to the ten-second deadline, all of them
+belonging to the callers bound to one frontend, at every offered rate
+including the closed loop. Those were reads held pending on a
+projection that had not caught up, not reads refused, and they were
+published in [the results](operations/wan-results.md) rather than tuned
+away.
+
+That is closed now, in two places that both had to be right: the
+catch-up path was repeating its bounded ask on nearly every turn and
+flooding the lane its answers travel on, and the drive loop was letting
+the peer plane starve the caller's plane outright. Both are below.
 
 **A refusal the domain had a word for arrived as "internal error".**
 This one the Kubernetes overhead benchmark found rather than the matrix,
@@ -2369,6 +2371,197 @@ runs a second instance that acknowledges nothing and meets
 it at the second invocation. On the composed path the difference is the
 whole benchmark: the rows that refused 230 of 300 and then 300 of 300
 complete 300 of 300.
+
+### And the replica that could not catch up
+
+The finding the WAN matrix was published with, closed here. It said a
+replica falls behind, recovers but not quickly, and its own callers
+lose about three operations in ten to their deadline while it does. What
+it did not say -- because nothing had looked -- is why the catch-up path
+was so slow.
+
+A voter that learns a command's identity before its content executes
+nothing past it until a peer sends the payload. It asks for up to
+`MAX_PAYLOAD_TRANSFER` of them at a time, and that bound exists for a
+reason the source states plainly: *"An unbounded ask therefore answers
+itself: a replica missing a tableful of payloads asks for all of them
+several times a second, the peer answers with that many payload frames
+each time, the lane fills, and what it drops includes the proposals and
+acknowledgements that would have let the replica catch up -- so it falls
+further behind and asks for more."*
+
+The bound was right and the *rate* was not. The runtime repeated the ask
+whenever the count of missing payloads moved, and that count moves for
+two reasons: a payload arrived, or a command arrived by identity. Under
+load the second happens on nearly every turn, so the replica asked
+continuously -- which is exactly the sentence above, with the flood
+moved from the control lane to the bulk one the transfer was separated
+onto. Instrumented on a three-voter domain under the read-heavy
+workload: one follower issued over 2400 asks while its missing count
+climbed from 243 to 436, the leader logged `QueueFull { lane: Bulk }` on
+390 sends to it, and that follower refused 8527 submissions with
+`Backpressure` because its command table was full of commands it could
+not execute for want of content it had asked for 2400 times.
+
+The comment beside the old rule already said what the rule should have
+been -- *"one ask outstanding at a time, and the next one goes the
+moment the last was answered"*. Nothing counted answers. So
+`Follower::payloads_answered` does, and it moves only when a peer
+replied; `ask_for_payloads_now` lets the next ask go when the last batch
+is answered **in full**, and otherwise on the retry floor. In full
+matters: an ask is worth eight frames on the bulk lane, so re-asking
+when the first of them lands puts a fresh batch of eight on that lane
+for every payload that arrives, which is the same loop reached from the
+other side. The floor is still there for the case the answer-driven rule
+cannot cover, which is part of a batch the peer does not hold durably
+yet and so will never send.
+
+The count first moved on *every* payload response, before the machine
+looked at it. On a link whose round trip exceeds the retry floor -- the
+WAN rows -- the floor re-asked before the first answers landed, the
+second ask's answers were all refused as already held and still counted,
+and they satisfied the next ask's threshold: two asks in flight instead
+of one. The follower now records the commands its outstanding ask named
+and counts a response only when it names one of them and the payload is
+then held, removing it as it counts, so a duplicate or an answer to a
+superseded ask is taken if it is new and never counted.
+
+Measured over five trials each, 1500 operations per trial through three
+frontends:
+
+| | operations never answered | bulk lane queue-full on the leader |
+| --- | --- | --- |
+| before | 21, 172, 134, 127, 2 | 392, 185, 189, 203, 284 |
+| after | 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0 |
+
+No overlap in ten runs. `scans` and `read-mostly` complete 300 of 300
+where they completed 192 and 201, and every row's throughput went up
+rather than down.
+
+**And that was not all of it.** Re-running the full matrix against the
+fix, the domain stopped serving one of its three frontends nine rows
+in: 38 of 44 rows did not run, because no `coord-wan-bench` caller
+could bind to that node any more. The second half of this finding is
+below, and the honest order of events is that pacing the asks did not
+expose it so much as change the balance enough to make it total.
+
+### The peer plane's priority had nothing behind it
+
+The drive loop polls two planes in a biased `tokio::select!`, peer
+first, under a comment that says exactly why: *"a vote, an adoption or a
+recovery summary from a peer is the work that lets a caller's request
+finish, and a frontend under load must not be able to hold it up."* The
+reverse hazard was never guarded. A biased select is a priority, and a
+priority with no budget behind it is starvation: on a busy domain the
+peer plane is ready on every poll, so the loop never polls the caller's
+plane at all.
+
+Instrumented with a counter per arm, one voter of three **served 4560
+api events and then not one more, while its peer arm took another
+80000**. Everything else about that node was fine -- it was voting, its
+logs were four kilobytes, its store was healthy -- and every caller
+bound to its frontend waited out its deadline against it. From the
+outside it looked exactly like a domain that had stopped accepting
+sessions, which is why it took a counter to see.
+
+The bias is a budget now: after `PEER_BEFORE_API` consecutive peer
+events the caller's plane is polled first for one turn. 64 is high
+enough that the ordering still holds for the case it is for -- a burst
+of votes for one command, a recovery summary -- and low enough that a
+caller waits for a bounded number of frames rather than for the domain
+to go quiet.
+
+On the same sequence of eleven rows against one standing domain:
+
+| | outcome |
+| --- | --- |
+| before the catch-up fix | every row ran, losing 17 to 98 operations of 400 |
+| after it, before this | rows 1-8 clean, rows 9-11 could not bind at all |
+| after this | every row runs, losing 0, 2 and 3 of 400 |
+
+And on a *fresh* domain, which is the comparison that holds the history
+constant, `warm` goes from 184 to 202 operations a second, `hot-writers`
+from 134 to 158, and `transactions` from 372 of 400 answered at 135 a
+second to 400 of 400 at 145.
+
+**What this cost to find, and what that is worth writing down.** Two
+false starts, both from measurement rather than from reading the code.
+The first was a bisect with a stale `coord-wan-bench`: the retry-floor
+change altered the digest a command carries, so an old client against a
+new daemon is a mismatched pair, and it reported a domain answering
+nothing at a commit that was fine. Acting on that, the held-evidence
+window was half reverted before a matched rebuild showed the commit was
+innocent. The second was running `cargo xtask ci` -- 822 tests on every
+core -- beside a benchmark, and reading the contention as a domain
+failure. A benchmark harness is an instrument, and an instrument used
+without checking that both ends are the same build, on a machine doing
+nothing else, measures itself.
+
+**A line per dropped frame is its own denial of service.** Found while
+measuring this. A send the transport could not queue printed a line, and
+that loop runs as fast as the runtime turns: one run wrote a 157 MB log
+and filled the disk, which took out the benchmark rows that were meant
+to measure the fix. The line is now silent for a lane that fills and
+drains inside a turn -- that is backpressure working, not an event --
+and past `UNDELIVERABLE_SAID_AT` frames it is said at each doubling, so
+the lines are logarithmic in the frames lost and the last one an
+operator reads is within a factor of two of the truth.
+
+### A voter's unplaced evidence waits for a race, not for a bound
+
+**What it looked like.** `a_quorum_keeps_answering_past_its_table_capacity`
+failed about two runs in five on a loaded machine, on its hygiene
+assertion that no voter says `dropped evidence no submission ever
+claimed`. Every request in the run was still answered -- the assertions
+above it check that -- so what failed was the check that the answers did
+not come through the recovery path. Pre-existing: two failures in five
+on the commit before the retry-floor change.
+
+**What it was.** A voter can learn a command from a peer before the
+submission naming it arrives, and the acknowledgement it then produces
+belongs to whichever collector did the asking; handing it to the
+collector in this process would lose it, so it waits. The wait was
+bounded at 256 entries, oldest evicted, under a comment saying the
+window is "one frame per command between this voter acknowledging it and
+the submission naming it arriving here".
+
+That is one of the two ways a submission fails to arrive. The other is
+that it never will. Instrumenting the fan-out under load showed 317 of
+about 880 submissions rejected by the transport with
+`Unavailable(QueueFull { lane: Unary })`: the peer's lane queue is full,
+the frame is dropped, and no retry of that presentation is coming. The
+command still commits, because the local voter and one remote peer took
+it and that is a quorum of three -- but the third voter is never told
+where its evidence belongs, so it holds it until something newer needs
+the room. The hold grows monotonically, the bound is reached, and an
+ordinary consequence of backpressure gets reported as a bound that is
+wrong.
+
+**What it is now.** A window, not a depth. Evidence waits `PARKED_HOLD`
+-- one second, orders of magnitude past a race won in microseconds --
+and is released after that, counted and said once. The 256-entry bound
+stays as a ceiling with its own counter and its own line, because
+reaching *it* means the bound and the traffic have diverged, which is a
+different fact. The test now asserts both halves: that no voter ran out
+of room, and that every voter did release held evidence on the window,
+so a run where the hold has stopped expiring fails rather than passing
+on its way to the bound. A bound of 4 fails the first; a window of 600
+seconds fails the second.
+
+The window was first applied only when a turn happened to run, and on a
+voter that has gone quiet no turn runs: evidence parked just before the
+last submission sat past the hold, and `unclaimed` was not said, until
+unrelated traffic arrived. The held evidence now registers the oldest
+hold's end through the loop's `Deadline` mechanism, like lease expiry,
+so the loop takes a turn when it runs out and that turn lets the
+evidence go.
+
+**What it did not fix.** The fan-out. A submission a peer's lane cannot
+queue leaves that command on a bare quorum, and nothing says so beyond a
+count on the shutdown report. Whether the collector should re-offer it,
+or whether a lane too full to take a submission should refuse the caller
+rather than silently narrow the quorum, is a question about the
+collector boundary rather than a bound to raise, and it is open.
 
 ### What the benchmark harness had to get right to find these
 

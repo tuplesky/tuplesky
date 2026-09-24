@@ -110,15 +110,27 @@ impl Machine {
 
     /// How many commands this replica knows by identity and not by
     /// content.
-    ///
-    /// The count, and not just the fact: a replica catching up asks
-    /// again as soon as the number moves, which is what turns a fixed
-    /// retry interval into a window that empties at the link's speed
-    /// rather than at the interval's.
     pub fn missing_payloads(&self) -> usize {
         match self {
             Machine::Leader(_) => 0,
             Machine::Follower(m) => m.missing_payloads().len(),
+        }
+    }
+
+    /// How many payload transfers a peer has answered this replica
+    /// with.
+    ///
+    /// What paces a replica catching up. The missing count cannot: it
+    /// moves because new commands arrive by identity as well as because
+    /// old ones were answered, so under load it is never still and a
+    /// replica that asked again whenever it moved would ask on every
+    /// turn. This moves only when a peer replied, which is exactly the
+    /// condition for the next ask to go at once rather than on the
+    /// retry floor.
+    pub const fn payloads_answered(&self) -> u64 {
+        match self {
+            Machine::Leader(_) => 0,
+            Machine::Follower(m) => m.payloads_answered(),
         }
     }
 
@@ -350,6 +362,12 @@ impl<P: Persistence> Node<P> {
     /// content.
     pub fn missing_payloads(&self) -> usize {
         self.machine.missing_payloads()
+    }
+
+    /// How many payload transfers a peer has answered this replica
+    /// with.
+    pub const fn payloads_answered(&self) -> u64 {
+        self.machine.payloads_answered()
     }
 
     /// Ask `from` for the payloads this replica lacks.
