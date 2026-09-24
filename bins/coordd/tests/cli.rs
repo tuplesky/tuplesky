@@ -1225,13 +1225,17 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
 }
 
 /// A process that only serves clients starts, binds no peer listener,
-/// and answers a caller.
+/// and takes a caller's binding to the voters.
 ///
 /// A frontend reaches every committed voter over the api plane, as a
 /// collector: they are its destinations, not peers it votes with. A
 /// process that took "there are voters to reach" to mean "this process
 /// has a peer plane" would demand a peer listener a frontend is not
 /// required to bind, and so a supported role could never start.
+///
+/// A binding is a replicated command, so with none of the committed
+/// voters running the frontend holds it rather than answering it: that
+/// it negotiates and holds the binding is what says it is serving.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frontend_only_process_starts_without_a_peer_plane() {
     let dir = workspace("frontend");
@@ -1250,8 +1254,19 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
 
     assert_eq!(run(&path, &["init"]).code, Some(0));
     let daemon = start(&path);
-    let caller = Caller::bind(&daemon, &ca, &ring, [0x45; 16]).await;
-    assert_eq!(caller.session, coord_types::ids::SessionId([0x45; 16]));
+    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
+    let token = service_token(&ring, [0x45; 16]);
+    let (mut send, mut recv) = connection.open_bi().await.expect("bind stream");
+    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
+        .await
+        .expect("written");
+    send.finish().expect("finished");
+    let mut buf = [0u8; 4096];
+    let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
+    assert!(
+        early.is_err(),
+        "a frontend answered a binding no voter agreed to: {early:?}"
+    );
     let said = daemon.said();
     assert!(
         !said.contains("peer listener"),

@@ -640,7 +640,7 @@ fn the_store_records_under_the_ballot_the_voter_is_at() {
         IngressBudget::default(),
     )
     .expect("replica 1 is a committed voter");
-    let mut voter = Voter::new(node, ingress, ballot());
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
     assert_eq!(voter.node().applier().store().ballot, Some(ballot()));
 
     let adopted = Ballot {
