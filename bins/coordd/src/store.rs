@@ -150,11 +150,11 @@ fn show(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// This node's durable storage, open and ready to attach an applier to.
 /// This node's persistence: the journal is the record, `redb` the
 /// projection of it that answers reads.
 pub type Persistence = JournaledDomain<RaftEngineJournal, RedbEngine>;
 
+/// This node's durable storage, open and ready to attach an applier to.
 pub struct Storage {
     /// The journal-first coordinator: one shared journal, this node's
     /// domain attached to it.
@@ -169,14 +169,30 @@ pub struct Storage {
     pub boot: BootId,
 }
 
-/// Open the journal and the projection, and attach the domain.
+/// The journal and the projection, open and not yet attached.
+///
+/// The two steps are apart so that what has to be settled about the
+/// projection before anything is replayed into it -- the genesis it is
+/// pinned to (see `genesis`) -- is settled on the generation itself,
+/// while it is still only this node's store and not yet the journal's
+/// materialization.
+pub struct Opened {
+    journal: RaftEngineJournal,
+    journal_root: PathBuf,
+    /// The projection's generation, matched to this node's identity.
+    pub generation: Generation,
+    cluster: ClusterId,
+    domain_id: DomainId,
+    replica: ReplicaId,
+    incarnation: ReplicaIncarnation,
+}
+
+/// Open the journal and the projection, for `intent`.
 ///
 /// The order is the durability order. The journal is opened first
-/// because it is the authority; the projection is attached to it, which
-/// is where the two frontiers are checked against each other and the
-/// journal's suffix is replayed into the projection. Nothing is served
-/// until that has happened: a projection that has not caught up with the
-/// journal has forgotten transitions this node already acknowledged.
+/// because it is the authority; the projection is then opened (or, for
+/// `coordd init`, created) under this node's identity, and handed back
+/// unattached. Attaching it is [`Opened::attach`].
 pub fn open_storage(
     config: &Config,
     intent: Intent,
@@ -184,7 +200,7 @@ pub fn open_storage(
     domain_id: DomainId,
     replica: ReplicaId,
     incarnation: ReplicaIncarnation,
-) -> Result<Storage, StoreError> {
+) -> Result<Opened, StoreError> {
     let journal_root = root_path(&config.state_directory, &config.journal.root);
     let identity = JournalIdentity { cluster, replica };
     let options = JournalOptions::default();
@@ -232,50 +248,80 @@ pub fn open_storage(
     })?;
 
     let generation = open(config, intent, cluster, domain_id, replica, incarnation)?;
-    let directory = generation.directory().to_path_buf();
-    let (engine, _lock, _manifest) = generation.into_parts();
-
-    let boot = BootId(boot_of(replica, incarnation));
-    let mut store = JournaledStore::open(
+    Ok(Opened {
         journal,
+        journal_root,
+        generation,
         cluster,
+        domain_id,
         replica,
         incarnation,
-        boot,
-        JournalLimits::default(),
-    )
-    .map_err(|e| StoreError::Refused {
-        root: show(&journal_root),
-        reason: format!("{e:?}"),
-    })?;
-    // Shard 0 for the single-domain preview; task-j07 is where a node
-    // spreads domains over a shard set.
-    let shard = ShardId::new(0).expect("shard zero");
-    store
-        .attach(domain_id, shard, engine)
-        .map_err(|e| StoreError::Refused {
-            root: show(&directory),
-            reason: format!("the projection could not be attached to the journal: {e:?}"),
-        })?;
-
-    // A transition's ballot is in the epoch of the configuration its base
-    // names. The number and leader here are only what a process that
-    // never votes keeps: a voter hands the store its machine's ballot
-    // when it is built and on every ballot it moves to (`Voter::new`,
-    // `Voter::set_ballot`, through `Persistence::follow_ballot`), so
-    // nothing a voter records is stamped with this one.
-    let base = store.application_base(domain_id).expect("just attached");
-    let ballot = Ballot {
-        epoch: base.configuration,
-        number: 0,
-        leader: replica,
-    };
-    let domain = JournaledDomain::new(store, domain_id, ballot).expect("just attached");
-    Ok(Storage {
-        domain,
-        generation: directory,
-        boot,
     })
+}
+
+impl Opened {
+    /// Attach the projection to the journal.
+    ///
+    /// This is where the two frontiers are checked against each other
+    /// and the journal's suffix is replayed into the projection. Nothing
+    /// is served until that has happened: a projection that has not
+    /// caught up with the journal has forgotten transitions this node
+    /// already acknowledged.
+    pub fn attach(self) -> Result<Storage, StoreError> {
+        let Opened {
+            journal,
+            journal_root,
+            generation,
+            cluster,
+            domain_id,
+            replica,
+            incarnation,
+        } = self;
+        let directory = generation.directory().to_path_buf();
+        let (engine, _lock, _manifest) = generation.into_parts();
+
+        let boot = BootId(boot_of(replica, incarnation));
+        let mut store = JournaledStore::open(
+            journal,
+            cluster,
+            replica,
+            incarnation,
+            boot,
+            JournalLimits::default(),
+        )
+        .map_err(|e| StoreError::Refused {
+            root: show(&journal_root),
+            reason: format!("{e:?}"),
+        })?;
+        // Shard 0 for the single-domain preview; task-j07 is where a node
+        // spreads domains over a shard set.
+        let shard = ShardId::new(0).expect("shard zero");
+        store
+            .attach(domain_id, shard, engine)
+            .map_err(|e| StoreError::Refused {
+                root: show(&directory),
+                reason: format!("the projection could not be attached to the journal: {e:?}"),
+            })?;
+
+        // A transition's ballot is in the epoch of the configuration its base
+        // names. The number and leader here are only what a process that
+        // never votes keeps: a voter hands the store its machine's ballot
+        // when it is built and on every ballot it moves to (`Voter::new`,
+        // `Voter::set_ballot`, through `Persistence::follow_ballot`), so
+        // nothing a voter records is stamped with this one.
+        let base = store.application_base(domain_id).expect("just attached");
+        let ballot = Ballot {
+            epoch: base.configuration,
+            number: 0,
+            leader: replica,
+        };
+        let domain = JournaledDomain::new(store, domain_id, ballot).expect("just attached");
+        Ok(Storage {
+            domain,
+            generation: directory,
+            boot,
+        })
+    }
 }
 
 /// The journal an initialization created before it stopped, or

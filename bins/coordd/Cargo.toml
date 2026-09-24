@@ -45,6 +45,7 @@ jsonwebtoken.workspace = true
 coord-node-issuer.workspace = true
 coord-membership.workspace = true
 coord-session.workspace = true
+coord-store-api.workspace = true
 coord-sts.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

@@ -335,7 +335,8 @@ fn issued() -> (rcgen::Certificate, rcgen::KeyPair, Vec<u8>, Vec<u8>) {
 }
 
 fn verified(config: &IdentityConfig) -> Result<(), IdentityError> {
-    let identity = load(config, CLUSTER, DOMAIN, Vec::new()).expect("the credentials load");
+    let identity =
+        load(config, CLUSTER, DOMAIN, Vec::new(), Class::Peer, None).expect("the credentials load");
     coord_daemon::identity::verify(&identity, config)
 }
 
@@ -352,6 +353,8 @@ fn a_certificate_is_an_identity_only_if_the_bundle_issued_it_and_the_key_is_its_
         trust_bundle: write(&dir, "issuer.pem", &pem("CERTIFICATE", ca.der()), 0o644),
         node_certificate: write(&dir, "leaf.pem", &leaf, 0o644),
         node_key: write(&dir, "leaf.key", &key, 0o600),
+        collector_certificate: None,
+        collector_key: None,
     };
     assert_eq!(verified(&good), Ok(()));
 

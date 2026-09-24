@@ -172,6 +172,49 @@ pub fn load(
     })
 }
 
+/// Check that `identity` is one this domain vouches for: its leaf chains
+/// to its own trust bundle, and its private key is the leaf's.
+///
+/// The node's replica and incarnation are read out of its certificate,
+/// so the certificate is only an identity once something trusted issued
+/// it. A self-signed leaf that merely claims a voter's node URI would
+/// otherwise open, or initialize, that voter's store before any peer ever
+/// saw the handshake that would have refused it; and a leaf whose key
+/// this process does not hold would pass every local check and fail only
+/// at the first handshake, where it reads as a peer problem. `config`
+/// names the files, for the refusal.
+pub fn verify(identity: &LocalIdentity, config: &IdentityConfig) -> Result<(), IdentityError> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let not_issued = |reason: String| IdentityError::NotIssuedByTrustBundle {
+        path: config.node_certificate.clone(),
+        reason,
+    };
+    let (leaf, intermediates) = identity.chain.split_first().ok_or(IdentityError::Empty {
+        what: "node certificate",
+        path: config.node_certificate.clone(),
+    })?;
+    // The same verifier the transport authenticates peers with, so a
+    // certificate this accepts is one every peer holding the same bundle
+    // accepts too.
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(identity.roots.clone(), provider.clone())
+            .build()
+            .map_err(|e| not_issued(e.to_string()))?;
+    verifier
+        .verify_client_cert(leaf, intermediates, UnixTime::now())
+        .map_err(|e| not_issued(e.to_string()))?;
+    let mismatch = || IdentityError::KeyDoesNotMatchCertificate {
+        path: config.node_key.clone(),
+    };
+    let certified =
+        CertifiedKey::from_der(identity.chain.clone(), identity.key.clone_key(), &provider)
+            .map_err(|_| mismatch())?;
+    // `from_der` lets through a key whose public half it cannot derive;
+    // here that is a question that must be answered, so an unknown is a
+    // refusal too.
+    certified.keys_match().map_err(|_| mismatch())
+}
+
 /// The credential this process presents when it dials another voter as
 /// this domain's collector.
 ///

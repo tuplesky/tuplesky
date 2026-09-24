@@ -100,6 +100,8 @@ fn main() -> ExitCode {
         placed.membership.cluster(),
         placed.membership.domain(),
         Vec::new(),
+        coord_transport::Class::Api,
+        Some(placed.replica),
     )
     .and_then(|identity| coord_daemon::verify_identity(&identity, &config.identity))
     {
@@ -115,7 +117,7 @@ fn main() -> ExitCode {
     );
 
     if let Some(Command::Init) = cli.command {
-        return match store::open_storage(
+        let opened = store::open_storage(
             &config,
             store::Intent::Initialize,
             placed.membership.cluster(),
@@ -123,16 +125,19 @@ fn main() -> ExitCode {
             placed.replica,
             placed.incarnation,
         );
-        let mut generation = match opened {
-            Ok(generation) => generation,
-            // An initialization that created the generation and stopped
+        let mut opened = match opened {
+            Ok(opened) => opened,
+            // An initialization that created the projection and stopped
             // before it pinned the manifest is finished here rather than
-            // refused: the generation has never been served, since a start
-            // refuses an unpinned store, so there is no history to lose,
-            // and refusing both commands would leave the node with no way
-            // forward but deleting its store by hand.
+            // refused: the store has never been served, since a start
+            // refuses an unpinned one, so there is no history to lose, and
+            // refusing both commands would leave the node with no way
+            // forward but deleting its store by hand. (One that stopped
+            // before the projection existed at all is finished by
+            // `store::open_storage` itself, which reuses the journal it
+            // left.)
             Err(already @ store::StoreError::AlreadyInitialized { .. }) => {
-                match store::open(
+                match store::open_storage(
                     &config,
                     store::Intent::Serve,
                     placed.membership.cluster(),
@@ -141,10 +146,10 @@ fn main() -> ExitCode {
                     placed.incarnation,
                 )
                 .ok()
-                .and_then(|mut generation| {
-                    (genesis::unfinished(&mut generation) == Some(true)).then_some(generation)
+                .and_then(|mut opened| {
+                    (genesis::unfinished(&mut opened.generation) == Some(true)).then_some(opened)
                 }) {
-                    Some(generation) => generation,
+                    Some(opened) => opened,
                     None => {
                         eprintln!("{already}");
                         return ExitCode::from(2);
@@ -156,11 +161,18 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        return match genesis::check(
-            &mut generation,
+        // Pinned before the projection is attached to the journal, so an
+        // initialization that stops at any point after this is a
+        // finished one: attaching is what every start does anyway.
+        if let Err(e) = genesis::check(
+            &mut opened.generation,
             &placed.manifest,
             genesis::Intent::Initialize,
         ) {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+        return match opened.attach() {
             Ok(storage) => {
                 println!("initialized {}", storage.generation.display());
                 ExitCode::SUCCESS
@@ -182,7 +194,7 @@ fn main() -> ExitCode {
     // The store is opened before a listener exists. A process that bound
     // first would accept connections it could not serve, and a caller
     // cannot tell that from one it is merely slow to answer.
-    let storage = match store::open_storage(
+    let mut opened = match store::open_storage(
         &config,
         store::Intent::Serve,
         placed.membership.cluster(),
@@ -190,6 +202,28 @@ fn main() -> ExitCode {
         placed.replica,
         placed.incarnation,
     ) {
+        Ok(o) => o,
+        Err(e) => {
+            lifecycle.quarantine(QuarantineReason::Disk);
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    // The store is this node's only under the manifest it was
+    // initialized with. Anything else -- another set of voters, another
+    // policy, under the same cluster and domain -- is a genesis
+    // quarantine, not a new configuration to adopt. It is settled on the
+    // projection before the journal replays anything into it.
+    if let Err(e) = genesis::check(
+        &mut opened.generation,
+        &placed.manifest,
+        genesis::Intent::Serve,
+    ) {
+        lifecycle.quarantine(e.quarantine_reason());
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    let storage = match opened.attach() {
         Ok(s) => s,
         Err(e) => {
             lifecycle.quarantine(QuarantineReason::Disk);

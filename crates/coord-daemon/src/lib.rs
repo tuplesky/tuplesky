@@ -79,7 +79,7 @@ pub use diagnostics::{Diagnostics, Redacted};
 pub use fanout::{
     Dispatched, LocalIngress, NotQueued, PeerFanOut, Queued, Route, Saturated, dispatch,
 };
-pub use identity::{IdentityError, load as load_identity};
+pub use identity::{IdentityError, load as load_identity, verify as verify_identity};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use mailbox::{Ingress, IngressBudget, LocalRoute};

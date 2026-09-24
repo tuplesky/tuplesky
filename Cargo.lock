@@ -1088,6 +1088,7 @@ dependencies = [
  "coord-state",
  "coord-storage",
  "coord-storage-redb",
+ "coord-store-api",
  "coord-sts",
  "coord-transport",
  "coord-types",
