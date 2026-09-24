@@ -356,6 +356,16 @@ impl Opened {
     /// caught up with the journal has forgotten transitions this node
     /// already acknowledged.
     pub fn attach(self) -> Result<Storage, StoreError> {
+        self.attach_between(|| Ok(()))
+    }
+
+    /// [`Opened::attach`], running `between` after an adoption's first
+    /// durable write and before its second -- the one point where a stop
+    /// decides whether the next start can finish it.
+    fn attach_between(
+        self,
+        between: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<Storage, StoreError> {
         let Opened {
             mut store,
             journal_root,
@@ -368,7 +378,14 @@ impl Opened {
         } = self;
         let generation = match adoption {
             None => generation,
-            Some(adoption) => adopt(&mut store, &journal_root, domain_id, generation, adoption)?,
+            Some(adoption) => adopt(
+                &mut store,
+                &journal_root,
+                domain_id,
+                generation,
+                adoption,
+                between,
+            )?,
         };
         let directory = generation.directory().to_path_buf();
         let (engine, _lock, _manifest) = generation.into_parts();
@@ -462,6 +479,7 @@ fn adopt(
     domain_id: DomainId,
     generation: Generation,
     adoption: Adoption,
+    between: impl FnOnce() -> Result<(), StoreError>,
 ) -> Result<Generation, StoreError> {
     let Adoption {
         previous,
@@ -478,6 +496,7 @@ fn adopt(
             root: show(journal_root),
             reason: format!("this node's journal stream could not be carried forward: {e:?}"),
         })?;
+    between()?;
     let refused = |e| match e {
         OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
             StoreError::NotInitialized { root: show(&root) }
@@ -570,4 +589,161 @@ fn root_path(state_directory: &str, root: &str) -> PathBuf {
         return path.to_path_buf();
     }
     Path::new(state_directory).join(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A configuration whose store lives under `dir`, with a genesis
+    /// policy to record (so the journal holds something a fresh stream
+    /// would be missing).
+    fn config(dir: &Path) -> Config {
+        Config::parse(&format!(
+            r#"config_version = 2
+role = "voter-frontend-observer"
+cluster_manifest = "{root}/genesis.json"
+cluster_endpoints = "{root}/endpoints.bin"
+domain = "control-plane-test"
+state_directory = "{root}"
+
+[listen]
+api_quic = "127.0.0.1:0"
+peer_quic = "127.0.0.1:0"
+
+[capability]
+writer_queue_bytes = 16777216
+buffer_bytes_per_subscription = 8388608
+max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+shards = 1
+
+[identity]
+trust_bundle = "{root}/roots.pem"
+node_certificate = "{root}/node.pem"
+node_key = "{root}/node.key"
+collector_certificate = "{root}/collector.pem"
+collector_key = "{root}/collector.key"
+
+[sts]
+issuer = "https://sts.test"
+resource = "control-plane-test"
+jwks = "{root}/sts-jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
+
+[[grant]]
+principal = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+"#,
+            root = dir.display()
+        ))
+        .expect("config")
+    }
+
+    fn workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("coordd-store-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("workspace");
+        dir
+    }
+
+    const CLUSTER: ClusterId = ClusterId([0xc1; 16]);
+    const DOMAIN: DomainId = DomainId([0xd0; 16]);
+    const REPLICA: ReplicaId = ReplicaId([1; 16]);
+
+    fn incarnation(n: u64) -> ReplicaIncarnation {
+        ReplicaIncarnation::new(n).expect("incarnation")
+    }
+
+    fn serve(config: &Config, at: u64) -> Result<Opened, StoreError> {
+        open_storage(
+            config,
+            Intent::Serve,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(at),
+        )
+    }
+
+    /// A replacement that stops after the first of its two durable
+    /// writes finishes on the next start, on the same journal.
+    ///
+    /// The stop is made between the two writes themselves, whichever
+    /// order they are in: were the manifest advanced first, this stop
+    /// would leave the root at the new generation with the stream still
+    /// keyed to the old one, the next start would find nothing pending,
+    /// allocate a fresh stream and refuse the projection as materialized
+    /// past it. A replacement is not reachable through `coordd` while the
+    /// genesis pin admits no change (see `genesis`), so this is where the
+    /// order is held.
+    #[test]
+    fn an_adoption_stopped_between_its_two_writes_finishes_on_the_next_start() {
+        let dir = workspace("adopt-between");
+        let config = config(&dir);
+
+        let recorded = {
+            let opened = open_storage(
+                &config,
+                Intent::Initialize,
+                CLUSTER,
+                DOMAIN,
+                REPLICA,
+                incarnation(1),
+            )
+            .expect("init");
+            let mut storage = opened.attach().expect("attach");
+            crate::write_genesis_policy(&config, &mut storage, incarnation(1)).expect("policy");
+            storage
+                .domain
+                .store()
+                .frontiers(DOMAIN)
+                .expect("frontiers")
+                .durable()
+        };
+        assert!(recorded.get() > 0, "the journal recorded nothing");
+
+        let opened = serve(&config, 2).expect("open at the next generation");
+        assert!(opened.adoption.is_some(), "no adoption was pending");
+        let stopped = opened.attach_between(|| {
+            Err(StoreError::Refused {
+                root: "test".into(),
+                reason: "stopped between the two writes".into(),
+            })
+        });
+        assert!(
+            matches!(&stopped, Err(StoreError::Refused { reason, .. }) if reason == "stopped between the two writes"),
+            "the start did not stop where this test stops it: {:?}",
+            stopped.err()
+        );
+
+        let storage = serve(&config, 2)
+            .expect("reopen at the next generation")
+            .attach()
+            .expect("the next start did not finish the adoption");
+        let durable = storage
+            .domain
+            .store()
+            .frontiers(DOMAIN)
+            .expect("frontiers")
+            .durable();
+        assert!(
+            durable >= recorded,
+            "the adoption came back on a stream without what was recorded: {durable:?} < {recorded:?}"
+        );
+        drop(storage);
+
+        // And it is finished: the root has moved to the new generation, so
+        // the credential it replaced is fenced.
+        assert!(
+            serve(&config, 1).is_err(),
+            "the replaced generation could still open the store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

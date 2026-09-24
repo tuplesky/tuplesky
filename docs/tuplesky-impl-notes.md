@@ -1340,3 +1340,34 @@ replaces its key, and asserts the same invocation gets the same command
 identifier and the same outcome afterwards -- and then puts the retired
 credential back and asserts the node refuses to start and `inspect`
 names it `state=stale committed=2 presented=1`.
+
+### The genesis pin stays strict, so a replacement waits for its path
+
+The genesis pin (task-43-compose) and the replacement above collided: a
+replacement here was committed by handing the node an edited
+`genesis.json` whose voter entry moved to the next incarnation with its
+new key, and the pin quarantines any manifest but the one the node was
+initialized under. A stopgap that let the pin admit a "forward move of
+existing voters" was tried and reverted. It changed voter keys under an
+unchanged epoch, while the design binds exact voter incarnations to the
+epoch and names key replacement a committed lifecycle transition
+(Sections 10.5, 20.4); it was per node and unauthenticated, since the
+manifest is read as plain JSON and whoever can write the file could
+rotate a key on that node; and its re-pin wrote to the projection before
+`attach`, the shape the identity-record note above records as wrong.
+
+So the pin admits nothing, and the two end-to-end replacement tests are
+marked pending the committed reconfiguration path. What they drove
+stays: adoption is still reported as pending by `open_storage` and
+carried out by `Opened::attach` after the pin has been checked, stream
+first and manifest second, and
+`store::tests::an_adoption_stopped_between_its_two_writes_finishes_on_the_next_start`
+stops a real adoption between those two writes and shows the next start
+finishes it. Swapping the two writes makes that test fail, which is the
+regression it is there for; the end-to-end test that obstructs the
+checkpoint directory stops only after both writes.
+
+A gap the pin does not cover: nothing in `coordd` verifies the
+manifest's signature (`verify_genesis` has no caller), so `init` pins
+whatever file it is handed. With a strict pin that is a bootstrap-time
+gap only, and it is recorded in the task-58 plan entry.

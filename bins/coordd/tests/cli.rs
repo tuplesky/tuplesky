@@ -3118,19 +3118,17 @@ fn genesis_of_incarnation(dir: &Path, voter_one_key: &[u8], incarnation: u64) {
     .expect("write manifest");
 }
 
-/// A replacement interrupted between its two durable steps finishes on
+/// A replacement whose first start fails after it has begun finishes on
 /// the next start instead of quarantining the node.
 ///
-/// Adoption carries the journal's stream forward and advances the
-/// projection's manifest, and the generation to carry the stream from is
-/// recorded only in the manifest. With the manifest advanced first, any
-/// failure before the stream was carried -- here, a checkpoint directory
-/// that cannot be opened -- left a manifest that had moved and a stream
-/// that had not; the next start had nothing to carry from, allocated a
-/// fresh stream, and refused the projection as materialized past it.
+/// The start here stops at the checkpoint directory, which is opened
+/// after both of the adoption's durable writes; a stop *between* those
+/// two writes is `store::tests::an_adoption_stopped_between_its_two_writes_finishes_on_the_next_start`,
+/// which is where their order is held while no replacement can reach
+/// `coordd` end to end.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "a replacement is committed here by editing genesis.json, which the genesis pin (task-j08) now quarantines; it needs a committed reconfiguration path to be exercised end to end"]
-async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_start() {
+#[ignore = "pending a committed reconfiguration path: a key replacement is a committed lifecycle transition (design Section 20.4), and the genesis pin admits no edited manifest, so it cannot be driven through coordd yet"]
+async fn a_replacement_whose_first_start_fails_finishes_on_the_next_start() {
     let dir = workspace("replace-interrupted");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
     genesis_of(&dir, 1, Some(&ca.node_spki));
@@ -3202,7 +3200,7 @@ async fn a_replacement_interrupted_between_its_two_steps_finishes_on_the_next_st
 /// cloned or restored from *before* a replacement is not the current
 /// replica at all, and serving from it is a replaced voter voting.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "a replacement is committed here by editing genesis.json, which the genesis pin (task-j08) now quarantines; it needs a committed reconfiguration path to be exercised end to end"]
+#[ignore = "pending a committed reconfiguration path: a key replacement is a committed lifecycle transition (design Section 20.4), and the genesis pin admits no edited manifest, so it cannot be driven through coordd yet"]
 async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_not() {
     let dir = workspace("replace");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
