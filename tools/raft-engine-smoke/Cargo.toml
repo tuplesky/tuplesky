@@ -1,0 +1,21 @@
+[package]
+name = "raft-engine-smoke"
+description = "Build/feature audit and postcard codec smoke test for the pinned raft-engine candidate (task-01)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# Audit tool: not a production artifact and not the task-j02 journal adapter.
+role = "tool"
+
+[dependencies]
+raft-engine.workspace = true
+postcard.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

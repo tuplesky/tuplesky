@@ -1,0 +1,6 @@
+# Workspace-local cargo configuration (task-01).
+[alias]
+xtask = "run --quiet --package xtask --"
+
+[build]
+# Keep warnings visible; CI promotes them to errors through `cargo xtask lint`.

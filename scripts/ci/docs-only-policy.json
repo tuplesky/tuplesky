@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "description": "Reviewed allowlist of non-executable documentation paths (design Section 12.4.1). A change set is documentation-only when every changed path, including both sides of a rename, matches one of these anchored regular expressions. Anything else, including this policy, the classifier, workflows, specs, fixtures, manifests and lockfiles, requires the heavy CI jobs.",
+  "documentation_paths": [
+    "^README\\.md$",
+    "^LICENSE\\.md$",
+    "^docs/[A-Za-z0-9._-]+\\.md$",
+    "^docs/design/[A-Za-z0-9._-]+\\.md$",
+    "^docs/build/[A-Za-z0-9._-]+\\.md$",
+    "^\\.github/PULL_REQUEST_TEMPLATE\\.md$"
+  ]
+}

@@ -1,0 +1,106 @@
+# Reusable Rust/Go build-test workflow (task-01, design Sections 12.4.1 and 16).
+#
+# Every job uses the locked resolution and the exact toolchains recorded in
+# rust-toolchain.toml and adapters/kine/go.mod. Jobs are added here as their
+# implementation tasks land; nothing advertises an unimplemented suite.
+name: build-test
+
+on:
+  workflow_call:
+    inputs:
+      full:
+        description: "Scheduled/manual full run: also build release artifacts"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: adapters/kine/go.mod
+          cache-dependency-path: adapters/kine/go.sum
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+          cargo --version && rustc --version
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: ${{ matrix.arch }}
+      - name: Install checksummed tools (cargo-deny, cargo-nextest)
+        run: python3 scripts/ci/install_tools.py --skip-npm
+      - name: Verify tool versions
+        run: cargo xtask check-tools --skip-npm
+      - name: Format
+        run: cargo xtask fmt --check
+      - name: Lint
+        run: cargo xtask lint
+      - name: Dependency policy (advisories, licenses, bans, sources, roles, feature audit)
+        run: cargo xtask check-deps
+      - name: Test
+        run: cargo xtask test ${{ inputs.full && '--extended' || '' }}
+      - name: Record compiler and feature trees
+        run: |
+          rustc -Vv
+          cargo tree --workspace --locked -e features --depth 1 | head -200
+
+  msrv:
+    name: minimum supported rust version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install declared MSRV toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: msrv
+      - name: Check the workspace with the MSRV
+        run: cargo xtask msrv
+
+  go:
+    name: go (adapters/kine)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: adapters/kine/go.mod
+          cache-dependency-path: adapters/kine/go.sum
+      - name: Verify module checksums
+        working-directory: adapters/kine
+        run: go mod verify && test -z "$(gofmt -l .)"
+      - name: Vet and test
+        working-directory: adapters/kine
+        run: go vet ./... && go test -count=1 -race ./...
