@@ -527,7 +527,7 @@ fn report_metrics(
         // Nothing has been recorded before the first turn, but which
         // stages this daemon records is already known, and the ones it
         // does not are stated as such rather than as zeroes.
-        stages: serve::recorder().snapshot_stages(roles),
+        stages: serve::recorder(roles.votes()).snapshot_stages(roles),
         lanes,
         shards,
         durability: Measure::Unavailable(Unavailable::NotInstrumented),

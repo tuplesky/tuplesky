@@ -601,8 +601,18 @@ pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 3] = [
 
 /// A recorder for this daemon: nothing observed yet, and the stages it
 /// does not instrument stated as such.
-pub fn recorder() -> coord_daemon::metrics::Recorder {
-    coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED)
+///
+/// What is instrumented follows what runs here, not the roles alone. The
+/// journal and materialization points are the voter's node's, so a
+/// process with no voter (`voting` false) records neither, and reports
+/// both as not instrumented rather than as observed zeroes -- which they
+/// would be the day its serving applier materializes something.
+pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
+    if voting {
+        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED)
+    } else {
+        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED[..1])
+    }
 }
 
 /// Where this node's local recovery images live, and when it makes one.
@@ -633,7 +643,7 @@ struct Housekeeping {
 impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Compose `frontend` over `backing`.
     pub fn new(frontend: Frontend, mut backing: Backing<P>, budgets: Budgets) -> Self {
-        let recorder = std::sync::Arc::new(recorder());
+        let recorder = std::sync::Arc::new(recorder(matches!(backing, Backing::Voting(_))));
         if let Backing::Voting(voter) = &mut backing {
             voter
                 .node_mut()
@@ -1824,5 +1834,46 @@ mod tests {
             None,
             "replica 9 is not a committed voter of this domain"
         );
+    }
+
+    /// The stages a recorder reports as instrumented follow what runs
+    /// in the process. An observer journals and materializes its own
+    /// storage, so both stages apply to it, but only a voter's node
+    /// records them; without a voter they are not instrumented, not
+    /// observed zeroes.
+    #[test]
+    fn journal_and_materialization_are_instrumented_only_where_a_voter_records_them() {
+        use coord_daemon::metrics::{Measure, Stage, Unavailable};
+        use coord_daemon::role::RoleSet;
+
+        let reading = |voting: bool, roles: &str, stage: Stage| {
+            super::recorder(voting)
+                .snapshot_stages(&RoleSet::parse(roles).expect("roles"))
+                .into_iter()
+                .find(|r| r.stage == stage)
+                .expect("every stage is reported")
+                .metrics
+        };
+        for stage in [Stage::Journal, Stage::Materialization] {
+            assert!(
+                matches!(
+                    reading(true, "voter-frontend-observer", stage),
+                    Measure::Observed(_)
+                ),
+                "{stage:?} is recorded by a voter"
+            );
+            for roles in ["frontend-observer", "observer"] {
+                assert_eq!(
+                    reading(false, roles, stage),
+                    Measure::Unavailable(Unavailable::NotInstrumented),
+                    "{stage:?} reported as observed with no voter to record it ({roles})"
+                );
+            }
+        }
+        // Admission is the frontend's, and is recorded wherever one runs.
+        assert!(matches!(
+            reading(false, "frontend-observer", Stage::Admission),
+            Measure::Observed(_)
+        ));
     }
 }

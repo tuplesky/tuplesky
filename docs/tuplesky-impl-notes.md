@@ -1605,7 +1605,12 @@ served a write reported zero journal and materialization work. So a
 frontend decides a caller's frame, and the journal and materialization
 where the voter's node flushes a round and applies a command. Every
 other stage, and every lane count and wait, is `NotInstrumented` until
-something measures it.
+something measures it. Which stages are instrumented follows what runs
+in the process, not the role set: an observer journals and
+materializes its own storage, so those stages apply to it, but only a
+voter's node records them, and a process with no voter reports them as
+`NotInstrumented` rather than as the observed zeroes the review found
+again for frontend-only and observer-only daemons.
 
 ### Bounded labels have to be bounded by the type
 
