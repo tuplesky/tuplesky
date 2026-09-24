@@ -23,7 +23,7 @@ pub mod lifecycle;
 pub mod manifest;
 
 pub use engine::{RedbEngine, RedbReader, RedbView, RedbWrite};
-pub use lifecycle::{Generation, OpenError, OpenOptions, StoreIdentity};
+pub use lifecycle::{Generation, OpenError, OpenOptions, RootLock, StoreIdentity};
 pub use manifest::StoreManifestV1;
 
 /// Crate role marker used by the dependency-policy check.
