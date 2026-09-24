@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.4.  
 **Date:** 2026-09-17.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 92 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05` and `task-q01` suffixes and prerequisites are preserved. Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 94 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c02`, `task-c03` and `task-q01` suffixes and prerequisites are preserved. Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -152,6 +152,8 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-m03](#task-m03) | Connect observer staging to sealed handoff and activation | task-m01, task-o02, task-57, task-j04 |
 | [task-m04](#task-m04) | Implement conservative regional placement and quorum tuning | task-m03, task-m02 |
 | [task-m05](#task-m05) | Qualify client-aware membership under mixed failures | task-m02, task-m03, task-m04, task-58 |
+| [task-c02](#task-c02) | Repair lost frontend evidence, and complete a half-held command from the durable record (contract revision 2) | task-23, task-33, task-62 |
+| [task-c03](#task-c03) | Give the collector boundary its own monotonic clock | task-33, task-37 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64 |
 
 ## Task specifications
@@ -1365,6 +1367,30 @@ Include the evidence-conditioned handoff recovery branches and the explicit five
 A surviving three-voter majority progresses only after required leader recovery, and only through a valid available path. Until redundancy is restored it has no further voter-failure margin; observers cannot substitute as voters. Report that interval and degraded latency.
 
 **Review boundary:** No absolute availability when required authority is unavailable; DR is separately declared workflow.
+
+<a id="task-c02"></a>
+### task-c02: Repair lost frontend evidence, and complete a half-held command from the durable record (contract revision 2)
+
+**Prerequisites:** task-23, task-33, task-62.  
+**Design:** Sections 3.2, 4.3, 4.4, 5.1.
+
+**Implement:** A voter that learns a command from a peer acknowledges it before any submission has told its frontend which collector asked; the frontend holds such evidence for a while and lets it go, and a submission arriving afterwards was refused as a duplicate with no effects, so the collector was one voter short for ever on a command the domain had executed -- and when that voter was the leader, unable to learn at all. Keep, in each machine, exactly what it published to the frontend for each command it still remembers (context, required barriers, bytes), bounded by the command table's live records and tombstones and never by a count of unrelated commands. On an exact duplicate -- the retry key's binding, the canonical request, the admission facts and the acknowledged floor all as accepted -- publish it again to the frontend only, through the same outbox, so the boot fence, the durable prerequisites and the promise are judged at release as they were the first time; release in the same step. Refuse, with a named reason that changes nothing about the command, when the replica is fenced, the retained ballot is not the configured one, the batch is not yet durable (the original is still queued), the batch failed, nothing was published this boot, the command is forgotten, or a per-boot cap is reached. Split `AlreadyInitialized` from `PayloadConflict`; a presentation under other facts is a conflict, never a replay. Nothing is recomputed, voted, persisted or executed again. In the collector, complete a command that holds half of what a release needs -- the predicate without the release, or the release without the predicate -- from the durable retry record of its execution on the collector's own node, the same committed state that answers a caller's retry before anything is submitted: the record must name the command, and must agree with a held release on digest and bytes. Never from nothing; never counted as a vote. Move the runtime's parked-evidence bookkeeping (`coord_daemon::parked`) and the record lookup (`coord_daemon::settle`) out of the serving loop, with the instant as an input, so the hold expiring and the depth crowding out are schedules a test produces rather than waits for.
+
+**Acceptance:** A late exact duplicate repairs the identified failure at a follower and at the leader and lets the collector finish under the existing predicate and release gate, with no peer sends, no second execution and no vote counted twice. A duplicate before durability adds no copy and the original still goes; after a failed batch nothing is replayed; a fenced replica replays nothing; other facts under the same identity are a conflict. Repairs of one command are bounded per boot and the bound is per command. Retention survives table pressure for unresolved work and is gone after a restart. Forcing the replay cache past what the table remembers exercises the record path: the collector completes from its own node's record, and a record that disagrees with a held release settles nothing and is reported. All-voter targeting and majority availability are unchanged. An in-process three-voter schedule over real stores, the real voter door, the real parked bookkeeping and the real collector (`coord-daemon/tests/repair.rs`) lets the parked evidence expire, and separately lets the depth crowd it out with no time passing, delivers the duplicate afterwards and shows the collector learn and release from the republished evidence alone; a refused repair (the per-boot bound spent) is followed by the record path completing the same request, and a lost release is completed the same way from the counted votes. Negative control: reverting the duplicate path to no effects fails the core regression (the same schedule with the repair's output discarded leaves the caller waiting).
+
+**Review boundary:** Delivery repair and record settlement only. No change to the learning predicate, the leader release gate or what evidence a command is established on. The runtime's hold and depth for unplaced evidence are performance controls, not the recoverability boundary. Peer retransmission and reliable end-to-end delivery are not claimed.
+
+<a id="task-c03"></a>
+### task-c03: Give the collector boundary its own monotonic clock
+
+**Prerequisites:** task-33, task-37.  
+**Design:** Sections 3.2, 9.3.
+
+**Implement:** `ClockHealth.now` is Unix seconds, and it is what validates a token's `exp`, `nbf`, `iat`, age and uncertainty; the collector's request deadlines add `deadline_ms` to it, so a nominal 1,500 ms deadline is 1,500 seconds. Do not change `ClockHealth`: it is the authentication clock and its units are load-bearing there. Give the collector boundary a distinct monotonic millisecond reading -- a small named type, not another ambiguous `now_ticks` -- for request deadlines and repeat scheduling, injected into the deterministic logic rather than read inside it, so submission, retry attachment and expiration share one time base that wall-clock steps cannot move. Wiring `expire()` into the serving loop, with timeout responses and caller-stream cleanup, is a behaviour change of its own and is named as such, not an incidental part of the unit fix.
+
+**Acceptance:** A 1,500 ms deadline is not expired immediately before it and is at it; subsecond deadlines work; a wall-clock jump with no monotonic progress expires nothing; the existing zero-deadline behaviour is preserved. A caller's timeout never cancels accepted work or releases its outstanding obligation: expiration reports and retains.
+
+**Review boundary:** Clock inputs at one boundary. Authentication time semantics are untouched.
 
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report

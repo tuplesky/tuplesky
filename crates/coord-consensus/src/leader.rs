@@ -85,8 +85,31 @@ pub enum Rejection {
         /// Command bound first.
         bound: CommandId,
     },
-    /// The same command was already proposed; nothing changed.
+    /// The same command was presented again under the same facts. Not a
+    /// fault: the reply this leader already published for it is offered
+    /// to the submitter again (task-c02).
     Duplicate(CommandId),
+    /// The retry key is bound to this command, but the presentation
+    /// carries other admission facts or another acknowledged floor. The
+    /// identity is shared; the request is not, and nothing is replayed
+    /// for it.
+    RequestFactsConflict {
+        /// Command.
+        command: CommandId,
+        /// Digest of the facts this leader proposed the command under.
+        accepted: Digest32,
+    },
+    /// The command table holds this command under another payload
+    /// digest. Nothing is replayed for it.
+    PayloadConflict(CommandId),
+    /// An exact duplicate could not repair delivery of this leader's
+    /// reply, and why. The command itself is unaffected.
+    ReplayRefused {
+        /// Command.
+        command: CommandId,
+        /// Why.
+        why: crate::replay::ReplayRefusal,
+    },
     /// The command table is full.
     Backpressure,
     /// A proposal batch was definitely rejected and is being presented
@@ -204,6 +227,11 @@ pub struct Leader {
     speculation: Speculation,
     rejections: Vec<Rejection>,
     fenced: Option<FenceReason>,
+    /// The reply this leader published to the frontend for each command
+    /// it still remembers, kept so an exact duplicate submission can
+    /// offer it to the submitter again (task-c02). Never recovered: the
+    /// outbox it went through is this boot's.
+    replay: crate::replay::EvidenceStore,
 }
 
 impl Leader {
@@ -240,6 +268,7 @@ impl Leader {
         );
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
+            replay: crate::replay::EvidenceStore::new(config.capacity),
             config,
             boot: None,
             alloc: None,
@@ -343,6 +372,7 @@ impl Leader {
             speculation: Speculation::new(),
             rejections: Vec::new(),
             fenced: None,
+            replay: crate::replay::EvidenceStore::new(state.capacity),
         };
         let _ = identity;
         // Dependency order among the entries: a command follows every
@@ -917,7 +947,18 @@ impl Leader {
             self.rejections.push(Rejection::MalformedRequest);
             return Vec::new();
         };
-        // Identity: one retry key binds one payload, first presentation wins.
+        let payload = PayloadRecordV1 {
+            retry_key: request.retry_key,
+            logical: request.logical.as_slice().to_vec(),
+            admission,
+            ack_through: request.ack_through,
+        };
+        // Identity: one retry key binds one payload, first presentation
+        // wins. The same identity again is a duplicate only if the facts
+        // beside it -- the attested admission and the acknowledged floor
+        // -- are the ones this leader proposed it under; and a duplicate
+        // is answered rather than ignored, because the submitter
+        // presenting it may never have received this leader's reply.
         match self.bindings.get(&request.retry_key) {
             Some(bound) if *bound != command => {
                 self.rejections.push(Rejection::RequestIdentityConflict {
@@ -927,17 +968,28 @@ impl Leader {
                 return Vec::new();
             }
             Some(_) => {
-                self.rejections.push(Rejection::Duplicate(command));
-                return Vec::new();
+                let accepted = self
+                    .payloads
+                    .get(&command)
+                    .map(PayloadRecordV1::admission_digest);
+                return match accepted {
+                    Some(accepted) if accepted == payload.admission_digest() => {
+                        self.rejections.push(Rejection::Duplicate(command));
+                        self.repair_evidence(command)
+                    }
+                    Some(accepted) => {
+                        self.rejections
+                            .push(Rejection::RequestFactsConflict { command, accepted });
+                        Vec::new()
+                    }
+                    None => {
+                        self.rejections.push(Rejection::Duplicate(command));
+                        Vec::new()
+                    }
+                };
             }
             None => {}
         }
-        let payload = PayloadRecordV1 {
-            retry_key: request.retry_key,
-            logical: request.logical.as_slice().to_vec(),
-            admission,
-            ack_through: request.ack_through,
-        };
         // Atomic initialization: admission binding, conservative
         // dependencies, path evidence and index publication in one
         // transition.
@@ -951,8 +1003,16 @@ impl Leader {
                 self.rejections.push(Rejection::Backpressure);
                 return Vec::new();
             }
-            Err(InitError::AlreadyInitialized | InitError::PayloadConflict) => {
+            // The table compared the digest: `AlreadyInitialized` is an
+            // exact duplicate whose binding was not kept, and
+            // `PayloadConflict` is not a duplicate at all.
+            Err(InitError::AlreadyInitialized) => {
+                self.bindings.insert(request.retry_key, command);
                 self.rejections.push(Rejection::Duplicate(command));
+                return self.repair_evidence(command);
+            }
+            Err(InitError::PayloadConflict) => {
+                self.rejections.push(Rejection::PayloadConflict(command));
                 return Vec::new();
             }
         };
@@ -1018,19 +1078,33 @@ impl Leader {
                 frame: ProtocolMessage::Proposal(proposal.clone()).encode(),
             });
         }
+        let reply = ProtocolMessage::LeaderReply {
+            ballot,
+            command,
+            seqnum,
+            deps: init.deps.clone(),
+            path: init.path,
+        }
+        .encode();
         outbox.publish(PendingSend {
             context,
             requires: alloc::vec![barrier],
             to: self.config.frontend,
-            frame: ProtocolMessage::LeaderReply {
-                ballot,
-                command,
-                seqnum,
-                deps: init.deps.clone(),
-                path: init.path,
-            }
-            .encode(),
+            frame: reply.clone(),
         });
+        // The frontend's copy is the one a submission can ask for again
+        // (task-c02).
+        self.replay.retain(
+            command,
+            crate::replay::RetainedEvidence {
+                barrier,
+                ballot,
+                context,
+                requires: alloc::vec![barrier],
+                frame: reply,
+            },
+            &self.table,
+        );
         // The leader's own acknowledgement counts toward learning later.
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
@@ -1175,19 +1249,31 @@ impl Leader {
                 frame: ProtocolMessage::Proposal(ack.clone()).encode(),
             });
         }
+        let reply = ProtocolMessage::LeaderReply {
+            ballot,
+            command,
+            seqnum,
+            deps,
+            path,
+        }
+        .encode();
         outbox.publish(PendingSend {
             context,
             requires: alloc::vec![barrier],
             to: self.config.frontend,
-            frame: ProtocolMessage::LeaderReply {
-                ballot,
-                command,
-                seqnum,
-                deps,
-                path,
-            }
-            .encode(),
+            frame: reply.clone(),
         });
+        self.replay.retain(
+            command,
+            crate::replay::RetainedEvidence {
+                barrier,
+                ballot,
+                context,
+                requires: alloc::vec![barrier],
+                frame: reply,
+            },
+            &self.table,
+        );
         self.rejections.push(Rejection::ProposalRetried(command));
         alloc::vec![Effect::Persist(batch)]
     }
@@ -1246,6 +1332,57 @@ impl Leader {
         self.outbox
             .as_mut()
             .map_or_else(Vec::new, |o| o.release(&promised))
+    }
+
+    /// Offer the submitter the reply this leader already published for
+    /// `command`, because a submission naming it arrived again.
+    ///
+    /// A leader learns of a command it never received a submission for
+    /// the same way a follower does -- a peer's acknowledgement names it
+    /// and the payload is transferred -- and replies to a frontend that
+    /// does not yet know which collector asked. The leader's reply is
+    /// the one piece of evidence every learning predicate requires, so
+    /// a collector that lost it is not one voter short but unable to
+    /// learn at all. The same reply is published again, to the frontend
+    /// only, through the same outbox and under the same gates, and
+    /// released here (task-c02). Not a proposal attempt: nothing is
+    /// persisted, and the fence on repeated persistence is not touched.
+    fn repair_evidence(&mut self, command: CommandId) -> Vec<Effect> {
+        let why = if self.boot.is_none() || !self.is_leading() {
+            crate::replay::ReplayRefusal::Fenced
+        } else {
+            let Some(outbox) = self.outbox.as_mut() else {
+                self.rejections.push(Rejection::ReplayRefused {
+                    command,
+                    why: crate::replay::ReplayRefusal::Fenced,
+                });
+                return Vec::new();
+            };
+            match self.replay.plan(
+                command,
+                outbox,
+                self.config.quorum.ballot(),
+                self.config.frontend,
+                &self.table,
+            ) {
+                Ok(sends) => {
+                    for send in sends {
+                        outbox.publish(send);
+                    }
+                    return self.release();
+                }
+                Err(why) => why,
+            }
+        };
+        self.rejections
+            .push(Rejection::ReplayRefused { command, why });
+        Vec::new()
+    }
+
+    /// How often `command`'s reply has been published again this boot
+    /// (diagnostic).
+    pub fn evidence_repairs(&self, command: &CommandId) -> u32 {
+        self.replay.repairs_of(command)
     }
 
     fn on_peer(&mut self, from: PeerId, frame: &[u8]) -> Vec<Effect> {

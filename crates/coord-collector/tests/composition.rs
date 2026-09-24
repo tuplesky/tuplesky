@@ -1483,6 +1483,7 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
             CollectorEvent::Evidence { .. } => "evidence",
             CollectorEvent::Held { .. } => "held",
             CollectorEvent::Released { .. } => "released",
+            CollectorEvent::SettledFromRecord { .. } => "settled-from-record",
             CollectorEvent::Cancelled { .. } => "cancelled",
             CollectorEvent::Resolved { .. } => "resolved",
             CollectorEvent::TimedOut { .. } => "timed-out",

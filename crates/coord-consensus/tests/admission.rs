@@ -179,10 +179,17 @@ fn a_fresh_receipt_on_a_retry_does_not_replace_what_was_accepted() {
         f.step(admitted(4, 99)).is_empty(),
         "nothing new is proposed for a command already accepted"
     );
+    // The same identity under other facts is a conflict, not a
+    // duplicate: nothing is replayed for it, because what this replica
+    // acknowledged was the first presentation and not this one
+    // (task-c02).
     assert_eq!(
         f.take_rejections(),
-        vec![FollowerRejection::Duplicate(command())],
-        "the retry is a duplicate, not an update"
+        vec![FollowerRejection::RequestFactsConflict {
+            command: command(),
+            accepted: bound.admission_digest(),
+        }],
+        "the retry is a conflict under other facts, not an update"
     );
     assert_eq!(
         f.payload(&command()).expect("still held").admission,

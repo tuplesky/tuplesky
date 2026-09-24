@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandTable, ConfigurationIdentity, FastAck,
     FenceReason, GuardViolation, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Phase,
-    ProtocolMessage, Rejection, ReplicaRole, SlowAck, VoteError, decode_dependency, decode_payload,
-    decode_proposal, dependency_key, payload_key, proposal_key,
+    ProtocolMessage, Rejection, ReplayRefusal, ReplicaRole, SlowAck, VoteError, decode_dependency,
+    decode_payload, decode_proposal, dependency_key, payload_key, proposal_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -377,9 +377,20 @@ fn reordered_and_duplicate_requests_cannot_bind_conflicting_payload() {
     );
     assert!(leader.proposal(&other).is_none());
     // The same request again (a retry, reordered after the conflict): no
-    // second proposal, no new sequence number.
+    // second proposal, no new sequence number. The reply is not repeated
+    // either, because its batch is not durable yet and the original is
+    // still queued (task-c02).
     assert!(leader.step(e1).is_empty());
-    assert_eq!(leader.take_rejections(), vec![Rejection::Duplicate(c1)]);
+    assert_eq!(
+        leader.take_rejections(),
+        vec![
+            Rejection::Duplicate(c1),
+            Rejection::ReplayRefused {
+                command: c1,
+                why: ReplayRefusal::NotYetDurable
+            }
+        ]
+    );
     assert_eq!(leader.proposal(&c1).unwrap().seqnum, 0);
     // A different retry key with the same logical payload is a distinct
     // command with its own proposal.

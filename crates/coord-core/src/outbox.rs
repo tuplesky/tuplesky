@@ -129,6 +129,12 @@ impl Outbox {
         self.durable.contains(barrier)
     }
 
+    /// Whether a barrier of this boot failed. A send requiring it was
+    /// dropped and will never release; neither would a repeat of it.
+    pub fn is_failed(&self, barrier: &BarrierId) -> bool {
+        self.failed.contains_key(barrier)
+    }
+
     /// Journal sequence the current boot has been reported durable through.
     pub fn durable_through(&self) -> LocalJournalSeq {
         self.durable_through

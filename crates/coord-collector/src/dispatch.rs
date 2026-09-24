@@ -425,6 +425,27 @@ impl Dispatcher {
         Ok(self.deliver(progress))
     }
 
+    /// Pending commands the collector holds half of a release for
+    /// (task-c02): the ones a durable record is consulted for.
+    pub fn half_established(&self) -> Vec<(CommandId, RetryKey)> {
+        self.collector.half_established()
+    }
+
+    /// Settle a half-held command from the durable record of its
+    /// execution on this node (task-c02).
+    pub fn settle_from_record(
+        &mut self,
+        command: CommandId,
+        result_digest: coord_types::identity::Digest32,
+        revision: Option<coord_types::ids::KvRevision>,
+        response: &[u8],
+    ) -> Result<Option<Delivery>, crate::collector::SettleError> {
+        let progress =
+            self.collector
+                .settle_from_record(command, result_digest, revision, response)?;
+        Ok(self.deliver(progress))
+    }
+
     fn deliver(&mut self, progress: Progress) -> Option<Delivery> {
         let Progress::Released(release) = progress else {
             return None;

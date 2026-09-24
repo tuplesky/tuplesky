@@ -47,6 +47,13 @@
 //! * [`pending`]: the request streams held open while the collector
 //!   establishes their results, matched to deliveries by invocation and
 //!   by the connection that asked.
+//! * [`parked`]: a voter's evidence for a command whose submitter it
+//!   does not know yet, held under a bounded window and depth that are
+//!   performance controls rather than correctness boundaries -- what is
+//!   let go is published again when the submission arrives (task-c02).
+//! * [`settle`]: completing what a collector half holds from this
+//!   node's own durable record of the command's execution, the same
+//!   record that answers a caller's retry (task-c02).
 //! * [`serve`]: what the serving loop does with one ingress -- whether
 //!   the stream the frame arrived on is answered, held, held and fanned
 //!   out, kept as a watch's output, or closed.
@@ -68,9 +75,11 @@ pub mod listen;
 pub mod mailbox;
 pub mod metrics;
 pub mod node;
+pub mod parked;
 pub mod pending;
 pub mod role;
 pub mod serve;
+pub mod settle;
 pub mod startup;
 pub mod supervise;
 pub mod voter;
