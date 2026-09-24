@@ -251,6 +251,25 @@ C2 has a single fast set.
 | Client-side learning (`swift/client.go` `accept`, `acceptFastAndSlowAck`) at the trusted collector | `coord-collector` `Collector::on_evidence` over `VoteSet::learned` (task-33); release additionally requires the leader's release gate | `[EXT]` on top of the source predicate; `spec/collector-v1.md` |
 | Kine collector epoch integration, observers | out of scope here | Sections 4.5, 6.6, 6.7; later tasks |
 
+## Quorum-certified checkpoint floors (task-52)
+
+Outside the paper entirely: SwiftPaxos says nothing about forgetting, and
+the prototype never trims. The protocol is modeled here because it rests
+on the same intersection argument the paper's quorums do, and because
+getting it wrong loses obligations rather than availability.
+
+| Item | Status | Where |
+|---|---|---|
+| `FloorCandidate`: configuration, executed prefix, subject digest | `[EXT]` | Section 5.3 |
+| `Readiness`: a durable promise never to vote from below a position, recorded only once the checkpoint it names is durably held | `[EXT]` | Section 5.3; possession alone certifies nothing |
+| `ReadinessLedger`: one row per voter; moves up, never down, never two subjects at one position | `[EXT]` | the rule uniqueness rests on |
+| `activate`: a majority of the configuration's voters, all for one candidate | `[EXT]` | Section 5.3 |
+| `discover`: the highest readiness a majority reports | `[EXT]` | the intersection is between two majorities of one voter set |
+| `FenceVerdict::Retained`: a message at or below a held floor is answered from the retained outcome | `[EXT]` | Section 5.3: pre-floor messages cannot resurrect forgotten state |
+| `FloorLedger`: the held floor, never lowered | `[EXT]` | Section 5.3 |
+| Ballot or leader as part of a floor | `[EXT]` rejected | a floor belongs to a configuration and outlives every term in it |
+| Copying a snapshot to a majority as activation | `[EXT]` rejected | Section 5.3, and the frozen counterexample |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the
@@ -271,6 +290,21 @@ with the guard enforced and deliberately removed. Frozen results live in
 * `guard_removed_counterexample.json`: the trace with the guard enforced
   (violation at the leader-evidence step) and removed (the oracle finds a
   command committed while its dependency is below ACCEPT).
+
+`crates/coord-consensus/tests/floor.rs` (task-52) does the same for the
+checkpoint floor: every assignment of a readiness script to each of
+three, four and five voters, every certification those promises allow,
+and every majority read of them.
+
+* `floor_scenarios.json`: the worlds explored, what was certified, the
+  positions at which two subjects were both certified (none) and the
+  majority reads that discovered less than a certified floor (none);
+* `floor_counterexamples.json`: the three rules removed one at a time --
+  a voter ready for two subjects at one position (two majorities certify
+  different state at one executed prefix), a recovery that reads one
+  report instead of a majority (it misses the floor), and possession
+  counted as readiness (a signer crashes and votes from a baseline the
+  cluster has forgotten below).
 
 ## Not claimed
 

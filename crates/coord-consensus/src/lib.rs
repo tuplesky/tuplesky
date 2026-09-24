@@ -78,6 +78,18 @@
 //!   guards, and re-acknowledge the new leader's proposals; roles convert
 //!   through [`role::RecoveredState`] so learned outcomes, execution
 //!   frontier and retries survive the change.
+//! * [`floor`] (task-52): quorum-certified checkpoint floors. A voter
+//!   records readiness only when it durably holds the checkpoint a
+//!   candidate names, and readiness is a promise never to vote from
+//!   below that position; a majority of the configuration's voters
+//!   certifies the floor; every permitted recovery reads a majority and
+//!   therefore intersects the signers, so it always discovers the
+//!   highest activated floor; a message at or below a held floor is
+//!   answered from the retained outcome rather than re-creating trimmed
+//!   rows. Discovery reads promises, not certificates: a signer
+//!   promised before any certificate existed and keeps the promise
+//!   whether or not it ever saw one. Nothing here consults a ballot: a floor belongs to a
+//!   configuration and outlives every term in it.
 //! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
 //!   rows and the postcard-encoded protocol messages of this increment.
 #![forbid(unsafe_code)]
@@ -88,6 +100,7 @@ extern crate alloc;
 pub mod ballot;
 pub mod campaign;
 pub mod commands;
+pub mod floor;
 pub mod follower;
 pub mod graph;
 pub mod leader;
@@ -109,6 +122,11 @@ pub use ballot::{
 };
 pub use campaign::Campaign;
 pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
+pub use floor::{
+    ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
+    FloorInstall, FloorLedger, FloorVoters, Readiness, ReadinessError, ReadinessLedger, activate,
+    discover,
+};
 pub use follower::{Follower, FollowerConfig, FollowerRejection, HeldProposal};
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,

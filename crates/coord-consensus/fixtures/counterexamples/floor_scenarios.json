@@ -1,0 +1,80 @@
+[
+  {
+    "voters": 3,
+    "worlds": 512,
+    "with_a_floor": 400,
+    "certified": [
+      [
+        4,
+        161
+      ],
+      [
+        4,
+        178
+      ],
+      [
+        9,
+        195
+      ]
+    ],
+    "contested": [],
+    "missed": 0,
+    "unidentified": 60,
+    "refusals": [
+      "Competing { held: FloorCandidate { epoch: ConfigurationEpoch(7), position: ExecutionPosition(4), subject: Digest32(a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1) } }",
+      "Regression { held: FloorCandidate { epoch: ConfigurationEpoch(7), position: ExecutionPosition(9), subject: Digest32(c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3) } }"
+    ]
+  },
+  {
+    "voters": 4,
+    "worlds": 4096,
+    "with_a_floor": 1943,
+    "certified": [
+      [
+        4,
+        161
+      ],
+      [
+        4,
+        178
+      ],
+      [
+        9,
+        195
+      ]
+    ],
+    "contested": [],
+    "missed": 0,
+    "unidentified": 192,
+    "refusals": [
+      "Competing { held: FloorCandidate { epoch: ConfigurationEpoch(7), position: ExecutionPosition(4), subject: Digest32(a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1) } }",
+      "Regression { held: FloorCandidate { epoch: ConfigurationEpoch(7), position: ExecutionPosition(9), subject: Digest32(c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3) } }"
+    ]
+  },
+  {
+    "voters": 5,
+    "worlds": 32768,
+    "with_a_floor": 23872,
+    "certified": [
+      [
+        4,
+        161
+      ],
+      [
+        4,
+        178
+      ],
+      [
+        9,
+        195
+      ]
+    ],
+    "contested": [],
+    "missed": 0,
+    "unidentified": 10500,
+    "refusals": [
+      "Competing { held: FloorCandidate { epoch: ConfigurationEpoch(7), position: ExecutionPosition(4), subject: Digest32(a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1) } }",
+      "Regression { held: FloorCandidate { epoch: ConfigurationEpoch(7), position: ExecutionPosition(9), subject: Digest32(c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3) } }"
+    ]
+  }
+]
