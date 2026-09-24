@@ -177,6 +177,16 @@ impl<P: Persistence> Voter<P> {
     /// ballot, and the store stamps what it records with its own, so the
     /// two are one value kept in two places: moving only this one would
     /// record every later promise and vote under the ballot before.
+    ///
+    /// Nothing in production calls this yet. The points where a voter
+    /// adopts a higher ballot are inside `coord-consensus` -- a
+    /// follower's `NewLeader`, and a promise row turning durable
+    /// (`PromiseOutcome::Promised`) -- and neither is surfaced to the
+    /// voter, so a promise for a higher ballot would still be stamped
+    /// with the one this voter was built at. Nothing in this build sends
+    /// `NewLeader`, so that cannot happen yet; the work that wires leader
+    /// election into the daemon has to call this on every adopted ballot
+    /// (the task-j08 plan entry records it).
     pub fn set_ballot(&mut self, ballot: Ballot) {
         self.ballot = ballot;
         self.node.applier_mut().store_mut().follow_ballot(ballot);
