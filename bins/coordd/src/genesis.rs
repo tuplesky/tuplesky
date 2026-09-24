@@ -22,6 +22,20 @@
 //! can be run again (the policy writes only the rows that are missing),
 //! and a generation that was never pinned has never been served, so it
 //! holds no history to lose.
+//!
+//! The pin admits no change, a voter's key replacement included. Design
+//! Section 20.4 makes that replacement a committed lifecycle transition,
+//! and the epoch binds exact voter incarnations (Section 10.5); a
+//! manifest whose keys moved under an unchanged epoch would let two
+//! honest replicas hold different memberships for the same epoch with no
+//! record that either is wrong. A replacement waits for the committed
+//! reconfiguration path, and until then an edited manifest is a genesis
+//! quarantine like any other.
+//!
+//! What the pin does not do is authenticate the manifest: `coordd` reads
+//! it as JSON and nothing here verifies its signature. The pin makes the
+//! manifest immutable after `init`; the manifest `init` pins is whatever
+//! file it was handed. That gap is recorded in the task-58 plan entry.
 
 use coord_daemon::{NodeJournal, Startup, StartupError, StoreGenesis};
 use coord_membership::genesis::GenesisManifest;

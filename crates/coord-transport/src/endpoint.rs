@@ -47,6 +47,9 @@ pub enum CloseCode {
     Timeout = 3,
     /// This endpoint is shutting down.
     Shutdown = 4,
+    /// The credential this connection was authenticated under reached
+    /// its end, or the connection reached its age cap (task-58).
+    Expired = 5,
 }
 
 /// Why a connection ended.
@@ -67,6 +70,14 @@ pub enum CloseReason {
     Shutdown,
     /// A newer connection took this lane's single slot.
     Replaced,
+    /// The credential this connection was authenticated under reached
+    /// its end, or the connection reached its age cap (task-58).
+    ///
+    /// Not a failure and not a refusal: the peer reconnects under
+    /// whatever it holds now, and is admitted or not on that. What is
+    /// deliberately impossible is carrying on without being asked
+    /// again.
+    Expired,
     /// The QUIC connection failed (redacted description).
     Transport(String),
 }
@@ -80,6 +91,7 @@ impl CloseReason {
             CloseReason::PeerClosed { .. } => CloseCode::Orderly,
             CloseReason::Shutdown => CloseCode::Shutdown,
             CloseReason::Replaced => CloseCode::Orderly,
+            CloseReason::Expired => CloseCode::Expired,
             CloseReason::Transport(_) => CloseCode::Orderly,
         }
     }
@@ -525,6 +537,30 @@ impl Shared {
         }
     }
 
+    /// How long this connection may live: the age cap, or the credential
+    /// it was authenticated under, whichever ends first (task-58;
+    /// design Section 10.4).
+    ///
+    /// A connection is a decision that was made once. Left alone it
+    /// would outlive the credential that made it, and a peer whose
+    /// certificate has been rotated away from -- or replaced after a
+    /// compromise -- would keep the link it already had. So the
+    /// credential's end is the connection's end, and the cap bounds
+    /// even a credential that outlives it.
+    fn credential_life(&self, conn: &quinn::Connection) -> Duration {
+        let cap = self.limits.max_connection_age;
+        let Ok(certs) = peer_certs(conn) else {
+            return cap;
+        };
+        let Some(expires_at) = self.binder.expires_at(&certs) else {
+            return cap;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Duration::from_secs(expires_at.saturating_sub(now)).min(cap)
+    }
+
     fn link(&self, key: LinkKey) -> Arc<Link> {
         self.links
             .lock()
@@ -918,6 +954,7 @@ impl Transport {
                     false,
                     &self.shared.limits.lanes[lane.index()],
                 );
+                spawn_expiry(&self.shared, &peer);
                 self.shared.register(peer.clone());
                 self.shared
                     .emit(TransportEvent::Connected {
@@ -1476,6 +1513,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
                 true,
                 &shared.limits.lanes[lane.index()],
             );
+            spawn_expiry(&shared, &peer);
             shared.register(peer.clone());
             shared
                 .emit(TransportEvent::Connected {
@@ -1765,6 +1803,33 @@ async fn read_uni(
             peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
         }
     }
+}
+
+/// Close `peer` when its credential ends or its age cap is reached
+/// (task-58).
+///
+/// Racing the connection's own close keeps the task's life the
+/// connection's life: a cap measured in hours would otherwise leave one
+/// sleeping task per connection ever made.
+fn spawn_expiry(shared: &Arc<Shared>, peer: &Arc<Peer>) {
+    let life = shared.credential_life(&peer.conn);
+    let peer = peer.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tokio::time::sleep(life) => {}
+            _ = peer.conn.closed() => return,
+        }
+        // Never over a reason already recorded: a connection that was
+        // closed for a protocol violation is reported as that, and the
+        // deadline merely arrived afterwards.
+        let mut recorded = peer.close_reason.lock().unwrap();
+        if recorded.is_none() {
+            *recorded = Some(CloseReason::Expired);
+        }
+        drop(recorded);
+        peer.conn
+            .close(VarInt::from_u32(CloseCode::Expired as u32), b"credential");
+    });
 }
 
 /// Close a connection that lost its lane slot.

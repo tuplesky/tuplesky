@@ -970,3 +970,102 @@ fn a_retired_stream_never_becomes_active_again() {
     assert!(err.is_definite(), "{err:?}");
     assert_eq!(err.error().class, JournalErrorClass::GuardRejected);
 }
+
+#[test]
+fn a_mapping_that_keeps_its_key_keeps_its_shard() {
+    // Only a changed key was checked against `adopts`, which compares the
+    // shard, so the same key under another shard slipped past: a stream's
+    // placement could be rewritten and survive a reopen, although an
+    // authorized replacement changes only the generation the stream
+    // serves.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (mut journal, allocator, streams) = create(&root, Arc::new(DefaultFileSystem), &[1]);
+    let mapping = *allocator.usable(streams[0].id).unwrap();
+    let elsewhere = ShardId::new(1).unwrap();
+    assert_ne!(mapping.shard, elsewhere);
+
+    let moved = StreamMappingV1 {
+        shard: elsewhere,
+        ..mapping
+    };
+    let err = journal
+        .persist_mapping(allocator.high_water(), &moved)
+        .unwrap_err();
+    assert!(err.is_definite(), "{err:?}");
+    assert_eq!(err.error().class, JournalErrorClass::GuardRejected);
+    // Re-persisting the mapping as it is changes nothing.
+    journal
+        .persist_mapping(allocator.high_water(), &mapping)
+        .expect("the same mapping is idempotent");
+
+    // A carried stream changes exactly its generation: the shard has to
+    // come along unchanged, before and after the adoption.
+    let later = StreamKey {
+        incarnation: ReplicaIncarnation::new(2).unwrap(),
+        ..mapping.key
+    };
+    let carried_elsewhere = StreamMappingV1 {
+        key: later,
+        shard: elsewhere,
+        ..mapping
+    };
+    let err = journal
+        .persist_mapping(allocator.high_water(), &carried_elsewhere)
+        .unwrap_err();
+    assert!(err.is_definite(), "{err:?}");
+    let carried = StreamMappingV1 {
+        key: later,
+        ..mapping
+    };
+    journal
+        .persist_mapping(allocator.high_water(), &carried)
+        .expect("an authorized replacement carries the stream forward");
+    let moved = StreamMappingV1 {
+        shard: elsewhere,
+        ..carried
+    };
+    let err = journal
+        .persist_mapping(allocator.high_water(), &moved)
+        .unwrap_err();
+    assert!(err.is_definite(), "{err:?}");
+
+    drop(journal);
+    let reopened = RaftEngineJournal::open_existing(&root, identity(), &options()).unwrap();
+    let (_, mappings) = reopened.mappings().unwrap();
+    assert_eq!(mappings, vec![carried], "only the generation moved");
+}
+
+#[test]
+fn a_carried_stream_opens_before_its_new_generation_has_written() {
+    // An authorized replacement carries the stream forward and only then
+    // appends under the new generation. A node that stops in between has a
+    // mapping at the new generation over a head the old one wrote, and the
+    // open check required the two to be equal, so the journal refused to
+    // open at all. A head past the mapping is still refused.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("j");
+    let (mut journal, allocator, mut streams) = create(&root, Arc::new(DefaultFileSystem), &[1]);
+    let records = streams[0].next(vec![transition(1, 16)]);
+    journal
+        .append_group(&group(vec![(barrier(1), streams[0].id, records)]))
+        .unwrap();
+    let mapping = *allocator.usable(streams[0].id).unwrap();
+    let carried = StreamMappingV1 {
+        key: StreamKey {
+            incarnation: ReplicaIncarnation::new(2).unwrap(),
+            ..mapping.key
+        },
+        ..mapping
+    };
+    journal
+        .persist_mapping(allocator.high_water(), &carried)
+        .expect("an authorized replacement carries the stream forward");
+    drop(journal);
+
+    let reopened = RaftEngineJournal::open_existing(&root, identity(), &options())
+        .expect("a carried stream whose new generation has not written yet opens");
+    let (_, mappings) = reopened.mappings().unwrap();
+    assert_eq!(mappings, vec![carried]);
+    assert_eq!(read_all(&reopened, streams[0].id).len(), 2);
+}

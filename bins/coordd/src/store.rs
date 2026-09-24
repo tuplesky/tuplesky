@@ -103,7 +103,7 @@ pub fn open(
     domain: DomainId,
     replica: ReplicaId,
     incarnation: ReplicaIncarnation,
-) -> Result<Generation, StoreError> {
+) -> Result<(Generation, Option<ReplicaIncarnation>), StoreError> {
     let root = config.state.root_path(&config.state_directory);
     let identity = StoreIdentity {
         cluster_id: cluster,
@@ -126,25 +126,54 @@ pub fn open(
                     reason: e.to_string(),
                 })?;
             }
-            Generation::create(&root, identity, options).map_err(|e| match e {
-                OpenError::AlreadyInitialized => {
-                    StoreError::AlreadyInitialized { root: show(&root) }
+            Generation::create(&root, identity, options)
+                .map_err(|e| match e {
+                    OpenError::AlreadyInitialized => {
+                        StoreError::AlreadyInitialized { root: show(&root) }
+                    }
+                    other => StoreError::Refused {
+                        root: show(&root),
+                        reason: format!("{other:?}"),
+                    },
+                })
+                .map(|g| (g, None))
+        }
+        Intent::Serve => {
+            // An authorized replacement keeps this node's durable state
+            // (task-58). `place` has already established that this
+            // certificate's generation is the *committed* voter's, so a
+            // root stamped with an earlier one belongs to this same
+            // replica before its key was replaced -- its journal,
+            // checkpoints and epoch metadata are exactly what the new
+            // generation comes back on. A root stamped *later* is the
+            // fencing case and is refused, so a clone restored from
+            // before a replacement still cannot serve.
+            //
+            // Nothing is adopted here. The generation is opened as it is
+            // stamped, and the adoption is only reported as pending: the
+            // genesis pin is checked on this generation before anything
+            // durable moves (`Opened::attach` carries the stream and then
+            // advances the manifest), so a manifest the node was not
+            // initialized under is refused while the store is still
+            // exactly as it was.
+            let not_there = |e| match e {
+                OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
+                    StoreError::NotInitialized { root: show(&root) }
                 }
                 other => StoreError::Refused {
                     root: show(&root),
                     reason: format!("{other:?}"),
                 },
-            })
+            };
+            let pending = Generation::adoption_pending(&root, identity).map_err(not_there)?;
+            let stamped = StoreIdentity {
+                incarnation: pending.unwrap_or(incarnation),
+                ..identity
+            };
+            let generation =
+                Generation::open_existing(&root, stamped, options).map_err(not_there)?;
+            Ok((generation, pending))
         }
-        Intent::Serve => Generation::open_existing(&root, identity, options).map_err(|e| match e {
-            OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
-                StoreError::NotInitialized { root: show(&root) }
-            }
-            other => StoreError::Refused {
-                root: show(&root),
-                reason: format!("{other:?}"),
-            },
-        }),
     }
 }
 
@@ -188,16 +217,33 @@ pub struct Storage {
 /// while it is still only this node's store and not yet the journal's
 /// materialization.
 pub struct Opened {
-    journal: RaftEngineJournal,
+    /// The journal-first coordinator, open over the journal with nothing
+    /// attached to it yet (and, for an authorized replacement, this
+    /// node's stream already carried forward).
+    store: JournaledStore<RaftEngineJournal, RedbEngine>,
     journal_root: PathBuf,
     /// The projection's generation, matched to this node's identity.
     pub generation: Generation,
-    cluster: ClusterId,
     domain_id: DomainId,
     replica: ReplicaId,
-    incarnation: ReplicaIncarnation,
+    boot: BootId,
     /// Where this node's local recovery checkpoints are published.
     checkpoint_root: PathBuf,
+    /// An authorized replacement's adoption, still to be made durable.
+    adoption: Option<Adoption>,
+}
+
+/// An authorized replacement this start comes back on (task-58), found
+/// by [`open_storage`] and carried out by [`Opened::attach`] -- after the
+/// genesis pin has been checked on the generation as it is stamped.
+struct Adoption {
+    /// The generation the root is stamped with.
+    previous: ReplicaIncarnation,
+    /// The projection root.
+    root: PathBuf,
+    /// This node's identity at the committed generation.
+    identity: StoreIdentity,
+    options: OpenOptions,
 }
 
 /// Open the journal and the projection, for `intent`.
@@ -260,17 +306,44 @@ pub fn open_storage(
         },
     })?;
 
-    let generation = open(config, intent, cluster, domain_id, replica, incarnation)?;
-    let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
-    Ok(Opened {
+    let boot = BootId(boot_of(replica, incarnation));
+    let store = JournaledStore::open(
         journal,
-        journal_root,
-        generation,
         cluster,
-        domain_id,
         replica,
         incarnation,
+        boot,
+        JournalLimits::default(),
+    )
+    .map_err(|e| StoreError::Refused {
+        root: show(&journal_root),
+        reason: format!("{e:?}"),
+    })?;
+
+    let (generation, pending) = open(config, intent, cluster, domain_id, replica, incarnation)?;
+    let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
+    let adoption = pending.map(|previous| Adoption {
+        previous,
+        root: config.state.root_path(&config.state_directory),
+        identity: StoreIdentity {
+            cluster_id: cluster,
+            domain_id,
+            replica_id: replica,
+            incarnation,
+        },
+        options: OpenOptions {
+            cache_bytes: config.state.cache_bytes,
+        },
+    });
+    Ok(Opened {
+        store,
+        journal_root,
+        generation,
+        domain_id,
+        replica,
+        boot,
         checkpoint_root,
+        adoption,
     })
 }
 
@@ -283,32 +356,40 @@ impl Opened {
     /// caught up with the journal has forgotten transitions this node
     /// already acknowledged.
     pub fn attach(self) -> Result<Storage, StoreError> {
+        self.attach_between(|| Ok(()))
+    }
+
+    /// [`Opened::attach`], running `between` after an adoption's first
+    /// durable write and before its second -- the one point where a stop
+    /// decides whether the next start can finish it.
+    fn attach_between(
+        self,
+        between: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<Storage, StoreError> {
         let Opened {
-            journal,
+            mut store,
             journal_root,
             generation,
-            cluster,
             domain_id,
             replica,
-            incarnation,
+            boot,
             checkpoint_root,
+            adoption,
         } = self;
+        let generation = match adoption {
+            None => generation,
+            Some(adoption) => adopt(
+                &mut store,
+                &journal_root,
+                domain_id,
+                generation,
+                adoption,
+                between,
+            )?,
+        };
         let directory = generation.directory().to_path_buf();
         let (engine, _lock, _manifest) = generation.into_parts();
 
-        let boot = BootId(boot_of(replica, incarnation));
-        let mut store = JournaledStore::open(
-            journal,
-            cluster,
-            replica,
-            incarnation,
-            boot,
-            JournalLimits::default(),
-        )
-        .map_err(|e| StoreError::Refused {
-            root: show(&journal_root),
-            reason: format!("{e:?}"),
-        })?;
         // The local checkpoint directory, and what the journal says the
         // baseline is. Both are read before the domain is attached: the
         // baseline is a fact of the stream, not of the projection, and an
@@ -370,6 +451,72 @@ impl Opened {
             boot,
         })
     }
+}
+
+/// Carry out an authorized replacement's adoption: the journal's stream
+/// first, then the projection's manifest, then the generation reopened
+/// under the committed identity.
+///
+/// The stream is carried *before* the projection's manifest is advanced,
+/// and that order is the whole of crash safety here. The generation to
+/// carry from is recorded only in the manifest, and advancing the
+/// manifest overwrites it: stream-then-manifest leaves, after a crash
+/// between them, a manifest still behind, so the next start reads the
+/// same generation and finishes (carrying the stream again is a no-op
+/// once it is this incarnation's). Manifest-then-stream left a manifest
+/// that had moved and a stream that had not, which the next start could
+/// not tell from a fresh node, and quarantined.
+///
+/// The stream is keyed by the incarnation that allocated it, so a
+/// replaced node would otherwise attach to a fresh stream whose durable
+/// head is zero while its projection is materialized far past that --
+/// the shape of a lost prefix, which `attach` refuses. Its records each
+/// carry the incarnation that wrote them, so nothing about provenance is
+/// blurred by keeping the stream.
+fn adopt(
+    store: &mut JournaledStore<RaftEngineJournal, RedbEngine>,
+    journal_root: &Path,
+    domain_id: DomainId,
+    generation: Generation,
+    adoption: Adoption,
+    between: impl FnOnce() -> Result<(), StoreError>,
+) -> Result<Generation, StoreError> {
+    let Adoption {
+        previous,
+        root,
+        identity,
+        options,
+    } = adoption;
+    // The root lock is the generation's; the manifest cannot be advanced
+    // while it is held.
+    drop(generation);
+    store
+        .adopt_stream(domain_id, previous)
+        .map_err(|e| StoreError::Refused {
+            root: show(journal_root),
+            reason: format!("this node's journal stream could not be carried forward: {e:?}"),
+        })?;
+    between()?;
+    let refused = |e| match e {
+        OpenError::NotInitialized | OpenError::MissingGeneration(_) => {
+            StoreError::NotInitialized { root: show(&root) }
+        }
+        other => StoreError::Refused {
+            root: show(&root),
+            reason: format!("{other:?}"),
+        },
+    };
+    if let Some(previous) = Generation::adopt(&root, identity).map_err(refused)? {
+        // On stdout, with the rest of the startup report: an adoption is
+        // a durable, one-way step and the operator who replaced the node
+        // is the one who has to see it.
+        println!(
+            "adopted this node's durable state from incarnation {} under {}",
+            previous.get(),
+            identity.incarnation.get()
+        );
+    }
+    Generation::open_existing(&root, identity, options).map_err(refused)
 }
 
 /// The journal an initialization created before it stopped, or
@@ -442,4 +589,161 @@ fn root_path(state_directory: &str, root: &str) -> PathBuf {
         return path.to_path_buf();
     }
     Path::new(state_directory).join(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A configuration whose store lives under `dir`, with a genesis
+    /// policy to record (so the journal holds something a fresh stream
+    /// would be missing).
+    fn config(dir: &Path) -> Config {
+        Config::parse(&format!(
+            r#"config_version = 2
+role = "voter-frontend-observer"
+cluster_manifest = "{root}/genesis.json"
+cluster_endpoints = "{root}/endpoints.bin"
+domain = "control-plane-test"
+state_directory = "{root}"
+
+[listen]
+api_quic = "127.0.0.1:0"
+peer_quic = "127.0.0.1:0"
+
+[capability]
+writer_queue_bytes = 16777216
+buffer_bytes_per_subscription = 8388608
+max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+shards = 1
+
+[identity]
+trust_bundle = "{root}/roots.pem"
+node_certificate = "{root}/node.pem"
+node_key = "{root}/node.key"
+collector_certificate = "{root}/collector.pem"
+collector_key = "{root}/collector.key"
+
+[sts]
+issuer = "https://sts.test"
+resource = "control-plane-test"
+jwks = "{root}/sts-jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
+
+[[grant]]
+principal = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+"#,
+            root = dir.display()
+        ))
+        .expect("config")
+    }
+
+    fn workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("coordd-store-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("workspace");
+        dir
+    }
+
+    const CLUSTER: ClusterId = ClusterId([0xc1; 16]);
+    const DOMAIN: DomainId = DomainId([0xd0; 16]);
+    const REPLICA: ReplicaId = ReplicaId([1; 16]);
+
+    fn incarnation(n: u64) -> ReplicaIncarnation {
+        ReplicaIncarnation::new(n).expect("incarnation")
+    }
+
+    fn serve(config: &Config, at: u64) -> Result<Opened, StoreError> {
+        open_storage(
+            config,
+            Intent::Serve,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(at),
+        )
+    }
+
+    /// A replacement that stops after the first of its two durable
+    /// writes finishes on the next start, on the same journal.
+    ///
+    /// The stop is made between the two writes themselves, whichever
+    /// order they are in: were the manifest advanced first, this stop
+    /// would leave the root at the new generation with the stream still
+    /// keyed to the old one, the next start would find nothing pending,
+    /// allocate a fresh stream and refuse the projection as materialized
+    /// past it. A replacement is not reachable through `coordd` while the
+    /// genesis pin admits no change (see `genesis`), so this is where the
+    /// order is held.
+    #[test]
+    fn an_adoption_stopped_between_its_two_writes_finishes_on_the_next_start() {
+        let dir = workspace("adopt-between");
+        let config = config(&dir);
+
+        let recorded = {
+            let opened = open_storage(
+                &config,
+                Intent::Initialize,
+                CLUSTER,
+                DOMAIN,
+                REPLICA,
+                incarnation(1),
+            )
+            .expect("init");
+            let mut storage = opened.attach().expect("attach");
+            crate::write_genesis_policy(&config, &mut storage, incarnation(1)).expect("policy");
+            storage
+                .domain
+                .store()
+                .frontiers(DOMAIN)
+                .expect("frontiers")
+                .durable()
+        };
+        assert!(recorded.get() > 0, "the journal recorded nothing");
+
+        let opened = serve(&config, 2).expect("open at the next generation");
+        assert!(opened.adoption.is_some(), "no adoption was pending");
+        let stopped = opened.attach_between(|| {
+            Err(StoreError::Refused {
+                root: "test".into(),
+                reason: "stopped between the two writes".into(),
+            })
+        });
+        assert!(
+            matches!(&stopped, Err(StoreError::Refused { reason, .. }) if reason == "stopped between the two writes"),
+            "the start did not stop where this test stops it: {:?}",
+            stopped.err()
+        );
+
+        let storage = serve(&config, 2)
+            .expect("reopen at the next generation")
+            .attach()
+            .expect("the next start did not finish the adoption");
+        let durable = storage
+            .domain
+            .store()
+            .frontiers(DOMAIN)
+            .expect("frontiers")
+            .durable();
+        assert!(
+            durable >= recorded,
+            "the adoption came back on a stream without what was recorded: {durable:?} < {recorded:?}"
+        );
+        drop(storage);
+
+        // And it is finished: the root has moved to the new generation, so
+        // the credential it replaced is fenced.
+        assert!(
+            serve(&config, 1).is_err(),
+            "the replaced generation could still open the store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

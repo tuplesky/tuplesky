@@ -63,4 +63,26 @@ pub trait IdentityBinder: Send + Sync {
         certs: &[CertificateDer<'_>],
         hello: &HelloV1,
     ) -> Result<BoundIdentity, BindError>;
+
+    /// When the credential this chain was admitted under stops being
+    /// valid, in unix seconds, where the binder can say (task-58).
+    ///
+    /// A connection is authenticated by a credential with an end, and
+    /// the end belongs to the credential rather than to the connection.
+    /// A peer that renews opens a new connection under the new leaf;
+    /// the warm one it holds under the old leaf is not thereby extended,
+    /// and is closed at the old leaf's deadline. Asking the binder
+    /// rather than reading the certificate here keeps one answer: the
+    /// component that decides a credential is acceptable is the one
+    /// that says how long it stays so.
+    ///
+    /// `None` means this binder does not answer, and the connection is
+    /// then bounded by [`Limits::max_connection_age`] alone -- a
+    /// weaker bound, never an unbounded one.
+    ///
+    /// [`Limits::max_connection_age`]: crate::Limits::max_connection_age
+    fn expires_at(&self, certs: &[CertificateDer<'_>]) -> Option<u64> {
+        let _ = certs;
+        None
+    }
 }

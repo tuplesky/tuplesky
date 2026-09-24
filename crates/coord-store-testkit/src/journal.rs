@@ -137,6 +137,14 @@ impl ModelJournal {
         self.streams.get(&stream).map_or(&[], |s| &s.records)
     }
 
+    /// Place a record at the head of a stream without validating it
+    /// against the durable head: a fault injection for tests of the
+    /// reader, which must refuse what the writer never would have
+    /// accepted. The record is durable and is read back like any other.
+    pub fn inject_record(&mut self, stream: StorageStreamId, record: JournalRecordV1) {
+        self.streams.entry(stream).or_default().records.push(record);
+    }
+
     /// What the next record of a stream must be. A stream with durable
     /// records continues their chain; an empty one expects genesis under
     /// the identity its durable mapping was allocated for, so the cluster,
@@ -144,13 +152,22 @@ impl ModelJournal {
     /// than against the record that is being validated. The mapping does
     /// not persist a replica, so that field is the record's own.
     fn expectation(&self, mapping: &StreamMappingV1, first: &JournalRecordV1) -> RecordExpectation {
+        // The mapping says which generation the stream currently serves,
+        // and the real journal decides the same way (task-58): they
+        // differ only where an authorized replacement carried the stream
+        // forward, and there the appends that follow carry the new
+        // generation while the prefix keeps the one that wrote it.
+        let serving = mapping.key.incarnation;
         match self
             .streams
             .get(&mapping.stream)
             .and_then(|s| s.records.last())
         {
             Some(last) => RecordExpectation {
-                origin: *last.origin(),
+                origin: coord_journal_api::record::RecordOrigin {
+                    incarnation: serving,
+                    ..*last.origin()
+                },
                 seq: last.seq().checked_next().expect("model head below maximum"),
                 predecessor: last.digest(),
             },
@@ -339,7 +356,16 @@ impl JournalEngine for ModelJournal {
             return Err(definite("high-water mark must cover the mapping"));
         }
         if let Some(existing) = self.mappings.get(&mapping.stream) {
-            if existing.key != mapping.key || existing.shard != mapping.shard {
+            // An authorized replacement carries the stream forward with
+            // the rest of the node's durable state (task-58); nothing
+            // else may move a mapping, and a mapping that keeps its key
+            // keeps its shard, here as in the real journal.
+            let moved = if existing.key == mapping.key {
+                existing.shard != mapping.shard
+            } else {
+                !existing.adopts(mapping)
+            };
+            if moved {
                 return Err(definite(
                     "mapping identity of an allocated stream cannot change",
                 ));

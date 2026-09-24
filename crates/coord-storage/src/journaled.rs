@@ -737,6 +737,51 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         Ok(stream)
     }
 
+    /// Carry this domain's stream forward to this incarnation after an
+    /// authorized key replacement (task-58; design Sections 10.4, 20.4).
+    ///
+    /// Call it before [`JournaledStore::attach`], and only where the
+    /// replacement has been established as committed -- the caller holds
+    /// that evidence, not this store. It looks for a durable mapping of
+    /// the same cluster and domain at `from`, and re-keys it to this
+    /// incarnation, persisting the mapping before it is used.
+    ///
+    /// Without this, a replaced node would allocate a fresh stream with
+    /// a durable head of zero while its projection is materialized well
+    /// past that, which `attach` refuses as a lost prefix -- so an
+    /// authorized replacement would cost the node everything it had. The
+    /// records already in the stream each carry the incarnation that
+    /// wrote them, so carrying the stream forward loses no provenance.
+    ///
+    /// `Ok(None)` means there was nothing to carry: either this
+    /// incarnation already owns the stream, or the node has no mapping
+    /// for this domain at all and `attach` will allocate one.
+    pub fn adopt_stream(
+        &mut self,
+        domain: DomainId,
+        from: ReplicaIncarnation,
+    ) -> Result<Option<StorageStreamId>, JournaledError> {
+        let current = StreamKey {
+            cluster: self.cluster,
+            domain,
+            incarnation: self.incarnation,
+        };
+        if self.allocator.lookup(&current).is_some() {
+            return Ok(None);
+        }
+        let previous = StreamKey {
+            cluster: self.cluster,
+            domain,
+            incarnation: from,
+        };
+        if self.allocator.lookup(&previous).is_none() {
+            return Ok(None);
+        }
+        let mapping = self.allocator.adopt(previous, current)?;
+        self.persist_mapping(&mapping)?;
+        Ok(Some(mapping.stream))
+    }
+
     fn persist_mapping(&mut self, mapping: &StreamMappingV1) -> Result<(), JournaledError> {
         self.journal
             .persist_mapping(self.allocator.high_water(), mapping)?;
@@ -760,6 +805,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             },
             predecessor: domain.head_digest,
         };
+        // The generation the last accepted record was written under.
+        // Nothing is known about the record at `M` beyond its digest, so
+        // the first replayed record may carry any generation up to the
+        // one the mapping serves; every record after it may not go
+        // below the record before it, within a page or across one.
+        let mut accepted = ReplicaIncarnation::ZERO;
         while domain.frontiers.materialized() < target {
             let page = journal.read_suffix(
                 domain.origin.stream,
@@ -773,7 +824,24 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
             let mut batch: Vec<Durable> = Vec::new();
             for record in page.records {
+                // A prefix written by an earlier generation of this same
+                // replica is this node's own history (task-58): an
+                // authorized key replacement carries the stream forward,
+                // so the records below the cut legitimately carry the
+                // generation that wrote them. Never a *later* one --
+                // that would be a stream that has moved past this node
+                // -- and never an *earlier* one than the record before
+                // it: a generation only ever advances, so a record that
+                // went back would be one a fenced generation wrote after
+                // its replacement, which is exactly what the fence is
+                // for. Either way the expectation is left where it was
+                // and the verification below refuses the record.
+                let written_at = record.origin().incarnation;
+                if written_at >= accepted && written_at <= domain.origin.incarnation {
+                    expect.origin.incarnation = written_at;
+                }
                 record.verify(&expect)?;
+                accepted = written_at;
                 expect = expect.after(&record)?;
                 batch.push(Durable {
                     barrier: None,
