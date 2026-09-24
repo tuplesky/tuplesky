@@ -1,0 +1,24 @@
+[package]
+name = "coord-journal-raft-engine"
+description = "Pinned raft-engine mapping of the shared journal contract: bounded postcard codec, durable stream metadata, synced group writes and fail-stop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+coord-core.workspace = true
+coord-journal-api.workspace = true
+raft-engine.workspace = true
+serde = { workspace = true, features = ["std"] }
+postcard.workspace = true
+
+[dev-dependencies]
+coord-store-api.workspace = true
+tempfile.workspace = true
