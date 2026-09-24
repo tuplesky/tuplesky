@@ -189,6 +189,52 @@ impl EstablishedResult {
     }
 }
 
+/// A result released to the trusted boundary (task-29; design Sections
+/// 4.5, 17.4): an established result together with the exact encoded
+/// response. It carries no events, credentials or tokens: those await
+/// irrevocable application whatever path released the result. A
+/// speculative release is produced by the release gate only when the
+/// complete learning predicate has determined the command, its closed
+/// predecessor order, its authorization and the exact result from durable
+/// evidence; a final release follows materialization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasedResult {
+    established: EstablishedResult,
+    response: Vec<u8>,
+    speculative: bool,
+}
+
+impl ReleasedResult {
+    /// Construct at the release gate (learning validation code). The
+    /// established result is the sealed evidence; `response` is the exact
+    /// encoding the client receives and `speculative` says whether it
+    /// precedes materialization.
+    pub const fn from_gate(
+        established: EstablishedResult,
+        response: Vec<u8>,
+        speculative: bool,
+    ) -> Self {
+        ReleasedResult {
+            established,
+            response,
+            speculative,
+        }
+    }
+
+    /// The established result.
+    pub const fn established(&self) -> &EstablishedResult {
+        &self.established
+    }
+    /// The exact encoded response.
+    pub fn response(&self) -> &[u8] {
+        &self.response
+    }
+    /// Whether the release preceded materialization.
+    pub const fn speculative(&self) -> bool {
+        self.speculative
+    }
+}
+
 /// Canonical trusted admission receipt (design Section 9.3): identity and
 /// relevant claims verified outside replicated execution, never a raw token.
 /// Only a verifier at the trusted boundary constructs it, through
