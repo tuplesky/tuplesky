@@ -151,7 +151,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-m01](#task-m01) | Define authoritative configuration discovery and epoch records | task-02, task-19 |
 | [task-c01](#task-c01) | Give the collector a submission delivery lifecycle (contract revision 3) | task-33, task-62 |
 | [task-m02](#task-m02) | Make Kine a full epoch-aware trusted collector | task-m01, task-33, task-48, task-c01 |
-| [task-m03](#task-m03) | Connect observer staging to sealed handoff and activation | task-m01, task-o02, task-57, task-j04 |
+| [task-m03](#task-m03) | Connect observer staging to sealed handoff and activation | task-m01, task-o02, task-57, task-j04, task-58 |
 | [task-m04](#task-m04) | Implement conservative regional placement and quorum tuning | task-m03, task-m02 |
 | [task-m05](#task-m05) | Qualify client-aware membership under mixed failures | task-m02, task-m03, task-m04, task-58, task-d01 |
 | [task-c02](#task-c02) | Repair lost frontend evidence, and complete a half-held command from the durable record (contract revision 2) | task-23, task-33, task-62 |
@@ -1339,7 +1339,7 @@ A question is asked only on an API-class connection this side dialed: on an acce
 <a id="task-m03"></a>
 ### task-m03: Connect observer staging to sealed handoff and activation
 
-**Prerequisites:** task-m01, task-o02, task-57, task-j04.  
+**Prerequisites:** task-m01, task-o02, task-57, task-j04, task-58.  
 **Design:** Sections 4.8, 10.3, 17.16.
 
 **Implement:** Integrate modeled seal/terminal/activation with non-voter readiness, shared journal/certificates, authoritative notifications and finalized-stream epoch links. Support replacement and 3→5/5→3.
@@ -1460,7 +1460,7 @@ task-s01, task-s02 feed the strict storage reference through task-07. Optional t
 
 G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacement/restore/upgrade through task-60 rather than merely all-voter task-51, and G6 task-66 including task-q01. Fixed-member observer previews may precede dynamic membership, but general production combines both. Code merged is not evidence that acceptance passed.
 
-**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption. The unenforced `max_request_bytes` bound is an open follow-up on task-c01. None of these changes the design: each is work the design already required and the plan had not named.
+**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption, and becomes a prerequisite of task-m03. The unenforced `max_request_bytes` bound is an open follow-up on task-c01. None of these changes the design: each is work the design already required and the plan had not named.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
