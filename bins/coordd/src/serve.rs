@@ -2722,55 +2722,25 @@ mod tests {
         ask_for_payloads_now, payload_batch_size, poll_api_first,
     };
 
-    /// Held evidence registers when it is due to be let go, and the turn
-    /// that deadline wakes lets it go and moves the deadline on.
+    /// Held evidence registers when it is due to be let go.
     ///
     /// The hold is applied only when a turn runs. Without a deadline an
     /// idle voter never runs one, so evidence parked just before the
     /// domain went quiet sat past the hold and `unclaimed` was not said
-    /// until unrelated traffic arrived. A deadline that stayed put after
-    /// its turn would instead wake the loop for ever.
+    /// until unrelated traffic arrived. What the domain registers is the
+    /// held evidence's own next expiry; that it is the oldest hold, and
+    /// moves on once the turn it wakes lets that evidence go, is tested
+    /// with the type itself in coord-daemon
+    /// (`the_next_expiry_is_the_oldest_hold_and_moves_on_when_it_goes`),
+    /// which is also the only crate allowed to mint the voter provenance
+    /// a held frame carries.
     #[test]
-    fn held_evidence_is_due_when_its_hold_runs_out_and_its_turn_lets_it_go() {
+    fn held_evidence_registers_its_own_next_expiry() {
         use super::{Deadline, PARKED_EVIDENCE, PARKED_HOLD};
-        use coord_types::identity::Digest32;
 
-        let t0 = std::time::Instant::now();
-        let command = |n: u8| coord_types::CommandId(Digest32([n; 32]));
-        let provenance = coord_core::event::PeerProvenance::from_local_voter(
-            ReplicaId([1; 16]),
-            ReplicaIncarnation::new(1).expect("positive"),
-        );
-        let mut parked = coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE);
+        let parked = coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE);
         assert_eq!(parked.next_deadline(), None, "nothing held, nothing due");
-        let later = t0 + std::time::Duration::from_millis(300);
-        parked.park(command(1), provenance, vec![1], t0);
-        parked.park(command(2), provenance, vec![2], later);
-        let due = t0 + PARKED_HOLD;
-        assert_eq!(parked.next_deadline(), Some(due), "due with the oldest");
-
-        // A turn before the deadline lets nothing go and leaves it.
-        let early = due - std::time::Duration::from_millis(1);
-        let routed = parked.route(early, |_| None);
-        assert!(routed.ready.is_empty());
-        assert_eq!(routed.unclaimed, 0);
-        assert_eq!(parked.next_deadline(), Some(due));
-
-        // The turn the deadline wakes lets the oldest go, as unclaimed,
-        // and the deadline moves on to the next oldest -- in the future.
-        let routed = parked.route(due, |_| None);
-        assert!(routed.ready.is_empty());
-        assert_eq!(routed.unclaimed, 1);
-        let next = parked.next_deadline().expect("one still held");
-        assert_eq!(next, later + PARKED_HOLD);
-        assert!(
-            next > due,
-            "a deadline in the past would wake the loop for ever"
-        );
-
-        // And once nothing is held nothing is due.
-        assert_eq!(parked.route(next, |_| None).unclaimed, 1);
-        assert_eq!(parked.next_deadline(), None);
+        assert_eq!(parked.next_deadline(), parked.next_expiry());
     }
 
     /// The peer plane's priority is a budget, not a licence.
