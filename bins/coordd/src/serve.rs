@@ -13,6 +13,8 @@
 //! do: a join that happened in several places would be several
 //! opportunities for one of them to answer the wrong caller.
 
+use std::collections::BTreeMap;
+
 use coord_authn::ClockHealth;
 use coord_checkpoint::local::LocalLimits;
 use coord_checkpoint::{LocalBaseline, LocalCheckpointStore};
@@ -89,6 +91,16 @@ pub struct Frontend {
     /// one. A frontend-only process has `None` here and reaches every
     /// voter over the wire.
     local: Option<LocalRoute>,
+    /// The output stream of every live watch, by the connection and the
+    /// client's own identifier for the subscription.
+    ///
+    /// A watch is the one shape whose stream outlives the frame that
+    /// opened it: the caller opens it once and the events, the progress
+    /// notifications and finally the close are written onto that same
+    /// stream for as long as the subscription lasts. So the responder is
+    /// kept here rather than in `pending`, which holds a stream until
+    /// one result arrives and then lets it go.
+    watches: BTreeMap<(u64, u64), Responder>,
     /// What the loop has done, for the readiness report. Counts, not
     /// contents: a diagnostic that carried a caller's data would be a
     /// disclosure by another name.
@@ -130,6 +142,15 @@ pub struct Counts {
     pub unreturnable: u64,
     /// Watches opened.
     pub watches: u64,
+    /// Frames written onto a watch's own stream: events, progress and
+    /// closes. A watch that was opened and never pumped is the
+    /// difference between this and `watches`.
+    pub watch_frames: u64,
+    /// Watches whose stream ended before the subscription did: the
+    /// caller stopped reading, or the connection went. The subscription
+    /// is forgotten with the stream; nothing is retained for a consumer
+    /// that is no longer there.
+    pub watches_lost: u64,
     /// Frames and effects this build has no loop for yet, counted rather
     /// than discarded so what arrives is visible.
     pub unserved: u64,
@@ -188,6 +209,7 @@ impl Frontend {
             membership,
             pending: Pending::new(),
             local,
+            watches: BTreeMap::new(),
             counts: Counts::default(),
         })
     }
@@ -828,6 +850,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     return;
                 }
             };
+            // Whatever applying produced for a watch goes out before
+            // this loop waits on anything: a subscriber is not an event
+            // source, so nothing will wake the loop on its behalf.
+            self.pump_watches(&ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS))
+                .await;
             // Two planes and one voter. The peer plane is polled first:
             // a vote, an adoption or a recovery summary from a peer is
             // the work that lets a caller's request finish, and a
@@ -870,7 +897,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         out.absorb(voter.execute()?);
         let provenance = voter.provenance();
         let did = !refused.is_empty() || !out.is_empty();
+        // A refusal at the voter's door is silent to the caller, whose
+        // stream is held for an answer that is not coming. The reason is
+        // a bounded enum, so this node says it rather than leaving an
+        // operator with a counter.
+        for why in &refused {
+            eprintln!("this voter refused a submission: {why:?}");
+        }
         self.frontend.counts.refused += refused.len() as u64;
+        // What the protocol machine itself refused. Drained every turn
+        // rather than left to grow: a refusal nobody reads is a list
+        // that lives as long as the process and a reason an operator
+        // never sees.
+        for why in voter.take_rejections() {
+            eprintln!("this voter's machine refused: {why}");
+        }
         self.carry(api, out, provenance);
         Ok(did)
     }
@@ -970,7 +1011,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // No route right now. The voter contributes nothing
                 // through this process until there is one; the quorum
                 // rule decides what that costs.
-                Some(Err(_)) | None => self.frontend.counts.unavailable += 1,
+                //
+                // Said, not only counted. A vote this node produced and
+                // could not send is the difference between a quorum
+                // that forms and one that does not, and it is invisible
+                // from every other node.
+                Some(Err(e)) => {
+                    eprintln!("this voter could not send to {}: {e:?}", hex4(&to.replica));
+                    self.frontend.counts.unavailable += 1;
+                }
+                None => {
+                    eprintln!("this voter has no peer plane to send on");
+                    self.frontend.counts.unavailable += 1;
+                }
             }
         }
         // Timers, read views and entropy are the runtime's, and this
@@ -1191,8 +1244,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Delivered::Unbound {
                 connection,
                 retry_key,
-                ..
+                reason,
             } => {
+                // Said on this node's log for the same reason a refused
+                // bind is: the caller is told only that it has no
+                // session, so an operator who cannot see why has nothing
+                // to go on.
+                eprintln!("a session was not established: {reason:?}");
                 if let Ok(responder) = self.frontend.pending.take(connection, &retry_key) {
                     drop(responder);
                 }
@@ -1281,6 +1339,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.backing.applier().hub(),
                     &policy,
                 );
+                // A refused binding is the one refusal an operator
+                // cannot diagnose from the outside: the caller is told
+                // only that it was refused, deliberately, because
+                // whether a token was wrong or merely late is not
+                // something an unbound caller may distinguish. The
+                // reason is a bounded enum with nothing of the caller
+                // in it, so this node says it on its own log.
+                if let coord_session::Ingress::Rejected(reason) = &ingress {
+                    eprintln!("a binding was refused: {reason:?}");
+                }
                 let decided = step(ingress, retry_key);
                 if matches!(decided, Step::Close { .. }) {
                     self.recorder.refused(Stage::Admission);
@@ -1302,6 +1370,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 for responder in self.frontend.pending.close(connection.0) {
                     drop(responder);
                 }
+                self.frontend.watches.retain(|(c, _), _| *c != connection.0);
             }
             // A voter answering a submission this process's collector
             // made. It is evidence, and it is counted by the identity
@@ -1405,7 +1474,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 let provenance = voter.provenance();
                 self.carry(api, out, provenance);
             }
-            Ok(Err(_)) => self.frontend.counts.refused += 1,
+            Ok(Err(why)) => {
+                eprintln!("this voter refused a collector's submission: {why:?}");
+                self.frontend.counts.refused += 1;
+            }
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
         }
     }
@@ -1454,15 +1526,213 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 counts.saturated += out.saturated() as u64;
                 counts.unavailable += out.unavailable() as u64;
             }
-            Step::Watch { .. } => {
-                // The watch's own stream, held for its lifetime. Pumping
-                // it is the next piece of this loop.
+            Step::Watch {
+                watch_id,
+                registration,
+            } => {
                 self.frontend.counts.watches += 1;
-                drop(responder);
+                self.open_watch(connection.0, watch_id, registration, responder)
+                    .await;
             }
             Step::Close { code, reason } => {
                 drop(responder);
                 transport.disconnect(connection, code, reason);
+            }
+        }
+    }
+
+    /// Take over the stream a watch was opened on: replay what the
+    /// registration named from a snapshot, then keep the stream for the
+    /// life of the subscription.
+    ///
+    /// The hub attached the watch at the frontier it had when the open
+    /// was decided and queued everything above it from that moment.
+    /// What is below the frontier is not the hub's to produce -- it is
+    /// history, and it is read here out of one pinned snapshot, in
+    /// revision order, into the same watch. Only when that is done does
+    /// the subscription become live, so the caller sees one gap-free
+    /// sequence across the handover rather than the live tail first and
+    /// the backlog after it.
+    ///
+    /// A replay that cannot be completed ends the subscription rather
+    /// than starting it live: a watch that silently began above its
+    /// requested revision would be a skipped change, which is exactly
+    /// what a resumable stream may not do.
+    async fn open_watch(
+        &mut self,
+        connection: u64,
+        watch_id: u64,
+        registration: coord_storage::watch::Registration,
+        mut responder: Responder,
+    ) {
+        let hub = self.backing.applier().hub().clone();
+        // The namespace the open named, from the frontend that admitted
+        // it. A watch this frontend does not know is not one this
+        // process may serve output for.
+        let Some(namespace) = self.frontend.frontend.watch_namespace(connection, watch_id) else {
+            self.frontend.counts.unserved += 1;
+            drop(responder);
+            return;
+        };
+        if let Some((from, through)) = registration.replay {
+            use coord_storage::watch::ReplayFromViewError;
+            use coord_types::wire_v1::WatchCloseReasonV1;
+            // One snapshot for the whole replay. Reading history out of
+            // several would be reading it at several execution points,
+            // and a watch that spanned them would be neither a complete
+            // history nor a resumable one.
+            let failure = match self.backing.applier().store().reader().snapshot() {
+                Err(e) => Some((WatchCloseReasonV1::SourceLost, format!("{e:?}"))),
+                Ok(gated) => match coord_storage::watch::replay_from_view(
+                    &hub,
+                    gated.view(),
+                    registration.id,
+                    namespace,
+                    from,
+                    through,
+                ) {
+                    Ok(()) => None,
+                    // The revision was retained when the hub attached
+                    // the watch and compacted before it was read. The
+                    // client is told which, because the two have
+                    // different resumptions: a compacted start needs a
+                    // fresh list, a lost source needs another replica.
+                    Err(ReplayFromViewError::Compacted { floor }) => Some((
+                        WatchCloseReasonV1::Compacted,
+                        format!("below the retention floor {}", floor.get()),
+                    )),
+                    Err(e) => Some((WatchCloseReasonV1::SourceLost, format!("{e:?}"))),
+                },
+            };
+            if let Some((reason, why)) = failure {
+                eprintln!("a watch could not be replayed from {}: {why}", from.get());
+                self.forget_watch(connection, watch_id, &hub);
+                let close = MessageV1::WatchClose(coord_types::wire_v1::WatchCloseV1 {
+                    watch_id,
+                    reason,
+                    last_complete_revision: None,
+                })
+                .encode()
+                .expect("bounded");
+                if responder.push(&close).await.is_ok() {
+                    self.frontend.counts.watch_frames += 1;
+                }
+                let _ = responder.finish();
+                return;
+            }
+        }
+        if let Some(displaced) = self
+            .frontend
+            .watches
+            .insert((connection, watch_id), responder)
+        {
+            // The frontend refuses a second open under a live
+            // identifier, so this cannot be a live subscription's
+            // stream. Ending it is still better than dropping it: a
+            // dropped stream is a reset, which a peer reads as a
+            // failure rather than an end.
+            self.frontend.counts.watches_lost += 1;
+            let _ = displaced.finish();
+        }
+    }
+
+    /// Cancel a watch at the hub and drain it, so both the hub and the
+    /// frontend forget the subscription.
+    ///
+    /// The frames the drain produces are discarded deliberately: this is
+    /// the path where the daemon has its own close to write, and a
+    /// client that received two closes for one watch would have to
+    /// decide which one to resume from.
+    fn forget_watch(&mut self, connection: u64, watch_id: u64, hub: &coord_storage::WatchHub) {
+        self.frontend
+            .frontend
+            .cancel_watch(connection, watch_id, hub);
+        self.frontend.watches.remove(&(connection, watch_id));
+    }
+
+    /// Move whatever the hub has for each live watch onto its stream.
+    ///
+    /// Called every time round the loop rather than when something looks
+    /// like it produced events. A revision reaches the hub from applying
+    /// a command, and a follower applies commands it learned from its
+    /// peers, which is not work this process's own turn reports; a pump
+    /// conditioned on local progress would deliver a follower's watches
+    /// only when that node happened to have business of its own.
+    ///
+    /// One bounded pump reads one fresh authorization barrier and
+    /// authorizes exactly the batches it selected under it, so a
+    /// permission lost mid-subscription stops the very next batch. The
+    /// loop repeats until the hub has nothing left, which is what makes
+    /// a backlog drain without waiting for the next event.
+    async fn pump_watches(&mut self, health: &ClockHealth) {
+        if self.frontend.watches.is_empty() {
+            return;
+        }
+        let hub = self.backing.applier().hub().clone();
+        let live: Vec<(u64, u64)> = self.frontend.watches.keys().copied().collect();
+        for (connection, watch_id) in live {
+            // Whether the subscription is over is the frontend's answer,
+            // not this map's: a client cancels on a stream of its own,
+            // and the close it was acknowledged with is written there.
+            let mut lost = false;
+            loop {
+                let policy = StorePolicySource {
+                    store: self.backing.applier().store(),
+                    budget: ViewBudget::default(),
+                };
+                let frames = self
+                    .frontend
+                    .frontend
+                    .pump_watch(health, connection, watch_id, &hub, &policy);
+                if frames.is_empty() {
+                    break;
+                }
+                let Some(responder) = self.frontend.watches.get_mut(&(connection, watch_id)) else {
+                    break;
+                };
+                let mut written = 0;
+                for frame in &frames {
+                    // A push completes when QUIC has room for it, so a
+                    // consumer that stopped reading blocks here rather
+                    // than accumulating. What it cannot do is block
+                    // forever: the responder's deadline ends the write,
+                    // and the subscription ends with it.
+                    if responder.push(frame).await.is_err() {
+                        lost = true;
+                        break;
+                    }
+                    written += 1;
+                }
+                self.frontend.counts.watch_frames += written;
+                if lost {
+                    break;
+                }
+            }
+            let ended = self
+                .frontend
+                .frontend
+                .watch_namespace(connection, watch_id)
+                .is_none();
+            if (lost || ended)
+                && let Some(responder) = self.frontend.watches.remove(&(connection, watch_id))
+            {
+                {
+                    if lost {
+                        // Nobody to deliver to. The subscription ends
+                        // with its stream: a hub that kept queueing for
+                        // it would be a queue filling on behalf of a
+                        // consumer that is gone.
+                        self.frontend.counts.watches_lost += 1;
+                        drop(responder);
+                        self.forget_watch(connection, watch_id, &hub);
+                    } else {
+                        // The close has already gone out on this stream,
+                        // or the client cancelled on another: either way
+                        // the subscription is over and the stream ends
+                        // orderly rather than as a reset.
+                        let _ = responder.finish();
+                    }
+                }
             }
         }
     }

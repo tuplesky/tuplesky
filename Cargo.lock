@@ -686,6 +686,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-harness"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "coord-authn",
+ "coord-membership",
+ "coord-node-issuer",
+ "coord-sts",
+ "coord-types",
+ "jsonwebtoken",
+ "postcard",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "x509-parser",
+]
+
+[[package]]
 name = "coord-journal-api"
 version = "0.1.0"
 dependencies = [
@@ -1040,6 +1061,28 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "coord-wan-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "coord-harness",
+ "coord-membership",
+ "coord-sdk",
+ "coord-session",
+ "coord-store-bench",
+ "coord-transport",
+ "coord-types",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.0",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

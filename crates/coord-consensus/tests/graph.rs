@@ -407,3 +407,59 @@ fn applied_synchronizations_are_not_taken_for_early_evidence() {
     assert!(!t.log(b"key").unwrap().applied().contains(&a));
     assert!(t.log(b"key").unwrap().applied().contains(&b));
 }
+
+/// A full table makes room from what it has finished, and only from
+/// that.
+///
+/// The rule the module states -- only executed records may be retired --
+/// says what may be forgotten. It does not say to forget nothing: a
+/// table that waited for someone to call `retire` would turn its
+/// capacity into a bound on how many commands a replica may execute for
+/// as long as it runs, and the caller of the next one would wait out its
+/// deadline against an idle cluster.
+#[test]
+fn a_full_table_reclaims_what_it_executed_and_nothing_else() {
+    let mut t = CommandTable::with_capacity(2);
+    t.initialize(cmd(0), payload(0), k("key")).unwrap();
+    t.initialize(cmd(1), payload(1), k("key")).unwrap();
+
+    // Nothing has finished, so nothing is reclaimable and the refusal
+    // stands: a record in PRE-ACCEPT is work this replica still owes.
+    assert_eq!(
+        t.initialize(cmd(2), payload(2), k("key")),
+        Err(InitError::Backpressure)
+    );
+    assert_eq!(t.len(), 2);
+    assert_eq!(t.reclaim(), 0);
+
+    // The first one executes. The next initialization needs no explicit
+    // retirement: the table makes room from it, and the new command
+    // still depends on the one that has not executed.
+    t.accept(cmd(0), t.record(&cmd(0)).unwrap().deps.clone())
+        .unwrap();
+    t.commit(cmd(0)).unwrap();
+    t.execute(cmd(0)).unwrap();
+    let third = t.initialize(cmd(2), payload(2), k("key")).unwrap();
+    assert_eq!(t.len(), 2, "the executed record made room for this one");
+    assert_eq!(third.deps, vec![cmd(1)]);
+
+    // And the retired command is still executed as far as anything that
+    // depends on it is concerned.
+    t.accept(cmd(1), t.record(&cmd(1)).unwrap().deps.clone())
+        .unwrap();
+    assert_eq!(t.phase_of(&cmd(0)), Some(Phase::Executed));
+    assert!(t.tombstones().contains(&cmd(0)));
+
+    // A table that never fills reclaims nothing: retirement is what a
+    // full table does, not a policy of forgetting as soon as possible.
+    let mut roomy = CommandTable::with_capacity(8);
+    roomy.initialize(cmd(0), payload(0), k("key")).unwrap();
+    roomy
+        .accept(cmd(0), roomy.record(&cmd(0)).unwrap().deps.clone())
+        .unwrap();
+    roomy.commit(cmd(0)).unwrap();
+    roomy.execute(cmd(0)).unwrap();
+    roomy.initialize(cmd(1), payload(1), k("key")).unwrap();
+    assert_eq!(roomy.phase_of(&cmd(0)), Some(Phase::Executed));
+    assert_eq!(roomy.len(), 2);
+}

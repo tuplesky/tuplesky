@@ -64,6 +64,34 @@ impl Machine {
         }
     }
 
+    /// Take what this machine refused since the last call, rendered.
+    ///
+    /// A machine records a refusal and carries on; nothing in the
+    /// protocol is owed to a frame it would not accept. But a refusal
+    /// that nobody reads is two problems: a list that grows for as long
+    /// as the process runs, and a caller whose stream is held for an
+    /// answer that was decided against and never sent. The driver
+    /// drains this every turn, so the list stays bounded and the reason
+    /// reaches the node's log.
+    ///
+    /// Rendered here rather than returned as two different enums,
+    /// because the two roles refuse different things and a caller of
+    /// this wants to say what happened, not to match on it.
+    pub fn take_rejections(&mut self) -> Vec<String> {
+        match self {
+            Machine::Leader(m) => m
+                .take_rejections()
+                .into_iter()
+                .map(|r| format!("{r:?}"))
+                .collect(),
+            Machine::Follower(m) => m
+                .take_rejections()
+                .into_iter()
+                .map(|r| format!("{r:?}"))
+                .collect(),
+        }
+    }
+
     /// Whether this replica currently leads.
     pub const fn leads(&self) -> bool {
         matches!(self, Machine::Leader(_))
@@ -248,6 +276,11 @@ impl<P: Persistence> Node<P> {
         &self.machine
     }
 
+    /// Take what the machine refused since the last call, rendered.
+    pub fn take_rejections(&mut self) -> Vec<String> {
+        self.machine.take_rejections()
+    }
+
     /// The applier (watch hub, reader, store).
     pub const fn applier(&self) -> &Applier<P> {
         &self.applier
@@ -396,20 +429,43 @@ impl<P: Persistence> Node<P> {
 
         let mut next = Vec::new();
         if persisted {
-            let store = self.applier.store_mut();
-            let outcome =
-                Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
-                    .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
-            // Indeterminate is not "failed": the group's outcome is
-            // unknown, so the caller reconciles rather than assuming
-            // either answer. It surfaces as an engine failure here so it
-            // cannot be mistaken for a clean round.
-            if outcome.indeterminate {
-                return Err(DriveError::Engine("group outcome indeterminate".into()));
-            }
-            for event in outcome.events {
-                self.outbox.observe(&event);
-                next.extend(self.machine.step(Event::Storage(event)));
+            // One lowering moves one group, and a group takes one batch
+            // per domain. A round that submitted more than one -- two
+            // adoptions decided together, a proposal beside the
+            // acceptance its predecessor unblocked -- leaves the rest
+            // queued, and nothing comes back for them on its own: the
+            // next lowering happens only because something else was
+            // persisted. So the queue would lag by one for ever, and
+            // whatever was submitted last would never become durable at
+            // all. A replica that never reports a batch durable never
+            // releases the vote that waited on it, and the quorum that
+            // vote belongs to does not form.
+            //
+            // The bound is the queue's own depth when this started, so a
+            // lowering that moves nothing -- an append still in flight,
+            // an uncertain head -- ends the loop rather than spinning;
+            // the next round lowers again.
+            let mut attempts = self.applier.store().queued() + 1;
+            loop {
+                let store = self.applier.store_mut();
+                let outcome =
+                    Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
+                        .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+                // Indeterminate is not "failed": the group's outcome is
+                // unknown, so the caller reconciles rather than assuming
+                // either answer. It surfaces as an engine failure here so
+                // it cannot be mistaken for a clean round.
+                if outcome.indeterminate {
+                    return Err(DriveError::Engine("group outcome indeterminate".into()));
+                }
+                for event in outcome.events {
+                    self.outbox.observe(&event);
+                    next.extend(self.machine.step(Event::Storage(event)));
+                }
+                attempts -= 1;
+                if self.applier.store().queued() == 0 || attempts == 0 {
+                    break;
+                }
             }
         }
         for waiting in self.outbox.pending() {

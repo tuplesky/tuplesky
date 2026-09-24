@@ -1672,3 +1672,313 @@ reader taking two thousand snapshots never starves a concurrent writer
 and never observes more completions than entries. The test's doc comment
 says exactly that rather than claiming the stronger thing, because a
 test that overclaims is worse than one that is honest about its reach.
+
+It also found two things, once it was run often enough.
+
+The second half of its claim was not true when it was written: the
+reader loaded `entered` before `completed`, and both were relaxed, so it
+could take an entry count from before an operation started beside a
+completion count from after it finished and report more completions than
+entries. Reading the counters in the other order is necessary and not
+sufficient -- relaxed operations on separate atomics give a reader no
+ordering at all. The completion counter is now the writer's last store
+for an operation and carries release ordering, and the reader acquires
+it first; everything that operation wrote is then visible, and every
+counter read afterwards is read no earlier than the one it can never be
+smaller than.
+
+It is a small lie and a bad one. An operator who reads "more finished
+than arrived" cannot tell a reporting artefact from a double count, and
+the whole point of this module is that a reading means what it says.
+
+The second was in the test. It asserted that the writer had run
+alongside the readers, and on a loaded machine -- eighty-five tests in
+parallel -- the reader could finish its two thousand snapshots before
+the writer thread was scheduled at all. That is not a defect in the
+thing under test and not a reason to drop the assertion: a run where the
+two never overlapped shows nothing about either of them. The test now
+waits for the first write before it starts reading, so the overlap is
+established rather than assumed.
+
+### Why the fixtures had to leave the test binary
+
+Every fixture the project had lived inside a test binary. That is right
+for a test and useless to a certification run: an API server, a Go Kine
+build and a benchmark that runs for minutes all need a domain that
+outlives one `cargo test` process, and none of them can construct one.
+
+So `crates/coord-harness` writes a real domain into a directory —
+authority, per-node voter and collector credentials, a genesis that
+commits the key each node will present, one signed endpoint catalog, the
+issuer's published keys and a strict `coordd.toml` per node — and then
+starts every committed voter, waiting until each is actually serving.
+Every committed voter, because a three-voter genesis with two processes
+running is a quorum the domain does not have, and a suite that ran
+against it would be measuring something nobody deploys.
+
+The daemons are unchanged and unhelped. They run the production startup
+checks against this material and refuse it the moment it stops agreeing
+with itself, which is what makes a harness bug look like a harness bug
+instead of like a result.
+
+### The one place the harness is not the real thing, and why it says so
+
+The credential endpoint signs a real ES256 service token with the
+domain's configured issuer key on presentation of any non-empty
+assertion. It is not an identity provider and its own documentation says
+so in the first paragraph.
+
+The reasoning is about what a failure would mean. What task-48 certifies
+is the storage edge; the token exchange is task-35 and task-36's, and it
+has its own tests. A real identity provider in the certification run
+would add a second thing that can fail without testing the edge any
+better, and a red run whose cause is ambiguous is worth less than a red
+run whose cause is named. What is *not* weakened is the verifying side:
+`coordd` runs exactly the verification it runs in production, against a
+credential of exactly the shape it will see. The endpoint refuses to bind
+anything but loopback, and the `test-only` crate role keeps all of it out
+of every production artifact.
+
+### Findings, and why none was findable before
+
+The suite passed the whole storage-edge security matrix, create, read,
+compare-and-swap, delete, paging and the compaction floor. Then it found
+four things, of which two are fixed here and two are written down.
+
+**A watch was registered and never delivered on.** `Step::Watch` in
+`bins/coordd/src/serve.rs` counted the watch and dropped the responder.
+The collector had already registered the subscription with the hub by
+then, so the watch existed and nothing ever wrote to it: the caller's
+stream closed with no replay, no event and no progress. An API server
+rebuilds every cache it has from watches, so it could not start against
+this.
+
+The daemon now holds that stream. Three things the wiring had to get
+right, none of them the pump itself.
+
+*The handover has to be one sequence.* The hub attaches a watch at the
+frontier it had when the open was decided and queues everything above it
+from that instant. What is below the frontier is history, and it is read
+out of one pinned snapshot -- one, because reading it from several would
+be reading it at several execution points -- and replayed into the same
+watch before the subscription goes live. A replay that cannot be finished
+ends the subscription instead of starting it live, and says which of
+"compacted" or "source lost" it was, because those have different
+resumptions: the first needs a fresh list, the second another replica.
+
+*Pumping cannot be conditioned on local progress.* A revision reaches the
+hub from applying a command, and a follower applies commands it learned
+from its peers -- which is not work that node's own turn reports. So the
+pump runs every time round the loop, before it waits on a socket, and
+returns immediately when there is nothing subscribed. A subscriber is not
+an event source: nothing will wake the loop on its behalf.
+
+*A stream that is gone releases the subscription.* `Responder::push`
+completes when QUIC has room, so a consumer that stopped reading blocks
+that one frame rather than accumulating; when the write fails the
+subscription is cancelled at the hub and drained, because a hub that went
+on queueing for it would be a queue filling on behalf of a consumer that
+does not exist.
+
+Wiring it also surfaced two shape errors in the Go client, and they are
+the reason the open had never reached the frontend at all. A caller ends
+the request half of a stream it opens -- the frontend reads exactly one
+frame from such a stream, and will not begin serving one whose sender has
+not finished -- and the watch open left it open, so the frontend waited
+out its frame deadline and closed the whole connection. And a cancel is
+its own request on its own stream of the same connection, not a second
+frame written onto the stream the frontend is delivering events on. Both
+are now what every other request does; the same mistake in the Rust
+integration test failed the same way, which is how they were found.
+
+One property of the open worth naming, because a test that ignores it
+tests the network instead. A watch that starts at whatever the frontier
+happens to be races the first write, since the open and the write are on
+different streams. A watch that names a revision does not: what preceded
+the attachment is replayed and what followed is live. The API server
+always names one; the certification row and the daemon test do too.
+
+**A connection stops being answered after about sixty requests.** One
+caller, one request in flight at a time, three voters: exactly 61 of 100
+complete and the remaining 39 reach their deadline. Exactly 61 on every
+repetition, with a two-second deadline and with a thirty-second one, so
+it is an exhaustion and not a slowdown -- a slow domain would have
+finished the eightieth request eventually.
+
+The bound is the leader's command table. `coordd` builds it with
+`capacity: 64`, `CommandTable::initialize` refuses with `Backpressure`
+when the table is full, and nothing ever retired an executed record from
+it. `retire` exists, is documented, is tested, and has no caller. So the
+capacity was not a bound on unresolved work, which is what it reads as;
+it was a bound on how many commands a replica could execute for as long
+as it ran. The sixty-fifth caller waited out its deadline against an
+idle, healthy cluster, and `Rejection::Backpressure` went into a vector
+nobody drains.
+
+A full table now reclaims what it has executed before it refuses
+anything. That is what the module's own documentation already said the
+rule was -- "records in ACCEPT or COMMIT are never evicted to make room,
+only executed records can be retired" -- read as permission to retire
+rather than as permission to forget nothing.
+
+Two things the fix had to keep straight. Nothing unresolved is ever
+touched: a record in START, PRE-ACCEPT, ACCEPT or COMMIT is an
+obligation, and evicting one to serve a newer command would lose it
+rather than shed load. And a retired record has to go on looking
+executed to anything that depends on it, which is what `retire`'s
+tombstones are for -- they are dropped with the last record that
+references them, so the bookkeeping stays bounded by the live set
+instead of by history.
+
+The leader also had to stop asking the table whether a command executed.
+`unexecuted_in_order` filtered on `phase_of(c) < Some(Phase::Executed)`,
+and a reclaimed record reports no phase at all -- which sorts *below*
+`Executed`, so a command that executed long ago would read as
+outstanding, be speculated over, and have its result released a second
+time to a caller that already had it. The proposal now carries the fact
+itself.
+
+**Concurrent callers were not served across a quorum.** With the table
+fixed, a single caller sustained 200 requests against three voters and
+500 against one. Two callers against three voters completed 13 of 100;
+the same two against a *single* voter completed 100 of 100. So it was
+not the client, not the volume, and not the number of sessions: it was
+two commands in flight at once across a real quorum.
+
+The conservative conflict key was the obvious suspect and the wrong one.
+What the leader's table actually showed was commands sitting in ACCEPT
+while every follower had *executed* them -- so the order was agreed and
+the votes that would have told the leader so never arrived. The
+followers had published them. They were still in the outbox, waiting on
+a barrier that never became durable.
+
+A replica's journal lowers one group per call and a group takes one
+batch per domain; `Persistence::lower` says so in as many words. The
+driver lowered exactly once per round, however many batches that round
+had submitted. One round submits more than one whenever anything decides
+two things at once -- two adoptions unblocked together, a proposal
+beside the acceptance its predecessor just permitted -- and the rest
+stayed queued. Nothing comes back for a queued batch on its own: the
+next lowering happens only because something *else* was persisted. So
+the queue lagged by one for ever, and whatever was submitted last never
+became durable at all.
+
+Then the rule that makes a vote honest finishes the job. A follower's
+acknowledgement is published requiring every batch it has outstanding,
+because an acknowledgement is a promise not to forget, and a promise
+this replica cannot honour after a crash must not be sent. One batch
+stuck at the back of the queue therefore held every later
+acknowledgement behind it. The follower executed everything; the leader
+heard about none of it; the caller's stream waited out its deadline
+against a domain that had already agreed.
+
+The driver now lowers until the domain's queue is empty, bounded by the
+depth it started with -- so a lowering that moves nothing, an append
+still in flight or an uncertain head, ends the loop rather than
+spinning, and the next round tries again. The regression test is
+`bins/coordd/tests/cli.rs::two_callers_at_once_are_both_served_by_a_quorum`
+(two sessions, twenty-five requests each, three voters); with the loop
+reduced to one lowering again it answers 3 of 25 each.
+
+Two things this cost before it was found, both worth naming. The first
+is that nothing said anything: a refused submission, a rejection the
+protocol machine recorded, a send that found no route and a session that
+failed to establish were all counted and none was logged, so a domain
+that had stopped serving looked from its own log exactly like an idle
+one. All four now say so. The second is that `Leader::take_rejections`
+had no caller at all -- the list grew for the life of the process, and
+the reasons in it were never read by anything. The driver drains it
+every turn.
+
+**And a key under a time to live does not expire.** Written with a
+one-second lease, still readable a minute later. The private binding is
+not disclosed to the caller, which the same test checks and which
+passes, so what is missing is the expiry rather than the rule about what
+a caller may see.
+
+Worth being precise about what "the expiry" is, because the shape is the
+substance. Design Sections 7.2-7.3 make expiry an authoritative
+conditional command -- `ExpireLease` matching the binding's generation,
+the expected renewal sequence and the replicated `LeaseAuthorityEpoch`,
+applied only if every field still matches -- and a timer a scheduling
+hint rather than permission to mutate. The deadline is `(1 + rho) * TTL`
+local ticks from the observation of a committed grant or renewal, so
+expiry may be late and may not be early; a restart rearms every surviving
+binding for its full TTL from the new epoch's observation. The state
+machine has all of that: `coord_state::expiry::Scheduler` arms, rearms
+and emits candidates, and the planner applies them conditionally. What
+has no caller is the scheduler. Nothing in `coordd` constructs one, feeds
+it observations, or submits what it produces, and `ExpireLease` has no
+narrow `CanonicalOperation` to travel under -- deliberately, since each
+internal command gets its own discriminant so that a client's payload can
+never reach a lease-authority or policy operation. Closing this means
+building that path, not deleting a key locally when a timer fires.
+
+All of them had been invisible for a structural reason worth stating. The
+Kine backend holds one session and issues one invocation at a time, and
+the Go suite's etcd-level rows spend fewer requests than the old bound
+before the watch row stops the domain for its own reason. Every Rust
+integration test builds one caller and asks it a handful of questions.
+Nothing in the project had ever asked the composition a hundred
+questions in a row, or two at once, and nothing had ever held one of its
+streams open across two writes. A Kubernetes API server does all three
+while it is still booting.
+
+### What the benchmark harness had to get right to find these
+
+A closed-loop benchmark would not have found the last two. It sends the next
+request when the previous one returns, so a domain that serializes work
+looks like a domain with a long service time and a perfectly respectable
+throughput curve.
+
+`crates/coord-wan-bench` schedules arrivals against absolute instants
+from one start, and separates the wait before an operation started from
+the operation itself and from the whole thing. That is what made the
+findings legible rather than mysterious. A closed-loop harness would
+have reported "throughput fell and latency rose", which is the shape of
+a slow system. What the open-loop run showed instead was a fixed count
+of fast completions followed by nothing at all, identical on every
+repetition and unchanged by a fifteen-fold longer deadline. A count that
+does not move when the deadline moves is a resource that ran out.
+
+The same separation is what distinguishes the remaining finding from
+that one. Adding a second caller does not move a count; it collapses the
+completion rate while the service times of the few that get through stay
+ordinary. That is a different shape, and it is why the two are written
+up as two things rather than as "it gets slow under load".
+
+The three-distribution split is not decoration. `queue` says whether the
+harness was the bottleneck, `service` says what the operation cost once
+it started, and `whole` — scheduled arrival to answer — is the only one a
+headline may quote. A run that reported only the middle one would have
+reported this defect as good news.
+
+### Two rules the report inherits rather than invents
+
+Every metric the harness did not read is absent *with a reason*, never
+zero, exactly as `coord_daemon::metrics` does it. The daemon renders its
+stage, synchronization, commit-return and frontier metrics on its own
+startup and shutdown report and not on a socket a benchmark can poll, so
+the report says `NoEndpoint` rather than estimating. Journal
+synchronization and commit-return stay separate fields, because they are
+separate things and neither stands in for the other.
+
+And `--durability` is required. A latency figure without the durability
+it was obtained under is not a slow result or a fast one; it is not a
+result.
+
+### What the impairment script actually is
+
+`scripts/bench/wan-topology.sh` puts kernel delay, loss and asymmetry on
+the exact UDP port pairs that cross a region boundary, and can drop a
+region's traffic entirely while its voters keep running — which is the
+Section 21.5 region loss, and is a different experiment from killing the
+processes, because a partitioned voter still holds what it promised and
+rejoins.
+
+It is one host with netem on loopback. That gives real queues, real
+reordering and real timer behaviour, and it does not give a shared
+physical link, competing traffic or a route change. The script prints the
+`--impairment` line for the run that follows rather than letting the
+benchmark infer one, and a run that states no impairment says exactly
+that instead of implying there was none.

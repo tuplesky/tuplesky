@@ -312,6 +312,12 @@ impl<P: Persistence> Voter<P> {
     }
 
     /// Apply every command whose turn has come.
+    /// Take what this voter's machine refused since the last call.
+    pub fn take_rejections(&mut self) -> Vec<String> {
+        self.node.take_rejections()
+    }
+
+    /// Apply every command whose turn has come.
     pub fn execute(&mut self) -> Result<Outbound, DriveError> {
         self.node.execute(&self.ballot)
     }

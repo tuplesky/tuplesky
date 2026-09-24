@@ -394,6 +394,20 @@ fn reading_diagnostics_never_blocks_the_work_being_measured() {
         })
     };
 
+    // Wait until the writer has actually started. On a loaded machine
+    // the reader can finish its two thousand snapshots before the writer
+    // thread is ever scheduled, and a run where the two never overlapped
+    // shows nothing about either of them -- so this waits for the
+    // overlap instead of assuming the scheduler provides it.
+    let started = std::time::Instant::now();
+    while recorder.stage(Stage::Journal).entered == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the writer thread never started"
+        );
+        std::thread::yield_now();
+    }
+
     // Snapshot repeatedly while the writer runs. If a reader could
     // block a writer this would deadlock or starve; it cannot, because
     // there is no lock to take.

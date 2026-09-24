@@ -379,6 +379,13 @@ const PRINCIPAL: [u8; 16] = [0xa; 16];
 /// here is planned in.
 const REQUEST_NAMESPACE: [u8; 16] = [0x5e; 16];
 
+/// The single-use receipt identifier of `session`'s credential.
+fn receipt_of(session: [u8; 16]) -> [u8; 32] {
+    let mut out = [2u8; 32];
+    out[..16].copy_from_slice(&session);
+    out
+}
+
 fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -392,7 +399,12 @@ fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
         scope: 0xffff,
         rule: hex(&TRUST_RULE),
         generation: 1,
-        jti: hex(&[2u8; 32]),
+        // Per session, because a receipt is single use: the state
+        // machine consumes it when it creates the session, and a second
+        // session presenting the same one is correctly told the receipt
+        // is spent. A fixture that minted one identifier for every
+        // credential could establish exactly one session per domain.
+        jti: hex(&receipt_of(session)),
         iat: issued,
         exp: issued + 3600,
     })
@@ -1046,7 +1058,7 @@ impl Caller {
         let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
         let answer = ask(&connection, &bind)
             .await
-            .expect("the daemon answered the binding within the bound");
+            .unwrap_or_else(|| panic!("the daemon did not answer the binding:\n{}", daemon.said()));
         let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
         assert_eq!(
             ack.session,
@@ -2794,6 +2806,55 @@ async fn a_rust_caller_asks_through_the_sdk_and_reads_the_answer() {
     );
 }
 
+/// A caller that keeps asking is still answered.
+///
+/// The number is not arbitrary: the leader's command table is created
+/// with a capacity, and a table that never forgets an executed command
+/// would make that capacity a *lifetime* bound rather than a bound on
+/// outstanding work. A voter that answered its first sixty-four callers
+/// and then silently stopped would pass every test this project had,
+/// because nothing before this one ever asked it a hundred questions in
+/// a row. A Kubernetes API server asks it that many while it is still
+/// booting.
+///
+/// Sequential on purpose: one request is in flight at a time, so
+/// nothing here is a concurrency bound being reached. Each request is a
+/// distinct key, so nothing is deduplicated either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_that_keeps_asking_is_still_answered() {
+    let dir = workspace("sustained");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let mut caller = SdkCaller::bind(&dir, &daemon, &ca, &ring, [0x44; 16]).await;
+
+    // Comfortably past the table's capacity, which is 64.
+    const ASKS: usize = 200;
+    for n in 0..ASKS {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            coord_types::ids::NamespaceId([0x5e; 16]),
+            coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+                key: format!("k{n:04}").into_bytes(),
+                value: b"v".to_vec(),
+                lease: None,
+                prev_kv: false,
+            }),
+        );
+        logical.canonicalize();
+        let completion = caller.ask(n as u64 + 1, &logical).await;
+        let coord_sdk::Outcome::Established { .. } = &completion.outcome else {
+            panic!(
+                "request {n} of {ASKS} was not established: {:?}\n{}",
+                completion.outcome,
+                daemon.said()
+            );
+        };
+    }
+}
+
 /// A deadline that passes makes the outcome unknown, not failed, and the
 /// invocation stays resolvable by its identity.
 ///
@@ -3991,5 +4052,199 @@ async fn a_node_reports_bounded_secret_free_metrics() {
     assert!(
         longest <= 20,
         "the snapshot carries a {longest}-character run, which is identity-shaped:\n{rendered}"
+    );
+}
+
+/// A watch opened against the running daemon is served the events of
+/// the revisions that follow it, on the stream it was opened on.
+///
+/// This is the one request shape whose stream outlives its frame. The
+/// caller opens it once; the events are written onto that same stream
+/// for the life of the subscription, which means the daemon has to hold
+/// the responder and keep moving what the hub produces onto it rather
+/// than answering once and letting the stream go.
+///
+/// Two writes, because one proves less than it looks: a single event
+/// could be delivered by a pump that happens to run when the request
+/// that caused it is answered. The second arrives with nothing else
+/// going on, so it is the subscription that delivered it.
+///
+/// What this does not test is resumption from history: the watch here
+/// starts at the frontier, and replaying a compacted or retained past
+/// is the certification suite's, where a real API server's reflector
+/// asks for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_is_served_the_revisions_that_follow_it() {
+    let dir = workspace("watch");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x77; 16]).await;
+
+    // The subscription's own stream. It is not finished: the caller has
+    // said everything it has to say, and everything else on this stream
+    // comes the other way.
+    let (mut send, mut recv) = caller
+        .connection
+        .open_bi()
+        .await
+        .expect("a stream for the watch");
+    let open = coord_types::wire_v1::MessageV1::WatchOpen(coord_types::wire_v1::WatchOpenV1 {
+        watch_id: 7,
+        namespace: coord_types::ids::NamespaceId(REQUEST_NAMESPACE),
+        key: coord_types::wire_v1::BoundedBytes::new(b"w".to_vec()).expect("bounded"),
+        range_end: None,
+        // From the start of history, which is what a resuming client
+        // asks for and what makes this deterministic: the open and the
+        // first write are on different streams, so which of them the
+        // daemon sees first is the network's to decide. A watch from a
+        // revision is delivered either way -- replayed when it attached
+        // above the write, live when below -- and one that attached at
+        // whatever the frontier happened to be would be a test of that
+        // race instead.
+        start_revision: Some(coord_types::ids::KvRevision::new(1).expect("nonzero")),
+        prev_kv: false,
+        progress_notify: false,
+    })
+    .encode()
+    .expect("bounded");
+    send.write_all(&open).await.expect("the open is written");
+    // The request half ends here, as it does for every request: a
+    // caller says one thing on a stream it opens. The receiving half is
+    // what stays, and it is the subscription.
+    send.finish().expect("the open is complete");
+
+    let mut reader = coord_types::wire_v1::FrameReader::new();
+    let mut buffered: Vec<coord_types::wire_v1::Frame> = Vec::new();
+    let mut seen: Vec<(u64, Vec<u8>)> = Vec::new();
+    for (sequence, value) in [(1u64, b"one".to_vec()), (2, b"two".to_vec())] {
+        let answer = ask(&caller.connection, &caller.put(sequence, b"w", &value))
+            .await
+            .expect("the daemon never answered the write");
+        let coord_types::wire_v1::MessageV1::Response(response) =
+            coord_types::wire_v1::decode(&answer).expect("a decodable answer")
+        else {
+            panic!("the daemon answered a write with something else");
+        };
+        assert!(
+            matches!(response.outcome, coord_types::wire_v1::OutcomeV1::Ok { .. }),
+            "the write did not execute: {response:?}"
+        );
+
+        // One event frame per write, read off the subscription's stream
+        // within a bound. A watch that is registered and never pumped
+        // fails here by timing out, which is what this build did before
+        // the daemon held the stream.
+        let frame = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(frame) = buffered.pop() {
+                    return Some(frame);
+                }
+                if let Some(frame) = reader.next_frame().expect("a frame") {
+                    return Some(frame);
+                }
+                let mut buf = [0u8; 4096];
+                match recv.read(&mut buf).await {
+                    Ok(Some(n)) => reader.push(&buf[..n]).expect("within the reader bound"),
+                    // The daemon ended the stream, or the connection.
+                    // Either is a failure of the subscription, and what
+                    // the daemon said about it is the diagnosis.
+                    Ok(None) => return None,
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the watch delivered nothing within the bound:\n{}",
+                daemon.said()
+            )
+        })
+        .unwrap_or_else(|| panic!("the daemon ended the watch stream:\n{}", daemon.said()));
+        match coord_types::wire_v1::decode(&frame).expect("a decodable watch frame") {
+            coord_types::wire_v1::MessageV1::WatchEvents(events) => {
+                assert_eq!(events.watch_id, 7, "another subscription's events");
+                assert!(events.complete, "a revision arrived in pieces");
+                let delivered: Vec<Vec<u8>> = events
+                    .events
+                    .as_slice()
+                    .iter()
+                    .map(|e| e.value.as_slice().to_vec())
+                    .collect();
+                seen.push((events.revision.get(), delivered.concat()));
+            }
+            other => panic!("the watch delivered something else: {other:?}"),
+        }
+    }
+
+    // In order, each revision once, carrying what was written.
+    assert_eq!(
+        seen.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        vec![b"one".to_vec(), b"two".to_vec()],
+        "the watch delivered {seen:?}"
+    );
+    assert!(
+        seen[0].0 < seen[1].0,
+        "the watch delivered revisions out of order: {seen:?}"
+    );
+}
+
+/// Two callers asking at the same time are both served by a quorum.
+///
+/// One caller at a time is the shape every earlier test has: ask, wait,
+/// ask again. A domain can serialize all of its work and still pass
+/// every one of them. An API server is concurrent from its first
+/// second, so this asks two sessions to keep one request each in flight
+/// against three voters and expects every one of them answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_callers_at_once_are_both_served_by_a_quorum() {
+    let dir = workspace("concurrent");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0), "each store is made");
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "voter {} cannot submit to the other two:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    let first = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x41; 16]).await;
+    let second = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x42; 16]).await;
+
+    // Each caller keeps one request in flight and writes its own keys,
+    // so nothing here contends for a value: what is shared is the
+    // domain's ordering, not the data.
+    const EACH: usize = 25;
+    async fn ask_all(caller: &Caller, tag: u8) -> usize {
+        let mut answered = 0;
+        for n in 0..EACH {
+            let key = format!("{tag:02x}-{n:04}").into_bytes();
+            if ask(&caller.connection, &caller.put(n as u64 + 1, &key, b"v"))
+                .await
+                .is_some()
+            {
+                answered += 1;
+            }
+        }
+        answered
+    }
+    let (a, b) = tokio::join!(ask_all(&first, 1), ask_all(&second, 2));
+    assert_eq!(
+        (a, b),
+        (EACH, EACH),
+        "two callers at once were answered {a} and {b} of {EACH} each\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
     );
 }

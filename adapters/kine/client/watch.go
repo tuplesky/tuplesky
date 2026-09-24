@@ -48,6 +48,15 @@ func (c *Client) OpenWatch(ctx context.Context, open wire.WatchOpen) (*Watch, er
 		c.dropLane(LaneWatch, conn)
 		return nil, ErrWatchLost
 	}
+	// The request half ends with the open, as it does on every request
+	// stream: the frontend reads exactly one frame from a stream a
+	// caller opened and will not begin serving one whose sender has not
+	// finished. What stays is the receiving half, and that is the
+	// subscription -- events, progress and finally the close arrive on
+	// it for as long as the watch lasts. A later cancel is its own
+	// request, on its own stream of this same connection, because the
+	// subscription is keyed by connection and watch identifier.
+	_ = stream.Close()
 	w := &Watch{c: c, conn: conn, stream: stream, id: open.WatchID, frames: make(chan wire.Message), done: make(chan struct{})}
 	go w.read()
 	return w, nil
@@ -143,7 +152,23 @@ func (w *Watch) Cancel() {
 			// Cancelling must not block on a stalled peer: the watch is
 			// being torn down either way.
 			cancelCtx, done := context.WithTimeout(context.Background(), w.c.cfg.FrameTimeout)
-			_ = writeFrameWithin(cancelCtx, w.stream, frame)
+			// On this connection, because the frontend knows the
+			// subscription as (connection, watch id) and a cancel sent
+			// anywhere else names a watch it does not hold. On a stream
+			// of its own, because the frontend acknowledges the cancel
+			// on the stream that asked for it, and the watch's own
+			// stream is the one it is writing events on.
+			if cancel, err := w.conn.OpenStreamSync(cancelCtx); err == nil {
+				if writeFrameWithin(cancelCtx, cancel, frame) == nil {
+					_ = cancel.Close()
+					// The acknowledgement is read so the frontend's
+					// write completes rather than meeting a reset; what
+					// it says does not change the teardown.
+					_, _ = readOneFrame(cancelCtx, cancel)
+				} else {
+					_ = cancel.Close()
+				}
+			}
 			done()
 		}
 		_ = w.stream.Close()
