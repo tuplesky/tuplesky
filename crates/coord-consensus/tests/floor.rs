@@ -215,6 +215,11 @@ struct Summary {
     /// Majority reads that discovered less than a certified floor. Must
     /// be zero.
     missed: usize,
+    /// Majority reads that found a certified floor's position but could
+    /// not identify its image: more than one subject reported there and
+    /// none with a majority inside the read. Legitimate -- the position
+    /// still binds -- and the reason image resolution is the caller's.
+    unidentified: usize,
     /// Distinct refusals the ledgers produced.
     refusals: BTreeSet<String>,
 }
@@ -229,6 +234,7 @@ fn every_world_of_the_floor_protocol_holds_the_four_properties() {
         let mut certified_all = BTreeSet::new();
         let mut contested = BTreeSet::new();
         let mut missed = 0;
+        let mut unidentified = 0;
         let mut refusals = BTreeSet::new();
         let all = worlds(n);
         for world in &all {
@@ -278,6 +284,31 @@ fn every_world_of_the_floor_protocol_holds_the_four_properties() {
                         .map_or(ExecutionPosition::ZERO, |d| d.position);
                     if seen < floor.position() {
                         missed += 1;
+                    }
+                    // Identification: at the certified floor's own
+                    // position the read always carries its subject, and
+                    // whatever the read names as the image is that
+                    // subject. When it names nothing, the read is counted
+                    // rather than failed.
+                    let Some(d) = discovered
+                        .as_ref()
+                        .filter(|d| d.position == floor.position())
+                    else {
+                        continue;
+                    };
+                    assert!(
+                        d.subjects.contains(&floor.subject()),
+                        "a majority read lost the certified subject in world {world:?}"
+                    );
+                    let named = d.subject().or_else(|| d.certified(&voters(n)));
+                    match named {
+                        Some(subject) => assert_eq!(
+                            subject,
+                            floor.subject(),
+                            "a majority read named another image than the certified one in \
+                             world {world:?}"
+                        ),
+                        None => unidentified += 1,
                     }
                 }
             }
@@ -361,6 +392,7 @@ fn every_world_of_the_floor_protocol_holds_the_four_properties() {
             certified: certified_all,
             contested,
             missed,
+            unidentified,
             refusals,
         });
     }
@@ -462,6 +494,10 @@ fn removing_a_rule_produces_the_counterexample_it_exists_for() {
         })
         .collect();
     let floor = activate(&three, &ready).expect("a majority");
+    // The one voter answers with no promise, so what reaches `discover`
+    // is the empty slice -- the same value as a read that reached nobody.
+    // Nothing here can tell the two apart, which is why the caller counts
+    // who answered before it calls `discover`.
     let one_report: Vec<Readiness> = Vec::new();
     let narrow = discover(&one_report);
     assert!(narrow.is_none());
@@ -665,4 +701,54 @@ fn a_permanently_absent_voter_does_not_stop_the_floor() {
         assert_eq!(discovered.position, floor.position());
         assert_eq!(discovered.subject(), Some(floor.subject()));
     }
+}
+
+/// A certified floor whose position a majority read finds but whose
+/// image it cannot name. Voters 0 and 2 are ready for A and certify it;
+/// voter 1 is ready for the competing B at the same position, which is
+/// legal because B was never certified. The read {0, 1} sees one report
+/// for each subject: the position binds, `subject()` is `None`, and
+/// nothing in that read can say A. A read that holds a majority for one
+/// subject names it, and it is the certified one.
+#[test]
+fn a_majority_read_binds_the_position_even_when_it_cannot_name_the_image() {
+    let three = voters(3);
+    let a = at(LOW, 0xa1);
+    let b = at(LOW, 0xb2);
+    let mut ledgers: Vec<ReadinessLedger> = (0..3)
+        .map(|i| ReadinessLedger::new(r(i), epoch()))
+        .collect();
+    let ready_a: Vec<Readiness> = [0usize, 2]
+        .iter()
+        .map(|i| ledgers[*i].record(&three, a).expect("ready for A"))
+        .collect();
+    let ready_b = ledgers[1].record(&three, b).expect("ready for B");
+    let floor = activate(&three, &ready_a).expect("two of three");
+    assert_eq!(
+        activate(&three, &[ready_b]),
+        Err(ActivationError::NoQuorum { have: 1, need: 2 })
+    );
+
+    let narrow = discover(&[ready_a[0], ready_b]).expect("a signer is read");
+    assert_eq!(narrow.position, floor.position());
+    assert_eq!(
+        narrow.subjects,
+        [a.subject, b.subject].into_iter().collect()
+    );
+    assert_eq!(narrow.subject(), None);
+    assert_eq!(narrow.certified(&three), None);
+    assert_eq!(narrow.ready_for(a.subject), [r(0)].into_iter().collect());
+    assert_eq!(narrow.ready_for(b.subject), [r(1)].into_iter().collect());
+
+    let wide = discover(&[ready_a[0], ready_b, ready_a[1]]).expect("everyone is read");
+    assert_eq!(wide.subject(), None);
+    assert_eq!(wide.certified(&three), Some(floor.subject()));
+    // A replica outside the epoch never tips the count.
+    let stranger = Readiness {
+        voter: r(9),
+        candidate: b,
+    };
+    let padded = discover(&[ready_a[0], ready_b, stranger]).expect("a signer is read");
+    assert_eq!(padded.ready_for(b.subject).len(), 2);
+    assert_eq!(padded.certified(&three), None);
 }

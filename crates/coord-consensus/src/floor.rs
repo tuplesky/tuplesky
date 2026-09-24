@@ -28,8 +28,12 @@
 //! 4. **Discovery.** Every permitted recovery reads reports from a
 //!    majority of the same voter set. Two majorities of one set
 //!    intersect, so a recovery always sees at least one signer of the
-//!    highest activated floor: [`discover`] selects it, and a replica
-//!    below it installs the state before it votes.
+//!    highest activated floor: [`discover`] returns its position, and a
+//!    replica below it installs that state before it votes. Which image
+//!    to install is identified when the read allows it
+//!    ([`Discovered::subject`], [`Discovered::certified`]); a majority
+//!    read can also leave it open, and resolving it is the caller's
+//!    (task-53).
 //! 5. **Fence.** Once a floor is durable here, a delayed message about
 //!    state at or below it is answered from the retained common outcome
 //!    ([`FenceVerdict::Retained`]) and never by re-creating the protocol
@@ -56,6 +60,7 @@
 //! a floor is published are task-53's.
 
 use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
 use coord_types::identity::Digest32;
 use coord_types::ids::{ConfigurationEpoch, ExecutionPosition, ReplicaId};
@@ -402,19 +407,28 @@ pub struct FloorConflict {
 ///
 /// The `position` is the binding part: it is what the recovering
 /// replica may not vote from below, and the intersection argument gives
-/// it unconditionally. `subjects` says which image to obtain, and holds
-/// more than one only when voters at that position are ready for
-/// different checkpoints -- which is legitimate while none of them has
-/// been certified, because a candidate that no majority signed binds
-/// nobody. At most one of them can ever be certified: two certificates
-/// would need two majorities, which intersect in a voter that would
-/// have had to sign both, and [`ReadinessLedger::record`] refuses that.
+/// it unconditionally. The image is a weaker matter. At most one subject
+/// at a position can ever be certified: two certificates would need two
+/// majorities, which intersect in a voter that would have had to sign
+/// both, and [`ReadinessLedger::record`] refuses that. But voters that
+/// never signed may still be ready for a competing subject at the same
+/// position, so `subjects` can hold more than one entry *even when one
+/// of them is certified*. With three voters, 0 and 2 ready for A certify
+/// it, 1 is ready for B, and a majority read of {0, 1} sees one report
+/// for each: the position is right and the image is not identified by
+/// this read. [`Discovered::certified`] names the image whenever the
+/// read itself holds a majority for one subject; otherwise the caller
+/// must resolve it with more evidence (the certificate, or a wider
+/// read) before installing anything. That resolution is task-53's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Discovered {
     /// Highest position any report is ready for.
     pub position: ExecutionPosition,
     /// The distinct subjects reported at that position.
     pub subjects: BTreeSet<Digest32>,
+    /// Every report at that position, as read: the per-subject evidence
+    /// that [`Discovered::certified`] counts.
+    pub evidence: Vec<Readiness>,
 }
 
 impl Discovered {
@@ -425,6 +439,35 @@ impl Discovered {
         } else {
             None
         }
+    }
+
+    /// The distinct voters of the read that reported readiness for
+    /// `subject` at the discovered position.
+    pub fn ready_for(&self, subject: Digest32) -> BTreeSet<ReplicaId> {
+        self.evidence
+            .iter()
+            .filter(|r| r.candidate.subject == subject)
+            .map(|r| r.voter)
+            .collect()
+    }
+
+    /// The subject a majority of `voters` in this read is ready for, if
+    /// any.
+    ///
+    /// Sound whenever it answers: a majority of one voter set ready for
+    /// one candidate is enough to certify it, and uniqueness leaves no
+    /// other subject certifiable at that position. It answers `None`
+    /// when no subject reaches a majority within the read, which is not
+    /// evidence that nothing was certified -- only that this read
+    /// cannot tell which.
+    pub fn certified(&self, voters: &FloorVoters) -> Option<Digest32> {
+        self.subjects.iter().copied().find(|subject| {
+            self.ready_for(*subject)
+                .iter()
+                .filter(|v| voters.is_voter(v))
+                .count()
+                >= voters.majority()
+        })
     }
 }
 
@@ -444,14 +487,29 @@ impl Discovered {
 /// before any certificate existed and keeps the promise whether or not
 /// it ever saw one, so the promises are the evidence that is actually
 /// guaranteed to be there.
+///
+/// The majority is the caller's obligation, and this function cannot
+/// check it: `reports` holds only the promises that were read, not who
+/// answered, so an empty slice from a majority that promised nothing and
+/// an empty slice from a read that reached nobody are the same value,
+/// and both return `None`. The caller counts distinct responding voters
+/// of the epoch -- whether or not they promised -- and refuses to
+/// proceed below a majority before it calls this; in this repository
+/// that is `coord-checkpoint`'s `recovery_obligation` (task-53), which
+/// answers a short read with `TrimError::NoQuorum`.
 pub fn discover(reports: &[Readiness]) -> Option<Discovered> {
     let position = reports.iter().map(|r| r.candidate.position).max()?;
-    let subjects = reports
+    let evidence: Vec<Readiness> = reports
         .iter()
         .filter(|r| r.candidate.position == position)
-        .map(|r| r.candidate.subject)
+        .copied()
         .collect();
-    Some(Discovered { position, subjects })
+    let subjects = evidence.iter().map(|r| r.candidate.subject).collect();
+    Some(Discovered {
+        position,
+        subjects,
+        evidence,
+    })
 }
 
 /// What installing a floor did.
