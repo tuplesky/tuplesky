@@ -174,6 +174,25 @@ pub enum SimEvent {
         /// Payload.
         payload: Vec<u8>,
     },
+    /// A complete frame arrived on an API-class connection (task-33): it
+    /// carries the bound identity and connection, never provenance, so
+    /// nothing from a client or collector can be mistaken for a vote.
+    ApiFrame {
+        /// Node.
+        node: NodeId,
+        /// Lane.
+        lane: Lane,
+        /// Bound identity of the sender.
+        identity: BoundIdentity,
+        /// Connection identity.
+        connection: u64,
+        /// Kind.
+        kind: u16,
+        /// Schema version.
+        version: u16,
+        /// Payload.
+        payload: Vec<u8>,
+    },
     /// A connection ended.
     Closed {
         /// Node.
@@ -744,10 +763,19 @@ impl Node {
         let (Some(identity), Some(lane)) = (c.identity.as_ref(), c.lane) else {
             return;
         };
+        let connection_id = c.connection_id;
         let (Some(replica), Some(incarnation)) = (identity.replica, identity.incarnation) else {
+            self.events.push(SimEvent::ApiFrame {
+                node: self.id,
+                lane,
+                identity: identity.clone(),
+                connection: connection_id,
+                kind: frame.kind,
+                version: frame.version,
+                payload: frame.payload,
+            });
             return;
         };
-        let connection_id = c.connection_id;
         self.events.push(SimEvent::PeerFrame {
             node: self.id,
             lane,
@@ -956,15 +984,21 @@ impl Node {
         });
     }
 
-    /// Write pending frames as credit and flow control allow.
+    /// Write pending frames as credit and flow control allow. Peer
+    /// evidence goes on unidirectional streams; API-class frames (unary
+    /// requests) on bidirectional ones, as in production.
     fn flush(&mut self, ch: ConnectionHandle) {
         let c = self.connections.get_mut(&ch).expect("connection");
         // A stream is opened only when there is a frame for it, so a
         // frame is never taken out of the queue and then dropped for want
         // of credit: without credit it simply stays queued, and the lane's
         // depth keeps bounding what is held.
+        let dir = match c.class {
+            Some(Class::Api) => Dir::Bi,
+            _ => Dir::Uni,
+        };
         while !c.pending_opens.is_empty() {
-            let Some(id) = c.conn.streams().open(Dir::Uni) else {
+            let Some(id) = c.conn.streams().open(dir) else {
                 break;
             };
             let queued = c.pending_opens.pop().expect("not empty");
@@ -1051,6 +1085,11 @@ impl PacketWorld {
     /// Current tick.
     pub const fn tick(&self) -> u64 {
         self.clock.tick()
+    }
+
+    /// Virtual ticks elapsed (one tick is one millisecond).
+    pub fn ticks(&self) -> u64 {
+        self.clock.tick
     }
 
     /// The unix time the TLS stack sees.
