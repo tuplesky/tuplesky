@@ -1186,6 +1186,56 @@ async fn no_answer_within_the_deadline_is_unknown_rather_than_failed() {
     assert_eq!(answered, Err(RequestError::Timeout));
 }
 
+/// A request's deadline bounds the whole request, including the wait for
+/// admission behind other traffic.
+///
+/// A caller that asked to wait 300ms must not wait behind an earlier
+/// request's open slot for as long as that request takes, and then be
+/// given 300ms again for each phase after it. Caught before admission,
+/// the request was never written, so it is refused as a send that timed
+/// out rather than reported as an unknown outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_bounds_the_wait_for_admission_as_well() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Client]);
+    let mut node = bind(&f, 0);
+    let mut one_open = limits();
+    one_open.budget.max_opens = 1;
+    let caller = bind_with(&f, 1, one_open);
+    let connection = asked_on(&f, &caller, &node).await;
+    drained(&mut node).await;
+
+    let question = encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, b"ask").unwrap();
+    let (held, (waited, elapsed), ()) = tokio::join!(
+        // The first request takes the only open slot and is answered by
+        // nobody for a while.
+        caller.request(connection, question.clone(), Duration::from_secs(4)),
+        async {
+            // Asked once the first holds the slot.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let started = std::time::Instant::now();
+            let answer = caller
+                .request(connection, question.clone(), Duration::from_millis(300))
+                .await;
+            (answer, started.elapsed())
+        },
+        async {
+            loop {
+                if let TransportEvent::ApiRequest { responder, .. } = event(&mut node).await {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    drop(responder);
+                    return;
+                }
+            }
+        }
+    );
+    let _ = held;
+    assert_eq!(waited, Err(RequestError::Send(SendError::Timeout)));
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "a 300ms request waited {elapsed:?} for admission"
+    );
+}
+
 /// A question may only be asked on a connection this side dialed, on the
 /// caller's plane.
 #[tokio::test(flavor = "multi_thread")]

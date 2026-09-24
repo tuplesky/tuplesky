@@ -18,7 +18,7 @@ use quinn::{RecvStream, SendStream, VarInt};
 use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::{Notify, Semaphore, mpsc};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 
 use crate::budget::{Budget, BudgetError, Opens};
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
@@ -322,8 +322,10 @@ pub enum RequestError {
     NotAQuestionToAsk,
     /// The request itself was not admitted.
     Send(SendError),
-    /// No answer within the deadline. The outcome is unknown, not
-    /// failed.
+    /// No answer within the deadline, which bounds the request from
+    /// admission to answer. The outcome is unknown, not failed. (A
+    /// request the deadline caught before it was admitted was never
+    /// written, and is `Send(SendError::Timeout)` instead.)
     Timeout,
     /// The answer is not one well-formed frame within its class limit.
     Malformed(String),
@@ -1151,6 +1153,15 @@ impl Transport {
     /// transport uses, so a response above its kind's class limit is
     /// refused as a bound rather than truncated.
     ///
+    /// `deadline` bounds the whole request, from waiting for admission to
+    /// reading the last byte of the answer, and not each phase on its
+    /// own: a caller with a short deadline must not wait behind another
+    /// request's budget for longer than it asked to wait, and then be
+    /// given the full deadline again for every phase after it. A request
+    /// still waiting for admission when the deadline passes was never
+    /// written, so it is refused as [`SendError::Timeout`]; after that
+    /// point the outcome is unknown and it is [`RequestError::Timeout`].
+    ///
     /// # What an error means
     ///
     /// Only that this caller did not get an answer *here*. A timeout or
@@ -1192,23 +1203,27 @@ impl Transport {
                 return Err(RequestError::Send(SendError::TooLarge { bytes, limit }));
             }
         }
-        let _dest = link
-            .budget
-            .acquire(lane, bytes)
+        // One instant for the whole request. Every phase below is bounded
+        // by what is left of it, so the phases together take no longer
+        // than the caller asked to wait.
+        let until = tokio::time::Instant::now() + deadline;
+        let not_admitted = |_| RequestError::Send(SendError::Timeout);
+        let _dest = timeout_at(until, link.budget.acquire(lane, bytes))
             .await
+            .map_err(not_admitted)?
             .map_err(|_| RequestError::Send(SendError::NotConnected))?;
-        let _node = self
-            .shared
-            .node_budget
-            .acquire(lane, bytes)
+        let _node = timeout_at(until, self.shared.node_budget.acquire(lane, bytes))
             .await
+            .map_err(not_admitted)?
             .map_err(|_| RequestError::Send(SendError::NotConnected))?;
-        let _open = link.opens.acquire().await;
-        let (mut send, mut recv) = timeout(deadline, peer.conn.open_bi())
+        let _open = timeout_at(until, link.opens.acquire())
+            .await
+            .map_err(not_admitted)?;
+        let (mut send, mut recv) = timeout_at(until, peer.conn.open_bi())
             .await
             .map_err(|_| RequestError::Timeout)?
             .map_err(|e| RequestError::Stream(e.to_string()))?;
-        timeout(deadline, async {
+        timeout_at(until, async {
             send.write_all(&frame)
                 .await
                 .map_err(|e| RequestError::Stream(e.to_string()))?;
@@ -1217,7 +1232,8 @@ impl Transport {
         })
         .await
         .map_err(|_| RequestError::Timeout)??;
-        match read_frame(&mut recv, deadline, true).await {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        match read_frame(&mut recv, left, true).await {
             Ok(answer) => Ok(answer),
             Err(FrameError::Timeout) => Err(RequestError::Timeout),
             Err(FrameError::Wire(e)) => Err(RequestError::Malformed(format!("{e:?}"))),
