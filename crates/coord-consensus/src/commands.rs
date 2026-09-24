@@ -34,7 +34,18 @@ pub struct CommandRecord {
     pub deps: Vec<CommandId>,
     /// Conflict keys of the payload.
     pub keys: Vec<Vec<u8>>,
-    /// Digest of the bound payload (`None` for a placeholder).
+    /// Digest of what was bound beside the command identity: the
+    /// admission this replica accepted the command under
+    /// ([`coord_core::capability::admission_digest`]). `None` for a
+    /// placeholder, which has bound nothing yet.
+    ///
+    /// The identity is already the record's key, so repeating it here
+    /// would bind nothing. What is not in the identity, and must be, is
+    /// the admission: a second presentation of the same command under
+    /// different attested facts is a [`InitError::PayloadConflict`]
+    /// rather than a silent replacement, and the digest travels in this
+    /// replica's acknowledgements so no quorum can form across replicas
+    /// that accepted different facts.
     pub payload: Option<Digest32>,
     /// Per-key path digests through this command: the local ones at
     /// initialization, replaced by the leader's once its order is
@@ -79,6 +90,9 @@ pub struct Initialized {
     pub paths: Vec<(Vec<u8>, Digest32)>,
     /// Combined path evidence.
     pub path: Digest32,
+    /// The payload digest that was bound (what this replica's
+    /// acknowledgements carry).
+    pub payload: Digest32,
 }
 
 /// Per-key conflict information (prototype `lightKeyInfo` plus `HashLog`).
@@ -255,7 +269,12 @@ impl CommandTable {
                 path,
             },
         );
-        Ok(Initialized { deps, paths, path })
+        Ok(Initialized {
+            deps,
+            paths,
+            path,
+            payload,
+        })
     }
 
     /// The path log of `key`, if any command touched it.

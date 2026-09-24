@@ -14,9 +14,7 @@
 //! evidence is on the peer plane.
 
 use coord_consensus::ProtocolMessage;
-use coord_core::capability::{AdmissionReceipt, ReleasedResult};
-use coord_types::identity::Digest32;
-use coord_types::ids::SessionId;
+use coord_core::capability::{AdmissionFacts, ReleasedResult};
 use coord_types::wire_v1::{Frame, RequestV1, WireError, encode_frame};
 use serde::{Deserialize, Serialize};
 
@@ -37,49 +35,25 @@ pub const KIND_EVIDENCE: u16 = 0x0700;
 /// Schema version of every collector frame.
 pub const VERSION: u16 = 1;
 
-/// The claims of an admission receipt, as they travel between a
-/// collector and a voter.
+/// The submission: what the admitting verifier attested and the exact
+/// request the client sent (its logical bytes are what identity binds).
 ///
 /// An [`AdmissionReceipt`] is deliberately not deserializable: it is
 /// minted by a verifier and never restored from bytes, so nothing that
-/// merely decodes a frame can produce one. The claims therefore cross
+/// merely decodes a frame can produce one. The facts therefore cross
 /// the wire as their own record, and the voter's collector boundary
 /// mints the receipt again ([`crate::admitted_from_submit`]) only after
-/// it has checked that the connection's bound role may submit at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdmissionClaimsV1 {
-    /// Session the admission was for.
-    pub session: SessionId,
-    /// Rule/issuer generation the admission relied on.
-    pub rule_generation: u64,
-    /// Scope ceiling; policy at execution can only narrow it.
-    pub scope_ceiling: u32,
-    /// Unique receipt identity (single use).
-    pub receipt_id: Digest32,
-    /// Admission tick.
-    pub admitted_at_ticks: u64,
-}
-
-impl AdmissionClaimsV1 {
-    /// The claims a minted receipt carries.
-    pub fn of(receipt: &AdmissionReceipt) -> Self {
-        AdmissionClaimsV1 {
-            session: receipt.session(),
-            rule_generation: receipt.rule_generation(),
-            scope_ceiling: receipt.scope_ceiling(),
-            receipt_id: receipt.receipt_id(),
-            admitted_at_ticks: receipt.admitted_at_ticks(),
-        }
-    }
-}
-
-/// The submission: the admission claims minted at the collector and the
-/// exact request the client sent (its logical bytes are what identity
-/// binds).
+/// it has checked that the connection's bound role may do what those
+/// facts say they are for, and that they are this domain's.
+///
+/// Transporting facts is not authority to originate them. A role that
+/// may relay a client's work is not thereby a role that may say who a
+/// credential belongs to, which is why the two are different checks
+/// against different questions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitV1 {
-    /// Admission claims.
-    pub receipt: AdmissionClaimsV1,
+    /// What the admitting verifier attested.
+    pub receipt: AdmissionFacts,
     /// The client request.
     pub request: RequestV1,
 }

@@ -28,6 +28,7 @@ coord-transport.workspace = true
 coord-journal-api.workspace = true
 coord-journal-raft-engine.workspace = true
 coord-storage.workspace = true
+coord-store-api.workspace = true
 coord-storage-redb.workspace = true
 rustls-pki-types.workspace = true
 serde_json.workspace = true

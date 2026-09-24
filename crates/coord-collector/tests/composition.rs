@@ -30,7 +30,8 @@ use coord_consensus::{
     VoteError,
 };
 use coord_core::capability::{
-    AdmissionReceipt, EstablishedResult, EstablishmentEvidence, ReleasedResult, VerifierToken,
+    AdmissionReceipt, AttestedAdmission, EstablishedResult, EstablishmentEvidence, ReleasedResult,
+    VerifierToken,
 };
 use coord_core::effect::{BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{
@@ -463,7 +464,9 @@ impl World {
     fn deliver(&mut self, item: Item) {
         match item {
             Item::Submit { to, frame } => {
-                let admitted = admitted_from_submit(PeerRole::Frontend, &frame_of(&frame)).unwrap();
+                let admitted =
+                    admitted_from_submit(PeerRole::Frontend, &frame_of(&frame), CLUSTER, DOMAIN)
+                        .unwrap();
                 let effects = self.nodes[to as usize]
                     .machine
                     .step(Event::Admitted(admitted));
@@ -889,13 +892,17 @@ fn voter_identities_are_counted_rather_than_connections() {
     });
     let (command, req) = request(1, put(b"x", b"1"), 0);
     let admitted = AdmittedRequest {
-        receipt: AdmissionReceipt::from_verifier(
+        receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
-            SESSION,
-            1,
-            u32::MAX,
-            Digest32([7; 32]),
-            0,
+            AttestedAdmission {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([7; 32]),
+                admitted_at_ticks: 0,
+            },
         ),
         frame: MessageV1::Request(req).encode().unwrap(),
     };
@@ -941,11 +948,13 @@ fn voter_identities_are_counted_rather_than_connections() {
     );
     // The leader's proposal plus one adopter is the slow majority of three:
     // with the release already present, the second identity releases.
+    let admitted_under = c.admission(&command).expect("outstanding");
     let slow = |replica: u8| {
         ProtocolMessage::SlowAck(SlowAck {
             replica: r(replica),
             ballot: ballot(),
             command,
+            admission: admitted_under,
         })
     };
     assert_eq!(
@@ -982,6 +991,7 @@ fn voter_identities_are_counted_rather_than_connections() {
         deps: vec![],
         path,
     };
+    let admitted_under = c.admission(&command).expect("outstanding");
     let fast = |replica: u8, path: Digest32, deps: Vec<CommandId>| {
         ProtocolMessage::FastAck(FastAck {
             replica: r(replica),
@@ -990,6 +1000,7 @@ fn voter_identities_are_counted_rather_than_connections() {
             deps,
             paths: vec![],
             path,
+            admission: admitted_under,
             seqnum: None,
         })
     };
@@ -1071,11 +1082,13 @@ fn voter_identities_are_counted_rather_than_connections() {
         c.on_release(provenance(r(0), 1), right),
         Ok(Progress::Held(HoldReason::AwaitingVotes))
     );
+    let admitted_under = c.admission(&command).expect("outstanding");
     let slow = |replica: u8| {
         ProtocolMessage::SlowAck(SlowAck {
             replica: r(replica),
             ballot: ballot(),
             command,
+            admission: admitted_under,
         })
     };
     match c.on_evidence(provenance(r(2), 3), slow(2)) {
@@ -1120,13 +1133,17 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
         max_pending: 1,
         max_resolved: 1,
     });
-    let receipt = AdmissionReceipt::from_verifier(
+    let receipt = AdmissionReceipt::submitting(
         VerifierToken::for_boundary(),
-        SESSION,
-        1,
-        u32::MAX,
-        Digest32([7; 32]),
-        0,
+        AttestedAdmission {
+            cluster: CLUSTER,
+            domain: DOMAIN,
+            session: SESSION,
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([7; 32]),
+            admitted_at_ticks: 0,
+        },
     );
     let admitted = |seq| AdmittedRequest {
         receipt: receipt.clone(),
@@ -1297,18 +1314,120 @@ fn unary_and_finalized_watch_dispatch() {
     };
     let submit = frame_of(&fan_out.frame);
     assert!(matches!(
-        admitted_from_submit(PeerRole::Client, &submit),
+        admitted_from_submit(PeerRole::Client, &submit, CLUSTER, DOMAIN),
         Err(coord_collector::IngressError::RoleNotAuthorized(
             PeerRole::Client
         ))
     ));
     assert!(matches!(
-        admitted_from_submit(PeerRole::Observer, &submit),
+        admitted_from_submit(PeerRole::Observer, &submit, CLUSTER, DOMAIN),
         Err(coord_collector::IngressError::RoleNotAuthorized(
             PeerRole::Observer
         ))
     ));
-    assert!(admitted_from_submit(PeerRole::KineCollector, &submit).is_ok());
+    assert!(admitted_from_submit(PeerRole::KineCollector, &submit, CLUSTER, DOMAIN).is_ok());
+}
+
+/// Transporting claims is not authority to originate them.
+///
+/// A receipt that establishes a session says who a credential belongs
+/// to. A role that may relay a client's work under a session the
+/// cluster already agreed on has not thereby been made an identity
+/// issuer -- and a domain-scoped Kine collector in particular converts
+/// etcd traffic at a compatibility edge and deliberately does not
+/// forward its callers' identities as this cluster's.
+///
+/// So the two are different questions against different authorities,
+/// and the narrower one is checked against the *bound* role, before the
+/// capability is reconstructed. Deserializing a record proves nothing
+/// about where it came from.
+#[test]
+fn a_collector_that_may_submit_may_not_thereby_issue_an_identity() {
+    let establishing = submit_of(establishment_claims(CLUSTER, DOMAIN));
+
+    // The frontend is this domain's authentication broker: it is what
+    // verified the credential, so it is what may attest one.
+    let admitted = admitted_from_submit(PeerRole::Frontend, &establishing, CLUSTER, DOMAIN)
+        .expect("the broker's own claims are admitted");
+    assert_eq!(
+        admitted.receipt.purpose(),
+        coord_core::capability::AdmissionPurpose::Establish
+    );
+    assert_eq!(
+        admitted.receipt.establishment().map(|e| e.principal),
+        Some(PrincipalId([0xaa; 16]))
+    );
+
+    // The other role that may submit may not. Kine relays a client's
+    // work; it does not say who anybody is.
+    assert!(
+        matches!(
+            admitted_from_submit(PeerRole::KineCollector, &establishing, CLUSTER, DOMAIN),
+            Err(coord_collector::IngressError::NotASessionIssuer(
+                PeerRole::KineCollector
+            ))
+        ),
+        "a Kine collector acquired session-issuer authority by being able to submit"
+    );
+    // And a role that may not submit at all is refused for that first,
+    // whatever the claims are for.
+    assert!(matches!(
+        admitted_from_submit(PeerRole::Client, &establishing, CLUSTER, DOMAIN),
+        Err(coord_collector::IngressError::NotASessionIssuer(
+            PeerRole::Client
+        ))
+    ));
+}
+
+/// Claims attested by a verifier of another cluster or domain admit
+/// nothing here, whatever they say and whoever relays them.
+#[test]
+fn claims_attested_elsewhere_admit_nothing_here() {
+    let elsewhere = ClusterId([0xee; 16]);
+    let other_domain = DomainId([0xdd; 16]);
+
+    for (cluster, domain) in [
+        (elsewhere, DOMAIN),
+        (CLUSTER, other_domain),
+        (elsewhere, other_domain),
+    ] {
+        let submit = submit_of(establishment_claims(cluster, domain));
+        assert!(
+            matches!(
+                admitted_from_submit(PeerRole::Frontend, &submit, CLUSTER, DOMAIN),
+                Err(coord_collector::IngressError::WrongOrigin { .. })
+            ),
+            "claims attested for {cluster:?}/{domain:?} were admitted here"
+        );
+    }
+}
+
+/// Claims that establish a session, as an authorized broker would
+/// attest them.
+fn establishment_claims(cluster: ClusterId, domain: DomainId) -> coord_collector::SubmitV1 {
+    coord_collector::SubmitV1 {
+        receipt: coord_core::AdmissionFacts {
+            attested: AttestedAdmission {
+                cluster,
+                domain,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([9; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: Some(coord_core::AttestedEstablishment {
+                principal: PrincipalId([0xaa; 16]),
+                trust_rule: TrustRuleId([0xbb; 16]),
+                credential_valid_until: coord_core::capability::CredentialDeadline(1 << 40),
+            }),
+        },
+        request: request(9, get(b"z"), 0).1,
+    }
+}
+
+fn submit_of(submit: coord_collector::SubmitV1) -> coord_types::wire_v1::Frame {
+    frame_of(&coord_collector::submit_frame(&submit).expect("submit frame"))
 }
 
 #[test]
@@ -1333,6 +1452,7 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
                 replica: r(9),
                 ballot: ballot(),
                 command: c3,
+                admission: coord_core::capability::admission_digest(None),
             }),
         )
         .unwrap_err();

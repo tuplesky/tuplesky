@@ -6,6 +6,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use coord_core::capability::AdmissionReceipt;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
     LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId, PolicyRuleId, PrincipalId,
@@ -112,6 +113,41 @@ pub enum InternalCommand {
 }
 
 impl InternalCommand {
+    /// Build the command that consumes an establishment receipt and
+    /// creates the session it names.
+    ///
+    /// The only way to build [`InternalCommand::ConsumeAdmission`]: its
+    /// receipt is derived from an [`AdmissionReceipt`] capability, which
+    /// only the trusted admission boundary can mint. A caller holding
+    /// nothing but data cannot name a principal, a trust rule or a
+    /// credential deadline here, so the command's claims are the
+    /// verifier's and never a payload's.
+    ///
+    /// `None` when the receipt's purpose is merely to submit work:
+    /// being admitted under an existing session is not authority to
+    /// originate one, and the receipt carries no principal to originate
+    /// it with.
+    ///
+    /// What this builds is a *proposal*. Replicated execution rechecks
+    /// the trust rule and its generation against current policy, refuses
+    /// a receipt already consumed and refuses a session identity that
+    /// already exists; see [`crate::plan_internal`].
+    pub fn consume_admission(
+        namespace: NamespaceId,
+        receipt: &AdmissionReceipt,
+        code: Option<Digest32>,
+        refresh_family: Option<Digest32>,
+        window: u32,
+    ) -> Option<Self> {
+        Some(InternalCommand::ConsumeAdmission {
+            namespace,
+            receipt: AdmissionReceiptV1::of(&receipt.facts())?,
+            code,
+            refresh_family,
+            window,
+        })
+    }
+
     /// Namespace the command's view is built for.
     pub const fn namespace(&self) -> NamespaceId {
         match self {

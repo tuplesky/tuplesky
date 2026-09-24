@@ -13,7 +13,7 @@ use coord_consensus::{
     ProtocolMessage, RecoveryError, ReplicaRole, ReportAssembler, ReportPage, decode_dependency,
     paginate, select,
 };
-use coord_core::capability::{AdmissionReceipt, VerifierToken};
+use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageEvent,
@@ -129,13 +129,17 @@ fn admitted(seq: u64, key: u8) -> (Event, CommandId) {
     let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
         .encode()
         .unwrap();
-    let receipt = AdmissionReceipt::from_verifier(
+    let receipt = AdmissionReceipt::submitting(
         VerifierToken::for_boundary(),
-        SessionId([3; 16]),
-        1,
-        u32::MAX,
-        Digest32([9; 32]),
-        0,
+        AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
     );
     (Event::Admitted(AdmittedRequest { receipt, frame }), command)
 }
@@ -172,6 +176,22 @@ fn sends(effects: &[Effect]) -> Vec<(ReplicaId, ProtocolMessage)> {
         .collect()
 }
 
+/// The admission every request these tests admit is submitted under.
+fn admitted_under() -> Digest32 {
+    coord_core::capability::admission_digest(Some(&coord_core::capability::AdmissionFacts {
+        attested: AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
+        establishing: None,
+    }))
+}
+
 fn proposal_from(table: &CommandTable, c: CommandId, seqnum: u64) -> ProtocolMessage {
     let rec = table.record(&c).unwrap();
     ProtocolMessage::Proposal(FastAck {
@@ -181,6 +201,7 @@ fn proposal_from(table: &CommandTable, c: CommandId, seqnum: u64) -> ProtocolMes
         deps: rec.deps.clone(),
         paths: rec.paths.clone(),
         path: rec.path,
+        admission: rec.payload.expect("initialized"),
         seqnum: Some(seqnum),
     })
 }
@@ -194,7 +215,7 @@ fn reports_come_from_durable_state_at_the_cut_not_in_memory_phases() {
     // The leader saw c3 first: its proposal for c3 has no dependencies.
     let mut leader_view = CommandTable::new();
     leader_view
-        .initialize(c3, c3.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .initialize(c3, admitted_under(), vec![CONSERVATIVE_KEY.to_vec()])
         .unwrap();
     // c1: vote durable. c2: vote batch pending. c3: vote durable, adoption
     // of the leader order pending.
@@ -463,7 +484,7 @@ fn old_ballot_work_is_held_across_recovery_and_required_state_survives_a_crash()
     // A late proposal of ballot 0 is refused: no adoption, no slow ack.
     let mut leader_view = CommandTable::new();
     leader_view
-        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .initialize(c1, admitted_under(), vec![CONSERVATIVE_KEY.to_vec()])
         .unwrap();
     assert!(
         f.step(peer(0, proposal_from(&leader_view, c1, 0)))
@@ -549,7 +570,7 @@ fn legal_phase_differences_select_and_incompatible_candidates_are_diagnosed() {
     let (e1, c1) = admitted(1, 1);
     let mut leader_view = CommandTable::new();
     leader_view
-        .initialize(c1, c1.0, vec![CONSERVATIVE_KEY.to_vec()])
+        .initialize(c1, admitted_under(), vec![CONSERVATIVE_KEY.to_vec()])
         .unwrap();
     // r1 adopted the leader's order for c1; r2 only voted (PreAccept).
     let mut f1 = follower(1);
@@ -594,6 +615,7 @@ fn legal_phase_differences_select_and_incompatible_candidates_are_diagnosed() {
         deps: vec![c1],
         paths: vec![],
         path: Digest32([1; 32]),
+        admission: admitted_under(),
         seqnum: Some(1),
     };
     let mut conflicting = honest.clone();

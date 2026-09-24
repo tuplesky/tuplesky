@@ -155,9 +155,20 @@ kind at the collector boundary, like peer evidence.
 
 | Kind | Value | Direction | Payload |
 |---|---|---|---|
-| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionReceipt, request: RequestV1 }` (postcard); API class limit |
+| Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); API class limit |
 | Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
 | Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
+
+`FastAck` and `SlowAck` carry the admission digest the sender accepted
+the command under. The command identity is the retry key and the
+canonical request, so a retry under a rotated credential is the same
+command -- which leaves the attested facts outside the identity although
+they decide what execution does. Binding them to the acknowledgement is
+what keeps a quorum from forming across replicas that accepted one
+identity as different facts. A vote whose digest differs from the votes
+already counted is not counted at all (`VoteError::AdmissionConflict`),
+and a leader proposal that disagrees with a payload the replica already
+holds is refused rather than held.
 
 A voter admits `Submit` only from a connection bound to a collector role
 (`Frontend`, `KineCollector`). That is checked twice, from one rule
@@ -169,6 +180,32 @@ its payload carries admission claims minted for another principal's
 session, so a client may not open the stream at all. `Evidence` and
 `Release` are only ever sent by voters, and nothing received on an
 API-class connection is a vote.
+
+What travels in `SubmitV1.receipt` is `AdmissionFacts`, plain data: what
+a verifier attested, not the capability. `AdmissionReceipt` is
+deliberately not deserializable, because decoding facts must not be
+enough to produce one. The voter's ingress reconstructs the capability
+only after it has established that the connection had the authority
+those facts call for:
+
+* the facts name the verifier's own cluster and domain, and they must be
+  this voter's -- a receipt minted elsewhere admits nothing here;
+* the purpose is checked against the role. Submitting under an existing
+  session needs `may_submit_for_clients`; establishing a session needs
+  `may_establish_sessions` (`Frontend` only), which is strictly
+  narrower. Being able to send a `Submit` is not authority to originate
+  an identity.
+
+`AdmissionFacts` has a frozen 141-byte canonical encoding, distinct from
+its serde form and used only for the admission digest
+(`HashDomain::AdmissionReceipt`): cluster (16), domain (16), session
+(16), receipt id (32), rule generation (8, big-endian), scope ceiling
+(4, big-endian), admission tick (8, big-endian), purpose (1: `0` submit,
+`1` establish), principal (16), trust rule (16), credential deadline (8,
+big-endian). The last three are zero-filled when the purpose is submit;
+the purpose byte, not their emptiness, is what distinguishes the two. A
+command no verifier admitted digests the empty string under the same
+domain, so "no admission" is a value replicas must agree on too.
 
 A collector submits over an API-class connection it dialled, and a
 voter's evidence returns on that same connection, as output addressed to

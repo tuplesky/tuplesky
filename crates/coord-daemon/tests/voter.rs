@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 
-use coord_collector::wire::{AdmissionClaimsV1, SubmitV1, submit_frame};
+use coord_collector::wire::{SubmitV1, submit_frame};
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
     LearningMode, ReplicaRole,
@@ -191,7 +191,7 @@ fn leader(boot: BootId, budget: IngressBudget) -> Voter<StoreWorker<ModelEngine>
     let node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
     let ingress = Ingress::new(&membership(), r(0), PeerRole::Frontend, budget)
         .expect("replica 0 is a committed voter and Frontend may submit");
-    let mut voter = Voter::new(node, ingress, ballot());
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
     voter.boot(boot, inc()).expect("boot");
     assert!(voter.node().machine().leads());
     voter
@@ -219,7 +219,7 @@ fn follower(boot: BootId) -> Voter<StoreWorker<ModelEngine>> {
         IngressBudget::default(),
     )
     .expect("replica 1 is a committed voter");
-    let mut voter = Voter::new(node, ingress, ballot());
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
     voter.boot(boot, inc()).expect("boot");
     voter
 }
@@ -244,12 +244,17 @@ fn submission(sequence: u64) -> Vec<u8> {
         request_sequence: RequestSequence::new(sequence).unwrap(),
     };
     submit_frame(&SubmitV1 {
-        receipt: AdmissionClaimsV1 {
-            session: SESSION,
-            rule_generation: 1,
-            scope_ceiling: u32::MAX,
-            receipt_id: Digest32([7; 32]),
-            admitted_at_ticks: 0,
+        receipt: coord_core::AdmissionFacts {
+            attested: coord_core::AttestedAdmission {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([7; 32]),
+                admitted_at_ticks: 0,
+            },
+            establishing: None,
         },
         request: RequestV1::new(key, &logical, 0).unwrap(),
     })
@@ -635,7 +640,7 @@ fn the_store_records_under_the_ballot_the_voter_is_at() {
         IngressBudget::default(),
     )
     .expect("replica 1 is a committed voter");
-    let mut voter = Voter::new(node, ingress, ballot());
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
     assert_eq!(voter.node().applier().store().ballot, Some(ballot()));
 
     let adopted = Ballot {

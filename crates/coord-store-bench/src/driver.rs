@@ -279,6 +279,9 @@ impl<E: LocalEngine> Domain<E> {
             retry_key: key,
             logical: postcard::to_allocvec(&request)
                 .map_err(|_| DriveError::Apply("payload encode".to_owned()))?,
+            // The bench drives the application path, not admission: it
+            // writes its own session row and submits nothing.
+            admission: None,
         };
         self.logical_bytes += logical_bytes(&request);
         let repeat = matches!(op, Op::Repeat { .. });

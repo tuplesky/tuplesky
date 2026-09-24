@@ -31,7 +31,9 @@ use coord_consensus::{
     LeaderConfig, LearningMode, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole, SyncDecision,
 };
 use coord_consensus::{CONSERVATIVE_KEY, CommandRecord};
-use coord_core::capability::{AdmissionReceipt, EstablishedResult, ReleasedResult, VerifierToken};
+use coord_core::capability::{
+    AdmissionReceipt, AttestedAdmission, EstablishedResult, ReleasedResult, VerifierToken,
+};
 use coord_core::effect::{BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageEvent,
@@ -654,13 +656,17 @@ impl Cluster {
             if !self.nodes[i].alive {
                 continue;
             }
-            let receipt = AdmissionReceipt::from_verifier(
+            let receipt = AdmissionReceipt::submitting(
                 VerifierToken::for_boundary(),
-                SESSION,
-                1,
-                u32::MAX,
-                Digest32([9; 32]),
-                0,
+                AttestedAdmission {
+                    cluster: ClusterId([1; 16]),
+                    domain: DomainId([2; 16]),
+                    session: SESSION,
+                    rule_generation: 1,
+                    scope_ceiling: u32::MAX,
+                    receipt_id: Digest32([9; 32]),
+                    admitted_at_ticks: 0,
+                },
             );
             let effects = self.nodes[i].step(Event::Admitted(AdmittedRequest {
                 receipt,
@@ -1910,5 +1916,6 @@ fn payload_of(seq: u64) -> coord_consensus::PayloadRecordV1 {
     coord_consensus::PayloadRecordV1 {
         retry_key: retry_key(seq),
         logical: postcard::to_allocvec(&request_of(seq)).unwrap(),
+        admission: None,
     }
 }

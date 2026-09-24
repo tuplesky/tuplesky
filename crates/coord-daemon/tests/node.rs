@@ -13,7 +13,7 @@ use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
     LearningMode, ReplicaRole,
 };
-use coord_core::capability::{AdmissionReceipt, VerifierToken};
+use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, PeerId};
 use coord_core::event::Event;
 use coord_core::outbox::BarrierAllocator;
@@ -146,13 +146,17 @@ fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
     };
     let request = RequestV1::new(key, &logical, 0).unwrap();
     coord_core::event::AdmittedRequest {
-        receipt: AdmissionReceipt::from_verifier(
+        receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
-            SESSION,
-            1,
-            u32::MAX,
-            Digest32([7; 32]),
-            0,
+            AttestedAdmission {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([7; 32]),
+                admitted_at_ticks: 0,
+            },
         ),
         frame: MessageV1::Request(request).encode().unwrap(),
     }

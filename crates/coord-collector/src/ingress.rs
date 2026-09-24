@@ -8,9 +8,10 @@
 //! or voting access, and nothing that arrives on an API-class connection
 //! is ever treated as a vote (votes only exist on the peer plane).
 
-use coord_core::capability::{AdmissionReceipt, ReleasedResult, VerifierToken};
+use coord_core::capability::{AdmissionPurpose, AdmissionReceipt, ReleasedResult, VerifierToken};
 use coord_core::effect::{Effect, PeerId};
 use coord_core::event::AdmittedRequest;
+use coord_types::ids::{ClusterId, DomainId};
 use coord_types::wire_v1::{Frame, MessageV1, PeerRole};
 
 use crate::wire::{CollectorWireError, decode_submit, evidence_frame_from_bytes, release_frame};
@@ -20,6 +21,17 @@ use crate::wire::{CollectorWireError, decode_submit, evidence_frame_from_bytes, 
 pub enum IngressError {
     /// The role may not submit on behalf of clients.
     RoleNotAuthorized(PeerRole),
+    /// The role may relay a client's work but may not say who a
+    /// credential belongs to, and these claims establish a session.
+    NotASessionIssuer(PeerRole),
+    /// The claims were attested by a verifier of another cluster or
+    /// another domain. They admit nothing here whatever they say.
+    WrongOrigin {
+        /// Cluster the claims name.
+        cluster: ClusterId,
+        /// Domain the claims name.
+        domain: DomainId,
+    },
     /// Not a collector submission.
     Wire(CollectorWireError),
 }
@@ -34,34 +46,63 @@ pub const fn is_collector(role: PeerRole) -> bool {
 }
 
 /// Turn a collector's `Submit` into the admitted request the consensus
-/// machines consume. The claims travel as a record and the receipt is
-/// minted here, after the role check: this is the verifier boundary for
-/// a collector submission, and nothing that merely decodes a frame can
-/// produce a receipt. The request frame is re-encoded from the exact
-/// request so identity is bit-preserved.
+/// machines consume.
+///
+/// This is the verifier boundary for a collector submission: the claims
+/// travel as a record, and the receipt -- which nothing that merely
+/// decodes a frame can produce -- is minted here, after the checks
+/// below. The request frame is re-encoded from the exact request so
+/// identity is bit-preserved.
+///
+/// # What is checked, and why it is not one check
+///
+/// Deserializing a record is not proof of where it came from. So the
+/// capability is reconstructed only after the ingress it arrived on is
+/// shown to have the authority the claims call for:
+///
+/// * **Origin.** The claims name the cluster and domain their verifier
+///   belongs to, and they must be `cluster` and `domain` -- this
+///   voter's own. A receipt minted elsewhere admits nothing here.
+/// * **Purpose against authority.** A submission under an existing
+///   session needs a role that may relay a client's work. Establishing
+///   a session needs a role that may say who a credential belongs to,
+///   which is strictly narrower: being able to send a `Submit` is not
+///   authority to originate an identity.
+///
+/// Nothing here decides whether the session exists, whether the rule is
+/// still enabled, or whether the receipt was already consumed. Those
+/// are the replicated state machine's, at the command's own position.
 pub fn admitted_from_submit(
     role: PeerRole,
     frame: &Frame,
+    cluster: ClusterId,
+    domain: DomainId,
 ) -> Result<AdmittedRequest, IngressError> {
-    if !is_collector(role) {
-        return Err(IngressError::RoleNotAuthorized(role));
-    }
     let submit = decode_submit(frame).map_err(IngressError::Wire)?;
+    let facts = submit.receipt;
+    if facts.attested.cluster != cluster || facts.attested.domain != domain {
+        return Err(IngressError::WrongOrigin {
+            cluster: facts.attested.cluster,
+            domain: facts.attested.domain,
+        });
+    }
+    let authorized = match facts.purpose() {
+        AdmissionPurpose::Submit => role.may_submit_for_clients(),
+        AdmissionPurpose::Establish => role.may_establish_sessions(),
+    };
+    if !authorized {
+        return Err(match facts.purpose() {
+            AdmissionPurpose::Submit => IngressError::RoleNotAuthorized(role),
+            AdmissionPurpose::Establish => IngressError::NotASessionIssuer(role),
+        });
+    }
+    // Only now: the ingress has the authority these facts call for, so
+    // they may become a capability.
+    let receipt = AdmissionReceipt::attesting(VerifierToken::for_boundary(), facts);
     let frame = MessageV1::Request(submit.request)
         .encode()
         .map_err(|_| IngressError::Wire(CollectorWireError::TooLarge))?;
-    let claims = submit.receipt;
-    Ok(AdmittedRequest {
-        receipt: AdmissionReceipt::from_verifier(
-            VerifierToken::for_boundary(),
-            claims.session,
-            claims.rule_generation,
-            claims.scope_ceiling,
-            claims.receipt_id,
-            claims.admitted_at_ticks,
-        ),
-        frame,
-    })
+    Ok(AdmittedRequest { receipt, frame })
 }
 
 /// The frame a voter sends to its collector for `effect`, when the effect

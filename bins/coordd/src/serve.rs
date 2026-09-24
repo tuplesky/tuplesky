@@ -27,7 +27,7 @@ use coord_daemon::serve::{Step, step};
 use coord_daemon::voter::Voter;
 use coord_daemon::{Config, fanout};
 use coord_membership::membership::Membership;
-use coord_session::{BindingConfig, BoundFrontend, StorePolicySource};
+use coord_session::{BindingConfig, BoundFrontend, Delivered, StorePolicySource};
 use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_transport::{Responder, Transport, TransportEvent};
@@ -174,6 +174,8 @@ impl Frontend {
                 issuer: sts.issuer.clone(),
                 resource: sts.resource.clone(),
                 jwks,
+                cluster: membership.cluster(),
+                domain: membership.domain(),
             },
             PUMP_BOUND,
             config.limits.max_outstanding_per_session,
@@ -841,6 +843,108 @@ impl<P: Persistence> Domain<P> {
         }
     }
 
+    /// The answer this domain's durable record already holds for the
+    /// invocation `frame` names, if it holds one for this exact command.
+    ///
+    /// It is answered under the same authorization a live result is.
+    /// The record is resolved through `retry::resolve`, which refuses a
+    /// session that can no longer execute -- retired, or its rule
+    /// disabled or regenerated -- and a result the request would no
+    /// longer be authorized for (`retained_is_authorized`, the rule
+    /// execution applies to a retained result too). Those are answered
+    /// with a refusal rather than the result, and rather than submitted
+    /// again: the command has executed, so there is nothing new to order.
+    /// What is handed out then goes through the frontend's output gate
+    /// with the request's own metadata, which is recorded from this
+    /// request because a retry answered here never reached the
+    /// dispatcher that records it for a live one.
+    fn retained(
+        &mut self,
+        health: &ClockHealth,
+        connection: u64,
+        frame: &Frame,
+    ) -> Option<Vec<u8>> {
+        use coord_storage::retry::{Resolution, RetryBinding};
+
+        let MessageV1::Request(request) = decode(frame).ok()? else {
+            return None;
+        };
+        let key = request.retry_key;
+        // The connection must be bound, and bound to the session whose
+        // invocation this is. A retained result belongs to a session,
+        // and reading one is not something an unbound caller -- or a
+        // caller of another session -- may do.
+        let binding = self.frontend.frontend.binding(connection)?;
+        if !binding.active(health) || binding.session != key.session_id {
+            return None;
+        }
+        let logical = request.logical().ok()?;
+        let command = coord_types::CommandId::derive(&key, &logical).ok()?;
+        let resolved = {
+            let gated = self.backing.applier().store().reader().snapshot().ok()?;
+            coord_storage::retry::resolve(
+                gated.view(),
+                &RetryBinding {
+                    retry_key: key,
+                    command_id: command,
+                },
+                |record| {
+                    coord_storage::apply::retained_is_authorized(
+                        gated.view(),
+                        &key.session_id,
+                        &logical,
+                        record,
+                    )
+                },
+            )
+            .ok()?
+        };
+        let record = match resolved {
+            Resolution::Result(record) => record,
+            // The command executed, and this caller may not have what it
+            // produced -- or may not execute at all any more. The same
+            // refusal the output gate gives a live result it will not
+            // disclose; the command is not proposed a second time.
+            Resolution::NoSession => {
+                return refusal(command, "the session may no longer execute");
+            }
+            Resolution::Unauthorized => {
+                return refusal(command, "output not authorized by current policy");
+            }
+            // Not executed, retired below the floor, or a retry key bound
+            // to another payload: replicated execution decides each of
+            // those at the command's own position, not this node from a
+            // record that is not this command's.
+            Resolution::Pending | Resolution::Retired { .. } | Resolution::Conflict { .. } => {
+                return None;
+            }
+        };
+        let response = coord_types::wire_v1::ResponseV1 {
+            command_id: command,
+            outcome: coord_types::wire_v1::OutcomeV1::Ok {
+                revision: record.revision,
+                result: coord_types::wire_v1::BoundedBytes::new(record.response.clone()).ok()?,
+            },
+        };
+        let delivery = coord_collector::Delivery {
+            connection,
+            retry_key: key,
+            frame: MessageV1::Response(response).encode().ok()?,
+        };
+        let policy = StorePolicySource {
+            store: self.backing.applier().store(),
+            budget: ViewBudget::default(),
+        };
+        match self
+            .frontend
+            .frontend
+            .deliver_retained(delivery, command, &logical, &policy)
+        {
+            Delivered::Answer(delivery) => Some(delivery.frame),
+            Delivered::Unbound { .. } => None,
+        }
+    }
+
     /// Answer the caller a delivery belongs to, gated against a fresh
     /// barrier.
     fn answer(&mut self, delivery: coord_collector::Delivery) {
@@ -848,7 +952,25 @@ impl<P: Persistence> Domain<P> {
             store: self.backing.applier().store(),
             budget: ViewBudget::default(),
         };
-        let delivery = self.frontend.frontend.deliver(delivery, &policy);
+        let delivery = match self.frontend.frontend.deliver(delivery, &policy) {
+            Delivered::Answer(delivery) => delivery,
+            // The session this caller's credential named was not
+            // established. Its bind stream ends with no answer, which
+            // is the whole of what an unbound caller is told; the
+            // connection itself stays open and has no session, so its
+            // next frame closes it.
+            Delivered::Unbound {
+                connection,
+                retry_key,
+                ..
+            } => {
+                if let Ok(responder) = self.frontend.pending.take(connection, &retry_key) {
+                    drop(responder);
+                }
+                self.frontend.counts.unreturnable += 1;
+                return;
+            }
+        };
         match self
             .frontend
             .pending
@@ -895,6 +1017,26 @@ impl<P: Persistence> Domain<P> {
                 }
                 let health = ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS);
                 let retry_key = invocation_of(&frame);
+                // A request this domain has already executed is answered
+                // from its durable record rather than submitted again.
+                //
+                // The collector's retained results live in one process's
+                // memory, so after a restart an ordinary client retry
+                // would be new work to it: it would be proposed a second
+                // time, and a replica that has executed it already has
+                // nothing new to order -- the applier would hand back the
+                // outcome at the position the command already has, which
+                // is not the position the replica's learner is waiting
+                // to fill. The record the command left behind is what
+                // answers, before anything is submitted, and it is gated
+                // on the way out exactly as a fresh result is: a
+                // permission lost since it executed protects what it
+                // produced.
+                if let Some(answer) = self.retained(&health, connection.0, &frame) {
+                    self.frontend.counts.released += 1;
+                    let _ = responder.respond(answer).await;
+                    return;
+                }
                 let policy = StorePolicySource {
                     store: self.backing.applier().store(),
                     budget: ViewBudget::default(),
@@ -1226,6 +1368,18 @@ fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
             })?;
     reader.finish()?;
     Ok(frame)
+}
+
+/// A refusal of a retained result, in the shape the output gate refuses
+/// a live one it will not disclose.
+fn refusal(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    MessageV1::Response(coord_collector::codes::error_response(
+        command,
+        coord_collector::codes::NOT_ADMITTED,
+        detail,
+    ))
+    .encode()
+    .ok()
 }
 
 /// The invocation a frame names, where it names one.

@@ -71,7 +71,18 @@ const FEATURE_AUDIT: &[(&str, &[&str])] = &[("raft-engine", &[]), ("fjall", &["l
 /// Test-only crates are always allowed: the dependency policy keeps them out
 /// of production artifacts.
 const BOUNDARY_CONSTRUCTORS: &[(&str, &[&str])] = &[
-    ("VerifierToken::for_boundary", &["coord-collector"]),
+    // Two boundaries mint receipts, and they mint different ones.
+    // `coord-collector` reconstructs a receipt from facts that reached
+    // it over an ingress whose authority it has just established.
+    // `coord-session` is the authentication boundary itself: it
+    // verifies a service credential against the configured issuer,
+    // audience and keys, and what it attests -- the principal, the
+    // trust rule and its generation, the ceiling, the credential's
+    // deadline -- is that credential's, never a caller's.
+    (
+        "VerifierToken::for_boundary",
+        &["coord-collector", "coord-session"],
+    ),
     ("PeerProvenance::from_transport", &["coord-transport"]),
     // Evidence from a voter running in the same process never crosses a
     // connection, so the transport cannot be the one to prove where it

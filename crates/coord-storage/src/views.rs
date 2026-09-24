@@ -126,6 +126,7 @@ fn named_leases(op: &CanonicalOperation) -> Vec<LeaseId> {
         CanonicalOperation::Range(_)
         | CanonicalOperation::DeleteRange(_)
         | CanonicalOperation::KineDelete(_)
+        | CanonicalOperation::ConsumeAdmission
         | CanonicalOperation::Compact { .. } => {}
     }
     out

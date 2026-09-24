@@ -658,6 +658,27 @@ impl PeerRole {
     pub const fn may_submit_for_clients(self) -> bool {
         matches!(self, PeerRole::Frontend | PeerRole::KineCollector)
     }
+
+    /// Whether this role may originate the establishment of a session.
+    ///
+    /// Strictly narrower than [`Self::may_submit_for_clients`], and
+    /// deliberately not the same question. Submitting is relaying work
+    /// under a session the cluster has already agreed on; establishing
+    /// is asserting that a credential this principal verified maps to a
+    /// principal, a trust rule and a ceiling. A role that could do the
+    /// first because it can do the second would be an identity issuer,
+    /// and a domain-scoped Kine collector is not one: it converts etcd
+    /// traffic at a compatibility edge and deliberately does not
+    /// forward its callers' identities as this cluster's.
+    ///
+    /// The frontend is the authentication broker of its domain -- it is
+    /// what verifies a caller's service token against the configured
+    /// issuer -- so it is the role that may attest an authentication.
+    /// What it attests is still checked against current replicated
+    /// policy before any session exists.
+    pub const fn may_establish_sessions(self) -> bool {
+        matches!(self, PeerRole::Frontend)
+    }
 }
 
 /// First frame on a connection.

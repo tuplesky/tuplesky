@@ -4,8 +4,11 @@
 use alloc::vec::Vec;
 
 use coord_types::CommandId;
-use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, SessionId};
+use coord_types::identity::{Digest32, HashDomain};
+use coord_types::ids::{
+    Ballot, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition, KvRevision, PrincipalId,
+    SessionId, TrustRuleId,
+};
 use serde::{Deserialize, Serialize};
 
 /// Evidence presented to [`EstablishedResult::establish`]. Constructing this
@@ -235,19 +238,211 @@ impl ReleasedResult {
     }
 }
 
+/// What a receipt authorizes its holder to do.
+///
+/// A receipt attests an authentication. It does not follow that every
+/// authentication may create a session: a collector relaying a client's
+/// work under a session the cluster already agreed on is doing
+/// something different from a broker asserting that a credential it
+/// verified maps to a principal. Collapsing the two would make every
+/// principal that can submit an identity issuer.
+///
+/// So the purpose is part of what the verifier attests, it is checked
+/// against the authority of the ingress the receipt arrived on, and it
+/// is part of what consensus binds to the command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AdmissionPurpose {
+    /// Submit work under a session that already exists. The session's
+    /// own record decides what the work may do; this receipt asserts
+    /// only that the caller presenting it is bound to that session.
+    Submit,
+    /// Establish the session this receipt names, from a credential the
+    /// verifier checked against configured trust. Only an ingress with
+    /// session-establishment authority may originate one.
+    Establish,
+}
+
+/// The instant a verified credential stops admitting new work: whole
+/// seconds of the issuer's clock, the scale a token's `exp` uses.
+///
+/// It is an *admission* constraint and never a replica's branch. It is
+/// checked once, at the authentication boundary, under that boundary's
+/// configured clock-health assumptions; a replica applying the command
+/// does not consult a clock, and recovery does not revalidate an
+/// already accepted command against today's. A command admitted before
+/// the deadline may therefore finish after it, which is correct: what
+/// denies execution later is an ordered session retirement or a trust
+/// rule revocation at its own position, not the passage of time.
+///
+/// Distinct from the boundary's own monotonic admission tick, which is
+/// not comparable across processes and is not a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CredentialDeadline(pub u64);
+
+/// What every receipt attests, whatever it is for.
+///
+/// The cluster and domain are the verifier's own, so a receipt minted
+/// for one domain cannot admit work in another; the session is what the
+/// receipt is about; the generation and ceiling are what the binding or
+/// the credential allowed. None of it may be taken from a command
+/// payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AttestedAdmission {
+    /// Cluster the verifier belongs to.
+    pub cluster: ClusterId,
+    /// Domain the session lives in.
+    pub domain: DomainId,
+    /// Session the receipt is about: the one being established, or the
+    /// one the caller is already bound to.
+    pub session: SessionId,
+    /// Rule/issuer generation the admission relied on.
+    pub rule_generation: u64,
+    /// Ceiling the credential and rule allow; execution can only narrow
+    /// it further.
+    pub scope_ceiling: u32,
+    /// Unique receipt identity (single use).
+    pub receipt_id: Digest32,
+    /// The boundary's own monotonic tick at admission.
+    pub admitted_at_ticks: u64,
+}
+
+/// What a verifier attests *in addition* when a credential is to
+/// establish the session it names.
+///
+/// Separate from [`AttestedAdmission`] on purpose, and not a pair of
+/// optional fields on it. A submission receipt must not be *able* to
+/// carry a principal or a trust rule: if it could, every principal that
+/// may submit would be one field away from being an identity issuer,
+/// and the check that stops it would be a runtime condition rather than
+/// a type.
+///
+/// Every field is a verified fact. The principal is the configured
+/// mapping of the credential that was checked, the trust rule
+/// identifies the rule actually used, and the deadline is that
+/// credential's own. A replica still rechecks the rule and its
+/// generation against current replicated policy before it creates
+/// anything: this says who was authenticated, not what exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AttestedEstablishment {
+    /// Principal the verified credential maps to under configured trust.
+    pub principal: PrincipalId,
+    /// The trust rule actually used.
+    pub trust_rule: TrustRuleId,
+    /// When the verified credential stops admitting new work.
+    pub credential_valid_until: CredentialDeadline,
+}
+
+/// Everything a verifier attested, as data rather than as a capability.
+///
+/// The one shape for these facts: it is what a receipt holds, what
+/// crosses the wire in a collector's `Submit`, and what the accepted
+/// command's durable record binds. A second shape for any of the three
+/// would be a second thing to get out of step, and the one that
+/// mattered would be whichever the security check happened to read.
+///
+/// It is ordinary deserializable data, and that is not a weakness: the
+/// capability is [`AdmissionReceipt`], which is not deserializable, and
+/// decoding facts is exactly what must *not* be enough to produce one.
+/// A boundary reconstructs the capability from these facts only after
+/// establishing that the ingress they arrived on had the authority they
+/// call for.
+///
+/// Field and variant order are frozen (`spec/wire-v1.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AdmissionFacts {
+    /// What every receipt attests.
+    pub attested: AttestedAdmission,
+    /// What was attested in addition to establish a session. Its
+    /// presence is what says the purpose is
+    /// [`AdmissionPurpose::Establish`]: there is no separate purpose
+    /// field to disagree with it.
+    pub establishing: Option<AttestedEstablishment>,
+}
+
+impl AdmissionFacts {
+    /// Byte length of [`AdmissionFacts::canonical_bytes`].
+    pub const CANONICAL_LEN: usize = 141;
+
+    /// What these facts authorize.
+    pub const fn purpose(&self) -> AdmissionPurpose {
+        match self.establishing {
+            Some(_) => AdmissionPurpose::Establish,
+            None => AdmissionPurpose::Submit,
+        }
+    }
+
+    /// Fixed 141-byte canonical encoding, frozen (`spec/wire-v1.md`).
+    ///
+    /// Written out rather than derived from the serialization format
+    /// because it is what replicas compare to agree on what a command
+    /// is. A digest over an encoder's output would change meaning if
+    /// the encoder ever did, and a purpose whose absence is spelled by
+    /// an omitted field would hash the same as one spelled by a
+    /// zero-filled one. Here the purpose has its own byte, and the
+    /// establishment fields are present either way: zero-filled when
+    /// there is no establishment, which the purpose byte already
+    /// distinguishes from an establishment that happened to be zero.
+    pub fn canonical_bytes(&self) -> [u8; Self::CANONICAL_LEN] {
+        let mut out = [0u8; Self::CANONICAL_LEN];
+        let a = &self.attested;
+        out[0..16].copy_from_slice(a.cluster.as_bytes());
+        out[16..32].copy_from_slice(a.domain.as_bytes());
+        out[32..48].copy_from_slice(a.session.as_bytes());
+        out[48..80].copy_from_slice(&a.receipt_id.0);
+        out[80..88].copy_from_slice(&a.rule_generation.to_be_bytes());
+        out[88..92].copy_from_slice(&a.scope_ceiling.to_be_bytes());
+        out[92..100].copy_from_slice(&a.admitted_at_ticks.to_be_bytes());
+        if let Some(e) = &self.establishing {
+            out[100] = 1;
+            out[101..117].copy_from_slice(e.principal.as_bytes());
+            out[117..133].copy_from_slice(e.trust_rule.as_bytes());
+            out[133..141].copy_from_slice(&e.credential_valid_until.0.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// The digest that binds an admission into what a command *is*.
+///
+/// Deliberately separate from the command identity. Identity is the
+/// retry key and the canonical request, so a retry keeps it and a
+/// credential rotation does not change it. This is what voters compare
+/// to be sure they accepted the same command: two replicas that
+/// acknowledge one command under different attested facts would execute
+/// it as two different session-creation facts, and the acknowledgement
+/// is where that has to be caught -- after it, each replica is simply
+/// applying what it agreed to.
+///
+/// `None` -- a command no verifier admitted, such as the protocol's own
+/// internal work -- has its own digest rather than a zero, so "no
+/// admission" is a value that must be agreed on too.
+pub fn admission_digest(facts: Option<&AdmissionFacts>) -> Digest32 {
+    match facts {
+        Some(f) => HashDomain::AdmissionReceipt.digest(&[&f.canonical_bytes()]),
+        None => HashDomain::AdmissionReceipt.digest(&[&[]]),
+    }
+}
+
 /// Canonical trusted admission receipt (design Section 9.3): identity and
 /// relevant claims verified outside replicated execution, never a raw token.
 /// Only a verifier at the trusted boundary constructs it, through
-/// [`AdmissionReceipt::from_verifier`] with a [`VerifierToken`]. It is
-/// deliberately not deserializable: a receipt is minted per admission by the
-/// verifier and never restored from bytes.
+/// [`AdmissionReceipt::submitting`] or [`AdmissionReceipt::establishing`]
+/// with a [`VerifierToken`]. It is deliberately not deserializable: a
+/// receipt is minted per admission by the verifier and never restored
+/// from bytes.
+///
+/// # What it is evidence of, and what it is not
+///
+/// It is evidence that a credential was authenticated, under a named
+/// trust rule at a named generation, within named limits. It is *not*
+/// evidence that the session exists, that session creation committed,
+/// or that an operation is still authorized. Those remain the
+/// replicated state machine's to decide at the command's own position:
+/// current rules, the consumption state of this receipt, the session's
+/// own record and its retirement all outrank anything attested here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AdmissionReceipt {
-    session: SessionId,
-    rule_generation: u64,
-    scope_ceiling: u32,
-    receipt_id: Digest32,
-    admitted_at_ticks: u64,
+    facts: AdmissionFacts,
 }
 
 /// Proof that a verifier ran. It has no public constructor other than
@@ -268,42 +463,97 @@ impl VerifierToken {
 }
 
 impl AdmissionReceipt {
-    /// Construct a receipt at the trusted boundary.
-    pub fn from_verifier(
+    /// Mint a receipt for work under a session that already exists.
+    ///
+    /// It attests only that the caller presenting it is bound to that
+    /// session at that generation and ceiling. What the work may do is
+    /// the session record's answer at the command's position, not this
+    /// receipt's.
+    pub const fn submitting(_token: VerifierToken, attested: AttestedAdmission) -> Self {
+        AdmissionReceipt {
+            facts: AdmissionFacts {
+                attested,
+                establishing: None,
+            },
+        }
+    }
+
+    /// Mint a receipt for establishing the session it names.
+    ///
+    /// Only a verifier with session-establishment authority calls this,
+    /// and only from a credential it checked against configured trust.
+    /// The replica still decides whether the session exists.
+    pub const fn establishing(
         _token: VerifierToken,
-        session: SessionId,
-        rule_generation: u64,
-        scope_ceiling: u32,
-        receipt_id: Digest32,
-        admitted_at_ticks: u64,
+        attested: AttestedAdmission,
+        establishing: AttestedEstablishment,
     ) -> Self {
         AdmissionReceipt {
-            session,
-            rule_generation,
-            scope_ceiling,
-            receipt_id,
-            admitted_at_ticks,
+            facts: AdmissionFacts {
+                attested,
+                establishing: Some(establishing),
+            },
         }
+    }
+
+    /// Mint a receipt from facts an authorized ingress vouched for.
+    ///
+    /// The one way a receipt is reconstructed from data, and the reason
+    /// it takes a [`VerifierToken`]: decoding the facts is not proof of
+    /// where they came from, so only a boundary that has established
+    /// the ingress's authority may call this.
+    pub const fn attesting(_token: VerifierToken, facts: AdmissionFacts) -> Self {
+        AdmissionReceipt { facts }
+    }
+
+    /// Everything attested, as data.
+    pub const fn facts(&self) -> AdmissionFacts {
+        self.facts
+    }
+
+    /// What this receipt authorizes.
+    pub const fn purpose(&self) -> AdmissionPurpose {
+        self.facts.purpose()
+    }
+
+    /// Everything every receipt attests.
+    pub const fn attested(&self) -> AttestedAdmission {
+        self.facts.attested
+    }
+
+    /// What was attested for establishing a session, where that is what
+    /// this receipt is for.
+    pub const fn establishment(&self) -> Option<AttestedEstablishment> {
+        self.facts.establishing
+    }
+
+    /// Cluster the verifier belongs to.
+    pub const fn cluster(&self) -> ClusterId {
+        self.facts.attested.cluster
+    }
+    /// Domain the session lives in.
+    pub const fn domain(&self) -> DomainId {
+        self.facts.attested.domain
     }
 
     /// Session.
     pub const fn session(&self) -> SessionId {
-        self.session
+        self.facts.attested.session
     }
     /// Rule/issuer generation the admission relied on.
     pub const fn rule_generation(&self) -> u64 {
-        self.rule_generation
+        self.facts.attested.rule_generation
     }
     /// Scope ceiling; policy at execution can only narrow it.
     pub const fn scope_ceiling(&self) -> u32 {
-        self.scope_ceiling
+        self.facts.attested.scope_ceiling
     }
     /// Unique receipt identity (single use).
     pub const fn receipt_id(&self) -> Digest32 {
-        self.receipt_id
+        self.facts.attested.receipt_id
     }
     /// Admission tick.
     pub const fn admitted_at_ticks(&self) -> u64 {
-        self.admitted_at_ticks
+        self.facts.attested.admitted_at_ticks
     }
 }

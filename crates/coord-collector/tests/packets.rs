@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use coord_collector::{IngressError, KIND_SUBMIT, SubmitV1, admitted_from_submit, submit_frame};
-use coord_core::capability::{AdmissionReceipt, VerifierToken};
+use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_transport::{BoundIdentity, Lane, Limits};
 use coord_transport_sim::{LinkFaults, NodeConfig, PacketWorld, SimEvent};
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
@@ -80,14 +80,19 @@ fn submission() -> Vec<u8> {
         request_sequence: RequestSequence::new(1).unwrap(),
     };
     submit_frame(&SubmitV1 {
-        receipt: coord_collector::AdmissionClaimsV1::of(&AdmissionReceipt::from_verifier(
+        receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
-            SessionId([3; 16]),
-            1,
-            u32::MAX,
-            Digest32([6; 32]),
-            0,
-        )),
+            AttestedAdmission {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                session: SessionId([3; 16]),
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([6; 32]),
+                admitted_at_ticks: 0,
+            },
+        )
+        .facts(),
         request: RequestV1::new(key, &logical, 0).unwrap(),
     })
     .unwrap()
@@ -233,11 +238,11 @@ fn the_fan_out_reaches_every_voter_at_once_and_nobody_relays_it() {
         assert_eq!(frame.kind, KIND_SUBMIT);
         match role {
             PeerRole::Frontend => {
-                let admitted = admitted_from_submit(*role, frame).unwrap();
+                let admitted = admitted_from_submit(*role, frame, CLUSTER, DOMAIN).unwrap();
                 assert_eq!(admitted.receipt.session(), SessionId([3; 16]));
             }
             PeerRole::Client => assert_eq!(
-                admitted_from_submit(*role, frame).map(|_| ()),
+                admitted_from_submit(*role, frame, CLUSTER, DOMAIN).map(|_| ()),
                 Err(IngressError::RoleNotAuthorized(PeerRole::Client))
             ),
             other => panic!("{other:?}"),

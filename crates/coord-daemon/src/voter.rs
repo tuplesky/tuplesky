@@ -40,7 +40,7 @@ use coord_core::event::{AuthenticatedPeerMessage, Event, PeerProvenance};
 use coord_membership::membership::Membership;
 use coord_storage::Persistence;
 use coord_types::CommandId;
-use coord_types::ids::{Ballot, ReplicaId, ReplicaIncarnation};
+use coord_types::ids::{Ballot, ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{FrameReader, WireError};
 
 use crate::mailbox::Ingress;
@@ -111,6 +111,9 @@ pub enum Refused {
 pub struct Voter<P: Persistence> {
     node: Node<P>,
     ingress: Ingress,
+    /// This domain's committed origin, which a submission's claims must
+    /// have been attested for.
+    origin: (ClusterId, DomainId),
     ballot: Ballot,
     provenance: PeerProvenance,
     origins: alloc_map::Origins,
@@ -132,12 +135,18 @@ impl<P: Persistence> Voter<P> {
     /// The store is told the same ballot here, whatever it was opened
     /// with: it stamps every transition it records, and the ballot the
     /// machine steps at is this one ([`Persistence::follow_ballot`]).
-    pub fn new(mut node: Node<P>, ingress: Ingress, ballot: Ballot) -> Self {
+    pub fn new(
+        mut node: Node<P>,
+        ingress: Ingress,
+        origin: (ClusterId, DomainId),
+        ballot: Ballot,
+    ) -> Self {
         let provenance = PeerProvenance::from_local_voter(ingress.replica(), ingress.incarnation());
         node.applier_mut().store_mut().follow_ballot(ballot);
         Voter {
             node,
             ingress,
+            origin,
             ballot,
             provenance,
             origins: alloc_map::Origins::new(ORIGINS),
@@ -242,7 +251,7 @@ impl<P: Persistence> Voter<P> {
         frame: &coord_types::wire_v1::Frame,
         origin: Origin,
     ) -> Result<Result<Outbound, Refused>, DriveError> {
-        let admitted = match admitted_from_submit(submitter, frame) {
+        let admitted = match admitted_from_submit(submitter, frame, self.origin.0, self.origin.1) {
             Ok(a) => a,
             Err(e) => return Ok(Err(Refused::NotAdmissible(e))),
         };

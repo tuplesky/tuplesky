@@ -10,7 +10,9 @@ use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader,
     LeaderConfig, LearningMode, PayloadRecordV1, ProtocolMessage, ReplicaRole,
 };
-use coord_core::capability::{AdmissionReceipt, EstablishedResult, VerifierToken};
+use coord_core::capability::{
+    AdmissionReceipt, AttestedAdmission, EstablishedResult, VerifierToken,
+};
 use coord_core::effect::{BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageEvent,
@@ -330,13 +332,17 @@ impl Cluster {
             .encode()
             .unwrap();
         for i in 0..self.nodes.len() {
-            let receipt = AdmissionReceipt::from_verifier(
+            let receipt = AdmissionReceipt::submitting(
                 VerifierToken::for_boundary(),
-                SESSION,
-                1,
-                u32::MAX,
-                Digest32([9; 32]),
-                0,
+                AttestedAdmission {
+                    cluster: ClusterId([1; 16]),
+                    domain: DomainId([2; 16]),
+                    session: SESSION,
+                    rule_generation: 1,
+                    scope_ceiling: u32::MAX,
+                    receipt_id: Digest32([9; 32]),
+                    admitted_at_ticks: 0,
+                },
             );
             let effects = self.nodes[i].machine.step(Event::Admitted(AdmittedRequest {
                 receipt,

@@ -39,7 +39,10 @@ pub mod machine;
 pub mod outbox;
 pub mod ports;
 
-pub use capability::{AdmissionReceipt, EstablishError, EstablishedResult, EstablishmentEvidence};
+pub use capability::{
+    AdmissionFacts, AdmissionPurpose, AdmissionReceipt, AttestedAdmission, AttestedEstablishment,
+    CredentialDeadline, EstablishError, EstablishedResult, EstablishmentEvidence, admission_digest,
+};
 pub use effect::{
     BarrierId, BootId, CollectionId, Effect, EffectContext, PersistBatch, StoreUpdate, TimerId,
 };

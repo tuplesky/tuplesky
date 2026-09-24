@@ -11,7 +11,7 @@ use coord_consensus::{
     FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplicaRole,
     decode_dependency, decode_payload, dependency_key,
 };
-use coord_core::capability::{AdmissionReceipt, VerifierToken};
+use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
 use coord_core::event::{
     AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageError, StorageEvent,
@@ -104,13 +104,17 @@ fn admitted(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
     let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
         .encode()
         .unwrap();
-    let receipt = AdmissionReceipt::from_verifier(
+    let receipt = AdmissionReceipt::submitting(
         VerifierToken::for_boundary(),
-        SessionId([3; 16]),
-        1,
-        u32::MAX,
-        Digest32([9; 32]),
-        0,
+        AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
     );
     (Event::Admitted(AdmittedRequest { receipt, frame }), command)
 }
@@ -138,8 +142,27 @@ fn proposal(
         deps,
         paths,
         path,
+        admission: admitted_under(),
         seqnum: Some(seqnum),
     })
+}
+
+/// The admission every request these tests admit is submitted under.
+/// A proposal that named another one would be a proposal about another
+/// command, whatever identity it shares.
+fn admitted_under() -> Digest32 {
+    coord_core::capability::admission_digest(Some(&coord_core::capability::AdmissionFacts {
+        attested: AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
+        establishing: None,
+    }))
 }
 
 fn durable_of(effects: &[Effect], seq: u64) -> Vec<Event> {
@@ -375,6 +398,7 @@ fn conflict_arrival_permutations_converge_on_the_leader_order() {
         deps: vec![],
         paths: vec![],
         path: Digest32([0; 32]),
+        admission: admitted_under(),
         seqnum: Some(9),
     };
     assert!(
@@ -554,6 +578,7 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
         deps: record.deps.clone(),
         paths: vec![(CONSERVATIVE_KEY.to_vec(), Digest32([7; 32]))],
         path: Digest32([7; 32]),
+        admission: record.payload.expect("initialized"),
         seqnum: None,
     };
     assert!(
@@ -752,13 +777,17 @@ fn admitted_with_key(seq: u64, key: u8, value: u8) -> (Event, CommandId) {
     let frame = MessageV1::Request(RequestV1::new(retry_key(seq), &request, 0).unwrap())
         .encode()
         .unwrap();
-    let receipt = AdmissionReceipt::from_verifier(
+    let receipt = AdmissionReceipt::submitting(
         VerifierToken::for_boundary(),
-        SessionId([3; 16]),
-        1,
-        u32::MAX,
-        Digest32([9; 32]),
-        0,
+        AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
     );
     (Event::Admitted(AdmittedRequest { receipt, frame }), command)
 }

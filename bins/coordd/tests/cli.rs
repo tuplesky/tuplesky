@@ -352,6 +352,20 @@ fn sts_keys(dir: &Path) -> coord_sts::KeyRing {
 
 /// A token this domain's frontend will accept, signed by the keys it
 /// reads at startup.
+/// The trust rule this test cluster's issuer signs under, written into
+/// the domain's genesis policy by `coordd init`. One rule admits every
+/// session the issuer mints: a rule is the issuer mapping, not a
+/// session.
+const TRUST_RULE: [u8; 16] = [0x7c; 16];
+
+/// The principal every token in these tests names, and the one the
+/// domain's genesis grants permissions to.
+const PRINCIPAL: [u8; 16] = [0xa; 16];
+
+/// The namespace those permissions cover, and the one every request
+/// here is planned in.
+const REQUEST_NAMESPACE: [u8; 16] = [0x5e; 16];
+
 fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
     let issued = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -359,11 +373,11 @@ fn service_token(ring: &coord_sts::KeyRing, session: [u8; 16]) -> String {
         .as_secs();
     ring.sign(&coord_sts::ServiceClaims {
         iss: "https://sts.test".into(),
-        sub: hex(&[0xa; 16]),
+        sub: hex(&PRINCIPAL),
         aud: "control-plane-test".into(),
         sid: hex(&session),
         scope: 0xffff,
-        rule: hex(&session),
+        rule: hex(&TRUST_RULE),
         generation: 1,
         jti: hex(&[2u8; 32]),
         iat: issued,
@@ -419,6 +433,11 @@ collector_key = "{root}/collector.key"
 issuer = "https://sts.test"
 resource = "control-plane-test"
 jwks = "{root}/sts-jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
+
+[[grant]]
+principal = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
 "#,
         root = dir.display()
     );
@@ -971,6 +990,43 @@ impl Caller {
     /// Dial `daemon`, negotiate as a client of this domain, and bind
     /// `session` with a token the daemon's own keys verify.
     async fn bind(daemon: &Running, ca: &Ca, ring: &coord_sts::KeyRing, session: [u8; 16]) -> Self {
+        let (endpoint, connection, control, control_recv) = Self::negotiated(daemon, ca).await;
+        let token = service_token(ring, session);
+        let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
+        let answer = ask(&connection, &bind)
+            .await
+            .expect("the daemon answered the binding within the bound");
+        let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
+        assert_eq!(
+            ack.session,
+            coord_types::ids::SessionId(session),
+            "the daemon bound a different session than the token named"
+        );
+        assert!(ack.expires_at > 0, "a binding with no validity");
+
+        Caller {
+            connection,
+            session: ack.session,
+            _endpoint: endpoint,
+            _control: control,
+            _control_recv: control_recv,
+        }
+    }
+
+    /// Dial `daemon` and negotiate as a client of this domain, stopping
+    /// before the binding. Separate from [`Caller::bind`] because a
+    /// binding is now a replicated command, so a cluster that cannot
+    /// agree does not acknowledge one -- and a test about that has to be
+    /// able to reach the point of asking.
+    async fn negotiated(
+        daemon: &Running,
+        ca: &Ca,
+    ) -> (
+        quinn::Endpoint,
+        quinn::Connection,
+        quinn::SendStream,
+        quinn::RecvStream,
+    ) {
         use coord_types::wire_v1::PeerRole;
 
         let (certificate, key) = ca.issue("caller.coordd.test", CLUSTER, 0x0c, PeerRole::Client);
@@ -1053,27 +1109,7 @@ impl Caller {
             ),
             "the node answered the hello with something else: {ack:?}"
         );
-
-        let token = service_token(ring, session);
-        let bind = coord_session::bind_frame(token.as_bytes()).expect("bind frame");
-        let answer = ask(&connection, &bind)
-            .await
-            .expect("the daemon answered the binding within the bound");
-        let ack = coord_session::decode_bind_ack(&answer).expect("a binding acknowledgement");
-        assert_eq!(
-            ack.session,
-            coord_types::ids::SessionId(session),
-            "the daemon bound a different session than the token named"
-        );
-        assert!(ack.expires_at > 0, "a binding with no validity");
-
-        Caller {
-            connection,
-            session: ack.session,
-            _endpoint: endpoint,
-            _control: control,
-            _control_recv: control_recv,
-        }
+        (endpoint, connection, control, control_recv)
     }
 
     /// The retry key of this caller's `sequence`th invocation.
@@ -1096,6 +1132,27 @@ impl Caller {
                 value: value.to_vec(),
                 lease: None,
                 prev_kv: false,
+            }),
+        );
+        logical.canonicalize();
+        coord_types::wire_v1::MessageV1::Request(
+            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0)
+                .expect("bounded"),
+        )
+        .encode()
+        .expect("bounded")
+    }
+
+    /// One `Range` of exactly `key`, as a client would send it.
+    fn range(&self, sequence: u64, key: &[u8]) -> Vec<u8> {
+        let mut logical = coord_types::logical_v1::LogicalRequest::new(
+            coord_types::ids::NamespaceId([0x5e; 16]),
+            coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
+                range: coord_types::logical_v1::KeyRange::exact(key.to_vec()),
+                revision: None,
+                limit: 0,
+                keys_only: false,
+                count_only: false,
             }),
         );
         logical.canonicalize();
@@ -1132,14 +1189,24 @@ async fn ask(connection: &quinn::Connection, frame: &[u8]) -> Option<coord_types
     reader.next_frame().expect("a frame")
 }
 
-/// A caller binds a session against the running daemon, and the daemon
-/// answers from the composition it actually has.
+/// A caller binds a session against the running daemon, and the
+/// acknowledgement follows the cluster agreeing that the session
+/// exists.
+///
+/// The binding is not the frontend's own answer any more. Verifying the
+/// credential says who was authenticated; it does not make a session.
+/// So the frontend mints an establishment receipt, submits the
+/// `ConsumeAdmission` command the receipt authorizes, and holds this
+/// stream until that command has been proposed, executed against
+/// current replicated policy and materialized. The acknowledgement the
+/// caller reads is written after that, which is why a one-voter cluster
+/// is used here: a bind against a cluster that cannot reach quorum is
+/// not acknowledged, which the next test shows for a request.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_caller_binds_a_session_against_the_running_daemon() {
     let dir = workspace("bind");
     let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
-    genesis(&dir, Some(&ca.node_spki));
-    endpoints(&dir, &ca, 3, &[]);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
     let ring = sts_keys(&dir);
     let path = config_only(&dir);
 
@@ -1148,16 +1215,27 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
 
     let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
     assert_eq!(caller.session, coord_types::ids::SessionId([0x44; 16]));
+
+    // Binding again on a second connection converges on the row the
+    // first established rather than creating a second session: the
+    // receipt this credential carries is already consumed, and the
+    // session that exists is the one it describes.
+    let again = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    assert_eq!(again.session, caller.session);
 }
 
 /// A process that only serves clients starts, binds no peer listener,
-/// and answers a caller.
+/// and takes a caller's binding to the voters.
 ///
 /// A frontend reaches every committed voter over the api plane, as a
 /// collector: they are its destinations, not peers it votes with. A
 /// process that took "there are voters to reach" to mean "this process
 /// has a peer plane" would demand a peer listener a frontend is not
 /// required to bind, and so a supported role could never start.
+///
+/// A binding is a replicated command, so with none of the committed
+/// voters running the frontend holds it rather than answering it: that
+/// it negotiates and holds the binding is what says it is serving.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frontend_only_process_starts_without_a_peer_plane() {
     let dir = workspace("frontend");
@@ -1176,8 +1254,19 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
 
     assert_eq!(run(&path, &["init"]).code, Some(0));
     let daemon = start(&path);
-    let caller = Caller::bind(&daemon, &ca, &ring, [0x45; 16]).await;
-    assert_eq!(caller.session, coord_types::ids::SessionId([0x45; 16]));
+    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
+    let token = service_token(&ring, [0x45; 16]);
+    let (mut send, mut recv) = connection.open_bi().await.expect("bind stream");
+    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
+        .await
+        .expect("written");
+    send.finish().expect("finished");
+    let mut buf = [0u8; 4096];
+    let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
+    assert!(
+        early.is_err(),
+        "a frontend answered a binding no voter agreed to: {early:?}"
+    );
     let said = daemon.said();
     assert!(
         !said.contains("peer listener"),
@@ -1227,13 +1316,11 @@ async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
     // exactly it, and the release was matched back to the stream that
     // is holding.
     //
-    // Its *outcome* is whatever this cluster's committed policy says
-    // for a session with no rules written for it yet, and that is not
-    // what this test is about. What it holds is that an answer came
-    // back at all, addressed to this command, which it does only if
-    // every stage above happened.
+    // Its *outcome* is now a real one: the binding established this
+    // caller's session as a replicated command, so the Put executes
+    // against a session row the cluster agreed on.
     let mut logical = coord_types::logical_v1::LogicalRequest::new(
-        coord_types::ids::NamespaceId([0x5e; 16]),
+        coord_types::ids::NamespaceId(REQUEST_NAMESPACE),
         coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
@@ -1249,27 +1336,29 @@ async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
     );
 
     // And it is the result the *replicated* execution produced, decoded
-    // here rather than taken on trust.
+    // here rather than taken on trust: a mutation, with a revision,
+    // against a session row this path wrote.
     //
-    // It is a rejection, and the right one. Nothing in this build writes
-    // the session row a command's execution authorizes against: a
-    // session is established by a replicated command, and driving that
-    // from the bind is its own task (see the plan's task-j09). Until it
-    // exists, every command any cluster this binary starts can execute
-    // is refused at execution with `SessionInvalid` -- which is the
-    // correct fail-closed answer, and is still a full trip through the
-    // machinery above.
-    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+    // Nothing in the test wrote that row. The bind verified the
+    // credential, minted an establishment receipt, and submitted a
+    // `ConsumeAdmission` command; the voter proposed it, executed it
+    // against current replicated policy, and the acknowledgement the
+    // caller read was written only after that was durable. The Put
+    // afterwards is authorized by the session that command created and
+    // by the permission the domain's genesis granted its principal.
+    let coord_types::wire_v1::OutcomeV1::Ok { result, revision } = &response.outcome else {
         panic!("the daemon answered with a transport-level error: {response:?}");
     };
     let executed: coord_state::Response =
         postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
     assert_eq!(
         executed.outcome,
-        coord_state::Outcome::ErrRejected {
-            reason: coord_state::RejectionReason::SessionInvalid
-        },
-        "the session row is not written by anything yet; see task-j09"
+        coord_state::Outcome::Put { prev: None },
+        "the first command of an established session executes"
+    );
+    assert!(
+        revision.is_some(),
+        "a mutation that executed produced no revision: {response:?}"
     );
 }
 
@@ -1280,14 +1369,13 @@ async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
 /// process comes up on the store the first one left: it recovers, it
 /// serves, and the same invocation gets the same answer.
 ///
-/// What this does *not* yet hold is retry resolution from the durable
-/// record. The command here is refused at execution, and a semantic
-/// admission refusal deliberately records nothing under the retry key
-/// -- so there is nothing retained to resolve to, and the second trip
-/// re-derives the same refusal rather than finding it. Holding the
-/// resolution path needs a command that executes, which needs the
-/// session row nothing writes yet (task-j09). Saying so is more use
-/// than a test that named a property it does not check.
+/// This is the retry-resolution path, not a re-execution of the same
+/// request. The command executed in the first process and left a
+/// retained record keyed by this invocation; the second process cannot
+/// tell from its empty command table that it has seen the command, so
+/// it re-proposes it -- and the applier answers from the record rather
+/// than executing anything, at the position the command already has.
+/// The caller gets the same command identity and the same result.
 ///
 /// The restart is ordinary: the process is stopped and started again.
 /// That is integration evidence and not a durability qualification --
@@ -1319,7 +1407,7 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
         .await
-        .expect("the daemon answered the retry");
+        .unwrap_or_else(|| panic!("the daemon answered the retry\n{}", daemon.said()));
     let again = response_of(&answer);
 
     assert_eq!(
@@ -1329,6 +1417,59 @@ async fn the_same_invocation_is_answered_the_same_way_after_a_restart() {
     assert_eq!(
         again.outcome, first.outcome,
         "the same invocation was answered differently by the next process"
+    );
+}
+
+/// A read retried after a restart is answered with its retained result,
+/// not refused.
+///
+/// A read's output is gated on the request's namespace and keys, which
+/// the frontend records when its dispatcher accepts a live request. A
+/// retry answered from the durable record never reaches the dispatcher,
+/// and the process that recorded them is gone -- so without recording
+/// them from the retry itself, every read-bearing retry after a restart
+/// was answered as not admitted while the session and its permissions
+/// were unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_retried_after_a_restart_gets_its_retained_result() {
+    let dir = workspace("read-retry");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let first = {
+        let daemon = start(&path);
+        let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
+        ask(&caller.connection, &caller.put(1, b"k", b"v"))
+            .await
+            .expect("the daemon answered the write");
+        let answer = ask(&caller.connection, &caller.range(2, b"k"))
+            .await
+            .expect("the daemon answered the read");
+        response_of(&answer)
+    };
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &first.outcome else {
+        panic!("the read was not answered with a result: {first:?}");
+    };
+    let read: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the read's result decodes");
+    assert!(
+        !matches!(read.outcome, coord_state::Outcome::ErrPermissionDenied),
+        "the read itself was denied, so this is not the case under test: {read:?}"
+    );
+
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
+    let answer = ask(&caller.connection, &caller.range(2, b"k"))
+        .await
+        .unwrap_or_else(|| panic!("the daemon answered the retry\n{}", daemon.said()));
+    let again = response_of(&answer);
+    assert_eq!(again.command_id, first.command_id);
+    assert_eq!(
+        again.outcome, first.outcome,
+        "a read retried after a restart was not given its retained result"
     );
 }
 
@@ -1391,12 +1532,14 @@ async fn a_restarted_replica_recovers_what_it_already_owed() {
         field("position") >= 1,
         "the next command would take a position already taken: {line}"
     );
-    // `executed` is zero here and that is correct: the command was
-    // refused at execution (no session row -- task-j09), and a semantic
-    // refusal takes its position without writing an executed identity
-    // under it. The frontier moved, which is the part that matters for
-    // where the next command goes.
-    assert_eq!(field("executed"), 0, "{line}");
+    // Both commands wrote an executed identity: the establishment this
+    // caller's binding submitted, and the request it made afterwards.
+    // A refusal would take its position without writing one, so this is
+    // what says the work was executed rather than merely ordered.
+    assert!(
+        field("executed") >= 1,
+        "nothing that executed survived the restart: {line}"
+    );
 }
 
 /// A voter that cannot say where its peers are does not come up.
@@ -1548,16 +1691,87 @@ fn response_of(frame: &coord_types::wire_v1::Frame) -> coord_types::wire_v1::Res
     }
 }
 
+/// A binding the daemon refuses establishes nothing.
+///
+/// The credential is well formed and signed -- by a key this cluster
+/// does not trust. The daemon refuses the binding and closes the
+/// connection, and no `ConsumeAdmission` is submitted: a caller whose
+/// credential does not verify cannot cause a session to exist, which a
+/// later *valid* binding of the same session shows by creating it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_the_daemon_refuses_establishes_nothing() {
+    let dir = workspace("refused");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+
+    // Another signing key entirely: the same claims, an untrusted
+    // signature.
+    let stranger = {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+        coord_sts::KeyRing::new(
+            coord_sts::SigningKey::from_pkcs8_der("stranger-1", &key.serialize_der())
+                .expect("signing key"),
+        )
+    };
+    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
+    let token = service_token(&stranger, [0x44; 16]);
+    let (mut send, mut recv) = connection.open_bi().await.expect("bind stream");
+    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
+        .await
+        .expect("written");
+    send.finish().expect("finished");
+    // A refused binding is a statement about the connection, not about
+    // this stream: the daemon closes the peer rather than answering.
+    // Which of the two the caller sees first is a race between the
+    // close and the stream ending -- both are the refusal, and what
+    // must never arrive is an acknowledgement.
+    let mut buf = [0u8; 4096];
+    let read = tokio::time::timeout(Duration::from_secs(20), recv.read(&mut buf))
+        .await
+        .expect("the daemon decided within the bound");
+    match read {
+        Ok(None) => {}
+        Err(quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(close))) => {
+            assert_eq!(close.error_code.into_inner(), 2, "{close:?}")
+        }
+        other => panic!("the daemon answered a binding it could not verify: {other:?}"),
+    }
+
+    // The session the refused credential named does not exist: a valid
+    // credential for it is still the one that creates it, and a caller
+    // whose first command executes proves the row is there.
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the daemon answered the request\n{}", daemon.said()));
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response_of(&answer).outcome else {
+        panic!("a transport-level error");
+    };
+    let executed: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+    assert_eq!(executed.outcome, coord_state::Outcome::Put { prev: None });
+}
+
 /// One voter in this process is one voter, not a quorum.
 ///
-/// The same request, the same code, the same local route -- and three
-/// committed voters instead of one. The frame reaches this node's voter
-/// without a network hop, the voter proposes it, and the collector
-/// counts exactly one contribution: its own. Nothing is released,
-/// because nothing has agreed.
+/// The same code, the same local route -- and three committed voters
+/// instead of one. The caller presents a credential this node verifies
+/// perfectly well, so the frontend mints its establishment receipt and
+/// submits the command; the frame reaches this node's voter without a
+/// network hop, the voter proposes it, and the collector counts exactly
+/// one contribution: its own. Nothing is released, because nothing has
+/// agreed, and the binding is not acknowledged.
 ///
-/// A co-located voter that pre-counted itself, or that let the frontend
-/// treat a queued frame as an acknowledgement, would answer this caller.
+/// That the *binding* is what hangs here is the point of task-j09: a
+/// verified credential says who was authenticated, and the session it
+/// names exists only once the cluster has agreed to create it. A
+/// frontend that acknowledged the binding on its own verification, or a
+/// co-located voter that pre-counted itself, would answer this caller.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_co_located_voter_is_not_a_quorum() {
     let dir = workspace("noquorum");
@@ -1569,10 +1783,11 @@ async fn one_co_located_voter_is_not_a_quorum() {
 
     assert_eq!(run(&path, &["init"]).code, Some(0));
     let daemon = start(&path);
-    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
 
-    let (mut send, mut recv) = caller.connection.open_bi().await.expect("request stream");
-    send.write_all(&caller.put(1, b"k", b"v"))
+    let token = service_token(&ring, [0x44; 16]);
+    let (mut send, mut recv) = connection.open_bi().await.expect("bind stream");
+    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
         .await
         .expect("written");
     send.finish().expect("finished");
@@ -1584,7 +1799,7 @@ async fn one_co_located_voter_is_not_a_quorum() {
     let early = tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await;
     assert!(
         early.is_err(),
-        "one voter answered for a quorum of three: {early:?}"
+        "one voter established a session for a quorum of three: {early:?}"
     );
 }
 
@@ -1817,6 +2032,11 @@ collector_key = "{node}/collector.key"
 issuer = "https://sts.test"
 resource = "control-plane-test"
 jwks = "{node}/sts-jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
+
+[[grant]]
+principal = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
 "#,
                 root = dir.display(),
                 node = node.display(),
@@ -1902,20 +2122,22 @@ async fn a_request_is_established_by_three_voters_agreeing() {
     );
 
     // And it is the replicated execution's own result, decoded here.
-    // Its outcome is the fail-closed one every command gets until the
-    // session row exists (task-j09); what this test holds is that three
-    // processes agreed on it.
-    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+    // Two commands were agreed by these three processes, not one: the
+    // establishment this caller's binding submitted, and then the Put
+    // the session it created authorizes.
+    let coord_types::wire_v1::OutcomeV1::Ok { result, revision } = &response.outcome else {
         panic!("the cluster answered with a transport-level error: {response:?}");
     };
     let executed: coord_state::Response =
         postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
     assert_eq!(
         executed.outcome,
-        coord_state::Outcome::ErrRejected {
-            reason: coord_state::RejectionReason::SessionInvalid
-        },
-        "the session row is not written by anything yet; see task-j09"
+        coord_state::Outcome::Put { prev: None },
+        "three voters executed the first command of an established session"
+    );
+    assert!(
+        revision.is_some(),
+        "a mutation with no revision: {response:?}"
     );
 }
 
@@ -2149,10 +2371,111 @@ fn an_unfinished_initialization_is_finished_by_init_and_refused_by_a_start() {
         !dir.join("state").join("gen-000002").exists(),
         "finishing an initialization made a second generation"
     );
+    // The policy was written before the pin, so finishing finds it there
+    // and writes none of it again.
+    assert!(
+        finished.out.contains("genesis policy rows=0 present=")
+            && !finished.out.contains("present=0"),
+        "finishing rewrote a genesis policy the store already held: {}",
+        finished.out
+    );
     let report = start_and_report(&path);
     assert!(report.contains("owed=0"), "{report}");
 
     // Finished is finished: a further `init` is refused as before.
+    let again = run(&path, &["init"]);
+    assert_eq!(again.code, Some(2), "{}{}", again.out, again.err);
+    assert!(again.err.contains("already exists"), "{}", again.err);
+}
+
+/// An initialization that stopped before it wrote the genesis policy is
+/// finished by `init`, which writes the policy and only then pins, and
+/// the finished node serves a caller that policy admits.
+///
+/// The pin is the last durable step of `init`. Pinned before the policy,
+/// a stop between the two left a store every check took for initialized
+/// -- a start served it, trusting nothing and granting nothing, and
+/// `init` refused it as already initialized -- so a node could never be
+/// given the policy it was meant to have.
+///
+/// The state such a stop leaves is this node's journal and its first
+/// projection generation, created under its identity exactly as `init`
+/// creates them, with nothing written into either: no policy rows and no
+/// pin. It is made here directly, with the same calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_initialization_that_stopped_before_its_policy_is_finished_and_then_serves() {
+    let dir = workspace("unpolicied");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    drop(
+        coord_journal_raft_engine::journal::RaftEngineJournal::create(
+            &dir.join("journal"),
+            coord_journal_raft_engine::journal::JournalIdentity {
+                cluster: coord_types::ids::ClusterId(CLUSTER),
+                replica: coord_types::ids::ReplicaId([1; 16]),
+            },
+            &coord_journal_raft_engine::journal::JournalOptions::default(),
+        )
+        .expect("the journal init creates"),
+    );
+    drop(
+        coord_storage_redb::lifecycle::Generation::create(
+            &dir.join("state"),
+            coord_storage_redb::lifecycle::StoreIdentity {
+                cluster_id: coord_types::ids::ClusterId(CLUSTER),
+                domain_id: coord_types::ids::DomainId(DOMAIN),
+                replica_id: coord_types::ids::ReplicaId([1; 16]),
+                incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            },
+            coord_storage_redb::lifecycle::OpenOptions::default(),
+        )
+        .expect("the generation init creates"),
+    );
+
+    // A start refuses it: serving would serve a domain with no policy.
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("never pinned") && refused.err.contains("coordd init"),
+        "the refusal did not say what to do: {}",
+        refused.err
+    );
+
+    // `init` finishes it: the policy it never wrote, and then the pin.
+    let finished = run(&path, &["init"]);
+    assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
+    assert!(
+        finished.out.contains("genesis policy rows=")
+            && finished.out.contains(" present=0")
+            && !finished.out.contains("rows=0"),
+        "finishing did not write the missing policy: {}",
+        finished.out
+    );
+    assert!(
+        !dir.join("state").join("gen-000002").exists(),
+        "finishing an initialization made a second generation"
+    );
+
+    // And the finished node serves: the trust rule admits the caller's
+    // binding and the grant authorizes its Put.
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the finished node never answered\n{}", daemon.said()));
+    let response = response_of(&answer);
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+        panic!("the finished node refused a caller its policy admits: {response:?}");
+    };
+    let executed: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+    assert_eq!(executed.outcome, coord_state::Outcome::Put { prev: None });
+
+    // Finished is finished.
+    drop(daemon);
     let again = run(&path, &["init"]);
     assert_eq!(again.code, Some(2), "{}{}", again.out, again.err);
     assert!(again.err.contains("already exists"), "{}", again.err);
@@ -2415,10 +2738,8 @@ async fn a_rust_caller_asks_through_the_sdk_and_reads_the_answer() {
         postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
     assert_eq!(
         executed.outcome,
-        coord_state::Outcome::ErrRejected {
-            reason: coord_state::RejectionReason::SessionInvalid
-        },
-        "the session row is not written by anything yet; see task-j09"
+        coord_state::Outcome::Put { prev: None },
+        "the SDK's caller executed against the session its binding established"
     );
 }
 

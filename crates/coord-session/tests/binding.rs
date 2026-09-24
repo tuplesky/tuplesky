@@ -218,6 +218,8 @@ fn frontend(ring: &KeyRing) -> BoundFrontend {
             issuer: ISSUER.into(),
             resource: RESOURCE.into(),
             jwks: ring.jwks(),
+            cluster: CLUSTER,
+            domain: DOMAIN,
         },
         4,
         64,
@@ -299,6 +301,22 @@ fn outcome_of(d: &Delivery) -> OutcomeV1 {
     match decode_stream(&d.frame).unwrap().as_slice() {
         [MessageV1::Response(r)] => r.outcome.clone(),
         other => panic!("{other:?}"),
+    }
+}
+
+/// The delivery a caller with a session gets back. Every delivery in
+/// these tests answers a bound connection, so nothing here is an
+/// establishment settling.
+trait Answered {
+    fn answered(self) -> Delivery;
+}
+
+impl Answered for coord_session::Delivered {
+    fn answered(self) -> Delivery {
+        match self {
+            coord_session::Delivered::Answer(delivery) => delivery,
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -429,19 +447,27 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
         f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
-    let d = f.deliver(delivery(1, 1, c1, range_outcome(b"a")), &domain.policy());
+    let d = f
+        .deliver(delivery(1, 1, c1, range_outcome(b"a")), &domain.policy())
+        .answered();
     assert!(!is_denied(&d));
     assert_eq!(f.barriers_read, 1);
     // Narrowed permission denies the same historical data.
     domain.narrow_read();
-    let d = f.deliver(delivery(1, 1, c1, range_outcome(b"c")), &domain.policy());
+    let d = f
+        .deliver(delivery(1, 1, c1, range_outcome(b"c")), &domain.policy())
+        .answered();
     assert!(is_denied(&d));
-    let d = f.deliver(delivery(1, 1, c1, range_outcome(b"a")), &domain.policy());
+    let d = f
+        .deliver(delivery(1, 1, c1, range_outcome(b"a")), &domain.policy())
+        .answered();
     assert!(!is_denied(&d), "keys still permitted are still delivered");
     // Revocation denies everything protected, including cached results
     // answered to a retry or a resolution.
     domain.revoke();
-    let d = f.deliver(delivery(1, 1, c1, range_outcome(b"a")), &domain.policy());
+    let d = f
+        .deliver(delivery(1, 1, c1, range_outcome(b"a")), &domain.policy())
+        .answered();
     assert!(is_denied(&d));
     assert_eq!(
         f.barriers_read, 4,
@@ -457,6 +483,11 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
     };
     let path = Digest32([1; 32]);
     let prov = |i: u8| PeerProvenance::from_transport(r(i), ReplicaIncarnation::new(1).unwrap(), 1);
+    let admitted = f
+        .dispatcher()
+        .collector()
+        .admission(&c1)
+        .expect("outstanding");
     f.dispatcher_mut()
         .on_evidence(
             prov(0),
@@ -479,6 +510,9 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
                 deps: vec![],
                 paths: vec![],
                 path,
+                // Evidence for a command is counted only under the
+                // admission it was submitted with.
+                admission: admitted,
                 seqnum: None,
             }),
         )
@@ -507,7 +541,9 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
         .on_release(prov(0), released)
         .unwrap()
         .expect("attached caller");
-    assert!(is_denied(&f.deliver(delivered, &domain.policy())));
+    assert!(is_denied(
+        &f.deliver(delivered, &domain.policy()).answered()
+    ));
     let resolve = frame_of(
         &MessageV1::ResolveRequest(ResolveRequestV1 {
             retry_key: retry_key(1),
@@ -530,22 +566,26 @@ fn post_revocation_protected_data_is_denied_even_from_cached_results() {
         f.on_frame(&clock(NOW), 1, &req2, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
-    let ack = f.deliver(
-        delivery(1, 2, c2, Outcome::Put { prev: None }),
-        &domain.policy(),
-    );
+    let ack = f
+        .deliver(
+            delivery(1, 2, c2, Outcome::Put { prev: None }),
+            &domain.policy(),
+        )
+        .answered();
     assert!(!is_denied(&ack));
-    let with_prev = f.deliver(
-        delivery(
-            1,
-            2,
-            c2,
-            Outcome::Put {
-                prev: Some(entry(b"old")),
-            },
-        ),
-        &domain.policy(),
-    );
+    let with_prev = f
+        .deliver(
+            delivery(
+                1,
+                2,
+                c2,
+                Outcome::Put {
+                    prev: Some(entry(b"old")),
+                },
+            ),
+            &domain.policy(),
+        )
+        .answered();
     assert!(is_denied(&with_prev));
     assert!(f.denied >= 3);
 }
@@ -702,12 +742,16 @@ fn previously_authorized_in_flight_work_follows_documented_semantics() {
     domain.revoke();
     // The write's acknowledgement (execution decided at its position) is
     // delivered; the read's protected data is not.
-    let ack = f.deliver(
-        delivery(1, 1, cw, Outcome::Put { prev: None }),
-        &domain.policy(),
-    );
+    let ack = f
+        .deliver(
+            delivery(1, 1, cw, Outcome::Put { prev: None }),
+            &domain.policy(),
+        )
+        .answered();
     assert!(matches!(outcome_of(&ack), OutcomeV1::Ok { .. }));
-    let data = f.deliver(delivery(1, 2, cr, range_outcome(b"a")), &domain.policy());
+    let data = f
+        .deliver(delivery(1, 2, cr, range_outcome(b"a")), &domain.policy())
+        .answered();
     assert!(is_denied(&data));
     // The binding's own expiry does not cancel admitted work: it stays
     // pending and resolvable under the session, only new work is refused.
@@ -749,11 +793,12 @@ fn previously_authorized_in_flight_work_follows_documented_semantics() {
     ));
     assert!(is_denied(
         &g.deliver(delivery(2, 4, c4, range_outcome(b"a")), &Down)
+            .answered()
     ));
-    assert!(!is_denied(&g.deliver(
-        delivery(2, 4, c4, range_outcome(b"a")),
-        &fresh.policy()
-    )));
+    assert!(!is_denied(
+        &g.deliver(delivery(2, 4, c4, range_outcome(b"a")), &fresh.policy())
+            .answered()
+    ));
 }
 
 /// A token like [`token`] but with chosen claims.
@@ -823,10 +868,12 @@ fn a_rejected_conflicting_request_never_replaces_the_accepted_metadata() {
     // where read access has since been removed.
     let mut domain = domain;
     domain.remove_read();
-    let gated = f.deliver(
-        delivery(1, 1, command, range_outcome(b"secret")),
-        &domain.policy(),
-    );
+    let gated = f
+        .deliver(
+            delivery(1, 1, command, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
     assert!(
         is_denied(&gated),
         "the accepted request's namespace decides: {:?}",
@@ -859,11 +906,15 @@ fn read_output_that_names_no_key_is_still_reauthorized() {
         more: false,
     };
     // Permitted now.
-    let ok = f.deliver(delivery(1, 1, command, empty.clone()), &domain.policy());
+    let ok = f
+        .deliver(delivery(1, 1, command, empty.clone()), &domain.policy())
+        .answered();
     assert!(!is_denied(&ok), "{:?}", outcome_of(&ok));
     // Denied once read access is gone, although it names no key.
     domain.remove_read();
-    let gated = f.deliver(delivery(1, 1, command, empty), &domain.policy());
+    let gated = f
+        .deliver(delivery(1, 1, command, empty), &domain.policy())
+        .answered();
     assert!(is_denied(&gated), "{:?}", outcome_of(&gated));
     // A pure mutation acknowledgement still needs no barrier.
     let (put_command, put_req) = request(2, put(b"a", false));
@@ -871,10 +922,12 @@ fn read_output_that_names_no_key_is_still_reauthorized() {
         f.on_frame(&clock(NOW), 1, &put_req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
-    let ack = f.deliver(
-        delivery(1, 2, put_command, Outcome::Put { prev: None }),
-        &domain.policy(),
-    );
+    let ack = f
+        .deliver(
+            delivery(1, 2, put_command, Outcome::Put { prev: None }),
+            &domain.policy(),
+        )
+        .answered();
     assert!(!is_denied(&ack), "{:?}", outcome_of(&ack));
 }
 
@@ -898,10 +951,12 @@ fn a_token_without_the_read_bit_receives_no_read_output() {
         f.on_frame(&clock(NOW), 1, &req, &hub, &domain.policy()),
         Ingress::Action(Action::FanOut(_))
     ));
-    let gated = f.deliver(
-        delivery(1, 1, command, range_outcome(b"secret")),
-        &domain.policy(),
-    );
+    let gated = f
+        .deliver(
+            delivery(1, 1, command, range_outcome(b"secret")),
+            &domain.policy(),
+        )
+        .answered();
     assert!(
         is_denied(&gated),
         "the session permits the read; the token does not: {:?}",

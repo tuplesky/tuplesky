@@ -165,6 +165,7 @@ async fn serve(mut transport: Transport, config: BindingConfig) {
             let payload = PayloadRecordV1 {
                 retry_key: request.retry_key,
                 logical: request.logical.as_slice().to_vec(),
+                admission: None,
             };
             applier
                 .apply(command, &payload)
@@ -246,6 +247,8 @@ async fn the_kubernetes_storage_edge_runs_against_the_real_domain() {
         issuer: ISSUER.into(),
         resource: RESOURCE.into(),
         jwks: ring.jwks(),
+        cluster: CLUSTER,
+        domain: DOMAIN,
     };
     let frontend_task = tokio::spawn(serve(transport, config));
 

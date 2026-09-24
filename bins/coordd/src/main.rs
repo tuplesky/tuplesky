@@ -51,6 +51,164 @@ enum Command {
     Init,
 }
 
+/// Write the domain's genesis policy: the trust rule its configured
+/// issuer signs under, and the permissions its genesis grants.
+///
+/// Part of initializing the domain, not of serving it. Permission is
+/// allow-only and a session exists only under a trust rule replicated
+/// policy holds enabled, so a domain initialized without these could
+/// establish no session and authorize no command -- and the command
+/// that would write them would itself need a session to be authorized.
+/// Every replica writes the same rows from the same configuration, as
+/// it does the genesis membership.
+///
+/// It is not an execution: the batch carries no application base and
+/// takes no execution position. Everything after genesis goes through
+/// ordered replicated commands.
+///
+/// Idempotent, because it runs before the genesis pin and an
+/// initialization that stopped after it and before the pin is finished
+/// by running `init` again: a row the projection already holds with the
+/// value it would write is not written a second time, so finishing
+/// writes exactly the rows that are missing.
+fn write_genesis_policy(
+    config: &Config,
+    storage: &mut store::Storage,
+    incarnation: coord_types::ids::ReplicaIncarnation,
+) -> Result<(), String> {
+    use coord_storage::Persistence;
+    use coord_store_api::engine::OrderedRead;
+
+    let mut updates = Vec::new();
+    if let Some(sts) = &config.sts {
+        let rule = coord_daemon::config::identity_bytes(&sts.trust_rule)
+            .ok_or("sts.trust_rule is not an identity")?;
+        updates.push(
+            coord_storage::policy::bootstrap_trust_rule(&coord_types::ids::TrustRuleId(rule))
+                .map_err(|e| format!("the trust rule could not be encoded: {e:?}"))?,
+        );
+    }
+    for grant in &config.grant {
+        let principal = coord_daemon::config::identity_bytes(&grant.principal)
+            .ok_or("grant.principal is not an identity")?;
+        let namespace = coord_daemon::config::identity_bytes(&grant.namespace)
+            .ok_or("grant.namespace is not an identity")?;
+        updates.extend(
+            coord_storage::policy::bootstrap_grant(
+                coord_types::ids::PrincipalId(principal),
+                coord_types::ids::NamespaceId(namespace),
+            )
+            .map_err(|e| format!("a genesis grant could not be encoded: {e:?}"))?,
+        );
+    }
+    let wanted = updates.len();
+    {
+        let gated = storage
+            .domain
+            .reader()
+            .snapshot()
+            .map_err(|e| format!("the genesis policy could not be read: {e:?}"))?;
+        let mut unread = None;
+        updates.retain(
+            |update| match gated.view().get(update.collection, &update.key) {
+                Ok(held) => held != update.value,
+                Err(e) => {
+                    unread = Some(e);
+                    true
+                }
+            },
+        );
+        if let Some(e) = unread {
+            return Err(format!("the genesis policy could not be read: {e:?}"));
+        }
+    }
+    let rows = updates.len();
+    let present = wanted - rows;
+    if updates.is_empty() {
+        println!("genesis policy rows=0 present={present}");
+        return Ok(());
+    }
+    let mut alloc = coord_core::outbox::BarrierAllocator::new(incarnation, storage.boot);
+    storage
+        .domain
+        .submit(
+            coord_core::effect::PersistBatch {
+                barrier: alloc.allocate(),
+                base: None,
+                updates,
+            },
+            coord_storage::journaled::TransitionKind::Protocol,
+        )
+        .map_err(|e| format!("the genesis policy was refused: {e:?}"))?;
+    // Durable before `init` reports success: a store that said it was
+    // initialized and was not would serve a domain that trusts nothing,
+    // and nothing later writes these rows.
+    for _ in 0..8 {
+        if storage.domain.queued() == 0 && storage.domain.unmaterialized() == 0 {
+            break;
+        }
+        let lowered = storage
+            .domain
+            .lower()
+            .map_err(|e| format!("the genesis policy could not be made durable: {e:?}"))?;
+        if lowered.indeterminate {
+            storage
+                .domain
+                .reconcile()
+                .map_err(|e| format!("the genesis policy could not be resolved: {e:?}"))?;
+        }
+    }
+    if storage.domain.queued() > 0 || storage.domain.unmaterialized() > 0 {
+        return Err("the genesis policy did not become durable".into());
+    }
+    println!("genesis policy rows={rows} present={present}");
+    Ok(())
+}
+
+/// Finish initializing `opened`: attach it, write the genesis policy
+/// that is missing, and pin the genesis manifest -- in that order.
+///
+/// The pin is the last durable step, and it is what makes a store an
+/// initialized one: a start refuses a store with no pin, and `coordd
+/// init` finishes one. So an initialization that stops anywhere before
+/// the pin leaves a store that is refused and finished, and every step
+/// before it can be run again -- attaching is what every start does,
+/// and the policy writes only the rows the projection does not already
+/// hold. Pinned first, a stop before the policy left a store that was
+/// initialized as far as every check could tell, trusted nothing and
+/// granted nothing, and that `init` refused as already initialized.
+///
+/// The pin is written on the generation while it is not attached, as
+/// every start checks it, so the storage the policy was written through
+/// is closed and the store opened again for it.
+fn finish_initialization(
+    config: &Config,
+    placed: &membership::Placed,
+    opened: store::Opened,
+) -> Result<std::path::PathBuf, String> {
+    let directory = {
+        let mut storage = opened.attach().map_err(|e| e.to_string())?;
+        write_genesis_policy(config, &mut storage, placed.incarnation)?;
+        storage.generation
+    };
+    let mut reopened = store::open_storage(
+        config,
+        store::Intent::Serve,
+        placed.membership.cluster(),
+        placed.membership.domain(),
+        placed.replica,
+        placed.incarnation,
+    )
+    .map_err(|e| e.to_string())?;
+    genesis::check(
+        &mut reopened.generation,
+        &placed.manifest,
+        genesis::Intent::Initialize,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(directory)
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let text = match std::fs::read_to_string(&cli.config) {
@@ -125,7 +283,7 @@ fn main() -> ExitCode {
             placed.replica,
             placed.incarnation,
         );
-        let mut opened = match opened {
+        let opened = match opened {
             Ok(opened) => opened,
             // An initialization that created the projection and stopped
             // before it pinned the manifest is finished here rather than
@@ -161,20 +319,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        // Pinned before the projection is attached to the journal, so an
-        // initialization that stops at any point after this is a
-        // finished one: attaching is what every start does anyway.
-        if let Err(e) = genesis::check(
-            &mut opened.generation,
-            &placed.manifest,
-            genesis::Intent::Initialize,
-        ) {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-        return match opened.attach() {
-            Ok(storage) => {
-                println!("initialized {}", storage.generation.display());
+        // The genesis policy and then the pin, the pin last: an
+        // initialization that stops at any point before it is refused by
+        // a start and finished here.
+        return match finish_initialization(&config, &placed, opened) {
+            Ok(directory) => {
+                println!("initialized {}", directory.display());
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -569,6 +719,7 @@ fn voter(
     let mut voter = coord_daemon::Voter::new(
         coord_daemon::Node::new(machine, applier, collector),
         ingress,
+        (m.cluster(), m.domain()),
         ballot,
     );
     voter

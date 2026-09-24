@@ -76,6 +76,13 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         // the acknowledgement is the whole of the exchange, and the
         // connection's later work opens its own streams.
         Ingress::Bound(ack) => Step::Answer(ack),
+        // A binding whose session the cluster has still to agree on.
+        // The stream stays open under the establishment's own
+        // invocation, exactly as a request's does, and the
+        // acknowledgement is written when that command's outcome comes
+        // back: nothing the caller could do with the session precedes
+        // the session.
+        Ingress::Establishing(plan) => Step::Submit(plan),
         // A refused, absent or ended binding are three ways of saying the
         // same thing -- this connection has no session -- and the peer
         // learns which only as `Rejected`, because whether a token was

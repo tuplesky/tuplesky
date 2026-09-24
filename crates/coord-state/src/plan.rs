@@ -228,6 +228,15 @@ pub enum RejectionReason {
     /// Current authorization no longer permits handing out the retained
     /// result, and nothing re-executes.
     RetryUnauthorized,
+    /// The command's operation and the admission it was accepted under
+    /// do not authorize each other: an establishing admission carries
+    /// authority for exactly one action, and that action exists for
+    /// nothing else.
+    ///
+    /// It is a replicated rejection rather than an application error
+    /// because it is a property of the accepted command, identical on
+    /// every replica, and the command already holds its position.
+    AdmissionMismatch,
 }
 
 /// A Kine-facing entry: the entry's value and revisions plus the TTL of
