@@ -2933,24 +2933,30 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
         response_of(&answer)
     };
 
-    // One image, not one per publication. Step 5 of the publication
-    // order reclaims what a newer baseline supersedes, and a node that
-    // published without reclaiming would fill its disk with the
-    // history it had just decided it did not need.
+    // Images do not accumulate. Step 5 of the publication order
+    // reclaims what a newer baseline supersedes, and a node that
+    // published without reclaiming would fill its disk with the history
+    // it had just decided it did not need.
+    //
+    // Two, not one, because stopping the daemon can land between the
+    // pointer becoming durable and the cleanup finishing -- the
+    // "trim complete, old cleanup interrupted" row of the crash matrix,
+    // where the selected image plus the suffix suffice and the leftover
+    // is garbage the next publication collects. What must never happen
+    // is one image per publication, and this daemon published many.
     //
     // Images only. A `.pending-` directory is a write that was
-    // interrupted -- which is exactly what stopping the daemon does to
-    // one -- and it is not an image: nothing selects it, and the next
-    // publication reclaims it along with the superseded images.
+    // interrupted, and it is not an image: nothing selects it, and the
+    // next publication reclaims it along with the superseded images.
     let images: Vec<_> = std::fs::read_dir(dir.join("checkpoints"))
         .expect("the daemon created its checkpoint directory")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .filter(|name| !name.starts_with(".pending-"))
         .collect();
-    assert_eq!(
-        images.len(),
-        1,
-        "the checkpoint directory holds something other than one image: {images:?}"
+    assert!(
+        (1..=2).contains(&images.len()),
+        "the checkpoint directory holds {} images: {images:?}",
+        images.len()
     );
 
     // A different process, on a journal whose prefix has been retired.
