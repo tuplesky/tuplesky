@@ -1,9 +1,9 @@
 # TupleSky implementation task plan
 
-**Status:** Review proposal, consolidated v1.4.  
-**Date:** 2026-09-17.  
+**Status:** Review proposal, consolidated v1.5.  
+**Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 95 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03` and `task-q01` suffixes and prerequisites are preserved. Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 97 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01`, `task-d02` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` and `task-d02` from review of the open implementation PRs and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -32,6 +32,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-j01 through task-j10 | Shared journal, materialization, local checkpoint, runtime composition and multi-group qualification | task-j06 separately optional |
 | task-o01 through task-o06 | Finalized streams, regional observers/relays, Kine watch/read integration | Capability-specific gates |
 | task-m01 through task-m05 | Authoritative discovery, full-client Kine and integrated membership | Operational production requirement |
+| task-d01 through task-d02 | Daemon runtime wiring: leader election and leaf renewal inside `coordd` | Required before task-64/task-65 qualification and task-66 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -124,9 +125,9 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-61](#task-61) | Complete bounded observability and operator diagnostics | task-31, task-43, task-53, task-57 |
 | [task-62](#task-62) | Build and run the matched native WAN benchmark matrix | task-29, task-32, task-43, task-53, task-61 |
 | [task-63](#task-63) | Measure Kine end-to-end overhead and regression budgets | task-48, task-61, task-62 |
-| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60 |
-| [task-65](#task-65) | Package and qualify supported deployment targets | task-43, task-48, task-59, task-60, task-61 |
-| [task-66](#task-66) | Close security, supply-chain and production release gates | task-58, task-59, task-60, task-63, task-64, task-65, task-q01 |
+| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01 |
+| [task-65](#task-65) | Package and qualify supported deployment targets | task-43, task-48, task-59, task-60, task-61, task-d02 |
+| [task-66](#task-66) | Close security, supply-chain and production release gates | task-58, task-59, task-60, task-63, task-64, task-65, task-d02, task-q01 |
 | [task-s01](#task-s01) | Define the portable engine contract and logical collection registry | task-02, task-04 |
 | [task-s02](#task-s02) | Implement the model engine and common storage conformance kit | task-05, task-s01 |
 | [task-s03](#task-s03) | Add an experimental single-writer Fjall adapter | task-08, task-s02 |
@@ -152,9 +153,11 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-m02](#task-m02) | Make Kine a full epoch-aware trusted collector | task-m01, task-33, task-48, task-c01 |
 | [task-m03](#task-m03) | Connect observer staging to sealed handoff and activation | task-m01, task-o02, task-57, task-j04 |
 | [task-m04](#task-m04) | Implement conservative regional placement and quorum tuning | task-m03, task-m02 |
-| [task-m05](#task-m05) | Qualify client-aware membership under mixed failures | task-m02, task-m03, task-m04, task-58 |
+| [task-m05](#task-m05) | Qualify client-aware membership under mixed failures | task-m02, task-m03, task-m04, task-58, task-d01 |
 | [task-c02](#task-c02) | Repair lost frontend evidence, and complete a half-held command from the durable record (contract revision 2) | task-23, task-33, task-62 |
 | [task-c03](#task-c03) | Give the collector boundary its own monotonic clock | task-33, task-37 |
+| [task-d01](#task-d01) | Wire leader election and ballot adoption into coordd | task-26, task-27, task-43, task-j08 |
+| [task-d02](#task-d02) | Drive leaf renewal inside the serving daemon | task-41, task-43, task-58 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64 |
 
 ## Task specifications
@@ -677,7 +680,9 @@ The filter/workflows are maintained repository CI, not the temporary authoring/v
 
 **Implement:** Role-specific binaries, strict TOML, bounded supervised workers, startup/readiness/shutdown and secret-safe diagnostics. Document fixed-member/reference-storage preview restrictions.
 
-**Acceptance:** Cold auth bootstrap, browser/device/WIF, warm expiry, restart, overload and disk quarantine. Production dependency graph excludes test keys/bypasses; cached leadership not fresh-quorum readiness.
+Load the genesis manifest only through `verify_genesis` against the configured admin public key: at `init` before anything is pinned, and at every start before the pinned digest is compared. A manifest whose signature does not verify is refused and pins nothing, and `coordd` never reads the manifest as plain JSON. Without this, task-42's "signed/pinned genesis" is a pin without a signature check, and the pin alone is an unauthenticated per-node file (recorded on task-58).
+
+**Acceptance:** Cold auth bootstrap, browser/device/WIF, warm expiry, restart, overload and disk quarantine. An unsigned, wrong-key or edited genesis manifest is refused at `init` and at start, before any pin, attach or listener. Production dependency graph excludes test keys/bypasses; cached leadership not fresh-quorum readiness.
 
 **Review boundary:** No general-production claim; lifecycle and journal/observer/client integration gates remain. Reference preview does not supersede selected production architecture.
 
@@ -752,6 +757,8 @@ Four gaps that suite found are fixed here. Concurrent callers are served across 
 **Implement:** Real pinned API-server storage/integration suite, exact supported versions/operations/deviations and reproducible commands. This is the compatibility base; task-o04, task-m02 subsequently qualify observer routing/full collection at selected pin.
 
 **Acceptance:** CRUD/CAS, pagination, watch resume/progress, compaction/TTL, concurrent clients and regional failover. Any semantic failure blocks compatibility labeling; clean boot alone is insufficient.
+
+Regional failover is not in the suite the profile above passed, and cannot be until a leader is re-elected after the leader's region is lost: nothing in `coordd` starts a campaign or adopts a higher ballot before task-d01. That acceptance row is open until task-d01 lands and the suite is widened; this task's PR does not certify it and is not held for it.
 
 Test the API-server-to-Kine storage edge directly: unauthenticated, plaintext, wrong-CA, expired and valid-but-unauthorized/wrong-domain clients cannot read or mutate the domain. Verify API-server server-name validation, permitted client rotation and expiry, restricted local transport and absence of insecure fallback. Kubernetes end-user RBAC cannot be bypassed through a reachable Kine listener.
 
@@ -903,7 +910,7 @@ Resume the evidence-backed stage and reuse established terminal/activation decis
 **Prerequisites:** task-41, task-42, task-57.  
 **Design:** Sections 10.4, 20.4.
 
-**Implement:** Proactive leaf renewal, bounded key overlap, committed key/incarnation replacement and warm expiry/revocation; replace-node/inspect workflows. Include observer/collector role lifecycles without voting entitlement.
+**Implement:** Renewal policy and credential classification against committed membership, bounded key overlap, warm expiry/revocation and the durable adoption of an authorized replacement on the node; replace-node/inspect workflows. Include observer/collector role lifecycles without voting entitlement. The in-process renewal driver is task-d02 and committed key/incarnation replacement is task-m03; v1.5 moved both out of this task, where they were listed before.
 
 `coord_node_issuer::lifecycle` holds the arithmetic -- `RenewalPolicy::decide`, `due_at` with per-node jitter, `retire_at` for the rotation overlap and `session_deadline` for a warm session -- and deliberately has no outcome that means "serve on an expired leaf". `Membership::classify_credential` is the one rule that says what a presented credential is against committed membership (`Renewal`, `UncommittedKey`, `RequiresCommit`, `Stale`, `NotAVoter`); the peer binder binds exactly `Renewal` and tells a refused peer nothing else, and `coordd inspect` reports the distinction on the node itself, before placement, starting nothing. Warm connections end at the earlier of `Limits::max_connection_age` and the credential deadline the binder reports through the new `IdentityBinder::expires_at`. An authorized replacement keeps the node's durable state: `Generation::adopt` advances the store manifest forwards only, `StreamAllocator::adopt` and `JournaledStore::adopt_stream` carry the journal stream forward, and the append, read, replay and journal-open guards take the generation from the current mapping (as a bound, not an equality) instead of from the stream's first record. The stream is carried *before* the manifest advances, reading the generation to carry from with `Generation::adoption_pending`: the manifest is the only record of that generation, so the opposite order left an interrupted replacement with a moved manifest and an unmoved stream that the next start could not tell from a fresh node, and quarantined.
 
@@ -911,9 +918,9 @@ Resume the evidence-backed stage and reuse established terminal/activation decis
 
 An outage is walked hour by hour from the due point to the deadline: the answer stays "renew" and the credential stays valid the whole way down, and past the deadline it is `Expired` however long the outage runs. A warm peer connection closes at its credential's end and at the age cap, and the same peers reconnect immediately afterwards -- expiry ends a connection, it does not fence a node. A staged CA rotation admits leaves under both roots while both are trusted and refuses the outgoing one once it is dropped. The end-to-end `coordd` test that replaces a running node's voting key (same command identifier and outcome afterwards; the retired credential refused, and `inspect` reporting `state=stale committed=2 presented=1`) is pending the committed reconfiguration path, because the genesis pin admits no edited manifest; the adoption it drives is held below the pin by a store test that stops between the stream carry and the manifest write and shows the next start finishes. Writing the new generation into the projection database was tried and reverted: a redb commit there makes the previous run's uncommitted work durable and pushes the materialized frontier past the journal's head, so the in-database identity record may lag the manifest and never lead it.
 
-**Not in this task, and fails safe without it:** two runtime pieces are deliberately left out, and neither softens a deadline. The serving daemon does not renew its leaf: `RenewalPolicy::decide` is reached only through `coordd inspect`, the endpoint identity is built once at startup, and nothing enrolls at the issuer or reloads a leaf. A node whose leaf reaches `notAfter` has its warm connections closed as `Expired` by its peers and fails its own handshakes, and is put back by restarting it on a renewed leaf; no later task owns the in-process renewal driver yet (sleep until `Wait`, enroll at `Due`, rebuild the endpoint identity), and it is recorded here so that is not silent. And installing a new committed membership does not revisit connections already bound: `PeerBinder::install` swaps the membership and touches no connection, so a peer bound under a key the new membership replaces keeps its session until its own leaf's `notAfter` or the age cap, not until `retire_at`. `PeerBinder::install` has no production caller on this branch -- a replacement here is a manifest change and a restart, which ends every connection -- and runtime overlap enforcement (re-arm or disconnect a bound peer that no longer classifies as `Renewal`, capped by `retire_at`) is deferred to the membership-activation task, task-m03, where a committed membership is first installed into a running binder.
+**Not in this task, and fails safe without it:** two runtime pieces are deliberately left out, and neither softens a deadline. The serving daemon does not renew its leaf: `RenewalPolicy::decide` is reached only through `coordd inspect`, the endpoint identity is built once at startup, and nothing enrolls at the issuer or reloads a leaf. A node whose leaf reaches `notAfter` has its warm connections closed as `Expired` by its peers and fails its own handshakes, and is put back by restarting it on a renewed leaf; task-d02 owns the in-process renewal driver (sleep until `Wait`, enroll at `Due`, rebuild the endpoint identity). And installing a new committed membership does not revisit connections already bound: `PeerBinder::install` swaps the membership and touches no connection, so a peer bound under a key the new membership replaces keeps its session until its own leaf's `notAfter` or the age cap, not until `retire_at`. `PeerBinder::install` has no production caller on this branch -- a replacement here is a manifest change and a restart, which ends every connection -- and runtime overlap enforcement (re-arm or disconnect a bound peer that no longer classifies as `Renewal`, capped by `retire_at`) is deferred to the membership-activation task, task-m03, where a committed membership is first installed into a running binder.
 
-**Committed key replacement waits for the committed reconfiguration path.** The genesis pin (task-43-compose) admits no manifest change, including a voter entry moved to a higher incarnation with a new key: Section 20.4 makes that a committed lifecycle transition, and a manifest-level key change under an unchanged epoch has no representation in the configuration chain. So a replacement cannot be driven through `coordd` on this branch; the credential classification, the fencing of a left-behind disk and the interrupted-adoption recovery stand without it, and the end-to-end replacement tests run once a committed path carries replacements (task-m03 is where a committed membership is first installed). **Genesis signature:** `coordd` reads the manifest as plain JSON and never calls `verify_genesis`, so `init` pins whatever file it is handed; task-42's "signed/pinned genesis" holds for the pin and not for the signature. With a strict pin this is a bootstrap-time gap. Closing it means loading the manifest through `verify_genesis` against the admin key at `init`; no task owns that yet, and it is recorded here so that is not silent.
+**Committed key replacement waits for the committed reconfiguration path.** The genesis pin (task-43-compose) admits no manifest change, including a voter entry moved to a higher incarnation with a new key: Section 20.4 makes that a committed lifecycle transition, and a manifest-level key change under an unchanged epoch has no representation in the configuration chain. So a replacement cannot be driven through `coordd` on this branch; the credential classification, the fencing of a left-behind disk and the interrupted-adoption recovery stand without it, and the end-to-end replacement tests run under task-m03, which carries a voter's key/incarnation replacement as a committed reconfiguration and installs the activated membership into the running daemon. **Genesis signature:** `coordd` reads the manifest as plain JSON and never calls `verify_genesis`, so `init` pins whatever file it is handed; task-42's "signed/pinned genesis" holds for the pin and not for the signature. With a strict pin this is a bootstrap-time gap. Closing it means loading the manifest through `verify_genesis` against the admin key at `init` and at every start, which task-43 owns.
 
 **Review boundary:** Generic identity token does not prove exclusive voter ownership.
 
@@ -1008,10 +1015,10 @@ The other two came out of chasing the WAN matrix's open finding with this task's
 <a id="task-64"></a>
 ### task-64: Run mixed-fault qualification and automatic minimization
 
-**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60.  
+**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01.  
 **Design:** Sections 12, 21, 23 G6.
 
-**Implement:** Minimize combined storage/network/clock/issuer/queue/format/lease/watch/handoff faults. Retain actual redb reference suite and reusable oracles; composed journal and observer integration is explicitly exercised by later qualification.
+**Implement:** Minimize combined storage/network/clock/issuer/queue/format/lease/watch/handoff faults. Retain actual redb reference suite and reusable oracles; composed journal and observer integration is explicitly exercised by later qualification. Leader loss and re-election under every fault class is in the matrix, which is why task-d01 is a prerequisite: before it a leader-region outage is an outage of the domain, and the matrix would measure the absence of an election rather than its safety.
 
 **Acceptance:** Each failure yields replay/minimal regression; all stated invariants hold for declared matrix. Known faulty variants still detected. Scope actual engine/platform/uncontrolled scheduling rather than claiming simulator proof.
 
@@ -1020,24 +1027,24 @@ The other two came out of chasing the WAN matrix's open finding with this task's
 <a id="task-65"></a>
 ### task-65: Package and qualify supported deployment targets
 
-**Prerequisites:** task-43, task-48, task-59, task-60, task-61.  
+**Prerequisites:** task-43, task-48, task-59, task-60, task-61, task-d02.  
 **Design:** Sections 16, 22.1–22.2.
 
 **Implement:** Reproducible Linux x86_64/aarch64 server artifacts, supported CLI stores, locked containers/service units, firewall/secret examples and platform matrix; incorporate declared journal/observer roles/profile readiness in integrated release.
 
-**Acceptance:** Actual filesystem crash/reopen, AWS-LC/TLS, UDP, credential store and install/upgrade smoke tests on claimed targets. Unprivileged runtime and local admin defaults. Production excludes experimental/model/test-crypto linkage.
+**Acceptance:** Actual filesystem crash/reopen, AWS-LC/TLS, UDP, credential store and install/upgrade smoke tests on claimed targets. Unprivileged runtime and local admin defaults. Production excludes experimental/model/test-crypto linkage. A packaged node renews its own leaf across a service restart and an issuer outage shorter than the renewal window (task-d02); no supported target relies on an operator restart to pick up a renewed leaf.
 
 **Review boundary:** Cross-compilation is not qualification; no implied Windows support or copied local workspace tooling.
 
 <a id="task-66"></a>
 ### task-66: Close security, supply-chain and production release gates
 
-**Prerequisites:** task-58, task-59, task-60, task-63, task-64, task-65, task-q01.  
+**Prerequisites:** task-58, task-59, task-60, task-63, task-64, task-65, task-d02, task-q01.  
 **Design:** Sections 1.2, 15, 23.
 
 **Implement:** Final threat-model/source-extension evidence index, SBOM/license/advisories, exact conformance scope/WAN results and operator drills with sign-offs. Include the strict shared-journal, observer and client-aware report from task-q01.
 
-**Acceptance:** No unresolved safety-critical finding, unreviewed dependency exception or missing permanent-replacement/floor evidence. Production excludes simulator keys/bypasses. State exact supported profiles/limits; task-j06 replay mode remains off unless separately accepted/included. redb is the production state engine.
+**Acceptance:** No unresolved safety-critical finding, unreviewed dependency exception or missing permanent-replacement/floor evidence. Production excludes simulator keys/bypasses. State exact supported profiles/limits; task-j06 replay mode remains off unless separately accepted/included. redb is the production state engine. The three runtime gaps the task PRs recorded have closing evidence, not a note: genesis verified against the admin key at `init` and at start (task-43), every adopted ballot surfaced to the store (task-d01), and a serving node renewing its own leaf (task-d02).
 
 **Review boundary:** Evidence assembly, not omnibus last-minute implementation. No second-engine production approval, migration or unsupported capacity claim.
 
@@ -1197,7 +1204,7 @@ Three separate processes agreeing is the gate, not one process holding a quorum:
 
 Closing tests, all required: a real three-voter cluster serves a request end to end; a co-located submission and the same submission over the wire produce the same effects, and duplicate delivery yields **one counted voter contribution** -- not necessarily one emitted evidence frame, since a retry may legitimately retransmit -- with no double-counted replica, no command applied twice and no second revision; four stages stay distinct (queue admission accepts responsibility and is not a vote; protocol evidence is released through the outbox; an application outcome requires its matching `Materialized`; collector completion is the quorum's); local evidence enters the same collector validation and voter-identity deduplication path as remote evidence, with no `self_vote` flag, pre-counted acknowledgement or local-success shortcut, so one co-located voter is not a quorum of three; a restart serves again and a retry resolves; frontend and voter budgets are enforced separately; and a process whose verifier configuration is unusable refuses to start rather than binding listeners and rejecting every caller. A successful `Bind` alone is not the served-request gate. A clean restart is integration evidence and is not task-j05's filesystem and power-loss qualification.
 
-**Not in this task, and latent until leader election is wired:** the store stamps every transition it records with the ballot its voter holds. `Voter::new` hands it the genesis ballot and `Voter::set_ballot` moves both together, but `set_ballot` has no production caller. The points where a voter adopts a higher ballot are inside `coord-consensus` (a follower's `NewLeader`, and `PromiseOutcome::Promised` when a promise row turns durable), and neither reaches the `Voter`, so a promise for a higher ballot would still be recorded under the genesis ballot. Nothing in this build sends `NewLeader`, and `JournaledStore::fence` has no production caller, so this cannot happen yet. The work that wires leader election into `coordd` has to surface every adopted ballot (promise and sync adoption) to `Voter::set_ballot`. No task in this plan names that wiring yet, and it is recorded here so the gap is not silent.
+**Not in this task, and latent until leader election is wired:** the store stamps every transition it records with the ballot its voter holds. `Voter::new` hands it the genesis ballot and `Voter::set_ballot` moves both together, but `set_ballot` has no production caller. The points where a voter adopts a higher ballot are inside `coord-consensus` (a follower's `NewLeader`, and `PromiseOutcome::Promised` when a promise row turns durable), and neither reaches the `Voter`, so a promise for a higher ballot would still be recorded under the genesis ballot. Nothing in this build sends `NewLeader`, and `JournaledStore::fence` has no production caller, so this cannot happen yet. The work that wires leader election into `coordd` has to surface every adopted ballot (promise and sync adoption) to `Voter::set_ballot`. task-d01 owns that wiring.
 
 **Review boundary:** No second writer beside or beneath `JournaledStore` on the serving profile, and no duplicate application logic in a physical adapter. Journal durability alone is never an applied application outcome, and storage never manufactures establishment. Local delivery is a transport optimization and never a consensus shortcut: no direct `StoreWorker` path for local submissions, no local route obtained from a request's contents, and no acknowledgement a voter did not produce. No second definition of which role may submit on a client's behalf, no voter credential used to submit, and no evidence returned to a collector other than the one that submitted the command. Keeps `journaled-strict-v1`: no one-fsync claim and no enablement of optional task-j06. This is integration evidence and does not substitute for task-j05's filesystem and power-loss qualification.
 
@@ -1337,7 +1344,9 @@ A question is asked only on an API-class connection this side dialed: on an acce
 
 **Implement:** Integrate modeled seal/terminal/activation with non-voter readiness, shared journal/certificates, authoritative notifications and finalized-stream epoch links. Support replacement and 3→5/5→3.
 
-**Acceptance:** Staged replica cannot vote early; common snapshot/current KV not local protocol recovery. Old disk stays fenced; preserve requests/revisions/leases/policy/lineage and delayed voting obligations. Physical copies may exceed five while each active voter set respects cap.
+Carry a voter's voting-key/incarnation replacement (Section 20.4) as the same committed transition: a successor configuration that differs from its predecessor in exactly one voter's incarnation and key, sealed, certified and activated through the same handoff, with no manifest edit and no restart as the mechanism. On activation the daemon installs the committed membership into its running peer binder and adopts the node's own new incarnation (`PeerBinder::install`, and `Generation::adopt` with the stream carry task-58 built), and re-arms or disconnects a bound peer that no longer classifies as `Renewal`, capped by `retire_at`. Re-enable task-58's ignored end-to-end replacement tests here.
+
+**Acceptance:** Staged replica cannot vote early; common snapshot/current KV not local protocol recovery. Old disk stays fenced; preserve requests/revisions/leases/policy/lineage and delayed voting obligations. Physical copies may exceed five while each active voter set respects cap. A running node's voting key is replaced with the same command identifier and outcome afterwards; the retired credential is refused, `inspect` reports it stale against the committed incarnation, and a peer still bound under the retired key is disconnected by `retire_at`, not by its leaf's `notAfter`. The replaced node keeps its journal stream, checkpoints and epoch metadata.
 
 **Review boundary:** No ad hoc dual-majority algorithm, rollback after seal without authority or self-promoted observer majority-loss rescue.
 
@@ -1356,10 +1365,10 @@ A question is asked only on an API-class connection this side dialed: on an acce
 <a id="task-m05"></a>
 ### task-m05: Qualify client-aware membership under mixed failures
 
-**Prerequisites:** task-m02, task-m03, task-m04, task-58.  
+**Prerequisites:** task-m02, task-m03, task-m04, task-58, task-d01.  
 **Design:** Sections 4.8, 10.3, 10.5, 21.5–21.6.
 
-**Implement:** Competing operators, coordinator failure each handoff stage, stale/isolated Kine, delayed old completions/effects, stale disks, partial successor install, cert rotation and observer/checkpoint/GC faults.
+**Implement:** Competing operators, coordinator failure each handoff stage, stale/isolated Kine, delayed old completions/effects, stale disks, partial successor install, cert rotation and observer/checkpoint/GC faults. Include a committed key replacement (task-m03) interrupted at each handoff stage, including a coordinator failing after the seal and before activation: the replacement completes or the retired key stays refused, never both keys admitted, and the old disk stays fenced. Leader loss during a handoff needs the election task-d01 wires.
 
 Include the evidence-conditioned handoff recovery branches and the explicit five-voter 2-2-1 whole-region-outage cases in Section 21.5, with fixed-fast-set loss, leader-region loss, a further survivor failure, and eventual authorized repair.
 
@@ -1378,6 +1387,8 @@ A surviving three-voter majority progresses only after required leader recovery,
 **Implement:** Revision 1 said fan-out reaches every voter at once and said nothing about a destination that could not take it, so the transport dropped that copy and nothing re-offered it -- 317 of about 880 submissions in one measured run, with the command committing on whatever subset was free and the caller told nothing. The rule is that all-voter targeting is required and all-voter acceptance is not: every voter is offered the submission independently and without blocking, and while the command is unresolved the collector that accepted it owns re-offering what could not be queued. Reserve the pending slot *and* the envelope's bytes before any destination is offered anything, so a refusal means nothing was sent by this attempt and no later answer from a destination can become a refusal of the command. Retain the original envelope rather than a recipe; classify a full queue and an absent route as delivery backpressure and a configuration disagreement or an oversized envelope as something repeating cannot settle; bound the rate with a floor, backoff and a per-turn budget fair across commands, never the obligation; retire at settlement, recording the voters that never took it; reconcile destinations on reconfiguration.
 
 **Acceptance:** A destination's saturation costs that destination and nothing else, and is offered again without a caller retry. Collector capacity refuses only before dispatch. A caller's timeout or disconnection does not discard the obligation. A permanently unavailable minority never blocks a quorum result, and settlement clears the retry state. A repeat carries the original command identity and admission facts and cannot be counted as a second vote. Sustained saturation stays inside the byte, command and per-turn bounds. A voter's hold for an unplaced acknowledgement outlasts the repeat schedule's ceiling, because a duplicate submission produces no effects.
+
+**Open on this task:** `limits.max_request_bytes` is read for the undelivered budget above and for the writer-queue check, and enforced nowhere: a submission is bounded only by the API frame class limit, so lowering the setting changes the budget and not what a caller may send. Either it bounds a request at admission, refused with a named reason before any reservation, or it is removed. This is a follow-up fix on this task in its own PR, not a contract revision.
 
 **Review boundary:** Delivery only. No change to the learning predicate, the leader release gate or what evidence a command is established on; queue acceptance is never promoted into delivery evidence, and reliable end-to-end delivery is not claimed.
 
@@ -1405,6 +1416,30 @@ A surviving three-voter majority progresses only after required leader recovery,
 
 **Review boundary:** Clock inputs at one boundary. Authentication time semantics are untouched.
 
+<a id="task-d01"></a>
+### task-d01: Wire leader election and ballot adoption into coordd
+
+**Prerequisites:** task-26, task-27, task-43, task-j08.  
+**Design:** Sections 4.2, 4.8–4.9, 18.1, 22.1.
+
+**Implement:** `coord-consensus` has the campaign (task-26), the follower's `NewLeader` handling and the promise rows; `coordd` has none of the wiring, so the genesis leader is the only leader a domain ever has and losing it is losing the domain. Give the daemon the election it is missing as runtime wiring over the existing machines, with nothing new in the protocol: a configured, bounded campaign trigger (a follower's leader silence past a jittered patience, and an operator's explicit request, so a partitioned minority does not campaign for ever at full rate); the campaign replacing the machine in place, as `Machine` is built for; `NewLeader` and the campaign's promise and payload requests sent over the peer plane; and every adopted ballot -- a follower's `NewLeader`, `PromiseOutcome::Promised` when the row turns durable, and the campaign's own bound Sync -- surfaced to `Voter::set_ballot`, and through it to the store, so nothing is stamped with a ballot the voter no longer holds. Fence the obsolete ballot's queued transitions with `JournaledStore::fence` when the promise is made, refusing the fenced work with a named reason. Keep the epoch above the ballot: a campaign changes leadership within the committed configuration and never the voter set, the fast set or the quorum table.
+
+**Acceptance:** With the leader stopped, the remaining majority of a real three-voter domain elects a leader and serves the next request; every command established under the old ballot keeps its result and revision, and the old leader, returning, follows. A promise for a higher ballot is recorded under that ballot in the journal, and the negative control (the adopted ballot not surfaced) fails the recovery test task-j08 named. A late vote from the old ballot updates bookkeeping and authorizes nothing (Section 4.8). Two candidates campaigning at once end with one leader and no divergence. An election never changes membership, never spans domains, and an obsolete ballot's queued transitions are refused, not held.
+
+**Review boundary:** Wiring and triggers only; source selection, promise rules and the recovery cases stay task-26's and are not reopened here. No leader lease or clock-based leadership, no election on a minority, and no change to task-m03's handoff.
+
+<a id="task-d02"></a>
+### task-d02: Drive leaf renewal inside the serving daemon
+
+**Prerequisites:** task-41, task-43, task-58.  
+**Design:** Sections 10.4, 20.4, 22.1.
+
+**Implement:** task-58 left the renewal arithmetic (`RenewalPolicy::decide`, `due_at`, `retire_at`) reachable only through `coordd inspect`; the serving daemon builds its endpoint identity once at startup and never renews, so a leaf reaching `notAfter` takes the node out until an operator restarts it on a renewed leaf. Run the policy in the serving loop: sleep until `Wait`, enroll at the issuer at `Due` under the node's committed key and incarnation (a same-key renewal, which Section 20.4 says is not membership), rebuild the endpoint identity from the renewed leaf without dropping connections bound under the old one, and let those end at their own credential deadline or the age cap as task-58's binder already does. Bound the retry: an issuer outage keeps the node on its current leaf, retrying with backoff until the deadline and `Expired` after it, and never extends a deadline or serves on an expired leaf. Report the renewal state in the startup report and diagnostics without secrets.
+
+**Acceptance:** A node whose leaf is due renews and keeps serving, with no restart and no connection dropped for the renewal itself; peers admit the renewed leaf as `Renewal`. With the issuer down from the due point the node serves to the deadline and fails closed at it; the issuer returning before the deadline renews, and returning after it does not revive the node without a restart. The renewed leaf carries the same key and incarnation, and membership is unchanged before, during and after. Collector and observer roles renew the same way without acquiring voting entitlement.
+
+**Review boundary:** Renewal only; a new key or incarnation is task-m03's committed replacement and is refused here as task-58 classifies it. No deadline is softened for availability, and the issuer stays independent of the quorum.
+
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report
 
@@ -1424,6 +1459,8 @@ Require the named 2-2-1 region-loss schedules and privileged API-server/Kine edg
 task-s01, task-s02 feed the strict storage reference through task-07. Optional task-s03, task-s04 need not merge to release redb; retired task-s05 through task-s08 are not replaced by migration or mixed-engine support gates. Same-engine crash/restore, common/local checkpoints, safe replacement and schema lifecycle remain requirements.
 
 G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacement/restore/upgrade through task-60 rather than merely all-voter task-51, and G6 task-66 including task-q01. Fixed-member observer previews may precede dynamic membership, but general production combines both. Code merged is not evidence that acceptance passed.
+
+**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption. The unenforced `max_request_bytes` bound is an open follow-up on task-c01. None of these changes the design: each is work the design already required and the plan had not named.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
