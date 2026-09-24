@@ -62,6 +62,44 @@ enum Cmd {
     Msrv,
     /// Run the loom model checks (`--cfg loom`) for local concurrency boundaries.
     Loom,
+    /// Replay the committed fixture and the experiment workload on every
+    /// state engine and compare the logical results (no cost is reported).
+    StoreDifferential {
+        /// Directory run roots are allocated under.
+        #[arg(long, default_value = "target/experiments")]
+        experiment_dir: String,
+    },
+    /// Measure one state engine under the experiment workload.
+    StoreBench {
+        /// Engine: model, redb or fjall.
+        #[arg(long, default_value = "redb")]
+        engine: String,
+        /// Measured operations.
+        #[arg(long, default_value_t = 2000)]
+        measured_ops: u32,
+        /// Scheduled inter-arrival time in nanoseconds; 0 is a closed loop.
+        #[arg(long, default_value_t = 0)]
+        arrival_ns: u64,
+        /// Directory run roots are allocated under.
+        #[arg(long, default_value = "target/experiments")]
+        experiment_dir: String,
+    },
+    /// Paired, order-alternated comparison of state engines. Semantics are
+    /// checked first; a difference disqualifies the cost figures.
+    StoreCompare {
+        /// Comma-separated engines.
+        #[arg(long, default_value = "redb,fjall")]
+        engines: String,
+        /// Repetitions per engine.
+        #[arg(long, default_value_t = 5)]
+        repetitions: u32,
+        /// Measured operations per trial.
+        #[arg(long, default_value_t = 2000)]
+        measured_ops: u32,
+        /// Directory run roots are allocated under.
+        #[arg(long, default_value = "target/experiments")]
+        experiment_dir: String,
+    },
     /// Everything a pull request runs: fmt --check, lint, check-deps, test, check-docs, check-ci.
     Ci,
 }
@@ -86,6 +124,37 @@ fn run_cli() -> Result<()> {
         Cmd::CheckCi => check_ci(&root),
         Cmd::Msrv => msrv(&root),
         Cmd::Loom => loom(&root),
+        Cmd::StoreDifferential { experiment_dir } => {
+            store_experiment(&root, &["differential"], &experiment_dir, &[])
+        }
+        Cmd::StoreBench {
+            engine,
+            measured_ops,
+            arrival_ns,
+            experiment_dir,
+        } => store_experiment(
+            &root,
+            &["bench", "--engine", &engine],
+            &experiment_dir,
+            &[
+                ("--measured-ops", measured_ops.to_string()),
+                ("--arrival-ns", arrival_ns.to_string()),
+            ],
+        ),
+        Cmd::StoreCompare {
+            engines,
+            repetitions,
+            measured_ops,
+            experiment_dir,
+        } => store_experiment(
+            &root,
+            &["compare", "--engines", &engines],
+            &experiment_dir,
+            &[
+                ("--repetitions", repetitions.to_string()),
+                ("--measured-ops", measured_ops.to_string()),
+            ],
+        ),
         Cmd::Ci => {
             fmt(&root, true)?;
             lint(&root)?;
@@ -278,6 +347,41 @@ fn loom(root: &Path) -> Result<()> {
         .status()
         .context("failed to start cargo")?;
     ensure_success("cargo", status)
+}
+
+/// Run the fresh local storage experiment (task-s04). The harness is
+/// test-only, so it is never linked into a production artifact; this
+/// command builds and runs it in release, because debug numbers are not
+/// measurements. It is deliberately not part of `ci`: an experiment
+/// records evidence, it does not gate a pull request.
+fn store_experiment(
+    root: &Path,
+    subcommand: &[&str],
+    experiment_dir: &str,
+    options: &[(&str, String)],
+) -> Result<()> {
+    let mut args = vec![
+        "run",
+        "--locked",
+        "--release",
+        "-p",
+        "coord-store-bench",
+        "--bin",
+        "store-experiment",
+        "--",
+        "--experiment-dir",
+        experiment_dir,
+    ];
+    let mut tail: Vec<String> = Vec::new();
+    for (flag, value) in options {
+        tail.push((*flag).to_owned());
+        tail.push(value.clone());
+    }
+    // The subcommand and its own flags come last.
+    let mut owned: Vec<String> = subcommand.iter().map(|s| (*s).to_owned()).collect();
+    owned.extend(tail);
+    args.extend(owned.iter().map(String::as_str));
+    run(root, "cargo", &args)
 }
 
 fn msrv(root: &Path) -> Result<()> {
