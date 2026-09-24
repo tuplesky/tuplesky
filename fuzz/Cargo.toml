@@ -1,0 +1,30 @@
+# cargo-fuzz package for the wire codec (task-03). Excluded from the main
+# workspace: it needs a nightly toolchain and libFuzzer. Run with
+# `cargo +nightly fuzz run wire_frames` from this directory. The same harness
+# (`coord_types::wire_v1::fuzz_entry`) is replayed deterministically by the
+# regular test suite over mutated fixture frames.
+[package]
+name = "coord-types-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "FSL-1.1-ALv2"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.tuplesky]
+role = "test-only"
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+coord-types = { path = "../crates/coord-types" }
+
+[[bin]]
+name = "wire_frames"
+path = "fuzz_targets/wire_frames.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
