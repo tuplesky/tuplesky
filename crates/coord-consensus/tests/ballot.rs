@@ -540,3 +540,330 @@ fn the_synchronized_ballot_never_regresses_or_leaves_the_epoch() {
         ballot(1, 6, 2)
     );
 }
+
+// ---------------------------------------------------------------------
+// task-55: the durable old-configuration seal.
+// ---------------------------------------------------------------------
+
+fn transition() -> coord_consensus::handoff::Transition {
+    coord_consensus::handoff::Transition {
+        from: epoch(1),
+        to: epoch(2),
+        subject: Digest32([0xa1; 32]),
+    }
+}
+
+/// The seal report waits for the row and for every batch before the cut.
+///
+/// The same rule a promise reply follows, and for the same reason twice
+/// over: a seal reported before its own row was durable would let an
+/// initiator count a fence a crash then removed, and a report built
+/// before the outstanding batches resolved would omit work this replica
+/// had already learned. "Work learned immediately before sealing
+/// survives even with a delayed response" is exactly this.
+#[test]
+fn the_seal_report_waits_for_the_row_and_every_batch_before_the_cut() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut outbox = Outbox::new(b);
+    let mut state = voter();
+    let learned = [a.allocate(), a.allocate()];
+    let effects = state
+        .seal(transition(), peer(2), b, &mut a, &learned)
+        .unwrap();
+    let Effect::Persist(batch) = &effects.persist else {
+        panic!("a seal persists first")
+    };
+    assert_eq!(batch.base, None);
+    assert_eq!(batch.updates.len(), 1);
+    assert_eq!(batch.updates[0].collection, Collection::ProtocolV1.id());
+    assert_eq!(
+        batch.updates[0].key,
+        coord_consensus::seal_key(epoch(1)),
+        "the seal is the epoch's row, not a command's"
+    );
+    let seal = batch.barrier;
+    assert_eq!(effects.report.requires, vec![learned[0], learned[1], seal]);
+    assert_eq!(
+        ProtocolMessage::decode(&effects.report.frame).unwrap(),
+        ProtocolMessage::Sealed {
+            transition: transition(),
+            at: ballot(1, 0, 0),
+            replica: r(1),
+        }
+    );
+    outbox.publish(effects.report.clone());
+
+    // Not sealed until the row is durable: an initiator that counted
+    // the request would be counting a fence that does not exist.
+    assert!(!state.is_sealed());
+    outbox.observe(&durable(seal, 9));
+    assert_eq!(
+        state.on_storage(&durable(seal, 9)),
+        Some(PromiseOutcome::Sealed(transition()))
+    );
+    assert!(state.is_sealed());
+    assert_eq!(state.sealed().map(|s| s.transition), Some(transition()));
+
+    // And the report still waits for the work learned before the cut.
+    assert!(outbox.release(&state.promised()).is_empty());
+    outbox.observe(&durable(learned[0], 7));
+    assert!(outbox.release(&state.promised()).is_empty());
+    outbox.observe(&durable(learned[1], 8));
+    let released = outbox.release(&state.promised());
+    assert_eq!(released.len(), 1);
+    assert!(matches!(
+        &released[0],
+        Effect::SendWhenDurable { to, .. } if to.replica == r(2)
+    ));
+}
+
+/// A sealed configuration admits no ordinary voting under any ballot,
+/// and a restart comes back sealed because it reads the row.
+#[test]
+fn a_sealed_configuration_admits_no_ballot_and_a_restart_comes_back_sealed() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let effects = state.seal(transition(), peer(2), b, &mut a, &[]).unwrap();
+    let Effect::Persist(batch) = &effects.persist else {
+        panic!("a seal persists first")
+    };
+    let row = batch.updates[0].value.clone().expect("a written row");
+    state.on_storage(&durable(batch.barrier, 1));
+
+    // Not a higher ballot, not the highest imaginable one. A higher
+    // ballot is not an exception to a fence; it is what a fence is for.
+    for number in [1, 2, u64::MAX] {
+        assert_eq!(
+            state.on_new_leader(peer(2), ballot(1, number, 2), b, &mut a, &[]),
+            Err(PromiseRejection::Sealed {
+                transition: transition()
+            })
+        );
+    }
+
+    // The restart. The row is what says so: nothing is remembered and
+    // nothing is inferred.
+    let recovered = BallotState::recover_sealed(
+        identity(ReplicaRole::Voter),
+        ballot(1, 0, 0),
+        None,
+        Some(coord_consensus::decode_seal(&row).unwrap()),
+    );
+    assert!(recovered.is_sealed());
+    let mut recovered = recovered;
+    assert_eq!(
+        recovered.on_new_leader(peer(2), ballot(1, 4, 2), b, &mut a, &[]),
+        Err(PromiseRejection::Sealed {
+            transition: transition()
+        })
+    );
+
+    // A replica that reads no seal row has no seal. That is not
+    // evidence that the transition was cancelled -- a cancellation is a
+    // quorum's fact, and nothing here turns one replica's missing row
+    // into it.
+    let mut unsealed =
+        BallotState::recover_sealed(identity(ReplicaRole::Voter), ballot(1, 0, 0), None, None);
+    assert!(!unsealed.is_sealed());
+    assert!(
+        unsealed
+            .on_new_leader(peer(2), ballot(1, 4, 2), b, &mut a, &[])
+            .is_ok()
+    );
+}
+
+/// Sealing is idempotent for the transition it recorded and refused for
+/// any other, before and after the row is durable.
+#[test]
+fn a_competing_initiator_does_not_get_a_second_seal() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let other = coord_consensus::handoff::Transition {
+        subject: Digest32([0xb2; 32]),
+        ..transition()
+    };
+
+    // While the row is in flight the recorded transition already binds:
+    // a second initiator arriving in the window between the persist and
+    // its completion must not get a competing seal.
+    let first = state.seal(transition(), peer(2), b, &mut a, &[]).unwrap();
+    assert_eq!(
+        state.seal(other, peer(3), b, &mut a, &[]).unwrap_err(),
+        coord_consensus::SealRejection::AlreadySealed { held: transition() }
+    );
+    let Effect::Persist(batch) = &first.persist else {
+        panic!("a seal persists first")
+    };
+    state.on_storage(&durable(batch.barrier, 1));
+
+    // And once durable. Retrying the same transition is the same seal,
+    // which is what makes a retry after a lost report safe.
+    state
+        .seal(transition(), peer(2), b, &mut a, &[])
+        .expect("the same seal again");
+    assert_eq!(
+        state.seal(other, peer(3), b, &mut a, &[]).unwrap_err(),
+        coord_consensus::SealRejection::AlreadySealed { held: transition() }
+    );
+}
+
+/// A failed seal row leaves the replica unsealed and says so.
+///
+/// It is not a cancellation and it is not a timeout: the initiator
+/// learns that this replica did not fence, and may ask again. Nothing
+/// here turns the failure into a licence to resume anything.
+#[test]
+fn a_failed_seal_row_leaves_the_replica_unsealed() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let effects = state.seal(transition(), peer(2), b, &mut a, &[]).unwrap();
+    let Effect::Persist(batch) = &effects.persist else {
+        panic!("a seal persists first")
+    };
+    let failed = StorageEvent::Failed {
+        barrier_id: batch.barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    };
+    assert_eq!(
+        state.on_storage(&failed),
+        Some(PromiseOutcome::SealFailed(transition()))
+    );
+    assert!(!state.is_sealed());
+    // Ordinary voting is still admitted, because nothing was fenced.
+    assert!(
+        state
+            .on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[])
+            .is_ok()
+    );
+    // And the initiator may ask again.
+    let mut state = voter();
+    state.on_storage(&failed);
+    state
+        .seal(transition(), peer(2), b, &mut a, &[])
+        .expect("asking again is allowed");
+}
+
+/// What never seals: another configuration's transition, and a replica
+/// that does not vote here.
+#[test]
+fn a_seal_binds_its_own_configuration_and_only_a_voter_writes_one() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let elsewhere = coord_consensus::handoff::Transition {
+        from: epoch(9),
+        ..transition()
+    };
+    assert_eq!(
+        state.seal(elsewhere, peer(2), b, &mut a, &[]).unwrap_err(),
+        coord_consensus::SealRejection::WrongEpoch {
+            expected: epoch(1),
+            got: epoch(9)
+        }
+    );
+    for role in [ReplicaRole::Observer, ReplicaRole::Learner] {
+        let mut other = BallotState::recover(identity(role), ballot(1, 0, 0), None);
+        assert_eq!(
+            other
+                .seal(transition(), peer(2), b, &mut a, &[])
+                .unwrap_err(),
+            coord_consensus::SealRejection::NotVoting { role }
+        );
+    }
+}
+
+/// A retry of the same seal while the first row is still in flight is the
+/// same seal, whatever order the two rows resolve in.
+///
+/// The sequence this exists for: the report of the first request is lost,
+/// the initiator asks again before the first row lands, the first row
+/// becomes durable and the second fails. The replica is sealed -- the row
+/// is on disk -- and a failure of the redundant copy must neither hide
+/// that nor report the replica unfenced. The other order, first copy
+/// failing while the retry is still in flight, is not a failed seal
+/// either until the retry has also resolved.
+#[test]
+fn a_seal_retried_before_its_row_lands_is_the_same_seal() {
+    let b = boot(1);
+    let failed = |barrier| StorageEvent::Failed {
+        barrier_id: barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    };
+    let barrier_of = |effects: &coord_consensus::SealEffects| {
+        let Effect::Persist(batch) = &effects.persist else {
+            panic!("a seal persists first")
+        };
+        (batch.barrier, batch.updates.clone())
+    };
+
+    // First durable, retry failed.
+    let mut a = alloc(b);
+    let mut state = voter();
+    let (first, first_rows) =
+        barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    let (retry, retry_rows) = barrier_of(
+        &state
+            .seal(transition(), peer(2), b, &mut a, &[])
+            .expect("the same seal again, while in flight"),
+    );
+    assert_ne!(first, retry);
+    assert_eq!(first_rows, retry_rows, "the same row, not a second seal");
+    assert!(state.is_fenced(), "the cut is taken: voting has stopped");
+    assert_eq!(
+        state.on_storage(&durable(first, 1)),
+        Some(PromiseOutcome::Sealed(transition()))
+    );
+    assert_eq!(
+        state.on_storage(&failed(retry)),
+        None,
+        "a redundant copy failing is not a failed seal"
+    );
+    assert!(state.is_sealed());
+    assert_eq!(
+        state.on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[]),
+        Err(PromiseRejection::Sealed {
+            transition: transition()
+        })
+    );
+
+    // First failed while the retry is in flight, then the retry lands.
+    let mut a = alloc(b);
+    let mut state = voter();
+    let (first, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    let (retry, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    assert_eq!(
+        state.on_storage(&failed(first)),
+        None,
+        "another copy is still in flight"
+    );
+    assert!(state.is_fenced());
+    assert_eq!(
+        state.on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[]),
+        Err(PromiseRejection::Sealed {
+            transition: transition()
+        }),
+        "a row in flight already binds"
+    );
+    assert_eq!(
+        state.on_storage(&durable(retry, 2)),
+        Some(PromiseOutcome::Sealed(transition()))
+    );
+    assert!(state.is_sealed());
+
+    // Both fail: only then is the replica unsealed, and it says so once.
+    let mut a = alloc(b);
+    let mut state = voter();
+    let (first, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    let (retry, _) = barrier_of(&state.seal(transition(), peer(2), b, &mut a, &[]).unwrap());
+    assert_eq!(state.on_storage(&failed(first)), None);
+    assert_eq!(
+        state.on_storage(&failed(retry)),
+        Some(PromiseOutcome::SealFailed(transition()))
+    );
+    assert!(!state.is_sealed());
+    assert!(!state.is_fenced());
+}

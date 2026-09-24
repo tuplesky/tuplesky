@@ -298,6 +298,24 @@ because the failure mode is losing obligations, not availability.
 | An applied KV view or a closed frontend as terminal state | `[EXT]` rejected | Section 10.3.2, and the frozen counterexample |
 | Raft joint consensus | out of scope | Section 10.3.2: stop-and-transfer, explicitly modeled |
 
+The durable side is task-55: `rows::SealRecordV1` at key `epoch \|\| 0x04`
+in `protocol_v1`, written once and never rewritten or removed.
+`BallotState::seal` produces it and publishes the seal report through the
+logical outbox requiring the row *and* every batch submitted before the
+cut, exactly as `on_new_leader` does -- the Section 4.8 rule, applied to
+a fence. `BallotState::recover_sealed` reads it back, and while it is
+there `on_new_leader` refuses every ballot of the configuration:
+`PromiseRejection::Sealed`. A higher ballot is not an exception to a
+fence.
+
+| Item | Status | Where |
+|---|---|---|
+| `SealRecordV1`, one per replica per configuration | `[EXT]` | Section 10.3.2 |
+| Seal report published at the authoritative cut | `[EXT]` | Section 4.8; work learned immediately before sealing is inside it |
+| `PromiseRejection::Sealed` for every ballot of a sealed configuration | `[EXT]` | Section 10.3.2 |
+| A seal cleared by a timeout, a missing local row or a retry | `[EXT]` rejected | Section 10.3.2; no method clears one |
+| A seal trimmed as settled history | `[EXT]` rejected | Section 17.16.5; the row is retained like a promise |
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the

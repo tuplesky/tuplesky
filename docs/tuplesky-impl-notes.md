@@ -1057,3 +1057,72 @@ stances live, what the terminal root is computed over, how a successor
 is staged and how any of it travels between nodes are task-55, task-56
 and task-57. Nothing here is a proof; it is a regression of the rules
 and of the five counterexamples they exist for.
+
+## A seal is a promise rule applied to a fence
+
+Task-55 turned out to need almost no new machinery, which is the useful
+finding: sealing a configuration is the *same shape* as promising a
+ballot, and the places it differs are exactly the places it must.
+
+The same: the row is persisted first, and the report is published
+through the logical outbox requiring that row **and** every batch
+submitted before the cut. That is the Section 4.8 rule, and it is what
+"work learned immediately before sealing survives even with a delayed
+response" means operationally -- a report built before the outstanding
+batches resolved would omit an obligation this replica had already taken
+on, and an initiator counting a seal whose row was not yet durable would
+be counting a fence a crash could remove.
+
+The differences, and why each one is the way round it is:
+
+* **A promise is about one ballot; a seal is about all of them.** Once
+  the row is there, `on_new_leader` refuses ballot 1, ballot 2 and
+  `u64::MAX` alike. A higher ballot is not an exception to a fence; it
+  is the thing a fence exists to stop.
+* **A promise moves up; a seal does not move.** There is no method that
+  clears one. Not on a timeout, not on a missing reply, not on a retry
+  from a competing initiator, and not by recovering without it --
+  `recover_sealed` takes the row, and a replica that reads no row simply
+  has no seal, which is a different fact from the transition having been
+  cancelled. A cancellation is a quorum's fact (task-54); one replica's
+  absent row is not evidence of one, and nothing here turns it into any.
+* **A failed row is an answer, not a cancellation.**
+  `PromiseOutcome::SealFailed` says this replica did not fence and may
+  be asked again. Silence would have been the dangerous shape: an
+  initiator that could not tell "refused" from "no reply" would be
+  tempted to infer one from a timeout.
+* **A promise ends one ballot's voting when a higher one takes over; a
+  seal ends the current ballot's too.** Refusing new ballots alone would
+  leave the ballot already being served running, so `Leader::is_leading`
+  and the follower's `may_vote` both read the seal, and a leader or
+  follower recovered from the row proposes, adopts and acknowledges
+  nothing. The fence starts at the cut, while the row is still in
+  flight, because the report was built over the batches outstanding at
+  that moment and a vote cast after it is one the report does not show.
+* **The cut is every batch, not every proposal.** The leader writes a
+  proposal's ACCEPT row in a batch of its own, in the same turn the
+  proposal batch becomes durable, so the leader's cut is its proposal
+  batches together with every batch its durable ledger still has staged.
+* **A retry is the same row.** A second request for the recorded
+  transition while the first row is in flight writes the same record
+  under another barrier and keeps both in flight; the first to land
+  seals, and a copy that fails reports `SealFailed` only when no other
+  copy landed or is still pending.
+
+### Where the row lives, and why that tag
+
+`protocol_v1` keys are `epoch || tag || rest`, and the seal takes tag
+`0x04` -- immediately after the Sync tag. That is not arbitrary: a trim
+step surveys an epoch's rows up to and *excluding* `SYNC_TAG + 1`, so
+the floor epoch's own seal is outside every step's range by
+construction rather than by a rule someone has to remember. An earlier
+epoch's seal is inside the range and is retained deliberately, for the
+same reason a promise row is: a forgotten seal is an old configuration
+serving again.
+
+**Still missing:** the coordinator side. `SealRequest` is handled by
+both machines and `Sealed` is carried, but nothing yet drives the
+request to a quorum, counts the reports into a `SealCertificate`, or
+does anything with the terminal state afterwards. Selecting the terminal
+certificate is task-56 and activating the successor is task-57; task-54
+already says what each of those may conclude.

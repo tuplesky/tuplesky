@@ -100,6 +100,16 @@ pub enum Rejection {
     Promise(PromiseRejection),
     /// A peer frame did not decode.
     MalformedPeerMessage,
+    /// A `SealRequest` was rejected (task-55).
+    Seal(crate::ballot::SealRejection),
+    /// The configuration is sealed (or a seal row is in flight): the
+    /// request was not proposed, because ordinary service of this
+    /// configuration is over and the transition is what must finish
+    /// (task-55).
+    Sealed {
+        /// The transition the seal is for.
+        transition: crate::handoff::Transition,
+    },
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -189,8 +199,27 @@ impl Leader {
         durable_promise: Option<PromiseRecordV1>,
         executed_through: ExecutionPosition,
     ) -> Self {
-        let ballots =
-            BallotState::recover(config.identity.clone(), config.genesis, durable_promise);
+        Leader::new_sealed(config, durable_promise, None, executed_through)
+    }
+
+    /// A leader that also recovers the durable seal of its
+    /// configuration (task-55).
+    ///
+    /// Leading is a role within a configuration and the fence is the
+    /// configuration's, so a leader of a sealed epoch is as fenced as
+    /// any other voter: it admits no promise and proposes nothing new.
+    pub fn new_sealed(
+        config: LeaderConfig,
+        durable_promise: Option<PromiseRecordV1>,
+        durable_seal: Option<crate::rows::SealRecordV1>,
+        executed_through: ExecutionPosition,
+    ) -> Self {
+        let ballots = BallotState::recover_sealed(
+            config.identity.clone(),
+            config.genesis,
+            durable_promise,
+            durable_seal,
+        );
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
             config,
@@ -625,11 +654,16 @@ impl Leader {
     /// Whether this replica leads the promised ballot: it votes in this
     /// epoch (a non-voting role never proposes), its identity agrees with
     /// the ballot configuration, the promised ballot is the configured
-    /// one and no promise is in flight, and it has not been fenced.
+    /// one and no promise is in flight, it has not been fenced, and its
+    /// configuration is not sealed. The seal is read from the promise
+    /// state on every call rather than copied into `fenced`, so a leader
+    /// recovered from a durable seal row is fenced from its first step
+    /// and a leader whose seal row failed is not (task-55).
     pub fn is_leading(&self) -> bool {
         let identity = &self.config.identity;
         let quorum = &self.config.quorum;
         self.fenced.is_none()
+            && !self.ballots.is_fenced()
             && identity.role == ReplicaRole::Voter
             && identity.epoch == quorum.epoch()
             && identity.voters == *quorum.voters()
@@ -692,10 +726,28 @@ impl Leader {
         out
     }
 
+    /// Every batch this leader submitted and has not seen resolve: the
+    /// proposal batches, including one re-presented under a new barrier,
+    /// and the acceptance batches `advance_pending` writes separately.
+    /// A proposal is marked durable in the same turn its acceptance
+    /// batch is submitted, so a cut over proposals alone would release a
+    /// report while that ACCEPT row is still volatile.
+    fn cut(&self) -> Vec<BarrierId> {
+        let mut out = self.outstanding();
+        out.extend(self.ledger.outstanding());
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
+        if let Some(transition) = self.ballots.seal_held() {
+            self.rejections.push(Rejection::Sealed { transition });
+            return Vec::new();
+        }
         if !self.is_leading() {
             self.rejections.push(Rejection::NotLeading {
                 promised: self.ballots.promised(),
@@ -1052,15 +1104,10 @@ impl Leader {
         };
         match message {
             ProtocolMessage::NewLeader { ballot } => {
+                let outstanding = self.cut();
                 let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
                     return Vec::new();
                 };
-                let outstanding = self
-                    .proposals
-                    .values()
-                    .filter(|p| !p.durable)
-                    .map(|p| p.barrier)
-                    .collect::<Vec<_>>();
                 match self
                     .ballots
                     .on_new_leader(from, ballot, boot, alloc, &outstanding)
@@ -1096,7 +1143,34 @@ impl Leader {
                 }
                 Vec::new()
             }
-            ProtocolMessage::Proposal(_)
+            // Sealing the old configuration (task-55). A leader seals
+            // like any other voter: leading is a role within a
+            // configuration, and the fence is the configuration's.
+            ProtocolMessage::SealRequest { transition } => {
+                let outstanding = self.cut();
+                let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
+                    return Vec::new();
+                };
+                match self
+                    .ballots
+                    .seal(transition, from, boot, alloc, &outstanding)
+                {
+                    Ok(effects) => {
+                        if let Some(outbox) = self.outbox.as_mut() {
+                            outbox.publish(effects.report);
+                        }
+                        let mut out = alloc::vec![effects.persist];
+                        out.extend(self.release());
+                        out
+                    }
+                    Err(e) => {
+                        self.rejections.push(Rejection::Seal(e));
+                        Vec::new()
+                    }
+                }
+            }
+            ProtocolMessage::Sealed { .. }
+            | ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::ReportPage(_)

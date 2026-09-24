@@ -113,6 +113,15 @@ pub enum FollowerRejection {
     },
     /// A `NewLeader` was rejected.
     Promise(PromiseRejection),
+    /// A `SealRequest` was rejected (task-55).
+    Seal(crate::ballot::SealRejection),
+    /// The configuration is sealed (or a seal row is in flight): nothing
+    /// is adopted or acknowledged, because ordinary voting of this
+    /// configuration is over (task-55).
+    Sealed {
+        /// The transition the seal is for.
+        transition: crate::handoff::Transition,
+    },
     /// A peer frame did not decode.
     MalformedPeerMessage,
     /// A proposal of a ballot this replica no longer votes in.
@@ -211,6 +220,12 @@ impl Follower {
     /// `executed_through` is the application's durable execution
     /// position: the learner resumes from it, so the next command it
     /// establishes is the one the applier will plan, not position one.
+    ///
+    /// Recovers *unsealed*: a replica whose configuration may have been
+    /// sealed comes back through [`Follower::recover_with_syncs`], which
+    /// takes the seal row. The two are separate so that recovering a
+    /// sealed configuration is something a caller writes down rather
+    /// than something it gets by default (task-55).
     pub fn recover(
         config: FollowerConfig,
         durable_promise: Option<PromiseRecordV1>,
@@ -221,6 +236,7 @@ impl Follower {
         Follower::recover_with_syncs(
             config,
             durable_promise,
+            None,
             rows,
             payloads,
             core::iter::empty(),
@@ -236,14 +252,19 @@ impl Follower {
     pub fn recover_with_syncs(
         config: FollowerConfig,
         durable_promise: Option<PromiseRecordV1>,
+        durable_seal: Option<crate::rows::SealRecordV1>,
         rows: impl IntoIterator<Item = (CommandId, CommandRecord)>,
         payloads: impl IntoIterator<Item = (CommandId, PayloadRecordV1)>,
         syncs: impl IntoIterator<Item = (Ballot, SyncDecision)>,
         executed_through: ExecutionPosition,
     ) -> Self {
         let payloads: BTreeMap<CommandId, PayloadRecordV1> = payloads.into_iter().collect();
-        let ballots =
-            BallotState::recover(config.identity.clone(), config.genesis, durable_promise);
+        let ballots = BallotState::recover_sealed(
+            config.identity.clone(),
+            config.genesis,
+            durable_promise,
+            durable_seal,
+        );
         let resumed: Option<SyncDecision> = syncs
             .into_iter()
             .find(|(b, _)| *b == ballots.synced())
@@ -1065,8 +1086,11 @@ impl Follower {
     /// no higher promise is in flight. A promise for a higher ballot is
     /// the recovery cut: nothing of the old ballot may be adopted or
     /// acknowledged after it starts, whichever row becomes durable first.
+    /// A seal is the same cut for every ballot of the configuration, so a
+    /// durable seal, or a seal row in flight, ends voting too (task-55).
     fn may_vote(&self) -> bool {
-        self.config.identity.role == ReplicaRole::Voter
+        !self.ballots.is_fenced()
+            && self.config.identity.role == ReplicaRole::Voter
             && self.ballots.promised() == self.config.quorum.ballot()
             && self.ballots.in_flight().is_none()
     }
@@ -1120,6 +1144,11 @@ impl Follower {
 
     fn on_admitted(&mut self, frame: &[u8], admission: AdmissionFacts) -> Vec<Effect> {
         if self.boot.is_none() {
+            return Vec::new();
+        }
+        if let Some(transition) = self.ballots.seal_held() {
+            self.rejections
+                .push(FollowerRejection::Sealed { transition });
             return Vec::new();
         }
         if !self.may_vote() {
@@ -1259,6 +1288,11 @@ impl Follower {
     }
 
     fn on_proposal(&mut self, from: ReplicaId, proposal: FastAck) -> Vec<Effect> {
+        if let Some(transition) = self.ballots.seal_held() {
+            self.rejections
+                .push(FollowerRejection::Sealed { transition });
+            return Vec::new();
+        }
         if !self.may_vote() {
             self.rejections.push(FollowerRejection::FencedByPromise {
                 promised: self.ballots.promised(),
@@ -1319,6 +1353,13 @@ impl Follower {
     /// dependencies are all at least ACCEPT; repeat while progress is made.
     fn advance_pending(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // A proposal held before the seal (its payload had not arrived)
+        // stays held: adopting it now would acknowledge after the cut the
+        // seal report was built over.
+        if self.ballots.is_fenced() {
+            self.learn();
+            return effects;
+        }
         loop {
             let ready: Vec<CommandId> = self
                 .held
@@ -1527,6 +1568,38 @@ impl Follower {
                     }
                 }
             }
+            // Sealing the old configuration (task-55). The row and the
+            // report follow the promise's rule exactly: the report is
+            // published requiring the row and every batch submitted
+            // before the cut, so work this replica learned immediately
+            // before sealing is inside it even if the report is
+            // delayed.
+            ProtocolMessage::SealRequest { transition } => {
+                let outstanding = self.outstanding_for_cut();
+                let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
+                    return Vec::new();
+                };
+                match self
+                    .ballots
+                    .seal(transition, from, boot, alloc, &outstanding)
+                {
+                    Ok(effects) => {
+                        if let Some(outbox) = self.outbox.as_mut() {
+                            outbox.publish(effects.report);
+                        }
+                        let mut out = alloc::vec![effects.persist];
+                        out.extend(self.release());
+                        out
+                    }
+                    Err(e) => {
+                        self.rejections.push(FollowerRejection::Seal(e));
+                        Vec::new()
+                    }
+                }
+            }
+            // A seal report is a coordinator's to count, never a
+            // voter's to act on.
+            ProtocolMessage::Sealed { .. } => Vec::new(),
             ProtocolMessage::Promise {
                 ballot, replica, ..
             } => {

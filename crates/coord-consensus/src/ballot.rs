@@ -26,8 +26,9 @@ use coord_types::ids::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::handoff::Transition;
 use crate::messages::ProtocolMessage;
-use crate::rows::{PromiseRecordV1, promise_update};
+use crate::rows::{PromiseRecordV1, SealRecordV1, promise_update, seal_update};
 
 /// The role a replica holds in a configuration epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,6 +92,39 @@ pub enum PromiseRejection {
         /// The ballot that bounds it.
         promised: Ballot,
     },
+    /// This configuration is sealed. Ordinary voting is over for every
+    /// ballot of it, including ones nobody has proposed yet, and the
+    /// recorded transition is what has to be finished. A higher ballot
+    /// is not an exception to a seal -- it is exactly what a seal is
+    /// for (task-55).
+    Sealed {
+        /// The transition this replica sealed for.
+        transition: Transition,
+    },
+}
+
+/// Why a seal was not written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SealRejection {
+    /// The transition leaves another configuration than this one.
+    WrongEpoch {
+        /// Configured epoch.
+        expected: ConfigurationEpoch,
+        /// The transition's.
+        got: ConfigurationEpoch,
+    },
+    /// This replica does not vote in this epoch, so it fences nothing.
+    NotVoting {
+        /// Role.
+        role: ReplicaRole,
+    },
+    /// This replica is already sealed for another transition. A seal is
+    /// irreversible and the recorded transition is the one that must be
+    /// finished; a competing initiator does not get a second one.
+    AlreadySealed {
+        /// The transition it sealed for.
+        held: Transition,
+    },
 }
 
 /// A promise persisted but not yet durable.
@@ -141,6 +175,26 @@ pub enum PromiseOutcome {
     Promised(Ballot),
     /// The promise row failed; the earlier promise stands.
     Failed(Ballot),
+    /// The seal row is durable: ordinary voting is over here.
+    Sealed(Transition),
+    /// The seal row failed. This replica is *not* sealed and says so;
+    /// the initiator may ask again. It is not evidence that the
+    /// transition was cancelled, and nothing here turns it into any
+    /// (task-55).
+    SealFailed(Transition),
+}
+
+/// The effects of sealing.
+#[derive(Clone, Debug)]
+pub struct SealEffects {
+    /// Persist the seal row.
+    pub persist: Effect,
+    /// The seal report, to publish on the logical outbox. Like a
+    /// promise reply it requires the row *and* every batch submitted
+    /// before the cut, so what it reports is complete durable state:
+    /// work this replica learned immediately before sealing is inside
+    /// it even if the response is delayed.
+    pub report: PendingSend,
 }
 
 /// The promise state of one replica in one epoch.
@@ -155,6 +209,14 @@ pub struct BallotState {
     /// the others stay tracked, so no accepted promise is ever lost.
     in_flight: Vec<PromiseInFlight>,
     elections: u64,
+    /// The durable seal, once it exists. Nothing in this type clears it.
+    sealed: Option<SealRecordV1>,
+    /// Every seal row persisted and not yet durable, with its barrier.
+    /// Retries of one transition are kept side by side like promises in
+    /// flight rather than replacing each other: each row is the same
+    /// record, whichever lands first seals the replica, and a later
+    /// failure of another copy can neither hide that nor undo it.
+    sealing: Vec<(BarrierId, SealRecordV1)>,
 }
 
 impl BallotState {
@@ -164,6 +226,23 @@ impl BallotState {
         identity: ConfigurationIdentity,
         genesis: Ballot,
         durable: Option<PromiseRecordV1>,
+    ) -> Self {
+        Self::recover_sealed(identity, genesis, durable, None)
+    }
+
+    /// Recover from the durable promise row and the durable seal row.
+    ///
+    /// A replica whose seal row is there comes back sealed, and that is
+    /// the whole of "restart cannot resume old service": it is not a
+    /// decision this type makes on recovery, it is a row it reads. The
+    /// absence of the row means this replica has no seal -- never that
+    /// the transition was cancelled, which is a quorum's fact and not
+    /// one replica's (task-55).
+    pub fn recover_sealed(
+        identity: ConfigurationIdentity,
+        genesis: Ballot,
+        durable: Option<PromiseRecordV1>,
+        seal: Option<SealRecordV1>,
     ) -> Self {
         let (promised, synced) = match durable {
             Some(r) => (r.promised, r.synced),
@@ -175,7 +254,131 @@ impl BallotState {
             synced,
             in_flight: Vec::new(),
             elections: 0,
+            sealed: seal,
+            sealing: Vec::new(),
         }
+    }
+
+    /// The durable seal, if this replica has one.
+    pub const fn sealed(&self) -> Option<&SealRecordV1> {
+        self.sealed.as_ref()
+    }
+
+    /// Whether the seal row is durable here.
+    pub const fn is_sealed(&self) -> bool {
+        self.sealed.is_some()
+    }
+
+    /// The transition this replica is sealed for or sealing for: the
+    /// durable seal, or else a seal row still in flight.
+    pub fn seal_held(&self) -> Option<Transition> {
+        self.sealed
+            .iter()
+            .chain(self.sealing.iter().map(|(_, r)| r))
+            .map(|r| r.transition)
+            .next()
+    }
+
+    /// Whether ordinary voting is over here: the seal is durable, or a
+    /// seal row is in flight.
+    ///
+    /// The fence starts at the cut, not at durability. The seal report
+    /// was built over the batches outstanding when the seal was asked
+    /// for, so a vote cast after that and before the row lands is one
+    /// the report does not cover, and an initiator counting the report
+    /// would count a fence this replica had already voted past. If the
+    /// row fails nothing was fenced, and voting resumes with it.
+    pub fn is_fenced(&self) -> bool {
+        self.sealed.is_some() || !self.sealing.is_empty()
+    }
+
+    /// Seal this configuration for `transition`.
+    ///
+    /// The row is persisted and the report published through the
+    /// logical outbox requiring it and `outstanding`, exactly as a
+    /// promise reply is: a seal that was reported before its own row
+    /// was durable would let an initiator count a fence that a crash
+    /// then removed, and a report built before the outstanding batches
+    /// resolved would omit work this replica had already learned.
+    ///
+    /// Sealing again for the same transition is the same seal, which is
+    /// what makes a retry after a lost report safe. Sealing for another
+    /// one is refused: the recorded transition is the one that must be
+    /// finished.
+    ///
+    /// `to` is the coordinator that asked, at its authenticated
+    /// incarnation, so a stale incarnation of it never receives the
+    /// report -- the same rule a promise reply follows.
+    pub fn seal(
+        &mut self,
+        transition: Transition,
+        to: PeerId,
+        boot: BootId,
+        alloc: &mut BarrierAllocator,
+        outstanding: &[BarrierId],
+    ) -> Result<SealEffects, SealRejection> {
+        if transition.from != self.identity.epoch {
+            return Err(SealRejection::WrongEpoch {
+                expected: self.identity.epoch,
+                got: transition.from,
+            });
+        }
+        if self.identity.role != ReplicaRole::Voter {
+            return Err(SealRejection::NotVoting {
+                role: self.identity.role,
+            });
+        }
+        for held in self
+            .sealed
+            .iter()
+            .chain(self.sealing.iter().map(|(_, r)| r))
+        {
+            if held.transition != transition {
+                return Err(SealRejection::AlreadySealed {
+                    held: held.transition,
+                });
+            }
+        }
+        // A retry of the recorded transition writes the recorded row
+        // again, not a new one: a promise that advanced in between must
+        // not give the same seal two different cuts on disk.
+        let record = self
+            .sealed
+            .iter()
+            .chain(self.sealing.iter().map(|(_, r)| r))
+            .next()
+            .copied()
+            .unwrap_or(SealRecordV1 {
+                transition,
+                at: self.promised,
+            });
+        let barrier = alloc.allocate();
+        let update = seal_update(self.identity.epoch, &record).map_err(|_: EngineError| {
+            SealRejection::WrongEpoch {
+                expected: self.identity.epoch,
+                got: transition.from,
+            }
+        })?;
+        let persist = Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates: alloc::vec![update],
+        });
+        let mut requires: Vec<BarrierId> = outstanding.to_vec();
+        requires.push(barrier);
+        let report = PendingSend {
+            context: self.context(boot, self.promised, LocalJournalSeq::ZERO),
+            requires,
+            to,
+            frame: ProtocolMessage::Sealed {
+                transition,
+                at: record.at,
+                replica: self.identity.replica,
+            }
+            .encode(),
+        };
+        self.sealing.push((barrier, record));
+        Ok(SealEffects { persist, report })
     }
 
     /// Configuration identity.
@@ -250,6 +453,13 @@ impl BallotState {
         alloc: &mut BarrierAllocator,
         outstanding: &[BarrierId],
     ) -> Result<PromiseEffects, PromiseRejection> {
+        // The seal comes first. A higher ballot is not an exception to
+        // a fence; it is the thing a fence exists to stop. A seal row in
+        // flight already binds: the report's cut is taken, and a promise
+        // made after it is one the report does not show.
+        if let Some(transition) = self.seal_held() {
+            return Err(PromiseRejection::Sealed { transition });
+        }
         let candidate = from;
         let from = candidate.replica;
         if ballot.epoch != self.identity.epoch {
@@ -315,6 +525,32 @@ impl BallotState {
     /// failed one is dropped while the earlier promise, and every other
     /// promise in flight, stay in force.
     pub fn on_storage(&mut self, event: &StorageEvent) -> Option<PromiseOutcome> {
+        if let Some(index) = self
+            .sealing
+            .iter()
+            .position(|(b, _)| Some(*b) == event.barrier())
+        {
+            return match event {
+                StorageEvent::JournalDurable { .. } => {
+                    let (_, record) = self.sealing.remove(index);
+                    // The first durable copy seals; a later one is the
+                    // same record and changes nothing.
+                    let sealed = *self.sealed.get_or_insert(record);
+                    Some(PromiseOutcome::Sealed(sealed.transition))
+                }
+                StorageEvent::Failed { .. } => {
+                    let (_, record) = self.sealing.remove(index);
+                    // One failed copy is a failed seal only when no other
+                    // copy is durable or still in flight: a retry's row
+                    // failing says nothing about a row that already
+                    // landed, and must not report this replica unfenced.
+                    (self.sealed.is_none() && self.sealing.is_empty())
+                        .then_some(PromiseOutcome::SealFailed(record.transition))
+                }
+                StorageEvent::Materialized { .. }
+                | StorageEvent::LocalCheckpointPublished { .. } => None,
+            };
+        }
         let index = self
             .in_flight
             .iter()

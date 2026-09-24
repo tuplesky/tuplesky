@@ -413,6 +413,7 @@ impl Cluster {
                 capacity: 32,
             },
             promise,
+            None,
             rows,
             payload_rows(&self.nodes[i].storage),
             syncs,

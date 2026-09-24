@@ -705,3 +705,158 @@ fn votes_are_collected_but_never_learned_here() {
         vec![Rejection::Vote(VoteError::WrongCommand)]
     );
 }
+
+// ---------------------------------------------------------------------
+// task-55: a seal fences the leader's own ballot.
+// ---------------------------------------------------------------------
+
+fn transition() -> coord_consensus::handoff::Transition {
+    coord_consensus::handoff::Transition {
+        from: epoch(),
+        to: ConfigurationEpoch::new(2).unwrap(),
+        subject: Digest32([0xa1; 32]),
+    }
+}
+
+fn is_seal_report(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::SendWhenDurable { frame, .. }
+            if matches!(ProtocolMessage::decode(frame).unwrap(), ProtocolMessage::Sealed { .. })
+    )
+}
+
+/// A seal ends the leader's service of its ballot from the cut on: while
+/// the row is in flight, once it is durable, and after a restart that
+/// reads it back. A failed row fenced nothing, so service resumes.
+#[test]
+fn a_seal_stops_the_leader_proposing_live_and_after_a_restart() {
+    let mut leader = booted();
+    let seal = leader.step(peer(
+        2,
+        ProtocolMessage::SealRequest {
+            transition: transition(),
+        },
+    ));
+    let [Effect::Persist(row)] = seal.as_slice() else {
+        panic!("a seal persists its row: {seal:?}")
+    };
+    assert!(!leader.is_leading(), "the cut is taken at the request");
+    let (e1, _) = admitted(1, 1, 1);
+    assert!(leader.step(e1).is_empty(), "no proposal while sealing");
+    let released = leader.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: row.barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(released.iter().any(is_seal_report));
+    let (e2, _) = admitted(2, 2, 2);
+    assert!(leader.step(e2).is_empty(), "no proposal once sealed");
+    assert!(!leader.is_leading());
+    assert_eq!(
+        leader.take_rejections(),
+        vec![
+            Rejection::Sealed {
+                transition: transition()
+            };
+            2
+        ]
+    );
+
+    // The restart reads the row and leads nothing.
+    let mut restarted = Leader::new_sealed(
+        config(),
+        None,
+        Some(coord_consensus::SealRecordV1 {
+            transition: transition(),
+            at: ballot(0, 0),
+        }),
+        ExecutionPosition::ZERO,
+    );
+    restarted.step(Event::Boot {
+        boot_id: BootId([2; 16]),
+        incarnation: ReplicaIncarnation::new(1).unwrap(),
+    });
+    assert!(!restarted.is_leading());
+    let (e3, _) = admitted(3, 3, 3);
+    assert!(restarted.step(e3).is_empty(), "no proposal after restart");
+    assert_eq!(
+        restarted.take_rejections(),
+        vec![Rejection::Sealed {
+            transition: transition()
+        }]
+    );
+
+    // A failed seal row fenced nothing: the leader leads again.
+    let mut leader = booted();
+    let seal = leader.step(peer(
+        2,
+        ProtocolMessage::SealRequest {
+            transition: transition(),
+        },
+    ));
+    let [Effect::Persist(row)] = seal.as_slice() else {
+        panic!()
+    };
+    leader.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: row.barrier,
+        error: StorageError::DefinitelyNotCommitted,
+    }));
+    assert!(leader.is_leading());
+    let (e4, _) = admitted(4, 4, 4);
+    assert_eq!(leader.step(e4).len(), 1, "the proposal batch");
+}
+
+/// The seal cut includes the acceptance batch of a proposal that is
+/// already durable.
+///
+/// A proposal's own batch becoming durable is the turn in which its
+/// acceptance row is written, under a barrier of its own. A cut taken
+/// over proposal batches alone would release the seal report while that
+/// ACCEPT row was still volatile, and a terminal state built from the
+/// report would show the command below ACCEPT although the replica holds
+/// ACCEPT once the write lands.
+#[test]
+fn the_seal_report_waits_for_an_acceptance_batch_still_in_flight() {
+    let mut leader = booted();
+    let (e1, c1) = admitted(1, 1, 1);
+    let proposed = leader.step(e1);
+    let after = leader.step(durable(&proposed, 1).remove(0));
+    let accepts: Vec<_> = after
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Persist(b) => Some(b.clone()),
+            _ => None,
+        })
+        .collect();
+    let [accept] = accepts.as_slice() else {
+        panic!("the acceptance row is written: {after:?}")
+    };
+    assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
+    assert!(
+        leader.proposal(&c1).unwrap().durable,
+        "the proposal batch is no longer outstanding"
+    );
+
+    let seal = leader.step(peer(
+        2,
+        ProtocolMessage::SealRequest {
+            transition: transition(),
+        },
+    ));
+    let [Effect::Persist(row)] = seal.as_slice() else {
+        panic!("a seal persists its row: {seal:?}")
+    };
+    let released = leader.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: row.barrier,
+        journal_seq: LocalJournalSeq::new(2).unwrap(),
+    }));
+    assert!(
+        !released.iter().any(is_seal_report),
+        "the ACCEPT row is still volatile: {released:?}"
+    );
+    let released = leader.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: accept.barrier,
+        journal_seq: LocalJournalSeq::new(3).unwrap(),
+    }));
+    assert_eq!(released.iter().filter(|e| is_seal_report(e)).count(), 1);
+}

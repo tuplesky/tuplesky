@@ -77,6 +77,26 @@ pub enum ProtocolMessage {
     /// The new leader's selected recovery result (`MSync`), durably bound
     /// before it is sent.
     Sync(SyncDecision),
+    /// A coordinator asks the old voters to seal for a transition
+    /// (task-55; a TupleSky extension -- the paper is
+    /// fixed-membership).
+    SealRequest {
+        /// The transition.
+        transition: crate::handoff::Transition,
+    },
+    /// A voter's seal: ordinary voting is over here for every ballot of
+    /// the old configuration. Published only once the seal row and
+    /// every batch submitted before the cut are durable, so what it
+    /// reports is complete.
+    Sealed {
+        /// The transition it sealed for.
+        transition: crate::handoff::Transition,
+        /// The ballot it had promised when it sealed (evidence, never
+        /// an authorization).
+        at: Ballot,
+        /// Sealing replica.
+        replica: ReplicaId,
+    },
 }
 
 impl ProtocolMessage {
@@ -103,6 +123,8 @@ impl ProtocolMessage {
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PayloadRequest { .. }
+            | ProtocolMessage::SealRequest { .. }
+            | ProtocolMessage::Sealed { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }

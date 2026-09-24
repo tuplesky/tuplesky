@@ -858,3 +858,90 @@ fn persisted(effects: &[Effect]) -> Vec<coord_core::effect::PersistBatch> {
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------
+// task-55: a seal fences the follower's ordinary voting.
+// ---------------------------------------------------------------------
+
+fn transition() -> coord_consensus::handoff::Transition {
+    coord_consensus::handoff::Transition {
+        from: epoch(),
+        to: ConfigurationEpoch::new(2).unwrap(),
+        subject: Digest32([0xa1; 32]),
+    }
+}
+
+/// Once sealed, a follower adopts and acknowledges nothing of the old
+/// ballot: not a request, not a proposal, and not a proposal it held
+/// before the seal whose payload arrives after it. A restart that reads
+/// the seal row back is just as fenced.
+#[test]
+fn a_seal_stops_the_follower_voting_live_and_after_a_restart() {
+    let mut f = booted(1);
+    let (e1, c1) = admitted(1, 1, 1);
+    let (e2, c2) = admitted(2, 2, 2);
+    // c1's proposal arrives before its payload and is held.
+    assert!(
+        f.step(peer(
+            0,
+            proposal(c1, vec![], 0, vec![], coord_consensus::empty_path())
+        ))
+        .is_empty()
+    );
+    let seal = f.step(peer(
+        0,
+        ProtocolMessage::SealRequest {
+            transition: transition(),
+        },
+    ));
+    let [Effect::Persist(row)] = seal.as_slice() else {
+        panic!("a seal persists its row: {seal:?}")
+    };
+    f.step(Event::Storage(StorageEvent::JournalDurable {
+        barrier_id: row.barrier,
+        journal_seq: LocalJournalSeq::new(1).unwrap(),
+    }));
+    assert!(f.ballots().is_sealed());
+
+    assert!(f.step(e1).is_empty(), "no fast vote for the held proposal");
+    assert!(f.step(e2).is_empty(), "no fast vote for a new request");
+    assert!(
+        f.step(peer(
+            0,
+            proposal(c2, vec![], 1, vec![], coord_consensus::empty_path())
+        ))
+        .is_empty(),
+        "no adoption of a proposal"
+    );
+    let sealed = FollowerRejection::Sealed {
+        transition: transition(),
+    };
+    assert_eq!(f.take_rejections(), vec![sealed.clone(); 3]);
+    assert_eq!(f.table().phase_of(&c2), None, "nothing was initialized");
+
+    // The restart reads the row back and votes no more.
+    let mut restarted = Follower::recover_with_syncs(
+        config(1),
+        None,
+        Some(coord_consensus::SealRecordV1 {
+            transition: transition(),
+            at: ballot(0, 0),
+        }),
+        std::iter::empty(),
+        std::iter::empty(),
+        std::iter::empty(),
+        ExecutionPosition::ZERO,
+    );
+    assert!(restarted.step(boot_event()).is_empty());
+    let (e3, _) = admitted(3, 3, 3);
+    assert!(restarted.step(e3).is_empty());
+    assert!(
+        restarted
+            .step(peer(
+                0,
+                proposal(c2, vec![], 1, vec![], coord_consensus::empty_path())
+            ))
+            .is_empty()
+    );
+    assert_eq!(restarted.take_rejections(), vec![sealed; 2]);
+}
