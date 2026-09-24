@@ -32,7 +32,7 @@ target/release/coord-wan-bench \
   --arrival-ns 1000000 \
   --warmup-ops 500 --measured-ops 20000 \
   --callers 16 --frontends 3 \
-  --mix put=15,get=55,cas=20,txn=5,scan=5 \
+  --mix put=15,get=55,contended=20,txn=5,scan=5 \
   --out /tmp/bench/warm.json
 
 scripts/e2e/stop.sh /tmp/bench
@@ -51,15 +51,23 @@ reproducible from its own report.
 | --- | --- |
 | cold | a fresh run directory, no warm-up (`--warmup-ops 0`) |
 | warm | the same directory, after a warm-up pass |
-| hot writers | `--hot-keys 4 --mix put=0,get=0,cas=100` |
+| hot contended writes | `--hot-keys 4 --mix put=0,get=0,contended=100` |
 | transactions | `--mix txn=100 --transaction-keys 8` |
 | scans | `--mix scan=100 --scan-limit 128` |
-| read-mostly | `--mix get=95,cas=5` |
+| read-mostly | `--mix get=95,contended=5` |
 | loss | the topology script's `LOSS` argument |
 | asymmetric | different forward and reverse round trips |
 
 Run each row at several `--arrival-ns` values rather than one: a single rate
 says nothing about where the knee is, and the knee is the result.
+
+`contended` is a transaction on one of `--hot-keys` keys whose compare holds
+once the key has been written and whose both branches write. It measures the
+conditional path under contention, and it is not a compare-and-swap: it never
+compares against a revision the caller read, so it cannot lose a race and no
+row here measures optimistic concurrency. The older `cas` spelling is still
+accepted on the command line and means the same contended transaction; the
+report names it `contended-transaction`.
 
 ## Shaping the wide area
 

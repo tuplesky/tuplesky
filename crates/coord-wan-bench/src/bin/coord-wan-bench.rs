@@ -52,8 +52,8 @@ struct Cli {
     /// Seed of the offered work.
     #[arg(long, default_value_t = 1)]
     seed: u64,
-    /// Operation mix, `put=15,get=55,cas=20,txn=5,scan=5`.
-    #[arg(long, default_value = "put=15,get=55,cas=20,txn=5,scan=5")]
+    /// Operation mix, `put=15,get=55,contended=20,txn=5,scan=5`.
+    #[arg(long, default_value = "put=15,get=55,contended=20,txn=5,scan=5")]
     mix: String,
     /// Distinct keys the reads and unconditional writes touch.
     #[arg(long, default_value_t = 10_000)]

@@ -47,6 +47,46 @@ impl Drop for Daemon {
     }
 }
 
+/// Voters that make a quorum of `voters` committed ones: a majority.
+pub const fn quorum(voters: usize) -> usize {
+    voters / 2 + 1
+}
+
+/// What a running domain is, given which of its voters are still up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// A quorum is still running, so the domain still serves; a voter
+    /// that stopped is reported and the rest are left alone.
+    Serving {
+        /// Voters still running.
+        alive: usize,
+        /// Voters the domain was started with.
+        of: usize,
+    },
+    /// Fewer than a quorum remain, so the domain cannot serve and a run
+    /// that went on would be measuring an outage.
+    Lost {
+        /// Voters still running.
+        alive: usize,
+        /// Voters the domain was started with.
+        of: usize,
+    },
+}
+
+/// Where a domain of `of` voters stands with `alive` of them running.
+///
+/// Losing a minority is not the end of a run: a regional failover is
+/// exactly that loss, and certifying that the survivors keep serving
+/// needs the harness to keep them up rather than tear them down with the
+/// one that stopped.
+pub const fn standing(alive: usize, of: usize) -> Standing {
+    if alive >= quorum(of) {
+        Standing::Serving { alive, of }
+    } else {
+        Standing::Lost { alive, of }
+    }
+}
+
 /// What stopped a domain from coming up.
 #[derive(Debug)]
 pub enum RunError {
@@ -193,5 +233,26 @@ fn start(coordd: &Path, node: &str, config: &Path, directory: &Path) -> Result<D
                 log,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Standing, quorum, standing};
+
+    /// Losing one voter of three leaves a quorum, so the harness keeps
+    /// the other two serving; losing a second does not, so it stops.
+    #[test]
+    fn a_minority_loss_keeps_serving_and_a_majority_loss_stops() {
+        assert_eq!(quorum(3), 2);
+        assert_eq!(standing(3, 3), Standing::Serving { alive: 3, of: 3 });
+        assert_eq!(standing(2, 3), Standing::Serving { alive: 2, of: 3 });
+        assert_eq!(standing(1, 3), Standing::Lost { alive: 1, of: 3 });
+        // One voter is its own quorum, and losing it is losing the domain.
+        assert_eq!(standing(1, 1), Standing::Serving { alive: 1, of: 1 });
+        assert_eq!(standing(0, 1), Standing::Lost { alive: 0, of: 1 });
+        // Five tolerate two.
+        assert_eq!(standing(3, 5), Standing::Serving { alive: 3, of: 5 });
+        assert_eq!(standing(2, 5), Standing::Lost { alive: 2, of: 5 });
     }
 }

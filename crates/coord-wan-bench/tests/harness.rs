@@ -45,13 +45,13 @@ fn a_zero_weight_never_appears() {
     for _ in 0..500 {
         let (kind, _) = workload.next(&mut rng);
         assert!(
-            matches!(kind, Kind::Put | Kind::CompareAndSwap),
+            matches!(kind, Kind::Put | Kind::ContendedTransaction),
             "a removed kind was offered: {kind:?}"
         );
     }
 }
 
-/// Hot writers contend: every conditional write lands in the small key
+/// Hot writers contend: every contended transaction lands in the small key
 /// set the run asked for, which is what makes it a contention
 /// measurement rather than a spread of independent writes.
 #[test]
@@ -62,7 +62,7 @@ fn conditional_writes_contend_on_the_hot_keys() {
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..400 {
         let (kind, request) = spec.next(&mut rng);
-        if kind != Kind::CompareAndSwap {
+        if kind != Kind::ContendedTransaction {
             continue;
         }
         let coord_types::logical_v1::CanonicalOperation::Txn(txn) = &request.operation else {
@@ -87,7 +87,7 @@ fn a_scan_ranges_over_the_keys_that_follow_its_start() {
     let mut spec = workload(Mix {
         put: 0,
         get: 0,
-        compare_and_swap: 0,
+        contended: 0,
         transaction: 0,
         scan: 1,
     });
@@ -145,4 +145,27 @@ fn unread_metrics_say_why_rather_than_reporting_zero() {
     let observed: Measured<u64> = Measured::Observed(3);
     assert_eq!(observed.observed(), Some(&3));
     assert_eq!(observed.why(), None);
+}
+
+/// The contended kind is reported as what it is. Its compare holds for
+/// any key written before and both of its branches write, so it cannot
+/// detect a stale read, and a matrix row that called it compare-and-swap
+/// would be publishing optimistic-concurrency numbers nobody measured.
+/// The older `cas` spelling still parses, to this kind.
+#[test]
+fn the_contended_transaction_is_not_reported_as_compare_and_swap() {
+    assert_eq!(Kind::ContendedTransaction.name(), "contended-transaction");
+    let legacy = Mix::parse("cas=3").expect("the older spelling parses");
+    assert_eq!(legacy.contended, 3);
+    assert_eq!(Mix::parse("contended=3").expect("parses"), legacy);
+
+    let spec = workload(Mix::parse("contended=1").expect("parses"));
+    let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(9);
+    let (kind, request) = spec.next(&mut rng);
+    assert_eq!(kind, Kind::ContendedTransaction);
+    let coord_types::logical_v1::CanonicalOperation::Txn(txn) = &request.operation else {
+        panic!("a contended write is a transaction");
+    };
+    // Both branches write: what the name has to be honest about.
+    assert!(!txn.success.is_empty() && !txn.failure.is_empty());
 }

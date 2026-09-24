@@ -203,17 +203,45 @@ fn up(
     println!("harness dsn {}", dsn(&provisioned, 1)?);
     std::io::stdout().flush()?;
 
-    // Stay up, and notice if one of them does not. A certification run
-    // that kept going after a voter died would report the wrong thing
-    // about the cluster it was measuring.
+    // Stay up, and notice when one of them does not. A voter that stops
+    // is reported at once, on its own line, so a run can tell which one
+    // went and when. The others are kept up for as long as they are a
+    // quorum: losing one of three is the regional failover a
+    // certification run exercises, and tearing the survivors down with
+    // it would certify an outage instead. Only once fewer than a quorum
+    // remain does the harness stop, because a run that kept going then
+    // would report the wrong thing about the domain it was measuring.
+    let mut stopped = vec![false; daemons.len()];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        for daemon in &mut daemons {
-            if !daemon.alive() {
-                return Err(format!(
-                    "node {} stopped; its output is {}",
+        let mut alive = 0;
+        let mut changed = false;
+        for (daemon, gone) in daemons.iter_mut().zip(stopped.iter_mut()) {
+            if daemon.alive() {
+                alive += 1;
+                continue;
+            }
+            if !*gone {
+                *gone = true;
+                changed = true;
+                println!(
+                    "harness voter-stopped node={} output={}",
                     daemon.node,
                     daemon.log.display()
+                );
+            }
+        }
+        match coord_harness::run::standing(alive, daemons.len()) {
+            coord_harness::run::Standing::Serving { alive, of } => {
+                if changed {
+                    println!("harness serving voters={alive} of={of}");
+                    std::io::stdout().flush()?;
+                }
+            }
+            coord_harness::run::Standing::Lost { alive, of } => {
+                return Err(format!(
+                    "only {alive} of {of} voters are still running, fewer than a quorum; \
+                     each stopped voter's output is named on its voter-stopped line"
                 )
                 .into());
             }

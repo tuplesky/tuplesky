@@ -64,17 +64,44 @@ jobs:
         working-directory: adapters/kine
         run: go test ./certify/ -count=1 -v -timeout 20m
       - name: Lose a voter and certify again
-        # Regional failover: a committed voter goes away and the domain
-        # still answers, because two of three is the quorum. The prefix
-        # changes so this is a fresh key space rather than a re-read of
-        # what the first pass wrote.
+        # Regional failover: exactly one committed voter goes away and
+        # the domain still answers, because two of three is the quorum.
+        # The harness reports the loss and keeps the other two up, and
+        # this step checks that before and after certifying, so a pass
+        # is a pass on two voters and never on a domain that is gone.
+        # The prefix changes so this is a fresh key space rather than a
+        # re-read of what the first pass wrote.
         env:
           COORD_CERTIFY_HARNESS: ${{ runner.temp }}/run/harness.json
           COORD_CERTIFY_PREFIX: after-failover
         run: |
-          tail -n 1 "$RUNNER_TEMP/run/harness.pids" | xargs -r kill -9
-          sleep 5
+          run="$RUNNER_TEMP/run"
+          victim=$(tail -n 1 "$run/harness.pids")
+          kill -9 "$victim"
+          survivors() {
+            local alive=0
+            while read -r pid; do
+              [ "$pid" = "$victim" ] && continue
+              kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+            done < "$run/harness.pids"
+            echo "$alive"
+          }
+          # The harness notices within a poll and says what it still has.
+          for _ in $(seq 1 20); do
+            grep -q "^harness serving voters=2 of=3" "$run/harness.log" && break
+            sleep 0.5
+          done
+          grep -q "^harness serving voters=2 of=3" "$run/harness.log" || {
+            echo "the harness did not report two of three voters serving" >&2
+            cat "$run/harness.log" >&2
+            exit 1
+          }
+          kill -0 "$(cat "$run/harness.pid")" || { echo "the harness stopped" >&2; exit 1; }
+          kill -0 "$(cat "$run/kine.pid")" || { echo "the storage edge stopped" >&2; exit 1; }
+          [ "$(survivors)" -eq 2 ] || { echo "not exactly two voters remain" >&2; exit 1; }
           (cd adapters/kine && go test ./certify/ -count=1 -v -timeout 20m)
+          # And they were still the two serving when it finished.
+          [ "$(survivors)" -eq 2 ] || { echo "a surviving voter stopped during certification" >&2; exit 1; }
       - name: Collect what everything said
         if: always()
         run: scripts/e2e/stop.sh "$RUNNER_TEMP/run" || true
