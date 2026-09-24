@@ -1586,13 +1586,26 @@ absent one carries the reason:
 * `Quarantined` — any reading would describe state the node has stopped
   trusting.
 * `NoBound` — there is no configured bound to have headroom against.
+* `NotInstrumented` — the node has the thing, but nothing in this
+  process records it, so any count would be one nobody took.
 
-Those four call for four different operator responses, and none of them
+Those five call for five different operator responses, and none of them
 is the response to a zero. Writing them down turned out to also settle
 an ambiguity in the snapshot: a stage a role *has* but has not exercised
 reports honest zero counts with an unavailable latency. "Nothing has
 happened here" and "this does not exist here" are different statements,
 and now they look different.
+
+The fifth reason came from the first review of `coordd`'s snapshot. A
+recorder that every stage reports from, but that only some stages feed,
+prints observed zero counts for the rest -- a voter that had just
+served a write reported zero journal and materialization work. So a
+`Recorder` is built knowing which stages its owner records
+(`Recorder::instrumenting`), and `coordd` records admission where the
+frontend decides a caller's frame, and the journal and materialization
+where the voter's node flushes a round and applies a command. Every
+other stage, and every lane count and wait, is `NotInstrumented` until
+something measures it.
 
 ### Bounded labels have to be bounded by the type
 

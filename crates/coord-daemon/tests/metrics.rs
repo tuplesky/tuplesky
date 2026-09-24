@@ -311,8 +311,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 lane: *lane,
                 queue_wait: Measure::Observed(Duration::from_micros(80)),
                 credit_wait: Measure::Unavailable(Unavailable::NoSamples),
-                frames: 12,
-                refused: 0,
+                frames: Measure::Observed(12),
+                refused: Measure::Observed(0),
                 headroom: Measure::Observed(4096),
             })
             .collect(),

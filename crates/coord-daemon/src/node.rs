@@ -40,6 +40,8 @@ use coord_storage::{Applier, Persistence};
 use coord_types::CommandId;
 use coord_types::ids::Ballot;
 
+use crate::metrics::{Recorder, Stage};
+
 /// A voter's protocol machine in its current role.
 ///
 /// Leader and follower are the same replica at different ballots, not
@@ -187,6 +189,9 @@ pub struct Node<P: Persistence> {
     pub executed: u64,
     withheld: u64,
     withheld_evidence: u64,
+    /// Where the journal and materialization stages are recorded
+    /// (task-61), when the process keeps a recorder.
+    recorder: Option<std::sync::Arc<Recorder>>,
 }
 
 impl<P: Persistence> Node<P> {
@@ -202,7 +207,40 @@ impl<P: Persistence> Node<P> {
             executed: 0,
             withheld: 0,
             withheld_evidence: 0,
+            recorder: None,
         }
+    }
+
+    /// Record this node's journal and materialization work in
+    /// `recorder` (task-61).
+    ///
+    /// The points are here because this is where the work happens: a
+    /// flush of the round's protocol transitions is the
+    /// [`Stage::Journal`], and applying one executable command is the
+    /// [`Stage::Materialization`]. Counting them anywhere else would be a
+    /// second accounting of the same work, one step removed from it.
+    pub fn record_into(&mut self, recorder: std::sync::Arc<Recorder>) {
+        self.recorder = Some(recorder);
+    }
+
+    /// Time `work` as one pass through `stage`: entered before it runs,
+    /// then completed with its duration or refused on an error.
+    fn measured<T, E>(
+        recorder: Option<&Recorder>,
+        stage: Stage,
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let Some(recorder) = recorder else {
+            return work();
+        };
+        recorder.entered(stage);
+        let started = std::time::Instant::now();
+        let result = work();
+        match &result {
+            Ok(_) => recorder.completed(stage, started.elapsed()),
+            Err(_) => recorder.refused(stage),
+        }
+        result
     }
 
     /// The machine.
@@ -358,11 +396,10 @@ impl<P: Persistence> Node<P> {
 
         let mut next = Vec::new();
         if persisted {
-            let outcome = self
-                .applier
-                .store_mut()
-                .lower()
-                .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+            let store = self.applier.store_mut();
+            let outcome =
+                Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
+                    .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
             // Indeterminate is not "failed": the group's outcome is
             // unknown, so the caller reconciles rather than assuming
             // either answer. It surfaces as an engine failure here so it
@@ -429,10 +466,11 @@ impl<P: Persistence> Node<P> {
                     "no payload for the next executable command {command:?}"
                 )));
             };
-            let outcome = self
-                .applier
-                .apply(command, &payload)
-                .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+            let applier = &mut self.applier;
+            let outcome = Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
+                applier.apply(command, &payload)
+            })
+            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
             self.executed += 1;
             let effects = self.machine.applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);

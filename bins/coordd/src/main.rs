@@ -482,7 +482,7 @@ fn report_metrics(
     domain: coord_types::ids::DomainId,
 ) {
     use coord_daemon::metrics::{
-        Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, Recorder, ShardIndex, ShardReading,
+        Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, ShardIndex, ShardReading,
         Unavailable,
     };
 
@@ -497,17 +497,18 @@ fn report_metrics(
         // as an empty but healthy store.
         None => Measure::Unavailable(Unavailable::Quarantined),
     };
-    // At startup nothing has travelled a lane and nothing has been
-    // committed under measurement, so every one of these is an honest
-    // "no samples" rather than a zero.
+    // The transport does not account per lane in this build, so every
+    // lane reading is "not instrumented", the same as on the shutdown
+    // snapshot: "no samples" would claim a measurement, and a zero
+    // count that the lane carried nothing.
     let lanes = Lane::ALL
         .iter()
         .map(|lane| LaneReading {
             lane: *lane,
-            queue_wait: Measure::Unavailable(Unavailable::NoSamples),
-            credit_wait: Measure::Unavailable(Unavailable::NoSamples),
-            frames: 0,
-            refused: 0,
+            queue_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+            credit_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+            frames: Measure::Unavailable(Unavailable::NotInstrumented),
+            refused: Measure::Unavailable(Unavailable::NotInstrumented),
             headroom: Measure::Unavailable(Unavailable::NoBound),
         })
         .collect();
@@ -523,12 +524,15 @@ fn report_metrics(
         })
         .unwrap_or_default();
     let snapshot = MetricsSnapshot {
-        stages: Recorder::new().snapshot_stages(roles),
+        // Nothing has been recorded before the first turn, but which
+        // stages this daemon records is already known, and the ones it
+        // does not are stated as such rather than as zeroes.
+        stages: serve::recorder().snapshot_stages(roles),
         lanes,
         shards,
-        durability: Measure::Unavailable(Unavailable::NoSamples),
+        durability: Measure::Unavailable(Unavailable::NotInstrumented),
         frontiers,
-        view_age: Measure::Unavailable(Unavailable::NoSamples),
+        view_age: Measure::Unavailable(Unavailable::NotInstrumented),
         engine_pressure: Measure::Unavailable(Unavailable::NoBound),
     };
     match serde_json::to_string(&snapshot) {
@@ -1066,10 +1070,6 @@ fn main() -> ExitCode {
             domain = domain.with_peers(plane);
         }
         domain = domain.with_links(serve::CollectorLinks::new(links));
-        // One recorder for this run, shared with whatever measures a
-        // stage. Lock-free, so a diagnostics reader can never stall the
-        // work it is reading about.
-        let recorder = coord_daemon::metrics::Recorder::new();
         domain.run(&mut transport, now_seconds).await;
         eprintln!(
             "peers connected={} submittable={}",
@@ -1082,7 +1082,7 @@ fn main() -> ExitCode {
         // field is a number or a frozen enum: there is nothing in it to
         // redact, and an absent reading says why it is absent rather
         // than reporting a zero an operator would act on.
-        let snapshot = domain.metrics(&roles, &recorder);
+        let snapshot = domain.metrics(&roles);
         match serde_json::to_string(&snapshot) {
             Ok(rendered) => eprintln!("metrics {rendered}"),
             Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),

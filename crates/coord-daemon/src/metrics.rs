@@ -60,6 +60,10 @@ pub enum Unavailable {
     /// The bound this would be measured against is not configured, so
     /// there is no headroom to report.
     NoBound,
+    /// This process has no instrumentation point for it: nothing records
+    /// the stage, so any count would be a zero nobody measured. Distinct
+    /// from [`Unavailable::NoSamples`], which is instrumented and idle.
+    NotInstrumented,
 }
 
 /// A reading, or the reason there is none.
@@ -459,10 +463,12 @@ pub struct LaneReading {
     pub queue_wait: Measure<Duration>,
     /// Time from being picked to holding budget and a stream.
     pub credit_wait: Measure<Duration>,
-    /// Frames handed to the transport.
-    pub frames: u64,
-    /// Frames refused at the queue.
-    pub refused: u64,
+    /// Frames handed to the transport, or why they are not counted.
+    /// A count, but still a [`Measure`]: a lane nothing counts must not
+    /// report that it carried nothing.
+    pub frames: Measure<u64>,
+    /// Frames refused at the queue, or why they are not counted.
+    pub refused: Measure<u64>,
     /// Room left in the lane's byte budget.
     pub headroom: Measure<u64>,
 }
@@ -484,9 +490,24 @@ pub struct ShardReading {
 /// a diagnostics reader -- however slow, however stuck -- cannot stall a
 /// voter. That is a property of the type rather than a rule callers
 /// follow: there is no lock here to take.
-#[derive(Debug, Default)]
+///
+/// A recorder also knows which stages its owner actually records. A
+/// stage nothing in the process feeds is reported as
+/// [`Unavailable::NotInstrumented`] rather than as observed zeroes:
+/// "a voter that served writes did no journal work" is exactly the
+/// false statement a zero would make.
+#[derive(Debug)]
 pub struct Recorder {
     stages: [StageCells; Stage::ALL.len()],
+    /// Bit `i` is set when [`Stage::ALL`]`[i]` has an instrumentation
+    /// point in the owning process.
+    instrumented: u16,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Recorder::new()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -500,17 +521,40 @@ struct StageCells {
 }
 
 impl Recorder {
-    /// A recorder with nothing observed.
+    /// A recorder with nothing observed, whose owner records every
+    /// stage.
     pub fn new() -> Self {
-        Recorder::default()
+        Recorder::instrumenting(&Stage::ALL)
+    }
+
+    /// A recorder with nothing observed, whose owner records only
+    /// `stages`. Every other stage is reported as
+    /// [`Unavailable::NotInstrumented`], so a process that wires some
+    /// stages and not others says which is which.
+    pub fn instrumenting(stages: &[Stage]) -> Self {
+        let instrumented = stages
+            .iter()
+            .fold(0u16, |bits, stage| bits | (1 << Self::index(*stage)));
+        Recorder {
+            stages: Default::default(),
+            instrumented,
+        }
+    }
+
+    /// Whether the owner records `stage`.
+    pub fn instruments(&self, stage: Stage) -> bool {
+        self.instrumented & (1 << Self::index(stage)) != 0
+    }
+
+    fn index(stage: Stage) -> usize {
+        Stage::ALL
+            .iter()
+            .position(|s| *s == stage)
+            .expect("every stage is in ALL")
     }
 
     fn cells(&self, stage: Stage) -> &StageCells {
-        let index = Stage::ALL
-            .iter()
-            .position(|s| *s == stage)
-            .expect("every stage is in ALL");
-        &self.stages[index]
+        &self.stages[Self::index(stage)]
     }
 
     /// One operation entered `stage`.
@@ -574,18 +618,22 @@ impl Recorder {
     /// Every stage's reading for a node in `roles`.
     ///
     /// A stage this role does not have reports
-    /// [`Unavailable::NotThisRole`], and one it has but has not
-    /// exercised reports its zero counts with an unavailable latency --
-    /// which are different statements and are meant to look different.
+    /// [`Unavailable::NotThisRole`]; one it has but nothing in this
+    /// process records reports [`Unavailable::NotInstrumented`]; and one
+    /// that is recorded but has not been exercised reports its zero
+    /// counts with an unavailable latency. Those are three different
+    /// statements and are meant to look different.
     pub fn snapshot_stages(&self, roles: &crate::role::RoleSet) -> Vec<StageReading> {
         Stage::ALL
             .iter()
             .map(|stage| StageReading {
                 stage: *stage,
-                metrics: if stage.applies(roles) {
-                    Measure::Observed(self.stage(*stage))
-                } else {
+                metrics: if !stage.applies(roles) {
                     Measure::Unavailable(Unavailable::NotThisRole)
+                } else if !self.instruments(*stage) {
+                    Measure::Unavailable(Unavailable::NotInstrumented)
+                } else {
+                    Measure::Observed(self.stage(*stage))
                 },
             })
             .collect()

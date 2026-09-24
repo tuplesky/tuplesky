@@ -3928,12 +3928,13 @@ async fn a_node_reports_bounded_secret_free_metrics() {
     assert!(frontiers.get("materialized").is_some());
     assert!(frontiers.get("checkpoint").is_some());
 
-    // What it does not have says why, never zero. This node published
-    // no checkpoint and measured no view, and both are stated absences.
+    // What it does not have says why, never zero. This build times no
+    // view and no durability quantity, and configures no engine bound,
+    // and each is a stated absence.
     for (field, reason) in [
-        ("/view_age/Unavailable", "NoSamples"),
+        ("/view_age/Unavailable", "NotInstrumented"),
         ("/engine_pressure/Unavailable", "NoBound"),
-        ("/durability/Unavailable", "NoSamples"),
+        ("/durability/Unavailable", "NotInstrumented"),
     ] {
         assert_eq!(
             snapshot.pointer(field).and_then(|v| v.as_str()),
@@ -3946,6 +3947,30 @@ async fn a_node_reports_bounded_secret_free_metrics() {
     // observed: a missing series is always a stated absence.
     let stages = snapshot["stages"].as_array().expect("stages");
     assert_eq!(stages.len(), 12, "a stage was dropped rather than stated");
+    // The stages this daemon records are observed, and the ones nothing
+    // in it records say so rather than reporting counts nobody took.
+    let reading = |name: &str| {
+        stages
+            .iter()
+            .find(|s| s["stage"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("no {name} reading:\n{rendered}"))["metrics"]
+            .clone()
+    };
+    for recorded in ["Admission", "Journal", "Materialization"] {
+        assert!(
+            reading(recorded).get("Observed").is_some(),
+            "{recorded} is recorded by this daemon but was not observed:\n{rendered}"
+        );
+    }
+    for unrecorded in ["FanOut", "ClientTransit", "EvidenceLearning"] {
+        assert_eq!(
+            reading(unrecorded)
+                .pointer("/Unavailable")
+                .and_then(|v| v.as_str()),
+            Some("NotInstrumented"),
+            "{unrecorded} has no instrumentation point but was reported:\n{rendered}"
+        );
+    }
 
     // And nothing in it could not be shipped off the host. The scan is
     // the one design Section 22.3 asks for; it finds nothing because

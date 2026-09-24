@@ -23,6 +23,7 @@ use coord_collector::wire::{
 use coord_collector::{Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher};
 use coord_core::event::PeerProvenance;
 use coord_daemon::mailbox::LocalRoute;
+use coord_daemon::metrics::Stage;
 use coord_daemon::node::DriveError;
 use coord_daemon::pending::Pending;
 use coord_daemon::serve::{Step, step};
@@ -578,6 +579,30 @@ pub struct Domain<P: Persistence> {
     /// collector credential to submit with.
     links: CollectorLinks,
     budgets: Budgets,
+    /// This run's stage accounting (task-61), shared with the voter's
+    /// node so the journal and materialization points record into the
+    /// same cells the snapshot reads.
+    recorder: std::sync::Arc<coord_daemon::metrics::Recorder>,
+}
+
+/// The stages this daemon has an instrumentation point for (task-61).
+///
+/// Admission is recorded where the frontend decides a caller's frame;
+/// the journal and materialization are recorded by the voter's node,
+/// around the flush of a round's protocol transitions and around the
+/// application of each executable command. Every other stage has no
+/// point in this build and is reported as not instrumented rather than
+/// as a zero: a count nobody took is not a count of nothing.
+pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 3] = [
+    coord_daemon::metrics::Stage::Admission,
+    coord_daemon::metrics::Stage::Journal,
+    coord_daemon::metrics::Stage::Materialization,
+];
+
+/// A recorder for this daemon: nothing observed yet, and the stages it
+/// does not instrument stated as such.
+pub fn recorder() -> coord_daemon::metrics::Recorder {
+    coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED)
 }
 
 /// Where this node's local recovery images live, and when it makes one.
@@ -607,7 +632,13 @@ struct Housekeeping {
 
 impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Compose `frontend` over `backing`.
-    pub fn new(frontend: Frontend, backing: Backing<P>, budgets: Budgets) -> Self {
+    pub fn new(frontend: Frontend, mut backing: Backing<P>, budgets: Budgets) -> Self {
+        let recorder = std::sync::Arc::new(recorder());
+        if let Backing::Voting(voter) = &mut backing {
+            voter
+                .node_mut()
+                .record_into(std::sync::Arc::clone(&recorder));
+        }
         Domain {
             backing,
             frontend,
@@ -615,6 +646,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             plane: None,
             links: CollectorLinks::new(Vec::new()),
             budgets,
+            recorder,
         }
     }
 
@@ -627,12 +659,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     ///
     /// Everything this node does not have reports *why*, never zero. A
     /// gap in a dashboard is a question; a zero is an answer, and a
-    /// wrong one.
+    /// wrong one. The stage counts are this domain's own recorder,
+    /// which the frontend and the voter's node record into as they work
+    /// (see [`INSTRUMENTED`]).
     pub fn metrics(
         &self,
         roles: &coord_daemon::role::RoleSet,
-        recorder: &coord_daemon::metrics::Recorder,
     ) -> coord_daemon::metrics::MetricsSnapshot {
+        let recorder = &*self.recorder;
         use coord_daemon::metrics::{
             Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, ShardIndex, ShardReading,
             Unavailable,
@@ -646,17 +680,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }),
             None => Measure::Unavailable(Unavailable::Quarantined),
         };
-        // A lane this node has never used has no waits to report, and
-        // saying "no samples" is the honest reading: a lane nothing has
-        // travelled is not a fast lane.
+        // The transport does not account per lane in this build: no
+        // wait is timed and no frame is counted. So every lane reading
+        // is "not instrumented" -- "no samples" would claim the lane was
+        // measured and idle, and a zero count that it carried nothing,
+        // on a node that may have served all day.
         let lanes = Lane::ALL
             .iter()
             .map(|lane| LaneReading {
                 lane: *lane,
-                queue_wait: Measure::Unavailable(Unavailable::NoSamples),
-                credit_wait: Measure::Unavailable(Unavailable::NoSamples),
-                frames: 0,
-                refused: 0,
+                queue_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+                credit_wait: Measure::Unavailable(Unavailable::NotInstrumented),
+                frames: Measure::Unavailable(Unavailable::NotInstrumented),
+                refused: Measure::Unavailable(Unavailable::NotInstrumented),
                 headroom: Measure::Unavailable(Unavailable::NoBound),
             })
             .collect();
@@ -675,9 +711,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             stages: recorder.snapshot_stages(roles),
             lanes,
             shards,
-            durability: Measure::Unavailable(Unavailable::NoSamples),
+            // Neither the three durability quantities nor the age of a
+            // pinned view is timed by this build, whatever the node did.
+            durability: Measure::Unavailable(Unavailable::NotInstrumented),
             frontiers,
-            view_age: Measure::Unavailable(Unavailable::NoSamples),
+            view_age: Measure::Unavailable(Unavailable::NotInstrumented),
             engine_pressure: Measure::Unavailable(Unavailable::NoBound),
         }
     }
@@ -1222,6 +1260,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     store: self.backing.applier().store(),
                     budget: ViewBudget::default(),
                 };
+                // Admission is the frontend's decision about this frame:
+                // verified and admitted, answered, or refused at the door.
+                self.recorder.entered(Stage::Admission);
+                let started = std::time::Instant::now();
                 let ingress = self.frontend.frontend.on_frame(
                     &health,
                     connection.0,
@@ -1230,6 +1272,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     &policy,
                 );
                 let decided = step(ingress, retry_key);
+                if matches!(decided, Step::Close { .. }) {
+                    self.recorder.refused(Stage::Admission);
+                } else {
+                    self.recorder.completed(Stage::Admission, started.elapsed());
+                }
                 self.carry_out(transport, connection, decided, responder)
                     .await;
             }
