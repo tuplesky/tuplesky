@@ -276,7 +276,11 @@ fn main() -> ExitCode {
     println!(
         "peers reachable={} of {}",
         peers.len(),
-        placed.membership.voters().count().saturating_sub(1)
+        placed
+            .membership
+            .voters()
+            .filter(|v| v.node != placed.replica)
+            .count()
     );
     // A frontend submits on a client's behalf, and that is the
     // collector's authority, not the node's. A node certificate binds
@@ -369,11 +373,14 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        // The peer plane, where this process has peers to reach. A
-        // voter with none skips it: there is no socket to serve and
-        // nobody to dial, and binding one would be a listener nothing
-        // could arrive on.
-        if !peers.is_empty() {
+        // The peer plane, where this process votes and has peers to
+        // reach. A voter with none skips it: there is no socket to serve
+        // and nobody to dial, and binding one would be a listener nothing
+        // could arrive on. A process that does not vote never enters it:
+        // the voters `peers` names are where its collector submits, over
+        // the api plane below, not peers it exchanges votes with -- and a
+        // frontend is not required to bind a peer listener at all.
+        if roles.votes() && !peers.is_empty() {
             let Some(socket) = peer_socket else {
                 eprintln!("this node votes alongside peers but bound no peer listener");
                 return ExitCode::from(2);

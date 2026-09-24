@@ -983,3 +983,30 @@ fn a_replica_recovers_a_promise_the_projection_has_not_caught_up_with() {
         "recovery forgot a promise the journal already held"
     );
 }
+
+/// The journal-first coordinator follows the ballot its replica's
+/// machine is at: a follower's transitions carry the leader and number
+/// it actually voted under, not its own replica as leader. The epoch
+/// stays the one the application base names, because that is what an
+/// application transition is checked against when it is recorded.
+#[test]
+fn the_journal_stamps_the_ballot_the_machine_is_at() {
+    use coord_storage::Persistence;
+
+    let mut applier = journaled();
+    let epoch = applier.store().application_base().configuration;
+    let leader = ReplicaId([0x01; 16]);
+    applier.store_mut().follow_ballot(Ballot {
+        epoch: ConfigurationEpoch::new(9).unwrap(),
+        number: 4,
+        leader,
+    });
+    assert_eq!(
+        applier.store().ballot(),
+        Ballot {
+            epoch,
+            number: 4,
+            leader,
+        }
+    );
+}

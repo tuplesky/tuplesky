@@ -48,11 +48,15 @@ pub struct Peer {
 /// Why this process cannot say where its peers are.
 #[derive(Debug)]
 pub enum PeerError {
-    /// A voting process shares its domain with other committed voters
-    /// and was given no catalog to find them in.
+    /// This process has committed voters to reach -- as a voter, the
+    /// others in its domain; as a frontend, every one of them -- and was
+    /// given no catalog to find them in.
     NoCatalog {
-        /// How many other voters it would have to reach.
+        /// How many voters it would have to reach.
         others: usize,
+        /// Whether this process is one of the voters itself, which is
+        /// what decides whether they are its peers or its destinations.
+        votes: bool,
     },
     /// The catalog could not be read.
     Unreadable {
@@ -82,10 +86,21 @@ pub enum PeerError {
 impl core::fmt::Display for PeerError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            PeerError::NoCatalog { others } => write!(
+            PeerError::NoCatalog {
+                others,
+                votes: true,
+            } => write!(
                 f,
                 "this node votes alongside {others} other committed voter(s) \
                  and names no cluster_endpoints to find them at"
+            ),
+            PeerError::NoCatalog {
+                others,
+                votes: false,
+            } => write!(
+                f,
+                "this node does not vote and submits to {others} committed \
+                 voter(s), and names no cluster_endpoints to find them at"
             ),
             PeerError::Unreadable { path, reason } => {
                 write!(f, "cannot read the endpoint catalog at {path}: {reason}")
@@ -121,10 +136,12 @@ fn short(replica: &ReplicaId) -> String {
 /// Every committed voter of this domain except `me`, and where to try
 /// each of them.
 ///
-/// `None` for `path` is only allowed when there is nobody else to reach:
-/// a single-voter domain, or a process that does not vote. Anything else
-/// is refused here, before a listener exists, rather than at the first
-/// submission that finds no quorum.
+/// For a process that does not vote, that is every committed voter: they
+/// are where its collector submits. `None` for `path` is only allowed
+/// when there is nobody else to reach, which is a single-voter domain
+/// seen from its own voter. Anything else is refused here, before a
+/// listener exists, rather than at the first submission that finds no
+/// quorum.
 pub fn resolve(
     membership: &Membership,
     me: ReplicaId,
@@ -135,15 +152,16 @@ pub fn resolve(
         .map(|v| v.node)
         .filter(|node| *node != me)
         .collect();
-    // Nobody to look up. A single-voter domain, or a process that does
-    // not vote, has no peer to dial, and a catalog is an address book
-    // for peers: there is nothing here for it to answer.
+    // Nobody to look up. The only voter of a single-voter domain has no
+    // peer to dial, and a catalog is an address book for peers: there is
+    // nothing here for it to answer.
     if others.is_empty() {
         return Ok(Vec::new());
     }
     let Some(path) = path else {
         return Err(PeerError::NoCatalog {
             others: others.len(),
+            votes: others.len() < membership.voters().count(),
         });
     };
 

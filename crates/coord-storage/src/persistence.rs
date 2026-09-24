@@ -144,6 +144,24 @@ pub trait Persistence {
         epoch: coord_types::ids::ConfigurationEpoch,
         budget: crate::views::ViewBudget,
     ) -> Result<crate::protocol::RecoveredProtocol, EngineError>;
+
+    /// The replica's consensus machine is now at `ballot`, so what this
+    /// coordinator records from here on is stamped with the ballot the
+    /// transition was actually made under.
+    ///
+    /// A coordinator with no journal records no ballot and ignores it.
+    /// The journal-first one stamps every transition, and a stamp that
+    /// lagged the machine recorded a follower's promises and votes under
+    /// a ballot it never entered -- its own replica as leader -- which a
+    /// fence at the promised ballot, tie-broken on the leader, would then
+    /// refuse as obsolete. It takes the machine's number and leader. The
+    /// epoch stays the configuration epoch of the application base, which
+    /// is what the record format checks every application transition
+    /// against; that is the configuration the record extends, and it is
+    /// not the machine's to move.
+    fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {
+        let _ = ballot;
+    }
 }
 
 /// The reference path: the projection is itself the durable record.
@@ -325,6 +343,13 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
 
     fn unmaterialized(&self) -> usize {
         self.store.unmaterialized(self.domain)
+    }
+
+    fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {
+        self.ballot = coord_types::ids::Ballot {
+            epoch: self.application_base().configuration,
+            ..ballot
+        };
     }
 
     fn submit(&mut self, batch: PersistBatch, kind: TransitionKind) -> Result<(), Refused> {

@@ -536,6 +536,41 @@ fn initializing_is_deliberate_and_happens_exactly_once() {
     assert!(dir.join("state").join("gen-000001").is_dir());
 }
 
+/// An initialization that created the journal and then failed to create
+/// the projection can be run again, and finishes.
+///
+/// The two are separate directories, so no one write makes both exist.
+/// Without this the node was left with a journal and no projection: `init`
+/// refused because a store existed, a start refused because none did, and
+/// the only way out was deleting the journal by hand.
+#[test]
+fn an_initialization_that_stopped_between_the_journal_and_the_projection_can_be_finished() {
+    let dir = workspace("half-init");
+    let path = config(&dir);
+
+    // Something that is not a directory where the projection goes: the
+    // journal is created, and then the projection cannot be.
+    std::fs::write(dir.join("state"), b"not a directory").expect("obstruct");
+    let failed = run(&path, &["init"]);
+    assert_eq!(failed.code, Some(2), "{}{}", failed.out, failed.err);
+    assert!(
+        dir.join("journal").is_dir(),
+        "the journal was not created first, so this is not the case under test"
+    );
+
+    std::fs::remove_file(dir.join("state")).expect("clear");
+    let finished = run(&path, &["init"]);
+    assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
+    let report = start_and_report(&path);
+    assert!(report.contains("owed=0"), "{report}");
+
+    // Once the journal has been used, it is a store, and a second
+    // initialization is refused as before.
+    let again = run(&path, &["init"]);
+    assert_eq!(again.code, Some(2), "{}{}", again.out, again.err);
+    assert!(again.err.contains("already exists"), "{}", again.err);
+}
+
 /// A configuration a node cannot serve is refused under `--check` --
 /// which is where an operator would want to find out, rather than at
 /// the first start in production.
@@ -1113,6 +1148,41 @@ async fn a_caller_binds_a_session_against_the_running_daemon() {
 
     let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
     assert_eq!(caller.session, coord_types::ids::SessionId([0x44; 16]));
+}
+
+/// A process that only serves clients starts, binds no peer listener,
+/// and answers a caller.
+///
+/// A frontend reaches every committed voter over the api plane, as a
+/// collector: they are its destinations, not peers it votes with. A
+/// process that took "there are voters to reach" to mean "this process
+/// has a peer plane" would demand a peer listener a frontend is not
+/// required to bind, and so a supported role could never start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frontend_only_process_starts_without_a_peer_plane() {
+    let dir = workspace("frontend");
+    let ca = credentials(&dir, 7, coord_types::wire_v1::PeerRole::Frontend);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace("role = \"voter-frontend-observer\"", "role = \"frontend\"")
+            .replace("peer_quic = \"127.0.0.1:0\"\n", ""),
+    )
+    .expect("write");
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x45; 16]).await;
+    assert_eq!(caller.session, coord_types::ids::SessionId([0x45; 16]));
+    let said = daemon.said();
+    assert!(
+        !said.contains("peer listener"),
+        "a frontend was asked for a peer plane: {said}"
+    );
 }
 
 /// A request is carried all the way through by the voter in this

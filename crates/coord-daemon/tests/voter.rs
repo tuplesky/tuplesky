@@ -532,3 +532,118 @@ fn a_local_submission_does_not_skip_the_durability_gate() {
     );
     assert!(!out.peer.is_empty());
 }
+
+/// A store that remembers the ballot it was last told to record under,
+/// and is otherwise the reference store.
+struct Stamped {
+    inner: StoreWorker<ModelEngine>,
+    ballot: Option<Ballot>,
+}
+
+impl coord_storage::Persistence for Stamped {
+    type Reader = <StoreWorker<ModelEngine> as coord_storage::Persistence>::Reader;
+
+    fn boot(&self) -> BootId {
+        coord_storage::Persistence::boot(&self.inner)
+    }
+    fn application_base(&self) -> coord_core::effect::ApplyBase {
+        coord_storage::Persistence::application_base(&self.inner)
+    }
+    fn reader(&self) -> coord_storage::GatedReader<Self::Reader> {
+        coord_storage::Persistence::reader(&self.inner)
+    }
+    fn queued(&self) -> usize {
+        coord_storage::Persistence::queued(&self.inner)
+    }
+    fn unmaterialized(&self) -> usize {
+        coord_storage::Persistence::unmaterialized(&self.inner)
+    }
+    fn submit(
+        &mut self,
+        batch: coord_core::effect::PersistBatch,
+        kind: coord_storage::journaled::TransitionKind,
+    ) -> Result<(), coord_storage::Refused> {
+        coord_storage::Persistence::submit(&mut self.inner, batch, kind)
+    }
+    fn lower(&mut self) -> Result<coord_storage::Lowered, coord_store_api::engine::EngineError> {
+        coord_storage::Persistence::lower(&mut self.inner)
+    }
+    fn reconcile(
+        &mut self,
+    ) -> Result<coord_storage::Lowered, coord_store_api::engine::EngineError> {
+        coord_storage::Persistence::reconcile(&mut self.inner)
+    }
+    fn recovered(
+        &self,
+        epoch: ConfigurationEpoch,
+        budget: coord_storage::ViewBudget,
+    ) -> Result<coord_storage::protocol::RecoveredProtocol, coord_store_api::engine::EngineError>
+    {
+        coord_storage::Persistence::recovered(&self.inner, epoch, budget)
+    }
+    fn follow_ballot(&mut self, ballot: Ballot) {
+        self.ballot = Some(ballot);
+    }
+}
+
+/// What the store stamps on a transition is the ballot the machine is
+/// stepped at, from the first round and across every ballot the voter
+/// moves to.
+///
+/// The two are one value held in two places. A store opened with a
+/// ballot of its own and never told otherwise records a follower's
+/// promises and votes under a ballot it never entered, and a fence set
+/// at the ballot actually promised would refuse them as obsolete.
+#[test]
+fn the_store_records_under_the_ballot_the_voter_is_at() {
+    let boot = BootId([7; 16]);
+    let mut worker =
+        StoreWorker::open(ModelEngine::new(), boot, inc(), GroupLimits::default()).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = worker.application_base();
+    worker
+        .submit(coord_core::effect::PersistBatch {
+            barrier: alloc.allocate(),
+            base: Some(base),
+            updates: bootstrap_updates(),
+        })
+        .unwrap();
+    worker.flush().unwrap();
+    let applier = Applier::new(
+        Stamped {
+            inner: worker,
+            ballot: None,
+        },
+        alloc,
+    )
+    .unwrap();
+    let bootstrapped =
+        coord_storage::Persistence::application_base(applier.store()).execution_position;
+    let machine = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(),
+        genesis: ballot(),
+        frontend: FRONTEND,
+        capacity: 64,
+    })
+    .restore_execution(bootstrapped, []);
+    let node = Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND);
+    let ingress = Ingress::new(
+        &membership(),
+        r(1),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("replica 1 is a committed voter");
+    let mut voter = Voter::new(node, ingress, ballot());
+    assert_eq!(voter.node().applier().store().ballot, Some(ballot()));
+
+    let adopted = Ballot {
+        epoch: epoch(),
+        number: 3,
+        leader: r(2),
+    };
+    voter.set_ballot(adopted);
+    assert_eq!(voter.ballot(), adopted);
+    assert_eq!(voter.node().applier().store().ballot, Some(adopted));
+}

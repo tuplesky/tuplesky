@@ -197,7 +197,24 @@ pub fn open_storage(
                     reason: e.to_string(),
                 })?;
             }
-            RaftEngineJournal::create(&journal_root, identity, &options)
+            match RaftEngineJournal::create(&journal_root, identity, &options) {
+                Err(JournalOpenError::AlreadyInitialized) => {
+                    let projection = StoreIdentity {
+                        cluster_id: cluster,
+                        domain_id,
+                        replica_id: replica,
+                        incarnation,
+                    };
+                    left_by_an_interrupted_initialization(
+                        config,
+                        projection,
+                        &journal_root,
+                        identity,
+                        &options,
+                    )
+                }
+                created => created,
+            }
         }
         Intent::Serve => RaftEngineJournal::open_existing(&journal_root, identity, &options),
     }
@@ -242,8 +259,11 @@ pub fn open_storage(
         })?;
 
     // A transition's ballot is in the epoch of the configuration its base
-    // names; the replica's own ballot replaces this as soon as its
-    // machine has one.
+    // names. The number and leader here are only what a process that
+    // never votes keeps: a voter hands the store its machine's ballot
+    // when it is built and on every ballot it moves to (`Voter::new`,
+    // `Voter::set_ballot`, through `Persistence::follow_ballot`), so
+    // nothing a voter records is stamped with this one.
     let base = store.application_base(domain_id).expect("just attached");
     let ballot = Ballot {
         epoch: base.configuration,
@@ -256,6 +276,55 @@ pub fn open_storage(
         generation: directory,
         boot,
     })
+}
+
+/// The journal an initialization created before it stopped, or
+/// `AlreadyInitialized`.
+///
+/// Initialization creates the journal and then the projection, and the
+/// two are separate directories, so no single write makes both exist.
+/// One that failed or stopped in between -- the projection's parent
+/// unwritable, the disk full, the process killed -- left a journal and no
+/// projection. Refusing that as "a store already exists" while a start
+/// refused it as "no store" would leave the node with no command that
+/// works, and only deleting the journal by hand as a way out.
+///
+/// So the journal is reused, and only when both of these hold: there is
+/// no projection generation at all, and the journal is this node's and
+/// has never allocated a stream -- nothing was ever attached to it, so
+/// nothing was ever recorded in it. A journal with any history is a real
+/// store and stays refused.
+fn left_by_an_interrupted_initialization(
+    config: &Config,
+    projection: StoreIdentity,
+    journal_root: &Path,
+    identity: JournalIdentity,
+    options: &JournalOptions,
+) -> Result<RaftEngineJournal, JournalOpenError> {
+    use coord_journal_api::JournalEngine;
+
+    // "No projection" is the lifecycle's own verdict -- no generation is
+    // selected -- rather than a guess from the directory's contents. What
+    // a partly created generation directory means is the lifecycle's to
+    // decide when initialization creates it again.
+    let root = config.state.root_path(&config.state_directory);
+    if !matches!(
+        Generation::open_existing(&root, projection, OpenOptions::default()),
+        Err(OpenError::NotInitialized)
+    ) {
+        return Err(JournalOpenError::AlreadyInitialized);
+    }
+    let journal = RaftEngineJournal::open_existing(journal_root, identity, options)
+        .map_err(|_| JournalOpenError::AlreadyInitialized)?;
+    match journal.mappings() {
+        Ok((high_water, mappings))
+            if high_water == coord_journal_api::stream::StreamHighWater::NONE
+                && mappings.is_empty() =>
+        {
+            Ok(journal)
+        }
+        _ => Err(JournalOpenError::AlreadyInitialized),
+    }
 }
 
 /// A boot identity for this run.

@@ -128,8 +128,13 @@ impl<P: Persistence> Voter<P> {
     /// from the ingress's committed identity. It is not derived from
     /// anything a frame says, which is why the collector can count it
     /// the same way it counts a peer's.
-    pub fn new(node: Node<P>, ingress: Ingress, ballot: Ballot) -> Self {
+    ///
+    /// The store is told the same ballot here, whatever it was opened
+    /// with: it stamps every transition it records, and the ballot the
+    /// machine steps at is this one ([`Persistence::follow_ballot`]).
+    pub fn new(mut node: Node<P>, ingress: Ingress, ballot: Ballot) -> Self {
         let provenance = PeerProvenance::from_local_voter(ingress.replica(), ingress.incarnation());
+        node.applier_mut().store_mut().follow_ballot(ballot);
         Voter {
             node,
             ingress,
@@ -167,8 +172,14 @@ impl<P: Persistence> Voter<P> {
     }
 
     /// Move to `ballot` (a campaign, or an adopted higher one).
-    pub const fn set_ballot(&mut self, ballot: Ballot) {
+    ///
+    /// The store moves with it. The machine is stepped at this voter's
+    /// ballot, and the store stamps what it records with its own, so the
+    /// two are one value kept in two places: moving only this one would
+    /// record every later promise and vote under the ballot before.
+    pub fn set_ballot(&mut self, ballot: Ballot) {
         self.ballot = ballot;
+        self.node.applier_mut().store_mut().follow_ballot(ballot);
     }
 
     /// Local submissions waiting for a turn.
