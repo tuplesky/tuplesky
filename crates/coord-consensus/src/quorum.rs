@@ -11,6 +11,54 @@ use alloc::collections::BTreeSet;
 use coord_types::ids::{Ballot, ConfigurationEpoch, ReplicaId};
 use serde::{Deserialize, Serialize};
 
+/// The voters of one configuration epoch, and what a majority of them is.
+///
+/// Deliberately not a [`BallotConfiguration`]. That type describes one
+/// term -- it has a ballot, a leader and a fast set -- and the facts
+/// this one serves are durable across terms: a checkpoint floor
+/// (task-52) and a membership handoff (task-54) belong to a
+/// configuration and outlive every leadership in it. Sharing the ballot
+/// type would invite a rule that depended on who happened to be leading
+/// when a certificate was gathered, and would buy nothing: the
+/// intersection those protocols rest on is between two majorities of
+/// the same voter set, and majorities of a set intersect whoever leads.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EpochVoters {
+    epoch: ConfigurationEpoch,
+    voters: BTreeSet<ReplicaId>,
+}
+
+impl EpochVoters {
+    /// The voters of `epoch`. Refused when empty: a certificate signed
+    /// by nobody is not a weaker certificate, it is none.
+    pub fn new(epoch: ConfigurationEpoch, voters: BTreeSet<ReplicaId>) -> Option<Self> {
+        if voters.is_empty() {
+            return None;
+        }
+        Some(EpochVoters { epoch, voters })
+    }
+
+    /// The configuration epoch.
+    pub const fn epoch(&self) -> ConfigurationEpoch {
+        self.epoch
+    }
+
+    /// The exact voters.
+    pub const fn voters(&self) -> &BTreeSet<ReplicaId> {
+        &self.voters
+    }
+
+    /// Whether `replica` votes in this epoch.
+    pub fn is_voter(&self, replica: &ReplicaId) -> bool {
+        self.voters.contains(replica)
+    }
+
+    /// Signatures a certificate needs: a majority (`N/2 + 1`).
+    pub fn majority(&self) -> usize {
+        self.voters.len() / 2 + 1
+    }
+}
+
 /// Which fast-quorum class a ballot uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FastQuorumClass {

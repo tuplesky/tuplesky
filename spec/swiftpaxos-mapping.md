@@ -270,6 +270,12 @@ getting it wrong loses obligations rather than availability.
 | Ballot or leader as part of a floor | `[EXT]` rejected | a floor belongs to a configuration and outlives every term in it |
 | Copying a snapshot to a majority as activation | `[EXT]` rejected | Section 5.3, and the frozen counterexample |
 
+The durable side is `coord_checkpoint::floor` (task-53):
+`CheckpointReadinessV1` is the promise row, `ActivatedFloorV1` the
+certificate, and the `TrimmedFloorV1` it yields is task-51's floor
+unchanged -- so the fence, the bounded trimming and the deletions are the
+same code on both paths.
+
 ## Bounded models and counterexamples
 
 `crates/coord-consensus/tests/model.rs` explores every permutation of the

@@ -80,6 +80,9 @@ pub enum HashDomain {
     /// rule a domain's genesis grants is the same row on every replica
     /// (task-j09).
     PolicyRuleIdentity,
+    /// The subject of a checkpoint floor: what every signer of a
+    /// quorum-certified floor must have agreed on exactly (task-53).
+    CheckpointFloorSubject,
 }
 
 impl HashDomain {
@@ -101,6 +104,9 @@ impl HashDomain {
             HashDomain::KineBinding => "tuplesky coord.v1 2026-09 kine-binding",
             HashDomain::ConfigurationRecord => "tuplesky coord.v1 2026-09 configuration-record",
             HashDomain::PolicyRuleIdentity => "tuplesky coord.v1 2026-09 policy-rule-identity",
+            HashDomain::CheckpointFloorSubject => {
+                "tuplesky coord.v1 2026-09 checkpoint-floor-subject"
+            }
             HashDomain::ConfigurationActivation => {
                 "tuplesky coord.v1 2026-09 configuration-activation"
             }

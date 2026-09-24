@@ -124,8 +124,7 @@ pub use campaign::Campaign;
 pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
-    FloorInstall, FloorLedger, FloorVoters, Readiness, ReadinessError, ReadinessLedger, activate,
-    discover,
+    FloorInstall, FloorLedger, Readiness, ReadinessError, ReadinessLedger, activate, discover,
 };
 pub use follower::{Follower, FollowerConfig, FollowerRejection, HeldProposal};
 pub use graph::{
@@ -138,7 +137,7 @@ pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{PathAnchors, ProtocolMessage};
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
-pub use quorum::{BallotConfiguration, ConfigurationError, FastQuorumClass};
+pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};
 pub use recovery::{RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, select};
 pub use role::{PendingReport, RecoveredState};
 pub use rows::{
