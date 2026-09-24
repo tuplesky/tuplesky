@@ -955,11 +955,17 @@ impl Follower {
 
     /// Commands known by identity (a held proposal) without a payload.
     pub fn missing_payloads(&self) -> Vec<CommandId> {
+        // Held by identity and not by content. A command this replica
+        // has a record for may still have no payload: a proposal that
+        // arrived before its submission leaves a placeholder, and a
+        // command the leader proposed out of its own scheduler has no
+        // submission coming at all.
         let mut out: Vec<CommandId> = self
             .held
             .keys()
             .chain(self.sync_pending.keys())
-            .filter(|c| self.table.phase_of(c).is_none())
+            .chain(self.adopted.keys())
+            .filter(|c| !self.payloads.contains_key(c))
             .copied()
             .collect();
         out.sort();
@@ -1365,7 +1371,13 @@ impl Follower {
                 .held
                 .iter()
                 .filter(|(c, h)| {
-                    self.table.phase_of(c).is_some()
+                    // Initialized, not merely known. A proposal that
+                    // arrived before the payload leaves a placeholder,
+                    // and a placeholder cannot be accepted: there is
+                    // nothing to accept an order *for* yet. It stays
+                    // held until the payload arrives -- from the
+                    // submission, or from the leader that proposed it.
+                    self.table.is_initialized(c)
                         && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
                             .is_ok()
                 })
@@ -1699,13 +1711,49 @@ impl Follower {
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
             return Vec::new();
         }
-        if self.table.phase_of(&command).is_some() {
+        if self.payloads.contains_key(&command) {
             return Vec::new();
         }
         // The admission travels with the payload, so a replica that
         // recovered a command from a peer executes it under the same
         // attested facts as the replica that accepted it first.
-        self.on_request(payload.retry_key, payload.logical, payload.admission)
+        //
+        // A placeholder left by an early proposal becomes the record in
+        // that same transition, which is what initialization has always
+        // done. Nothing has been accepted over the placeholder -- a
+        // placeholder cannot be accepted -- so there is no order here to
+        // overwrite.
+        if !self.table.is_initialized(&command) {
+            return self.on_request(payload.retry_key, payload.logical, payload.admission);
+        }
+        // A record already exists, so this replica heard the leader's
+        // evidence before the payload and holds a placeholder -- or has
+        // adopted the leader's order over it. Initializing now would
+        // recompute dependencies this replica has already been told, and
+        // would reset an adoption it has already acknowledged, so the
+        // payload is bound beside the record rather than through it.
+        //
+        // This is the ordinary case for the service's own commands. A
+        // caller's command reaches every voter as a submission, so a
+        // voter that has one has its payload; a command a leader
+        // proposes out of its own scheduler reaches the others as
+        // evidence alone, and the payload has to follow.
+        //
+        // Written as well as remembered: a payload only in memory is one
+        // a restart loses, and the command would then be unexecutable
+        // with every later command waiting behind it.
+        if self.boot.is_none() {
+            return Vec::new();
+        }
+        self.bindings.insert(payload.retry_key, command);
+        self.payloads.insert(command, payload.clone());
+        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        self.durable_payloads.insert(barrier, command);
+        alloc::vec![Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates: alloc::vec![payload_update(&command, &payload).expect("bounded")],
+        })]
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {

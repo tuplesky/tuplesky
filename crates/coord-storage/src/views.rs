@@ -122,11 +122,15 @@ fn named_leases(op: &CanonicalOperation) -> Vec<LeaseId> {
         CanonicalOperation::LeaseGrant { lease_id, .. }
         | CanonicalOperation::LeaseKeepAlive { lease_id }
         | CanonicalOperation::LeaseRevoke { lease_id }
-        | CanonicalOperation::LeaseTimeToLive { lease_id, .. } => out.push(*lease_id),
+        | CanonicalOperation::LeaseTimeToLive { lease_id, .. }
+        // An expiry names the lease it is a candidate for, and every
+        // condition it carries is checked against that record.
+        | CanonicalOperation::ExpireLease { lease_id, .. } => out.push(*lease_id),
         CanonicalOperation::Range(_)
         | CanonicalOperation::DeleteRange(_)
         | CanonicalOperation::KineDelete(_)
         | CanonicalOperation::ConsumeAdmission
+        | CanonicalOperation::EstablishLeaseAuthority { .. }
         | CanonicalOperation::Compact { .. } => {}
     }
     out
@@ -140,6 +144,10 @@ fn needs_attachments(op: &CanonicalOperation) -> Option<LeaseId> {
             lease_id,
             keys: true,
         } => Some(*lease_id),
+        // An expiry that applies deletes every key attached to the
+        // lease in one revision, so the view it plans against has to
+        // carry them; loading them is what bounds that deletion.
+        CanonicalOperation::ExpireLease { lease_id, .. } => Some(*lease_id),
         _ => None,
     }
 }

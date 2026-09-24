@@ -117,63 +117,64 @@ Run against three voters on one host, at the commit this document ships in:
 | Pagination: bounded, ordered, resumable at one revision | passes |
 | Compaction refuses a watch below the floor | passes |
 | Watch replay, live handover, progress, resume | passes |
-| Time-to-live expiry | **fails** |
+| Time-to-live expiry | passes |
 | Concurrent writers on one key | passes |
 
-### The one gap, named
+Fourteen of fourteen. That is not a compatibility claim: it is this
+profile, these operations, this pin, on one host. What it does mean is
+that every row this suite states now holds, so the next thing to widen
+is the suite -- regional outage, restore, adapter and API-server
+restart, and the k3s control plane the workflow's second job runs.
 
-It is not a flake, it is reproducible from a fresh domain, and it blocks
-compatibility labeling on its own.
+### What was fixed to get here
 
-**A key under a time to live does not expire.** A key written with a
-one-second lease is still readable a minute later.
+**A key under a time to live expires.** The state machine's half of
+this was already there and had no caller: `coord_state::expiry` arms
+deadlines under a replicated authority epoch and emits conditional
+`ExpireLease` candidates, and the planner applies them only if every
+field still matches. What was missing was the path between them.
 
-The specified behaviour, so the gap is measured against something.
-Design Section 6.6 says a Kine `lease` is a *TTL in seconds*, not a
-lease identity: at the reference pin `LeaseGrant` returns the
-requested TTL as the apparent lease id, so unrelated keys written with
-TTL 60 must not end up attached to one shared lease 60. A positive TTL
-creates or replaces a **hidden private per-key expiry binding**,
-atomically with the create or update that carries it -- one command,
-no separate lease-grant round trip before the `Put`. The binding's
-identity is derived from the stable request, and it is never
-disclosed: what a Kine caller reads back is the TTL, never the hidden
-id. A TTL of zero removes the binding. Replacing or refreshing the key
-invalidates the old binding, so a stale expiry candidate is a no-op.
+A leader now schedules expiry. It orders a fresh authority epoch for
+its own boot -- which fences a predecessor's candidates, because an
+expiry carries the epoch it was scheduled under and the state machine
+refuses an older one -- then arms every surviving lease for its full TTL
+from the observation that epoch committed under, reads committed lease
+state back on an interval, and proposes a candidate when a deadline
+passes. A timer never deletes anything: the candidate is an ordinary
+replicated command whose every field is a condition, so a renewal
+ordered first, a rebound key or a superseded epoch makes it a no-op at
+its own position.
 
-Expiry itself is Section 7.2-7.3, and its shape is the whole point:
-it is an **authoritative conditional command**, `ExpireLease`, matching
-the binding's generation, the expected renewal sequence and the
-replicated `LeaseAuthorityEpoch`, applied only if every field still
-matches -- never a local unconditional delete by whichever process
-noticed the time. A timer is a scheduling hint and not permission to
-mutate. The deadline is `(1 + rho) * TTL` local ticks from an anchor
-that is the observation of a *committed* grant or renewal, for a
-documented maximum fast clock-rate error `rho`, and TTL is anchored to
-the operation's linearization rather than to a reply's arrival. After
-a restart or a failover the new authority epoch rearms every surviving
-binding for its full TTL from that observation. So expiry may be late,
-and is allowed to be; it may not be early, and without a quorum it
-does not happen at all.
+The candidates travel as two appended canonical operations,
+`EstablishLeaseAuthority` and `ExpireLease`, narrow in the same way
+`ConsumeAdmission` is. Narrowness is not what keeps a caller out of
+them, though. Every submission a collector makes carries an admission
+receipt minted for a session, and these two execute only for a command
+accepted with *no* admission at all -- which only a voter's own proposal
+is. A caller that names one is refused whatever its session holds, which
+`cli.rs::a_caller_cannot_expire_a_lease_however_it_spells_it` states for
+both of them.
 
-What exists: the state machine side. `coord_state::expiry::Scheduler`
-arms deadlines under an authority epoch, rearms conservatively and
-emits `InternalCommand::ExpireLease` candidates, and the planner
-applies them conditionally; the private binding is created and
-replaced atomically with the write, and stays hidden (this suite
-checks the disclosure rule, and it passes).
+Wiring it surfaced two things that had been true all along and never
+mattered, because until now every command reached every voter as a
+submission. A replica that heard a proposal before the payload left a
+placeholder, and a placeholder was treated as acceptable: it was taken
+out of the held set, the adoption failed against a record that had no
+payload to accept an order for, and the proposal was dropped without a
+word. A placeholder is now held until it is initialized. And a payload
+that arrived for a command a replica already had a record for was
+discarded, so a replica in that state could never acquire one; it is now
+bound and written. Nothing asked for a missing payload either --
+`request_payloads` had no caller -- so a replica now asks this ballot's
+leader, on an interval, and execution waits at the command rather than
+failing the node.
 
-What is missing: the driver. Nothing in `coordd` constructs that
-scheduler, feeds it observations of committed lease state, or submits
-the candidates it produces -- `Scheduler` has no caller outside its own
-tests. The internal command also has no narrow `CanonicalOperation`
-to travel under, which is deliberate: each internal command gets its
-own discriminant so a client's payload can never reach lease-authority
-or policy operations, and `ExpireLease` needs one of its own before it
-can be submitted through the ordinary replicated path. Nothing here
-may be shortcut into a direct store write.
-
-Three more, now fixed.
+The regression tests are
+`cli.rs::a_key_under_a_time_to_live_stops_being_readable` (negative
+control: with the leader's scheduler disabled, the key is still readable
+a minute later) and the certification row, which also checks that the
+binding stays private -- a Kine caller reads back the TTL and never a
+lease identity.
 
 **Concurrent callers are served across a quorum.** Two callers issuing
 one request each at a time against three voters used to complete 13 of
@@ -226,14 +227,18 @@ one. The regression tests are
 and
 `crates/coord-consensus/tests/activation.rs::a_cluster_serves_past_its_table_capacity`.
 
-That fix is also why the remaining rows are separate findings. A
-wedged domain used to turn one failure into every later one, so a suite
-run reported a cascade and the first line of the log was the only one
-worth reading.
+That fix is also why the four above read as four findings. A wedged
+domain used to turn one failure into every later one, so a suite run
+reported a cascade and the first line of the log was the only one worth
+reading.
 
-Until it is closed, this document's answer to "is this
-etcd-compatible" is no, for stated reasons, in a named profile. That is
-the point of certifying rather than booting.
+This document's answer to "is this etcd-compatible" is still not yes.
+It is: every row of this profile passes, the profile is the one named
+above, and what it does not cover it does not claim. Widening it --
+regional outage, restore, adapter and API-server restart, a real k3s
+control plane under load -- is what would turn a passing suite into a
+compatibility statement. That is the point of certifying rather than
+booting.
 
 ## Reading a failure
 

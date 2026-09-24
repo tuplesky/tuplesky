@@ -226,6 +226,19 @@ impl<P: Persistence> Applier<P> {
             (CanonicalOperation::ConsumeAdmission, _) => {
                 self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
             }
+            // A service operation, accepted with no admission because
+            // no verifier admitted one: this is a voter's own proposal,
+            // and it is the only kind of command that arrives without a
+            // receipt. Every collector submission carries one, so a
+            // caller naming one of these falls through to the arm below
+            // and is refused whatever its session may do.
+            (operation, None) if Self::is_service_operation(operation) => {
+                let internal = coord_state::service_command(&request).expect("a service operation");
+                self.apply_internal(request.namespace, &internal, &binding)
+            }
+            (operation, Some(_)) if Self::is_service_operation(operation) => {
+                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
+            }
             (_, Some(facts)) if facts.purpose() == AdmissionPurpose::Establish => {
                 self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
             }
@@ -237,6 +250,19 @@ impl<P: Persistence> Applier<P> {
             }
             _ => self.apply_bound(&request, &binding),
         }
+    }
+
+    /// Whether `operation` is one of the service's own.
+    ///
+    /// Named here rather than derived from `service_command`, because
+    /// the dispatch has to answer it for an operation alone, before it
+    /// decides which planner runs.
+    fn is_service_operation(operation: &CanonicalOperation) -> bool {
+        matches!(
+            operation,
+            CanonicalOperation::EstablishLeaseAuthority { .. }
+                | CanonicalOperation::ExpireLease { .. }
+        )
     }
 
     /// Create the session an accepted establishment receipt attests.
@@ -278,12 +304,28 @@ impl<P: Persistence> Applier<P> {
             refresh_family: None,
             window: SESSION_RETRY_WINDOW,
         };
+        self.apply_internal(namespace, &internal, binding)
+    }
+
+    /// Execute one internal command: the service's own transition,
+    /// planned against replicated state and bound to its invocation.
+    ///
+    /// The ordinary admission path cannot answer for one of these. It
+    /// asks a session whether the command may run, and an internal
+    /// command has no session -- it is the service's, admitted by
+    /// nobody, and what decides whether it changes anything is the
+    /// planner rechecking every condition it carries against current
+    /// replicated state. So a redelivery is resolved from the retry
+    /// record directly, and everything else is the same batch an
+    /// ordinary command gets: outcome, retry binding and state in one.
+    fn apply_internal(
+        &mut self,
+        namespace: NamespaceId,
+        internal: &InternalCommand,
+        binding: &RetryBinding,
+    ) -> Result<AppliedOutcome, ApplyError> {
         for _ in 0..8 {
             let gated = self.store.reader().snapshot()?;
-            // A second delivery of this same command returns what the
-            // first established. The ordinary admission path cannot
-            // answer this one: it asks the session whether the command
-            // may run, and this is the command that creates it.
             match retry::lookup(gated.view(), &binding.retry_key)? {
                 Some(record) if record.command_id == binding.command_id => {
                     if let Some(revision) = record.revision {
@@ -302,8 +344,8 @@ impl<P: Persistence> Applier<P> {
                 }
                 None => {}
             }
-            let planned = match build_internal_view(&gated, &internal, ViewBudget::SCHEMA) {
-                Ok(view) => match plan_internal(&internal, &view, &PlanLimits::default()) {
+            let planned = match build_internal_view(&gated, internal, ViewBudget::SCHEMA) {
+                Ok(view) => match plan_internal(internal, &view, &PlanLimits::default()) {
                     Ok(planned) => planned,
                     Err(e) => match e.terminal() {
                         Some(reason) => rejection_plan(&view, reason).map_err(ApplyError::Plan)?,
@@ -320,9 +362,10 @@ impl<P: Persistence> Applier<P> {
             };
             drop(gated);
             let barrier = self.alloc.allocate();
-            // The retry binding rides in the same batch as the session
-            // row and the consumed receipt: the outcome is recoverable
-            // exactly when the session exists.
+            // The retry binding rides in the same batch as whatever the
+            // command changed -- a session row and a consumed receipt,
+            // an authority epoch, a deleted key -- so the outcome is
+            // recoverable exactly when the change is.
             match apply_plan(&mut self.store, barrier, namespace, &planned, Some(binding))? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)

@@ -600,6 +600,12 @@ pub struct Domain<P: Persistence> {
     /// with nobody else in it, and for a process whose frontend holds no
     /// collector credential to submit with.
     links: CollectorLinks,
+    /// Lease and private-TTL expiry, where this process votes. A node
+    /// that runs no voter schedules nothing: an expiry is a command,
+    /// and proposing one is a leader's.
+    expiry: Option<crate::leases::Expiry>,
+    /// Turns spent holding a command whose payload this node lacks.
+    asking: u64,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -635,6 +641,29 @@ pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
     } else {
         coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED[..1])
     }
+}
+
+/// Turns between two asks for a missing payload.
+const ASK_EVERY: u64 = 16;
+
+/// Something in a domain that has work due at a time rather than on an
+/// event.
+///
+/// The domain loop otherwise waits only on its sockets, so work that
+/// becomes due while nothing arrives -- a lease whose deadline passes on
+/// a quiet domain -- would wait for unrelated traffic to be noticed. The
+/// loop instead sleeps until the earliest deadline any component
+/// registers ([`Domain::next_deadline`]) and gives the voter a turn when
+/// it passes. Lease expiry is the first component; the collector's
+/// re-offers and the expiry of held evidence are meant to register here
+/// in the same way rather than add arms of their own to the loop.
+pub trait Deadline {
+    /// The earliest instant this component has work due, if it has any.
+    ///
+    /// It must move past a deadline once the turn that deadline wakes has
+    /// done the work due at it; a deadline that stays in the past would
+    /// wake the loop again at once, for ever.
+    fn next_deadline(&self) -> Option<std::time::Instant>;
 }
 
 /// Where this node's local recovery images live, and when it makes one.
@@ -677,6 +706,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             housekeeping: None,
             plane: None,
             links: CollectorLinks::new(Vec::new()),
+            expiry: None,
+            asking: 0,
             budgets,
             recorder,
         }
@@ -865,6 +896,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // nowhere else, so an api connection and a peer connection
             // can share a number. Handling them through one arm would
             // let a caller's closing stream look like a voter's.
+            // Work due at a time rather than on an event. Last in the
+            // order, so it never holds up a frame that is already here;
+            // when it fires the loop simply takes another turn, which is
+            // where the component whose deadline it was does its work.
+            let wake = self.next_deadline();
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                wake.unwrap_or_else(std::time::Instant::now),
+            ));
             let arrived = tokio::select! {
                 biased;
                 // Voter work that is still outstanding pre-empts waiting
@@ -874,6 +913,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 () = std::future::ready(()), if progressed => continue,
                 peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                 event = transport.next_event() => event.map(Arrived::Api),
+                () = sleep, if wake.is_some() => continue,
             };
             match arrived {
                 Some(Arrived::Api(event)) => self.on_transport(transport, event, &clock).await,
@@ -881,6 +921,37 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 None => return,
             }
         }
+    }
+
+    /// Schedule lease and private-TTL expiry from this node's leader.
+    pub fn with_expiry(mut self, expiry: crate::leases::Expiry) -> Self {
+        self.expiry = Some(expiry);
+        self
+    }
+
+    /// The earliest deadline any component of this domain has
+    /// registered: when the loop has to take a turn even if nothing
+    /// arrives (see [`Deadline`]).
+    ///
+    /// Expiry counts only where this replica leads, because only then
+    /// does a turn run it; a follower's driver has nothing due. Further
+    /// components are folded into the same minimum.
+    pub fn next_deadline(&self) -> Option<std::time::Instant> {
+        let expiry = match &self.backing {
+            Backing::Voting(voter) if voter.leads() => {
+                self.expiry.as_ref().and_then(Deadline::next_deadline)
+            }
+            _ => None,
+        };
+        [expiry].into_iter().flatten().min()
+    }
+
+    /// Authority epochs proposed, expiry candidates proposed, and leases
+    /// currently armed.
+    pub fn expiries(&self) -> (u64, u64, usize) {
+        self.expiry
+            .as_ref()
+            .map_or((0, 0, 0), |e| (e.done.0, e.done.1, e.armed()))
     }
 
     /// Give the voter its turn: the local submissions it is owed, then
@@ -895,6 +966,36 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         };
         let (mut out, refused) = voter.serve_local(self.budgets.local_per_turn)?;
         out.absorb(voter.execute()?);
+        // A command whose identity this replica learned from evidence
+        // and whose content nobody sent it. Execution stops at it
+        // rather than going past it, so what unblocks the domain is
+        // asking the leader for the payload; the request carries no
+        // durable prerequisite and goes out at once.
+        //
+        // Asked on an interval rather than on every turn: the request
+        // has no durable prerequisite and goes out at once, so one is
+        // enough until the answer comes, and a busy domain must not
+        // turn one missing payload into a request per event.
+        if voter.awaiting().is_some() || voter.wants_payloads() {
+            self.asking = self.asking.saturating_add(1);
+            if self.asking % ASK_EVERY == 1 {
+                out.absorb(voter.request_payloads()?);
+            }
+        } else {
+            self.asking = 0;
+        }
+        // Expiry is the leader's to schedule, and every candidate it
+        // produces is conditional: nothing here decides that a key
+        // goes, only that the cluster should be asked.
+        if voter.leads()
+            && let Some(expiry) = self.expiry.as_mut()
+        {
+            let applied = voter.node().executed;
+            let frames = expiry.due(voter.node().applier().store(), applied);
+            for frame in frames {
+                out.absorb(voter.propose_service(&frame)?);
+            }
+        }
         let provenance = voter.provenance();
         let did = !refused.is_empty() || !out.is_empty();
         // A refusal at the voter's door is silent to the caller, whose

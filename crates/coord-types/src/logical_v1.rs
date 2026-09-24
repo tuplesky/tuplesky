@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ValidationError;
-use crate::ids::{KvRevision, LeaseId, NamespaceId};
+use crate::ids::{KvRevision, LeaseAuthorityEpoch, LeaseGeneration, LeaseId, NamespaceId};
 
 /// Semantic limits (Section 19.3). Local scheduling budgets may be lower but
 /// cannot change a chosen result.
@@ -309,6 +309,48 @@ pub enum CanonicalOperation {
     /// policy administration, trust-rule or lease-authority operations
     /// that happen to share an internal encoding.
     ConsumeAdmission,
+    /// Establish a new lease expiry authority epoch (discriminant 13).
+    ///
+    /// The service's own, never a caller's. A recovered leader takes
+    /// authority for scheduling expirations by ordering this, and the
+    /// epoch it installs fences every scheduler of an older one, so a
+    /// former leader's expiry candidate is refused after a successor
+    /// has taken over (design Section 7.2).
+    ///
+    /// Narrow for the same reason [`CanonicalOperation::ConsumeAdmission`]
+    /// is: it names one action a client may not take, rather than
+    /// opening a door onto every internal command that shares an
+    /// encoding. What keeps a client out is not the name, though -- see
+    /// [`CanonicalOperation::ExpireLease`].
+    EstablishLeaseAuthority {
+        /// The epoch to install; it must exceed the current one.
+        epoch: LeaseAuthorityEpoch,
+    },
+    /// Conditionally expire a lease or a private Kine TTL binding
+    /// (discriminant 14).
+    ///
+    /// Every field is a condition, and the command applies only if all
+    /// of them still match replicated state: a renewal ordered first
+    /// makes this a no-op, a rebinding of the key invalidates the
+    /// candidate, and a former leader's epoch is refused outright. So a
+    /// timer is a scheduling hint and never permission to mutate
+    /// (design Sections 6.6, 7.2-7.3).
+    ///
+    /// What keeps a caller from submitting one is not this variant's
+    /// narrowness but the admission beside it: every submission a
+    /// collector makes carries a receipt minted for a session, and the
+    /// two service operations execute only for a command accepted with
+    /// no admission at all -- which only a voter's own proposal is.
+    ExpireLease {
+        /// The lease or private binding to end.
+        lease_id: LeaseId,
+        /// Ownership generation the scheduler observed.
+        generation: LeaseGeneration,
+        /// Renewal sequence the scheduler observed.
+        expected_renewal_sequence: u64,
+        /// Authority epoch the scheduler runs under.
+        authority_epoch: LeaseAuthorityEpoch,
+    },
 }
 
 /// A canonical logical request: domain-scoped tenant plus operation.
@@ -490,6 +532,14 @@ impl CanonicalOperation {
             }
             // Nothing to validate: there is nothing in it.
             CanonicalOperation::ConsumeAdmission => {}
+            // The service's own operations. Every field is an identity
+            // or a condition the state machine rechecks against
+            // replicated state, so there is no bound here to enforce
+            // that execution does not already enforce: a stale epoch,
+            // an unknown lease or a moved renewal sequence is a no-op
+            // outcome, not a malformed request.
+            CanonicalOperation::EstablishLeaseAuthority { .. }
+            | CanonicalOperation::ExpireLease { .. } => {}
         }
         if cost > limits::MAX_REQUEST_BYTES {
             return Err(ValidationError::RequestTooLarge);
