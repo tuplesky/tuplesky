@@ -1,0 +1,27 @@
+[
+  {
+    "name": "leader-evidence-before-dependency-readiness",
+    "guards_enforced": true,
+    "steps": [
+      "c1 descriptor without payload (Start)",
+      "c2 pre-accepted with deps [c1]",
+      "leader proposal for c2: guard_accept -> Err(DependencyNotAccepted { dep: CommandIdDigest32(97266848284bff9c01499de3c8648ebac7490a31ad09f54b56b0b2e9a2692857) })"
+    ],
+    "violation_at_step": 3,
+    "oracle_finding": null
+  },
+  {
+    "name": "leader-evidence-before-dependency-readiness",
+    "guards_enforced": false,
+    "steps": [
+      "c1 descriptor without payload (Start)",
+      "c2 pre-accepted with deps [c1]",
+      "leader proposal for c2: guard_accept -> Err(DependencyNotAccepted { dep: CommandIdDigest32(97266848284bff9c01499de3c8648ebac7490a31ad09f54b56b0b2e9a2692857) })",
+      "guard removed: c2 -> Accept",
+      "quorum for c2: guard_commit -> Err(DependencyNotCommitted { dep: CommandIdDigest32(97266848284bff9c01499de3c8648ebac7490a31ad09f54b56b0b2e9a2692857) })",
+      "guard removed: c2 -> Commit"
+    ],
+    "violation_at_step": null,
+    "oracle_finding": "CommandIdDigest32(d3a08a361532d9419c28013c97a13bbb437188b95a791f17fe1232e15895063f) committed while dependency CommandIdDigest32(97266848284bff9c01499de3c8648ebac7490a31ad09f54b56b0b2e9a2692857) is Start"
+  }
+]

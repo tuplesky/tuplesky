@@ -1,0 +1,19 @@
+[package]
+name = "coord-consensus"
+description = "Source-exact SwiftPaxos quorum policy, guards, learning and recovery selection (pure core)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "core"
+
+[dependencies]
+coord-types.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
