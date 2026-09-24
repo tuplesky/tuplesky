@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d3ebe1402cb86b0529a2f12a1c8c2e6a11ac53b5d8f53cb6a8de69371f52092d # shrinks to ops = [Put(PutOp { key: [97], value: [], lease: None, prev_kv: false }), Compact { revision: KvRevision(1) }, Range(RangeOp { range: KeyRange { key: [97], range_end: Some([99]) }, revision: Some(KvRevision(1)), limit: 0, keys_only: false, count_only: false })]
+cc ae9a332c8a089fe0000fd129b43558ac7442d3ae38e5132576a9f430d38794f5 # shrinks to ops = [Put(PutOp { key: [97], value: [], lease: None, prev_kv: false }), Compact { revision: KvRevision(1) }, DeleteRange(DeleteRangeOp { range: KeyRange { key: [97], range_end: None }, prev_kv: false }), Range(RangeOp { range: KeyRange { key: [97], range_end: Some([99]) }, revision: Some(KvRevision(1)), limit: 0, keys_only: false, count_only: false })]

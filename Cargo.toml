@@ -7,6 +7,7 @@ resolver = "3"
 members = [
     "crates/coord-types",
     "crates/coord-core",
+    "crates/coord-state",
     "crates/coord-oracle",
     "crates/coord-store-api",
     "crates/coord-store-testkit",
@@ -29,6 +30,7 @@ publish = false
 # Internal crates.
 coord-types = { path = "crates/coord-types" }
 coord-core = { path = "crates/coord-core" }
+coord-state = { path = "crates/coord-state" }
 coord-oracle = { path = "crates/coord-oracle" }
 coord-store-api = { path = "crates/coord-store-api" }
 coord-store-testkit = { path = "crates/coord-store-testkit" }
