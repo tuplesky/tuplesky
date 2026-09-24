@@ -993,3 +993,67 @@ the wire yet, so a floor is certified from readiness a caller already
 has. Wiring the prepare round into the peer plane, and fetching the
 checkpoint a `RecoveryObligation::Install` names, are the parts task-57
 and the membership workstream need and are not yet built.
+
+## The dangerous part of a membership change is the coordinator dying
+
+A sealed handoff is a long operation with a single driver, and the
+failure that matters is not the driver crashing -- that is expected --
+but the replacement believing the wrong thing about how far the last one
+got. Everything in `coord_consensus::handoff` is arranged around that
+one sentence.
+
+`Evidence` has no lifecycle label and deliberately no place to put one.
+Every field is a record some replica made durable: stances, terminal
+reports, the certificates, installations. `resume` returns a stage only
+when one of those justifies it, and the order it checks them in is by
+how far the transition demonstrably got -- highest first, because a
+later record implies the earlier ones happened and the reverse is never
+true.
+
+Three things are structurally impossible rather than checked for:
+
+* **A fence cleared by a retry.** A voter records one stance per
+  transition and never reverses it, so a seal and a cancellation cannot
+  both certify. `resume` has no path from any fence back to `Stable`:
+  not a partial one, not one whose transition was later cancelled
+  elsewhere. The voters that sealed will not vote in the old
+  configuration again whatever a coordinator decides, so a coordinator
+  that returned to `Stable` would be describing a cluster that cannot
+  serve.
+* **A second successor.** The terminal certificate is selected after the
+  seal by a majority of the old voters agreeing on one root. Two
+  selections need two majorities, which intersect, and the intersecting
+  voter reported one root.
+* **Terminal state without a fence.** `select_terminal` takes a
+  `SealCertificate`, so there is no selection before the fence. This is
+  the subtle one: before sealing, an old voter can still accept work, so
+  what it reports as terminal is a state the old configuration may
+  already have moved past. An applied KV view, a closed frontend or a
+  vanished client is not a fence.
+
+### A fence belongs to the configuration, not to the transition
+
+The model found this. A voter that sealed for transition B is fenced,
+and a coordinator driving transition A that only collected A's stances
+would see nothing and resume as if the domain were idle. So
+`stances_of` is deliberately unfiltered and `resume` refuses with
+`FencedByAnother`: the domain permits one transition at a time, and the
+recorded one is the one that must be finished. A cancelled transition is
+different -- it releases the domain, and a voter that cancelled may
+record a stance for the next one.
+
+### What the model does and does not say
+
+Every assignment of a stance script to each of three old voters, crossed
+with five points at which the coordinator can die: 1715 worlds, all
+eight stages reached. The invariants are checked against everything that
+was ever recorded, not against whatever the rows hold at the end -- a
+certificate formed from an earlier row does not stop existing when the
+row changes, and a model that only looked at final state could not tell
+a rule that forbids clearing a fence from one that clears it quietly.
+
+**Still missing:** this is the model, not the implementation. Where
+stances live, what the terminal root is computed over, how a successor
+is staged and how any of it travels between nodes are task-55, task-56
+and task-57. Nothing here is a proof; it is a regression of the rules
+and of the five counterexamples they exist for.

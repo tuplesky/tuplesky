@@ -90,6 +90,15 @@
 //!   promised before any certificate existed and keeps the promise
 //!   whether or not it ever saw one. Nothing here consults a ballot: a floor belongs to a
 //!   configuration and outlives every term in it.
+//! * [`handoff`] (task-54): the sealed membership handoff. A voter
+//!   records one stance per transition and never reverses it, so a seal
+//!   and a cancellation can never both certify and no retry clears a
+//!   fence; a terminal certificate is selected only after the seal, by
+//!   a majority of the old voters agreeing on one root; the successor
+//!   activates only once a majority of it has installed that exact
+//!   root. `resume` chooses where a replacement coordinator continues
+//!   from durable records alone -- there is no lifecycle label to
+//!   consult, and no path from a fence back to `Stable`.
 //! * [`rows`], [`messages`]: the promise, payload, dependency and proposal
 //!   rows and the postcard-encoded protocol messages of this increment.
 #![forbid(unsafe_code)]
@@ -103,6 +112,7 @@ pub mod commands;
 pub mod floor;
 pub mod follower;
 pub mod graph;
+pub mod handoff;
 pub mod leader;
 pub mod learner;
 pub mod messages;
@@ -129,6 +139,11 @@ pub use floor::{
 pub use follower::{Follower, FollowerConfig, FollowerRejection, HeldProposal};
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, empty_path,
+};
+pub use handoff::{
+    ActivationCertificate, CancellationCertificate, Evidence, HandoffError, InstallRecord,
+    SealCertificate, Stage, Stance, StanceError, StanceLedger, StanceRecord, TerminalCertificate,
+    TerminalReport, TerminalReportError, Transition, cancel, resume, seal, select_terminal,
 };
 pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal, Rejection,
