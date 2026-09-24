@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use coord_transport::{
     ALPN_API, ALPN_PEER, BudgetLimits, Class, CloseCode, CloseReason, Destination, Lane,
-    LaneLimits, Limits, SendError, Transport, TransportError, TransportEvent, evidence_frame,
+    LaneLimits, Limits, RequestError, SendError, Transport, TransportError, TransportEvent,
+    evidence_frame,
 };
 use coord_transport_testkit::{TestBinder, TestCa, TestIdentity};
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
@@ -1057,6 +1058,241 @@ async fn a_submission_stream_is_open_to_a_collector_and_to_nobody_else() {
             }
             _ => {}
         }
+    }
+}
+
+/// A caller asks a question on a stream it opens and reads the answer on
+/// the same stream.
+///
+/// The client shape, and the only one that reads a node's reply.
+/// `Transport::send` is the other shape -- output addressed *to* a node,
+/// on a stream whose receiving half nobody reads -- and this is beside
+/// it, not in place of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_asks_a_question_and_reads_the_answer_on_the_same_stream() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Client]);
+    let mut node = bind(&f, 0);
+    let caller = bind(&f, 1);
+    let connection = asked_on(&f, &caller, &node).await;
+    drained(&mut node).await;
+
+    let question = encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, b"who am i").unwrap();
+    let answered = tokio::join!(
+        caller.request(connection, question, Duration::from_secs(5)),
+        async {
+            loop {
+                if let TransportEvent::ApiRequest {
+                    frame, responder, ..
+                } = event(&mut node).await
+                {
+                    assert_eq!(frame.kind, KIND_SESSION_BIND);
+                    assert_eq!(frame.payload, b"who am i");
+                    responder
+                        .respond(
+                            encode_frame(KIND_SESSION_BIND_ACK, SESSION_BIND_VERSION, b"you are")
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    return;
+                }
+            }
+        }
+    )
+    .0;
+
+    let answer = answered.expect("the caller read its answer");
+    assert_eq!(answer.kind, KIND_SESSION_BIND_ACK);
+    assert_eq!(answer.payload, b"you are");
+}
+
+/// An answer above its kind's class limit is refused as a bound, not
+/// truncated.
+///
+/// The caller reads through the same bounded reader as everything else,
+/// so the limit is checked from the length header before a payload is
+/// allocated. A caller that truncated instead would hand a short frame
+/// to a decoder and call whatever came out an answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_above_its_class_limit_is_refused_as_a_bound() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Client]);
+    let mut node = bind(&f, 0);
+    let caller = bind(&f, 1);
+    let connection = asked_on(&f, &caller, &node).await;
+    drained(&mut node).await;
+
+    // A negotiation-range kind, whose class limit is 64 KiB, carrying
+    // far more. Built by hand: the encoder refuses it too, which is the
+    // point -- nothing well-behaved produces this, and the reader must
+    // not accept it if something does.
+    let payload = vec![0u8; 100_000];
+    let mut oversize = Vec::with_capacity(payload.len() + HEADER_LEN);
+    oversize.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+    oversize.extend_from_slice(&0x0003u16.to_be_bytes());
+    oversize.extend_from_slice(&1u16.to_be_bytes());
+    oversize.extend_from_slice(&payload);
+
+    let question = encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, b"ask").unwrap();
+    let answered = tokio::join!(
+        caller.request(connection, question, Duration::from_secs(5)),
+        async {
+            loop {
+                if let TransportEvent::ApiRequest { responder, .. } = event(&mut node).await {
+                    let _ = responder.respond(oversize.clone()).await;
+                    return;
+                }
+            }
+        }
+    )
+    .0;
+
+    assert!(
+        matches!(answered, Err(RequestError::Malformed(_))),
+        "{answered:?}"
+    );
+}
+
+/// No answer within the deadline is an unknown outcome, not a failure.
+///
+/// The error says only that this caller did not hear back here. What the
+/// node did with the question is not settled by it, which is why the
+/// invocation keeps its identity and is resolvable by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_answer_within_the_deadline_is_unknown_rather_than_failed() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Client]);
+    let mut node = bind(&f, 0);
+    let caller = bind(&f, 1);
+    let connection = asked_on(&f, &caller, &node).await;
+    drained(&mut node).await;
+
+    let question = encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, b"ask").unwrap();
+    let answered = tokio::join!(
+        caller.request(connection, question, Duration::from_millis(300)),
+        async {
+            // The node takes the question and says nothing. The
+            // responder is held rather than dropped, so this is a slow
+            // answer and not a closed stream.
+            loop {
+                if let TransportEvent::ApiRequest { responder, .. } = event(&mut node).await {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    drop(responder);
+                    return;
+                }
+            }
+        }
+    )
+    .0;
+
+    assert_eq!(answered, Err(RequestError::Timeout));
+}
+
+/// A request's deadline bounds the whole request, including the wait for
+/// admission behind other traffic.
+///
+/// A caller that asked to wait 300ms must not wait behind an earlier
+/// request's open slot for as long as that request takes, and then be
+/// given 300ms again for each phase after it. Caught before admission,
+/// the request was never written, so it is refused as a send that timed
+/// out rather than reported as an unknown outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_bounds_the_wait_for_admission_as_well() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Client]);
+    let mut node = bind(&f, 0);
+    let mut one_open = limits();
+    one_open.budget.max_opens = 1;
+    let caller = bind_with(&f, 1, one_open);
+    let connection = asked_on(&f, &caller, &node).await;
+    drained(&mut node).await;
+
+    let question = encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, b"ask").unwrap();
+    let (held, (waited, elapsed), ()) = tokio::join!(
+        // The first request takes the only open slot and is answered by
+        // nobody for a while.
+        caller.request(connection, question.clone(), Duration::from_secs(4)),
+        async {
+            // Asked once the first holds the slot.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let started = std::time::Instant::now();
+            let answer = caller
+                .request(connection, question.clone(), Duration::from_millis(300))
+                .await;
+            (answer, started.elapsed())
+        },
+        async {
+            loop {
+                if let TransportEvent::ApiRequest { responder, .. } = event(&mut node).await {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    drop(responder);
+                    return;
+                }
+            }
+        }
+    );
+    let _ = held;
+    assert_eq!(waited, Err(RequestError::Send(SendError::Timeout)));
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "a 300ms request waited {elapsed:?} for admission"
+    );
+}
+
+/// A question may only be asked on a connection this side dialed, on the
+/// caller's plane.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_is_only_asked_on_a_connection_this_side_dialed() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Client]);
+    let mut node = bind(&f, 0);
+    let caller = bind(&f, 1);
+    let dialled = asked_on(&f, &caller, &node).await;
+    let accepted = match event(&mut node).await {
+        TransportEvent::Connected { connection, .. } => connection,
+        other => panic!("{other:?}"),
+    };
+
+    let question = encode_frame(KIND_SESSION_BIND, SESSION_BIND_VERSION, b"ask").unwrap();
+    assert_eq!(
+        node.request(accepted, question.clone(), Duration::from_millis(200))
+            .await,
+        Err(RequestError::NotAQuestionToAsk),
+        "a node answered questions; it does not ask them on a connection it accepted"
+    );
+    assert_eq!(
+        caller
+            .request(
+                coord_transport::ConnectionId(dialled.0 + 1000),
+                question,
+                Duration::from_millis(200)
+            )
+            .await,
+        Err(RequestError::NotConnected)
+    );
+}
+
+/// A caller's connection to a node, on the unary lane.
+async fn asked_on(
+    f: &Fixture,
+    caller: &Transport,
+    node: &Transport,
+) -> coord_transport::ConnectionId {
+    caller
+        .connect(
+            node.local_addr().unwrap(),
+            &f.ids[0].name,
+            PeerRole::Client,
+            None,
+            Lane::Unary,
+            f.ids[0].expected(),
+        )
+        .await
+        .expect("the caller connected")
+}
+
+/// Take the caller's own `Connected` event, so what follows is the
+/// exchange and not the handshake.
+async fn drained(node: &mut Transport) {
+    match event(node).await {
+        TransportEvent::Connected { .. } => {}
+        other => panic!("{other:?}"),
     }
 }
 
