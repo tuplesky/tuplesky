@@ -1,11 +1,11 @@
-//! The endpoint: TLS lifecycle, accept and connect, negotiation, stream
-//! readers and owned dispatch.
+//! The endpoint: TLS lifecycle, accept and connect, negotiation, lanes,
+//! links with fair queues and budgets, stream readers and owned dispatch.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
@@ -16,14 +16,17 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{RecvStream, SendStream, VarInt};
 use rustls::server::WebPkiClientVerifier;
 use rustls_pki_types::CertificateDer;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::time::timeout;
 
+use crate::budget::{Budget, BudgetError, Opens};
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
 use crate::frames::{
     ControlStream, FrameError, KIND_PEER_EVIDENCE, PEER_EVIDENCE_VERSION, read_frame,
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
+use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
+use crate::sched::{FairQueue, LaneStats, QueueError, Queued};
 
 /// Identity of one connection at this endpoint (never reused).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -37,7 +40,7 @@ pub enum CloseCode {
     Orderly = 0,
     /// The peer violated the framing or negotiation protocol.
     Protocol = 1,
-    /// Negotiation rejected (origin, role, version, identity).
+    /// Negotiation rejected (origin, role, lane, version, identity).
     Rejected = 2,
     /// A deadline passed.
     Timeout = 3,
@@ -61,6 +64,8 @@ pub enum CloseReason {
     },
     /// This endpoint shut down.
     Shutdown,
+    /// A newer connection took this lane's single slot.
+    Replaced,
     /// The QUIC connection failed (redacted description).
     Transport(String),
 }
@@ -73,6 +78,7 @@ impl CloseReason {
             CloseReason::Timeout => CloseCode::Timeout,
             CloseReason::PeerClosed { .. } => CloseCode::Orderly,
             CloseReason::Shutdown => CloseCode::Shutdown,
+            CloseReason::Replaced => CloseCode::Orderly,
             CloseReason::Transport(_) => CloseCode::Orderly,
         }
     }
@@ -89,6 +95,8 @@ pub enum TransportEvent {
         connection: ConnectionId,
         /// Class.
         class: Class,
+        /// Lane.
+        lane: Lane,
         /// Bound identity of the peer.
         identity: BoundIdentity,
         /// Remote address (diagnostic).
@@ -98,6 +106,8 @@ pub enum TransportEvent {
     PeerFrame {
         /// Connection.
         connection: ConnectionId,
+        /// Lane it arrived on.
+        lane: Lane,
         /// Provenance bound at negotiation.
         provenance: PeerProvenance,
         /// Frame kind.
@@ -111,6 +121,8 @@ pub enum TransportEvent {
     ApiRequest {
         /// Connection.
         connection: ConnectionId,
+        /// Lane it arrived on.
+        lane: Lane,
         /// Bound identity of the requester.
         identity: BoundIdentity,
         /// The request frame.
@@ -118,39 +130,148 @@ pub enum TransportEvent {
         /// Where the response goes.
         responder: Responder,
     },
+    /// A frame the peer delivered on an API connection this side dialed
+    /// (output addressed to this node, never a request to serve).
+    ApiDelivery {
+        /// Connection.
+        connection: ConnectionId,
+        /// Lane it arrived on.
+        lane: Lane,
+        /// Bound identity of the peer.
+        identity: BoundIdentity,
+        /// The delivered frame.
+        frame: Frame,
+    },
     /// A connection ended (after `Connected`, or instead of it).
     Closed {
         /// Connection.
         connection: ConnectionId,
+        /// Lane, when negotiation had reached one.
+        lane: Option<Lane>,
         /// Why.
         reason: CloseReason,
     },
 }
 
+impl TransportEvent {
+    /// The lane whose queue delivers the event.
+    const fn lane(&self) -> Lane {
+        match self {
+            TransportEvent::Connected { lane, .. }
+            | TransportEvent::PeerFrame { lane, .. }
+            | TransportEvent::ApiRequest { lane, .. }
+            | TransportEvent::ApiDelivery { lane, .. } => *lane,
+            TransportEvent::Closed { lane, .. } => match lane {
+                Some(l) => *l,
+                None => Lane::Control,
+            },
+        }
+    }
+}
+
 /// The response half of a unary request stream.
-#[derive(Debug)]
 pub struct Responder {
     send: SendStream,
+    lane: Lane,
+    link: Arc<Link>,
+    node: Arc<Budget>,
+    deadline: Duration,
+}
+
+impl core::fmt::Debug for Responder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Responder")
+            .field("lane", &self.lane)
+            .finish()
+    }
 }
 
 impl Responder {
     /// Write the complete response frame and finish the stream.
+    ///
+    /// A reply is traffic like any other: it is admitted under the
+    /// destination and node budgets first, and the bytes stay counted
+    /// against both until the peer acknowledges them. Writing straight to
+    /// the stream would let concurrent unary requests, or many API
+    /// connections, hand window after window to QUIC outside the caps
+    /// this lane exists to enforce.
     pub async fn respond(mut self, frame: Vec<u8>) -> Result<(), SendError> {
-        self.send
-            .write_all(&frame)
+        let bytes = frame.len();
+        for budget in [&self.link.budget, self.node.as_ref()] {
+            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(self.lane, bytes) {
+                return Err(SendError::TooLarge { bytes, limit });
+            }
+        }
+        let dest = self
+            .link
+            .budget
+            .acquire(self.lane, bytes)
             .await
-            .map_err(|e| SendError::Stream(e.to_string()))?;
-        self.send
-            .finish()
-            .map_err(|e| SendError::Stream(e.to_string()))
+            .map_err(|_| SendError::NotConnected)?;
+        let node = self
+            .node
+            .acquire(self.lane, bytes)
+            .await
+            .map_err(|_| SendError::NotConnected)?;
+        timeout(self.deadline, async {
+            self.send
+                .write_all(&frame)
+                .await
+                .map_err(|e| SendError::Stream(e.to_string()))?;
+            self.send
+                .finish()
+                .map_err(|e| SendError::Stream(e.to_string()))
+        })
+        .await
+        .map_err(|_| SendError::Timeout)??;
+        let stopped = self.send.stopped();
+        tokio::spawn(async move {
+            let _dest = dest;
+            let _node = node;
+            let _ = stopped.await;
+        });
+        Ok(())
     }
 }
 
-/// Why a send did not reach the transport.
-#[derive(Debug)]
+/// Where a frame goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination {
+    /// A replica's lane (peer roles bound with replica and incarnation).
+    Replica {
+        /// Replica.
+        replica: ReplicaId,
+        /// Incarnation.
+        incarnation: ReplicaIncarnation,
+        /// Lane.
+        lane: Lane,
+    },
+    /// A specific negotiated connection (API-class peers).
+    Connection(ConnectionId),
+}
+
+/// Why a frame was not admitted to the transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendError {
-    /// No negotiated connection to that replica and incarnation.
+    /// No negotiated connection for that destination.
     NotConnected,
+    /// The frame can never fit the lane's share of the destination budget.
+    TooLarge {
+        /// Frame bytes.
+        bytes: usize,
+        /// Bytes the lane may hold at most.
+        limit: usize,
+    },
+    /// The destination's queue for this group and lane is at its depth.
+    QueueFull {
+        /// Lane.
+        lane: Lane,
+    },
+    /// Too many groups have frames queued on this lane.
+    TooManyGroups {
+        /// Lane.
+        lane: Lane,
+    },
     /// The stream could not be opened within the deadline.
     Timeout,
     /// The stream failed (redacted description).
@@ -168,6 +289,8 @@ pub enum TransportError {
     Connect(String),
     /// Negotiation with the remote failed.
     Rejected(CloseReason),
+    /// The dialing role may not open that lane.
+    LaneNotAdmitted(Lane),
 }
 
 impl From<std::io::Error> for TransportError {
@@ -180,8 +303,92 @@ struct Peer {
     id: ConnectionId,
     conn: quinn::Connection,
     class: Class,
+    lane: Lane,
     identity: BoundIdentity,
     close_reason: Mutex<Option<CloseReason>>,
+    /// Whether this side accepted the connection. An accepted API
+    /// connection carries client requests inward; a dialed one carries
+    /// this node's output outward and receives the peer's replies.
+    accepted: bool,
+    /// Frames held between the stream and the lane's event queue. When
+    /// the consumer stalls, the readers hold their permits and no further
+    /// stream is accepted: QUIC flow control then backs the sender up
+    /// instead of this side buffering without limit.
+    readers: Arc<Semaphore>,
+}
+
+impl Peer {
+    fn new(
+        id: ConnectionId,
+        conn: quinn::Connection,
+        class: Class,
+        lane: Lane,
+        identity: BoundIdentity,
+        accepted: bool,
+        limits: &LaneLimits,
+    ) -> Arc<Peer> {
+        let readers = match class {
+            Class::Peer => limits.max_uni_streams,
+            Class::Api => limits.max_bidi_streams,
+        };
+        Arc::new(Peer {
+            id,
+            conn,
+            class,
+            lane,
+            identity,
+            close_reason: Mutex::new(None),
+            accepted,
+            readers: Arc::new(Semaphore::new(readers.max(1) as usize)),
+        })
+    }
+}
+
+/// Link key: a replica for peer roles, the connection otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LinkKey {
+    Replica(ReplicaId, ReplicaIncarnation),
+    Connection(ConnectionId),
+}
+
+struct LaneState {
+    peer: Option<Arc<Peer>>,
+    queue: FairQueue,
+    stats: LaneStats,
+}
+
+/// Everything shared by the lanes to one destination.
+struct Link {
+    budget: Budget,
+    opens: Opens,
+    lanes: [Mutex<LaneState>; 4],
+    notify: [Notify; 4],
+}
+
+impl Link {
+    fn new(limits: &Limits) -> Self {
+        let lane_state = |l: &LaneLimits| {
+            Mutex::new(LaneState {
+                peer: None,
+                queue: FairQueue::new(l.queue_depth, l.max_groups),
+                stats: LaneStats::default(),
+            })
+        };
+        Link {
+            budget: Budget::new(
+                limits.budget.destination_bytes,
+                limits.budget.control_reserve,
+            ),
+            opens: Opens::new(limits.budget.max_opens),
+            lanes: [
+                lane_state(&limits.lanes[0]),
+                lane_state(&limits.lanes[1]),
+                lane_state(&limits.lanes[2]),
+                lane_state(&limits.lanes[3]),
+            ],
+            notify: [Notify::new(), Notify::new(), Notify::new(), Notify::new()],
+        }
+    }
 }
 
 struct Shared {
@@ -190,9 +397,10 @@ struct Shared {
     capabilities: Vec<u16>,
     limits: Limits,
     binder: Arc<dyn IdentityBinder>,
-    events: mpsc::Sender<TransportEvent>,
+    events: [mpsc::Sender<TransportEvent>; 4],
     peers: Mutex<HashMap<ConnectionId, Arc<Peer>>>,
-    by_replica: Mutex<HashMap<(ReplicaId, ReplicaIncarnation), ConnectionId>>,
+    links: Mutex<HashMap<LinkKey, Arc<Link>>>,
+    node_budget: Arc<Budget>,
     next: AtomicU64,
     accept_permits: Arc<Semaphore>,
 }
@@ -204,23 +412,80 @@ impl Shared {
 
     async fn emit(&self, event: TransportEvent) {
         // A closed receiver means the runtime is gone; dropping is fine.
-        let _ = self.events.send(event).await;
+        let _ = self.events[event.lane().index()].send(event).await;
     }
 
-    fn register(&self, peer: Arc<Peer>) {
-        if let (Some(r), Some(i)) = (peer.identity.replica, peer.identity.incarnation) {
-            self.by_replica.lock().unwrap().insert((r, i), peer.id);
+    fn link_key(peer: &Peer) -> LinkKey {
+        match (peer.identity.replica, peer.identity.incarnation) {
+            (Some(r), Some(i)) => LinkKey::Replica(r, i),
+            _ => LinkKey::Connection(peer.id),
         }
-        self.peers.lock().unwrap().insert(peer.id, peer);
     }
 
-    fn deregister(&self, id: ConnectionId) {
-        if let Some(peer) = self.peers.lock().unwrap().remove(&id)
-            && let (Some(r), Some(i)) = (peer.identity.replica, peer.identity.incarnation)
+    fn link(&self, key: LinkKey) -> Arc<Link> {
+        self.links
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(Link::new(&self.limits)))
+            .clone()
+    }
+
+    /// Register a negotiated connection on its link's lane and start the
+    /// lane's sender.
+    fn register(self: &Arc<Self>, peer: Arc<Peer>) {
+        self.peers.lock().unwrap().insert(peer.id, peer.clone());
+        let link = self.link(Self::link_key(&peer));
+        let displaced = {
+            let mut state = link.lanes[peer.lane.index()].lock().unwrap();
+            state.peer.replace(peer.clone())
+        };
+        // One connection per lane: a second dial of the same lane takes
+        // the slot, and the connection it displaces is closed here.
+        // Leaving it open would keep its receive loop, streams and
+        // windows alive, so repeated dials would multiply exactly the
+        // capacity the lane bounds.
+        if let Some(old) = displaced
+            && old.id != peer.id
         {
-            let mut by = self.by_replica.lock().unwrap();
-            if by.get(&(r, i)) == Some(&id) {
-                by.remove(&(r, i));
+            *old.close_reason.lock().unwrap() = Some(CloseReason::Replaced);
+            old.conn
+                .close(VarInt::from_u32(CloseCode::Orderly as u32), b"replaced");
+        }
+        tokio::spawn(sender_loop(self.clone(), link, peer));
+    }
+
+    fn deregister(&self, peer: &Peer) {
+        self.peers.lock().unwrap().remove(&peer.id);
+        let key = Self::link_key(peer);
+        let link = self.links.lock().unwrap().get(&key).cloned();
+        if let Some(link) = link {
+            let mut state = link.lanes[peer.lane.index()].lock().unwrap();
+            if state.peer.as_ref().is_some_and(|p| p.id == peer.id) {
+                state.peer = None;
+                // Frames queued for a lane whose connection is gone are
+                // transport losses: dropped and counted, never buffered.
+                while state.queue.pop().is_some() {
+                    state.stats.refused += 1;
+                }
+                state.stats.queued = 0;
+            }
+            drop(state);
+            link.notify[peer.lane.index()].notify_one();
+            // A link whose every lane is idle holds only empty queues,
+            // semaphores and counters. Ordinary connect/disconnect churn
+            // creates a new key per API connection and per replica
+            // incarnation, so keeping them would grow without bound over
+            // the process lifetime. The map is locked first, so a
+            // registration racing this cannot insert into an entry that
+            // is about to be removed.
+            let mut links = self.links.lock().unwrap();
+            let idle = link.lanes.iter().all(|l| {
+                let state = l.lock().unwrap();
+                state.peer.is_none() && state.queue.is_empty()
+            });
+            if idle && links.get(&key).is_some_and(|held| Arc::ptr_eq(held, &link)) {
+                links.remove(&key);
             }
         }
     }
@@ -230,9 +495,9 @@ impl Shared {
 pub struct Transport {
     endpoint: quinn::Endpoint,
     shared: Arc<Shared>,
-    events: mpsc::Receiver<TransportEvent>,
-    client_api: quinn::ClientConfig,
-    client_peer: quinn::ClientConfig,
+    events: [mpsc::Receiver<TransportEvent>; 4],
+    client_tls: [Arc<QuicClientConfig>; 2],
+    lane_transport: [Arc<quinn::TransportConfig>; 4],
 }
 
 fn tls_err(e: impl std::fmt::Display) -> TransportError {
@@ -263,24 +528,32 @@ impl Transport {
         server.max_early_data_size = TlsProfile::FIXED.max_early_data_size;
         let quic_server = QuicServerConfig::try_from(server).map_err(tls_err)?;
 
-        let mut transport = quinn::TransportConfig::default();
-        transport
-            .max_concurrent_uni_streams(VarInt::from_u32(limits.max_uni_streams))
-            .max_concurrent_bidi_streams(VarInt::from_u32(limits.max_bidi_streams))
-            .max_idle_timeout(Some(
-                quinn::IdleTimeout::try_from(limits.idle_timeout).map_err(tls_err)?,
-            ))
-            .keep_alive_interval(Some(limits.keep_alive))
-            .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
-        let transport = Arc::new(transport);
-
+        let lane_config = |i: usize| {
+            lane::transport_config(&limits.lanes[i], limits.idle_timeout, limits.keep_alive)
+                .map_err(TransportError::Tls)
+        };
+        let lane_transport: [Arc<quinn::TransportConfig>; 4] = [
+            lane_config(0)?,
+            lane_config(1)?,
+            lane_config(2)?,
+            lane_config(3)?,
+        ];
+        // Accepted connections start with the floor of every lane's
+        // limits (credit can only be raised once advertised); the lane
+        // declared in `Hello` raises them to its own.
+        let floor = lane::transport_config(
+            &LaneLimits::floor(&limits.lanes),
+            limits.idle_timeout,
+            limits.keep_alive,
+        )
+        .map_err(TransportError::Tls)?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
         server_config
-            .transport_config(transport.clone())
+            .transport_config(floor)
             .migration(TlsProfile::FIXED.server_migration)
             .max_incoming(limits.max_connections);
 
-        let client_for = |alpn: &[u8]| -> Result<quinn::ClientConfig, TransportError> {
+        let client_for = |alpn: &[u8]| -> Result<Arc<QuicClientConfig>, TransportError> {
             let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])
                 .map_err(tls_err)?
@@ -289,26 +562,35 @@ impl Transport {
                 .map_err(tls_err)?;
             client.alpn_protocols = vec![alpn.to_vec()];
             client.enable_early_data = TlsProfile::FIXED.client_early_data;
-            let quic_client = QuicClientConfig::try_from(client).map_err(tls_err)?;
-            let mut config = quinn::ClientConfig::new(Arc::new(quic_client));
-            config.transport_config(transport.clone());
-            Ok(config)
+            Ok(Arc::new(
+                QuicClientConfig::try_from(client).map_err(tls_err)?,
+            ))
         };
-        let client_api = client_for(ALPN_API)?;
-        let client_peer = client_for(ALPN_PEER)?;
+        let client_tls = [client_for(ALPN_API)?, client_for(ALPN_PEER)?];
 
         let mut endpoint = quinn::Endpoint::server(server_config, addr)?;
-        endpoint.set_default_client_config(client_peer.clone());
-        let (tx, rx) = mpsc::channel(limits.event_queue.max(1));
+        let mut default_client = quinn::ClientConfig::new(client_tls[1].clone());
+        default_client.transport_config(lane_transport[Lane::Control.index()].clone());
+        endpoint.set_default_client_config(default_client);
+
+        let depth = limits.event_queue.max(1);
+        let (tx0, rx0) = mpsc::channel(depth);
+        let (tx1, rx1) = mpsc::channel(depth);
+        let (tx2, rx2) = mpsc::channel(depth);
+        let (tx3, rx3) = mpsc::channel(depth);
         let shared = Arc::new(Shared {
             cluster: local.cluster,
             domain: local.domain,
             capabilities: local.capabilities,
             limits,
             binder,
-            events: tx,
+            events: [tx0, tx1, tx2, tx3],
             peers: Mutex::new(HashMap::new()),
-            by_replica: Mutex::new(HashMap::new()),
+            links: Mutex::new(HashMap::new()),
+            node_budget: Arc::new(Budget::new(
+                limits.budget.node_bytes,
+                limits.budget.control_reserve,
+            )),
             next: AtomicU64::new(1),
             accept_permits: Arc::new(Semaphore::new(limits.max_connections.max(1))),
         });
@@ -316,9 +598,9 @@ impl Transport {
         Ok(Transport {
             endpoint,
             shared,
-            events: rx,
-            client_api,
-            client_peer,
+            events: [rx0, rx1, rx2, rx3],
+            client_tls,
+            lane_transport,
         })
     }
 
@@ -337,27 +619,46 @@ impl Transport {
         self.shared.peers.lock().unwrap().len()
     }
 
-    /// The next owned event; `None` once the endpoint is gone.
+    /// The next owned event, lanes in priority order (control first);
+    /// `None` once the endpoint is gone.
     pub async fn next_event(&mut self) -> Option<TransportEvent> {
-        self.events.recv().await
+        let [c, u, w, b] = &mut self.events;
+        tokio::select! {
+            biased;
+            e = c.recv() => e,
+            e = u.recv() => e,
+            e = w.recv() => e,
+            e = b.recv() => e,
+        }
     }
 
-    /// Open a connection to `addr` as `local_role`, expecting the remote
-    /// to be `expected` (its certificate is bound to that identity before
-    /// anything is sent). The connection is registered on `HelloAck`.
+    /// The next event of one lane only; other lanes are left untouched.
+    pub async fn next_event_in(&mut self, lane: Lane) -> Option<TransportEvent> {
+        self.events[lane.index()].recv().await
+    }
+
+    /// Open a `lane` connection to `addr` as `local_role`, expecting the
+    /// remote to be `expected` (its certificate is bound to that identity
+    /// before anything is sent). Registered on `HelloAck`.
     pub async fn connect(
         &self,
         addr: SocketAddr,
         server_name: &str,
         local_role: PeerRole,
         local_incarnation: Option<ReplicaIncarnation>,
+        lane: Lane,
         expected: BoundIdentity,
     ) -> Result<ConnectionId, TransportError> {
+        if !role_lanes(local_role).contains(&lane) {
+            return Err(TransportError::LaneNotAdmitted(lane));
+        }
         let class = role_class(local_role);
-        let config = match class {
-            Class::Api => self.client_api.clone(),
-            Class::Peer => self.client_peer.clone(),
+        let tls = match class {
+            Class::Api => self.client_tls[0].clone(),
+            Class::Peer => self.client_tls[1].clone(),
         };
+        let mut config = quinn::ClientConfig::new(tls);
+        config.transport_config(self.lane_transport[lane.index()].clone());
         let connecting = self
             .endpoint
             .connect_with(config, addr, server_name)
@@ -370,22 +671,25 @@ impl Transport {
         };
         let id = self.shared.next_id();
         match self
-            .negotiate_outgoing(&conn, local_role, local_incarnation, &expected)
+            .negotiate_outgoing(&conn, local_role, local_incarnation, lane, &expected)
             .await
         {
             Ok((identity, control_recv)) => {
-                let peer = Arc::new(Peer {
+                let peer = Peer::new(
                     id,
-                    conn: conn.clone(),
+                    conn.clone(),
                     class,
-                    identity: identity.clone(),
-                    close_reason: Mutex::new(None),
-                });
+                    lane,
+                    identity.clone(),
+                    false,
+                    &self.shared.limits.lanes[lane.index()],
+                );
                 self.shared.register(peer.clone());
                 self.shared
                     .emit(TransportEvent::Connected {
                         connection: id,
                         class,
+                        lane,
                         identity,
                         remote: conn.remote_address(),
                     })
@@ -405,6 +709,7 @@ impl Transport {
         conn: &quinn::Connection,
         local_role: PeerRole,
         local_incarnation: Option<ReplicaIncarnation>,
+        lane: Lane,
         expected: &BoundIdentity,
     ) -> Result<(BoundIdentity, ControlStream), CloseReason> {
         let shared = &self.shared;
@@ -431,12 +736,16 @@ impl Transport {
             .await
             .map_err(|_| CloseReason::Timeout)?
             .map_err(|e| CloseReason::Transport(e.to_string()))?;
+        let mut capabilities = shared.capabilities.clone();
+        capabilities.push(lane.capability());
+        capabilities.sort_unstable();
+        capabilities.dedup();
         let hello = MessageV1::Hello(HelloV1 {
             role: local_role,
             cluster_id: shared.cluster,
             domain_id: shared.domain,
             incarnation: local_incarnation,
-            capabilities: BoundedVec::new(shared.capabilities.clone())
+            capabilities: BoundedVec::new(capabilities)
                 .map_err(|_| CloseReason::Rejected("caps".into()))?,
         })
         .encode()
@@ -450,63 +759,164 @@ impl Transport {
             .await
             .map_err(frame_reason)?;
         match decode(&frame) {
-            Ok(MessageV1::HelloAck(ack)) => Ok((
-                BoundIdentity {
-                    role: bound.role,
-                    replica: bound.replica,
-                    incarnation: bound.incarnation,
-                    capabilities: ack.capabilities.as_slice().to_vec(),
-                },
-                control,
-            )),
+            Ok(MessageV1::HelloAck(ack)) => {
+                tokio::spawn(park_control(send, conn.clone()));
+                Ok((
+                    BoundIdentity {
+                        role: bound.role,
+                        replica: bound.replica,
+                        incarnation: bound.incarnation,
+                        capabilities: ack.capabilities.as_slice().to_vec(),
+                    },
+                    control,
+                ))
+            }
             Ok(MessageV1::Close(c)) => Err(CloseReason::PeerClosed { code: c.code }),
             Ok(_) => Err(CloseReason::Malformed("expected hello ack".into())),
             Err(e) => Err(CloseReason::Malformed(format!("{e:?}"))),
         }
     }
 
-    /// Send one complete frame to a negotiated peer on a fresh
-    /// unidirectional stream. Success means the frame was handed to the
-    /// transport, nothing more.
-    pub async fn send_peer(
+    /// Queue one complete frame for `to` in `group`. Success means the
+    /// frame was admitted to the lane's fair queue under the destination
+    /// and node budgets; it is handed to QUIC by the lane's sender and
+    /// that is all a success ever means.
+    pub fn send(&self, to: Destination, group: DomainId, frame: Vec<u8>) -> Result<(), SendError> {
+        let (key, lane) = match to {
+            Destination::Replica {
+                replica,
+                incarnation,
+                lane,
+            } => (LinkKey::Replica(replica, incarnation), lane),
+            Destination::Connection(id) => {
+                let peer = self
+                    .shared
+                    .peers
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .cloned()
+                    .ok_or(SendError::NotConnected)?;
+                (Shared::link_key(&peer), peer.lane)
+            }
+        };
+        let link = self
+            .shared
+            .links
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or(SendError::NotConnected)?;
+        let bytes = frame.len();
+        for budget in [&link.budget, self.shared.node_budget.as_ref()] {
+            if let Err(BudgetError::TooLarge { bytes, limit }) = budget.check(lane, bytes) {
+                return Err(SendError::TooLarge { bytes, limit });
+            }
+        }
+        let mut state = link.lanes[lane.index()].lock().unwrap();
+        if state.peer.is_none() {
+            return Err(SendError::NotConnected);
+        }
+        let result = state.queue.push(Queued {
+            group,
+            frame,
+            enqueued: Instant::now(),
+        });
+        match result {
+            Ok(()) => {
+                state.stats.queued = state.queue.len();
+                drop(state);
+                link.notify[lane.index()].notify_one();
+                Ok(())
+            }
+            Err(QueueError::GroupFull) => {
+                state.stats.refused += 1;
+                Err(SendError::QueueFull { lane })
+            }
+            Err(QueueError::TooManyGroups) => {
+                state.stats.refused += 1;
+                Err(SendError::TooManyGroups { lane })
+            }
+        }
+    }
+
+    /// Queue the same frame for several replicas on one lane. Each
+    /// destination is admitted independently under its own budget and
+    /// queue; one saturated destination never blocks the others.
+    pub fn fan_out(
+        &self,
+        replicas: &[(ReplicaId, ReplicaIncarnation)],
+        lane: Lane,
+        group: DomainId,
+        frame: &[u8],
+    ) -> Vec<Result<(), SendError>> {
+        replicas
+            .iter()
+            .map(|(replica, incarnation)| {
+                self.send(
+                    Destination::Replica {
+                        replica: *replica,
+                        incarnation: *incarnation,
+                        lane,
+                    },
+                    group,
+                    frame.to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Accounting of one lane of a replica link, with the path RTT.
+    pub fn stats(
         &self,
         replica: ReplicaId,
         incarnation: ReplicaIncarnation,
-        frame: Vec<u8>,
-    ) -> Result<(), SendError> {
-        let id = self
+        lane: Lane,
+    ) -> Option<LaneStats> {
+        let link = self
             .shared
-            .by_replica
+            .links
             .lock()
             .unwrap()
-            .get(&(replica, incarnation))
-            .copied()
-            .ok_or(SendError::NotConnected)?;
-        let peer = self
+            .get(&LinkKey::Replica(replica, incarnation))
+            .cloned()?;
+        let state = link.lanes[lane.index()].lock().unwrap();
+        let mut stats = state.stats;
+        stats.queued = state.queue.len();
+        stats.rtt = state.peer.as_ref().map_or(Duration::ZERO, |p| p.conn.rtt());
+        Some(stats)
+    }
+
+    /// Bytes in flight to a replica now, and the most ever.
+    pub fn budget_of(
+        &self,
+        replica: ReplicaId,
+        incarnation: ReplicaIncarnation,
+    ) -> Option<(usize, usize)> {
+        let link = self
             .shared
-            .peers
+            .links
             .lock()
             .unwrap()
-            .get(&id)
-            .cloned()
-            .ok_or(SendError::NotConnected)?;
-        // The deadline covers the whole frame, not only the open: a peer
-        // that stops granting flow-control credit completes the open and
-        // then leaves the write pending forever, which would hang a
-        // consensus sender despite the documented bound.
-        timeout(self.shared.limits.frame_timeout, async {
-            let mut send = peer
-                .conn
-                .open_uni()
-                .await
-                .map_err(|e| SendError::Stream(e.to_string()))?;
-            send.write_all(&frame)
-                .await
-                .map_err(|e| SendError::Stream(e.to_string()))?;
-            send.finish().map_err(|e| SendError::Stream(e.to_string()))
-        })
-        .await
-        .map_err(|_| SendError::Timeout)?
+            .get(&LinkKey::Replica(replica, incarnation))
+            .cloned()?;
+        Some((link.budget.in_flight(), link.budget.peak()))
+    }
+
+    /// Destination links currently held (one per replica link or API
+    /// connection with an active lane). Diagnostic: an idle link is
+    /// removed, so this does not grow with connection churn.
+    pub fn links(&self) -> usize {
+        self.shared.links.lock().unwrap().len()
+    }
+
+    /// Bytes in flight across every destination now, and the most ever.
+    pub fn node_budget(&self) -> (usize, usize) {
+        (
+            self.shared.node_budget.in_flight(),
+            self.shared.node_budget.peak(),
+        )
     }
 
     /// Close every connection and wait at most `deadline` for the
@@ -515,6 +925,89 @@ impl Transport {
         self.endpoint
             .close(VarInt::from_u32(CloseCode::Shutdown as u32), b"shutdown");
         timeout(deadline, self.endpoint.wait_idle()).await.is_ok()
+    }
+}
+
+/// One lane's sender: fair across groups, bounded by the destination and
+/// node budgets and the open limit, measuring queue and credit waits.
+async fn sender_loop(shared: Arc<Shared>, link: Arc<Link>, peer: Arc<Peer>) {
+    let lane = peer.lane;
+    let idx = lane.index();
+    loop {
+        let next = {
+            let mut state = link.lanes[idx].lock().unwrap();
+            if state.peer.as_ref().is_none_or(|p| p.id != peer.id) {
+                return;
+            }
+            let next = state.queue.pop();
+            state.stats.queued = state.queue.len();
+            if let Some(q) = &next {
+                state.stats.queue_wait.record(q.enqueued.elapsed());
+            }
+            next
+        };
+        let Some(queued) = next else {
+            link.notify[idx].notified().await;
+            continue;
+        };
+        let picked = Instant::now();
+        let bytes = queued.frame.len();
+        let Ok(dest_permit) = link.budget.acquire(lane, bytes).await else {
+            continue;
+        };
+        let Ok(node_permit) = shared.node_budget.acquire(lane, bytes).await else {
+            continue;
+        };
+        let open_permit = link.opens.acquire().await;
+        // An API lane advertises no unidirectional streams and its peer
+        // consumes bidirectional ones, so opening a uni stream there
+        // would wait for credit that never comes and lose the frame.
+        // Each class opens what its lane carries.
+        let opened = timeout(shared.limits.frame_timeout, async {
+            match peer.class {
+                Class::Peer => peer.conn.open_uni().await,
+                Class::Api => peer.conn.open_bi().await.map(|(send, _recv)| send),
+            }
+        })
+        .await;
+        let mut send = match opened {
+            Ok(Ok(s)) => s,
+            _ => {
+                // The connection is gone or credit never came: a transport
+                // loss, counted, never buffered.
+                let mut state = link.lanes[idx].lock().unwrap();
+                state.stats.refused += 1;
+                continue;
+            }
+        };
+        {
+            let mut state = link.lanes[idx].lock().unwrap();
+            state.stats.credit_wait.record(picked.elapsed());
+            state.stats.frames += 1;
+            state.stats.bytes += bytes as u64;
+        }
+        // The deadline covers the write and the finish too. A peer that
+        // completes the open and then grants no more flow-control credit
+        // would otherwise leave the write pending forever and stall this
+        // lane's sender behind it.
+        let written = timeout(shared.limits.frame_timeout, async {
+            send.write_all(&queued.frame).await.is_ok() && send.finish().is_ok()
+        })
+        .await;
+        if written != Ok(true) {
+            let mut state = link.lanes[idx].lock().unwrap();
+            state.stats.refused += 1;
+            continue;
+        }
+        // The bytes stay counted against both budgets until the peer
+        // acknowledges them or the stream ends otherwise.
+        let stopped = send.stopped();
+        tokio::spawn(async move {
+            let _dest = dest_permit;
+            let _node = node_permit;
+            let _open = open_permit;
+            let _ = stopped.await;
+        });
     }
 }
 
@@ -583,6 +1076,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
             shared
                 .emit(TransportEvent::Closed {
                     connection: id,
+                    lane: None,
                     reason: CloseReason::Transport(e.to_string()),
                 })
                 .await;
@@ -592,6 +1086,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
             shared
                 .emit(TransportEvent::Closed {
                     connection: id,
+                    lane: None,
                     reason: CloseReason::Timeout,
                 })
                 .await;
@@ -599,19 +1094,22 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
         }
     };
     match negotiate_incoming(&shared, &conn).await {
-        Ok((class, identity, control_recv)) => {
-            let peer = Arc::new(Peer {
+        Ok((class, lane, identity, control_recv)) => {
+            let peer = Peer::new(
                 id,
-                conn: conn.clone(),
+                conn.clone(),
                 class,
-                identity: identity.clone(),
-                close_reason: Mutex::new(None),
-            });
+                lane,
+                identity.clone(),
+                true,
+                &shared.limits.lanes[lane.index()],
+            );
             shared.register(peer.clone());
             shared
                 .emit(TransportEvent::Connected {
                     connection: id,
                     class,
+                    lane,
                     identity,
                     remote: conn.remote_address(),
                 })
@@ -624,6 +1122,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
             shared
                 .emit(TransportEvent::Closed {
                     connection: id,
+                    lane: None,
                     reason,
                 })
                 .await;
@@ -631,7 +1130,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
     }
 }
 
-type Negotiated = (Class, BoundIdentity, ControlStream);
+type Negotiated = (Class, Lane, BoundIdentity, ControlStream);
 
 async fn negotiate_incoming(
     shared: &Shared,
@@ -671,17 +1170,24 @@ async fn negotiate_incoming(
     if class == Class::Peer && hello.incarnation.is_none() {
         return Err((CloseReason::Rejected("incarnation".into()), Some(send)));
     }
+    let lane = match lane_of_hello(&hello) {
+        Ok(l) => l,
+        Err(e) => return Err((CloseReason::Rejected(format!("lane {e:?}")), Some(send))),
+    };
     let bound = match shared.binder.bind(&certs, &hello) {
         Ok(b) => b,
         Err(e) => return Err((CloseReason::Rejected(format!("{e:?}")), Some(send))),
     };
-    let granted: Vec<u16> = hello
+    let mut granted: Vec<u16> = hello
         .capabilities
         .as_slice()
         .iter()
         .copied()
         .filter(|c| shared.capabilities.contains(c))
         .collect();
+    granted.push(lane.capability());
+    granted.sort_unstable();
+    granted.dedup();
     let ack = match BoundedVec::new(granted.clone()).map(|capabilities| {
         MessageV1::HelloAck(HelloAckV1 {
             capabilities,
@@ -692,6 +1198,8 @@ async fn negotiate_incoming(
         Ok(Ok(bytes)) => bytes,
         _ => return Err((CloseReason::Malformed("hello ack".into()), Some(send))),
     };
+    // The lane's stream limits and window apply from here on.
+    lane::apply_to_connection(conn, &shared.limits.lanes[lane.index()]);
     if let Err(e) = send.write_all(&ack).await {
         return Err((CloseReason::Transport(e.to_string()), None));
     }
@@ -700,6 +1208,7 @@ async fn negotiate_incoming(
     tokio::spawn(park_control(send, conn.clone()));
     Ok((
         class,
+        lane,
         BoundIdentity {
             role: bound.role,
             replica: bound.replica,
@@ -720,16 +1229,38 @@ async fn park_control(send: SendStream, conn: quinn::Connection) {
 async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
     tokio::spawn(watch_control(peer.clone(), control));
     let reason = loop {
+        // A reader permit is taken before the stream is accepted, so a
+        // stalled consumer stops acceptance rather than growing a backlog.
+        let permit = peer
+            .readers
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("reader semaphore never closes");
         match peer.class {
             Class::Peer => match peer.conn.accept_uni().await {
                 Ok(recv) => {
-                    tokio::spawn(read_uni(shared.clone(), peer.clone(), recv));
+                    tokio::spawn(read_uni(shared.clone(), peer.clone(), recv, permit));
                 }
                 Err(e) => break e,
             },
-            Class::Api => match peer.conn.accept_bi().await {
+            Class::Api if peer.accepted => match peer.conn.accept_bi().await {
                 Ok((send, recv)) => {
-                    tokio::spawn(read_request(shared.clone(), peer.clone(), send, recv));
+                    tokio::spawn(read_request(
+                        shared.clone(),
+                        peer.clone(),
+                        send,
+                        recv,
+                        permit,
+                    ));
+                }
+                Err(e) => break e,
+            },
+            // This side dialed: streams the peer opens carry its output
+            // to us, never requests of ours to serve.
+            Class::Api => match peer.conn.accept_bi().await {
+                Ok((_send, recv)) => {
+                    tokio::spawn(read_delivery(shared.clone(), peer.clone(), recv, permit));
                 }
                 Err(e) => break e,
             },
@@ -743,10 +1274,11 @@ async fn serve(shared: Arc<Shared>, peer: Arc<Peer>, control: ControlStream) {
         },
         other => CloseReason::Transport(other.to_string()),
     });
-    shared.deregister(peer.id);
+    shared.deregister(&peer);
     shared
         .emit(TransportEvent::Closed {
             connection: peer.id,
+            lane: Some(peer.lane),
             reason,
         })
         .await;
@@ -784,7 +1316,13 @@ async fn watch_control(peer: Arc<Peer>, mut control: ControlStream) {
     }
 }
 
-async fn read_uni(shared: Arc<Shared>, peer: Arc<Peer>, mut recv: RecvStream) {
+async fn read_uni(
+    shared: Arc<Shared>,
+    peer: Arc<Peer>,
+    mut recv: RecvStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _held = permit;
     match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
         Ok(frame) => {
             // The frame reader checks lengths and class limits, not what
@@ -809,6 +1347,7 @@ async fn read_uni(shared: Arc<Shared>, peer: Arc<Peer>, mut recv: RecvStream) {
             shared
                 .emit(TransportEvent::PeerFrame {
                     connection: peer.id,
+                    lane: peer.lane,
                     provenance: PeerProvenance::from_transport(replica, incarnation, peer.id.0),
                     kind: frame.kind,
                     version: frame.version,
@@ -837,12 +1376,43 @@ const fn client_request(message: &MessageV1) -> bool {
     )
 }
 
+/// Read one frame the peer delivered on an API connection this side
+/// dialed, and hand it to the runtime as it arrived.
+async fn read_delivery(
+    shared: Arc<Shared>,
+    peer: Arc<Peer>,
+    mut recv: RecvStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _held = permit;
+    match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
+        Ok(frame) => {
+            shared
+                .emit(TransportEvent::ApiDelivery {
+                    connection: peer.id,
+                    lane: peer.lane,
+                    identity: peer.identity.clone(),
+                    frame,
+                })
+                .await;
+        }
+        Err(FrameError::Stream(_)) => {}
+        Err(e) => {
+            let reason = frame_reason(e);
+            *peer.close_reason.lock().unwrap() = Some(reason.clone());
+            peer.conn.close(VarInt::from_u32(reason.code() as u32), b"");
+        }
+    }
+}
+
 async fn read_request(
     shared: Arc<Shared>,
     peer: Arc<Peer>,
     send: SendStream,
     mut recv: RecvStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let _held = permit;
     match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
         Ok(frame) => {
             // Decode here, at the boundary, and accept only what a client
@@ -866,9 +1436,16 @@ async fn read_request(
             shared
                 .emit(TransportEvent::ApiRequest {
                     connection: peer.id,
+                    lane: peer.lane,
                     identity: peer.identity.clone(),
                     frame,
-                    responder: Responder { send },
+                    responder: Responder {
+                        send,
+                        lane: peer.lane,
+                        link: shared.link(Shared::link_key(&peer)),
+                        node: shared.node_budget.clone(),
+                        deadline: shared.limits.frame_timeout,
+                    },
                 })
                 .await;
         }
