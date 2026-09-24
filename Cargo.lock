@@ -422,6 +422,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-session"
+version = "0.1.0"
+dependencies = [
+ "coord-authn",
+ "coord-collector",
+ "coord-consensus",
+ "coord-core",
+ "coord-state",
+ "coord-storage",
+ "coord-store-api",
+ "coord-store-testkit",
+ "coord-sts",
+ "coord-types",
+ "postcard",
+ "rcgen",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "coord-sim"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,30 @@
+[package]
+name = "coord-session"
+description = "API session binding and output authorization: token-bound warm connections with rebind and expiry, ordered revocation and fresh permission barriers for reads, retries and each selected watch batch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+role = "production"
+
+[dependencies]
+coord-types.workspace = true
+coord-state.workspace = true
+coord-storage.workspace = true
+coord-store-api.workspace = true
+coord-collector.workspace = true
+coord-authn.workspace = true
+coord-sts.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+coord-core.workspace = true
+coord-consensus.workspace = true
+coord-store-testkit.workspace = true
+rcgen.workspace = true
