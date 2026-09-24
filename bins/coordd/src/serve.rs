@@ -129,6 +129,14 @@ pub struct Counts {
     /// Destinations there was no route to. Not a failure of the
     /// submission: only the quorum rule decides that.
     pub unavailable: u64,
+    /// Destinations an envelope could not reach as it stood. Permanent
+    /// for that frame, so it is not repeated on the congestion
+    /// schedule.
+    pub undeliverable: u64,
+    /// Offers of a submission this node made again, to destinations
+    /// that had not taken it. Not second submissions: the same
+    /// envelope, the same command identity.
+    pub reoffered: u64,
     /// Submissions this node's own voter refused at its door.
     pub refused: u64,
     /// Results the collector released to a waiting caller.
@@ -208,6 +216,21 @@ impl Frontend {
             quorum,
             max_pending: config.limits.max_outstanding_per_session,
             max_resolved: config.limits.max_outstanding_per_session,
+            // Derived from the two bounds that already govern this
+            // domain rather than given a number of its own: what the
+            // collector may owe at once is at most one whole submission
+            // envelope for each command it may hold pending -- the
+            // request, and the admission facts, request fields and
+            // frame header the envelope carries around it
+            // (`SUBMIT_ENVELOPE_ALLOWANCE`). The request alone is not
+            // what is held, and budgeting only it refused a legal
+            // request near the limit when one command may be pending. A
+            // separate setting here could be raised past either bound
+            // and would stop meaning anything.
+            max_undelivered_bytes: coord_collector::undelivered_budget(
+                config.limits.max_outstanding_per_session,
+                config.limits.max_request_bytes,
+            ),
         });
         let admission = Admission::new(
             membership.cluster(),
@@ -703,6 +726,14 @@ pub struct Domain<P: Persistence> {
     no_plane_said: bool,
     /// Refusals this node keeps saying, so that it says them less.
     recurring: Recurring,
+    /// When this domain's loop started, as the base of the monotonic
+    /// milliseconds the collector schedules re-offers against.
+    ///
+    /// Not the wall clock the deadline path uses. A retry schedule on a
+    /// clock that can step is a schedule that can stall or stampede,
+    /// and a node whose time source is corrected must not answer that
+    /// by re-offering everything at once.
+    started: std::time::Instant,
     /// Peer events taken since the last caller's event, so the peer
     /// plane's priority cannot become the caller plane's starvation.
     peer_streak: u32,
@@ -756,17 +787,42 @@ pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
 /// a collector's repeat, or a retry -- has the voter publish it again.
 /// The hold exists so that the ordinary race, won in microseconds, is
 /// served from here rather than from that repair, and so that a loaded
-/// voter holds a second's evidence rather than a whole depth of it.
-const PARKED_HOLD: core::time::Duration = core::time::Duration::from_secs(1);
+/// voter holds a window's evidence rather than a whole depth of it.
+///
+/// The window is sized against the collector's repeat schedule. A
+/// submission a destination's lane could not queue is offered again by
+/// the collector that owns it, on a schedule that backs off to
+/// [`coord_collector::OFFER_CEILING_MILLIS`] between repeats; a hold
+/// that spans that schedule serves the repeat from here, and a hold
+/// shorter than it serves the repeat from the voter's repair -- correct
+/// either way, but the repair is bounded per command and per boot, and
+/// spending it on the ordinary case is spending it on the wrong one.
+/// Twice the ceiling is what the schedule actually needs: the first
+/// repeat goes at the floor and the wait doubles from there, so two
+/// ceilings covers six consecutive refusals of the same destination
+/// before the wait is at the ceiling at all. Sizing it for the ceiling
+/// *itself* would be sizing the common case for the rare one -- the
+/// hold's volume is the ordinary race, which resolves in microseconds,
+/// and every millisecond of window costs a domain's whole offered rate
+/// in entries.
+const PARKED_HOLD: core::time::Duration =
+    core::time::Duration::from_millis(coord_collector::OFFER_CEILING_MILLIS * 2);
 
 /// How much evidence a node holds for want of a submitter.
+///
+/// The ceiling on what the window above can cost. The two are one
+/// bound, not two: a node holds roughly its offered rate times the
+/// window, so a window that grows and a depth that does not is a depth
+/// that starts being reached. This covers a couple of seconds of a
+/// domain running at hundreds of commands a second, in frames that are
+/// one vote each.
 ///
 /// With the hold above this is a ceiling rather than the working bound:
 /// what is normally in here is one second's worth of a race that is won
 /// in microseconds. Reaching it is a signal in its own right, counted
 /// and said apart from the hold expiring. Like the hold, what it drops
 /// is recoverable the same way (task-c02).
-const PARKED_EVIDENCE: usize = 256;
+const PARKED_EVIDENCE: usize = 1024;
 
 /// Held evidence is due to be let go when the oldest of it has waited
 /// the whole hold.
@@ -799,9 +855,9 @@ const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// a quiet domain -- would wait for unrelated traffic to be noticed. The
 /// loop instead sleeps until the earliest deadline any component
 /// registers ([`Domain::next_deadline`]) and gives the voter a turn when
-/// it passes. Lease expiry and the expiry of held evidence register
-/// here; the collector's re-offers are meant to register in the same way
-/// rather than add arms of their own to the loop.
+/// it passes. Lease expiry, the expiry of held evidence and the
+/// collector's re-offers all register here rather than adding arms of
+/// their own to the loop.
 pub trait Deadline {
     /// The earliest instant this component has work due, if it has any.
     ///
@@ -816,6 +872,31 @@ pub trait Deadline {
 /// is not reached this turn is reached on a later one, because the turns
 /// rotate through the list rather than each starting at its head.
 const SETTLE_PER_TURN: usize = 16;
+
+/// The collector's re-offer schedule, on this domain's clock.
+///
+/// The collector decides when a destination that could not take a
+/// submission is due again, and `Domain::reoffer` makes the offers that
+/// are due on every pass of the loop. What was missing is the pass: a
+/// rejected fan-out is usually recorded before the retry floor has
+/// elapsed, so that pass finds nothing due, and a domain with no other
+/// traffic -- a frontend-only one above all -- then waited on its
+/// sockets and never re-offered, which is the caller retry the collector
+/// exists to make unnecessary. Registered here, the loop wakes when the
+/// next re-offer falls due, and the offer it makes moves the schedule on.
+struct Reoffers<'a> {
+    dispatcher: &'a Dispatcher,
+    /// The instant the collector's millisecond clock counts from.
+    started: std::time::Instant,
+}
+
+impl Deadline for Reoffers<'_> {
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        self.dispatcher
+            .next_due()
+            .map(|at| self.started + std::time::Duration::from_millis(at))
+    }
+}
 
 /// How many times a recurring condition is said in full before it is
 /// said only at each doubling.
@@ -876,6 +957,14 @@ impl Recurring {
 /// that stays full, which is a peer too far behind to take what this
 /// node has for it.
 const UNDELIVERABLE_SAID_AT: u64 = 64;
+
+/// Destinations one turn will re-offer a submission to.
+///
+/// A repeat is delivery work, and delivery work must never be able to
+/// crowd out the work it exists to enable. This is the whole of what a
+/// turn spends on it; what is still owed after that is owed on the next
+/// turn, on the collector's schedule.
+const OFFERS_PER_TURN: usize = 16;
 
 /// How many peer events in a row are taken before the caller's plane is
 /// polled first for one turn.
@@ -995,6 +1084,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
+            started: std::time::Instant::now(),
             peer_streak: 0,
             budgets,
             recorder,
@@ -1175,6 +1265,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             self.pump_watches(&ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS))
                 .await;
             self.settle_from_records();
+            // A submission a destination could not take is offered
+            // again here, on the collector's schedule and within a
+            // per-turn budget. It goes after the voter's own turn and
+            // before the loop waits. No socket wakes this loop on a
+            // re-offer's behalf, and a domain that has gone quiet is
+            // exactly when the destination that was busy is free again,
+            // so the collector's next due re-offer is registered as a
+            // deadline (`Reoffers`) and the loop wakes for it.
+            self.reoffer(transport);
             // Two planes and one voter. The peer plane is polled first:
             // a vote, an adoption or a recovery summary from a peer is
             // the work that lets a caller's request finish, and a
@@ -1276,7 +1375,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Expiry counts only where this replica leads, because only then
     /// does a turn run it; a follower's driver has nothing due. Held
     /// evidence counts on any voter, since every voter's turn applies
-    /// the hold. Further components are folded into the same minimum.
+    /// the hold. The collector's re-offers count on every domain, a
+    /// frontend-only one included, since every pass of the loop makes
+    /// the re-offers that are due. Further components are folded into
+    /// the same minimum.
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         let (expiry, parked) = match &self.backing {
             Backing::Voting(voter) => (
@@ -1288,7 +1390,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             ),
             Backing::Serving(_) => (None, None),
         };
-        [expiry, parked].into_iter().flatten().min()
+        let reoffer = Reoffers {
+            dispatcher: self.frontend.frontend.dispatcher(),
+            started: self.started,
+        }
+        .next_deadline();
+        [expiry, parked, reoffer].into_iter().flatten().min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases
@@ -1651,6 +1758,73 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
+    /// Monotonic milliseconds since this domain's loop started.
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record one offer's outcome with the collector, and count it.
+    ///
+    /// Every offer goes through here, the first and every repeat, so
+    /// the delivery state the collector re-offers from is the state
+    /// this process actually produced rather than a plan it was
+    /// assumed to have carried out.
+    fn record_offer(&mut self, command: CommandId, out: &fanout::Dispatched) {
+        let counts = &mut self.frontend.counts;
+        counts.queued_local += out.queued_local() as u64;
+        counts.queued_remote += out.queued_remote() as u64;
+        counts.not_a_voter += out.not_a_committed_voter() as u64;
+        counts.saturated += out.saturated() as u64;
+        counts.unavailable += out.unavailable() as u64;
+        counts.undeliverable += out.undeliverable() as u64;
+        let now = self.now_millis();
+        self.frontend
+            .frontend
+            .dispatcher_mut()
+            .offered(now, &out.offered(command));
+    }
+
+    /// Offer again what a destination could not take, for commands this
+    /// collector still owes one.
+    ///
+    /// Bounded in two ways that matter. `OFFERS_PER_TURN` caps what one
+    /// turn spends on repeats, so a congested destination cannot
+    /// displace new work, protocol traffic or recovery; and the
+    /// collector's own schedule decides which destinations are due, so
+    /// the budget is spread across commands rather than poured into the
+    /// first one. Neither bound ever gives up on an accepted command:
+    /// what they bound is the rate, and the obligation ends at
+    /// settlement.
+    fn reoffer(&mut self, transport: &Transport) {
+        let now = self.now_millis();
+        let due = self
+            .frontend
+            .frontend
+            .dispatcher_mut()
+            .due_offers(now, OFFERS_PER_TURN);
+        for plan in due {
+            let command = plan.command;
+            let out = fanout::dispatch(
+                &self.frontend.membership,
+                transport,
+                self.frontend
+                    .local
+                    .as_ref()
+                    .map(|l| l as &dyn fanout::LocalIngress),
+                &plan,
+            );
+            self.frontend.counts.reoffered += 1;
+            self.record_offer(command, &out);
+            // Said, and said less as it goes on: a re-offer is delivery
+            // backpressure being worked off, which an operator wants to
+            // know is happening without a line per attempt.
+            if let Some(n) = self.recurring.seen("reoffered") {
+                eprintln!(
+                    "this collector offered a submission again to a voter that could not take it ({n} so far)"
+                );
+            }
+        }
+    }
     /// Deliver held evidence whose submitter this voter now knows, and
     /// let go of what has waited longer than the race can take.
     ///
@@ -2196,6 +2370,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 {
                     drop(displaced);
                 }
+                let command = plan.command;
                 let out = fanout::dispatch(
                     &self.frontend.membership,
                     transport,
@@ -2205,12 +2380,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         .map(|l| l as &dyn fanout::LocalIngress),
                     &plan,
                 );
-                let counts = &mut self.frontend.counts;
-                counts.queued_local += out.queued_local() as u64;
-                counts.queued_remote += out.queued_remote() as u64;
-                counts.not_a_voter += out.not_a_committed_voter() as u64;
-                counts.saturated += out.saturated() as u64;
-                counts.unavailable += out.unavailable() as u64;
+                self.record_offer(command, &out);
             }
             Step::Watch {
                 watch_id,

@@ -1,4 +1,4 @@
-# Collector contract, revision 2 (task-33, revised by task-c02)
+# Collector contract, revision 3 (task-33, revised by task-c02 and task-c01)
 
 The collector is the trusted component that turns an admitted client
 request into a SwiftPaxos command, fans it out to the voters and
@@ -23,6 +23,16 @@ half holds from the durable record of the command's execution on its
 own node; see *Release*. Nothing about evidence or learning moved: a
 command is established on exactly the evidence it was before, and the
 record is never counted as a vote.
+
+**What revision 3 changed.** Revisions 1 and 2 said fan-out was to every
+voter at once and said nothing about a destination that could not take it. In
+practice the transport dropped that copy and nothing re-offered it, so
+a command ran on whatever subset happened to be free while the caller
+was told nothing. Delivery is now a stated obligation with a stated
+end: see *Dissemination*, and the admission rule it forced in
+*Submission and fan-out*. Nothing about evidence, learning or release
+moved -- a command is established on exactly the evidence it was
+before.
 
 ## Roles and authority
 
@@ -69,15 +79,88 @@ command_id = H(command-id domain, retry_key, canonical logical bytes)
   submitted.
 * A retry of a pending command re-attaches the caller and sends nothing.
 * A retry of a resolved command returns the retained outcome.
-* The domain has a pending bound; at the bound a new submission is
-  refused with backpressure. Unresolved entries are never evicted, and a
-  cancelled entry frees no slot.
+* The domain has two admission bounds and **both are reserved before any
+  destination is offered anything**: a pending-command bound, and a bound
+  on the submission envelope bytes held for commands that still owe a
+  destination. The byte bound is sized in whole envelopes -- a request
+  at the size limit plus what the envelope carries around it -- so a
+  valid request always fits a free pending slot. At either bound a new
+  submission is refused with backpressure. Unresolved entries are never evicted, and a cancelled
+  entry frees no slot.
+* A refusal therefore means *nothing was offered by this attempt*. It is
+  not evidence that the same identity was never submitted from
+  elsewhere. **Past the point of dispatch no destination's answer may
+  become a refusal of the command**: a queue that was full says
+  something about that destination and nothing about whether the command
+  will be established.
 * Fan-out targets are **every voter of the configuration, at once**. The
   leader is one target; no voter relays the submission and no follower
   waits for a leader hop before voting (the fast-set follower's `FastAck`
   leaves on arrival of the `Submit`; a follower outside the fixed fast
   set adopts the leader's order and answers with `SlowAck`, which is the
   source rule, not a relay).
+
+## Dissemination
+
+Delivery, and nothing here is consensus. An enqueue accepted says a
+destination's ingress took responsibility for the frame; it is not a
+vote, not durability, not application, and a destination that later
+fails or makes no progress remains the same-identity retry and recovery
+problem it always was.
+
+**All-voter targeting is required; all-voter acceptance is not.** Every
+voter is offered the submission, independently and without blocking.
+One destination's refusal never delays another's offer and never blocks
+the command.
+
+* While a command is unresolved, the collector that accepted it **owns
+  re-offering** what could not be queued. A caller does not repair this
+  by presenting the request again: a retry of a pending command attaches
+  and sends nothing, deliberately, and is not the delivery-retry
+  mechanism.
+* A repeat is **another delivery attempt for the original submission**:
+  the same command identity, retry key, canonical request, admission
+  facts and acknowledged sequence floor, from one retained envelope. It
+  is never rebuilt from current session state, which would mint fresh
+  admission facts for a command already submitted under others.
+* A repeat names **only the destinations that still owe an enqueue**.
+* Refusals are classified, because they need different treatment. A full
+  queue and an absent route are delivery backpressure and are offered
+  again on a floor with exponential backoff to a ceiling. A target the
+  committed configuration does not name as a voter, and an envelope a
+  route can never carry, are **not** on that schedule: repeating them is
+  a busy loop with a known answer. They are remembered and reported at
+  settlement, and only a reconfiguration revisits them.
+* Re-offering is bounded in **memory and rate, never in obligation**.
+  There is no attempt limit after which an accepted, unresolved command
+  is forgotten. Scheduling is fair across commands and capped per turn,
+  so one congested destination starves neither the other destinations
+  nor new work, protocol traffic or recovery.
+* A due re-offer is carried out **without any other traffic**. The
+  collector says when its next re-offer falls due, and the runtime wakes
+  for it; a runtime that waited only on its sockets would leave a quiet
+  domain's refused submission unoffered until something unrelated
+  arrived or the caller retried.
+* A caller that times out or disconnects is detached; **the command
+  keeps its delivery obligation**. A client deadline is not the lifetime
+  of work the domain has accepted.
+* **The obligation ends at settlement.** A command may legitimately be
+  established by the quorum it needed before a saturated voter ever took
+  its submission. At settlement the retry state is retired, its reserved
+  capacity is released, and destinations that never took the submission
+  are recorded (`Undisseminated`). Closing that gap is the replication
+  and recovery path's, not a reason to hold a settled command's capacity
+  open for an unreachable minority.
+* Release is unchanged and does **not** wait for delivery: the
+  collector's learning predicate over counted votes plus the leader's
+  release-gate result, exactly as in *Release* below.
+
+A voter that acknowledged a command before the submission naming its
+submitter arrived holds that evidence until a submission places it.
+That hold must outlast the repeat schedule's ceiling: a duplicate
+submission produces no effects, so a repeat landing after the hold has
+expired finds a voter with nothing to hand over and the acknowledgement
+is lost. The runtime derives its hold from the ceiling for that reason.
 
 ## Evidence
 
@@ -150,17 +233,23 @@ as `SettledFromRecord` followed by the `Released` it produced, whose
 
 When the collector learns a new ballot configuration, evidence and
 releases of the old ballot are void: pending commands collect afresh under
-the new configuration. Epoch (membership) integration and configuration
+the new configuration. Delivery is reconciled with it in the same step: a
+replica that is no longer a voter stops being a destination, a replica
+that has become one is owed the submission and is due it at once, and a
+destination held off the congestion schedule is revisited here. Saturation
+never gets a say in either direction -- a busy queue is not a membership
+change. Epoch (membership) integration and configuration
 refresh are task-m02.
 
 ## Golden event trace
 
 Every transition is recorded as a `CollectorEvent` (`Submitted`,
 `Attached`, `Retained`, `Refused`, `Evidence`, `Held`, `Released`,
-`Cancelled`, `Resolved`, `TimedOut`, `Reconfigured`, `SettledFromRecord`)
-with identities in lowercase hex. The one added in revision 2 appears
-only when a delivery was lost, so the frozen revision-1 scenario produces
-the same trace it always did. The Rust reference trace of the frozen scenario is
+`Cancelled`, `Resolved`, `TimedOut`, `Reconfigured`, `SettledFromRecord`,
+`Reoffered`, `Undisseminated`) with identities in lowercase hex. The three
+added in revisions 2 and 3 appear only when a delivery was lost or did not go
+straight through, so the frozen revision-1 scenario produces the same trace it
+always did. The Rust reference trace of the frozen scenario is
 `crates/coord-collector/fixtures/collector_trace_v1.json` (regenerate
 deliberately with `COORD_COLLECTOR_WRITE_FIXTURES=1`). The Go collector
 must produce the same trace for the same scenario; differential tests of
@@ -168,6 +257,13 @@ loss, duplication, reordering, recovery and configuration change are
 task-m02.
 
 ## Not claimed
+
+Re-offering is delivery, not a guarantee of it: a destination that
+accepts an enqueue may still fail before processing the frame, and
+that remains the same-identity retry and recovery problem. This
+revision does not claim reliable end-to-end delivery, only that a
+submission a destination could not take is offered to it again while
+the command is unresolved.
 
 The collector re-derives command-level learning from voter evidence; the
 predecessor order, authorization and exact result of a speculative release

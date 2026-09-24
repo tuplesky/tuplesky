@@ -1378,6 +1378,77 @@ async fn a_frontend_only_process_starts_without_a_peer_plane() {
     );
 }
 
+/// A submission no voter could take is offered again on a quiet
+/// frontend-only domain, without the caller sending anything more
+/// (task-c01).
+///
+/// The collector schedules the re-offer, but nothing in it runs on its
+/// own: the domain loop carries it out. A rejected fan-out is recorded
+/// before the retry floor has passed, so the pass that recorded it finds
+/// nothing due, and a frontend-only domain has no voter turn and no
+/// payload timer -- it waited on its sockets, and the submission was
+/// offered again only when unrelated traffic arrived or the caller gave
+/// up and retried. The loop now wakes when the collector's next re-offer
+/// falls due. Here no voter is running, so every offer is refused as
+/// unavailable, and the caller sends its binding once and then nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_frontend_offers_a_refused_submission_again_without_a_caller_retry() {
+    let dir = workspace("frontend-reoffer");
+    let ca = credentials(&dir, 7, coord_types::wire_v1::PeerRole::Frontend);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace("role = \"voter-frontend-observer\"", "role = \"frontend\"")
+            .replace("peer_quic = \"127.0.0.1:0\"\n", ""),
+    )
+    .expect("write");
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let (_endpoint, connection, _control, _control_recv) = Caller::negotiated(&daemon, &ca).await;
+    let token = service_token(&ring, [0x46; 16]);
+    let (mut send, _recv) = connection.open_bi().await.expect("bind stream");
+    send.write_all(&coord_session::bind_frame(token.as_bytes()).expect("bind frame"))
+        .await
+        .expect("written");
+    send.finish().expect("finished");
+
+    // The binding is a replicated command: the frontend submits it to
+    // the three committed voters, none of which is there. After that the
+    // caller is silent and nothing else reaches this process.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let said = loop {
+        let said = daemon.said();
+        if said.contains("offered a submission again") {
+            break said;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a quiet frontend never offered the refused submission again:\n{said}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // And it goes on doing so on the collector's schedule, still with
+    // nothing arriving: the wake is not a one-off.
+    let before = said.matches("offered a submission again").count();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let said = daemon.said();
+        if said.matches("offered a submission again").count() > before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-offers stopped on a quiet frontend:\n{said}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// A request is carried all the way through by the voter in this
 /// process, and the caller is answered on the stream it asked on.
 ///

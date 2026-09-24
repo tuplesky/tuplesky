@@ -32,7 +32,7 @@ fn plan(sequence: u64) -> FanOut {
         command: CommandId(Digest32([0xc; 32])),
         retry_key: key(sequence),
         targets: Vec::new(),
-        frame: b"submit".to_vec(),
+        frame: std::sync::Arc::from(&b"submit"[..]),
     }
 }
 

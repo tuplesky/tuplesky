@@ -39,6 +39,25 @@ pub enum CollectorEvent {
         /// Voters the command was fanned out to.
         targets: Vec<String>,
     },
+    /// A submission was offered again to destinations that had not
+    /// taken it. Not a second submission: the same envelope, the same
+    /// command identity, to the subset that still owes an enqueue.
+    Reoffered {
+        /// Command.
+        command: String,
+        /// Destinations this offer was for.
+        targets: Vec<String>,
+    },
+    /// A command settled while one or more voters had never taken its
+    /// submission. The quorum it needed was reached without them; what
+    /// they missed is the replication and recovery path's to close, and
+    /// this is the record that it was missed.
+    Undisseminated {
+        /// Command.
+        command: String,
+        /// Voters that never took the submission.
+        missed: Vec<String>,
+    },
     /// A retry attached to a pending command (no second fan-out).
     Attached {
         /// Command.

@@ -20,11 +20,25 @@
 //! * **Cancellation** detaches the caller and nothing else: the entry
 //!   keeps collecting, its identity stays bound and the outcome, once
 //!   established, is resolvable by `ResolveRequest`.
+//! * **Dissemination** is the collector's obligation, not the caller's.
+//!   Every voter is offered the submission, independently and without
+//!   blocking; a destination whose queue is full or whose link is down
+//!   refuses *delivery*, which is neither a rejection of the command nor
+//!   a change of membership. While the command is unresolved this
+//!   collector re-offers what could not be queued. All-voter targeting
+//!   is required; all-voter acceptance is not, and nothing waits for it:
+//!   release is the learning predicate plus the leader's release gate,
+//!   exactly as before.
 //! * **Bounds**: pending commands per domain are capped and unresolved
-//!   entries are never evicted to make room; resolved outcomes are kept
-//!   in a bounded window.
+//!   entries are never evicted to make room; the retained submission
+//!   envelopes are capped in bytes; resolved outcomes are kept in a
+//!   bounded window. Capacity for both is reserved *before* anything is
+//!   offered, so a refusal means nothing was sent by this attempt --
+//!   and a destination refusing its queue afterwards never turns into
+//!   "not executed".
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use coord_consensus::{
     BallotConfiguration, FastAck, Learned, ProtocolMessage, Vote, VoteError, VoteSet,
@@ -47,6 +61,29 @@ use crate::wire::{SubmitV1, submit_frame};
 const MAX_DELIVERABLE_RESULT_BYTES: usize =
     (coord_types::wire_v1::KindRange::Api.max_frame_length() as usize) - 64 * 1024;
 
+/// What a submission envelope may carry beyond its request's own bytes.
+///
+/// The undelivered-bytes budget is sized from the request limit, but
+/// what the collector holds is the whole `Submit` frame: the request's
+/// canonical encoding -- which the wire lets run up to 64 KiB past the
+/// request limit, for the encoding's own tags and lengths -- inside a
+/// `SubmitV1` beside the admission facts, with the retry key, deadline
+/// and acknowledged floor, and the frame header. Those come to a few
+/// hundred bytes; the allowance is the wire's 64 KiB twice over, so a
+/// request at the limit always fits the slot it was admitted into.
+pub const SUBMIT_ENVELOPE_ALLOWANCE: usize = 128 * 1024;
+
+/// The undelivered-bytes budget of a collector that may hold
+/// `max_pending` commands of requests up to `max_request_bytes`: one
+/// whole submission envelope for each, request and allowance together.
+///
+/// Budgeting the request alone refused a legal request near the limit
+/// when only one command may be pending -- the envelope around it is
+/// what is held, and it is larger than the request by a constant.
+pub const fn undelivered_budget(max_pending: usize, max_request_bytes: usize) -> usize {
+    max_pending.saturating_mul(max_request_bytes.saturating_add(SUBMIT_ENVELOPE_ALLOWANCE))
+}
+
 /// Configuration of one domain's collector.
 #[derive(Clone, Debug)]
 pub struct CollectorConfig {
@@ -56,6 +93,16 @@ pub struct CollectorConfig {
     pub max_pending: usize,
     /// Resolved outcomes retained for retries and resolution.
     pub max_resolved: usize,
+    /// Submission envelope bytes this collector will hold at once for
+    /// commands it still owes a destination.
+    ///
+    /// The second half of the admission reservation, and the one a
+    /// count alone cannot express: what re-offering costs is the
+    /// envelopes, and one large command is not one small one. Reserved
+    /// before any destination is offered and released the moment the
+    /// command owes nobody -- either because every voter took it or
+    /// because it settled.
+    pub max_undelivered_bytes: usize,
 }
 
 /// The parallel fan-out of one submission.
@@ -65,11 +112,166 @@ pub struct FanOut {
     pub command: CommandId,
     /// Retry key.
     pub retry_key: RetryKey,
-    /// Every voter, all at once.
+    /// The voters this offer is for.
+    ///
+    /// Every voter of the configuration on the first offer. A re-offer
+    /// names only the destinations that still owe an enqueue, which is
+    /// what keeps a repeat from costing the voters that already took it.
     pub targets: Vec<ReplicaId>,
     /// The `Submit` frame.
-    pub frame: Vec<u8>,
+    ///
+    /// Shared rather than owned, because the collector keeps this exact
+    /// envelope for as long as it may have to offer it again. A
+    /// re-offer is another delivery attempt for the original
+    /// submission: the same command identity, retry key, canonical
+    /// request, admission facts and acknowledged sequence floor. It is
+    /// never rebuilt from current session state, which would mint fresh
+    /// admission facts for a command already submitted under others.
+    pub frame: Arc<[u8]>,
 }
+
+/// What one destination did with one offer of a submission.
+///
+/// This is delivery, not consensus. `Queued` says an ingress accepted
+/// responsibility for the frame; it is not a vote, not durability and
+/// not application, and a destination that later fails or makes no
+/// progress is still the same-identity retry and recovery problem it
+/// always was. The reasons are kept apart because they need different
+/// treatment, which is the whole point of reporting them separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfferOutcome {
+    /// The destination's ingress took the frame.
+    Queued,
+    /// The destination is a live voter with no room right now. Delivery
+    /// backpressure: offer it again.
+    Saturated,
+    /// There is no route to the destination at the moment. A network
+    /// fact, and also transient: offer it again.
+    Unreachable,
+    /// The committed configuration does not name this replica as a
+    /// voter of this domain. A disagreement between the plan and the
+    /// configuration, which repeating cannot fix: it is not retried on
+    /// the congestion schedule, and only a reconfiguration revisits it.
+    NotACommittedVoter,
+    /// The frame can never reach this destination as it stands -- it
+    /// does not fit what the route may carry. Permanent for this
+    /// envelope, so retrying it forever would be a busy loop with a
+    /// known answer.
+    Undeliverable,
+}
+
+impl OfferOutcome {
+    /// Whether offering this destination again could plausibly differ.
+    const fn worth_repeating(self) -> bool {
+        matches!(self, OfferOutcome::Saturated | OfferOutcome::Unreachable)
+    }
+}
+
+/// What an offer of one command's submission actually achieved.
+///
+/// Handed back to the collector by whoever holds the sockets, so the
+/// obligation to re-offer lives beside the pending command rather than
+/// in the runtime that happened to make the attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offered {
+    /// The command the offer was for.
+    pub command: CommandId,
+    /// One outcome per destination the offer named.
+    pub outcomes: Vec<(ReplicaId, OfferOutcome)>,
+}
+
+/// What one destination still owes this command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owed {
+    /// The ingress took it. Nothing further is owed by delivery.
+    Queued,
+    /// Not taken, and worth offering again at `next` with `attempts`
+    /// behind it.
+    Missed {
+        attempts: u32,
+        next: u64,
+        why: OfferOutcome,
+    },
+    /// Not taken, and not on the congestion schedule: a configuration
+    /// disagreement or an envelope this route can never carry. Held so
+    /// it can be reported at settlement rather than forgotten, and
+    /// revisited only by a reconfiguration.
+    Stalled(OfferOutcome),
+}
+
+/// The delivery state of one pending command's submission.
+struct Dissemination {
+    /// The exact envelope that was submitted, kept while anything is
+    /// owed. `None` once every destination has taken it, which is what
+    /// releases the bytes reserved for it.
+    envelope: Option<Arc<[u8]>>,
+    /// Bytes this command has reserved against the byte budget. Held
+    /// separately from `envelope` so releasing is a single subtraction
+    /// that cannot drift from what was added.
+    reserved: usize,
+    /// What each planned destination owes, in replica order.
+    owed: BTreeMap<ReplicaId, Owed>,
+}
+
+/// Reported by its shape, never its contents: the envelope is a
+/// caller's request, and a debug format that printed it would put one
+/// in every log line that ever formats a collector.
+impl core::fmt::Debug for Dissemination {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Dissemination")
+            .field("envelope_bytes", &self.envelope.as_ref().map(|e| e.len()))
+            .field("reserved", &self.reserved)
+            .field("owed", &self.owed)
+            .finish()
+    }
+}
+
+impl Dissemination {
+    /// Destinations that have not taken the frame, for any reason.
+    fn missing(&self) -> Vec<ReplicaId> {
+        self.owed
+            .iter()
+            .filter(|(_, owed)| !matches!(owed, Owed::Queued))
+            .map(|(r, _)| *r)
+            .collect()
+    }
+
+    /// Whether anything is still owed and worth another offer.
+    fn outstanding(&self) -> bool {
+        self.owed
+            .values()
+            .any(|owed| matches!(owed, Owed::Missed { .. }))
+    }
+}
+
+/// How long a destination waits before the first repeat, in
+/// milliseconds.
+///
+/// Milliseconds of a **monotonic** reading, and deliberately not the
+/// `now_ticks` the deadline path takes: that one is a wall clock, and a
+/// retry schedule built on a clock that can step is a retry schedule
+/// that can stall or stampede. The caller supplies it; this crate holds
+/// no clock of its own.
+///
+/// A floor, not a rate. A queue that was full a moment ago is often
+/// free a moment later, so the first repeat is soon; what must not
+/// happen is a repeat per turn, which would spend the lane on the
+/// retries instead of on the drain that ends them.
+const OFFER_FLOOR_MILLIS: u64 = 25;
+
+/// The longest a destination waits between repeats, in milliseconds.
+///
+/// Doubling stops here. A destination that has refused many times in a
+/// row is congested or gone, and the cost of finding out is one frame a
+/// second rather than a frame per floor for as long as it lasts.
+///
+/// Public because a voter's side has to outlast it. A voter that
+/// acknowledged a command before the submission naming its submitter
+/// arrived holds that evidence for the submission to place it, and a
+/// hold shorter than this schedule would expire between two repeats --
+/// so the frame would land on a voter with nothing left to hand over,
+/// and the acknowledgement would be lost for good.
+pub const OFFER_CEILING_MILLIS: u64 = 1_000;
 
 /// What a submission produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +432,16 @@ struct Pending {
     attached: bool,
     deadline: Option<u64>,
     timed_out: bool,
+    /// What each voter still owes this command by way of taking the
+    /// submission. Independent of `votes`: a destination that took the
+    /// frame has not voted, and a destination that never took it may
+    /// still have learned the command from the leader.
+    ///
+    /// Bound to the *command*, not to the caller: a caller that times
+    /// out or disconnects is detached and this obligation stays, which
+    /// is the rule that keeps a client deadline from silently becoming
+    /// the lifetime of work the domain has accepted.
+    dissemination: Dissemination,
 }
 
 /// The collector of one domain.
@@ -241,6 +453,14 @@ pub struct Collector {
     resolved: BTreeMap<RetryKey, (CommandId, ResponseV1)>,
     resolved_order: VecDeque<RetryKey>,
     trace: Vec<CollectorEvent>,
+    /// Envelope bytes reserved by commands that still owe a
+    /// destination. The sum of every pending entry's `reserved`, kept
+    /// incrementally so admission is a comparison rather than a walk.
+    undelivered_bytes: usize,
+    /// Where the next round of repeats starts looking, so one
+    /// destination's congestion cannot spend the whole budget on the
+    /// same command every turn.
+    offer_cursor: usize,
 }
 
 impl Collector {
@@ -253,6 +473,8 @@ impl Collector {
             resolved: BTreeMap::new(),
             resolved_order: VecDeque::new(),
             trace: Vec::new(),
+            undelivered_bytes: 0,
+            offer_cursor: 0,
         }
     }
 
@@ -344,7 +566,27 @@ impl Collector {
             request: request.clone(),
         })
         .map_err(|_| SubmitRefusal::Malformed)?;
+        // The second half of the reservation, and the last point at
+        // which refusing is honest. Accepting a command means owing its
+        // dissemination until it settles, and that obligation is the
+        // envelope: reserve it here, before a single destination has
+        // been offered anything, so a refusal is a statement that
+        // nothing was sent by this attempt. Past this line no
+        // destination's answer may turn into a refusal of the command,
+        // because by then it may be anywhere.
+        let bytes = frame.len();
+        if self.undelivered_bytes.saturating_add(bytes) > self.config.max_undelivered_bytes {
+            self.trace.push(CollectorEvent::Refused {
+                sequence,
+                reason: "undelivered-bytes".into(),
+            });
+            return Err(SubmitRefusal::Backpressure {
+                pending: self.pending.len(),
+            });
+        }
+        let frame: Arc<[u8]> = Arc::from(frame.into_boxed_slice());
         let targets: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
+        self.undelivered_bytes += bytes;
         self.bindings.insert(key, command);
         self.pending.insert(
             command,
@@ -357,6 +599,19 @@ impl Collector {
                 attached: true,
                 deadline: deadline(now_ticks, request.deadline_ms),
                 timed_out: false,
+                dissemination: Dissemination {
+                    envelope: Some(Arc::clone(&frame)),
+                    reserved: bytes,
+                    // Every voter is a planned destination from the
+                    // start, and stays one until it takes the frame.
+                    // Nothing here is scheduled yet: the offer about to
+                    // be made is the first attempt, and its answer is
+                    // what puts a destination on the repeat schedule.
+                    owed: targets
+                        .iter()
+                        .map(|t| (*t, Owed::Stalled(OfferOutcome::Unreachable)))
+                        .collect(),
+                },
             },
         );
         self.trace.push(CollectorEvent::Submitted {
@@ -370,6 +625,171 @@ impl Collector {
             targets,
             frame,
         }))
+    }
+
+    /// Record what an offer of `report.command` achieved, destination by
+    /// destination.
+    ///
+    /// The one way delivery state moves. Whoever holds the sockets makes
+    /// the attempt and says what happened; the obligation that follows
+    /// from it lives here, beside the pending command, because that is
+    /// what survives the caller going away and the runtime moving on.
+    ///
+    /// Nothing here can fail a command. A destination that refused its
+    /// queue has said something about itself and nothing about whether
+    /// the command will be established: the learning predicate and the
+    /// leader's release gate decide that, over however many voters did
+    /// take it.
+    pub fn offered(&mut self, now_millis: u64, report: &Offered) {
+        let Some(entry) = self.pending.get_mut(&report.command) else {
+            // Settled, or never ours. Either way there is nothing left
+            // to owe, and a late report about it is not an error.
+            return;
+        };
+        for (replica, outcome) in &report.outcomes {
+            // Only planned destinations. A report naming a replica this
+            // command never targeted is not permission to start owing
+            // it one.
+            let Some(owed) = entry.dissemination.owed.get_mut(replica) else {
+                continue;
+            };
+            *owed = match outcome {
+                OfferOutcome::Queued => Owed::Queued,
+                why if why.worth_repeating() => {
+                    let attempts = match owed {
+                        Owed::Missed { attempts, .. } => attempts.saturating_add(1),
+                        _ => 1,
+                    };
+                    Owed::Missed {
+                        attempts,
+                        next: now_millis.saturating_add(backoff_millis(attempts)),
+                        why: *why,
+                    }
+                }
+                // A configuration disagreement or an envelope this
+                // route can never carry. Repeating it on the congestion
+                // schedule would be a busy loop with a known answer, so
+                // it waits for the only thing that could change it.
+                why => Owed::Stalled(*why),
+            };
+        }
+        // Owing nobody is the other way the reservation ends, and the
+        // common one: every voter took it, so the envelope is not
+        // needed again and its bytes go back to the budget now rather
+        // than when the command settles.
+        if entry.dissemination.missing().is_empty() {
+            self.undelivered_bytes = self
+                .undelivered_bytes
+                .saturating_sub(entry.dissemination.reserved);
+            entry.dissemination.reserved = 0;
+            entry.dissemination.envelope = None;
+        }
+    }
+
+    /// The re-offers that are due, newest obligations last, bounded by
+    /// `budget` destinations in total.
+    ///
+    /// Fair across commands rather than in command order: the cursor
+    /// advances past whatever was served, so one congested destination's
+    /// command cannot take the whole budget on every turn while the
+    /// commands behind it wait.
+    ///
+    /// Bounded in what it *does*, never in what it *owes*. There is no
+    /// attempt limit after which an accepted, unresolved command is
+    /// forgotten: what the bounds cap is memory and retry pressure, and
+    /// a command stops being re-offered when it settles or when the
+    /// destination stops being one, not when it has been difficult
+    /// enough times.
+    pub fn due_offers(&mut self, now_millis: u64, budget: usize) -> Vec<FanOut> {
+        if budget == 0 || self.pending.is_empty() {
+            return Vec::new();
+        }
+        let commands: Vec<CommandId> = self.pending.keys().copied().collect();
+        let start = self.offer_cursor % commands.len();
+        let mut out = Vec::new();
+        let mut spent = 0usize;
+        let mut examined = 0usize;
+        for i in 0..commands.len() {
+            if spent >= budget {
+                break;
+            }
+            examined = i + 1;
+            let command = commands[(start + i) % commands.len()];
+            let Some(entry) = self.pending.get_mut(&command) else {
+                continue;
+            };
+            let Some(envelope) = entry.dissemination.envelope.clone() else {
+                continue;
+            };
+            let mut targets = Vec::new();
+            for (replica, owed) in &mut entry.dissemination.owed {
+                if spent >= budget {
+                    break;
+                }
+                if let Owed::Missed { next, .. } = owed
+                    && *next <= now_millis
+                {
+                    targets.push(*replica);
+                    spent += 1;
+                    // Marked as offered before the offer is made. The
+                    // answer will overwrite this, and until it does the
+                    // destination must not be picked again -- an
+                    // in-flight attempt is not a free slot.
+                    *next = now_millis.saturating_add(OFFER_CEILING_MILLIS);
+                }
+            }
+            if targets.is_empty() {
+                continue;
+            }
+            self.trace.push(CollectorEvent::Reoffered {
+                command: command_hex(&command),
+                targets: targets.iter().map(replica_hex).collect(),
+            });
+            out.push(FanOut {
+                command,
+                retry_key: entry.retry_key,
+                targets,
+                frame: envelope,
+            });
+        }
+        self.offer_cursor = start.wrapping_add(examined);
+        out
+    }
+
+    /// When the next re-offer falls due, on the clock `due_offers` is
+    /// given, or `None` when nothing is owed on the congestion schedule.
+    ///
+    /// For the runtime to wake on. The schedule lives here, but nothing
+    /// here runs on its own: a runtime that waits only on its sockets
+    /// would carry out a due re-offer only when unrelated traffic woke
+    /// it, and on a quiet domain -- exactly when the destination that
+    /// was busy is free again -- that is never. A destination stalled
+    /// for a reason repeating cannot change is not on the schedule and
+    /// is not counted.
+    pub fn next_due(&self) -> Option<u64> {
+        self.pending
+            .values()
+            .filter(|entry| entry.dissemination.envelope.is_some())
+            .flat_map(|entry| entry.dissemination.owed.values())
+            .filter_map(|owed| match owed {
+                Owed::Missed { next, .. } => Some(*next),
+                Owed::Queued | Owed::Stalled(_) => None,
+            })
+            .min()
+    }
+
+    /// Commands that still owe a destination an enqueue (diagnostic).
+    pub fn undelivered(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|p| p.dissemination.outstanding())
+            .count()
+    }
+
+    /// Submission envelope bytes held for commands that owe a
+    /// destination (diagnostic).
+    pub const fn undelivered_bytes(&self) -> usize {
+        self.undelivered_bytes
     }
 
     /// Count protocol evidence from a bound voter identity.
@@ -540,6 +960,25 @@ impl Collector {
             return Progress::Held(HoldReason::AwaitingRelease);
         };
         let entry = self.pending.remove(&command).expect("present");
+        // Settled, so the dissemination obligation ends here. A command
+        // may legitimately be established by the quorum it needed
+        // before a saturated voter ever took its submission, and
+        // holding this collector's capacity open for an unreachable
+        // minority after the answer exists would be paying for a
+        // delivery nobody is waiting on. What that minority missed is
+        // the replication and recovery path's to close, which is what
+        // it is for; what is owed here is to say so rather than let it
+        // pass unrecorded.
+        self.undelivered_bytes = self
+            .undelivered_bytes
+            .saturating_sub(entry.dissemination.reserved);
+        let missed = entry.dissemination.missing();
+        if !missed.is_empty() {
+            self.trace.push(CollectorEvent::Undisseminated {
+                command: command_hex(&command),
+                missed: missed.iter().map(replica_hex).collect(),
+            });
+        }
         let fast = matches!(learned, Learned::Fast { .. });
         let established = released.established();
         let response = self.answer_of(command, established.revision(), released.response());
@@ -753,15 +1192,77 @@ impl Collector {
     /// configuration. Full epoch integration is task-m02.
     pub fn reconfigure(&mut self, quorum: BallotConfiguration) {
         let reset = self.pending.len();
+        let voters: Vec<ReplicaId> = quorum.voters().iter().copied().collect();
+        let mut released = 0usize;
         for (command, entry) in &mut self.pending {
             entry.votes = VoteSet::new(quorum.clone(), *command);
             entry.released = None;
+            // Delivery follows the committed configuration, the same as
+            // evidence does. A replica that is no longer a voter is no
+            // longer a destination and stops being owed anything; one
+            // that has become a voter is owed the submission and is due
+            // it now. Saturation never got a say in either: this is the
+            // configuration changing, not a busy queue being
+            // reinterpreted as a membership change.
+            entry.dissemination.owed.retain(|r, _| voters.contains(r));
+            let held = entry.dissemination.envelope.is_some();
+            for voter in &voters {
+                let owed = entry
+                    .dissemination
+                    .owed
+                    .entry(*voter)
+                    .or_insert(Owed::Stalled(OfferOutcome::Unreachable));
+                // A destination held off the congestion schedule was
+                // waiting for exactly this. One that has taken the
+                // frame keeps that; re-offering a voter that already
+                // has it would be work with no question behind it.
+                //
+                // And only while there is something to offer. A command
+                // every voter had taken released its envelope, so a
+                // voter that joins afterwards has genuinely missed this
+                // submission and cannot be handed it: saying it is due
+                // would leave it owed for ever with nothing to send.
+                // It stays recorded, and settlement reports it.
+                if matches!(owed, Owed::Stalled(_)) && held {
+                    *owed = Owed::Missed {
+                        attempts: 1,
+                        next: 0,
+                        why: OfferOutcome::Unreachable,
+                    };
+                }
+            }
+            // A command that owes nothing again gives its bytes back,
+            // and one that owes something after the reconciliation
+            // keeps holding them: the reservation tracks the
+            // obligation, never the other way round.
+            if entry.dissemination.missing().is_empty() {
+                released += entry.dissemination.reserved;
+                entry.dissemination.reserved = 0;
+                entry.dissemination.envelope = None;
+            }
         }
+        self.undelivered_bytes = self.undelivered_bytes.saturating_sub(released);
         self.trace.push(CollectorEvent::Reconfigured {
             ballot: quorum.ballot().number,
             reset,
         });
         self.config.quorum = quorum;
+    }
+}
+
+/// How long the `attempts`-th repeat waits, in milliseconds.
+///
+/// Exponential from the floor to the ceiling. The point is not to find
+/// the fastest schedule -- it is that a destination which keeps
+/// refusing costs less and less, so sustained congestion cannot be
+/// turned into sustained retry traffic by the retries themselves.
+const fn backoff_millis(attempts: u32) -> u64 {
+    let shift = if attempts > 8 { 8 } else { attempts - 1 };
+    let wait = OFFER_FLOOR_MILLIS << shift;
+    if wait > OFFER_CEILING_MILLIS {
+        OFFER_CEILING_MILLIS
+    } else {
+        wait
     }
 }
 

@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use coord_collector::{
     Action, Admission, AdmissionLimits, AdmissionRefusal, Caller, Collector, CollectorConfig,
     CollectorEvent, Delivery, Dispatcher, EvidenceError, HoldReason, KIND_EVIDENCE, KIND_RELEASE,
-    Progress, SubmitRefusal, Submitted, admitted_from_submit, codes, decode_evidence,
-    decode_release, frontend_frame,
+    OfferOutcome, Offered, Progress, SubmitRefusal, Submitted, admitted_from_submit, codes,
+    decode_evidence, decode_release, frontend_frame,
 };
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, ConfigurationIdentity, FastAck, Follower, FollowerConfig,
@@ -351,6 +351,7 @@ impl World {
             quorum: quorum(3),
             max_pending,
             max_resolved: 16,
+            max_undelivered_bytes: usize::MAX,
         });
         let admission = Admission::new(CLUSTER, DOMAIN, AdmissionLimits::default());
         World {
@@ -622,15 +623,24 @@ impl World {
             .on_frame(self.tick, connection, &caller(), &frame, &hub);
         if let Action::FanOut(fan_out) = &action {
             assert_eq!(fan_out.command, command);
+            let mut outcomes = Vec::new();
             for target in &fan_out.targets {
                 self.enqueue(
                     Item::Submit {
                         to: target.0[0],
-                        frame: fan_out.frame.clone(),
+                        frame: fan_out.frame.to_vec(),
                     },
                     0,
                 );
+                outcomes.push((*target, OfferOutcome::Queued));
             }
+            // This world's ingresses always take the frame, and saying
+            // so is part of modelling the contract rather than an
+            // accounting detail: a collector nobody reports delivery to
+            // is a collector that believes nothing was ever delivered,
+            // which is exactly what it should believe.
+            let report = Offered { command, outcomes };
+            self.frontend.offered(self.tick, &report);
         }
         (command, action)
     }
@@ -892,6 +902,7 @@ fn voter_identities_are_counted_rather_than_connections() {
         quorum: quorum(3),
         max_pending: 8,
         max_resolved: 8,
+        max_undelivered_bytes: usize::MAX,
     });
     let (command, req) = request(1, put(b"x", b"1"), 0);
     let admitted = AdmittedRequest {
@@ -1135,6 +1146,7 @@ fn collection_is_bounded_per_domain_without_evicting_unresolved_work() {
         quorum: quorum(3),
         max_pending: 1,
         max_resolved: 1,
+        max_undelivered_bytes: usize::MAX,
     });
     let receipt = AdmissionReceipt::submitting(
         VerifierToken::for_boundary(),
@@ -1488,6 +1500,8 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
             CollectorEvent::Resolved { .. } => "resolved",
             CollectorEvent::TimedOut { .. } => "timed-out",
             CollectorEvent::Reconfigured { .. } => "reconfigured",
+            CollectorEvent::Reoffered { .. } => "reoffered",
+            CollectorEvent::Undisseminated { .. } => "undisseminated",
         })
         .collect();
     for k in [
