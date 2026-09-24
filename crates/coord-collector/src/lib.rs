@@ -36,6 +36,7 @@
 #![warn(missing_docs)]
 
 pub mod admission;
+pub mod clock;
 pub mod codes;
 pub mod collector;
 pub mod dispatch;
@@ -44,6 +45,7 @@ pub mod trace;
 pub mod wire;
 
 pub use admission::{Admission, AdmissionLimits, AdmissionRefusal, Caller};
+pub use clock::MonotonicMillis;
 pub use collector::{
     Collector, CollectorConfig, EvidenceError, Expired, FanOut, HoldReason, OFFER_CEILING_MILLIS,
     OfferOutcome, Offered, Progress, Release, Resolution, SUBMIT_ENVELOPE_ALLOWANCE, SettleError,

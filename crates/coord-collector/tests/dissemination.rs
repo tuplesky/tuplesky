@@ -25,7 +25,8 @@
 use std::collections::BTreeSet;
 
 use coord_collector::{
-    Collector, CollectorConfig, FanOut, OfferOutcome, Offered, SubmitRefusal, Submitted,
+    Collector, CollectorConfig, FanOut, MonotonicMillis, OfferOutcome, Offered, SubmitRefusal,
+    Submitted,
 };
 use coord_consensus::{BallotConfiguration, ProtocolMessage, SlowAck};
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
@@ -119,7 +120,8 @@ fn collector(max_pending: usize, max_undelivered_bytes: usize) -> Collector {
 
 fn fan_out(c: &mut Collector, seq: u64) -> (CommandId, FanOut) {
     let (command, request) = admitted(seq, put(b"k", b"v"));
-    let Submitted::FanOut(plan) = c.submit(0, &request).expect("admitted") else {
+    let Submitted::FanOut(plan) = c.submit(MonotonicMillis::ZERO, &request).expect("admitted")
+    else {
         panic!("a first presentation fans out");
     };
     (command, plan)
@@ -129,7 +131,7 @@ fn fan_out(c: &mut Collector, seq: u64) -> (CommandId, FanOut) {
 fn report(c: &mut Collector, now: u64, plan: &FanOut, outcome: OfferOutcome) {
     let outcomes = plan.targets.iter().map(|t| (*t, outcome)).collect();
     c.offered(
-        now,
+        MonotonicMillis::new(now),
         &Offered {
             command: plan.command,
             outcomes,
@@ -154,7 +156,7 @@ fn report_one(c: &mut Collector, now: u64, plan: &FanOut, who: ReplicaId, outcom
         })
         .collect();
     c.offered(
-        now,
+        MonotonicMillis::new(now),
         &Offered {
             command: plan.command,
             outcomes,
@@ -186,9 +188,12 @@ fn a_full_queue_costs_that_destination_and_is_offered_again_by_itself() {
 
     // Not immediately: a repeat per turn would spend the lane on the
     // retries instead of on the drain that ends them.
-    assert!(c.due_offers(0, 16).is_empty(), "the floor has not passed");
+    assert!(
+        c.due_offers(MonotonicMillis::new(0), 16).is_empty(),
+        "the floor has not passed"
+    );
 
-    let due = c.due_offers(1_000, 16);
+    let due = c.due_offers(MonotonicMillis::new(1_000), 16);
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].command, command);
     assert_eq!(due[0].targets, vec![r(2)], "only what is still owed");
@@ -198,7 +203,7 @@ fn a_full_queue_costs_that_destination_and_is_offered_again_by_itself() {
     report_one(&mut c, 1_000, &due[0], r(2), OfferOutcome::Queued);
     assert_eq!(c.undelivered(), 0);
     assert_eq!(c.undelivered_bytes(), 0);
-    assert!(c.due_offers(u64::MAX, 16).is_empty());
+    assert!(c.due_offers(MonotonicMillis::new(u64::MAX), 16).is_empty());
 }
 
 /// A destination that is unreachable rather than busy is on the same
@@ -208,7 +213,7 @@ fn an_unreachable_destination_is_offered_again_like_a_busy_one() {
     let mut c = collector(8, usize::MAX);
     let (_, plan) = fan_out(&mut c, 1);
     report_one(&mut c, 0, &plan, r(1), OfferOutcome::Unreachable);
-    let due = c.due_offers(1_000, 16);
+    let due = c.due_offers(MonotonicMillis::new(1_000), 16);
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].targets, vec![r(1)]);
 }
@@ -224,7 +229,7 @@ fn a_repeat_is_the_same_envelope_and_the_same_identity() {
     let mut c = collector(8, usize::MAX);
     let (command, plan) = fan_out(&mut c, 1);
     report_one(&mut c, 0, &plan, r(2), OfferOutcome::Saturated);
-    let due = c.due_offers(1_000, 16);
+    let due = c.due_offers(MonotonicMillis::new(1_000), 16);
     assert_eq!(due[0].command, command);
     assert_eq!(due[0].retry_key, plan.retry_key);
     assert_eq!(
@@ -243,9 +248,9 @@ fn an_outstanding_offer_is_not_a_free_slot() {
     let mut c = collector(8, usize::MAX);
     let (_, plan) = fan_out(&mut c, 1);
     report_one(&mut c, 0, &plan, r(2), OfferOutcome::Saturated);
-    assert_eq!(c.due_offers(1_000, 16).len(), 1);
+    assert_eq!(c.due_offers(MonotonicMillis::new(1_000), 16).len(), 1);
     assert!(
-        c.due_offers(1_001, 16).is_empty(),
+        c.due_offers(MonotonicMillis::new(1_001), 16).is_empty(),
         "the answer to the last offer has not come back"
     );
 }
@@ -268,25 +273,26 @@ fn the_next_re_offer_is_announced_and_moves_on_once_made() {
     report_one(&mut c, 100, &plan, r(2), OfferOutcome::Saturated);
     let due = c
         .next_due()
-        .expect("a refused destination is owed a re-offer");
+        .expect("a refused destination is owed a re-offer")
+        .get();
     assert!(due > 100, "due after the floor, not at once");
     assert!(
-        c.due_offers(due - 1, 16).is_empty(),
+        c.due_offers(MonotonicMillis::new(due - 1), 16).is_empty(),
         "not due before it says"
     );
 
     // At the time it named, the re-offer is there, and making it moves
     // the schedule past now: a deadline left in the past would wake the
     // runtime for ever.
-    let offered = c.due_offers(due, 16);
+    let offered = c.due_offers(MonotonicMillis::new(due), 16);
     assert_eq!(offered.len(), 1);
-    assert!(c.next_due().expect("still owed until answered") > due);
+    assert!(c.next_due().expect("still owed until answered").get() > due);
 
     // Refused again: owed later than before. Taken: nothing owed.
     report_one(&mut c, due, &offered[0], r(2), OfferOutcome::Saturated);
-    let again = c.next_due().expect("still owed");
+    let again = c.next_due().expect("still owed").get();
     assert!(again - due > due - 100, "the wait grows as refusals repeat");
-    let offered = c.due_offers(again, 16);
+    let offered = c.due_offers(MonotonicMillis::new(again), 16);
     report_one(&mut c, again, &offered[0], r(2), OfferOutcome::Queued);
     assert_eq!(c.next_due(), None);
 
@@ -334,7 +340,8 @@ fn a_maximum_size_request_fits_a_single_pending_slot() {
 
     let (_, request) = admitted(1, largest.clone());
     let mut c = collector(1, undelivered_budget(1, limits::MAX_REQUEST_BYTES));
-    let Submitted::FanOut(plan) = c.submit(0, &request).expect("admitted") else {
+    let Submitted::FanOut(plan) = c.submit(MonotonicMillis::ZERO, &request).expect("admitted")
+    else {
         panic!("a first presentation fans out");
     };
     assert!(
@@ -347,7 +354,7 @@ fn a_maximum_size_request_fits_a_single_pending_slot() {
     let mut c = collector(1, limits::MAX_REQUEST_BYTES);
     assert!(
         matches!(
-            c.submit(0, &request),
+            c.submit(MonotonicMillis::ZERO, &request),
             Err(SubmitRefusal::Backpressure { pending: 0 })
         ),
         "the request-only budget no longer refuses a legal request"
@@ -363,7 +370,7 @@ fn capacity_is_reserved_before_a_single_destination_is_offered() {
     // budget alone doing the refusing.
     let (_, probe) = admitted(1, put(b"k", b"v"));
     let mut sizer = collector(64, usize::MAX);
-    let Submitted::FanOut(plan) = sizer.submit(0, &probe).unwrap() else {
+    let Submitted::FanOut(plan) = sizer.submit(MonotonicMillis::ZERO, &probe).unwrap() else {
         panic!()
     };
     let one = plan.frame.len();
@@ -376,7 +383,7 @@ fn capacity_is_reserved_before_a_single_destination_is_offered() {
     let (_, second) = admitted(2, put(b"j", b"w"));
     assert!(
         matches!(
-            c.submit(0, &second),
+            c.submit(MonotonicMillis::ZERO, &second),
             Err(SubmitRefusal::Backpressure { .. })
         ),
         "the envelope budget refuses before dispatch"
@@ -386,7 +393,10 @@ fn capacity_is_reserved_before_a_single_destination_is_offered() {
     // first command owes nobody, the capacity is back.
     report(&mut c, 0, &first, OfferOutcome::Queued);
     assert_eq!(c.undelivered_bytes(), 0);
-    assert!(matches!(c.submit(0, &second), Ok(Submitted::FanOut(_))));
+    assert!(matches!(
+        c.submit(MonotonicMillis::ZERO, &second),
+        Ok(Submitted::FanOut(_))
+    ));
 }
 
 /// A destination refusing its queue is never a refusal of the command.
@@ -408,7 +418,10 @@ fn saturation_after_dispatch_never_becomes_a_refusal() {
     // A retry of the same request attaches; it does not re-fan-out and
     // it is certainly not refused.
     let (_, same) = admitted(1, put(b"k", b"v"));
-    assert!(matches!(c.submit(0, &same), Ok(Submitted::Attached { .. })));
+    assert!(matches!(
+        c.submit(MonotonicMillis::ZERO, &same),
+        Ok(Submitted::Attached { .. })
+    ));
 }
 
 /// The caller's deadline is not the lifetime of accepted work.
@@ -420,7 +433,7 @@ fn saturation_after_dispatch_never_becomes_a_refusal() {
 fn a_callers_deadline_does_not_discard_the_delivery_obligation() {
     let mut c = collector(8, usize::MAX);
     let (command, request) = admitted(1, put(b"k", b"v"));
-    let Submitted::FanOut(plan) = c.submit(0, &request).unwrap() else {
+    let Submitted::FanOut(plan) = c.submit(MonotonicMillis::ZERO, &request).unwrap() else {
         panic!()
     };
     report_one(&mut c, 0, &plan, r(2), OfferOutcome::Saturated);
@@ -429,7 +442,7 @@ fn a_callers_deadline_does_not_discard_the_delivery_obligation() {
     c.cancel(&retry_key(1));
     assert!(c.is_pending(&command), "the command keeps collecting");
     assert_eq!(c.undelivered(), 1, "and keeps owing the destination");
-    let due = c.due_offers(1_000, 16);
+    let due = c.due_offers(MonotonicMillis::new(1_000), 16);
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].targets, vec![r(2)]);
 }
@@ -454,7 +467,7 @@ fn a_settled_command_does_not_wait_for_a_minority_that_never_took_it() {
     assert_eq!(c.undelivered(), 0, "the obligation retired with it");
     assert_eq!(c.undelivered_bytes(), 0, "and so did its capacity");
     assert!(
-        c.due_offers(u64::MAX, 16).is_empty(),
+        c.due_offers(MonotonicMillis::new(u64::MAX), 16).is_empty(),
         "a settled command is not offered again"
     );
     // Said, not silently dropped: an operator can see that this command
@@ -488,7 +501,7 @@ fn the_offer_budget_is_spread_across_commands() {
         // Far enough forward that every destination is due again, so
         // what decides who is served is the order alone.
         now += 10_000;
-        let due = c.due_offers(now, 2);
+        let due = c.due_offers(MonotonicMillis::new(now), 2);
         for plan in &due {
             served.push(plan.command);
             report(&mut c, now, plan, OfferOutcome::Saturated);
@@ -511,7 +524,7 @@ fn the_offer_budget_bounds_destinations_and_not_commands() {
         report(&mut c, 0, &plan, OfferOutcome::Saturated);
     }
     for budget in [0usize, 1, 2, 5, 7] {
-        let due = c.due_offers(1_000, budget);
+        let due = c.due_offers(MonotonicMillis::new(1_000), budget);
         let destinations: usize = due.iter().map(|d| d.targets.len()).sum();
         assert!(
             destinations <= budget,
@@ -538,7 +551,7 @@ fn a_destination_that_keeps_refusing_is_asked_less_often() {
         // Walk time forward to whenever the next offer is due.
         let mut waited = 0u64;
         loop {
-            let due = c.due_offers(now, 16);
+            let due = c.due_offers(MonotonicMillis::new(now), 16);
             if let Some(plan) = due.first() {
                 report_one(&mut c, now, plan, r(2), OfferOutcome::Saturated);
                 break;
@@ -580,7 +593,7 @@ fn a_configuration_disagreement_is_not_retried_as_congestion() {
         let (_, plan) = fan_out(&mut c, 1);
         report_one(&mut c, 0, &plan, r(2), permanent);
         assert!(
-            c.due_offers(u64::MAX, 16).is_empty(),
+            c.due_offers(MonotonicMillis::new(u64::MAX), 16).is_empty(),
             "{permanent:?} must not enter the congestion loop"
         );
         assert_eq!(
@@ -606,7 +619,7 @@ fn a_reconfiguration_reconciles_the_destinations_it_still_owes() {
     // Five voters now: r(2) is one again, and r(3) and r(4) are new.
     c.reconfigure(quorum(5));
 
-    let due = c.due_offers(0, 16);
+    let due = c.due_offers(MonotonicMillis::new(0), 16);
     assert_eq!(due.len(), 1);
     let targets: BTreeSet<ReplicaId> = due[0].targets.iter().copied().collect();
     assert_eq!(
@@ -640,7 +653,7 @@ fn a_voter_that_leaves_the_configuration_is_no_longer_a_destination() {
 
     assert_eq!(c.undelivered(), 0, "nobody is owed the submission now");
     assert_eq!(c.undelivered_bytes(), 0, "so nothing holds its bytes");
-    assert!(c.due_offers(u64::MAX, 16).is_empty());
+    assert!(c.due_offers(MonotonicMillis::new(u64::MAX), 16).is_empty());
 }
 
 /// Establish `command` over `voters` and release it, so the test can
@@ -739,7 +752,10 @@ fn a_late_submission_cannot_be_counted_twice() {
     // second execution.
     assert!(c.is_pending(&command));
     let (_, same) = admitted(1, put(b"k", b"v"));
-    assert!(matches!(c.submit(0, &same), Ok(Submitted::Attached { .. })));
+    assert!(matches!(
+        c.submit(MonotonicMillis::ZERO, &same),
+        Ok(Submitted::Attached { .. })
+    ));
 }
 
 /// A voter holding evidence for a submitter it does not know yet must
@@ -783,7 +799,7 @@ fn a_voter_joining_after_the_envelope_was_released_is_not_left_owed() {
     c.reconfigure(quorum(5));
 
     assert!(
-        c.due_offers(u64::MAX, 16).is_empty(),
+        c.due_offers(MonotonicMillis::new(u64::MAX), 16).is_empty(),
         "there is no envelope to offer the new voters"
     );
     assert_eq!(

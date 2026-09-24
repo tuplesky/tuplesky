@@ -51,6 +51,7 @@ use coord_types::wire_v1::{
 };
 use coord_types::{CommandId, RetryKey};
 
+use crate::clock::MonotonicMillis;
 use crate::codes;
 
 use crate::trace::{CollectorEvent, command_hex, replica_hex};
@@ -189,7 +190,7 @@ enum Owed {
     /// behind it.
     Missed {
         attempts: u32,
-        next: u64,
+        next: MonotonicMillis,
         why: OfferOutcome,
     },
     /// Not taken, and not on the congestion schedule: a configuration
@@ -247,11 +248,11 @@ impl Dissemination {
 /// How long a destination waits before the first repeat, in
 /// milliseconds.
 ///
-/// Milliseconds of a **monotonic** reading, and deliberately not the
-/// `now_ticks` the deadline path takes: that one is a wall clock, and a
-/// retry schedule built on a clock that can step is a retry schedule
-/// that can stall or stampede. The caller supplies it; this crate holds
-/// no clock of its own.
+/// Milliseconds of a **monotonic** reading ([`MonotonicMillis`]), the
+/// same reading the deadline path takes, and deliberately not the wall
+/// clock that authenticates a token: a retry schedule built on a clock
+/// that can step is a retry schedule that can stall or stampede. The
+/// caller supplies it; this crate holds no clock of its own.
 ///
 /// A floor, not a rate. A queue that was full a moment ago is often
 /// free a moment later, so the first repeat is soon; what must not
@@ -430,7 +431,7 @@ struct Pending {
     votes: VoteSet,
     released: Option<ReleasedResult>,
     attached: bool,
-    deadline: Option<u64>,
+    deadline: Option<MonotonicMillis>,
     timed_out: bool,
     /// What each voter still owes this command by way of taking the
     /// submission. Independent of `votes`: a destination that took the
@@ -509,10 +510,11 @@ impl Collector {
         std::mem::take(&mut self.trace)
     }
 
-    /// Submit an admitted request at `now_ticks`.
+    /// Submit an admitted request at `now`, the monotonic reading its
+    /// deadline is measured from.
     pub fn submit(
         &mut self,
-        now_ticks: u64,
+        now: MonotonicMillis,
         admitted: &AdmittedRequest,
     ) -> Result<Submitted, SubmitRefusal> {
         let request = match decode_stream(&admitted.frame).as_deref() {
@@ -542,7 +544,7 @@ impl Collector {
             if let Some(entry) = self.pending.get_mut(&command) {
                 entry.attached = true;
                 entry.timed_out = false;
-                entry.deadline = deadline(now_ticks, request.deadline_ms);
+                entry.deadline = deadline(now, request.deadline_ms);
                 self.trace.push(CollectorEvent::Attached {
                     command: command_hex(&command),
                     sequence,
@@ -597,7 +599,7 @@ impl Collector {
                 votes: VoteSet::new(self.config.quorum.clone(), command),
                 released: None,
                 attached: true,
-                deadline: deadline(now_ticks, request.deadline_ms),
+                deadline: deadline(now, request.deadline_ms),
                 timed_out: false,
                 dissemination: Dissemination {
                     envelope: Some(Arc::clone(&frame)),
@@ -640,7 +642,7 @@ impl Collector {
     /// the command will be established: the learning predicate and the
     /// leader's release gate decide that, over however many voters did
     /// take it.
-    pub fn offered(&mut self, now_millis: u64, report: &Offered) {
+    pub fn offered(&mut self, now: MonotonicMillis, report: &Offered) {
         let Some(entry) = self.pending.get_mut(&report.command) else {
             // Settled, or never ours. Either way there is nothing left
             // to owe, and a late report about it is not an error.
@@ -662,7 +664,7 @@ impl Collector {
                     };
                     Owed::Missed {
                         attempts,
-                        next: now_millis.saturating_add(backoff_millis(attempts)),
+                        next: now.plus(backoff_millis(attempts)),
                         why: *why,
                     }
                 }
@@ -700,7 +702,7 @@ impl Collector {
     /// a command stops being re-offered when it settles or when the
     /// destination stops being one, not when it has been difficult
     /// enough times.
-    pub fn due_offers(&mut self, now_millis: u64, budget: usize) -> Vec<FanOut> {
+    pub fn due_offers(&mut self, now: MonotonicMillis, budget: usize) -> Vec<FanOut> {
         if budget == 0 || self.pending.is_empty() {
             return Vec::new();
         }
@@ -727,7 +729,7 @@ impl Collector {
                     break;
                 }
                 if let Owed::Missed { next, .. } = owed
-                    && *next <= now_millis
+                    && *next <= now
                 {
                     targets.push(*replica);
                     spent += 1;
@@ -735,7 +737,7 @@ impl Collector {
                     // answer will overwrite this, and until it does the
                     // destination must not be picked again -- an
                     // in-flight attempt is not a free slot.
-                    *next = now_millis.saturating_add(OFFER_CEILING_MILLIS);
+                    *next = now.plus(OFFER_CEILING_MILLIS);
                 }
             }
             if targets.is_empty() {
@@ -766,7 +768,7 @@ impl Collector {
     /// was busy is free again -- that is never. A destination stalled
     /// for a reason repeating cannot change is not on the schedule and
     /// is not counted.
-    pub fn next_due(&self) -> Option<u64> {
+    pub fn next_due(&self) -> Option<MonotonicMillis> {
         self.pending
             .values()
             .filter(|entry| entry.dissemination.envelope.is_some())
@@ -1160,16 +1162,16 @@ impl Collector {
         resolution
     }
 
-    /// Commands whose client deadline passed at `now_ticks`; each is
-    /// reported once and stays pending for resolution.
-    pub fn expire(&mut self, now_ticks: u64) -> Vec<Expired> {
+    /// Commands whose client deadline passed at `now`; each is reported
+    /// once and stays pending for resolution.
+    pub fn expire(&mut self, now: MonotonicMillis) -> Vec<Expired> {
         let mut out = Vec::new();
         for (command, entry) in &mut self.pending {
             if entry.timed_out {
                 continue;
             }
             if let Some(deadline) = entry.deadline
-                && now_ticks >= deadline
+                && now >= deadline
             {
                 entry.timed_out = true;
                 out.push(Expired {
@@ -1226,7 +1228,7 @@ impl Collector {
                 if matches!(owed, Owed::Stalled(_)) && held {
                     *owed = Owed::Missed {
                         attempts: 1,
-                        next: 0,
+                        next: MonotonicMillis::ZERO,
                         why: OfferOutcome::Unreachable,
                     };
                 }
@@ -1266,8 +1268,10 @@ const fn backoff_millis(attempts: u32) -> u64 {
     }
 }
 
-fn deadline(now_ticks: u64, deadline_ms: u32) -> Option<u64> {
-    (deadline_ms > 0).then(|| now_ticks.saturating_add(u64::from(deadline_ms)))
+/// The reading at which a request presented at `now` with `deadline_ms`
+/// expires; none for a request that named no deadline.
+fn deadline(now: MonotonicMillis, deadline_ms: u32) -> Option<MonotonicMillis> {
+    (deadline_ms > 0).then(|| now.plus(u64::from(deadline_ms)))
 }
 
 fn evidence_event(

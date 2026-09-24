@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_authn::ClockHealth;
+use coord_collector::MonotonicMillis;
 use coord_collector::{Action, Delivery, Dispatcher, codes};
 use coord_core::event::AdmittedRequest;
 use coord_state::Response;
@@ -193,17 +194,21 @@ impl BoundFrontend {
         self.config.jwks = jwks;
     }
 
-    /// One frame of `connection` at `clock`.
+    /// One frame of `connection` at `clock` (the authentication wall
+    /// clock, which a binding's expiry and a receipt's stamp are judged
+    /// by) and `now` (the monotonic reading a request's deadline is
+    /// measured from).
     pub fn on_frame(
         &mut self,
         clock: &ClockHealth,
+        now: MonotonicMillis,
         connection: u64,
         frame: &Frame,
         hub: &WatchHub,
         policy: &dyn PolicySource,
     ) -> Ingress {
         if frame.kind == KIND_BIND {
-            return self.bind(clock, connection, frame, policy);
+            return self.bind(clock, now, connection, frame, policy);
         }
         let Some(binding) = self.bindings.get(&connection) else {
             return Ingress::NotBound;
@@ -221,7 +226,7 @@ impl BoundFrontend {
         };
         let action = self
             .dispatcher
-            .on_frame(clock.now, connection, &caller, frame, hub);
+            .on_frame(clock.now, now, connection, &caller, frame, hub);
         // Bookkeeping for later disclosures, recorded only for a request
         // the dispatcher accepted under its own identity. Recording it
         // before would let a conflicting payload under a pending retry
@@ -280,6 +285,7 @@ impl BoundFrontend {
     fn bind(
         &mut self,
         clock: &ClockHealth,
+        now: MonotonicMillis,
         connection: u64,
         frame: &Frame,
         policy: &dyn PolicySource,
@@ -318,7 +324,7 @@ impl BoundFrontend {
                 Ingress::Bound(ack)
             }
             Some(_) => Ingress::Rejected(BindError::SessionDisagrees),
-            None => self.establish(clock, connection, binding, ack),
+            None => self.establish(clock, now, connection, binding, ack),
         }
     }
 
@@ -327,6 +333,7 @@ impl BoundFrontend {
     fn establish(
         &mut self,
         clock: &ClockHealth,
+        now: MonotonicMillis,
         connection: u64,
         binding: Binding,
         ack: Vec<u8>,
@@ -354,7 +361,7 @@ impl BoundFrontend {
         };
         match self
             .dispatcher
-            .establish(clock.now, connection, &admitted, retry_key)
+            .establish(now, connection, &admitted, retry_key)
         {
             Ok(Action::FanOut(plan)) => {
                 self.establishing.insert(
@@ -696,16 +703,19 @@ impl BoundFrontend {
         self.dispatcher.cancel_watch(connection, watch_id, hub)
     }
 
-    /// Time passed: connections whose binding ended (to close) and the
-    /// dispatcher's deadline deliveries.
-    pub fn tick(&mut self, clock: &ClockHealth) -> (Vec<u64>, Vec<Delivery>) {
+    /// Time passed: connections whose binding ended at `clock` (to
+    /// close) and the requests whose deadline passed at `now` (the
+    /// dispatcher's deliveries). A binding ends on the wall clock, a
+    /// deadline on the monotonic one; a step in the first moves nothing
+    /// in the second.
+    pub fn tick(&mut self, clock: &ClockHealth, now: MonotonicMillis) -> (Vec<u64>, Vec<Delivery>) {
         let expired: Vec<u64> = self
             .bindings
             .iter()
             .filter(|(_, b)| !b.active(clock))
             .map(|(c, _)| *c)
             .collect();
-        let deliveries = self.dispatcher.expire(clock.now);
+        let deliveries = self.dispatcher.expire(now);
         (expired, deliveries)
     }
 
