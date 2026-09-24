@@ -4443,3 +4443,134 @@ async fn a_caller_cannot_expire_a_lease_however_it_spells_it() {
         );
     }
 }
+
+/// A quorum goes on answering long past its command table's capacity.
+///
+/// The single-voter version of this found the reclamation defect. This
+/// is the same question of a real quorum, where the answer depends on
+/// every replica draining: a follower that stops executing stops
+/// retiring, its table fills, and from then on it refuses every
+/// submission and every proposal it is sent -- silently, because a
+/// refusal at that door is not something the caller is told.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quorum_keeps_answering_past_its_table_capacity() {
+    let dir = workspace("sustained-quorum");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0), "each store is made");
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "voter {} cannot submit to the other two:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x43; 16]).await;
+
+    // Comfortably past the table's capacity, which is 64.
+    const ASKS: u64 = 400;
+    for n in 1..=ASKS {
+        let key = format!("k{n:04}").into_bytes();
+        let answered = ask(&caller.connection, &caller.put(n, &key, b"v")).await;
+        assert!(
+            answered.is_some(),
+            "request {n} of {ASKS} was never answered\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+            running[0].said(),
+            running[1].said(),
+            running[2].said()
+        );
+    }
+
+    // And again with two callers in flight, which is what fills a
+    // follower's table with the leader's proposals as well as its own
+    // records. A follower in that state reclaims ahead of the leader,
+    // and the next proposal names the command it has just retired: the
+    // dependency guard has to read that as executed, because it was.
+    // Four, not two. What this phase is really for is the race between
+    // a voter hearing a command's identity from the leader and hearing
+    // its content from the collector, and the more callers there are
+    // the more often the first wins.
+    const EACH: u64 = 120;
+    const CALLERS: usize = 4;
+    let mut callers = Vec::new();
+    for n in 0..CALLERS {
+        let session = [0x44 + n as u8; 16];
+        callers.push(Caller::bind(&running[0], &cluster.ca, &cluster.ring, session).await);
+    }
+    async fn ask_all(caller: &Caller, tag: u8) -> u64 {
+        let mut answered = 0;
+        for n in 1..=EACH {
+            let key = format!("c{tag:02x}-{n:04}").into_bytes();
+            if ask(&caller.connection, &caller.put(n, &key, b"v"))
+                .await
+                .is_some()
+            {
+                answered += 1;
+            }
+        }
+        answered
+    }
+    let mut work = Vec::new();
+    for (n, caller) in callers.iter().enumerate() {
+        work.push(ask_all(caller, n as u8 + 1));
+    }
+    // Every caller keeps one request in flight at a time, and all of
+    // them are in flight at once.
+    let (a, b, c, d) = tokio::join!(
+        work.remove(0),
+        work.remove(0),
+        work.remove(0),
+        work.remove(0)
+    );
+    let answered = vec![a, b, c, d];
+    assert_eq!(
+        answered,
+        vec![EACH; CALLERS],
+        "{CALLERS} callers past the capacity were answered {answered:?} of {EACH} each\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
+    );
+
+    // The symptom of the defect was not a slow domain but a dead one:
+    // every voter's table stayed full, so the next caller's session --
+    // a replicated command like any other -- was refused at a door
+    // that tells the caller nothing, and the binding waited out its
+    // deadline. So the last thing asked here is a new session.
+    let later = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x50; 16]).await;
+    assert!(
+        ask(&later.connection, &later.put(1, b"after", b"v"))
+            .await
+            .is_some(),
+        "a caller that arrived after the load was never answered\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
+    );
+
+    // Two callers at once is also what makes a voter hear about a
+    // command from a peer before the collector asks it for one, so this
+    // run is where the holding path is exercised. The assertions above
+    // are the ones that matter; these two say that they were not
+    // passed vacuously, and that nothing was lost on the way.
+    let said: Vec<String> = running.iter().map(Running::said).collect();
+    assert!(
+        said.iter()
+            .any(|s| s.contains("holding evidence for a submitter it does not know yet")),
+        "no voter ever held evidence, so this run did not exercise the path it is here for\n-- voter 1 --\n{}\n-- voter 2 --\n{}\n-- voter 3 --\n{}",
+        said[0],
+        said[1],
+        said[2]
+    );
+    for (n, s) in said.iter().enumerate() {
+        assert!(
+            !s.contains("dropped evidence no submission ever claimed"),
+            "voter {} dropped evidence a caller's collector was waiting for:\n{}",
+            n + 1,
+            s
+        );
+    }
+}

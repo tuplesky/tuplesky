@@ -1743,7 +1743,8 @@ of every production artifact.
 
 The suite passed the whole storage-edge security matrix, create, read,
 compare-and-swap, delete, paging and the compaction floor. Then it found
-four things, of which two are fixed here and two are written down.
+eight things. All eight are fixed here, and each became findable
+only once the ones before it were.
 
 **A watch was registered and never delivered on.** `Step::Watch` in
 `bins/coordd/src/serve.rs` counted the watch and dropped the responder.
@@ -1826,9 +1827,8 @@ touched: a record in START, PRE-ACCEPT, ACCEPT or COMMIT is an
 obligation, and evicting one to serve a newer command would lose it
 rather than shed load. And a retired record has to go on looking
 executed to anything that depends on it, which is what `retire`'s
-tombstones are for -- they are dropped with the last record that
-references them, so the bookkeeping stays bounded by the live set
-instead of by history.
+tombstones are for. How long a tombstone lives was answered wrongly
+first, and is the subject of the last finding below.
 
 The leader also had to stop asking the table whether a command executed.
 `unexecuted_in_order` filtered on `phase_of(c) < Some(Phase::Executed)`,
@@ -1889,6 +1889,94 @@ one. All four now say so. The second is that `Leader::take_rejections`
 had no caller at all -- the list grew for the life of the process, and
 the reasons in it were never read by anything. The driver drains it
 every turn.
+
+**A follower forgot a command the leader was about to name.** With the
+lowering loop in, two callers against three voters ran clean: two
+hundred operations, none unknown, three hundred and forty-five a second.
+Then the *next* invocation against the same domain could not even bind,
+and no later one ever did. Every voter had stopped serving, permanently,
+on an idle machine.
+
+The symptom is the one the table capacity produced before, and the cause
+is its mirror image. Both followers' tables were full and stayed full:
+sixty-four records, all of them proposals held for an order that could
+never be adopted, every payload present, nothing executable. Walking the
+chain down from the newest held proposal ends at leader sequence
+sixty-four, whose single dependency is a command that has no phase at
+all -- and which that same replica had adopted, committed, executed and
+retired minutes earlier.
+
+`retire` tombstoned a command only when a live record already depended on
+it. That rule quietly assumes every dependency is written down in the
+table, and on a follower it is not. A follower holds the leader's
+proposals until their payloads arrive, and the dependency such a proposal
+names lives in the proposal. So the sequence is: the follower executes a
+command, its table fills -- with held proposals as well as its own
+records, which is why it fills ahead of the leader's -- it reclaims, the
+command goes without a tombstone because no record refers to it, and the
+next proposal to arrive names exactly that command. `guard_accept` reads
+"unknown" for a command this replica ran itself, the proposal is never
+adopted, every later command queues behind it, and the table never drains
+again. A new caller's session is a replicated command like any other, so
+binding is what fails first, which is why it looked like a transport
+fault.
+
+The tombstone is now unconditional, and what bounds it is recency rather
+than reference counting: the oldest goes once there are more tombstones
+than the table has room for records. That bound is not arbitrary. A
+leader names as a dependency only a command still live in its own table,
+and under the conservative conflict key that is always the immediately
+preceding command; a replica that remembers its last `capacity`
+retirements therefore remembers every command a leader can still name,
+with a large margin.
+
+Why one caller never hit it is the same accident that hid the first two
+findings. With one request in flight, the table is nearly empty when
+reclamation runs, so there is rarely a held proposal to be orphaned --
+four hundred sequential operations pass. With two, there is always one,
+and the collapse is total: the run before the fix completed 190 of 200
+at seven operations a second, the six runs after it completed 200 of 200
+at about three hundred and forty-five.
+
+The regression test is at the table, where the defect is:
+`crates/coord-consensus/tests/graph.rs::a_dependency_retired_before_its_proposal_arrives_is_still_executed`
+retires a command nothing refers to and then adopts an order that names
+it. With the old rule it fails with `DependencyUnknown`, which is
+verbatim what the wedged follower reported.
+`bins/coordd/tests/cli.rs::a_quorum_keeps_answering_past_its_table_capacity`
+now carries the composition's half: past the capacity sequentially, then
+past it again with two callers in flight, and then a *new* session --
+because the symptom was never a slow domain, it was a dead one.
+
+**A vote that outran the proposal it was about was thrown away.** The
+leader logged `Vote(WrongCommand)` a thousand times in one matrix, under
+a comment reading "acknowledgements for a command this leader never
+proposed are kept out: nothing to learn from". It had not proposed them
+*yet*. Every voter is sent the same submission, so a voter that
+initializes one before this leader does acknowledges it before this
+leader has ordered it, and under concurrent callers that race is won by
+a follower most of the time.
+
+Dropping that acknowledgement loses nothing -- the follower's slow
+acknowledgement after the proposal still forms a quorum -- but it costs
+the fast path a round trip on the majority of commands, which is the
+difference the fast path exists to make. It is now held, in the same
+spirit as the proposal a follower holds until its payload arrives, and
+bounded the same way: as many commands as the table has room for, with
+the oldest evicted rather than the newest refused, so acknowledgements
+for a command nobody will ever propose cannot turn the mechanism off.
+After the fix that counter reads zero.
+
+**And a node that is waiting for content has to keep asking.** The
+request for a missing payload was sent every sixteenth *turn*, and a
+turn happens when an event arrives. A domain with nothing else going on
+takes no turns -- which is exactly the state a replica is in when
+execution has stopped at a command it lacks -- so the second ask never
+went out. The peer it asked may have had nothing to send the first time,
+because its own proposal was not durable yet, and then nobody asked
+again. The interval is now a duration and the loop has a timer arm for
+it: a replica waiting for content comes back on its own rather than
+waiting for an event that is not coming.
 
 **And a key under a time to live did not expire.** Written with a
 one-second lease, still readable a minute later. The private binding was
@@ -1980,9 +2068,184 @@ questions in a row, or two at once, and nothing had ever held one of its
 streams open across two writes. A Kubernetes API server does all three
 while it is still booting.
 
+**And about one operation in two hundred was never answered.** With
+four callers against three voters, a run of two hundred operations ended
+with one or two that reached their deadline. Not slowness: a
+two-second deadline, a four-second one and a thirty-second one all lost
+the same count, and the thirty-second run's straggler waited the whole
+thirty seconds. A count that does not move when the deadline moves is
+something that never completes.
+
+Every voter was idle when it happened. Nothing queued for the journal,
+nothing unmaterialized, nothing withheld in an outbox, every record in
+every command table executed -- and a caller's stream still held open.
+The collector holding that stream reported the invocation as
+`awaiting-release`; it had its votes and was waiting for a release the
+leader had already sent. No refusal was recorded anywhere.
+
+The count that gave it away was the collector's own. For the lost
+command it had exactly **one** vote -- the leader's -- while both
+followers had refused the submission as a `Duplicate`. They had already
+accepted that command; they simply never told the collector so.
+
+A voter learns a command's content from a submission *or* from a peer.
+When it learns it from a peer -- because the leader's proposal outran
+the collector's submission and it asked for the payload -- it
+initializes the command and acknowledges it, correctly. But
+acknowledgement is owed to the collector that asked for the work, and
+this voter has not been asked yet: no submission has reached it, so it
+has nothing to say where the acknowledgement belongs. The daemon's rule
+for that case was to hand the frame to the collector in its own process,
+and that collector has never heard of the command, so the frame was
+dropped. Moments later the real submission arrived, the retry key was
+already bound, the replica refused it as a duplicate, and the
+acknowledgement was never produced again.
+
+The domain was never wrong: the command was ordered, executed and
+durable, and every voter agreed. What was lost was one third of the
+evidence the *caller's* collector needs to learn it independently, which
+is the whole reason the collector counts votes rather than trusting one
+replica's word.
+
+So evidence with no known submitter is now held instead of misdelivered,
+and a submission -- including one refused as a duplicate, which is
+exactly the case that produces this -- is what releases it. The hold is
+bounded by the thing the window is bounded by: a command can be in this
+state only between this voter acknowledging it and the submission
+reaching it, so the depth that matters is the commands in flight at
+once. Past the bound the oldest goes and says so, because a caller's
+collector is then one acknowledgement short and will not be told why.
+
+Two things this makes visible that were not. A voter now says once that
+it is holding evidence for a submitter it does not know, which is
+ordinary and worth seeing; and it says once if it ever drops any, which
+is not. `a_quorum_keeps_answering_past_its_table_capacity` asserts on
+both, and the second half of it -- four callers in flight past the
+table's capacity -- fails without the fix with a caller one or two
+short of its hundred and twenty.
+
+*A wrong turn worth recording.* The obvious first suspect was the
+leader's per-command memory, which is genuinely unbounded: proposals,
+vote sets and payloads are kept for the life of the process. Bounding
+them made the loss dramatically worse -- every run failed instead of one
+in two hundred -- and that looked like a second defect. It was the same
+one. Forgetting a payload makes a follower ask a peer for it, asking a
+peer is how a follower comes to hold a command no collector has asked it
+for, and every one of those was a chance to drop an acknowledgement. The
+bound was reverted at the time for being unsafe; with the routing fixed
+it passes, which is how the coupling was finally named. Bounding that
+memory is still worth doing and belongs with
+[task-j07](design/tuplesky-prs-plan.md#task-j07).
+
+**A voter that filled its table never emptied it again.** Once the
+straggler above was fixed the matrix ran eight times faster, and the
+re-run found the defect the old rate had been hiding. One voter of
+three would stop: sixty-four records at PRE-ACCEPT, every later proposal
+and submission refused for backpressure, its projection frozen at the
+position it reached, and -- because a frontend reads replicated policy
+out of that projection -- every read its own callers asked for refused
+as unauthorized for the rest of the run. About a third of the reads in
+the `scans` and `read-mostly` rows, which is what a caller bound to that
+voter's frontend sees, and nothing at all in the rows that ran before it
+stopped.
+
+The cause is two lines, both the same mistake. `Follower::on_proposal`
+and `Follower::on_request` each recorded a backpressure refusal and
+returned. What they returned from is the function that ends by calling
+`advance_pending` -- the step that adopts the records whose turn has
+come, and adoption is what lets a command execute, be retired, and free
+the slot that was missing. So the two doors into the machine, on the one
+occasion when making progress mattered most, were exactly the two that
+stopped making it. The table stayed full, and it stayed full for ever:
+the leader does not re-propose, there is no message to ask it for an
+order it already sent, and nothing else would prompt the replica to look
+again.
+
+The proposal was also *dropped*, which is the second half of it. A
+leader's order reaches a replica once. Dropped for want of a table slot,
+the command can never be adopted even after the slot frees and its
+payload arrives -- it sits at PRE-ACCEPT, and with a conservative key
+making the dependency chain total, so does everything ordered after it.
+It is now held instead, bounded at eight times the table's own capacity,
+which is generous on purpose: the failure mode of holding too few is the
+wedge, and the failure mode of holding too many is memory.
+
+**And a repair that made the thing it was repairing worse.** A replica
+that lacks a command's content asks its leader for it every fifty
+milliseconds until it arrives, which is right. It asked for *all* of
+them -- a tableful, sixty-four -- and the leader answered with sixty-four
+payload frames, several times a second, on the one bounded lane that
+also carries the proposals and acknowledgements that replica was waiting
+for. The lane filled, what it dropped was the traffic that would have
+let the replica catch up, and it fell further behind and asked for more.
+The leader's own log says it plainly: `QueueFull { lane: Control }` to
+one replica, over and over, while that replica reported sixty-four
+payloads missing and never fewer.
+
+Payload transfer is now bounded on both sides at
+`MAX_PAYLOAD_TRANSFER`, with a rotating cursor so that a bound on how
+many are asked for at once does not mean the same few are asked for
+every time and the rest never. The bound is on the answering side too,
+because a peer must not be able to make this replica flood its own lane
+by asking for more than the protocol's own bound.
+
+A bound on the ask needs a matching change to when the ask goes out, and
+this is the part that took a second run to see. The daemon repeated the
+ask on a fifty-millisecond interval, which was right when the ask was
+unbounded and wrong the moment it was not: a bounded ask on an interval
+is a *rate*, and a replica behind by more than the domain produces in an
+interval can never close the gap however long it runs. The soak showed
+exactly that -- a follower holding ninety-nine proposals and missing
+ninety-two payloads, asking for eight of them twenty times a second
+while the domain committed three hundred. The interval is now the floor
+for an ask nobody answered, and the ask is a window: one outstanding at
+a time, and the next goes the moment the number of missing payloads
+moves, which is to say as soon as the last one was answered.
+
+Which put the two halves of the repair in direct conflict, and that is
+the thing worth naming. Ask slowly and a replica behind by more than the
+interval's worth can never catch up; ask as fast as the answers come and
+the catch-up traffic fills the queue that the proposals and
+acknowledgements it is catching up *with* are waiting in. Both were
+measured, one wedge each. There is no rate that resolves it, because the
+two kinds of traffic were competing for one queue -- and the transport
+has had a lane for exactly this since task-31. Payload transfer now goes
+down the bulk lane, which is where moving whole command payloads
+belongs, and the control lane carries only what the protocol needs to
+make progress. The classification reads the encoded discriminant rather
+than decoding the frame, because deciding where to send a payload by
+decoding it would cost more than the send;
+`payload_transfer_is_recognized_from_the_encoded_discriminant` pins the
+two bytes against the encoder so that a variant added above them fails a
+test instead of quietly mis-routing.
+
+`a_full_table_still_adopts_and_still_keeps_the_order_it_was_sent` fills
+a follower's table exactly, refuses a submission and a proposal at the
+door, and asserts both halves: the order in the refused proposal is
+kept, and the records whose turn had come are adopted anyway. Reverting
+either half fails it. The bound and the rotation are asserted together
+by `payload_transfer_is_bounded_in_both_directions_and_still_covers_everything`:
+a bound that always took the same prefix would be a wedge with a bound
+on it rather than a fix.
+
+*And what is left, stated plainly.* A replica that falls behind now
+recovers instead of stopping, and nothing is lost or refused that was
+not lost or refused before it fell behind. It does not recover
+*quickly*: on the re-run matrix the read-heavy rows lose about three
+operations in ten to the ten-second deadline, all of them belonging to
+the callers bound to one frontend, at every offered rate including the
+closed loop. Those are reads held pending on a projection that has not
+caught up, not reads refused, and they are published in
+[the results](operations/wan-results.md#the-finding-this-run-exposed)
+rather than tuned away. Closing it means a catch-up path that outruns
+the load that put the replica behind, which is a protocol question
+rather than a bound to adjust, and it belongs with
+[task-j07](design/tuplesky-prs-plan.md#task-j07) beside the leader's
+per-command memory.
+
 ### What the benchmark harness had to get right to find these
 
-A closed-loop benchmark would not have found the last two. It sends the next
+A closed-loop benchmark would not have found the fifth or the sixth. It sends the next
 request when the previous one returns, so a domain that serializes work
 looks like a domain with a long service time and a perfectly respectable
 throughput curve.
@@ -1997,11 +2260,17 @@ of fast completions followed by nothing at all, identical on every
 repetition and unchanged by a fifteen-fold longer deadline. A count that
 does not move when the deadline moves is a resource that ran out.
 
-The same separation is what distinguishes the remaining finding from
-that one. Adding a second caller does not move a count; it collapses the
+The same separation is what distinguishes the third finding from that
+one. Adding a second caller does not move a count; it collapses the
 completion rate while the service times of the few that get through stay
 ordinary. That is a different shape, and it is why the two are written
 up as two things rather than as "it gets slow under load".
+
+The fourth needed something else again: a run that succeeds, followed by
+a run against the same domain that cannot start. One invocation per row
+is what made that visible. A harness that stood a domain up and tore it
+down inside each row would have reported six healthy rows and never the
+state the first one left behind.
 
 The three-distribution split is not decoration. `queue` says whether the
 harness was the bottleneck, `service` says what the operation cost once

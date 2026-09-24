@@ -18,7 +18,7 @@
 //! Follower acknowledgements are collected per command and nothing more:
 //! learning is not decided here.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
 use coord_core::capability::{AdmissionFacts, ReleasedResult, admission_digest};
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::{PathAnchors, ProtocolMessage};
+use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryReport, SyncDecision};
@@ -189,6 +189,12 @@ pub struct Leader {
     bindings: BTreeMap<RetryKey, CommandId>,
     proposals: BTreeMap<CommandId, Proposal>,
     votes: BTreeMap<CommandId, VoteSet>,
+    /// Acknowledgements that reached this leader before it had proposed
+    /// the command they are about, held until it does.
+    early_votes: BTreeMap<CommandId, Vec<Vote>>,
+    /// The same commands in arrival order, so the oldest is the one
+    /// dropped when the hold is full.
+    early_order: VecDeque<CommandId>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
     ledger: DurableLedger,
     learner: Learner,
@@ -243,6 +249,8 @@ impl Leader {
             bindings: BTreeMap::new(),
             proposals: BTreeMap::new(),
             votes: BTreeMap::new(),
+            early_votes: BTreeMap::new(),
+            early_order: VecDeque::new(),
             payloads: BTreeMap::new(),
             ledger: DurableLedger::new(),
             learner: Learner::new(executed_through),
@@ -324,6 +332,8 @@ impl Leader {
             bindings: state.bindings,
             proposals: BTreeMap::new(),
             votes: BTreeMap::new(),
+            early_votes: BTreeMap::new(),
+            early_order: VecDeque::new(),
             payloads: state.payloads,
             ledger: state.ledger,
             learner: state.learner,
@@ -450,6 +460,7 @@ impl Leader {
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
         self.votes.insert(command, set);
+        self.adopt_early_votes(command);
         self.proposals.insert(
             command,
             Proposal {
@@ -1023,6 +1034,7 @@ impl Leader {
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
         self.votes.insert(command, set);
+        self.adopt_early_votes(command);
         self.proposals.insert(
             command,
             Proposal {
@@ -1339,6 +1351,12 @@ impl Leader {
                         payload: p.clone(),
                     })
             })
+            // A replica that fell behind asks again on a timer. If every
+            // ask were answered in full, the answers alone would fill
+            // the lane they share with the proposals and commits that
+            // replica is waiting for, and it would fall further behind
+            // for as long as it kept asking. See [`MAX_PAYLOAD_TRANSFER`].
+            .take(MAX_PAYLOAD_TRANSFER)
             .collect();
         if let Some(outbox) = self.outbox.as_mut() {
             for m in responses {
@@ -1356,6 +1374,58 @@ impl Leader {
         self.release()
     }
 
+    /// Hold an acknowledgement for a command not yet proposed. Returns
+    /// whether it had to be refused instead.
+    fn hold_vote(&mut self, command: CommandId, vote: Vote) -> bool {
+        let voters = self.config.identity.voters.len();
+        if !self.early_votes.contains_key(&command) {
+            // Full means the oldest goes, not that this one is refused.
+            // A command this leader never proposes leaves its
+            // acknowledgements here for ever otherwise, and a hold
+            // full of those would quietly turn the mechanism off.
+            while self.early_votes.len() >= self.config.capacity {
+                match self.early_order.pop_front() {
+                    Some(oldest) => {
+                        self.early_votes.remove(&oldest);
+                    }
+                    None => return true,
+                }
+            }
+            self.early_order.push_back(command);
+        }
+        let held = self.early_votes.entry(command).or_default();
+        // One fast and one adoption acknowledgement per voter is all a
+        // vote set will ever count, so that is all this holds.
+        if held.len() >= voters.saturating_mul(2) {
+            return true;
+        }
+        held.push(vote);
+        false
+    }
+
+    /// Count the acknowledgements held for a command this leader has
+    /// just proposed. Nothing is released here: the proposal's own rows
+    /// are not durable yet, and learning waits for them as it always
+    /// did.
+    fn adopt_early_votes(&mut self, command: CommandId) {
+        let Some(held) = self.early_votes.remove(&command) else {
+            return;
+        };
+        self.early_order.retain(|c| *c != command);
+        let Some(set) = self.votes.get_mut(&command) else {
+            return;
+        };
+        let mut refused = Vec::new();
+        for vote in held {
+            if let Err(e) = set.add(vote) {
+                refused.push(e);
+            }
+        }
+        for e in refused {
+            self.rejections.push(Rejection::Vote(e));
+        }
+    }
+
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {
         if vote.replica() != from {
             self.rejections.push(Rejection::Vote(VoteError::NotAVoter));
@@ -1363,10 +1433,25 @@ impl Leader {
         }
         let command = vote.command();
         let Some(set) = self.votes.get_mut(&command) else {
-            // Acknowledgements for a command this leader never proposed are
-            // kept out: nothing to learn from.
-            self.rejections
-                .push(Rejection::Vote(VoteError::WrongCommand));
+            // Not "a command this leader never proposed": a command it
+            // has not proposed *yet*. Every voter is sent the same
+            // submission, and a voter that initializes it before this
+            // leader does acknowledges it before this leader has
+            // ordered it. Dropping that acknowledgement does not lose
+            // the command -- the slow path still learns it -- but it
+            // costs the fast path a round trip on every command whose
+            // acknowledgement wins that race, which under concurrent
+            // callers is most of them.
+            //
+            // So it is held, in the same spirit as the proposal a
+            // follower holds until its payload arrives, and bounded the
+            // same way: as many commands as the table has room for, and
+            // per command no more acknowledgements than there are
+            // voters to send them.
+            if self.hold_vote(command, vote) {
+                self.rejections
+                    .push(Rejection::Vote(VoteError::WrongCommand));
+            }
             return Vec::new();
         };
         if let Err(e) = set.add(vote) {

@@ -13,7 +13,7 @@
 //! do: a join that happened in several places would be several
 //! opportunities for one of them to answer the wrong caller.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use coord_authn::ClockHealth;
 use coord_checkpoint::local::LocalLimits;
@@ -36,8 +36,8 @@ use coord_session::{BindingConfig, BoundFrontend, Delivered, StorePolicySource};
 use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_transport::{Responder, Transport, TransportEvent};
-use coord_types::RetryKey;
 use coord_types::wire_v1::{Frame, MessageV1, decode};
+use coord_types::{CommandId, RetryKey};
 
 /// Why the loop could not be built.
 #[derive(Debug)]
@@ -154,6 +154,12 @@ pub struct Counts {
     /// Frames and effects this build has no loop for yet, counted rather
     /// than discarded so what arrives is visible.
     pub unserved: u64,
+    /// Evidence this voter produced for a command whose submitter it did
+    /// not know yet, held until it does.
+    pub parked: u64,
+    /// Held evidence dropped because the submission it was waiting for
+    /// never arrived here.
+    pub unclaimed: u64,
 }
 
 impl Frontend {
@@ -333,9 +339,9 @@ pub struct PeerPlane {
     peers: Vec<crate::peers::Peer>,
     /// Dials attempted and dials that reached a voter (diagnostic).
     pub dialled: (u64, u64),
-    /// The reachable count last reported on stderr, so the report is
+    /// The control and bulk counts last reported on stderr, so the report is
     /// repeated when it changes and not on every connection event.
-    reported: Option<usize>,
+    reported: Option<(usize, usize)>,
 }
 
 impl PeerPlane {
@@ -370,16 +376,17 @@ impl PeerPlane {
     /// a process must not die because whoever read its startup report
     /// has stopped reading.
     fn report(&mut self) {
-        let reachable = self.reachable();
+        let reachable = (self.reachable(), self.reachable_bulk());
         if self.reported == Some(reachable) {
             return;
         }
         self.reported = Some(reachable);
         eprintln!(
-            "peers connected={} of {} attempts={}",
-            reachable,
+            "peers connected={} of {} attempts={} bulk={}",
+            reachable.0,
             self.peers.len(),
-            self.dialled.0
+            self.dialled.0,
+            reachable.1
         );
     }
 
@@ -394,13 +401,22 @@ impl PeerPlane {
         self.peers.iter().filter(|p| self.holds(p)).count()
     }
 
+    /// Voters whose bulk lane a connection is holding.
+    pub fn reachable_bulk(&self) -> usize {
+        self.peers
+            .iter()
+            .filter(|p| self.holds_lane(p, coord_transport::Lane::Bulk))
+            .count()
+    }
+
     /// Whether a connection is holding this peer's control lane.
     fn holds(&self, peer: &crate::peers::Peer) -> bool {
-        self.transport.linked(
-            peer.replica,
-            peer.incarnation,
-            coord_transport::Lane::Control,
-        )
+        self.holds_lane(peer, coord_transport::Lane::Control)
+    }
+
+    /// Whether a connection is holding one of this peer's lanes.
+    fn holds_lane(&self, peer: &crate::peers::Peer, lane: coord_transport::Lane) -> bool {
+        self.transport.linked(peer.replica, peer.incarnation, lane)
     }
 
     /// Try every voter not currently connected.
@@ -410,17 +426,34 @@ impl PeerPlane {
     /// incarnation fails the handshake rather than becoming a peer. That
     /// is the whole of what an address is trusted for.
     pub async fn dial_missing(&mut self) {
+        // A voter's lanes are control and bulk; a unary lane is a
+        // collector's or a client's. Both are dialled, because both are
+        // used: what the protocol needs to make progress goes down the
+        // control lane, and a replica fetching the content of commands
+        // it missed moves whole payloads down the bulk one, which is
+        // what keeps catching up from starving the thing it is catching
+        // up with.
+        //
+        // Reachability stays the control lane's. A voter this node can
+        // vote with is reachable whether or not its bulk lane is up
+        // yet, and counting bulk would report a cluster that cannot
+        // form when what is actually true is that nobody has needed to
+        // catch up.
+        self.dial_lane(coord_transport::Lane::Control, true).await;
+        self.dial_lane(coord_transport::Lane::Bulk, false).await;
+    }
+
+    /// Dial every voter whose `lane` this node is not holding.
+    async fn dial_lane(&mut self, lane: coord_transport::Lane, counted: bool) {
         let missing: Vec<crate::peers::Peer> = self
             .peers
             .iter()
-            .filter(|p| !self.holds(p))
+            .filter(|p| !self.holds_lane(p, lane))
             .cloned()
             .collect();
-        self.dialled.0 += missing.len() as u64;
-        // A voter's lanes are control and bulk; a unary lane is a
-        // collector's or a client's. Protocol traffic between replicas
-        // is control traffic, which is also why a bulk checkpoint
-        // transfer cannot delay a vote.
+        if counted {
+            self.dialled.0 += missing.len() as u64;
+        }
         let transport = &self.transport;
         let me = self.me;
         let reached = concurrently(
@@ -432,7 +465,7 @@ impl PeerPlane {
                         peer,
                         Some(me),
                         coord_types::wire_v1::PeerRole::Voter,
-                        coord_transport::Lane::Control,
+                        lane,
                     ))
                 })
                 .collect(),
@@ -440,7 +473,11 @@ impl PeerPlane {
         .await;
         for (peer, outcome) in missing.iter().zip(reached) {
             match outcome {
-                Ok(_) => self.dialled.1 += 1,
+                Ok(_) => {
+                    if counted {
+                        self.dialled.1 += 1;
+                    }
+                }
                 // Not a failure of anything: a voter this process cannot
                 // reach right now contributes no evidence and nothing
                 // else. It is reported because an operator wants to see
@@ -453,7 +490,7 @@ impl PeerPlane {
                 // it now has: reporting that as unreachable would make
                 // an ordinary mesh look broken.
                 Err(e) => {
-                    if !self.holds(peer) {
+                    if counted && !self.holds_lane(peer, lane) {
                         eprintln!(
                             "cannot reach voter {} on the peer plane: {e:?}",
                             hex4(&peer.replica)
@@ -476,11 +513,24 @@ impl PeerPlane {
         // refuses anything else rather than handing it to consensus.
         let frame = coord_transport::evidence_frame(message)
             .map_err(|_| coord_transport::SendError::NotConnected)?;
+        // Catch-up traffic goes down the bulk lane, and everything the
+        // protocol needs to make progress goes down the control one.
+        // They are separated because they compete: a replica fetching
+        // the content of commands it missed moves whole payloads, and
+        // sharing a queue with proposals and acknowledgements means the
+        // frames it drops when that queue fills are the ones it is
+        // catching up *with*. That is not a hypothesis -- it is what one
+        // voter of three did under a benchmark, permanently.
+        let lane = if coord_consensus::is_payload_transfer(message) {
+            coord_transport::Lane::Bulk
+        } else {
+            coord_transport::Lane::Control
+        };
         self.transport.send(
             coord_transport::Destination::Replica {
                 replica: to.replica,
                 incarnation: to.incarnation,
-                lane: coord_transport::Lane::Control,
+                lane,
             },
             self.domain,
             frame,
@@ -604,8 +654,16 @@ pub struct Domain<P: Persistence> {
     /// that runs no voter schedules nothing: an expiry is a command,
     /// and proposing one is a leader's.
     expiry: Option<crate::leases::Expiry>,
-    /// Turns spent holding a command whose payload this node lacks.
-    asking: u64,
+    /// When this node last asked for a payload it lacks, and how many
+    /// it was missing when it did. A time and not a turn count: a
+    /// domain with nothing else happening takes no turns, and that is
+    /// exactly when the asking has to go on. The count beside it makes
+    /// the ask a window rather than a rate: an answer moves the number,
+    /// and the next ask goes at once.
+    asked: Option<(std::time::Instant, usize)>,
+    /// Evidence this voter has produced for commands whose submitter it
+    /// does not know yet, oldest first.
+    parked: VecDeque<(CommandId, PeerProvenance, Vec<u8>)>,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -643,8 +701,21 @@ pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
     }
 }
 
-/// Turns between two asks for a missing payload.
-const ASK_EVERY: u64 = 16;
+/// How much evidence a node holds for want of a submitter.
+///
+/// The window is one frame per command between this voter acknowledging
+/// it and the submission naming it arriving here, so the depth that
+/// matters is the commands in flight at once. This is comfortably past
+/// the command table's own capacity.
+const PARKED_EVIDENCE: usize = 256;
+
+/// How often a node repeats a request for a payload it is waiting on.
+///
+/// Bounded by time rather than by events for the same reason the ask
+/// exists at all: the replica that can answer may not have been able to
+/// the first time -- its own proposal was not durable yet -- and nothing
+/// else is going to happen on an idle domain to prompt a second try.
+const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Something in a domain that has work due at a time rather than on an
 /// event.
@@ -707,7 +778,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             plane: None,
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
-            asking: 0,
+            asked: None,
+            parked: VecDeque::new(),
             budgets,
             recorder,
         }
@@ -904,6 +976,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
                 wake.unwrap_or_else(std::time::Instant::now),
             ));
+            // A replica waiting for the content of a command it knows
+            // by identity is waiting on a message no socket here will
+            // deliver on its own: the peer it asked may not have been
+            // able to answer -- its own proposal was not durable yet --
+            // and on an idle domain nothing else will prompt a second
+            // ask. So it comes back on a timer rather than waiting for
+            // an event that is not coming. Every command after the one
+            // it lacks is queued behind it, and so is every caller
+            // whose stream this node is holding.
+            let waiting_for_content = match &self.backing {
+                Backing::Voting(v) => v.awaiting().is_some() || v.missing_payloads() > 0,
+                Backing::Serving(_) => false,
+            };
             let arrived = tokio::select! {
                 biased;
                 // Voter work that is still outstanding pre-empts waiting
@@ -911,6 +996,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // turn actually did something, so a voter that cannot
                 // progress waits rather than spins.
                 () = std::future::ready(()), if progressed => continue,
+                () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                 peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                 event = transport.next_event() => event.map(Arrived::Api),
                 () = sleep, if wake.is_some() => continue,
@@ -976,13 +1062,25 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // has no durable prerequisite and goes out at once, so one is
         // enough until the answer comes, and a busy domain must not
         // turn one missing payload into a request per event.
-        if voter.awaiting().is_some() || voter.wants_payloads() {
-            self.asking = self.asking.saturating_add(1);
-            if self.asking % ASK_EVERY == 1 {
+        let missing = voter.missing_payloads();
+        if voter.awaiting().is_some() || missing > 0 {
+            let now = std::time::Instant::now();
+            // One ask outstanding at a time, and the next one goes the
+            // moment the last was answered. The interval is the floor
+            // for an ask nobody answered, not the rate a replica catches
+            // up at: an ask is bounded at `MAX_PAYLOAD_TRANSFER`
+            // commands, so an interval alone would cap catching up at
+            // that many per interval -- and a replica behind by more
+            // than the domain produces in an interval would never close
+            // the gap, however long it ran.
+            if self.asked.is_none_or(|(last, then)| {
+                then != missing || now.duration_since(last) >= PAYLOAD_RETRY
+            }) {
+                self.asked = Some((now, missing));
                 out.absorb(voter.request_payloads()?);
             }
         } else {
-            self.asking = 0;
+            self.asked = None;
         }
         // Expiry is the leader's to schedule, and every candidate it
         // produces is conditional: nothing here decides that a key
@@ -1014,6 +1112,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             eprintln!("this voter's machine refused: {why}");
         }
         self.carry(api, out, provenance);
+        // A submission is the only thing that can say where this voter's
+        // evidence for a command belongs, so whatever was waiting for
+        // one is tried again here.
+        self.route_parked(api);
         Ok(did)
     }
 
@@ -1144,31 +1246,118 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// would leave the caller's collector with nothing to count and
     /// hand a second collector evidence for a request it never made.
     ///
-    /// Where this voter admitted the command locally -- and where it
-    /// cannot say, which is what an unrecognised or forgotten command
-    /// looks like -- the frame goes to the collector in this process.
-    /// The bytes are the same bytes either way: what changes is which
-    /// process counts them, and the identity they are counted under is
-    /// this voter's committed one in both cases.
+    /// Where this voter admitted the command locally, the frame goes to
+    /// the collector in this process. The bytes are the same bytes
+    /// either way: what changes is which process counts them, and the
+    /// identity they are counted under is this voter's committed one in
+    /// both cases.
+    ///
+    /// Where it cannot say at all, the frame is held rather than
+    /// delivered here. A voter learns a command's content from a
+    /// submission *or* from a peer, and when it learns it from a peer it
+    /// acknowledges a command no collector has yet asked it for. That
+    /// acknowledgement belongs to whichever collector did the asking,
+    /// and the submission naming it is usually already in flight; giving
+    /// it to the collector in this process instead loses it, because
+    /// that collector has never heard of the command. So it waits for
+    /// the submission to say where it goes.
     fn hand_to_collector(&mut self, api: &Transport, provenance: PeerProvenance, bytes: &[u8]) {
         let Ok(frame) = one_frame(bytes) else {
             self.frontend.counts.unserved += 1;
             return;
         };
-        let owed = self.owed_to(&frame);
-        if let Some(coord_daemon::voter::Origin::Connection(id)) = owed {
-            let sent = api.send(
-                coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
-                self.frontend.membership.domain(),
-                bytes.to_vec(),
-            );
-            match sent {
-                Ok(()) => self.frontend.counts.returned += 1,
-                Err(_) => self.frontend.counts.unreturnable += 1,
+        match self.owed_to(&frame) {
+            Some(coord_daemon::voter::Origin::Connection(id)) => {
+                self.return_to_collector(api, id, bytes);
             }
+            Some(coord_daemon::voter::Origin::Local) => {
+                self.on_frame_from_voter(provenance, &frame);
+            }
+            None => match command_of_frame(&frame) {
+                Some(command) => self.park(command, provenance, bytes),
+                // Not about a command at all: nothing can arrive later to
+                // say where it belongs, so this process is where it ends.
+                None => self.on_frame_from_voter(provenance, &frame),
+            },
+        }
+    }
+
+    /// Send a frame back to the collector on the other end of `id`.
+    fn return_to_collector(&mut self, api: &Transport, id: u64, bytes: &[u8]) {
+        let sent = api.send(
+            coord_transport::Destination::Connection(coord_transport::ConnectionId(id)),
+            self.frontend.membership.domain(),
+            bytes.to_vec(),
+        );
+        match sent {
+            Ok(()) => self.frontend.counts.returned += 1,
+            Err(_) => self.frontend.counts.unreturnable += 1,
+        }
+    }
+
+    /// Hold a frame until the submission that says where it belongs
+    /// arrives.
+    ///
+    /// Bounded, and by the same thing the window is: a command can be in
+    /// this state only between this voter acknowledging it and the
+    /// submission reaching this voter, so the queue is as deep as the
+    /// commands that can be in flight at once. Past the bound the oldest
+    /// goes, which is the one whose submission is least likely still
+    /// coming; the command is decided and durable either way, and the
+    /// caller resolves it by identity.
+    fn park(&mut self, command: CommandId, provenance: PeerProvenance, bytes: &[u8]) {
+        self.parked.push_back((command, provenance, bytes.to_vec()));
+        self.frontend.counts.parked += 1;
+        // Said once, not once per frame. That this happens at all is
+        // ordinary -- it is a command this voter heard about from a
+        // peer before the collector asked it -- and an operator wants
+        // to know the path is in use without a line per acknowledgement.
+        if self.frontend.counts.parked == 1 {
+            eprintln!("this voter is holding evidence for a submitter it does not know yet");
+        }
+        while self.parked.len() > PARKED_EVIDENCE {
+            self.parked.pop_front();
+            self.frontend.counts.unclaimed += 1;
+            // This one is not ordinary: a caller's collector is one
+            // acknowledgement short and will not be told why.
+            if self.frontend.counts.unclaimed == 1 {
+                eprintln!("this voter dropped evidence no submission ever claimed");
+            }
+        }
+    }
+
+    /// Deliver held evidence whose submitter this voter now knows.
+    ///
+    /// Called after submissions are taken in, which is the only thing
+    /// that can supply the answer.
+    fn route_parked(&mut self, api: &Transport) {
+        if self.parked.is_empty() {
             return;
         }
-        self.on_frame_from_voter(provenance, &frame);
+        let Backing::Voting(voter) = &self.backing else {
+            return;
+        };
+        let mut still_waiting = VecDeque::with_capacity(self.parked.len());
+        let mut ready = Vec::new();
+        for (command, provenance, bytes) in core::mem::take(&mut self.parked) {
+            match voter.origin_of(&command) {
+                Some(origin) => ready.push((origin, provenance, bytes)),
+                None => still_waiting.push_back((command, provenance, bytes)),
+            }
+        }
+        self.parked = still_waiting;
+        for (origin, provenance, bytes) in ready {
+            match origin {
+                coord_daemon::voter::Origin::Connection(id) => {
+                    self.return_to_collector(api, id, &bytes);
+                }
+                coord_daemon::voter::Origin::Local => {
+                    if let Ok(frame) = one_frame(&bytes) {
+                        self.on_frame_from_voter(provenance, &frame);
+                    }
+                }
+            }
+        }
     }
 
     /// Which collector this voter owes a frame to, where it knows.
@@ -1181,14 +1370,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &self.backing else {
             return None;
         };
-        let command = match frame.kind {
-            KIND_EVIDENCE => coord_consensus::ProtocolMessage::decode(&frame.payload)
-                .ok()?
-                .command()?,
-            KIND_RELEASE => decode_release(frame).ok()?.established().command(),
-            _ => return None,
-        };
-        voter.origin_of(&command)
+        voter.origin_of(&command_of_frame(frame)?)
     }
 
     /// One frame of a voter's evidence, for the collector in this
@@ -1575,12 +1757,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 let provenance = voter.provenance();
                 self.carry(api, out, provenance);
             }
+            // A refusal at the machine's door still told this voter
+            // where the command came from -- a duplicate submission is
+            // exactly the case where the evidence went out before the
+            // submitter was known -- so what was held is tried again
+            // either way.
             Ok(Err(why)) => {
                 eprintln!("this voter refused a collector's submission: {why:?}");
                 self.frontend.counts.refused += 1;
             }
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
         }
+        self.route_parked(api);
     }
 
     async fn carry_out(
@@ -1947,6 +2135,24 @@ fn hex4(replica: &coord_types::ids::ReplicaId) -> String {
 /// The peer plane's next event, or nothing for ever when there is no
 /// peer plane.
 ///
+/// The command a voter's frame is about, where it is about one.
+///
+/// Read from the frame's own payload rather than tracked beside it, for
+/// the same reason [`Domain::owed_to`] does: a second bookkeeping of
+/// which frame belongs to which command is a second thing that can be
+/// wrong.
+fn command_of_frame(frame: &Frame) -> Option<CommandId> {
+    match frame.kind {
+        KIND_EVIDENCE => coord_consensus::ProtocolMessage::decode(&frame.payload)
+            .ok()?
+            .command(),
+        KIND_RELEASE => decode_release(frame)
+            .ok()
+            .map(|r| r.established().command()),
+        _ => None,
+    }
+}
+
 /// A `select!` arm needs a future either way. A process with no peers
 /// must not have its arm resolve immediately -- that would spin the loop
 /// -- so it gets one that never completes and the other arms decide.
