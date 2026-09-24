@@ -3,7 +3,10 @@
 //! issued certificates to the identities they were issued for. Nothing
 //! here is production issuance (task-41/42) and the crate is `test-only`:
 //! the dependency policy keeps it out of every production edge, so a
-//! test certificate can never be what a voter votes with.
+//! test certificate can never be what a voter votes with. Keys are
+//! Ed25519: fixed-length signatures keep handshake packet sizes stable,
+//! which the packet-level simulator (task-32) relies on for trace
+//! digests.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -92,7 +95,7 @@ impl TestCa {
         params
             .distinguished_name
             .push(DnType::CommonName, "tuplesky test ca");
-        let key = KeyPair::generate().expect("ca key");
+        let key = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ca key");
         let cert = params.self_signed(&key).expect("ca cert");
         let der = cert.der().clone();
         TestCa {
@@ -122,7 +125,7 @@ impl TestCa {
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
         params.distinguished_name.push(DnType::CommonName, name);
-        let key = KeyPair::generate().expect("leaf key");
+        let key = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("leaf key");
         let cert = params.signed_by(&key, &self.issuer).expect("leaf cert");
         TestIdentity {
             name: name.to_string(),
