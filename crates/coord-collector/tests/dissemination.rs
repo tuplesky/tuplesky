@@ -250,7 +250,109 @@ fn an_outstanding_offer_is_not_a_free_slot() {
     );
 }
 
+/// The collector says when its next re-offer falls due, so a runtime
+/// that otherwise waits on its sockets can wake for it.
+///
+/// A refused fan-out is recorded before the floor has passed, so the
+/// pass that records it finds nothing due. Without this a quiet runtime
+/// had no reason to come back, and the re-offer waited for unrelated
+/// traffic. It moves past each due time once the offer is made, and is
+/// `None` once nothing is owed on the schedule.
+#[test]
+fn the_next_re_offer_is_announced_and_moves_on_once_made() {
+    let mut c = collector(8, usize::MAX);
+    assert_eq!(c.next_due(), None, "nothing pending, nothing due");
+    let (_, plan) = fan_out(&mut c, 1);
+    assert_eq!(c.next_due(), None, "nothing refused yet");
+
+    report_one(&mut c, 100, &plan, r(2), OfferOutcome::Saturated);
+    let due = c
+        .next_due()
+        .expect("a refused destination is owed a re-offer");
+    assert!(due > 100, "due after the floor, not at once");
+    assert!(
+        c.due_offers(due - 1, 16).is_empty(),
+        "not due before it says"
+    );
+
+    // At the time it named, the re-offer is there, and making it moves
+    // the schedule past now: a deadline left in the past would wake the
+    // runtime for ever.
+    let offered = c.due_offers(due, 16);
+    assert_eq!(offered.len(), 1);
+    assert!(c.next_due().expect("still owed until answered") > due);
+
+    // Refused again: owed later than before. Taken: nothing owed.
+    report_one(&mut c, due, &offered[0], r(2), OfferOutcome::Saturated);
+    let again = c.next_due().expect("still owed");
+    assert!(again - due > due - 100, "the wait grows as refusals repeat");
+    let offered = c.due_offers(again, 16);
+    report_one(&mut c, again, &offered[0], r(2), OfferOutcome::Queued);
+    assert_eq!(c.next_due(), None);
+
+    // A destination stalled for a reason repeating cannot change is not
+    // on the schedule, so it wakes nothing.
+    let (_, plan) = fan_out(&mut c, 2);
+    report_one(&mut c, 0, &plan, r(1), OfferOutcome::NotACommittedVoter);
+    assert_eq!(c.next_due(), None);
+}
+
 // --- admission versus uncertain outcome --------------------------------
+
+/// A request at the size limit is accepted when only one command may be
+/// pending: the budget holds its whole envelope, not just the request.
+///
+/// The negative control is the old derivation, one request's bytes per
+/// slot, under which this legal request is refused as undelivered bytes
+/// by a collector that holds nothing at all -- the envelope around a
+/// request is larger than the request.
+#[test]
+fn a_maximum_size_request_fits_a_single_pending_slot() {
+    use coord_collector::undelivered_budget;
+
+    // Two puts of a one-byte key and a value one byte short of the value
+    // limit: exactly the request limit, and valid.
+    let put_at = |key: u8| {
+        BranchOp::Put(PutOp {
+            key: vec![key],
+            value: vec![0x5a; limits::MAX_VALUE_BYTES - 1],
+            lease: None,
+            prev_kv: false,
+        })
+    };
+    let largest = CanonicalOperation::Txn(TxnOp {
+        compares: Vec::new(),
+        success: vec![put_at(1), put_at(2)],
+        failure: Vec::new(),
+    });
+    assert_eq!(2 * limits::MAX_VALUE_BYTES, limits::MAX_REQUEST_BYTES);
+    let mut logical = LogicalRequest::new(NS, largest.clone());
+    logical.canonicalize();
+    logical
+        .validate()
+        .expect("a request exactly at the limit is valid");
+
+    let (_, request) = admitted(1, largest.clone());
+    let mut c = collector(1, undelivered_budget(1, limits::MAX_REQUEST_BYTES));
+    let Submitted::FanOut(plan) = c.submit(0, &request).expect("admitted") else {
+        panic!("a first presentation fans out");
+    };
+    assert!(
+        plan.frame.len() > limits::MAX_REQUEST_BYTES,
+        "the envelope is larger than the request, which is the point"
+    );
+
+    // One request's bytes per slot, as the budget used to be derived.
+    let (_, request) = admitted(2, largest);
+    let mut c = collector(1, limits::MAX_REQUEST_BYTES);
+    assert!(
+        matches!(
+            c.submit(0, &request),
+            Err(SubmitRefusal::Backpressure { pending: 0 })
+        ),
+        "the request-only budget no longer refuses a legal request"
+    );
+}
 
 /// The collector's own capacity is the last point at which refusing is
 /// honest, and it is checked before anything is offered.

@@ -429,6 +429,12 @@ impl Dispatcher {
         self.collector.due_offers(now_millis, budget)
     }
 
+    /// When the next re-offer falls due, on the clock `due_offers` is
+    /// given; see [`crate::Collector::next_due`].
+    pub fn next_due(&self) -> Option<u64> {
+        self.collector.next_due()
+    }
+
     /// Commands that still owe a destination an enqueue (diagnostic).
     pub fn undelivered(&self) -> usize {
         self.collector.undelivered()

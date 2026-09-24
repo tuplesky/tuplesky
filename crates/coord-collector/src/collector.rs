@@ -61,6 +61,29 @@ use crate::wire::{SubmitV1, submit_frame};
 const MAX_DELIVERABLE_RESULT_BYTES: usize =
     (coord_types::wire_v1::KindRange::Api.max_frame_length() as usize) - 64 * 1024;
 
+/// What a submission envelope may carry beyond its request's own bytes.
+///
+/// The undelivered-bytes budget is sized from the request limit, but
+/// what the collector holds is the whole `Submit` frame: the request's
+/// canonical encoding -- which the wire lets run up to 64 KiB past the
+/// request limit, for the encoding's own tags and lengths -- inside a
+/// `SubmitV1` beside the admission facts, with the retry key, deadline
+/// and acknowledged floor, and the frame header. Those come to a few
+/// hundred bytes; the allowance is the wire's 64 KiB twice over, so a
+/// request at the limit always fits the slot it was admitted into.
+pub const SUBMIT_ENVELOPE_ALLOWANCE: usize = 128 * 1024;
+
+/// The undelivered-bytes budget of a collector that may hold
+/// `max_pending` commands of requests up to `max_request_bytes`: one
+/// whole submission envelope for each, request and allowance together.
+///
+/// Budgeting the request alone refused a legal request near the limit
+/// when only one command may be pending -- the envelope around it is
+/// what is held, and it is larger than the request by a constant.
+pub const fn undelivered_budget(max_pending: usize, max_request_bytes: usize) -> usize {
+    max_pending.saturating_mul(max_request_bytes.saturating_add(SUBMIT_ENVELOPE_ALLOWANCE))
+}
+
 /// Configuration of one domain's collector.
 #[derive(Clone, Debug)]
 pub struct CollectorConfig {
@@ -731,6 +754,28 @@ impl Collector {
         }
         self.offer_cursor = start.wrapping_add(examined);
         out
+    }
+
+    /// When the next re-offer falls due, on the clock `due_offers` is
+    /// given, or `None` when nothing is owed on the congestion schedule.
+    ///
+    /// For the runtime to wake on. The schedule lives here, but nothing
+    /// here runs on its own: a runtime that waits only on its sockets
+    /// would carry out a due re-offer only when unrelated traffic woke
+    /// it, and on a quiet domain -- exactly when the destination that
+    /// was busy is free again -- that is never. A destination stalled
+    /// for a reason repeating cannot change is not on the schedule and
+    /// is not counted.
+    pub fn next_due(&self) -> Option<u64> {
+        self.pending
+            .values()
+            .filter(|entry| entry.dissemination.envelope.is_some())
+            .flat_map(|entry| entry.dissemination.owed.values())
+            .filter_map(|owed| match owed {
+                Owed::Missed { next, .. } => Some(*next),
+                Owed::Queued | Owed::Stalled(_) => None,
+            })
+            .min()
     }
 
     /// Commands that still owe a destination an enqueue (diagnostic).

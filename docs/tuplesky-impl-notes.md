@@ -2045,8 +2045,7 @@ expiry and read the key. The loop now also sleeps until the earliest
 deadline any component registers through a small `Deadline` trait
 (`next_deadline()`), and expiry registers its armed deadlines, its next
 scan while there is something new to observe, and its retries; held
-evidence registers the same way, and the collector's re-offers are
-meant to. Second, a candidate whose proposal never reached a quorum
+evidence and the collector's re-offers register the same way. Second, a candidate whose proposal never reached a quorum
 stayed "in flight" for ever: the driver now presents any proposal that
 committed state has not shown resolving within a retry interval again.
 Third, presenting it again did nothing, because the leader refused a
@@ -2691,6 +2690,24 @@ shorter than the schedule serves every repeat from the bounded repair
 rather than from the park, so `PARKED_HOLD` is derived from
 `OFFER_CEILING_MILLIS` rather than chosen beside it -- to keep the
 ordinary case off the path that exists for the rare one.
+
+**Two things review found.** The collector scheduled the re-offer and
+nothing carried it out on a quiet domain. A rejected fan-out is recorded
+before the 25 ms floor has passed, so the pass of the loop that records
+it finds nothing due, and the loop then waited on its sockets: on a
+frontend-only domain, with no voter turn and no payload timer, the
+submission was offered again only when unrelated traffic arrived or the
+caller retried -- the retry this exists to make unnecessary. The
+collector now says when its next re-offer is due (`next_due`) and the
+loop registers it through `Deadline`, so both of its selects wake for
+it; a daemon test on a quiet frontend-only domain with no voter running
+sees the refused binding offered again, repeatedly, with the caller
+silent, and fails with the registration removed. Second, the
+undelivered-bytes budget was one request's bytes per pending slot while
+what is held is the whole `Submit` frame, so a legal request near the
+limit was refused at one outstanding command. The budget is now one
+request plus `SUBMIT_ENVELOPE_ALLOWANCE` per slot (`undelivered_budget`),
+and a request exactly at the limit is accepted at one pending slot.
 
 **What is still not claimed.** An accepted enqueue is not delivery
 evidence. A destination that takes the frame may still fail before

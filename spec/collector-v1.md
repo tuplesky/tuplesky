@@ -82,8 +82,10 @@ command_id = H(command-id domain, retry_key, canonical logical bytes)
 * The domain has two admission bounds and **both are reserved before any
   destination is offered anything**: a pending-command bound, and a bound
   on the submission envelope bytes held for commands that still owe a
-  destination. At either bound a new submission is refused with
-  backpressure. Unresolved entries are never evicted, and a cancelled
+  destination. The byte bound is sized in whole envelopes -- a request
+  at the size limit plus what the envelope carries around it -- so a
+  valid request always fits a free pending slot. At either bound a new
+  submission is refused with backpressure. Unresolved entries are never evicted, and a cancelled
   entry frees no slot.
 * A refusal therefore means *nothing was offered by this attempt*. It is
   not evidence that the same identity was never submitted from
@@ -134,6 +136,11 @@ the command.
   is forgotten. Scheduling is fair across commands and capped per turn,
   so one congested destination starves neither the other destinations
   nor new work, protocol traffic or recovery.
+* A due re-offer is carried out **without any other traffic**. The
+  collector says when its next re-offer falls due, and the runtime wakes
+  for it; a runtime that waited only on its sockets would leave a quiet
+  domain's refused submission unoffered until something unrelated
+  arrived or the caller retried.
 * A caller that times out or disconnects is detached; **the command
   keeps its delivery obligation**. A client deadline is not the lifetime
   of work the domain has accepted.
