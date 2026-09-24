@@ -649,7 +649,51 @@ fn directory_is_not_transition_authority() {
         client.install_configuration(real.clone()),
         Ok(Installed::AlreadyHeld)
     );
-    let divergent = handoff_record(&w.root, &five, &[w.n(1), w.n(2)]);
+    // Other evidence for the same activation is the same record: a relay
+    // that trims the approvals to another majority, or the same approvers
+    // re-signing (ES256 is randomized), yields the held certificate, and
+    // installing it changes nothing.
+    let other_majority = handoff_record(&w.root, &five, &[w.n(1), w.n(2)]);
+    let resigned = handoff_record(&w.root, &five, &[w.n(2), w.n(3)]);
+    let all_three = handoff_record(&w.root, &five, &[w.n(1), w.n(2), w.n(3)]);
+    assert_ne!(resigned, real);
+    for copy in [&other_majority, &resigned, &all_three] {
+        assert_eq!(copy.certificate_hash(), real.certificate_hash());
+        assert_eq!(
+            client.install_configuration(copy.clone()),
+            Ok(Installed::AlreadyHeld)
+        );
+    }
+    // A reordered copy names the same certificate too, but it is not the
+    // canonical encoding and is refused as malformed, not accepted as a
+    // second form of the record.
+    let mut reordered = all_three.clone();
+    if let ActivationEvidenceV1::Handoff { approvals, .. } = &mut reordered.activation {
+        approvals.reverse();
+    }
+    assert_eq!(reordered.certificate_hash(), real.certificate_hash());
+    assert_eq!(
+        client.install_configuration(reordered.clone()),
+        Err(ChainError::Shape(
+            coord_types::config_v1::ConfigError::ApprovalsNotCanonical
+        ))
+    );
+    reordered.canonicalize();
+    assert_eq!(
+        client.install_configuration(reordered),
+        Ok(Installed::AlreadyHeld)
+    );
+    // A chain that installed another copy of the epoch agrees with this
+    // client on every later link, and a bootstrap naming either copy's
+    // certificate is not a divergence.
+    let mut relayed = w.chain();
+    relayed.extend(all_three.clone()).unwrap();
+    assert_eq!(relayed.current().certificate(), real.certificate_hash());
+    let (records, complete) =
+        relayed.records_after(Some(epoch(2)), Some(real.certificate_hash()), 64);
+    assert!(records.is_empty() && complete);
+    // Different content for the same epoch is a divergence.
+    let divergent = handoff_record(&w.root, &[w.n(1), w.n(2), w.n(4)], &[w.n(1), w.n(2)]);
     assert_eq!(
         client.install_configuration(divergent.clone()),
         Err(ChainError::Divergent)

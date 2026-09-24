@@ -149,7 +149,8 @@ pub enum ChainError {
         /// Majority size.
         need: usize,
     },
-    /// A record for an already held epoch that is not the held record.
+    /// A record for an already held epoch whose certificate is not the held
+    /// one.
     Divergent,
     /// A record below the held epoch: never installed.
     Stale,
@@ -723,7 +724,15 @@ impl ClientConfiguration {
     }
 
     /// Install a configuration record: monotonic, verified against the
-    /// held chain. A record for a held epoch must be that record.
+    /// held chain. A record for a held epoch must name the held
+    /// certificate.
+    ///
+    /// The held epoch is compared by certificate, not by bytes. Another
+    /// well-formed copy of the same activation (its approvals trimmed to a
+    /// different majority, or re-signed) is the same record with other
+    /// evidence, and refusing it as divergent would make every honest node
+    /// that relayed a different copy look like a fork. A copy that is not
+    /// in canonical form is still refused as malformed.
     pub fn install_configuration(
         &mut self,
         record: GroupConfigurationV1,
@@ -733,7 +742,8 @@ impl ClientConfiguration {
             return Err(ChainError::Stale);
         }
         if record.epoch == current {
-            return if self.chain.current().record() == &record {
+            record.validate_shape()?;
+            return if self.chain.current().certificate() == record.certificate_hash() {
                 Ok(Installed::AlreadyHeld)
             } else {
                 Err(ChainError::Divergent)

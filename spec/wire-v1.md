@@ -209,12 +209,18 @@ policy identifier (`1` C2 fixed majority, `2` C1), the previous epoch's
 certificate hash and the activation evidence: the genesis admin's ES256
 signature over the activation message for epoch one, or the terminal
 certificate plus approvals of a majority of the previous epoch's voters
-for a handoff. The activation message is the domain-separated digest
-(`configuration-activation`) of every field except the signatures; the
-certificate hash (`configuration-record`) covers the complete record.
+for a handoff, ascending by node. A record has at most five voters, the
+design's ceiling for an active configuration. The activation message is
+the domain-separated digest (`configuration-activation`) of every field
+except the signatures; the certificate hash (`configuration-record`) is
+the domain-separated digest of the activation message. The certificate
+therefore names the signed content, not the evidence: reordering,
+trimming to another majority or re-signing the approvals leaves it
+unchanged, and a verifier compares held epochs by certificate. Only the
+ascending approval order is well formed, so each copy has one encoding.
 `BallotConfigurationV1 { cluster, domain, epoch,
-configuration_certificate, ballot, quorum_policy, fast_set[<=16],
-promises[<=16] }` binds a ballot's leader and sorted fast set to one
+configuration_certificate, ballot, quorum_policy, fast_set[<=5],
+promises[<=5] }` binds a ballot's leader and sorted fast set to one
 cluster, one domain and one configuration record under an epoch, with the
 voters' promises over the `configuration-ballot` message. That message is
 the domain-separated digest of cluster, domain, epoch, the configuration

@@ -151,9 +151,11 @@ fn record_shape_is_validated() {
             },
             ConfigError::NoVoters,
         ),
+        // Six voters: one past the design's ceiling of five per active
+        // configuration.
         (
             GroupConfigurationV1 {
-                voters: (0..17).map(voter).collect(),
+                voters: (1..=6).map(voter).collect(),
                 ..g.clone()
             },
             ConfigError::TooManyVoters,
@@ -238,23 +240,120 @@ fn record_shape_is_validated() {
             },
             ConfigError::DuplicateSigner,
         ),
+        (
+            GroupConfigurationV1 {
+                activation: ActivationEvidenceV1::Handoff {
+                    old_epoch: epoch(1),
+                    terminal_certificate: Digest32([0; 32]),
+                    approvals: vec![sig(2), sig(1)],
+                },
+                ..handoff_record(Digest32([1; 32]))
+            },
+            ConfigError::ApprovalsNotCanonical,
+        ),
     ];
     for (record, expected) in cases {
         assert_eq!(record.validate_shape(), Err(expected));
     }
-    // The activation message excludes signatures; the certificate hash
-    // includes them.
+    // Neither the activation message nor the certificate hash covers the
+    // signatures: a re-signed record is the same record.
     let h = handoff_record(g.certificate_hash());
     let mut resigned = h.clone();
     if let ActivationEvidenceV1::Handoff { approvals, .. } = &mut resigned.activation {
         approvals[0].signature = vec![9; 64];
     }
     assert_eq!(h.activation_message(), resigned.activation_message());
-    assert_ne!(h.certificate_hash(), resigned.certificate_hash());
+    assert_eq!(h.certificate_hash(), resigned.certificate_hash());
+    let mut regenesis = g.clone();
+    regenesis.activation = ActivationEvidenceV1::Genesis {
+        manifest_digest: Digest32([0xaa; 32]),
+        admin_signature: vec![8; 64],
+    };
+    assert_eq!(g.certificate_hash(), regenesis.certificate_hash());
+    // The content is the identity: any field other than a signature moves
+    // both digests.
     let mut other_voters = h.clone();
     other_voters.voters.pop();
     assert_ne!(h.activation_message(), other_voters.activation_message());
+    assert_ne!(h.certificate_hash(), other_voters.certificate_hash());
+    let mut other_terminal = h.clone();
+    if let ActivationEvidenceV1::Handoff {
+        terminal_certificate,
+        ..
+    } = &mut other_terminal.activation
+    {
+        *terminal_certificate = Digest32([0xbc; 32]);
+    }
+    assert_ne!(h.certificate_hash(), other_terminal.certificate_hash());
+    // The two digests are domain-separated: a certificate is never an
+    // activation message a voter could be asked to sign.
     assert_ne!(h.activation_message(), h.certificate_hash());
+}
+
+/// The approval vectors a relay can produce from one genuine handoff, in
+/// wire order: canonical, reordered, trimmed to a majority and trimmed in
+/// another order, and with an exact repeat.
+fn approval_variants() -> Vec<Vec<VoterSignatureV1>> {
+    vec![
+        vec![sig(1), sig(2), sig(3)],
+        vec![sig(3), sig(1), sig(2)],
+        vec![sig(1), sig(3)],
+        vec![sig(3), sig(2)],
+        vec![sig(2), sig(1), sig(2), sig(3)],
+    ]
+}
+
+fn with_approvals(
+    mut record: GroupConfigurationV1,
+    vector: Vec<VoterSignatureV1>,
+) -> GroupConfigurationV1 {
+    if let ActivationEvidenceV1::Handoff { approvals, .. } = &mut record.activation {
+        *approvals = vector;
+    }
+    record
+}
+
+#[test]
+fn reordered_or_trimmed_approvals_name_one_certificate() {
+    let h = handoff_record(genesis_record().certificate_hash());
+    for vector in approval_variants() {
+        let canonical_input = vector.windows(2).all(|p| p[0].node < p[1].node);
+        let mut record = with_approvals(h.clone(), vector.clone());
+        // Whatever the order, trimming or repetition, the record names the
+        // same certificate: approvals are evidence, not identity.
+        assert_eq!(
+            record.certificate_hash(),
+            h.certificate_hash(),
+            "{vector:?}"
+        );
+        // Only the canonical order is well formed; anything else is refused
+        // rather than silently accepted as a second encoding.
+        if canonical_input {
+            record.validate_shape().unwrap();
+        } else {
+            assert!(record.validate_shape().is_err(), "{vector:?}");
+        }
+        // Canonicalizing sorts and drops exact repeats, and the result is
+        // well formed with the certificate unchanged.
+        record.canonicalize();
+        record.validate_shape().unwrap();
+        assert_eq!(record.certificate_hash(), h.certificate_hash());
+        let ActivationEvidenceV1::Handoff { approvals, .. } = &record.activation else {
+            unreachable!()
+        };
+        assert!(approvals.windows(2).all(|p| p[0].node < p[1].node));
+    }
+    // Two different signatures from one node are not an exact repeat:
+    // canonicalizing keeps both and the shape check refuses the record.
+    let mut forked = sig(1);
+    forked.signature = vec![0x55; 64];
+    let mut record = with_approvals(h, vec![sig(2), sig(1), forked]);
+    record.canonicalize();
+    assert_eq!(record.validate_shape(), Err(ConfigError::DuplicateSigner));
+    // Genesis evidence has no vector to canonicalize.
+    let mut g = genesis_record();
+    g.canonicalize();
+    assert_eq!(g, genesis_record());
 }
 
 #[test]
@@ -505,22 +604,24 @@ fn configuration_frames_round_trip_exactly() {
             extra: 1
         }))
     ));
-    // The largest well-formed response (64 records of 16 voters with 16
-    // approvals each, plus a full endpoint catalog) fits the configuration
-    // class limit (256 KiB); anything above the bound is refused before
-    // framing, and a raw oversized payload by the frame encoder.
+    // The largest well-formed response (64 records of the most voters with
+    // as many approvals each, plus a full endpoint catalog) fits the
+    // configuration class limit (256 KiB); anything above the bound is
+    // refused before framing, and a raw oversized payload by the frame
+    // encoder.
+    let most = u8::try_from(limits::MAX_VOTERS).unwrap();
     let mut big = g.clone();
-    big.voters = (1..=16).map(voter).collect();
+    big.voters = (1..=most).map(voter).collect();
     big.activation = ActivationEvidenceV1::Handoff {
         old_epoch: epoch(1),
         terminal_certificate: Digest32([0; 32]),
-        approvals: (1..=16).map(sig).collect(),
+        approvals: (1..=most).map(sig).collect(),
     };
     big.previous_certificate = Digest32([1; 32]);
     big.epoch = epoch(2);
     big.validate_shape().unwrap();
     let mut full_endpoints = endpoints();
-    full_endpoints.endpoints = (1..=16)
+    full_endpoints.endpoints = (1..=most)
         .map(|n| EndpointV1 {
             node: node(n),
             incarnation: inc(1),
@@ -698,4 +799,13 @@ fn configuration_fixture_is_frozen() {
         stored, fixture,
         "configuration fixture drifted; records, digests and frames are frozen"
     );
+    // The frozen handoff certificate is the certificate of every approval
+    // vector a relay can make of that handoff, so the chain link other
+    // records and ballots name does not depend on which copy arrived.
+    for vector in approval_variants() {
+        assert_eq!(
+            hex(&with_approvals(h.clone(), vector).certificate_hash().0),
+            stored.handoff_certificate_hex
+        );
+    }
 }

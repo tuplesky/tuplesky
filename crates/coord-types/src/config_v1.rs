@@ -6,7 +6,8 @@
 //!   key, the quorum-policy identifier, the previous epoch's certificate
 //!   hash and the activation evidence (the genesis admin's signature for
 //!   the first epoch, a majority of the previous epoch's voters for a
-//!   handoff). Its certificate hash is the chain link.
+//!   handoff). Its certificate hash, derived from the signed content and
+//!   not from the evidence, is the chain link.
 //! * [`BallotConfigurationV1`] binds a ballot's leader and immutable fast
 //!   set to one cluster, domain and configuration certificate under an
 //!   epoch, with the voters' recovery promises as evidence.
@@ -41,8 +42,12 @@ use crate::wire_v1::{Frame, WireError, encode_frame};
 
 /// Frozen bounds of the configuration schema.
 pub mod limits {
-    /// Most voters in one epoch.
-    pub const MAX_VOTERS: usize = 16;
+    /// Most voters in one epoch. The design fixes an active configuration
+    /// at five voters at most (three by default); staging copies that a
+    /// replacement needs are not voters and never appear in a record, so
+    /// the wire bound is the voter ceiling itself rather than a looser
+    /// frame limit a six-voter record could pass.
+    pub const MAX_VOTERS: usize = 5;
     /// Most observers in one catalog.
     pub const MAX_OBSERVERS: usize = 256;
     /// Most addresses per endpoint.
@@ -141,7 +146,9 @@ pub enum ActivationEvidenceV1 {
         /// The unique terminal certificate of the handoff (task-56).
         terminal_certificate: Digest32,
         /// Approvals of a majority of the old epoch's voters over the
-        /// activation message.
+        /// activation message, strictly ascending by node. They are
+        /// evidence, not identity: the certificate hash does not cover
+        /// them.
         approvals: Vec<VoterSignatureV1>,
     },
 }
@@ -188,6 +195,9 @@ pub enum ConfigError {
     OldEpochNotPrevious,
     /// Two approvals or promises name the same node.
     DuplicateSigner,
+    /// Handoff approvals are not strictly ascending by node, the one
+    /// canonical order a record is relayed in.
+    ApprovalsNotCanonical,
     /// The fast set is empty, unsorted or repeats a node.
     BadFastSet,
     /// Ballot epoch differs from the record epoch.
@@ -314,8 +324,31 @@ impl GroupConfigurationV1 {
                 if old_epoch.checked_next().ok() != Some(self.epoch) {
                     return Err(ConfigError::OldEpochNotPrevious);
                 }
-                check_signers(approvals)
+                check_signers(approvals)?;
+                // One order only, so a relay cannot hand out a second
+                // encoding of the same evidence; `canonicalize` produces it.
+                if approvals
+                    .windows(2)
+                    .any(|pair| pair[0].node >= pair[1].node)
+                {
+                    return Err(ConfigError::ApprovalsNotCanonical);
+                }
+                Ok(())
             }
+        }
+    }
+
+    /// Put handoff approvals into their canonical form: ascending by node,
+    /// with exact repeats removed. Two different signatures from one node
+    /// are both kept, so `validate_shape` still refuses them as
+    /// [`ConfigError::DuplicateSigner`] rather than this choosing one.
+    /// Genesis evidence is left as it is.
+    pub fn canonicalize(&mut self) {
+        if let ActivationEvidenceV1::Handoff { approvals, .. } = &mut self.activation {
+            approvals.sort_by(|a, b| {
+                (a.node, a.incarnation, &a.signature).cmp(&(b.node, b.incarnation, &b.signature))
+            });
+            approvals.dedup();
         }
     }
 
@@ -384,11 +417,23 @@ impl GroupConfigurationV1 {
         digest_parts(HashDomain::ConfigurationActivation, &refs)
     }
 
-    /// The certificate hash: the digest of the complete record including
-    /// its evidence. The next epoch names it as `previous_certificate`.
+    /// The certificate hash: the record's identity, which the next epoch
+    /// names as `previous_certificate` and ballots bind to.
+    ///
+    /// It is derived from the signed content (the activation message under
+    /// its own domain), not from the evidence. Approvals and the admin
+    /// signature prove the content was activated; they do not name it.
+    /// Hashing them made the identity malleable without any key: a relay
+    /// could reorder a genuine record's approvals, or drop surplus ones
+    /// while keeping a majority, and every result verified with a different
+    /// certificate, so a client holding one variant refused the genuine
+    /// record, its successor and its ballots as divergent. ES256 signatures
+    /// are randomized, so even the same approvers re-signing produced a new
+    /// hash. Every valid evidence set for one content now yields one
+    /// certificate.
     pub fn certificate_hash(&self) -> Digest32 {
-        let encoded = postcard::to_allocvec(self).unwrap_or_default();
-        digest_parts(HashDomain::ConfigurationRecord, &[&encoded])
+        let message = self.activation_message();
+        digest_parts(HashDomain::ConfigurationRecord, &[&message.0])
     }
 }
 
