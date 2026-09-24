@@ -387,10 +387,10 @@ func TestStaleDropKeepsTheReplacementConnection(t *testing.T) {
 
 	// A late failure from the old connection must not close the healthy
 	// replacement that is now the shared connection.
-	c.conn = replacement
+	c.conns[LaneUnary] = replacement
 	c.drop(old)
-	if c.conn != replacement || c.Reconnects != 0 {
-		t.Fatalf("stale drop touched the replacement: conn=%v reconnects=%d", c.conn == replacement, c.Reconnects)
+	if c.conns[LaneUnary] != replacement || c.Reconnects != 0 {
+		t.Fatalf("stale drop touched the replacement: conn=%v reconnects=%d", c.conns[LaneUnary] == replacement, c.Reconnects)
 	}
 	if err := replacement.Context().Err(); err != nil {
 		t.Fatalf("stale drop closed the replacement: %v", err)
@@ -398,8 +398,8 @@ func TestStaleDropKeepsTheReplacementConnection(t *testing.T) {
 	// Dropping the connection that is actually current clears and closes
 	// it, and a second drop of the same connection is a no-op.
 	c.drop(replacement)
-	if c.conn != nil || c.Reconnects != 1 {
-		t.Fatalf("current drop: conn=%v reconnects=%d", c.conn, c.Reconnects)
+	if c.conns[LaneUnary] != nil || c.Reconnects != 1 {
+		t.Fatalf("current drop: conn=%v reconnects=%d", c.conns[LaneUnary], c.Reconnects)
 	}
 	c.drop(replacement)
 	if c.Reconnects != 1 {
@@ -502,7 +502,7 @@ func TestBindPresentsTokenOnceAndLearnsSession(t *testing.T) {
 		t.Fatalf("session %v %v", s, ok)
 	}
 	c.mu.Lock()
-	current := c.conn
+	current := c.conns[LaneUnary]
 	c.mu.Unlock()
 	c.drop(current)
 	wrong := New(addr, Config{TLS: clientTLS(pool), Tokens: staticTokens("other"), FrameTimeout: 2 * time.Second})

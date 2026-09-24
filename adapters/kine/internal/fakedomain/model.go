@@ -28,19 +28,40 @@ type version struct {
 	entry    *Entry // nil: tombstone
 }
 
+// Revision is one published revision: its complete event set with
+// previous values.
+type Revision struct {
+	Revision uint64
+	Events   []wire.Event
+}
+
 // Model is the domain's KV state: per-key version history, the current
-// revision, the spent binding identities and the compaction floor.
+// revision, the spent binding identities, the compaction floor and the
+// revision log that watches replay.
 type Model struct {
 	mu           sync.Mutex
 	revision     uint64
 	keys         map[string][]version
 	usedBindings map[[16]byte]bool
 	compactFloor uint64
+	log          []Revision
+	// published is called under the lock after every new revision.
+	published func(Revision)
+	// compactWatches is called under the lock when the floor advances.
+	compactWatches func(floor uint64)
+	// bindings maps a binding identity to its key and bound revision
+	// (the expiration's conditional facts).
+	bindings map[[16]byte]bound
+}
+
+type bound struct {
+	key         string
+	modRevision uint64
 }
 
 // NewModel starts at revision 0.
 func NewModel() *Model {
-	return &Model{keys: map[string][]version{}, usedBindings: map[[16]byte]bool{}}
+	return &Model{keys: map[string][]version{}, usedBindings: map[[16]byte]bool{}, bindings: map[[16]byte]bound{}}
 }
 
 // Revision is the current revision.
@@ -56,6 +77,72 @@ func (m *Model) SetCompactFloor(rev uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.compactFloor = rev
+}
+
+// CompactFloor is the retention floor.
+func (m *Model) CompactFloor() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.compactFloor
+}
+
+// Binding returns the private binding of a key's current entry and the
+// modification revision it is bound to.
+func (m *Model) Binding(key string) ([16]byte, uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e := m.latest(key)
+	if e == nil || e.Lease == nil {
+		return [16]byte{}, 0, false
+	}
+	return *e.Lease, e.ModRevision, true
+}
+
+// Expire is the authoritative conditional expiration of a binding
+// (design Section 7.3): it deletes the bound key only when the binding
+// is still the key's live binding at the expected modification revision;
+// a replaced or refreshed binding is stale and deletes nothing. It
+// reports whether a deletion happened.
+func (m *Model) Expire(binding [16]byte, expectedModRevision uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.bindings[binding]
+	if !ok || b.modRevision != expectedModRevision {
+		return false
+	}
+	cur := m.latest(b.key)
+	if cur == nil || cur.Lease == nil || *cur.Lease != binding || cur.ModRevision != expectedModRevision {
+		return false
+	}
+	m.revision++
+	m.append(b.key, nil)
+	delete(m.bindings, binding)
+	m.publish(deleteEvent(b.key, cur, m.revision))
+	return true
+}
+
+func putEvent(key string, e *Entry, prev *Entry) wire.Event {
+	ev := wire.Event{Kind: wire.EventPut, Key: []byte(key), Value: append([]byte(nil), e.Value...), CreateRevision: e.CreateRevision, ModRevision: e.ModRevision, Version: e.Version}
+	if prev != nil {
+		pv := append([]byte(nil), prev.Value...)
+		ev.PrevValue = &pv
+	}
+	return ev
+}
+
+func deleteEvent(key string, prev *Entry, revision uint64) wire.Event {
+	pv := append([]byte(nil), prev.Value...)
+	return wire.Event{Kind: wire.EventDelete, Key: []byte(key), ModRevision: revision, PrevValue: &pv}
+}
+
+// publish records the current revision's complete event set and notifies
+// watchers; the caller holds the lock and has advanced m.revision.
+func (m *Model) publish(events ...wire.Event) {
+	r := Revision{Revision: m.revision, Events: events}
+	m.log = append(m.log, r)
+	if m.published != nil {
+		m.published(r)
+	}
 }
 
 // Current returns the live entries.
@@ -149,8 +236,10 @@ func (m *Model) Apply(req wire.LogicalRequest) (wire.Result, bool) {
 			b := *op.Binding
 			e.Lease = &b
 			m.usedBindings[b] = true
+			m.bindings[b] = bound{key: key, modRevision: m.revision}
 		}
 		m.append(key, e)
+		m.publish(putEvent(key, e, nil))
 		return wire.Result{Revision: m.revision, Kind: wire.OutcomeKineCreated}, true
 	case wire.KineUpdateOp:
 		key := string(op.Key)
@@ -166,12 +255,18 @@ func (m *Model) Apply(req wire.LogicalRequest) (wire.Result, bool) {
 		}
 		m.revision++
 		e := &Entry{Value: op.Value, CreateRevision: cur.CreateRevision, ModRevision: m.revision, Version: cur.Version + 1, TTLSeconds: op.TTLSeconds}
+		if cur.Lease != nil {
+			// The prior binding is replaced: its expiration is stale.
+			delete(m.bindings, *cur.Lease)
+		}
 		if op.Binding != nil {
 			b := *op.Binding
 			e.Lease = &b
 			m.usedBindings[b] = true
+			m.bindings[b] = bound{key: key, modRevision: m.revision}
 		}
 		m.append(key, e)
+		m.publish(putEvent(key, e, cur))
 		return wire.Result{Revision: m.revision, Kind: wire.OutcomeKineUpdated, Updated: true, Current: kineKv(key, e)}, true
 	case wire.KineDeleteOp:
 		key := string(op.Key)
@@ -185,7 +280,25 @@ func (m *Model) Apply(req wire.LogicalRequest) (wire.Result, bool) {
 		}
 		m.revision++
 		m.append(key, nil)
+		if cur.Lease != nil {
+			delete(m.bindings, *cur.Lease)
+		}
+		m.publish(deleteEvent(key, cur, m.revision))
 		return wire.Result{Revision: m.revision, Kind: wire.OutcomeKineDeleted, Deleted: true, Prev: kineKv(key, cur)}, true
+	case wire.CompactOp:
+		// The floor advances to at most the current revision; history at
+		// or above it stays readable.
+		target := op.Revision
+		if target > m.revision {
+			target = m.revision
+		}
+		if target > m.compactFloor {
+			m.compactFloor = target
+			if m.compactWatches != nil {
+				m.compactWatches(target)
+			}
+		}
+		return wire.Result{Revision: m.revision, Kind: wire.OutcomeCompacted}, false
 	default:
 		return wire.Result{Revision: m.revision, Kind: wire.OutcomeErrPermissionDenied}, false
 	}

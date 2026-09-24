@@ -86,6 +86,11 @@ func run(endpoint, caFile string, edgeCfg edge.Config, notify time.Duration, ver
 	fmt.Fprintln(os.Stderr, "kine-coord: serving", ln.Endpoint)
 	go func() {
 		<-ctx.Done()
+		// Closing the backend ends every watch and pending synchronization
+		// wait before the bridge's streams are stopped.
+		if c, ok := backend.(interface{ Close() }); ok {
+			c.Close()
+		}
 		grpcServer.GracefulStop()
 	}()
 	if err := grpcServer.Serve(ln); err != nil {
