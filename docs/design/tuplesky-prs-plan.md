@@ -699,6 +699,8 @@ The filter/workflows are maintained repository CI, not the temporary authoring/v
 
 **Review boundary:** No exactly-once across lost upstream identity; epoch-aware collection is task-m02.
 
+**Deferred to task-46:** the session binding handshake. On task-45 the client sends only the Hello, reads no HelloAck and sends no Bind, so the service token is obtained but never presented and the Rust frontend refuses the connection's requests as not bound. task-46 keeps the control stream open, reads the HelloAck, presents the token once in a Bind frame and waits for the BindAck.
+
 <a id="task-46"></a>
 ### task-46: Implement Kine driver registration and CRUD/range backend
 

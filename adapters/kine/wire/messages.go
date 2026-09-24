@@ -377,3 +377,12 @@ func (m WatchClose) encode(w *writer) {
 		w.varint(*m.LastCompleteRevision)
 	}
 }
+
+// ClusterID16to32 widens the retry key's cluster id to a 32-byte command
+// id shape, used only by the in-process test server to echo an id.
+func (k RetryKey) ClusterID16to32() [32]byte {
+	var out [32]byte
+	copy(out[:16], k.ClusterID[:])
+	copy(out[16:], k.DomainID[:])
+	return out
+}
