@@ -550,6 +550,15 @@ membership, and the batch carries no application base and takes no
 execution position -- it is initial state, not an execution. Everything
 after it is ordinary replicated administration.
 
+The policy is written before the genesis pin, and the pin is the last
+durable step of `init`. A store with no pin is refused by a start and
+finished by `init`, so an initialization that stops anywhere before the
+pin is finished rather than served half-made; the policy writes only
+the rows the projection does not already hold, so finishing it twice
+writes nothing twice. The other order left a pinned store with no trust
+rule and no grants after a stop between the two, which every check took
+for initialized and nothing would ever repair.
+
 The identities in that configuration are row keys, so they are parsed
 strictly: exactly 32 lowercase hex characters, or the node refuses to
 start. A spelling that differed between nodes would be a different row

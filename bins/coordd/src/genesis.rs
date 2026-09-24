@@ -11,13 +11,17 @@
 //! the startup sequence through `check_membership` against that pin: the
 //! same manifest is this node's, any other is a genesis quarantine.
 //!
-//! A start never pins. A store with no pin is one whose initialization
-//! did not finish -- `coordd init` created the generation and stopped
-//! before the pin was durable -- and serving it would pin whatever
-//! manifest it was handed then, which is trust on first use by another
-//! name. It is refused, and `coordd init` finishes it: a generation that
-//! was never pinned has never been served, so it holds no history to
-//! lose.
+//! A start never pins. The pin is the last durable step of `coordd
+//! init`, after the generation is created, attached to the journal and
+//! holds the domain's genesis policy, so a store with no pin is one
+//! whose initialization did not finish -- it stopped somewhere before
+//! the pin was durable. Serving it would pin whatever manifest it was
+//! handed then, which is trust on first use by another name, and would
+//! serve a domain whose policy may never have been written. It is
+//! refused, and `coordd init` finishes it: every step before the pin
+//! can be run again (the policy writes only the rows that are missing),
+//! and a generation that was never pinned has never been served, so it
+//! holds no history to lose.
 
 use coord_daemon::{NodeJournal, Startup, StartupError, StoreGenesis};
 use coord_membership::genesis::GenesisManifest;

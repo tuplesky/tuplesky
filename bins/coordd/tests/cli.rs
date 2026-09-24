@@ -2371,10 +2371,111 @@ fn an_unfinished_initialization_is_finished_by_init_and_refused_by_a_start() {
         !dir.join("state").join("gen-000002").exists(),
         "finishing an initialization made a second generation"
     );
+    // The policy was written before the pin, so finishing finds it there
+    // and writes none of it again.
+    assert!(
+        finished.out.contains("genesis policy rows=0 present=")
+            && !finished.out.contains("present=0"),
+        "finishing rewrote a genesis policy the store already held: {}",
+        finished.out
+    );
     let report = start_and_report(&path);
     assert!(report.contains("owed=0"), "{report}");
 
     // Finished is finished: a further `init` is refused as before.
+    let again = run(&path, &["init"]);
+    assert_eq!(again.code, Some(2), "{}{}", again.out, again.err);
+    assert!(again.err.contains("already exists"), "{}", again.err);
+}
+
+/// An initialization that stopped before it wrote the genesis policy is
+/// finished by `init`, which writes the policy and only then pins, and
+/// the finished node serves a caller that policy admits.
+///
+/// The pin is the last durable step of `init`. Pinned before the policy,
+/// a stop between the two left a store every check took for initialized
+/// -- a start served it, trusting nothing and granting nothing, and
+/// `init` refused it as already initialized -- so a node could never be
+/// given the policy it was meant to have.
+///
+/// The state such a stop leaves is this node's journal and its first
+/// projection generation, created under its identity exactly as `init`
+/// creates them, with nothing written into either: no policy rows and no
+/// pin. It is made here directly, with the same calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_initialization_that_stopped_before_its_policy_is_finished_and_then_serves() {
+    let dir = workspace("unpolicied");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+
+    drop(
+        coord_journal_raft_engine::journal::RaftEngineJournal::create(
+            &dir.join("journal"),
+            coord_journal_raft_engine::journal::JournalIdentity {
+                cluster: coord_types::ids::ClusterId(CLUSTER),
+                replica: coord_types::ids::ReplicaId([1; 16]),
+            },
+            &coord_journal_raft_engine::journal::JournalOptions::default(),
+        )
+        .expect("the journal init creates"),
+    );
+    drop(
+        coord_storage_redb::lifecycle::Generation::create(
+            &dir.join("state"),
+            coord_storage_redb::lifecycle::StoreIdentity {
+                cluster_id: coord_types::ids::ClusterId(CLUSTER),
+                domain_id: coord_types::ids::DomainId(DOMAIN),
+                replica_id: coord_types::ids::ReplicaId([1; 16]),
+                incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            },
+            coord_storage_redb::lifecycle::OpenOptions::default(),
+        )
+        .expect("the generation init creates"),
+    );
+
+    // A start refuses it: serving would serve a domain with no policy.
+    let refused = run(&path, &[]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("never pinned") && refused.err.contains("coordd init"),
+        "the refusal did not say what to do: {}",
+        refused.err
+    );
+
+    // `init` finishes it: the policy it never wrote, and then the pin.
+    let finished = run(&path, &["init"]);
+    assert_eq!(finished.code, Some(0), "{}{}", finished.out, finished.err);
+    assert!(
+        finished.out.contains("genesis policy rows=")
+            && finished.out.contains(" present=0")
+            && !finished.out.contains("rows=0"),
+        "finishing did not write the missing policy: {}",
+        finished.out
+    );
+    assert!(
+        !dir.join("state").join("gen-000002").exists(),
+        "finishing an initialization made a second generation"
+    );
+
+    // And the finished node serves: the trust rule admits the caller's
+    // binding and the grant authorizes its Put.
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x44; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| panic!("the finished node never answered\n{}", daemon.said()));
+    let response = response_of(&answer);
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+        panic!("the finished node refused a caller its policy admits: {response:?}");
+    };
+    let executed: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the replicated result decodes");
+    assert_eq!(executed.outcome, coord_state::Outcome::Put { prev: None });
+
+    // Finished is finished.
+    drop(daemon);
     let again = run(&path, &["init"]);
     assert_eq!(again.code, Some(2), "{}{}", again.out, again.err);
     assert!(again.err.contains("already exists"), "{}", again.err);
