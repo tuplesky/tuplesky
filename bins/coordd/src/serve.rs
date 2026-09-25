@@ -2112,6 +2112,25 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let command = coord_types::CommandId::derive(&key, &logical).ok()?;
         let resolved = {
             let gated = self.backing.applier().store().reader().snapshot().ok()?;
+            // A session this node has not projected yet is not a session
+            // that may no longer execute. The binding was established from
+            // a committed session-creation command, and a replica that is
+            // behind -- one restarted a moment ago, above all -- reads no
+            // row for it until it catches up. Refusing there would tell a
+            // caller its session is gone on a domain that has just made it.
+            // Its request goes on to admission instead, and execution
+            // decides it at its own position, as for any request with no
+            // record here.
+            {
+                use coord_store_api::OrderedRead;
+                gated
+                    .view()
+                    .get(
+                        coord_store_api::Collection::SessionV1.id(),
+                        &coord_storage::codecs::session_key(&key.session_id),
+                    )
+                    .ok()??;
+            }
             coord_storage::retry::resolve(
                 gated.view(),
                 &RetryBinding {
