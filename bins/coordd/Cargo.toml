@@ -39,7 +39,7 @@ x509-parser.workspace = true
 quinn.workspace = true
 coord-types.workspace = true
 clap.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
 # Leaf renewal (task-d02): the enrollment request is signed with the
 # node's own key, and posted to the node issuer over a hardened client.
 rcgen.workspace = true

@@ -18,6 +18,7 @@
 //! configuration every replica agreed on.
 
 mod backup;
+mod election;
 mod enroll;
 mod genesis;
 mod leases;
@@ -1020,16 +1021,16 @@ fn main() -> ExitCode {
     // frontend reads. One writer, one domain: a second handle on this
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
-    let backing = if roles.votes() {
+    let (backing, resumed) = if roles.votes() {
         match voter(&placed, applier, boot) {
-            Ok(v) => serve::Backing::Voting(Box::new(v)),
+            Ok((v, resumed)) => (serve::Backing::Voting(Box::new(v)), resumed),
             Err(e) => {
                 eprintln!("{e}");
                 return ExitCode::from(2);
             }
         }
     } else {
-        serve::Backing::Serving(Box::new(applier))
+        (serve::Backing::Serving(Box::new(applier)), None)
     };
     // The local route is the voter's to hand over, and it exists only
     // because a voter is running here. A frontend-only process gets
@@ -1099,7 +1100,9 @@ fn main() -> ExitCode {
         // Where this node keeps its own recovery images, and how much
         // unrepresented journal it tolerates before making one. Local
         // to this node: no replicated result depends on the answer.
-        .with_checkpoints(checkpoints, config.limits.checkpoint_after_records);
+        .with_checkpoints(checkpoints, config.limits.checkpoint_after_records)
+        // What resuming a bound campaign produced, sent on the first turn.
+        .with_resumed(resumed);
     println!(
         "frontend ready waiting={} voting={}",
         domain.waiting(),
@@ -1335,7 +1338,13 @@ fn voter(
     placed: &membership::Placed,
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
-) -> Result<coord_daemon::Voter<store::Persistence>, String> {
+) -> Result<
+    (
+        coord_daemon::Voter<store::Persistence>,
+        Option<coord_daemon::Outbound>,
+    ),
+    String,
+> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
         ReplicaRole,
@@ -1387,7 +1396,36 @@ fn voter(
         recovered.frontier.get(),
         executed_through.get(),
     );
-    let machine = if placed.replica == ballot.leader {
+    // Where this replica left off (task-d01). The genesis ballot is where
+    // every replica of the epoch starts, not where one that has been
+    // through an election comes back: a promise row above it is the
+    // ballot it had moved to, and the ballot it was synchronized to is the
+    // one it votes and counts in. A replica that comes back at the genesis
+    // ballot after the domain elected another leader would lead or follow
+    // a ballot nobody else is in any more.
+    let promised = recovered
+        .promise
+        .as_ref()
+        .map_or(ballot, |p| highest(ballot, p.promised));
+    let active = recovered
+        .promise
+        .as_ref()
+        .map_or(ballot, |p| highest(ballot, p.synced));
+    let quorum = if active == ballot {
+        quorum
+    } else {
+        coord_consensus::BallotConfiguration::c2_default(
+            m.epoch(),
+            active,
+            m.voters().map(|v| v.node).collect(),
+        )
+        .map_err(|e| format!("this replica recovered a ballot it cannot vote in: {e:?}"))?
+    };
+    // Only the genesis leader, and only at the genesis ballot, comes back
+    // leading. A replica that won a later ballot comes back following it
+    // and finishes or repeats its campaign: leading is something a ballot
+    // gives, and a restart is not a campaign.
+    let machine = if placed.replica == ballot.leader && promised == ballot {
         let mut leader = Leader::new_sealed(
             LeaderConfig {
                 identity,
@@ -1437,12 +1475,43 @@ fn voter(
         coord_daemon::Node::new(machine, applier, collector),
         ingress,
         (m.cluster(), m.domain()),
-        ballot,
+        promised,
     );
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
-    Ok(voter)
+    // A campaign that bound its selection and then stopped publishes that
+    // selection and no other (task-26); the serving loop carries out what
+    // it produced on its first turn.
+    let resumed = match recovered.resumable_sync(&placed.replica) {
+        Some(decision) if promised != ballot => {
+            println!(
+                "this voter resumes its campaign for ballot {}",
+                promised.number
+            );
+            Some(
+                voter
+                    .resume_campaign(decision.clone())
+                    .and_then(|mut out| {
+                        out.absorb(voter.follow_machine()?);
+                        Ok(out)
+                    })
+                    .map_err(|e| format!("this voter cannot resume its campaign: {e}"))?,
+            )
+        }
+        _ => None,
+    };
+    Ok((voter, resumed))
+}
+
+/// The higher of two ballots of one epoch; `a` when they are not
+/// comparable.
+fn highest(a: coord_types::ids::Ballot, b: coord_types::ids::Ballot) -> coord_types::ids::Ballot {
+    if b.compare_same_epoch(&a) == Some(core::cmp::Ordering::Greater) {
+        b
+    } else {
+        a
+    }
 }
 
 /// Wall-clock seconds. A binding's validity is stated in them, so this

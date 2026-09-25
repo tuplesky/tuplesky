@@ -162,6 +162,22 @@ pub trait Persistence {
     fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {
         let _ = ballot;
     }
+
+    /// Stop admitting transitions of any ballot below `promised`, and
+    /// report the queued ones refused because of it (design Section 4.8),
+    /// so no barrier waits for ever on a transition that will never be
+    /// journaled.
+    ///
+    /// Called when this replica promises a higher ballot, after its own
+    /// promise row has been queued under that ballot. A coordinator with
+    /// no journal and no queue has nothing to fence and reports nothing.
+    fn fence(
+        &mut self,
+        promised: coord_types::ids::Ballot,
+    ) -> Result<Vec<StorageEvent>, EngineError> {
+        let _ = promised;
+        Ok(Vec::new())
+    }
 }
 
 /// The reference path: the projection is itself the durable record.
@@ -350,6 +366,20 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
             epoch: self.application_base().configuration,
             ..ballot
         };
+    }
+
+    fn fence(
+        &mut self,
+        promised: coord_types::ids::Ballot,
+    ) -> Result<Vec<StorageEvent>, EngineError> {
+        // In the stamp's epoch, for the same reason `follow_ballot` uses
+        // it: the fence is compared with the stamps, and a fence in the
+        // machine's epoch would compare as incomparable with every one.
+        let promised = coord_types::ids::Ballot {
+            epoch: self.application_base().configuration,
+            ..promised
+        };
+        self.store.fence(self.domain, promised).map_err(engine)
     }
 
     fn submit(&mut self, batch: PersistBatch, kind: TransitionKind) -> Result<(), Refused> {

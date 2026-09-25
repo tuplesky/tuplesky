@@ -255,7 +255,8 @@ Set `COORD_CERTIFY_PREFIX` to a fresh value for each pass against one domain.
 
 ## 10. Kill and restart a voter
 
-Pick voter 2 or 3; voter 1 is the leader (see the limits).
+Any voter can be killed. Killing the leader (voter 1 at first) also exercises
+the election described under the limits.
 
 ```text
 kill -9 "$(cat /opt/tuplesky/n3/coordd.pid)"
@@ -295,11 +296,18 @@ again.
 
 ## Known limits
 
-* **The leader is the lowest node id until task-d01.** The genesis ballot
-  names voter 1 and nothing in `coordd` campaigns or adopts a higher ballot
-  yet, so with voter 1 down the other two stay linked but establish nothing.
-  Kill and restart voters 2 and 3 freely; stopping voter 1 stops the domain
-  from establishing requests until it is back.
+* **A stopped leader is replaced after the idle timeout.** Voter 1 leads the
+  genesis ballot. When it stops, the others notice when its links end, at the
+  transport's thirty-second idle timeout, and one of them campaigns after a
+  jittered second: its log says `this voter campaigns for ballot 1` and then
+  `this voter leads ballot 1`, and the other's says `this voter follows
+  ballot 1`. Voter 1, restarted, is told of the new ballot when the leader
+  sees its link return and says `this voter follows ballot 1`. To move
+  leadership on purpose, send `SIGUSR1` to the voter that should lead
+  (`kill -USR1 "$(cat /opt/tuplesky/n2/coordd.pid)"`). A frontend running
+  without a voter beside it keeps counting evidence under the genesis ballot
+  and establishes nothing after an election; every voter here runs its own
+  frontend, and Kine can be pointed at any of them.
 * **Leaf renewal needs a node issuer, which the harness does not run.** A
   node with a `[renewal]` section in its `coordd.toml` renews its own leaf
   while it serves (task-d02): it enrolls at the issuer when the leaf falls

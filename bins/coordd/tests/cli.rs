@@ -5921,3 +5921,205 @@ async fn peers_admit_a_voters_renewed_leaf() {
         assert!(!node.said().contains("renewal expired"), "{}", node.said());
     }
 }
+
+/// The value a `Range` of one key answered with, if any.
+fn read_value(answer: &coord_types::wire_v1::Frame) -> Option<Vec<u8>> {
+    let response = response_of(answer);
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+        panic!("the read was not answered with a result: {response:?}");
+    };
+    let read: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the read's result decodes");
+    match read.outcome {
+        coord_state::Outcome::Range { items, .. } => items.first().map(|i| i.entry.value.clone()),
+        other => panic!("a range was answered with {other:?}"),
+    }
+}
+
+/// The survivors of a stopped leader elect one of themselves and go on
+/// serving; the old leader, started again, follows the new one; and what
+/// was established before is still there (task-d01).
+///
+/// Before this a domain served only while the voter the genesis ballot
+/// names was up: nothing chose another leader, so stopping one process
+/// stopped every write. The survivors notice the leader has gone when
+/// its links end -- a killed process closes nothing, so at the
+/// transport's idle timeout -- and one of them campaigns. The old
+/// leader comes back still leading the genesis ballot as far as its
+/// own rows go, and is told the domain has moved on when the new leader
+/// sees its link return.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_returns() {
+    let dir = workspace("elect");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_to_say("this voter leads ballot 0"),
+        "voter 1 does not lead the genesis ballot:\n{}",
+        running[0].said()
+    );
+    let before = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x4f; 16]).await;
+    let put = ask(&before.connection, &before.put(1, b"k", b"before"))
+        .await
+        .expect("the domain established a write while its leader was up");
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // The genesis leader goes away.
+    let leader = running.remove(0);
+    drop(leader);
+    let elected = |said: &str| said.contains("this voter leads ballot 1");
+    let followed = |said: &str| said.contains("this voter follows ballot 1");
+    assert!(
+        running[0].waits_until(90, |said| elected(said) || followed(said))
+            && running[1].waits_until(30, |said| elected(said) || followed(said))
+            && (running[0].waits_until(30, elected) || running[1].waits_until(1, elected)),
+        "the survivors did not elect a leader:\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said()
+    );
+    let leaders = running.iter().filter(|n| elected(&n.said())).count();
+    assert_eq!(
+        leaders,
+        1,
+        "not exactly one leader of ballot 1:\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said()
+    );
+
+    // They serve: a write is established by the two that are left, and
+    // the write made under the old leader is still what a read sees
+    // before it.
+    let after = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x50; 16]).await;
+    let read = ask(&after.connection, &after.range(1, b"k"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the new leader's domain did not answer a read\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said()
+            )
+        });
+    assert_eq!(read_value(&read).as_deref(), Some(&b"before"[..]));
+    let put = ask(&after.connection, &after.put(2, b"k", b"after"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the new leader's domain did not establish a write\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // The old leader comes back, and follows.
+    let back = start(&cluster.configs[0]);
+    assert!(
+        back.waits_until(60, |said| said.contains("this voter follows ballot 1")),
+        "the old leader did not follow the new ballot when it came back:\n{}",
+        back.said()
+    );
+    assert!(
+        !back.said().contains("this voter leads ballot 1"),
+        "{}",
+        back.said()
+    );
+    // And the domain it came back to still serves, with it in it.
+    let put = ask(&after.connection, &after.put(3, b"k2", b"again"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the domain stopped serving when the old leader returned\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                back.said(),
+                running[0].said(),
+                running[1].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}
+
+/// An operator moves leadership on purpose by asking a voter to campaign
+/// (`SIGUSR1`), and the leader it replaces steps down while it is running
+/// (task-d01).
+///
+/// The leader here is up throughout, so this is the path a failure never
+/// takes: a live leader promising a higher ballot, converting to a
+/// follower in place with its store and its connections carrying on, and
+/// the domain serving under the new ballot straight away.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_moves_leadership_and_the_old_leader_steps_down() {
+    let dir = workspace("operator-elect");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x51; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"one"))
+        .await
+        .expect("the domain established a write under its first leader");
+
+    let asked = std::process::Command::new("kill")
+        .args(["-USR1", &running[2].child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(asked.success());
+    assert!(
+        running[2].waits_until(20, |said| said.contains("this voter leads ballot 1")),
+        "voter 3 did not take the lead it was asked to:\n{}",
+        running[2].said()
+    );
+    for (n, node) in running.iter().take(2).enumerate() {
+        assert!(
+            node.waits_until(20, |said| said
+                .contains("this voter follows ballot 1 led by 03030303")),
+            "voter {} did not follow the new ballot:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    let read = ask(&caller.connection, &caller.range(2, b"k"))
+        .await
+        .unwrap_or_else(|| panic!("no answer to a read\n{}", running[0].said()));
+    assert_eq!(read_value(&read).as_deref(), Some(&b"one"[..]));
+    let put = ask(&caller.connection, &caller.put(3, b"k", b"two"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the domain did not establish a write under its new leader\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said(),
+                running[2].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}
