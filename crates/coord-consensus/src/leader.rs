@@ -429,6 +429,13 @@ impl Leader {
         if self.table.phase_of(&command).is_none() {
             return Vec::new();
         }
+        if self.table.record(&command).is_none() {
+            // Executed here and already retired: there is no record to
+            // propose from, and nothing to decide. The selection says the
+            // command is committed (the candidate marks what it executed),
+            // so every voter installing it commits it without a vote.
+            return Vec::new();
+        }
         // Re-proposal installs the order this ballot chose. A command that
         // is only accepted locally, from a lower synchronized ballot, must
         // take the new dependencies: the proposal carries them, so leaving

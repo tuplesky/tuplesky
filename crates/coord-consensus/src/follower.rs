@@ -674,44 +674,27 @@ impl Follower {
             // result is bound: the new leader re-proposes from payloads,
             // never from identities alone. The reporting voters hold them
             // durably (they reported the command).
-            let missing: Vec<CommandId> = decision
-                .entries
-                .keys()
-                .chain(decision.reproposed.iter())
-                .filter(|c| self.table.phase_of(c).is_none())
-                .copied()
-                .collect();
-            if !missing.is_empty() {
-                // Ask every promised voter that has not been asked yet, so a
-                // voter promising after the selection is still asked: the
-                // ones asked first may be gone while a live quorum holds the
-                // payload.
+            if !Self::selection_missing(&self.table, &decision).is_empty() {
+                // Ask again when a voter promised that has not been asked
+                // yet -- the ones asked first may be gone while a live
+                // quorum holds the payload -- or when the last ask was
+                // answered in full, for the next batch. An ask carries at
+                // most `MAX_PAYLOAD_TRANSFER` payloads back, so a
+                // candidate that asked once for everything it lacked got
+                // one batch and then waited for the rest for ever.
                 let me = self.config.identity.replica;
-                let voters = campaign.payload_requests_due(me);
-                if voters.is_empty() {
+                let due = !campaign.payload_requests_due(me).is_empty();
+                if !due && !self.payloads_asked.is_empty() {
                     return Vec::new();
                 }
-                campaign.mark_payloads_requested(&voters);
-                let context = self
-                    .ballots
-                    .context(boot, decision.ballot, LocalJournalSeq::ZERO);
-                let outbox = self.outbox.as_mut().expect("booted");
-                for voter in voters {
-                    outbox.publish(PendingSend {
-                        context,
-                        requires: Vec::new(),
-                        to: PeerId {
-                            replica: voter,
-                            incarnation: ReplicaIncarnation::ZERO,
-                        },
-                        frame: ProtocolMessage::PayloadRequest {
-                            commands: missing.clone(),
-                        }
-                        .encode(),
-                    });
-                }
-                return self.release();
+                return self.request_payloads(me);
             }
+            let table = &self.table;
+            campaign.commit_executed(|c| match table.phase_of(c) {
+                Some(Phase::Executed) => Some(table.record(c).map(|r| r.deps.clone())),
+                _ => None,
+            });
+            let decision = campaign.decision().expect("selected").clone();
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             campaign.bound(barrier);
             let update = sync_update(self.config.identity.epoch, &SyncRecordV1 { decision })
@@ -911,6 +894,19 @@ impl Follower {
             }
             for command in ready {
                 let entry = self.sync_pending.remove(&command).expect("ready");
+                if self.table.record(&command).is_none() {
+                    // Executed here and already retired: `phase_of` answers
+                    // EXECUTED from the tombstone, and there is no record
+                    // left to install the selection over or to write a row
+                    // for. Its place in every key's order is covered by the
+                    // log's prefix digest, as for any retired command, and
+                    // realigning a log to it would leave an anchor that no
+                    // append ever claims. A voter that led, retired what it
+                    // executed, was killed and came back as a follower
+                    // receives exactly these entries in the next leader's
+                    // Sync, and installing them was a panic.
+                    continue;
+                }
                 // Installing the selection means installing its whole
                 // evidence, not only the combined digest: the per-key
                 // logs are realigned to the selected order first, so a
@@ -1037,10 +1033,37 @@ impl Follower {
             .chain(self.adopted.keys())
             .filter(|c| !self.payloads.contains_key(c))
             .copied()
+            .chain(self.campaign_missing())
             .collect();
         out.sort();
         out.dedup();
         out
+    }
+
+    /// The commands a selection names that this replica holds nothing
+    /// for: what it needs before the selection can be bound.
+    fn selection_missing(table: &CommandTable, decision: &SyncDecision) -> Vec<CommandId> {
+        decision
+            .entries
+            .keys()
+            .chain(decision.reproposed.iter())
+            .filter(|c| table.phase_of(c).is_none())
+            .copied()
+            .collect()
+    }
+
+    /// What this replica's own campaign is waiting for before it can bind
+    /// its selection. Counted as missing like any other payload, so the
+    /// runtime's paced asks cover it: an ask its peers could not answer
+    /// yet is asked again rather than waited on for ever.
+    fn campaign_missing(&self) -> Vec<CommandId> {
+        match self.campaign.as_ref() {
+            Some(c) if c.binding().is_none() && !c.is_durable() => c
+                .decision()
+                .map(|d| Self::selection_missing(&self.table, d))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     /// The next bounded batch of missing payloads to ask for.
@@ -1049,8 +1072,7 @@ impl Follower {
     /// on a shared, bounded lane; rotating because a bound that always
     /// took the same prefix would leave the rest of the set unasked for
     /// ever. See [`MAX_PAYLOAD_TRANSFER`].
-    fn payload_batch(&mut self) -> Vec<CommandId> {
-        let mut missing = self.missing_payloads();
+    fn payload_batch(&mut self, mut missing: Vec<CommandId>) -> Vec<CommandId> {
         if missing.len() <= MAX_PAYLOAD_TRANSFER {
             return missing;
         }
@@ -1063,12 +1085,34 @@ impl Follower {
 
     /// Ask `from` for the payloads this replica lacks; the request has no
     /// durable prerequisite and is released at once.
+    ///
+    /// A candidate whose selection is waiting for payloads asks for
+    /// those, and asks the voters that promised it instead of `from`:
+    /// they reported the commands, so they hold them durably, while
+    /// `from` -- the leader of the ballot this replica follows -- is
+    /// usually the voter whose loss started the campaign.
     pub fn request_payloads(&mut self, from: ReplicaId) -> Vec<Effect> {
-        let commands = self.payload_batch();
         let Some(boot) = self.boot else {
             return Vec::new();
         };
-        if commands.is_empty() {
+        let me = self.config.identity.replica;
+        let campaign_missing = self.campaign_missing();
+        let sources: Vec<ReplicaId> = match self.campaign.as_mut() {
+            Some(c) if !campaign_missing.is_empty() => {
+                let voters: Vec<ReplicaId> =
+                    c.promised().iter().filter(|v| **v != me).copied().collect();
+                c.mark_payloads_requested(&voters);
+                voters
+            }
+            _ => alloc::vec![from],
+        };
+        let commands = if campaign_missing.is_empty() {
+            let missing = self.missing_payloads();
+            self.payload_batch(missing)
+        } else {
+            self.payload_batch(campaign_missing)
+        };
+        if commands.is_empty() || sources.is_empty() {
             return Vec::new();
         }
         self.payloads_asked = commands.iter().copied().collect();
@@ -1078,16 +1122,19 @@ impl Follower {
         let context = self
             .ballots
             .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
+        let frame = ProtocolMessage::PayloadRequest { commands }.encode();
         if let Some(outbox) = self.outbox.as_mut() {
-            outbox.publish(PendingSend {
-                context,
-                requires: Vec::new(),
-                to: PeerId {
-                    replica: from,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
-                frame: ProtocolMessage::PayloadRequest { commands }.encode(),
-            });
+            for to in sources {
+                outbox.publish(PendingSend {
+                    context,
+                    requires: Vec::new(),
+                    to: PeerId {
+                        replica: to,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: frame.clone(),
+                });
+            }
         }
         self.release()
     }
