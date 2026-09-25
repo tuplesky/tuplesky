@@ -3429,24 +3429,48 @@ outbox and every connection carry on.
 asks every voter once. One that was down or cut off comes back still
 leading, or still following, a ballot the domain has left. So a leader
 that won a ballot keeps the selection it won with (`Node::won`). When a
-voter's peer link returns, the leader sends it `NewLeader` for its
-ballot (`Voter::welcome`). When that voter's promise arrives, the leader
-sends it the Sync. A second copy of the active ballot's Sync changes
-nothing, so a late promise from a voter that already had it costs
-nothing.
+voter's control link returns, the leader sends it `NewLeader` for its
+ballot and the Sync it won with (`Voter::welcome`). Both are needed. A
+voter that had promised the ballot but not received its Sync before it
+stopped refuses a `NewLeader` for a ballot it has already promised, so
+it would send no promise and never be sent the Sync on one. A voter
+that has not promised refuses the Sync, harmlessly, and promises on the
+`NewLeader`, and its promise is answered with the Sync again. A second
+copy of the active ballot's Sync changes nothing.
 
-**A restart resumes the ballot it had.** `main.rs` used to start every
-replica at the genesis ballot, as its leader or as a follower. It now
-starts at the ballot the recovered promise row holds, votes in the
-configuration of the ballot it was synchronized to, and leads only if it
-is the genesis leader and nothing has been promised since. A replica
-that bound a campaign's Sync before stopping resumes that campaign. Any
-other replica that won a later ballot comes back following it, finds
-itself without a leader, and campaigns again.
+**A restart comes back at the ballot it had, and never leading it.**
+`main.rs` used to start every replica at the genesis ballot, as its
+leader or as a follower. It now starts at the ballot the recovered
+promise row holds and votes in the configuration of the ballot it was
+synchronized to. It comes back as a follower of that ballot. The one
+exception is the genesis leader on a store that has taken part in
+nothing: no promise, no records, no payloads, nothing executed, no Sync,
+and a zero frontier. A leader's command table, its proposals and its
+sequence numbers live in memory. A leader that restarted and went on
+leading its ballot would propose again from sequence zero with no memory
+of what it had proposed. Its followers would accept, since they check
+the ballot and the leader and not that sequences only go up, and a new
+command could take an order that contradicts one the domain had already
+committed. Replicas would diverge with nothing to detect it. The
+survivors cannot prevent this, because a leader killed and restarted
+before its links idle out was never missed. A restarted leader is
+instead a follower of a ballot that names itself and that it does not
+lead, which the election counts as leaderless. It campaigns for the next
+ballot, and that ballot's recovery rebuilds from a majority what the
+leader lost. A campaign whose Sync was bound before a stop is not taken
+up either, since taking it up would make the replica that ballot's
+proposer again. Nobody publishes that selection. Task-26 forbids
+publishing a different one, not publishing none, and the next campaign's
+recovery reads what the voters that received it kept. Every restart of
+a single-voter domain is therefore a campaign of one, a patience after
+start.
 
 **The collector follows its voter.** Evidence is counted under a ballot's
-configuration. Each turn, the co-located collector is reconfigured when
-the ballot its voter votes in has changed. That voids what it counted
+configuration. The co-located collector is reconfigured when the ballot
+its voter votes in has changed: after every peer frame, before that
+frame's output reaches it, and on every turn. Waiting for the turn would
+have the evidence produced by the step that activated a ballot refused
+as the old ballot's, and recovered only by a re-offer. That voids what it counted
 under the old ballot, and its pending commands collect afresh. A
 frontend-only process has no voter to follow. It keeps counting under
 the genesis ballot and establishes nothing after an election. That gap
@@ -3470,6 +3494,12 @@ The acceptance tests are these:
   established. The old leader, restarted, follows ballot 1 and the
   domain keeps serving. Without the campaign the survivors never elect.
   Without the welcome the old leader comes back leading ballot 0.
+- `a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_its_ballot`
+  kills the genesis leader and starts it again at once, while the
+  survivors still hold its old links. It does not lead ballot 0. It
+  leads ballot 1, the survivors follow it, and every voter reads the
+  value written before and then the value written after. With the old
+  restart rule it comes back leading ballot 0.
 - `an_operator_moves_leadership_and_the_old_leader_steps_down` sends
   `SIGUSR1` to voter 3 while voter 1 leads. Voter 1 converts in place and
   the domain serves under ballot 1.
@@ -3483,6 +3513,43 @@ The acceptance tests are these:
 - The voter tests check the ordering. A campaign's promise and a
   candidate's promise are each submitted under the ballot promised and
   fenced there. A `NewLeader` the machine refuses moves nothing.
+
+**A promise that does not become durable** moves the voter back. The
+machine counts a promise in flight as promised, so the voter fences at
+it. If the row then fails, the machine is back at the ballot it had, and
+`follow_machine` brings the voter's ballot back to it, so what the
+machine does is stamped with the ballot it does it under. The store's
+fence does not move back. Work stamped below it is refused and counted
+until the voter promises that ballot or a higher one again. A voter that
+does not vote is always safe.
+
+**A campaign still under way is left to finish.** A campaign collects a
+report from a majority, and a report carries what its voter holds, so on
+a busy domain the collection can outlast the doubled patience. Replacing
+it would discard it and raise the ballot every voter must promise again.
+While a campaign of the voter's own is live, a leaderless voter waits for
+it up to the schedule's ceiling (16 s) after it started. An operator's
+request is not held back.
+
+Recorded, not changed:
+
+- A leader that becomes a follower drops its proposals, its votes, its
+  early votes and the task-c02 replay store (`Follower::from_recovered`
+  keeps the table and the records). Retries are then served from the
+  table and the record path only.
+- A stale leader that reconnects to a follower of the higher ballot, but
+  not to that ballot's leader, keeps leading its own until the new
+  leader's welcome reaches it. That affects liveness only, because a
+  majority has promised the higher ballot and nothing is established on
+  its word.
+- A follower whose control link to the leader closes, while it still
+  holds another voter, campaigns after about a second. That churn is
+  bounded by the idle timeout: a link closes on a real departure or
+  after 30 s of silence, not on a short blip.
+- `SIGUSR1` exists only on Unix. Elsewhere leadership moves by election
+  alone, and the operator-request arm never fires.
+- A CLI election test waits for the transport's idle timeout plus
+  patience, 45 to 70 s, because a killed process closes nothing.
 
 **Surfacing the ballot before the promise is recorded** matters only
 where a promise row can still be queued when the fence arrives. In

@@ -261,18 +261,34 @@ impl<P: Persistence> Voter<P> {
     /// or still following, a ballot the domain has left, and nothing
     /// else would tell it. Nothing to say for the genesis ballot, which
     /// every voter starts at.
+    ///
+    /// The Sync goes with it. A voter that had promised this ballot and
+    /// not received its Sync before it stopped refuses a `NewLeader` for
+    /// the ballot it has already promised, so it sends no promise and
+    /// would never be sent the Sync on one. It takes the Sync directly. A
+    /// voter that has not promised the ballot refuses the Sync, harmlessly,
+    /// and promises on the `NewLeader`. One that already has it ignores
+    /// the copy.
     pub fn welcome(&self, replica: ReplicaId) -> Outbound {
         let mut out = Outbound::default();
-        if self.leads() && self.node.won().is_some() && replica != self.ingress.replica() {
+        if self.leads()
+            && replica != self.ingress.replica()
+            && let Some(decision) = self.node.won()
+        {
+            let to = PeerId {
+                replica,
+                incarnation: ReplicaIncarnation::ZERO,
+            };
             out.peer.push((
-                PeerId {
-                    replica,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
+                to,
                 coord_consensus::ProtocolMessage::NewLeader {
                     ballot: self.ballot,
                 }
                 .encode(),
+            ));
+            out.peer.push((
+                to,
+                coord_consensus::ProtocolMessage::Sync(decision.clone()).encode(),
             ));
         }
         out
@@ -291,6 +307,15 @@ impl<P: Persistence> Voter<P> {
         if higher(&promised, &self.ballot) {
             self.set_ballot(promised);
             out.absorb(self.fence()?);
+        } else if higher(&self.ballot, &promised) {
+            // The promise this voter fenced for did not become durable, and
+            // the machine is back at the ballot it had. The voter follows
+            // it, so what the machine does is stamped with the ballot it
+            // does it under. The store's fence does not move back. Work
+            // stamped below it is refused, and counted, until the voter
+            // promises that ballot or a higher one again. A voter that
+            // does not vote is always safe.
+            self.set_ballot(promised);
         }
         if let Some(changed) = self.node.change_role(&self.ballot)? {
             out.absorb(changed);

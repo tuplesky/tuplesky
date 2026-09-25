@@ -63,6 +63,8 @@ pub struct Election {
     salt: u64,
     /// An operator's request, not yet acted on.
     requested: bool,
+    /// When this voter last campaigned.
+    last: Option<Instant>,
     patience: Duration,
     ceiling: Duration,
 }
@@ -82,6 +84,7 @@ impl Election {
             attempts: 0,
             salt,
             requested: false,
+            last: None,
             patience,
             ceiling,
         }
@@ -96,7 +99,24 @@ impl Election {
     /// link to the voter its ballot names) and whether it can reach a
     /// majority of the voters, itself included. Says when a campaign is
     /// due now, and why.
-    pub fn observe(&mut self, led: bool, majority: bool, now: Instant) -> Option<Why> {
+    ///
+    /// `campaigning` is whether a campaign of this voter's own is still
+    /// under way. While it is, and for up to the ceiling after it
+    /// started, a leaderless voter waits for it rather than replacing it.
+    /// A campaign collects a report from a majority, and a report carries
+    /// what its voter holds, so on a busy domain the collection can take
+    /// longer than the doubled patience; a new campaign would discard it,
+    /// raise the ballot every voter must promise again, and start the
+    /// collection over. One that is stuck, whose reports will never come,
+    /// is replaced after the ceiling. An operator's request is not held
+    /// back by it.
+    pub fn observe(
+        &mut self,
+        led: bool,
+        majority: bool,
+        campaigning: bool,
+        now: Instant,
+    ) -> Option<Why> {
         if led {
             // A leader again: the next time it has none, it starts from
             // its patience, not from where a past duel left the backoff.
@@ -113,7 +133,8 @@ impl Election {
             self.campaigned(now);
             return Some(Why::Requested);
         }
-        if self.next.is_some_and(|at| at <= now) {
+        let finishing = campaigning && self.last.is_some_and(|at| now < at + self.ceiling);
+        if self.next.is_some_and(|at| at <= now) && !finishing {
             self.campaigned(now);
             return Some(Why::Leaderless);
         }
@@ -130,6 +151,7 @@ impl Election {
     /// A campaign went out now: the next, if this one produces no leader,
     /// waits twice as long.
     fn campaigned(&mut self, now: Instant) {
+        self.last = Some(now);
         self.attempts = self.attempts.saturating_add(1);
         self.backoff = self.backoff.saturating_mul(2).min(self.ceiling);
         self.next = Some(now + self.wait());
@@ -161,7 +183,7 @@ mod tests {
     ) -> Option<Instant> {
         let mut now = start;
         while now <= start + limit {
-            if e.observe(false, majority, now).is_some() {
+            if e.observe(false, majority, false, now).is_some() {
                 return Some(now);
             }
             now += Duration::from_millis(10);
@@ -174,7 +196,7 @@ mod tests {
         let mut e = schedule(1);
         let t = Instant::now();
         for i in 0..1000 {
-            assert_eq!(e.observe(true, true, t + P * i), None);
+            assert_eq!(e.observe(true, true, false, t + P * i), None);
         }
         assert_eq!(e.next_deadline(), None);
     }
@@ -212,7 +234,10 @@ mod tests {
         let t = Instant::now();
         assert_eq!(first_campaign(&mut e, t, C * 4, false), None);
         // Once it can, it goes at once: its patience ran while it could not.
-        assert_eq!(e.observe(false, true, t + C * 4), Some(Why::Leaderless));
+        assert_eq!(
+            e.observe(false, true, false, t + C * 4),
+            Some(Why::Leaderless)
+        );
     }
 
     #[test]
@@ -222,7 +247,7 @@ mod tests {
         let mut gaps = Vec::new();
         let mut last = None;
         while gaps.len() < 8 {
-            if e.observe(false, true, now).is_some() {
+            if e.observe(false, true, false, now).is_some() {
                 if let Some(l) = last {
                     gaps.push(now - l);
                 }
@@ -244,12 +269,12 @@ mod tests {
         let mut now = t;
         let mut campaigns = 0;
         while campaigns < 4 {
-            if e.observe(false, true, now).is_some() {
+            if e.observe(false, true, false, now).is_some() {
                 campaigns += 1;
             }
             now += Duration::from_millis(5);
         }
-        assert_eq!(e.observe(true, true, now), None);
+        assert_eq!(e.observe(true, true, false, now), None);
         let at = first_campaign(&mut e, now, C * 2, true).expect("campaigns");
         assert!(at - now <= P * 5 / 4 + Duration::from_millis(10));
     }
@@ -259,8 +284,35 @@ mod tests {
         let mut e = schedule(1);
         let t = Instant::now();
         e.request();
-        assert_eq!(e.observe(true, false, t), None, "no majority: held");
-        assert_eq!(e.observe(true, true, t), Some(Why::Requested));
-        assert_eq!(e.observe(true, true, t), None, "acted on once");
+        assert_eq!(e.observe(true, false, false, t), None, "no majority: held");
+        assert_eq!(e.observe(true, true, false, t), Some(Why::Requested));
+        assert_eq!(e.observe(true, true, false, t), None, "acted on once");
+    }
+
+    #[test]
+    fn a_campaign_still_under_way_is_left_to_finish_up_to_the_ceiling() {
+        let mut e = schedule(5);
+        let t = Instant::now();
+        let started = first_campaign(&mut e, t, C * 2, true).expect("campaigns");
+        // Still collecting: past the doubled patience, nothing new.
+        let mut now = started;
+        while now < started + C {
+            assert_eq!(
+                e.observe(false, true, true, now),
+                None,
+                "{:?}",
+                now - started
+            );
+            now += Duration::from_millis(10);
+        }
+        // Stuck past the ceiling: replaced.
+        let again = (0..200)
+            .map(|i| started + C + Duration::from_millis(10 * i))
+            .find(|at| e.observe(false, true, true, *at).is_some())
+            .expect("a stuck campaign is replaced");
+        assert!(again >= started + C);
+        // And an operator is never held back by one.
+        e.request();
+        assert_eq!(e.observe(false, true, true, again), Some(Why::Requested));
     }
 }
