@@ -303,12 +303,15 @@ again.
 * **Leaf renewal needs a node issuer, which the harness does not run.** A
   node with a `[renewal]` section in its `coordd.toml` renews its own leaf
   while it serves (task-d02): it enrolls at the issuer when the leaf falls
-  due, keeps its connections, and stops at the leaf's `notAfter` if the
-  issuer stays unreachable until then. The harness issues its leaves from a
-  local test authority valid until the year 4096 and writes no `[renewal]`
-  section, so a test domain never renews and never needs to; the startup
-  report says `renewal not-configured`. Testing renewal across hosts means
-  running a node issuer and adding the section by hand.
+  due and keeps serving, its connections moving to the renewed leaf as the
+  old one's end closes them. Every node, renewing or not, stops at its
+  leaf's `notAfter` with `reason=credential-expired`. The harness issues
+  its leaves from a local test authority valid until the year 4096 and
+  writes no `[renewal]` section, so a test domain never renews and never
+  needs to; the startup report says `renewal not-configured`. Testing
+  renewal across hosts means running a node issuer at an `https://` URL
+  and adding the section by hand: a release build refuses
+  `allow_insecure_loopback`.
 * **Storage grows until history garbage collection is driven by the daemon.**
   The serving daemon publishes local checkpoints, but it does not yet drive
   collection of the store's revision history, so a long soak grows each

@@ -403,6 +403,11 @@ pub enum TransportError {
     Rejected(CloseReason),
     /// The dialing role may not open that lane.
     LaneNotAdmitted(Lane),
+    /// The credential this endpoint would present has reached its end.
+    /// Nothing is dialled under it: a handshake under an expired leaf is
+    /// one the far end should refuse, and one it did not would be
+    /// serving on a credential nobody vouches for any more.
+    CredentialExpired,
 }
 
 impl From<std::io::Error> for TransportError {
@@ -540,16 +545,36 @@ struct Tls {
     /// credential, where the process has one. A renewal of the node's
     /// leaf does not touch it: it is another principal's credential.
     collector: Option<Arc<QuicClientConfig>>,
+    /// When the node's own leaf ends, in unix seconds, as the binder
+    /// reads it; `u64::MAX` where the binder does not answer. Every
+    /// handshake this endpoint accepts presents that leaf, and so does
+    /// every dial except an api-class one under the collector's.
+    node_until: u64,
+    /// The same for the collector credential, where there is one.
+    collector_until: u64,
 }
 
 impl Shared {
-    /// The client configuration a dial of `class` presents now.
-    fn client_tls(&self, class: Class) -> Arc<QuicClientConfig> {
+    /// The client configuration a dial of `class` presents now, and when
+    /// the credential in it ends.
+    fn client_tls(&self, class: Class) -> (Arc<QuicClientConfig>, u64) {
         let tls = self.tls.lock().unwrap();
         match class {
-            Class::Api => tls.client[0].clone(),
-            Class::Peer => tls.client[1].clone(),
+            Class::Api if tls.collector.is_some() => (tls.client[0].clone(), tls.collector_until),
+            Class::Api => (tls.client[0].clone(), tls.node_until),
+            Class::Peer => (tls.client[1].clone(), tls.node_until),
         }
+    }
+
+    /// When the leaf an accepted handshake presents ends.
+    fn serving_until(&self) -> u64 {
+        self.tls.lock().unwrap().node_until
+    }
+
+    /// When a credential this endpoint presents ends, as the binder reads
+    /// it -- the same answer it gives for a peer's (design Section 10.4).
+    fn until(binder: &dyn IdentityBinder, chain: &[CertificateDer<'_>]) -> u64 {
+        binder.expires_at(chain).unwrap_or(u64::MAX)
     }
 
     fn next_id(&self) -> ConnectionId {
@@ -749,7 +774,10 @@ impl Dialer {
         let class = role_class(local_role);
         // Read at the dial, not when the dialer was taken: a renewed
         // leaf (task-d02) is what the next dial presents.
-        let tls = self.shared.client_tls(class);
+        let (tls, until) = self.shared.client_tls(class);
+        if unix_millis() >= until.saturating_mul(1000) {
+            return Err(TransportError::CredentialExpired);
+        }
         let mut config = quinn::ClientConfig::new(tls);
         config.transport_config(self.lane_transport[lane.index()].clone());
         let connecting = self
@@ -777,7 +805,7 @@ impl Dialer {
                     false,
                     &self.shared.limits.lanes[lane.index()],
                 );
-                spawn_expiry(&self.shared, &peer);
+                spawn_expiry(&self.shared, &peer, until);
                 self.shared.register(peer.clone());
                 self.shared
                     .emit(TransportEvent::Connected {
@@ -883,6 +911,13 @@ impl Dialer {
             Err(e) => Err(CloseReason::Malformed(format!("{e:?}"))),
         }
     }
+}
+
+/// Wall-clock milliseconds: a credential's end is a wall-clock instant.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn tls_err(e: impl std::fmt::Display) -> TransportError {
@@ -1044,6 +1079,10 @@ impl Transport {
             )?),
             None => None,
         };
+        let node_until = Shared::until(binder.as_ref(), &local.chain);
+        let collector_until = local.api_client.as_ref().map_or(u64::MAX, |other| {
+            Shared::until(binder.as_ref(), &other.chain)
+        });
         let client_tls = node_client_configs(
             &provider,
             &local.roots,
@@ -1093,6 +1132,8 @@ impl Transport {
                 serves: local.serves,
                 client: client_tls,
                 collector,
+                node_until,
+                collector_until,
             }),
         });
         tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
@@ -1113,10 +1154,13 @@ impl Transport {
     /// configuration every [`Dialer`] reads at its next dial, including
     /// a dialer taken before this call. A connection already open was
     /// authenticated under the leaf it presented then and keeps it, and
-    /// ends where it always would: at the credential deadline its peer
-    /// holds for it, or at the age cap. Closing it here would turn every
-    /// renewal into an outage of every link the node holds, which is
-    /// exactly what renewing early exists to avoid.
+    /// ends where it always would: at the end of that leaf, at the
+    /// credential deadline its peer holds for it, or at the age cap. A
+    /// node renews long before its leaf ends, so those connections are
+    /// re-dialled under the new leaf in the meantime rather than all at
+    /// once here: closing them at the swap would turn every renewal into
+    /// an outage of every link the node holds, which is exactly what
+    /// renewing early exists to avoid.
     ///
     /// Everything is built before anything is replaced, so a chain or
     /// key the TLS stack refuses leaves the endpoint presenting what it
@@ -1138,10 +1182,12 @@ impl Transport {
             &self.shared.limits,
         )?;
         let client = node_client_configs(&tls.provider, &tls.roots, &chain, &key, &tls.collector)?;
+        let until = Shared::until(self.shared.binder.as_ref(), &chain);
         // New handshakes only: quinn hands an existing connection's
         // state nothing from here.
         self.endpoint.set_server_config(Some(server));
         tls.client = client;
+        tls.node_until = until;
         Ok(())
     }
 
@@ -1661,6 +1707,23 @@ async fn accept_loop(endpoint: quinn::Endpoint, shared: Arc<Shared>) {
 
 async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
     let id = shared.next_id();
+    // Read before the handshake: a renewal only ever moves it later, so
+    // a leaf swapped in while this handshake runs can only make the
+    // bound early, never late.
+    let until = shared.serving_until();
+    if unix_millis() >= until.saturating_mul(1000) {
+        // This endpoint's own leaf has ended: nothing is accepted under
+        // it, whoever is asking.
+        incoming.refuse();
+        shared
+            .emit(TransportEvent::Closed {
+                connection: id,
+                lane: None,
+                reason: CloseReason::Expired,
+            })
+            .await;
+        return;
+    }
     let conn = match timeout(shared.limits.handshake_timeout, incoming).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
@@ -1695,7 +1758,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
                 true,
                 &shared.limits.lanes[lane.index()],
             );
-            spawn_expiry(&shared, &peer);
+            spawn_expiry(&shared, &peer, until);
             shared.register(peer.clone());
             shared
                 .emit(TransportEvent::Connected {
@@ -1987,14 +2050,30 @@ async fn read_uni(
     }
 }
 
-/// Close `peer` when its credential ends or its age cap is reached
-/// (task-58).
+/// Close `peer` when its credential ends, when the credential this end
+/// presented on it ends (`local_until`, unix seconds), or at its age cap,
+/// whichever comes first (task-58, task-d02; design Sections 10.4, 20.4).
+///
+/// Both ends were authenticated once, at the handshake, and each by a
+/// credential with an end. A connection that outlived this end's leaf
+/// would go on carrying frames from a node whose credential nobody
+/// vouches for any more -- the peer's own bound says the same thing
+/// from the other side, but only where the peer enforces one. A node
+/// that renews has put a newer leaf into service long before the old one
+/// ends, so what closes here is a connection the peer then re-dials
+/// under the new one; a node that does not renew stops serving at its
+/// leaf's end rather than half-serving past it.
 ///
 /// Racing the connection's own close keeps the task's life the
 /// connection's life: a cap measured in hours would otherwise leave one
 /// sleeping task per connection ever made.
-fn spawn_expiry(shared: &Arc<Shared>, peer: &Arc<Peer>) {
-    let life = shared.credential_life(&peer.conn);
+fn spawn_expiry(shared: &Arc<Shared>, peer: &Arc<Peer>, local_until: u64) {
+    let local = Duration::from_millis(
+        local_until
+            .saturating_mul(1000)
+            .saturating_sub(unix_millis()),
+    );
+    let life = shared.credential_life(&peer.conn).min(local);
     let peer = peer.clone();
     tokio::spawn(async move {
         tokio::select! {
