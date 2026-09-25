@@ -2258,3 +2258,126 @@ async fn a_staged_ca_rotation_trusts_both_roots_and_then_only_the_new_one() {
     );
     assert_eq!(rotated.connections(), 0);
 }
+
+/// A renewed leaf is presented on every handshake that begins after it is
+/// installed, in both directions, and a connection opened under the leaf
+/// it replaced is left alone (task-d02).
+///
+/// Both halves are the point. A renewal that only took effect for new
+/// listeners, or only for this node's own dials, would leave half its
+/// links on a leaf that is about to expire; one that closed what was open
+/// would turn every renewal into an outage of every link the node holds,
+/// which is exactly what renewing early exists to avoid. The node `c`
+/// admits only the renewed leaf, so it can tell which one `b` presented.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewed_identity_is_presented_on_new_handshakes_and_open_ones_are_left_alone() {
+    let ca = TestCa::new();
+    let a_id = ca.issue("node-a", r(0), inc(1), PeerRole::Voter);
+    let old = ca.issue("node-b", r(1), inc(1), PeerRole::Voter);
+    let renewed = ca.issue("node-b", r(1), inc(1), PeerRole::Voter);
+    let c_id = ca.issue("node-c", r(2), inc(1), PeerRole::Voter);
+    let mut everyone = TestBinder::new(CLUSTER, DOMAIN);
+    let mut only_renewed = TestBinder::new(CLUSTER, DOMAIN);
+    for id in [&a_id, &renewed, &c_id] {
+        everyone.register(id);
+        only_renewed.register(id);
+    }
+    everyone.register(&old);
+    let everyone = Arc::new(everyone);
+    let bind_as = |id: &TestIdentity, binder: Arc<TestBinder>| {
+        Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            id.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
+            binder,
+            limits(),
+        )
+        .unwrap()
+    };
+    let mut a = bind_as(&a_id, everyone.clone());
+    let mut b = bind_as(&old, everyone.clone());
+    let mut c = bind_as(&c_id, Arc::new(only_renewed));
+
+    // A warm link under the old leaf, and a dialer taken before the
+    // renewal.
+    connect_lane(&a, &b, &old, Lane::Control).await;
+    assert!(matches!(
+        event(&mut a).await,
+        TransportEvent::Connected { .. }
+    ));
+    let TransportEvent::Connected {
+        connection: warm, ..
+    } = event(&mut b).await
+    else {
+        panic!("the warm link did not come up");
+    };
+    let dialer = b.dialer();
+    // `c` refuses the old leaf, which is what lets it tell the two apart.
+    let b_addr = b.local_addr().unwrap();
+    let refused = c
+        .connect(
+            b_addr,
+            "node-b",
+            PeerRole::Voter,
+            Some(inc(1)),
+            Lane::Control,
+            old.expected(),
+        )
+        .await;
+    assert!(refused.is_err(), "the control admitted the old leaf");
+
+    b.set_identity(renewed.chain.clone(), renewed.key.clone_key())
+        .expect("the renewed leaf is presentable");
+
+    // The warm link still carries frames: nothing was closed for the
+    // renewal itself.
+    a.send(
+        dest(1, Lane::Control),
+        DOMAIN,
+        evidence_frame(b"after-renewal").unwrap(),
+    )
+    .unwrap();
+    // `b` also hears the end of the handshake `c` refused above, and may
+    // hear it first: that connection is not the warm link, and its close
+    // is not the renewal's doing.
+    loop {
+        match event(&mut b).await {
+            TransportEvent::PeerFrame { payload, .. } => {
+                assert_eq!(payload, b"after-renewal");
+                break;
+            }
+            TransportEvent::Closed { connection, .. } if connection != warm => {}
+            other => panic!("the warm link did not survive the renewal: {other:?}"),
+        }
+    }
+    assert!(b.linked(r(0), inc(1), Lane::Control));
+
+    // A handshake into `b` now presents the renewed leaf...
+    c.connect(
+        b_addr,
+        "node-b",
+        PeerRole::Voter,
+        Some(inc(1)),
+        Lane::Control,
+        renewed.expected(),
+    )
+    .await
+    .expect("the renewed leaf was not presented to a new caller");
+    assert!(matches!(
+        event(&mut c).await,
+        TransportEvent::Connected { .. }
+    ));
+    // ...and so does a dial out of it, through the dialer taken before.
+    dialer
+        .connect(
+            c.local_addr().unwrap(),
+            "node-c",
+            PeerRole::Voter,
+            Some(inc(1)),
+            Lane::Bulk,
+            c_id.expected(),
+        )
+        .await
+        .expect("a dial after the renewal presented the old leaf");
+    // The warm link is still the one it was.
+    assert!(b.linked(r(0), inc(1), Lane::Control));
+}

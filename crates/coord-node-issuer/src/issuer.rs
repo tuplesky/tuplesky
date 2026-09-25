@@ -145,7 +145,7 @@ impl NodeIssuer {
         .map_err(IssueError::Policy)?;
         let uri = node_uri(&policy.identity);
         // Build the certificate from policy: node URI SAN plus endpoint
-        // DNS, client-and-server EKU, digital-signature usage, not a CA.
+        // DNS names and addresses, client-and-server EKU, digital-signature usage, not a CA.
         let mut params = CertificateParams::default();
         params
             .distinguished_name
@@ -164,6 +164,9 @@ impl NodeIssuer {
             sans.push(SanType::DnsName(
                 Ia5String::try_from(dns.clone()).map_err(|_| IssueError::Signing)?,
             ));
+        }
+        for ip in &policy.ip_addresses {
+            sans.push(SanType::IpAddress(*ip));
         }
         params.subject_alt_names = sans;
         // The certificate can outlive neither the assertion that

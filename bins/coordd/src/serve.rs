@@ -580,6 +580,99 @@ impl CollectorLinks {
     }
 }
 
+/// This node's leaf, renewed while it serves (task-d02).
+///
+/// The schedule ([`crate::renewal`]) says when; the enroller
+/// ([`crate::enroll`]) asks the issuer and decides whether the answer may
+/// be presented; this holds the two together with the credential being
+/// served on and the one attempt that may be out. The attempt runs beside
+/// the loop, as a dial does -- it is a network round trip to a service
+/// that may be down -- in a set the domain drops with it.
+pub struct Renewing {
+    schedule: crate::renewal::Schedule,
+    enroller: std::sync::Arc<crate::enroll::Enroller>,
+    current: std::sync::Arc<crate::enroll::Credential>,
+    attempt: tokio::task::JoinSet<Result<crate::enroll::Credential, crate::enroll::Failure>>,
+    /// The leaf reached its deadline and the loop ended on it.
+    expired: bool,
+}
+
+/// What renewal has done so far, for the report a stopping node makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenewalReport {
+    /// Leaves put into service.
+    pub renewed: u64,
+    /// Enrollments started.
+    pub attempts: u64,
+    /// Enrollments that put nothing into service.
+    pub failed: u64,
+    /// The `notAfter` of the leaf being served on (unix seconds).
+    pub expires_at: u64,
+    /// Whether serving ended because that leaf expired.
+    pub expired: bool,
+}
+
+impl Renewing {
+    /// Renew `current` through `enroller` under `policy`.
+    pub fn new(
+        enroller: crate::enroll::Enroller,
+        current: crate::enroll::Credential,
+        policy: coord_node_issuer::RenewalPolicy,
+    ) -> Self {
+        let seed = crate::renewal::seed(&current.identity.node);
+        Renewing {
+            schedule: crate::renewal::Schedule::new(policy, current.leaf, seed),
+            enroller: std::sync::Arc::new(enroller),
+            current: std::sync::Arc::new(current),
+            attempt: tokio::task::JoinSet::new(),
+            expired: false,
+        }
+    }
+
+    /// The leaf's validity, its due point and the policy's answer now, for
+    /// the startup report.
+    pub fn describe(&self, now_ms: u64) -> String {
+        let leaf = self.schedule.leaf();
+        format!(
+            "renewal configured issued_at={} expires_at={} due_at={} state={}",
+            leaf.issued_at,
+            leaf.expires_at,
+            self.schedule.due_at(),
+            crate::renewal_state(&self.schedule.decide(now_ms)),
+        )
+    }
+
+    fn report(&self) -> RenewalReport {
+        RenewalReport {
+            renewed: self.schedule.renewals,
+            attempts: self.schedule.attempts,
+            failed: self.schedule.failures,
+            expires_at: self.schedule.leaf().expires_at,
+            expired: self.expired,
+        }
+    }
+}
+
+/// Wall-clock milliseconds. A leaf's validity is stated in wall-clock
+/// seconds, so its schedule is too.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The renewal attempt out, or nothing for ever when there is none -- a
+/// `select!` arm that resolved at once would spin the loop.
+async fn next_attempt(
+    renewal: Option<&mut Renewing>,
+) -> Option<Result<Result<crate::enroll::Credential, crate::enroll::Failure>, tokio::task::JoinError>>
+{
+    match renewal {
+        Some(r) if !r.attempt.is_empty() => r.attempt.join_next().await,
+        _ => std::future::pending().await,
+    }
+}
+
 /// One domain running in this process: the voter that writes its store,
 /// and the frontend in front of it.
 ///
@@ -656,6 +749,8 @@ pub struct Domain<P: Persistence> {
     /// Which plane and voter each dial in `dials` is for, so one that
     /// ends without an answer still frees its voter's schedule.
     dialling: BTreeMap<tokio::task::Id, (Plane, usize)>,
+    /// This node's leaf renewal, where it is configured (task-d02).
+    renewal: Option<Renewing>,
 }
 
 /// The two planes a voter is dialled on.
@@ -1022,6 +1117,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             started: std::time::Instant::now(),
             dials: tokio::task::JoinSet::new(),
             dialling: BTreeMap::new(),
+            renewal: None,
             peer_streak: 0,
             budgets,
             recorder,
@@ -1170,6 +1266,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
         self.links.redial.start(now);
         loop {
+            // The leaf this node presents first, every pass: a node whose
+            // leaf has expired serves nothing more on it, however much
+            // work is queued (task-d02).
+            if self.renew() {
+                return;
+            }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1261,6 +1363,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         self.dialled(done);
                         continue;
                     }
+                    Some(done) = next_attempt(self.renewal.as_mut()) => {
+                        self.attempted(transport, done);
+                        continue;
+                    }
                     () = sleep, if wake.is_some() => continue,
                 }
             } else {
@@ -1272,6 +1378,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     event = transport.next_event() => event.map(Arrived::Api),
                     Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
                         self.dialled(done);
+                        continue;
+                    }
+                    Some(done) = next_attempt(self.renewal.as_mut()) => {
+                        self.attempted(transport, done);
                         continue;
                     }
                     () = sleep, if wake.is_some() => continue,
@@ -1445,6 +1555,122 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
     }
 
+    /// Renew this node's leaf while it serves (task-d02).
+    pub fn with_renewal(mut self, renewal: Renewing) -> Self {
+        self.renewal = Some(renewal);
+        self
+    }
+
+    /// What renewal has done, where it is configured.
+    pub fn renewal(&self) -> Option<RenewalReport> {
+        self.renewal.as_ref().map(Renewing::report)
+    }
+
+    /// Act on the leaf's schedule: start the enrollment that is due, or
+    /// end serving on a leaf that has expired.
+    ///
+    /// Returns whether the leaf has expired, which ends the loop. Nothing
+    /// that happens afterwards -- an attempt that was in flight answering,
+    /// the issuer coming back -- is looked at again: the attempt is
+    /// aborted with the loop, and the process stops. A leaf is never
+    /// served on past its `notAfter`, and the deadline is not something an
+    /// answer can move.
+    fn renew(&mut self) -> bool {
+        let Some(r) = self.renewal.as_mut() else {
+            return false;
+        };
+        if r.expired {
+            return true;
+        }
+        match r.schedule.step(unix_millis()) {
+            crate::renewal::Step::Expired => {
+                r.expired = true;
+                r.attempt.abort_all();
+                eprintln!(
+                    "renewal expired expires_at={} attempts={} failed={}: this node's leaf \
+                     is no longer valid and it stops serving on it; restart it on a renewed leaf",
+                    r.schedule.leaf().expires_at,
+                    r.schedule.attempts,
+                    r.schedule.failures,
+                );
+                true
+            }
+            crate::renewal::Step::Enroll => {
+                let enroller = std::sync::Arc::clone(&r.enroller);
+                let current = std::sync::Arc::clone(&r.current);
+                r.attempt
+                    .spawn(async move { enroller.renew(&current).await });
+                false
+            }
+            crate::renewal::Step::Wait { .. } | crate::renewal::Step::InFlight { .. } => false,
+        }
+    }
+
+    /// A renewal attempt started by [`Domain::renew`] has ended.
+    ///
+    /// A renewed leaf is already checked and already written where a
+    /// restart reads it; here it goes into service on both planes, for
+    /// the handshakes that begin from now on. Nothing already connected is
+    /// touched: those links were authenticated under the old leaf and end
+    /// where they always would, at the deadline their peers hold for it or
+    /// at the age cap, and are dialled again under the new one.
+    fn attempted(
+        &mut self,
+        api: &Transport,
+        done: Result<
+            Result<crate::enroll::Credential, crate::enroll::Failure>,
+            tokio::task::JoinError,
+        >,
+    ) {
+        let now = unix_millis();
+        let Some(r) = self.renewal.as_mut() else {
+            return;
+        };
+        if r.expired {
+            return;
+        }
+        let failure = match done {
+            Ok(Ok(renewed)) => {
+                let chain = renewed.chain.clone();
+                let presented = api
+                    .set_identity(chain.clone(), renewed.key.clone_key())
+                    .and_then(|()| match &self.plane {
+                        Some(plane) => plane.transport.set_identity(chain, renewed.key.clone_key()),
+                        None => Ok(()),
+                    });
+                match presented {
+                    Ok(()) => {
+                        let previous = r.schedule.leaf();
+                        r.schedule.renewed(renewed.leaf);
+                        r.current = std::sync::Arc::new(renewed);
+                        eprintln!(
+                            "renewal renewed expires_at={} previous={} due_at={} attempts={}",
+                            r.schedule.leaf().expires_at,
+                            previous.expires_at,
+                            r.schedule.due_at(),
+                            r.schedule.attempts,
+                        );
+                        return;
+                    }
+                    Err(e) => format!("the renewed leaf could not be presented: {e:?}"),
+                }
+            }
+            Ok(Err(failure)) => failure.to_string(),
+            Err(e) => format!("the attempt did not finish: {e}"),
+        };
+        r.schedule.failed(now);
+        // An issuer that stays away is retried for as long as the leaf
+        // lasts, so this is a condition and is said less as it goes on.
+        let what = "renewal attempt failed";
+        if let Some(n) = self.recurring.seen(what) {
+            let retry = r.schedule.wake_at(now).saturating_sub(now) / 1000;
+            let left = r.schedule.leaf().expires_at.saturating_sub(now / 1000);
+            eprintln!(
+                "{what}: {failure} ({n} so far); next in {retry}s, the leaf expires in {left}s"
+            );
+        }
+    }
+
     /// Schedule lease and private-TTL expiry from this node's leader.
     pub fn with_expiry(mut self, expiry: crate::leases::Expiry) -> Self {
         self.expiry = Some(expiry);
@@ -1487,7 +1713,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .into_iter()
             .chain(self.links.redial.next_deadline())
             .min();
-        [expiry, parked, reoffer, redial]
+        // The leaf turns due, an attempt is retried, or the leaf expires
+        // -- all on a quiet domain as much as a busy one (task-d02).
+        let renewal = self.renewal.as_ref().filter(|r| !r.expired).map(|r| {
+            let now = unix_millis();
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(r.schedule.wake_at(now).saturating_sub(now))
+        });
+        [expiry, parked, reoffer, redial, renewal]
             .into_iter()
             .flatten()
             .min()

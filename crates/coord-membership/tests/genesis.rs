@@ -122,6 +122,7 @@ fn build_issuer() -> Issuer {
         min_incarnation: 1,
         max_lifetime_secs: 3600,
         dns_names: vec![],
+        ip_addresses: vec![],
     };
     let rules = vec![
         policy(1, PeerRole::Voter, "voters", "voter-1"),

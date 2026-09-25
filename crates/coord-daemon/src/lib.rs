@@ -84,12 +84,14 @@ pub mod startup;
 pub mod supervise;
 pub mod voter;
 
-pub use config::{Config, ConfigError, Limits, ListenConfig, capability_covers};
+pub use config::{Config, ConfigError, Limits, ListenConfig, RenewalConfig, capability_covers};
 pub use diagnostics::{Diagnostics, Redacted};
 pub use fanout::{
     Dispatched, LocalIngress, NotQueued, PeerFanOut, Queued, Route, Saturated, dispatch,
 };
-pub use identity::{IdentityError, load as load_identity, verify as verify_identity};
+pub use identity::{
+    ChainRefusal, IdentityError, load as load_identity, verify as verify_identity, verify_chain,
+};
 pub use lifecycle::{Lifecycle, Phase, QuarantineReason, Readiness, ReadyGate};
 pub use listen::{BindFailure, BoundListeners, bind_listeners};
 pub use mailbox::{Ingress, IngressBudget, LocalRoute};
