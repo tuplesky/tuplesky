@@ -1464,6 +1464,8 @@ A surviving three-voter majority progresses only after required leader recovery,
 
 **Acceptance:** A provision with three distinct non-loopback addresses on the local range (for example `127.0.0.2` through `127.0.0.4`, so the test runs on one CI runner while exercising non-default SANs and catalog entries) comes up, serves a request through Kine, and rejoins a killed and restarted voter (task-d03). Provisioning without `--hosts` is byte-for-byte what it was, and the Kubernetes certification workflow still passes. The runbook is followed literally once on three real hosts and the markers it names are recorded in the document. `coord-harness` stays test-only in the production dependency graph.
 
+**Status:** The tooling and runbook merge with the real-hosts run recorded as not done. That run is the maintainer's, on their own test nodes, on a build carrying task-d03's both-lanes re-dial and task-d01's restart rule (or without restarting the leader host); it lands as a follow-up documentation PR on task-d04, and task-d04 stays open until it does.
+
 **Review boundary:** Test tooling and documentation. No production provisioning tool: signed genesis, catalog signing and node issuance for production remain task-42/task-43 and task-65 concerns. No weakening of identity checks or of the token service's test-only status, and no change to `coordd` beyond what a relocatable bundle strictly needs, which is expected to be nothing.
 
 <a id="task-q01"></a>

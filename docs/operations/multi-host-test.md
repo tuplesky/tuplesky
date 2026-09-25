@@ -335,3 +335,15 @@ no markers from such a run are recorded here. When it is, record the date, the
 commit, the hosts' operating system and network (same subnet, across zones,
 across regions), and on each voter host the output of step 7 before and after
 step 10, with the certification suite's result from step 9.
+
+The run is made by the maintainer on their own test nodes, and lands as a
+follow-up documentation PR on task-d04; task-d04 stays open in the plan until
+it does. Two conditions hold for it:
+
+* It follows this document with the review's corrections in it, not an
+  earlier copy.
+* It runs on a build that carries task-d03's both-lanes re-dial and task-d01's
+  restart rule. On a build without them, step 10 kills and restarts a voter
+  other than the leader (voter 1): a leader restarted there within the idle
+  timeout comes back on the ballot it had, with an empty table, and what the
+  run records is then that defect rather than the domain.
