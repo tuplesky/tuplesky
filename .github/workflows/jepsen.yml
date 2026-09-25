@@ -115,6 +115,9 @@ jobs:
           chmod +x "$HOME/bin/lein"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           (cd jepsen/jepsen && "$HOME/bin/lein" install)
+      - name: Run the Jepsen project's unit tests
+        working-directory: jepsen/tuplesky
+        run: lein test
       - name: Stand the cluster up
         run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
       - name: Deploy a domain on it and put a write through every voter

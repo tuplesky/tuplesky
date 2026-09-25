@@ -218,6 +218,11 @@ def check(ops, final):
             for m in answer["value"]:
                 if m[0] == "r":
                     reads.setdefault(m[1], []).append((m[2] or [], t0, t1))
+    # The final read is a read like the others, begun after everything
+    # else ended: a value an earlier read saw must still be in it.
+    if final is not None:
+        for k, lst in final.items():
+            reads.setdefault(k, []).append((lst, float("inf"), float("inf")))
     for k, rs in reads.items():
         longest = max((r for r, _, _ in rs), key=len)
         if final is not None:

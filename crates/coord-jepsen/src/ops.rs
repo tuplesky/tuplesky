@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use coord_state::Response;
-use coord_state::plan::Outcome;
+use coord_state::plan::{Outcome, RejectionReason};
 use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::{
     BranchOp, CanonicalOperation, Compare, CompareOperand, CompareResult, CompareTarget, KeyRange,
@@ -251,17 +251,38 @@ pub fn read_verdict(
     }
 }
 
+/// Whether an established refusal leaves open that the request ran.
+///
+/// Two rejections name a retry key rather than the request: a sequence
+/// at or below the session's retired floor (`RetryTooOld`), which is not
+/// a replay of whatever it did, and a retained result that current
+/// authorization no longer hands out (`RetryUnauthorized`), which was
+/// executed. Neither says the operation had no effect.
+fn may_have_run(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::ErrRejected {
+            reason: RejectionReason::RetryTooOld | RejectionReason::RetryUnauthorized
+        }
+    )
+}
+
 /// The verdict on an operation that may write.
 ///
 /// `complete` reads an established response: `Ok(Some(value))` is the
 /// operation done, `Ok(None)` is an established result in which it did
 /// not happen (a guard that did not hold). An established outcome of
-/// another kind is a planner refusal, which changed nothing.
+/// another kind is a planner refusal, which changed nothing -- except the
+/// two refusals of a retry key that may name a request that ran, which
+/// are `info`.
 pub fn write_verdict(
     answer: Answer,
     complete: impl FnOnce(&Response) -> Result<Option<Value>, String>,
 ) -> Verdict {
     match answer {
+        Answer::Established(response) if may_have_run(&response.outcome) => {
+            Verdict::Info(refused(&response.outcome))
+        }
         Answer::Established(response) => match complete(&response) {
             Ok(Some(value)) => Verdict::Ok(value),
             Ok(None) => Verdict::Fail("guard-failed".into()),
@@ -602,12 +623,25 @@ mod tests {
         assert_eq!(
             write_verdict(
                 established(Outcome::ErrRejected {
-                    reason: coord_state::plan::RejectionReason::RetryTooOld
+                    reason: RejectionReason::Unsupported
                 }),
                 applied
             ),
-            Verdict::Fail("rejected-retrytooold".into())
+            Verdict::Fail("rejected-unsupported".into())
         );
+        // A refusal of the retry key, not of the request: it may have run.
+        for (reason, name) in [
+            (RejectionReason::RetryTooOld, "rejected-retrytooold"),
+            (
+                RejectionReason::RetryUnauthorized,
+                "rejected-retryunauthorized",
+            ),
+        ] {
+            assert_eq!(
+                write_verdict(established(Outcome::ErrRejected { reason }), applied),
+                Verdict::Info(name.into())
+            );
+        }
         assert!(matches!(
             write_verdict(Answer::NotSubmitted("malformed".into()), applied),
             Verdict::Fail(_)

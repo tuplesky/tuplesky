@@ -60,7 +60,11 @@ history. The shim is `fail` only where it knows:
   hold, or a planner refusal (`ErrRejected`, `ErrSessionInvalid`,
   `ErrPermissionDenied`) -- or when it was refused before it could be
   submitted (`MALFORMED_REQUEST`, `REQUEST_TOO_LARGE`, an identity
-  conflict). Everything else that is not `ok` is `info`, including
+  conflict). Two planner refusals are the exception, because they refuse
+  a retry key and not the request: `RetryTooOld` (a retired sequence
+  presented again, not a replay of what it did) and `RetryUnauthorized`
+  (an executed command whose result current authorization withholds).
+  Both are `info`. Everything else that is not `ok` is `info`, including
   `NOT_ADMITTED`: a denied disclosure of an executed command is
   `NOT_ADMITTED` too.
 * A read is `fail` whenever it did not complete: it had no effect.
@@ -116,8 +120,8 @@ The Jepsen side is `jepsen.tuplesky`, in the `tuplesky/` directory of the
   through Jepsen's combined nemesis package. Any `panicked at` in a
   voter's log fails the test.
 
-It has not been run under Jepsen yet: the environment it was written in
-could not reach Clojars.
+It runs under Jepsen in the `jepsen` workflow, below. The environment
+it was written in could not reach Clojars, so that is where it runs.
 
 ### In a Docker cluster: the `jepsen` workflow
 
@@ -163,13 +167,31 @@ and `history.json`.
 
 ## Findings
 
-All of these are on this branch's base (the top of the task-43
-follow-up stack, `b642bfb`), in debug builds on one machine, inside a
-gVisor sandbox. No history had an anomaly. The first two sections came
-from the stress driver on one host: liveness failures after repeatedly
-killing and restarting one voter while the other two stayed up and
-linked. The third came from a deployment on containers, and reproduced
-on a GitHub runner; the fourth from the first Jepsen run there.
+No history, from the stress driver or from Jepsen, had an anomaly. All
+four findings are liveness failures. The first two came from the stress
+driver on one host (debug builds, a gVisor sandbox, the stack at
+`b642bfb`), repeatedly killing and restarting one voter while the other
+two stayed up. The third came from a container deployment and reproduces
+on a GitHub runner and on loopback. The fourth came from the Jepsen runs
+on the runner.
+
+Where they stand on the stack at `afc0df6`:
+
+| Finding | Status |
+| --- | --- |
+| A restarted follower whose table stays full | Open. Recovery carries the whole history (below). |
+| A restarted voter that panics, then no election | Fixed on task-d01 (`fe09234`, `f2d4dfb`). |
+| A follower that started late never completes a read | Open. Reproduced on `afc0df6`. |
+| No sessions after healing, under Jepsen | Open. Recovery carries the whole history (below). |
+
+The first and the last are the limit task-d01's notes now record as
+"recovery carries the whole history": dependency rows are never pruned,
+so every recovery report and every Sync names every command the domain
+has run, and a voter cannot tell a long-retired command from an unknown
+one. After enough history, any election fills the command table with
+placeholders. Deciding what bounds it (an execution floor, a pruned
+ledger, or a durable "executed" answer) is a `coord-consensus` protocol
+decision, and it is in no task yet.
 
 ### A restarted follower whose command table stays full
 
@@ -248,7 +270,7 @@ second leaves a majority of live voters unable to serve, which is the
 fault tolerance the domain promises. They are reported here rather than
 fixed; `scripts/e2e/shim-stress.py --fault leader` is the reproduction.
 
-### In containers, a follower frontend that never completes a read
+### A follower that started late never completes a read
 
 Deployed on three containers the way `docker/smoke.sh` deploys (DNS names,
 separate network namespaces, bundles run from `/opt/tuplesky/nN`), the
@@ -268,11 +290,41 @@ That is a hypothesis, not a diagnosis. The same domain on one host's
 loopback range, with IP literals or with DNS names, served reads through
 all three voters.
 
-It is not the sandbox. The first `jepsen` workflow run on a GitHub runner
-(a real kernel, five containers) reproduced it on three of five voters:
+It is not the sandbox. Both `jepsen` workflow runs on a GitHub runner (a
+real kernel, five containers) reproduced it on three of five voters:
 voters 1 and 2 served the smoke step's read back, and voters 3, 4 and 5
 each took the write and then held the read `Pending` for the shim's whole
 budget (`{"type":"fail","error":"pending"}`).
+
+It is not containers either. What matters is when the voter starts. On
+`afc0df6`, on loopback: start voters 1 and 2, put one write through voter
+1, then start voter 3 and wait for its full mesh. Through voter 3, a read
+stays `Pending`, a write succeeds, and a read of the key just written
+stays `Pending`. Voter 1 serves the first key. Voter 3 had not recovered
+25 seconds later. With all three started together (the `jepsen_shim`
+test), reads through voter 3 are served. The voters that stalled on
+containers and on the runner were the last ones started.
+
+The likely cause is in review on this change. A follower that misses one
+`Proposal` never learns that command exists:
+
+* a frame to a peer that is not linked yet is dropped;
+* nothing re-sends it: `welcome` sends only `NewLeader` and the bound Sync;
+* `missing_payloads` never covers a dependency the table has no record
+  for.
+
+Every later proposal depends on the conservative key's last command, and
+adoption needs every dependency at ACCEPT. So from the first missed
+proposal on, the follower holds everything and executes nothing. Its
+projection never shows the caller's session, and the frontend's output
+gate holds every read. Writes still succeed, because the leader answers
+them. A Sync that realigns the follower (an election, or a restart
+during one) clears it. The protocol gap is the follower having no way to
+learn a dependency it lacks, whether by asking for its identity and
+payload or by the leader re-sending held proposals when a link returns.
+It also accounts for more of the failed Jepsen transactions than the
+faults do: every transaction through a stalled voter fails at its
+snapshot read.
 
 ### Under Jepsen: a domain that no longer binds sessions
 

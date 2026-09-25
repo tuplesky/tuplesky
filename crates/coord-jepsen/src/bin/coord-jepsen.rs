@@ -99,7 +99,20 @@ async fn serve(cli: Cli) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            // A line that is not UTF-8 was never a request, so nothing was
+            // submitted: say so, rather than ending as if stdin had closed.
+            Err(e) => {
+                let answer =
+                    json!({"type": "fail", "error": format!("unreadable request line: {e}")});
+                let _ = stdout.write_all(format!("{answer}\n").as_bytes()).await;
+                let _ = stdout.flush().await;
+                return ExitCode::FAILURE;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
