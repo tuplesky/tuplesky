@@ -196,6 +196,194 @@ pub struct Plan {
     pub voters: u8,
     /// The port the storage edge binds, or 0 for an ephemeral one.
     pub edge_port: u16,
+    /// Where each voter runs, when that is not this host's loopback
+    /// (task-d04). Empty is the single-host domain this harness has
+    /// always written, byte for byte; otherwise one entry per voter.
+    pub hosts: Vec<Host>,
+    /// Bind every listener a host list places on the unspecified address
+    /// rather than on the named host, for hosts whose listed address is
+    /// not on any of their interfaces (a cloud instance's public address
+    /// behind one-to-one NAT). A DNS name is always bound this way, and a
+    /// loopback address never is.
+    pub listen_any: bool,
+    /// The host the storage edge is reached at, when that is not
+    /// loopback. Its server certificate carries it.
+    pub edge_host: Option<String>,
+    /// Where the credential endpoint is reached, `host:port`, when that
+    /// is not loopback. Its server certificate carries the host.
+    pub issuer_listen: Option<Address>,
+}
+
+impl Plan {
+    /// A single-host domain on loopback: what `coord-harness provision`
+    /// writes without `--hosts`.
+    pub fn loopback(directory: PathBuf, voters: u8, edge_port: u16) -> Self {
+        Plan {
+            directory,
+            voters,
+            edge_port,
+            hosts: Vec::new(),
+            listen_any: false,
+            edge_host: None,
+            issuer_listen: None,
+        }
+    }
+}
+
+/// A host and a port, where the host is an IP literal or a DNS name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Address {
+    /// An IP literal or a DNS name, without brackets.
+    pub host: String,
+    /// The port.
+    pub port: u16,
+}
+
+impl Address {
+    /// Parse `host:port`, with an IPv6 literal in brackets.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let (host, port) = text
+            .rsplit_once(':')
+            .ok_or_else(|| format!("`{text}` is not host:port"))?;
+        let port = port
+            .parse()
+            .map_err(|_| format!("`{port}` in `{text}` is not a port"))?;
+        let host = unbracket(host);
+        if crate::pki::reach(host).is_none() {
+            return Err(format!(
+                "`{host}` in `{text}` is neither an IP address nor a DNS name"
+            ));
+        }
+        Ok(Address {
+            host: host.to_owned(),
+            port,
+        })
+    }
+}
+
+/// Where one voter of a multi-host domain runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Host {
+    /// Which voter, one-based: `n1` is replica `01..01`.
+    pub node: u8,
+    /// An IP literal or a DNS name, without brackets. The catalog lists
+    /// it, peers dial it, and the node's certificates carry it.
+    pub host: String,
+    /// The api-plane port.
+    pub api: u16,
+    /// The peer-plane port.
+    pub peer: u16,
+}
+
+/// Parse `n1=host:api_port:peer_port,n2=...`.
+///
+/// Every voter from `n1` up is named exactly once and nothing else is:
+/// a genesis commits voters one to N, and a host list with a gap would
+/// provision a committed voter that no host runs. Two voters on one
+/// host must not share a port, and a voter's two planes are two ports,
+/// because each is its own listener.
+pub fn parse_hosts(spec: &str) -> Result<Vec<Host>, String> {
+    let mut hosts = Vec::new();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (name, place) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("`{entry}` is not nN=host:api_port:peer_port"))?;
+        let node: u8 = name
+            .strip_prefix('n')
+            .and_then(|n| n.parse().ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("`{name}` is not a voter name like n1"))?;
+        let (rest, peer) = place
+            .rsplit_once(':')
+            .ok_or_else(|| format!("`{place}` is not host:api_port:peer_port"))?;
+        let (host, api) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| format!("`{place}` is not host:api_port:peer_port"))?;
+        let port = |text: &str| -> Result<u16, String> {
+            text.parse()
+                .ok()
+                .filter(|p| *p > 0)
+                .ok_or_else(|| format!("`{text}` in `{entry}` is not a fixed port"))
+        };
+        let host = unbracket(host);
+        if crate::pki::reach(host).is_none() {
+            return Err(format!(
+                "`{host}` in `{entry}` is neither an IP address nor a DNS name"
+            ));
+        }
+        hosts.push(Host {
+            node,
+            host: host.to_owned(),
+            api: port(api)?,
+            peer: port(peer)?,
+        });
+    }
+    if hosts.is_empty() {
+        return Err("the host list names no voter".into());
+    }
+    hosts.sort_by_key(|h| h.node);
+    for (index, host) in hosts.iter().enumerate() {
+        if usize::from(host.node) != index + 1 {
+            return Err(format!(
+                "voters are n1 to n{} with each named once; n{} is {}",
+                hosts.len(),
+                index + 1,
+                if usize::from(host.node) > index + 1 {
+                    "missing"
+                } else {
+                    "named twice"
+                }
+            ));
+        }
+    }
+    let mut taken = std::collections::BTreeSet::new();
+    for host in &hosts {
+        for port in [host.api, host.peer] {
+            if !taken.insert((host.host.clone(), port)) {
+                return Err(format!(
+                    "port {port} on {} is given to two listeners",
+                    host.host
+                ));
+            }
+        }
+    }
+    Ok(hosts)
+}
+
+fn unbracket(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// `host:port`, with an IPv6 literal in brackets, as a catalog lists it
+/// and a client dials it.
+fn authority(host: &str, port: u16) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{host}:{port}"),
+    }
+}
+
+/// The socket a listener reached at `host` binds.
+///
+/// The named address itself where that is possible, so that several
+/// "hosts" on one machine's loopback range really are several listeners
+/// and a node never answers on an interface it was not placed on. The
+/// unspecified address of the same family where it is not: a DNS name,
+/// which a strict configuration cannot hold, or `listen_any`, for an
+/// address that is not on any of the host's interfaces. A loopback
+/// address always is on one, so it is always bound as itself. The QUIC
+/// stack answers each datagram from the address it arrived at, so a
+/// wildcard bind is still reached at the listed address.
+fn bind_address(host: &str, port: u16, listen_any: bool) -> SocketAddr {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if !listen_any || ip.is_loopback() => SocketAddr::new(ip, port),
+        Ok(std::net::IpAddr::V6(_)) => {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port)
+        }
+        _ => SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port),
+    }
 }
 
 /// Ask the operating system for a port nothing is using, then let go of
@@ -219,6 +407,31 @@ fn write_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
 /// Provision a domain into `plan.directory`.
 pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     let dir = &plan.directory;
+    let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, why);
+    if !plan.hosts.is_empty() && plan.hosts.len() != usize::from(plan.voters) {
+        return Err(invalid(format!(
+            "the host list places {} voters and the plan commits {}",
+            plan.hosts.len(),
+            plan.voters
+        )));
+    }
+    // What a certificate is reached at, settled before anything is
+    // written: a host a certificate cannot name is refused here rather
+    // than as a handshake failure on another machine.
+    let reach = |host: &str| {
+        crate::pki::reach(host)
+            .ok_or_else(|| invalid(format!("`{host}` is neither an IP address nor a DNS name")))
+    };
+    let mut voter_reach = Vec::new();
+    for host in &plan.hosts {
+        voter_reach.push(reach(&host.host)?);
+    }
+    let edge_reach = plan.edge_host.as_deref().map(reach).transpose()?;
+    let issuer_reach = plan
+        .issuer_listen
+        .as_ref()
+        .map(|a| reach(&a.host))
+        .transpose()?;
     std::fs::create_dir_all(dir)?;
 
     let cluster = ClusterId([0x11; 16]);
@@ -259,7 +472,16 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         let directory = dir.join(format!("n{n}"));
         std::fs::create_dir_all(&directory)?;
         let node = ReplicaId([n; 16]);
-        let issued = ca.issue_node(SERVER_NAME, cluster, node, incarnation, PeerRole::Voter);
+        // Both of a node's certificates carry the host it is placed on:
+        // its node certificate because peers dial it there, its
+        // collector certificate because the collector presents it when
+        // it dials the others. One key per certificate, issued once, so
+        // the key the genesis below commits is the key this leaf holds.
+        let issue = |role| match voter_reach.get(usize::from(n) - 1) {
+            None => ca.issue_node(SERVER_NAME, cluster, node, incarnation, role),
+            Some(at) => ca.issue_node_at(SERVER_NAME, cluster, node, incarnation, role, at.clone()),
+        };
+        let issued = issue(PeerRole::Voter);
         voter_keys.push(issued.spki());
         if n == 1 {
             attester = Some(issued.key.serialize_der());
@@ -268,7 +490,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         // A different certificate, because it is a different principal:
         // the role that may submit on a caller's behalf is the
         // collector's, not the voter's.
-        let collector = ca.issue_node(SERVER_NAME, cluster, node, incarnation, PeerRole::Frontend);
+        let collector = issue(PeerRole::Frontend);
         collector.write(
             &directory.join("collector.pem"),
             &directory.join("collector.key"),
@@ -305,11 +527,26 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     // Listeners. Both of a node's addresses go in one catalog entry:
     // which of them serves which plane is settled by dialling, because a
     // peer and a collector offer different ALPNs.
+    //
+    // Without a host list every voter is on this host's loopback at a
+    // port nothing is using. With one, each voter is where the list put
+    // it, at the ports it named: the catalog is what every other node
+    // dials, so it has to say where the node really is.
     let mut api = Vec::new();
     let mut peer = Vec::new();
-    for _ in 0..plan.voters {
-        api.push(free_udp()?);
-        peer.push(free_udp()?);
+    if plan.hosts.is_empty() {
+        for _ in 0..plan.voters {
+            let (a, p) = (free_udp()?, free_udp()?);
+            // Listed where it listens.
+            api.push((format!("127.0.0.1:{a}"), format!("127.0.0.1:{a}")));
+            peer.push((format!("127.0.0.1:{p}"), format!("127.0.0.1:{p}")));
+        }
+    } else {
+        for host in &plan.hosts {
+            let listen = |port| bind_address(&host.host, port, plan.listen_any).to_string();
+            api.push((authority(&host.host, host.api), listen(host.api)));
+            peer.push((authority(&host.host, host.peer), listen(host.peer)));
+        }
     }
 
     let catalog_path = dir.join("endpoints.bin");
@@ -318,32 +555,46 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         cluster,
         domain,
         attester.as_deref().expect("at least one voter"),
-        &api,
-        &peer,
+        &api.iter().map(|(at, _)| at.clone()).collect::<Vec<_>>(),
+        &peer.iter().map(|(at, _)| at.clone()).collect::<Vec<_>>(),
     )?;
 
     let mut voters_out = Vec::new();
-    for (index, (n, node, directory)) in nodes.iter().enumerate() {
+    for (index, (_, node, directory)) in nodes.iter().enumerate() {
         let config = directory.join("coordd.toml");
+        // A host list means the node runs somewhere else, from a copy of
+        // its own directory. Its configuration then names everything
+        // relative to that directory, and the directory holds its own
+        // copy of the genesis and the catalog, so the bundle works
+        // wherever it is unpacked. Without one the configuration is the
+        // absolute one this harness has always written.
+        let layout = if plan.hosts.is_empty() {
+            Layout::Absolute {
+                root: dir,
+                node: directory,
+            }
+        } else {
+            std::fs::copy(&manifest_path, directory.join("genesis.json"))?;
+            std::fs::copy(&catalog_path, directory.join("endpoints.bin"))?;
+            Layout::Bundle
+        };
         std::fs::write(
             &config,
             node_config(
-                dir,
-                directory,
-                api[index],
-                peer[index],
+                &layout,
+                &api[index].1,
+                &peer[index].1,
                 &hex(&principal),
                 &hex(&namespace),
                 &hex(&trust_rule),
             ),
         )?;
-        let _ = n;
         voters_out.push(Node {
             node: hex(&node.0),
             config,
             directory: directory.clone(),
-            api: format!("127.0.0.1:{}", api[index]),
-            peer: format!("127.0.0.1:{}", peer[index]),
+            api: api[index].0.clone(),
+            peer: peer[index].0.clone(),
         });
     }
 
@@ -363,8 +614,17 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
     std::fs::write(&authority_key, coord_sts::keys::b64url(&ca.signing_key()))?;
     restrict(&authority_key)?;
 
-    let issuer = provision_issuer(dir)?;
-    let edge = provision_edge(dir, plan.edge_port)?;
+    let issuer = provision_issuer(
+        dir,
+        plan.issuer_listen.as_ref().zip(issuer_reach),
+        plan.listen_any,
+    )?;
+    let edge = provision_edge(
+        dir,
+        plan.edge_port,
+        plan.edge_host.as_deref().zip(edge_reach),
+        plan.listen_any,
+    )?;
 
     let provisioned = Provisioned {
         cluster: hex(&cluster.0),
@@ -414,8 +674,8 @@ fn write_catalog(
     cluster: ClusterId,
     domain: DomainId,
     attester_key: &[u8],
-    api: &[u16],
-    peer: &[u16],
+    api: &[String],
+    peer: &[String],
 ) -> std::io::Result<()> {
     use coord_types::config_v1::{EndpointCatalogV1, EndpointV1, VoterSignatureV1};
 
@@ -424,10 +684,7 @@ fn write_catalog(
         .map(|i| EndpointV1 {
             node: ReplicaId([i as u8 + 1; 16]),
             incarnation,
-            addresses: vec![
-                format!("127.0.0.1:{}", peer[i]),
-                format!("127.0.0.1:{}", api[i]),
-            ],
+            addresses: vec![peer[i].clone(), api[i].clone()],
             certificate_fingerprint: None,
         })
         .collect();
@@ -454,12 +711,65 @@ fn write_catalog(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What a bundle's configuration says about itself, and how the harness
+/// recognizes one: its paths are relative, so it has to be run from its
+/// own directory.
+pub const BUNDLE_NOTE: &str = "# Every path below is relative to this directory, and coordd opens a
+# relative path against its working directory: run it from here.
+";
+
+/// Where a node's configuration says its files are.
+enum Layout<'a> {
+    /// Absolute paths into the run directory, which is where the node
+    /// runs: the single-host domain.
+    Absolute {
+        /// The run directory, which holds the shared genesis and catalog.
+        root: &'a Path,
+        /// The node's own directory.
+        node: &'a Path,
+    },
+    /// Paths relative to the node's own directory, which holds
+    /// everything the node reads. `coordd` opens a relative path against
+    /// its working directory -- it does not resolve paths against the
+    /// configuration file, and this harness does not change it to -- so
+    /// a bundle is run from inside itself.
+    Bundle,
+}
+
+impl Layout<'_> {
+    fn shared(&self, name: &str) -> String {
+        match self {
+            Layout::Absolute { root, .. } => format!("{}/{name}", root.display()),
+            Layout::Bundle => name.to_owned(),
+        }
+    }
+
+    fn own(&self, name: &str) -> String {
+        match self {
+            Layout::Absolute { node, .. } => format!("{}/{name}", node.display()),
+            Layout::Bundle => name.to_owned(),
+        }
+    }
+
+    fn state_directory(&self) -> String {
+        match self {
+            Layout::Absolute { node, .. } => node.display().to_string(),
+            Layout::Bundle => ".".to_owned(),
+        }
+    }
+
+    fn preamble(&self) -> &'static str {
+        match self {
+            Layout::Absolute { .. } => "",
+            Layout::Bundle => BUNDLE_NOTE,
+        }
+    }
+}
+
 fn node_config(
-    root: &Path,
-    node: &Path,
-    api: u16,
-    peer: u16,
+    layout: &Layout<'_>,
+    api: &str,
+    peer: &str,
     principal: &str,
     namespace: &str,
     trust_rule: &str,
@@ -467,16 +777,16 @@ fn node_config(
     format!(
         r#"# Written by `coord-harness provision`. A strict configuration: the
 # daemon that reads it runs the same startup checks it runs anywhere.
-config_version = 2
+{preamble}config_version = 2
 role = "voter-frontend-observer"
-cluster_manifest = "{root}/genesis.json"
-cluster_endpoints = "{root}/endpoints.bin"
+cluster_manifest = "{manifest}"
+cluster_endpoints = "{endpoints}"
 domain = "{resource}"
-state_directory = "{node}"
+state_directory = "{state}"
 
 [listen]
-api_quic = "127.0.0.1:{api}"
-peer_quic = "127.0.0.1:{peer}"
+api_quic = "{api}"
+peer_quic = "{peer}"
 
 [capability]
 writer_queue_bytes = 16777216
@@ -491,44 +801,82 @@ root = "journal"
 shards = 1
 
 [identity]
-trust_bundle = "{node}/roots.pem"
-node_certificate = "{node}/node.pem"
-node_key = "{node}/node.key"
-collector_certificate = "{node}/collector.pem"
-collector_key = "{node}/collector.key"
+trust_bundle = "{roots}"
+node_certificate = "{node_certificate}"
+node_key = "{node_key}"
+collector_certificate = "{collector_certificate}"
+collector_key = "{collector_key}"
 
 [sts]
 issuer = "{issuer}"
 resource = "{resource}"
-jwks = "{node}/sts-jwks.json"
+jwks = "{jwks}"
 trust_rule = "{trust_rule}"
 
 [[grant]]
 principal = "{principal}"
 namespace = "{namespace}"
 "#,
-        root = root.display(),
-        node = node.display(),
+        preamble = layout.preamble(),
+        manifest = layout.shared("genesis.json"),
+        endpoints = layout.shared("endpoints.bin"),
+        state = layout.state_directory(),
+        roots = layout.own("roots.pem"),
+        node_certificate = layout.own("node.pem"),
+        node_key = layout.own("node.key"),
+        collector_certificate = layout.own("collector.pem"),
+        collector_key = layout.own("collector.key"),
+        jwks = layout.own("sts-jwks.json"),
         issuer = ISSUER,
         resource = RESOURCE,
     )
 }
 
-fn provision_issuer(dir: &Path) -> std::io::Result<Issuer> {
+/// The credential endpoint's material. On loopback unless `at` names
+/// where it is reached, in which case its certificate carries that host
+/// and its URL names it -- the certificate is what a client on another
+/// host verifies, so the two are written together or not at all.
+fn provision_issuer(
+    dir: &Path,
+    at: Option<(&Address, rcgen::SanType)>,
+    listen_any: bool,
+) -> std::io::Result<Issuer> {
     let ca = Ca::new();
     let root = dir.join("issuer-ca.pem");
     std::fs::write(&root, ca.root_pem())?;
-    let issued = ca.issue_server("sts.tuplesky.harness");
+    let issued = match &at {
+        None => ca.issue_server("sts.tuplesky.harness"),
+        Some((_, reach)) => ca.issue_server_at("sts.tuplesky.harness", reach.clone()),
+    };
     let certificate = dir.join("issuer.pem");
     let key = dir.join("issuer.key");
     issued.write(&certificate, &key)?;
-    let port = free_tcp()?;
+    let (listen, url) = match at {
+        None => {
+            let port = free_tcp()?;
+            (
+                format!("127.0.0.1:{port}"),
+                format!("https://127.0.0.1:{port}"),
+            )
+        }
+        Some((address, _)) => {
+            let port = if address.port == 0 {
+                free_tcp()?
+            } else {
+                address.port
+            };
+            (
+                bind_address(&address.host, port, listen_any).to_string(),
+                format!("https://{}", authority(&address.host, port)),
+            )
+        }
+    };
     let assertion = dir.join("workload-assertion");
     std::fs::write(&assertion, "harness-workload-assertion\n")?;
     restrict(&assertion)?;
     Ok(Issuer {
-        listen: format!("127.0.0.1:{port}"),
-        url: format!("https://127.0.0.1:{port}"),
+        listen,
+        url,
         ca: root,
         certificate,
         key,
@@ -537,7 +885,16 @@ fn provision_issuer(dir: &Path) -> std::io::Result<Issuer> {
     })
 }
 
-fn provision_edge(dir: &Path, port: u16) -> std::io::Result<Edge> {
+/// The storage edge's material. `at` is the host an API server reaches
+/// it at, when that is not loopback: an API server verifies the edge
+/// against the host of the endpoint it is configured with unless told
+/// otherwise, so the server certificate carries it.
+fn provision_edge(
+    dir: &Path,
+    port: u16,
+    at: Option<(&str, rcgen::SanType)>,
+    listen_any: bool,
+) -> std::io::Result<Edge> {
     let server_ca = Ca::new();
     let client_ca = Ca::new();
     let foreign_ca = Ca::new();
@@ -549,7 +906,10 @@ fn provision_edge(dir: &Path, port: u16) -> std::io::Result<Edge> {
     let foreign_root = dir.join("edge-foreign-ca.pem");
     std::fs::write(&foreign_root, foreign_ca.root_pem())?;
 
-    let server = server_ca.issue_server(EDGE_SERVER_NAME);
+    let server = match &at {
+        None => server_ca.issue_server(EDGE_SERVER_NAME),
+        Some((_, reach)) => server_ca.issue_server_at(EDGE_SERVER_NAME, reach.clone()),
+    };
     let server_certificate = dir.join("edge-server.pem");
     let server_key = dir.join("edge-server.key");
     server.write(&server_certificate, &server_key)?;
@@ -569,10 +929,19 @@ fn provision_edge(dir: &Path, port: u16) -> std::io::Result<Edge> {
         write_client(&foreign_ca, EDGE_CLIENT_NAME, "edge-foreign")?;
 
     let port = if port == 0 { free_tcp()? } else { port };
-    let listen: SocketAddr = format!("127.0.0.1:{port}").parse().expect("loopback");
+    let (listen, endpoint) = match at {
+        None => {
+            let listen: SocketAddr = format!("127.0.0.1:{port}").parse().expect("loopback");
+            (listen.to_string(), format!("https://{listen}"))
+        }
+        Some((host, _)) => (
+            bind_address(host, port, listen_any).to_string(),
+            format!("https://{}", authority(host, port)),
+        ),
+    };
     Ok(Edge {
-        listen: listen.to_string(),
-        endpoint: format!("https://{listen}"),
+        listen,
+        endpoint,
         server_name: EDGE_SERVER_NAME.to_owned(),
         server_certificate,
         server_key,

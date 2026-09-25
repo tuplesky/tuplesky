@@ -64,7 +64,10 @@ endpoint catalog, the issuer's published keys, and a strict `coordd.toml` per
 node. `coord-harness up` initializes each node's first generation and starts
 every committed voter, waiting until each one is actually serving. The
 daemons run the production startup checks against this material, so a harness
-bug shows up as a harness bug rather than as a result.
+bug shows up as a harness bug rather than as a result. With `--hosts` it
+provisions the same domain for voters on separate hosts instead; that
+procedure, and the workflow's third job that rehearses it on one runner, is
+[multi-host-test.md](multi-host-test.md).
 
 Two honest limits of the fixture, both deliberate:
 
@@ -74,7 +77,10 @@ Two honest limits of the fixture, both deliberate:
   qualify and has its own tests; putting a real identity provider in this run
   would make its failures ambiguous without testing the edge any better. The
   verifying side is not weakened: `coordd` runs the same verification it runs
-  in production. The endpoint binds loopback only and refuses anything else.
+  in production. The endpoint binds loopback and refuses anything else,
+  except in a domain provisioned for several hosts with `--issuer-listen`,
+  where it may also bind the one host its certificate was issued for
+  ([multi-host-test.md](multi-host-test.md)).
 * **The authority's key is kept in the run directory** so a driver can issue
   the caller credentials it needs. It is a throwaway fixture authority in a
   temporary directory; the `test-only` crate role keeps all of this out of

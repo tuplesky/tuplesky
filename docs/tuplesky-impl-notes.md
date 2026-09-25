@@ -2993,3 +2993,68 @@ sends a put, and the lookup ahead of admission (`retained_answer`, which
 frontend admits the put. With the row written retired, the same put is
 refused `NOT_ADMITTED` under its own command id. Without the absent-row
 check, the first question is refused and the test fails.
+
+
+## A host list is a certificate change before it is an address change
+
+task-d04. `coordd` had no single-host assumption, but the harness did,
+and the part of it that mattered was not where it listened. A voter
+verifies a peer's certificate against the host part of the catalog
+address it dialled (`peers::server_name`), and the harness issued every
+node certificate for `127.0.0.1` only. Placing a node at `127.0.0.3`
+with an unchanged certificate gives three daemons that each start
+cleanly and never link: `peers connected=0 of 2` for ever, which reads
+as a firewall. That is the negative control of
+`multi_host.rs::a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_voter`:
+issued for loopback in a placed domain, no voter reaches the mesh. The
+name is only reachability; the binder still decides which voter answered
+from the node-identity URI, so the extra SAN grants nothing.
+
+Three smaller things the plan entry left open:
+
+- **`coordd` opens a relative path against its working directory**, not
+  against its configuration file. The daemon was not changed. A placed
+  node's `coordd.toml` names everything relative to its own directory,
+  which holds its own copy of the genesis and the catalog, and the
+  harness runs a bundle from inside it. It recognizes one by the note
+  the bundle's configuration carries (`domain::BUNDLE_NOTE`). A
+  single-host configuration is still run from the caller's directory,
+  because its paths are whatever the run directory was given as, and a
+  relative run directory has always been relative to the caller.
+- **Per-address listeners, not wildcards, by default.** Binding the
+  placed address lets three "hosts" on `127.0.0.2`-`127.0.0.4` use the
+  same fixed ports, as a deployment would, which three wildcard
+  listeners on one machine could not. A DNS name has to bind the
+  unspecified address, because a strict configuration's listener is a
+  socket address, and so does `--listen-any` for an address behind NAT.
+  A wildcard QUIC listener answers from the address a datagram arrived
+  at. That was checked by provisioning three voters on this container's
+  one non-loopback address with `--listen-any`: they formed the mesh,
+  and the credential endpoint answered TLS on that address from
+  `0.0.0.0`.
+- **The credential endpoint's containment is checked against its
+  certificate.** It signs for any assertion, so where it listens is all
+  that contains it. Off loopback it binds only a host its certificate
+  was issued for, on the port its URL names. That opt-in is made at
+  provisioning, when the certificate is made. Editing `harness.json` to
+  name another host does not produce a certificate for that host, so
+  the bind is still refused
+  (`provision.rs::the_issuer_leaves_loopback_only_for_the_host_it_was_provisioned_for`).
+
+Provisioning without a host list was compared against the previous
+binary rather than only against a test written afterwards. Both wrote 45
+files with the same names and modes, the same `harness.json` and
+`coordd.toml` texts, and the same subject alternative names. The only
+differences were the run directory, the free ports, and the freshly
+generated keys and what embeds them (the genesis voter keys and the
+JWKS). `provisioning_without_hosts_writes_what_it_always_wrote` pins
+the same things.
+
+The acceptance lives in `bins/coordd/tests/` rather than in the
+harness's own tests, because that is where the `coordd` binary is built
+beside the test. `coord-harness` and `coord-wan-bench` are
+development dependencies there, an edge the dependency policy excludes
+by design. The Kine half is `scripts/e2e/multi-host-local.sh`, which
+the certification workflow runs. Neither is the runbook followed on
+three real hosts, and `docs/operations/multi-host-test.md` says so
+rather than recording markers nobody has seen.

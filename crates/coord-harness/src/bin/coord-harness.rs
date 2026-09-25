@@ -1,19 +1,20 @@
 //! `coord-harness`: stand a real domain up so something outside
 //! `cargo test` can drive it (task-48, task-62).
 //!
-//! `provision` writes the domain; `up` runs it and stays up; `issuer`
-//! runs the credential endpoint alone; `dsn` prints the data source a
-//! Kine build is given. The commands are separate because the steps are:
-//! a certification run provisions once, keeps the directory as evidence,
-//! and can restart the daemons against it.
+//! `provision` writes the domain; `up` runs it and stays up; `start`
+//! runs one voter of it, for a domain whose voters are on different
+//! hosts; `issuer` runs the credential endpoint alone; `dsn` prints the
+//! data source a Kine build is given. The commands are separate because
+//! the steps are: a certification run provisions once, keeps the
+//! directory as evidence, and can restart the daemons against it.
 #![forbid(unsafe_code)]
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
-use coord_harness::domain::{Plan, Provisioned};
+use clap::{Args, Parser, Subcommand};
+use coord_harness::domain::{Address, Plan, Provisioned};
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +26,46 @@ struct Cli {
     command: Command,
 }
 
+/// How a domain is provisioned, shared by `provision` and by `up` when
+/// it has to provision.
+#[derive(Args)]
+struct Provisioning {
+    /// How many voters the genesis commits, and how many `up` runs.
+    /// Defaults to 3, or to the number of voters `--hosts` places.
+    #[arg(long)]
+    voters: Option<u8>,
+    /// The port the Kubernetes storage edge binds; 0 picks a free
+    /// one. A Kubernetes run pins it, because the API server's
+    /// configuration names it.
+    #[arg(long, default_value_t = 0)]
+    edge_port: u16,
+    /// Place each voter on its own host:
+    /// `n1=host:api_port:peer_port,n2=...`, each host an IP literal (an
+    /// IPv6 one in brackets) or a DNS name. The catalog lists these
+    /// addresses, each node listens on its fixed ports, its certificates
+    /// carry its host, and each `nN/` directory becomes a bundle that
+    /// runs wherever it is copied. Without it every voter is on this
+    /// host's loopback, exactly as before.
+    #[arg(long)]
+    hosts: Option<String>,
+    /// Listen on the unspecified address instead of each named host, for
+    /// hosts reached at an address that is not on any of their
+    /// interfaces. A host given by DNS name always is; a loopback
+    /// address never is.
+    #[arg(long)]
+    listen_any: bool,
+    /// The host an API server reaches the storage edge at, when that is
+    /// not this host's loopback. Its server certificate carries it.
+    #[arg(long)]
+    edge_host: Option<String>,
+    /// Where the credential endpoint listens, `host:port`, when a Kine
+    /// build on another host has to reach it. Its certificate carries
+    /// the host, and `coord-harness issuer` then binds that host and no
+    /// other off-loopback address.
+    #[arg(long, value_parser = Address::parse)]
+    issuer_listen: Option<Address>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Write a provisioned domain into a directory.
@@ -32,14 +73,8 @@ enum Command {
         /// The run directory. It is created if absent.
         #[arg(long)]
         dir: PathBuf,
-        /// How many voters the genesis commits, and how many `up` runs.
-        #[arg(long, default_value_t = 3)]
-        voters: u8,
-        /// The port the Kubernetes storage edge binds; 0 picks a free
-        /// one. A Kubernetes run pins it, because the API server's
-        /// configuration names it.
-        #[arg(long, default_value_t = 0)]
-        edge_port: u16,
+        #[command(flatten)]
+        provisioning: Provisioning,
     },
     /// Provision if needed, start every voter and the credential
     /// endpoint, and stay up until the process is stopped.
@@ -50,18 +85,36 @@ enum Command {
         /// The `coordd` binary to run.
         #[arg(long)]
         coordd: PathBuf,
-        /// Voters, when this provisions.
-        #[arg(long, default_value_t = 3)]
-        voters: u8,
-        /// Storage edge port, when this provisions.
-        #[arg(long, default_value_t = 0)]
-        edge_port: u16,
+        #[command(flatten)]
+        provisioning: Provisioning,
+    },
+    /// Initialize one voter if it has no store yet, start it from its
+    /// own directory, wait until it serves, and stay in the foreground
+    /// until it exits. This is how a voter of a multi-host domain is run
+    /// on its host.
+    Start {
+        /// The directory holding the voter's `nN/` bundle: the run
+        /// directory, or wherever the bundle was copied to.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Which voter, one-based.
+        #[arg(long)]
+        node: u8,
+        /// The `coordd` binary to run.
+        #[arg(long)]
+        coordd: PathBuf,
     },
     /// Run the credential endpoint alone, in the foreground.
     Issuer {
         /// The run directory.
         #[arg(long)]
         dir: PathBuf,
+        /// Bind this address instead of the provisioned one. Anything
+        /// but loopback is refused unless the domain was provisioned
+        /// with `--issuer-listen` for that host, on that port; the
+        /// unspecified address on that port is accepted then too.
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
     },
     /// Print the `coord://` data source a Kine build is given. It names
     /// the credential file; it carries no credential.
@@ -87,23 +140,19 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
-        Command::Provision {
-            dir,
-            voters,
-            edge_port,
-        } => {
-            let provisioned = provision(&dir, voters, edge_port)?;
+        Command::Provision { dir, provisioning } => {
+            let provisioned = provision(&dir, provisioning)?;
             println!("{}", serde_json::to_string_pretty(&provisioned)?);
             Ok(())
         }
         Command::Up {
             dir,
             coordd,
-            voters,
-            edge_port,
-        } => up(&dir, &coordd, voters, edge_port),
-        Command::Issuer { dir } => {
-            let endpoint = Arc::new(coord_harness::issuer::Endpoint::bind(&dir)?);
+            provisioning,
+        } => up(&dir, &coordd, provisioning),
+        Command::Start { dir, node, coordd } => start(&dir, node, &coordd),
+        Command::Issuer { dir, listen } => {
+            let endpoint = Arc::new(coord_harness::issuer::Endpoint::bind_on(&dir, listen)?);
             println!("issuer listening {}", endpoint.address()?);
             std::io::stdout().flush()?;
             endpoint.serve()?;
@@ -119,17 +168,72 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn provision(
     dir: &std::path::Path,
-    voters: u8,
-    edge_port: u16,
+    provisioning: Provisioning,
 ) -> Result<Provisioned, Box<dyn std::error::Error>> {
+    let hosts = match provisioning.hosts.as_deref() {
+        Some(spec) => coord_harness::domain::parse_hosts(spec)?,
+        None => Vec::new(),
+    };
+    let voters = match (provisioning.voters, hosts.len()) {
+        (Some(voters), 0) => voters,
+        (None, 0) => 3,
+        (None, placed) => u8::try_from(placed).map_err(|_| "more voters than a genesis holds")?,
+        (Some(voters), placed) if usize::from(voters) == placed => voters,
+        (Some(voters), placed) => {
+            return Err(format!("--voters {voters} and a host list placing {placed}").into());
+        }
+    };
     if voters == 0 {
         return Err("a domain with no voters has no quorum".into());
     }
     Ok(coord_harness::provision(&Plan {
-        directory: dir.to_path_buf(),
-        voters,
-        edge_port,
+        hosts,
+        listen_any: provisioning.listen_any,
+        edge_host: provisioning.edge_host,
+        issuer_listen: provisioning.issuer_listen,
+        ..Plan::loopback(dir.to_path_buf(), voters, provisioning.edge_port)
     })?)
+}
+
+/// Run one voter from its bundle until it exits.
+///
+/// What it prints is what an operator on that host watches for: one
+/// `harness node-ready` line once the daemon has said `phase=live`, and
+/// the daemon's own output in `coordd.log` beside its configuration,
+/// where the `peers connected=` and `voters submittable=` lines say
+/// whether it has found the others. The daemon's process identifier is
+/// written to `coordd.pid` there too, so the voter can be killed
+/// without killing this process first; this one then exits with it.
+fn start(
+    dir: &std::path::Path,
+    node: u8,
+    coordd: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = dir.join(format!("n{node}"));
+    let config = directory.join("coordd.toml");
+    if !config.is_file() {
+        return Err(format!("{} is not a provisioned voter", config.display()).into());
+    }
+    let label = format!("n{node}");
+    coord_harness::run::initialize_node(coordd, &label, &config, &directory)?;
+    let mut daemon = coord_harness::run::start_node(coordd, &label, &config, &directory)?;
+    let pid = directory.join("coordd.pid");
+    std::fs::write(&pid, format!("{}\n", daemon.pid()))?;
+    println!(
+        "harness node-ready node={label} pid={} api={} output={}",
+        daemon.pid(),
+        daemon.api,
+        daemon.log.display()
+    );
+    std::io::stdout().flush()?;
+    let status = daemon.wait()?;
+    let _ = std::fs::remove_file(&pid);
+    println!("harness node-stopped node={label} status={status}");
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{label} stopped: {status}").into())
+    }
 }
 
 /// The data source a Kine build is given. Every field in it is a public
@@ -159,13 +263,12 @@ fn dsn(provisioned: &Provisioned, voter: usize) -> Result<String, Box<dyn std::e
 fn up(
     dir: &std::path::Path,
     coordd: &std::path::Path,
-    voters: u8,
-    edge_port: u16,
+    provisioning: Provisioning,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let provisioned = if dir.join("harness.json").is_file() {
         Provisioned::read(dir)?
     } else {
-        provision(dir, voters, edge_port)?
+        provision(dir, provisioning)?
     };
 
     // The credential endpoint first: a frontend verifies tokens against
