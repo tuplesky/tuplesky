@@ -122,6 +122,7 @@ fn policy() -> RolePolicy {
         min_incarnation: 2,
         max_lifetime_secs: 3600,
         dns_names: vec!["voter-0.cluster-1.internal".into()],
+        ip_addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 7))],
     }
 }
 
@@ -184,7 +185,7 @@ fn cold_enrollment_works_before_any_voter_and_binds_the_node_identity() {
     assert_eq!(identity.node, node(1));
     assert_eq!(identity.incarnation, ReplicaIncarnation::new(2).unwrap());
     assert_eq!(identity.role, PeerRole::Voter);
-    // The certificate carries the policy's node URI and DNS, not the
+    // The certificate carries the policy's node URI, DNS and address, not the
     // CSR's attacker SAN, and it is not a CA.
     let (_, x509) = x509_parser::parse_x509_certificate(&issued.certificate).unwrap();
     assert!(!x509.is_ca());
@@ -202,6 +203,21 @@ fn cold_enrollment_works_before_any_voter_and_binds_the_node_identity() {
             .any(|s| s.contains("voter-0.cluster-1.internal"))
     );
     assert!(sans.iter().any(|s| s.contains(&issued.node_uri)));
+    // And the policy's address, for a peer that dials the node by IP
+    // literal and checks the certificate's IP SANs rather than its names.
+    assert!(
+        x509.subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .any(|g| matches!(
+                g,
+                x509_parser::extensions::GeneralName::IPAddress(ip) if *ip == [10, 0, 0, 7]
+            )),
+        "{sans:?}"
+    );
     assert!(
         !sans.iter().any(|s| s.contains("attacker.example")),
         "CSR SAN not copied"

@@ -34,6 +34,12 @@ pub enum QuarantineReason {
     Genesis,
     /// A configured listener could not be bound.
     Listeners,
+    /// This node's own leaf reached its `notAfter` without a renewal
+    /// (task-d02). Not a disk condition: the store is intact, and a
+    /// restart on a renewed leaf serves it again. But nothing in this
+    /// process may serve on the expired one, and nothing arriving later
+    /// -- an issuer that answers again -- revives it.
+    CredentialExpired,
 }
 
 /// What makes a role's readiness.

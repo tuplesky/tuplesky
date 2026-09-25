@@ -267,6 +267,112 @@ pub struct IdentityConfig {
     pub collector_key: Option<String>,
 }
 
+/// Renewing this node's leaf while it serves (task-d02; design Sections
+/// 10.4, 20.4).
+///
+/// A node certificate is short-lived on purpose, so a node that serves
+/// longer than one lifetime has to renew it in place. It does so the way
+/// it was first enrolled: at the node issuer, presenting a workload
+/// assertion and a request signed with the key it already holds -- the
+/// committed key, so what comes back is a renewal and not a replacement.
+///
+/// Optional. Without it the node serves on the leaf it started with until
+/// that leaf's `notAfter`, and is put back by restarting it on a renewed
+/// one; the startup report says renewal is not configured.
+///
+/// Paths and a URL, nothing secret: the assertion is read from its file
+/// at each attempt and never held in the configuration or printed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenewalConfig {
+    /// The node issuer's base URL. Enrollment is posted to
+    /// `{issuer}/enroll`.
+    ///
+    /// `https://` always, except a loopback `http://` URL where
+    /// [`RenewalConfig::allow_insecure_loopback`] says so. The issuer
+    /// hands this node the credential its peers authenticate it by, and
+    /// a response nothing authenticated could only be refused here
+    /// afterwards, if it could be refused at all.
+    pub issuer: String,
+    /// A file holding the workload assertion the issuer verifies (a
+    /// projected service-account token, for instance).
+    ///
+    /// Read at every attempt, because the platform rotates it in place;
+    /// a copy taken at startup would expire long before the leaf does.
+    pub assertion: String,
+    /// PEM roots for the issuer's own TLS certificate. Absent, the public
+    /// web roots are used; present, only these are.
+    #[serde(default)]
+    pub issuer_roots: Option<String>,
+    /// The lifetime to ask for, in seconds.
+    ///
+    /// Stated rather than copied from the leaf being renewed. The issuer
+    /// back-dates each leaf by its clock uncertainty, so a lifetime read
+    /// off one leaf is a little longer than the one asked for it, and a
+    /// node that asked for "the same again" would ask for a little more
+    /// each time -- until the issuer's policy refused it, at a due point,
+    /// on a node that had renewed without trouble for weeks. The issuer's
+    /// policy bounds it either way, and a lifetime past the policy's is a
+    /// refusal the node reports at every attempt.
+    pub lifetime_secs: u64,
+    /// The window renewal is spread over after the leaf turns due, in
+    /// seconds, so a fleet issued together does not renew together. Each
+    /// node's point in it is derived from its own identity, so it is the
+    /// same across restarts.
+    #[serde(default = "default_renewal_jitter")]
+    pub jitter_secs: u64,
+    /// Accept an `http://` issuer on a loopback address.
+    ///
+    /// For an issuer on the same host and for tests: a loopback URL
+    /// never leaves the machine. Anything else is refused whatever this
+    /// says.
+    #[serde(default)]
+    pub allow_insecure_loopback: bool,
+}
+
+const fn default_renewal_jitter() -> u64 {
+    3600
+}
+
+/// Whether `url` is an issuer this node may enroll at: `https://`, or a
+/// loopback `http://` where `insecure_loopback` allows it.
+///
+/// The scheme and host are decided by parsing the authority, never by a
+/// prefix of the string: `http://127.0.0.1.evil.example` starts with the
+/// loopback prefix and is not loopback at all. Userinfo is refused
+/// outright, since a URL that carries a credential would carry it into
+/// every report that names the issuer.
+pub fn issuer_url_permitted(url: &str, insecure_loopback: bool) -> bool {
+    let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') || rest.contains(['?', '#']) {
+        return false;
+    }
+    if secure {
+        return true;
+    }
+    if !insecure_loopback {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(inside) => match inside.split_once(']') {
+            Some((host, after)) if after.is_empty() || after.starts_with(':') => host,
+            _ => return false,
+        },
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The daemon configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -311,6 +417,10 @@ pub struct Config {
     /// Permissions this domain's genesis grants (see [`GrantConfig`]).
     #[serde(default)]
     pub grant: Vec<GrantConfig>,
+    /// Renewing this node's leaf while it serves (see
+    /// [`RenewalConfig`]). Absent, the node never renews in place.
+    #[serde(default)]
+    pub renewal: Option<RenewalConfig>,
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
@@ -380,6 +490,11 @@ pub enum ConfigError {
         /// What needs it.
         needed_by: &'static str,
     },
+    /// The issuer a node renews at is not one it may trust with that:
+    /// not `https://`, and not a loopback URL explicitly allowed.
+    InsecureIssuer,
+    /// A renewal that asks for no lifetime at all.
+    ZeroLifetime,
 }
 
 /// Supported configuration schema version.
@@ -521,6 +636,14 @@ impl Config {
         if self.journal.shards == 0 {
             return Err(ConfigError::NoJournalShards);
         }
+        if let Some(renewal) = &self.renewal {
+            if !issuer_url_permitted(&renewal.issuer, renewal.allow_insecure_loopback) {
+                return Err(ConfigError::InsecureIssuer);
+            }
+            if renewal.lifetime_secs == 0 {
+                return Err(ConfigError::ZeroLifetime);
+            }
+        }
         // An empty path is not a default: it resolves to the working
         // directory, which is where a process would silently create a
         // second, empty generation beside the real one.
@@ -540,6 +663,16 @@ impl Config {
                 ("sts.resource", &sts.resource),
                 ("sts.jwks", &sts.jwks),
             ]
+        }))
+        .chain(self.renewal.iter().flat_map(|renewal| {
+            [("renewal.assertion", &renewal.assertion)]
+                .into_iter()
+                .chain(
+                    renewal
+                        .issuer_roots
+                        .iter()
+                        .map(|roots| ("renewal.issuer_roots", roots)),
+                )
         })) {
             if path.trim().is_empty() {
                 return Err(ConfigError::EmptyPath(name));

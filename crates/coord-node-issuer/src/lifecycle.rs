@@ -31,13 +31,14 @@
 //! configuration transition -- `coord_membership::Membership` says which
 //! is which.
 //!
-//! This is the arithmetic, not a driver. On this branch the serving
-//! daemon consults it only through `coordd inspect`: nothing in a running
-//! node sleeps until [`Renewal::Wait`], enrolls at the issuer when due, or
-//! reloads its endpoint identity, so a node is renewed by restarting it on
-//! a renewed leaf. It fails safe -- at `notAfter` its peers close its warm
-//! connections and its own handshakes fail -- and the plan entry for
-//! task-58 records the driver as not yet owned.
+//! This is the arithmetic, not the driver. The driver is the serving
+//! daemon's (task-d02, `coordd`'s `renewal` and `enroll` modules): it
+//! sleeps until [`Renewal::Wait`], enrolls at this issuer when
+//! [`Renewal::Due`] with a request signed by the node's committed key,
+//! puts the renewed leaf into service for new handshakes without closing
+//! the ones already open, retries with bounded backoff while the issuer
+//! is away, and stops serving at [`Renewal::Expired`]. `coordd inspect`
+//! reports the same decision under the same policy.
 
 /// One issued leaf, as the holder sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

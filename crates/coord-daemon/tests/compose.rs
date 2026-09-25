@@ -801,3 +801,72 @@ node_key = "/n.key"
         );
     }
 }
+
+/// Renewal is optional, and where it is configured the issuer it names
+/// is one this node may take its credential from (task-d02).
+#[test]
+fn a_renewal_issuer_is_https_or_an_allowed_loopback_address() {
+    let renewal = |body: &str| base_config(&format!("\n[renewal]\n{body}\n"));
+    // Absent: nothing renews, and nothing is required.
+    assert_eq!(Config::parse(&base_config("")).unwrap().renewal, None);
+    let config = Config::parse(&renewal(
+        "issuer = \"https://issuer.example:8443\"\nassertion = \"/var/run/secrets/token\"\nlifetime_secs = 86400",
+    ))
+    .unwrap();
+    let section = config.renewal.expect("configured");
+    assert_eq!(section.jitter_secs, 3600, "the default spread");
+    assert_eq!(section.lifetime_secs, 86400);
+    // Plain HTTP is refused, loopback included, unless explicitly allowed
+    // -- and then only on loopback, decided by parsing the host rather
+    // than by a prefix of the string.
+    for (url, allow, ok) in [
+        ("http://127.0.0.1:9000", false, false),
+        ("http://127.0.0.1:9000", true, true),
+        ("http://[::1]:9000", true, true),
+        ("http://localhost:9000", true, true),
+        ("http://127.0.0.1.evil.example", true, false),
+        ("http://issuer.example", true, false),
+        ("https://user:secret@issuer.example", false, false),
+        ("https://issuer.example/?next=x", false, false),
+        ("ftp://issuer.example", true, false),
+    ] {
+        let parsed = Config::parse(&renewal(&format!(
+            "issuer = \"{url}\"\nassertion = \"/t\"\nlifetime_secs = 60\nallow_insecure_loopback = {allow}"
+        )));
+        assert_eq!(
+            parsed.is_ok(),
+            ok,
+            "{url} allow={allow}: {:?}",
+            parsed.err()
+        );
+        if !ok {
+            assert_eq!(parsed, Err(ConfigError::InsecureIssuer), "{url}");
+        }
+    }
+    // A lifetime of nothing, none at all, an empty path, and an unknown
+    // key are refused.
+    assert!(matches!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \"/t\""
+        )),
+        Err(ConfigError::Parse(_))
+    ));
+    assert_eq!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \"/t\"\nlifetime_secs = 0"
+        )),
+        Err(ConfigError::ZeroLifetime)
+    );
+    assert_eq!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \" \"\nlifetime_secs = 60"
+        )),
+        Err(ConfigError::EmptyPath("renewal.assertion"))
+    );
+    assert!(matches!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \"/t\"\nlifetime_secs = 60\nextend_deadline = true"
+        )),
+        Err(ConfigError::Parse(_))
+    ));
+}

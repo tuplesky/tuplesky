@@ -184,35 +184,74 @@ pub fn load(
 /// at the first handshake, where it reads as a peer problem. `config`
 /// names the files, for the refusal.
 pub fn verify(identity: &LocalIdentity, config: &IdentityConfig) -> Result<(), IdentityError> {
+    verify_chain(&identity.chain, &identity.key, &identity.roots).map_err(|refusal| match refusal {
+        ChainRefusal::Empty => IdentityError::Empty {
+            what: "node certificate",
+            path: config.node_certificate.clone(),
+        },
+        ChainRefusal::NotIssued(reason) => IdentityError::NotIssuedByTrustBundle {
+            path: config.node_certificate.clone(),
+            reason,
+        },
+        ChainRefusal::KeyMismatch => IdentityError::KeyDoesNotMatchCertificate {
+            path: config.node_key.clone(),
+        },
+    })
+}
+
+/// Why a chain is not an identity this domain vouches for, before it is
+/// attributed to any file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainRefusal {
+    /// There is no leaf.
+    Empty,
+    /// The leaf does not chain to the roots now, with the reason.
+    NotIssued(String),
+    /// The key is not the leaf's.
+    KeyMismatch,
+}
+
+impl core::fmt::Display for ChainRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ChainRefusal::Empty => f.write_str("the chain holds no certificate"),
+            ChainRefusal::NotIssued(reason) => {
+                write!(f, "not issued by the trust bundle: {reason}")
+            }
+            ChainRefusal::KeyMismatch => f.write_str("the key is not the leaf's"),
+        }
+    }
+}
+
+/// Check that `chain` chains to `roots` now and that `key` is its
+/// leaf's: what [`verify`] asks of the credential a node starts on, and
+/// what a renewed leaf has to satisfy before a running node presents it
+/// (task-d02). One check for both, so a renewal cannot put into service a
+/// leaf a restart would refuse.
+pub fn verify_chain(
+    chain: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+    roots: &Arc<RootCertStore>,
+) -> Result<(), ChainRefusal> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let not_issued = |reason: String| IdentityError::NotIssuedByTrustBundle {
-        path: config.node_certificate.clone(),
-        reason,
-    };
-    let (leaf, intermediates) = identity.chain.split_first().ok_or(IdentityError::Empty {
-        what: "node certificate",
-        path: config.node_certificate.clone(),
-    })?;
+    let (leaf, intermediates) = chain.split_first().ok_or(ChainRefusal::Empty)?;
     // The same verifier the transport authenticates peers with, so a
     // certificate this accepts is one every peer holding the same bundle
     // accepts too.
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(identity.roots.clone(), provider.clone())
-            .build()
-            .map_err(|e| not_issued(e.to_string()))?;
+    let verifier = WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
+        .build()
+        .map_err(|e| ChainRefusal::NotIssued(e.to_string()))?;
     verifier
         .verify_client_cert(leaf, intermediates, UnixTime::now())
-        .map_err(|e| not_issued(e.to_string()))?;
-    let mismatch = || IdentityError::KeyDoesNotMatchCertificate {
-        path: config.node_key.clone(),
-    };
-    let certified =
-        CertifiedKey::from_der(identity.chain.clone(), identity.key.clone_key(), &provider)
-            .map_err(|_| mismatch())?;
+        .map_err(|e| ChainRefusal::NotIssued(e.to_string()))?;
+    let certified = CertifiedKey::from_der(chain.to_vec(), key.clone_key(), &provider)
+        .map_err(|_| ChainRefusal::KeyMismatch)?;
     // `from_der` lets through a key whose public half it cannot derive;
     // here that is a question that must be answered, so an unknown is a
     // refusal too.
-    certified.keys_match().map_err(|_| mismatch())
+    certified
+        .keys_match()
+        .map_err(|_| ChainRefusal::KeyMismatch)
 }
 
 /// The credential this process presents when it dials another voter as

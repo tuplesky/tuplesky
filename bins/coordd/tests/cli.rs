@@ -939,6 +939,8 @@ struct Running {
     /// to stderr, and a test that wants to know whether a cluster formed
     /// has to be able to read them.
     said: std::sync::Arc<std::sync::Mutex<String>>,
+    /// What it printed on stdout: its startup report.
+    out: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Running {
@@ -1036,6 +1038,8 @@ fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
         .expect("coordd started");
     let stdout = child.stdout.take().expect("piped");
     let (tx, rx) = std::sync::mpsc::channel();
+    let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let printed = std::sync::Arc::clone(&out);
     std::thread::spawn(move || {
         let mut api = None;
         let mut live = false;
@@ -1044,6 +1048,11 @@ fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
         // stopped listening, and a test that let that happen would be
         // testing its own harness.
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            {
+                let mut held = printed.lock().expect("not poisoned");
+                held.push_str(&line);
+                held.push('\n');
+            }
             if let Some(rest) = line.strip_prefix("listening api_quic=") {
                 api = rest.parse::<std::net::SocketAddr>().ok();
             }
@@ -1075,7 +1084,12 @@ fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
             let said = said.lock().expect("not poisoned").clone();
             panic!("coordd did not report a serving api listener within 30s:\n{said}")
         });
-    Running { child, api, said }
+    Running {
+        child,
+        api,
+        said,
+        out,
+    }
 }
 
 /// A caller with a bound session against a running daemon.
@@ -5126,4 +5140,503 @@ async fn a_submission_made_while_its_voters_were_away_is_delivered_when_they_ret
         response_of(&answer).outcome,
         coord_types::wire_v1::OutcomeV1::Ok { .. }
     ));
+}
+
+// ---------------------------------------------------------------------
+// Leaf renewal inside the serving daemon (task-d02).
+// ---------------------------------------------------------------------
+
+/// Wall-clock seconds, as a leaf's validity is stated.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+}
+
+impl Ca {
+    /// A leaf for `key` that is valid from a second ago for `secs`
+    /// seconds, with the names and node identity [`Ca::issue`] gives.
+    ///
+    /// Short on purpose: renewal is continuous only because leaves are
+    /// short-lived, and a test that wants to watch a node renew, or fail
+    /// to, has to hold a leaf that ends while it watches. Returns the
+    /// certificate and its `notAfter`.
+    fn issue_short(&self, key: &rcgen::KeyPair, replica: u8, secs: u64) -> (Vec<u8>, u64) {
+        let identity = coord_node_issuer::NodeIdentity {
+            cluster: coord_types::ids::ClusterId(CLUSTER),
+            node: coord_types::ids::ReplicaId([replica; 16]),
+            incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
+            role: coord_types::wire_v1::PeerRole::Voter,
+        };
+        let now = unix_now();
+        let not_after = now + secs - 1;
+        let mut params =
+            rcgen::CertificateParams::new(vec![SERVER_NAME.to_string()]).expect("leaf params");
+        params.not_before =
+            time::OffsetDateTime::from_unix_timestamp(now as i64 - 1).expect("representable");
+        params.not_after =
+            time::OffsetDateTime::from_unix_timestamp(not_after as i64).expect("representable");
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.subject_alt_names = vec![
+            rcgen::SanType::DnsName(SERVER_NAME.try_into().expect("dns name")),
+            rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            rcgen::SanType::URI(
+                coord_node_issuer::node_uri(&identity)
+                    .try_into()
+                    .expect("uri"),
+            ),
+        ];
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::from_params(&ca_params, &self.key);
+        let certificate = params.signed_by(key, &issuer).expect("leaf cert");
+        (certificate.der().to_vec(), not_after)
+    }
+}
+
+/// The platform identity the issuer's policy matches, and the audience
+/// its assertions carry.
+const K8S_ISS: &str = "https://kubernetes.default.svc";
+const ENROLL_AUD: &str = "node-enrollment";
+
+/// A node issuer serving this domain's CA over plain HTTP on loopback,
+/// in this test's process: the same `coord_node_issuer::http::router` a
+/// deployment runs, with a workload identity provider whose assertion
+/// the node reads from a file.
+struct NodeIssuerFixture {
+    state: std::sync::Arc<coord_node_issuer::IssuerState>,
+    /// The workload identity provider's key, which signs assertions.
+    idp: rcgen::KeyPair,
+}
+
+impl NodeIssuerFixture {
+    /// An issuer signing with `ca`, whose policy lets the workload
+    /// `voters/voter-<n>` enroll node `n` as a voter, for `nodes`.
+    fn new(ca: &Ca, nodes: &[u8]) -> Self {
+        let now = unix_now();
+        let idp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("idp key");
+        let point = idp.public_key_raw();
+        let jwks = serde_json::to_vec(&serde_json::json!({"keys": [{
+            "kty": "EC", "crv": "P-256", "kid": "kk", "alg": "ES256", "use": "sig",
+            "x": b64url(&point[1..33]), "y": b64url(&point[33..65]),
+        }]}))
+        .expect("jwks");
+        let config = coord_authn::IssuerConfig {
+            name: "k8s".into(),
+            issuer: K8S_ISS.into(),
+            jwks_url: "https://k8s/keys".into(),
+            algorithms: vec![jsonwebtoken::Algorithm::ES256],
+            audiences: vec![ENROLL_AUD.into()],
+            max_age_secs: Some(3600),
+            allow_insecure_loopback: false,
+        };
+        let mut registry =
+            coord_authn::Registry::new(vec![config], coord_authn::JwksLimits::default())
+                .expect("registry");
+        registry.install_keys("k8s", &jwks, now).expect("keys");
+        let kinds = [(
+            "k8s".to_string(),
+            coord_authn::WorkloadKind::Kubernetes(coord_authn::KubernetesMode::Offline),
+        )]
+        .into_iter()
+        .collect();
+        let verifier = coord_authn::WifVerifier::new(registry, kinds);
+        let signer =
+            coord_node_issuer::Ca::load(ca.certificate.der(), &ca.key.serialize_der(), now)
+                .expect("the domain's CA is a usable issuer CA");
+        let rules = nodes
+            .iter()
+            .map(|n| coord_node_issuer::RolePolicy {
+                issuer: "k8s".into(),
+                required: [
+                    ("namespace".to_string(), "voters".to_string()),
+                    ("serviceaccount".to_string(), format!("voter-{n}")),
+                ]
+                .into_iter()
+                .collect(),
+                cluster: coord_types::ids::ClusterId(CLUSTER),
+                nodes: vec![coord_types::ids::ReplicaId([*n; 16])],
+                role: coord_types::wire_v1::PeerRole::Voter,
+                min_incarnation: 1,
+                max_lifetime_secs: 3600,
+                dns_names: vec![SERVER_NAME.into()],
+                ip_addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            })
+            .collect();
+        let state = coord_node_issuer::IssuerState::new(
+            coord_node_issuer::NodeIssuer::new(verifier, signer, rules),
+            Box::new(coord_node_issuer::SystemSignClock { uncertainty: 1 }),
+            4,
+            64 * 1024,
+        );
+        NodeIssuerFixture {
+            state: std::sync::Arc::new(state),
+            idp,
+        }
+    }
+
+    /// Serve on `port` from now on, until the test ends.
+    async fn serve(&self, port: u16) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("the issuer's port is free");
+        let router = coord_node_issuer::router(std::sync::Arc::clone(&self.state));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+    }
+
+    /// Write the assertion workload `voters/voter-<n>` presents.
+    fn assertion(&self, path: &Path, n: u8) {
+        let now = unix_now();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some("kk".into());
+        let claims = serde_json::json!({
+            "iss": K8S_ISS,
+            "sub": format!("system:serviceaccount:voters:voter-{n}"),
+            "aud": ENROLL_AUD,
+            "iat": now,
+            "exp": now + 900,
+            "kubernetes.io": {"namespace": "voters", "serviceaccount": {"name": format!("voter-{n}")}},
+        });
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_ec_der(&self.idp.serialize_der()),
+        )
+        .expect("assertion");
+        std::fs::write(path, token).expect("write assertion");
+    }
+}
+
+/// Give `config` a renewal section enrolling at a loopback issuer on
+/// `port`, with no spread, so the leaf is due at exactly two thirds of
+/// its life.
+fn renew_at(config: &Path, port: u16, assertion: &Path) {
+    let mut text = std::fs::read_to_string(config).expect("read config");
+    text.push_str(&format!(
+        "\n[renewal]\n\
+         issuer = \"http://127.0.0.1:{port}\"\n\
+         assertion = \"{}\"\n\
+         lifetime_secs = 120\n\
+         jitter_secs = 0\n\
+         allow_insecure_loopback = true\n",
+        assertion.display()
+    ));
+    std::fs::write(config, text).expect("write config");
+}
+
+/// A single-voter node holding a leaf that ends `secs` from now, and the
+/// domain's CA, key ring and the leaf's `notAfter`.
+fn short_lived_voter(dir: &Path, secs: u64) -> (Ca, coord_sts::KeyRing, PathBuf, u64) {
+    let ca = credentials(dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    let key = rcgen::KeyPair::try_from(ca.node_key.as_slice()).expect("node key");
+    let (leaf, not_after) = ca.issue_short(&key, 1, secs);
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", &leaf)).expect("cert");
+    genesis_of(dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(dir);
+    let path = config_only(dir);
+    (ca, ring, path, not_after)
+}
+
+/// The leaf at `path`: its SubjectPublicKeyInfo and `notAfter`.
+fn leaf_on_disk(path: &Path) -> (Vec<u8>, u64) {
+    use rustls_pki_types::pem::PemObject;
+    let der = rustls_pki_types::CertificateDer::pem_file_iter(path)
+        .expect("readable")
+        .next()
+        .expect("a certificate")
+        .expect("pem");
+    let (_, x509) = x509_parser::parse_x509_certificate(&der).expect("x509");
+    (
+        x509.public_key().raw.to_vec(),
+        x509.validity().not_after.timestamp() as u64,
+    )
+}
+
+/// Sleep until the wall clock is past `unix`.
+async fn until_past(unix: u64) {
+    while unix_now() <= unix {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A node whose leaf falls due renews it in place and keeps serving
+/// (task-d02): no restart, and no connection dropped for the renewal.
+///
+/// The issuer is down at the due point and comes back before the
+/// deadline, so this is also the outage the early due point is for: the
+/// node reports the failed attempt, retries, and renews when the issuer
+/// answers. The renewed leaf is on disk under the same key with a later
+/// `notAfter`, so a restart would come back on it. A caller that bound
+/// before the renewal is still served after the old leaf's `notAfter`,
+/// and a caller arriving after that instant can connect at all -- which
+/// it cannot to a node still presenting the old leaf, because its
+/// handshake checks the server certificate's validity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
+    let dir = workspace("renew");
+    let (ca, ring, path, old_not_after) = short_lived_voter(&dir, 30);
+    let port = free_port();
+    let issuer = NodeIssuerFixture::new(&ca, &[1]);
+    issuer.assertion(&dir.join("assertion.jwt"), 1);
+    renew_at(&path, port, &dir.join("assertion.jwt"));
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let (spki_before, _) = leaf_on_disk(&dir.join("node.pem"));
+
+    let daemon = start(&path);
+    let report = daemon.out.lock().expect("not poisoned").clone();
+    assert!(
+        report.contains("renewal configured")
+            && report.contains(&format!("expires_at={old_not_after}"))
+            && report.contains("state=wait"),
+        "the startup report does not say when this leaf is renewed:\n{report}"
+    );
+    let early = Caller::bind(&daemon, &ca, &ring, [0x51; 16]).await;
+
+    // The issuer is not there when the leaf falls due.
+    assert!(
+        daemon.waits_until(40, |said| said.contains("renewal attempt failed")),
+        "no attempt was made at the due point:\n{}",
+        daemon.said()
+    );
+    assert!(
+        unix_now() < old_not_after,
+        "the first attempt came only at the deadline"
+    );
+    issuer.serve(port).await;
+    assert!(
+        daemon.waits_until(20, |said| said.contains("renewal renewed expires_at")),
+        "the node did not renew once the issuer was back:\n{}",
+        daemon.said()
+    );
+    // Written where a restart reads it: the same key, a later end.
+    let (spki_after, new_not_after) = leaf_on_disk(&dir.join("node.pem"));
+    assert_eq!(spki_after, spki_before, "the renewal changed the key");
+    assert!(
+        new_not_after > old_not_after,
+        "{new_not_after} <= {old_not_after}"
+    );
+
+    // Past the old leaf's end: the caller that connected before the
+    // renewal is still connected and still served...
+    until_past(old_not_after + 1).await;
+    let answer = ask(&early.connection, &early.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "a caller connected before the renewal was not served after it:\n{}",
+                daemon.said()
+            )
+        });
+    assert!(matches!(
+        response_of(&answer).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+    // ...and a new one can connect, which it could not to a node still
+    // presenting the old leaf.
+    let late = Caller::bind(&daemon, &ca, &ring, [0x52; 16]).await;
+    let answer = ask(&late.connection, &late.range(1, b"k"))
+        .await
+        .expect("a caller arriving after the old leaf's end is served");
+    assert!(matches!(
+        response_of(&answer).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+    assert!(
+        !daemon.said().contains("renewal expired"),
+        "{}",
+        daemon.said()
+    );
+}
+
+/// With the issuer down from the due point, the node serves to its
+/// deadline and stops there (task-d02). It never serves on the expired
+/// leaf, and the issuer coming back afterwards does not revive it: a
+/// restart on the expired leaf is refused before anything is opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_issuer_down_a_node_serves_to_its_deadline_and_stops_there() {
+    let dir = workspace("renew-outage");
+    let (ca, ring, path, not_after) = short_lived_voter(&dir, 18);
+    let port = free_port();
+    let issuer = NodeIssuerFixture::new(&ca, &[1]);
+    issuer.assertion(&dir.join("assertion.jwt"), 1);
+    renew_at(&path, port, &dir.join("assertion.jwt"));
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let mut daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x53; 16]).await;
+    assert!(
+        daemon.waits_until(30, |said| said.contains("renewal attempt failed")),
+        "no attempt was made at the due point:\n{}",
+        daemon.said()
+    );
+    // Due, and not renewed: still valid, so still serving.
+    assert!(unix_now() < not_after);
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("a node inside its leaf's life serves through an outage");
+    assert!(matches!(
+        response_of(&answer).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // And at the deadline it stops.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the node kept serving past its leaf's end:\n{}",
+            daemon.said()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        unix_now() >= not_after,
+        "the node stopped before its leaf's end"
+    );
+    assert_eq!(status.code(), Some(2), "{}", daemon.said());
+    // The reader threads have the last lines once the pipe closes.
+    assert!(
+        daemon.waits_until(5, |said| said.contains("reason=credential-expired")),
+        "{}",
+        daemon.said()
+    );
+    let said = daemon.said();
+    assert!(said.contains("renewal expired"), "{said}");
+    assert!(said.contains("phase=quarantined"), "{said}");
+    assert!(!said.contains("renewal renewed expires_at"), "{said}");
+    assert!(said.contains("renewal renewed=0 "), "{said}");
+
+    // The issuer comes back. Nothing revives the node by itself: a
+    // restart on the expired leaf is refused before a store is opened.
+    // (Past the second `notAfter` names: X.509 counts that second as
+    // valid, while the node stops serving at its start.)
+    issuer.serve(port).await;
+    until_past(not_after + 1).await;
+    let restarted = run(&path, &[]);
+    assert_eq!(
+        restarted.code,
+        Some(2),
+        "{}{}",
+        restarted.out,
+        restarted.err
+    );
+    assert!(
+        restarted.err.contains("trust bundle"),
+        "the refusal did not say the leaf is not valid: {}",
+        restarted.err
+    );
+}
+
+/// The renewed leaf of one voter of three is admitted by its peers as a
+/// renewal (task-d02): once the old leaf's end has closed every link it
+/// authenticated, the peers dial and accept the node again under the new
+/// one, and a request through it -- it leads, so nothing is established
+/// without its links -- is established by the three.
+#[tokio::test(flavor = "multi_thread")]
+async fn peers_admit_a_voters_renewed_leaf() {
+    let dir = workspace("renew-peers");
+    let cluster = three_voters(&dir);
+    let n1 = dir.join("n1");
+    let key = rcgen::KeyPair::try_from(cluster.ca.node_key.as_slice()).expect("voter 1 key");
+    let (leaf, old_not_after) = cluster.ca.issue_short(&key, 1, 36);
+    std::fs::write(n1.join("node.pem"), pem("CERTIFICATE", &leaf)).expect("cert");
+    let port = free_port();
+    let issuer = NodeIssuerFixture::new(&cluster.ca, &[1]);
+    issuer.assertion(&n1.join("assertion.jwt"), 1);
+    renew_at(&cluster.configs[0], port, &n1.join("assertion.jwt"));
+    issuer.serve(port).await;
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("peers connected=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_until(40, |said| said.contains("renewal renewed expires_at")),
+        "voter 1 did not renew:\n{}",
+        running[0].said()
+    );
+    // The old leaf's end closes the links it authenticated -- each peer
+    // holds that deadline for voter 1's connections, and may act on it up
+    // to a second early -- and the peers get them back under the renewed
+    // one. What each says from just before that instant has to show the
+    // link going and coming back.
+    //
+    // Checked from two seconds past it. A link dialled again within the
+    // second `notAfter` names is still accepted under the old leaf --
+    // X.509 counts that second as valid -- and is closed again at once,
+    // so a count read at the boundary can say 2 for a node its peers are
+    // about to refuse.
+    until_past(old_not_after - 3).await;
+    let marks: Vec<usize> = running.iter().map(|node| node.said().len()).collect();
+    until_past(old_not_after + 2).await;
+    let returned = |said: &str| {
+        let counts = reported(said, "peers connected=");
+        counts
+            .iter()
+            .position(|n| *n < 2)
+            .is_some_and(|down| counts[down..].contains(&2))
+            && counts.last() == Some(&2)
+    };
+    for (n, node) in running.iter().enumerate().skip(1) {
+        assert!(
+            node.waits_until(30, |said| returned(&said[marks[n]..])),
+            "voter {} did not take voter 1 back under its renewed leaf:\n{}",
+            n + 1,
+            &node.said()[marks[n]..]
+        );
+        assert!(
+            !node.said()[marks[n]..].contains("Rejected(Rejected("),
+            "voter {} refused voter 1's renewed leaf:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+    // And they stay back. A link that is refused keeps being dialled, and
+    // each dial that the old leaf's last second let through is closed at
+    // once; a mesh that has really taken the node back says nothing more.
+    let settled: Vec<usize> = running.iter().map(|node| node.said().len()).collect();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for (n, node) in running.iter().enumerate().skip(1) {
+        let said = node.said();
+        assert!(
+            reported(&said[settled[n]..], "peers connected=").is_empty()
+                && reported(&said[marks[n]..], "peers connected=").last() == Some(&2),
+            "voter {}'s link to voter 1 did not hold:\n{}",
+            n + 1,
+            &said[marks[n]..]
+        );
+    }
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x54; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the renewed voter's request was not established\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said(),
+                running[2].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&answer).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+    for node in &running {
+        assert!(!node.said().contains("renewal expired"), "{}", node.said());
+    }
 }

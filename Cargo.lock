@@ -1118,6 +1118,7 @@ dependencies = [
 name = "coordd"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "coord-authn",
  "coord-checkpoint",
@@ -1145,9 +1146,11 @@ dependencies = [
  "postcard",
  "quinn",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "time",
  "tokio",
  "x509-parser",
 ]
