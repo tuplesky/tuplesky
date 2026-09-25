@@ -447,6 +447,15 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
              --issuer-listen names the host the endpoint is reached at"
         )));
     }
+    if let Some(at) = &plan.issuer_listen
+        && crate::pki::loopback_name(&at.host)
+    {
+        return Err(invalid(format!(
+            "`{}` only reaches the machine it is resolved on; the endpoint is on \
+             loopback without --issuer-listen, which names a host other machines reach",
+            at.host
+        )));
+    }
     let issuer_reach = plan
         .issuer_listen
         .as_ref()

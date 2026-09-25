@@ -258,6 +258,13 @@ pub fn reach(host: &str) -> Option<rcgen::SanType> {
     Some(rcgen::SanType::DnsName(host.try_into().ok()?))
 }
 
+/// Whether a DNS name only ever means the machine it is resolved on:
+/// `localhost` and the names under it (RFC 6761, section 6.3).
+pub fn loopback_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
 impl Default for Ca {
     fn default() -> Self {
         Ca::new()
