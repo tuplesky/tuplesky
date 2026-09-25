@@ -180,7 +180,7 @@ Where they stand on the stack at `afc0df6`:
 | Finding | Status |
 | --- | --- |
 | A restarted follower whose table stays full | Open. Recovery carries the whole history (below). |
-| A restarted voter that panics, then no election | Fixed on task-d01 (`fe09234`, `f2d4dfb`). |
+| A restarted voter that panics, then no election | Fixed on task-d01 (`fe09234`, `f2d4dfb`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 1's full tables. |
 | A follower that started late never completes a read | Open. Reproduced on `afc0df6`. |
 | No sessions after healing, under Jepsen | Open. Recovery carries the whole history (below). |
 
@@ -189,7 +189,11 @@ The first and the last are the limit task-d01's notes now record as
 so every recovery report and every Sync names every command the domain
 has run, and a voter cannot tell a long-retired command from an unknown
 one. After enough history, any election fills the command table with
-placeholders. Deciding what bounds it (an execution floor, a pruned
+placeholders. Rerun on `afc0df6`, the leader-kill stress run shows it on
+its own: voter 1 was killed five times and led ballots 6 and 7 after
+coming back. But voters 2 and 3 refused every submission with
+`Backpressure` (past 16384), and no voter served the final read (exit 2;
+290 operations, no anomaly). Deciding what bounds it (an execution floor, a pruned
 ledger, or a durable "executed" answer) is a `coord-consensus` protocol
 decision, and it is in no task yet.
 
