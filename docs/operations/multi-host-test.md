@@ -88,6 +88,11 @@ What `--hosts` changes, and nothing else does:
   *working directory*, not against the configuration file -- this task did
   not change that -- so a bundle is run from inside itself. Copy it anywhere;
   the examples use `/opt/tuplesky/nN`.
+* **The admin's private key is never written.** Provisioning generates it,
+  signs the manifest once, and drops it. Only its public half ships. So a
+  provisioned domain's genesis cannot be re-signed by the harness or by
+  anyone else, which is what the pin admits anyway: no change. A domain that
+  needs another genesis is provisioned again, and every bundle is replaced.
 * **The credential endpoint** (`--issuer-listen`) gets a certificate for its
   host and a URL naming it, so a Kine build on another host can exchange its
   assertion there. Without the flag it stays on loopback. `localhost` (and any
