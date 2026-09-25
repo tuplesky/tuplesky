@@ -124,6 +124,11 @@ pub struct Voter<P: Persistence> {
     /// Queued transitions refused because a higher ballot was promised
     /// (diagnostic, task-d01).
     pub fenced: u64,
+    /// The highest ballot the store was fenced at. A fence never moves
+    /// back, so a voter whose promise did not become durable is below it,
+    /// and a campaign for anything at or under it would be refused by its
+    /// own store.
+    fenced_at: Option<Ballot>,
 }
 
 impl<P: Persistence> Voter<P> {
@@ -156,6 +161,7 @@ impl<P: Persistence> Voter<P> {
             admitted: 0,
             refused: 0,
             fenced: 0,
+            fenced_at: None,
         }
     }
 
@@ -223,7 +229,13 @@ impl<P: Persistence> Voter<P> {
         if self.leads() {
             return Ok(None);
         }
-        let highest = highest(self.ballot, self.node.machine().promised());
+        // Above the fence as well: after a promise that did not become
+        // durable the voter is back below the ballot its store is fenced
+        // at, and the successor of what it holds and has promised can be
+        // under that fence (a candidate with a higher replica id at the
+        // same number), which its own store refuses every time.
+        let held = highest(self.ballot, self.node.machine().promised());
+        let highest = self.fenced_at.map_or(held, |fence| highest(held, fence));
         let Ok(ballot) = highest.successor(self.ingress.replica()) else {
             return Ok(None);
         };
@@ -313,11 +325,14 @@ impl<P: Persistence> Voter<P> {
             // it, so what the machine does is stamped with the ballot it
             // does it under. The store's fence does not move back. Work
             // stamped below it is refused at submit, and counted, until
-            // the voter promises that ballot or a higher one again. The
-            // refusal reaches the machine as a failed barrier
-            // (`Node::one_round`), so the transition it asked for is
-            // definitely not committed and the voter goes on serving. A
-            // voter that does not vote is always safe.
+            // the voter promises that ballot or a higher one again. For a
+            // follower the refusal reaches the machine as a failed barrier
+            // (`Node::one_round`): the transition is definitely not
+            // committed, and the voter serves on. A leader stops instead,
+            // and so does a refused apply (`DriveError::Fenced`); the fence
+            // is in memory only, so a restart resumes at the promised
+            // ballot. A voter that does not vote is always safe, and its
+            // own next campaign goes above the fence (`Voter::campaign`).
             self.set_ballot(promised);
         }
         if let Some(changed) = self.node.change_role(&self.ballot)? {
@@ -336,6 +351,10 @@ impl<P: Persistence> Voter<P> {
             .store_mut()
             .fence(self.ballot)
             .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+        self.fenced_at = Some(
+            self.fenced_at
+                .map_or(self.ballot, |fence| highest(fence, self.ballot)),
+        );
         let mut out = Outbound::default();
         for event in refused {
             self.fenced += 1;

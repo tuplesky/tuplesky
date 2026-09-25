@@ -551,6 +551,14 @@ struct Stamped {
     /// Refuse every submission as fenced at a newer promise, as the
     /// journaled store does for work stamped below its fence.
     fenced_out: bool,
+    /// Refuse a submission stamped below the highest fence, as the
+    /// journaled store does.
+    below_fence: bool,
+    /// Take submissions without making them durable, so a test can say
+    /// later how each one ended.
+    hold: bool,
+    /// The barriers taken while holding, in order.
+    held: Vec<coord_core::effect::BarrierId>,
 }
 
 impl coord_storage::Persistence for Stamped {
@@ -579,6 +587,23 @@ impl coord_storage::Persistence for Stamped {
         self.stamps.push(self.ballot);
         if self.fenced_out {
             return Err(coord_storage::Refused::Fenced);
+        }
+        let fence = self.fences.iter().copied().reduce(|a, b| {
+            if b.compare_same_epoch(&a) == Some(core::cmp::Ordering::Greater) {
+                b
+            } else {
+                a
+            }
+        });
+        if self.below_fence
+            && let (Some(stamp), Some(fence)) = (self.ballot, fence)
+            && stamp.compare_same_epoch(&fence) == Some(core::cmp::Ordering::Less)
+        {
+            return Err(coord_storage::Refused::Fenced);
+        }
+        if self.hold {
+            self.held.push(batch.barrier);
+            return Ok(());
         }
         coord_storage::Persistence::submit(&mut self.inner, batch, kind)
     }
@@ -633,6 +658,9 @@ fn stamped(me: u8) -> Voter<Stamped> {
             stamps: Vec::new(),
             fences: Vec::new(),
             fenced_out: false,
+            below_fence: false,
+            hold: false,
+            held: Vec::new(),
         },
         alloc,
     )
@@ -811,6 +839,107 @@ fn a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on() {
     assert_eq!(voter.ballot(), ballot());
 }
 
+/// A candidate's promise that is fenced and then fails, as a group
+/// failure would fail it, leaving the voter back at the ballot it had and
+/// below the ballot its store is fenced at (task-d01).
+fn promise_that_fails(voter: &mut Voter<Stamped>, from: u8, candidate: Ballot) {
+    voter.node_mut().applier_mut().store_mut().hold = true;
+    new_leader(voter, from, candidate);
+    let store = voter.node_mut().applier_mut().store_mut();
+    assert_eq!(
+        store.fences.last(),
+        Some(&candidate),
+        "the promise was fenced"
+    );
+    store.hold = false;
+    store.below_fence = true;
+    let barrier = *store.held.last().expect("the promise row was taken");
+    let at = voter.ballot();
+    voter
+        .node_mut()
+        .on_storage(
+            coord_core::event::StorageEvent::Failed {
+                barrier_id: barrier,
+                error: coord_core::event::StorageError::DefinitelyNotCommitted,
+            },
+            &at,
+        )
+        .expect("a failed promise row is a storage fact");
+    voter.follow_machine().expect("followed");
+    assert_eq!(
+        voter.ballot(),
+        ballot(),
+        "the voter went back to its ballot"
+    );
+}
+
+/// A leader whose work is refused by its own fence stops, rather than
+/// leading a domain it can no longer propose in (task-d01).
+///
+/// The leader promised a candidate's ballot and fenced its store there,
+/// and the promise row then failed: the machine still leads the old
+/// ballot, and every batch it makes is stamped below the fence. Serving
+/// on, it would exhaust its retries and stop proposing while still the
+/// leader, so neither it nor the voters holding its links would campaign.
+/// Stopped, it restarts as a follower of its ballot and campaigns.
+#[test]
+fn a_leader_whose_work_is_refused_by_its_own_fence_stops() {
+    let mut voter = stamped(0);
+    promise_that_fails(
+        &mut voter,
+        2,
+        Ballot {
+            epoch: epoch(),
+            number: 1,
+            leader: r(2),
+        },
+    );
+    assert!(voter.leads(), "a promise that failed deposes nobody");
+    let stopped = voter.on_submission(
+        PeerRole::Frontend,
+        &frame(&submission(1)),
+        Origin::Connection(7),
+    );
+    assert!(
+        matches!(stopped, Err(coord_daemon::DriveError::Fenced(_))),
+        "a leader refused by its fence served on: {stopped:?}"
+    );
+}
+
+/// A follower back below its own fence campaigns above it (task-d01).
+///
+/// After a candidate's promise fails, the successor of what the voter
+/// holds and has promised is the old number plus one under its own id.
+/// With the candidate's id higher at that number, that ballot is below
+/// the fence and its own store refuses the campaign's promise every
+/// time. The campaign is for the successor of the fence instead.
+#[test]
+fn a_follower_below_its_own_fence_campaigns_above_it() {
+    let mut voter = stamped(1);
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(2),
+    };
+    promise_that_fails(&mut voter, 2, candidate);
+    let (campaigned, _) = voter
+        .campaign()
+        .expect("stepped")
+        .expect("a campaign its own store does not refuse");
+    assert_eq!(campaigned.leader, r(1));
+    assert_eq!(
+        campaigned.compare_same_epoch(&candidate),
+        Some(core::cmp::Ordering::Greater),
+        "{campaigned:?} is not above the fence at {candidate:?}"
+    );
+    assert_eq!(voter.node().machine().promised(), campaigned);
+    assert_eq!(
+        voter.node().fenced,
+        0,
+        "nothing of the campaign was refused"
+    );
+}
+
 /// A leader that promises a higher ballot steps down in place: the same
 /// voter, store and outbox, following the candidate (task-d01).
 #[test]
@@ -868,6 +997,9 @@ fn the_store_records_under_the_ballot_the_voter_is_at() {
             stamps: Vec::new(),
             fences: Vec::new(),
             fenced_out: false,
+            below_fence: false,
+            hold: false,
+            held: Vec::new(),
         },
         alloc,
     )

@@ -1012,3 +1012,47 @@ fn the_journal_stamps_the_ballot_the_machine_is_at() {
         }
     );
 }
+
+/// A transition stamped below the store's fence is refused as fenced,
+/// not as an engine fault, and an apply refused so says what it is
+/// (task-d01).
+///
+/// A voter whose promise did not become durable goes back below the
+/// ballot its store is fenced at, and the fence stays. The driver answers
+/// a fenced protocol transition by failing its barrier and a fenced apply
+/// by stopping with a named cause, so both have to reach it as such.
+#[test]
+fn a_transition_stamped_below_the_fence_is_refused_as_fenced() {
+    let mut applier = journaled();
+    let epoch = applier.store().application_base().configuration;
+    let at = |number| Ballot {
+        epoch,
+        number,
+        leader: REPLICA,
+    };
+    applier.store_mut().fence(at(2)).expect("fenced");
+    applier.store_mut().follow_ballot(at(1));
+
+    let mut alloc = BarrierAllocator::new(inc(), BOOT);
+    assert_eq!(
+        applier.store_mut().submit(
+            PersistBatch {
+                barrier: alloc.allocate(),
+                base: None,
+                updates: Vec::new(),
+            },
+            TransitionKind::Protocol,
+        ),
+        Err(coord_storage::Refused::Fenced)
+    );
+
+    let (command, record) = payload(1, &put(b"k", b"v"));
+    let refused = applier
+        .apply(command, &record)
+        .expect_err("an apply below the fence is refused");
+    assert!(
+        matches!(&refused, coord_storage::ApplyError::Engine(e)
+            if coord_storage::materialize::is_fenced(e)),
+        "{refused:?}"
+    );
+}

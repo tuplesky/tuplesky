@@ -3502,27 +3502,71 @@ until the voter promises that ballot or a higher one again. A voter that
 does not vote is always safe.
 
 What refused means matters, because the refusal lands in the serve loop.
-Work already queued is refused by the fence itself and its barriers fail.
+Work already queued is refused by the fence itself, and its barriers fail.
 Work the machine asks for afterwards is refused at submit, where the
 journaled store answers `ObsoleteBallot`. That used to surface as
-`DriveError::Submit`, and on the turn path a `DriveError` ends the serve
-loop as a voter that cannot make its transitions durable. Now the store
-wrapper reports it as `Refused::Fenced`, and `Node::one_round` turns it
-into what the fence reports for queued work: the barrier failed,
-`DefinitelyNotCommitted`, fed back to the machine. The send that waited
-on it is never released, and the voter serves on. Every other refusal at
-submit still ends the loop. `a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on`
-has the store refuse a candidate's promise row as fenced. The voter
-sends no promise, follows the machine back to its ballot, and counts
-the refusal. Without the `Fenced` arm, the step fails.
+`DriveError::Submit`. On the turn path, a `DriveError` ends the serve
+loop. On the peer path and the connection-submission path, it is logged
+and serving continues. In that case the `?` in `Voter::on_peer` also
+skips the revert, leaving a stamp at the candidate's ballot with a
+promise that never resolves. The store wrapper now reports the refusal as
+`Refused::Fenced`. What happens next depends on the role:
 
-Left: an *application* transition stamped below the fence (a committed
-command applied after the stamp moved back) is refused by the same check,
-and it still ends the loop through `materialize::submit` as
-`DriveError::Engine`. Failing its barrier and forgetting it is not an
-answer there, because a committed command has to be applied at its
-position. The way out is for the voter to promise that ballot or a higher
-one again. That is not done here.
+- **A follower serves on.** `Node::one_round` turns the refusal into what
+  the fence reports for queued work: the barrier failed,
+  `DefinitelyNotCommitted`, fed back to the machine. The send that waited
+  on it is never released. This also closes the peer-path case above for
+  `Fenced`. Every other refusal at submit still ends the loop on the turn
+  path. `a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on`
+  has the store refuse a candidate's promise row as fenced. The voter
+  sends no promise, follows the machine back to its ballot, and counts
+  the refusal.
+- **A leader stops**, with `DriveError::Fenced`. A leader whose promise
+  to a candidate failed still leads its old ballot, because
+  `Leader::deposed` reads the durable promise. Every batch it makes is
+  then stamped below the fence and refused. If it served on, it would run
+  out of proposal retries and stop proposing while still `Machine::Leader`.
+  Neither it nor the voters holding its links would campaign, and the
+  domain would stall. Stopped, it restarts as a follower of its ballot and
+  campaigns (the restart rule above).
+  `a_leader_whose_work_is_refused_by_its_own_fence_stops` fences the
+  promise, fails its row as a group failure would, and then submits: the
+  step ends `Fenced`. Without the leader arm, it serves on.
+- **A follower's own campaign goes above the fence.** `Voter` keeps the
+  highest ballot it fenced at, and `campaign` takes the successor of the
+  highest of its ballot, its promise and that fence. After a candidate's
+  promise fails, the successor of the first two alone is the old number
+  plus one under the voter's own id. Where the candidate's id is higher,
+  that ballot is below the fence, and the voter's own store would refuse
+  the campaign every time. `a_follower_below_its_own_fence_campaigns_above_it`
+  shows the campaign accepted above the fence. Without the fence in the
+  successor, it is refused.
+- **A fenced apply stops, and says why.** An application transition
+  stamped below the fence is refused by the same check. It is a committed
+  command being applied, and the batch carries the voter's current stamp,
+  not the ballot the command was committed under. Failing its barrier and
+  forgetting it is not an answer, because a committed command has to be
+  applied at its position. `materialize::submit` reports it as
+  `FENCED_APPLY`, and `Node::execute` turns that into `DriveError::Fenced`.
+  The serve loop then says the voter stopped because its store's fence is
+  above its ballot, and that a restart resumes at the promised ballot, as
+  a follower that campaigns. The fence is held in memory only (it is not
+  written, or restored at open or replay), and a promise row that
+  definitely failed leaves no trace, so a restart heals every variant of
+  this state. `composed.rs::a_transition_stamped_below_the_fence_is_refused_as_fenced`
+  shows both kinds reaching the driver as fenced through `JournaledDomain`.
+
+Re-promising is not done here. A driver-initiated re-promise would be a
+second path to a promise. A machine-side one needs the machine to keep the
+candidate, which `PromiseOutcome::Failed` drops; that is a
+`coord-consensus` change, and promise rules belong to task-26. Releasing
+the fence on a failed promise would be safe only if keyed to
+`DefinitelyNotCommitted`, and `PromiseOutcome::Failed` is not keyed to the
+failure class. The eventual fix is the machine-level re-promise. Until
+then, a leader stops where serving on would stall, and so does an apply.
+One harmless leftover: after a fenced promise, a follower's `report_due`
+still requires the failed barrier until the next promise or campaign
+replaces it.
 
 **A campaign still under way is left to finish.** A campaign collects a
 report from a majority, and a report carries what its voter holds, so on

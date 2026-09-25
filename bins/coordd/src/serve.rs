@@ -1468,6 +1468,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
+                Err(coord_daemon::DriveError::Fenced(what)) => {
+                    eprintln!(
+                        "this voter stopped: {what} was refused by its store's fence, \
+                         which is at a promise above this voter's ballot. \
+                         A restart resumes at the promised ballot, as a follower that campaigns"
+                    );
+                    return;
+                }
                 Err(e) => {
                     eprintln!("this voter cannot make its transitions durable: {e}");
                     return;

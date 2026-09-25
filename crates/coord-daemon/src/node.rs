@@ -277,6 +277,12 @@ pub enum DriveError {
     /// make its own transitions durable must stop, not carry on from
     /// memory.
     Engine(String),
+    /// This voter's store is fenced at a promise above the ballot a
+    /// transition was stamped with, and the voter cannot serve on: a
+    /// leader's own work, or a committed command's apply, refused by the
+    /// fence (task-d01). The fence is held in memory only, so a restart
+    /// resumes at the promised ballot, as a follower that campaigns.
+    Fenced(String),
     /// A frame the collector is owed could not be encoded. The round is
     /// refused rather than the frame dropped: evidence that is silently
     /// lost looks exactly like a voter that did not answer.
@@ -288,6 +294,7 @@ impl core::fmt::Display for DriveError {
         match self {
             DriveError::Submit(e) => write!(f, "batch refused: {e}"),
             DriveError::Engine(e) => write!(f, "engine failed: {e}"),
+            DriveError::Fenced(e) => write!(f, "fenced at a newer promise: {e}"),
             DriveError::Encode(e) => write!(f, "frame not encodable: {e}"),
         }
     }
@@ -646,6 +653,19 @@ impl<P: Persistence> Node<P> {
                         // the queue, and it is said the same way: the
                         // barrier fails and the machine hears so. A refusal
                         // the voter expects is not a reason to stop serving.
+                        // A leader does not serve on from here. Every batch
+                        // it makes is stamped below the fence and refused
+                        // the same way, so it would stop proposing while
+                        // still leading, and neither it nor the voters that
+                        // hold its links would campaign: the domain would
+                        // stall. Ended instead, it restarts as a follower
+                        // of its ballot and campaigns.
+                        Err(Refused::Fenced) if self.machine().leads() => {
+                            self.fenced += 1;
+                            return Err(DriveError::Fenced(
+                                "a transition of this leader's own".into(),
+                            ));
+                        }
                         Err(Refused::Fenced) => {
                             self.fenced += 1;
                             refused.push(StorageEvent::Failed {
@@ -805,7 +825,18 @@ impl<P: Persistence> Node<P> {
             let outcome = Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
                 applier.apply(command, &payload)
             })
-            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+            .map_err(|e| {
+                // A committed command has to be applied at its position,
+                // so a refused apply cannot be failed and forgotten the
+                // way a protocol transition is. Nothing but a promise at
+                // or above the fence moves it, and this voter does not
+                // make one on its own; a restart does.
+                if matches!(&e, coord_storage::ApplyError::Engine(engine) if coord_storage::materialize::is_fenced(engine)) {
+                    DriveError::Fenced(format!("the apply of {command:?}"))
+                } else {
+                    DriveError::Engine(format!("{e:?}"))
+                }
+            })?;
             self.executed += 1;
             let effects = self.machine_mut().applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);
