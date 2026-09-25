@@ -5,8 +5,9 @@
 # `tuplesky/jepsen` repository against it with this runner as the control
 # node. Each Jepsen process drives the domain through `coord-jepsen`.
 #
-# Like the Kubernetes certification, this is a qualification run and not a
-# pull-request check. A Jepsen run that finds an anomaly or a crash is
+# Like the Kubernetes certification, this is a qualification run and not
+# part of `CI`: it is dispatched, weekly, or run once for a pull request
+# that changes the Jepsen harness itself. A Jepsen run that finds an anomaly or a crash is
 # doing its job; its store directory is uploaded either way.
 name: jepsen
 
@@ -28,6 +29,12 @@ on:
       nodes:
         description: Voters (containers), 3 or 5
         default: "5"
+  # A change to the Jepsen harness itself runs it once, on the pull
+  # request, with the defaults. Not a required check.
+  pull_request:
+    paths:
+      - .github/workflows/jepsen.yml
+      - crates/coord-jepsen/**
   schedule:
     # Weekly, after the Kubernetes certification.
     - cron: "17 6 * * 1"

@@ -12,7 +12,7 @@ local authoring utilities excluded from the design package.
 | `docs.yml` | `workflow_call` | Markdown links, task identifiers/anchors, plan graph consistency, Mermaid rendering with the pinned mermaid-cli |
 | `build-test.yml` | `workflow_call` with `full` | Rust (x86_64 and aarch64): format, clippy, dependency policy, tests; MSRV check; Go vet/test with race detector |
 | `kubernetes-certification.yml` | `workflow_dispatch`, weekly `schedule` | Storage-profile qualification through Kine; not part of `CI` |
-| `jepsen.yml` | `workflow_dispatch`, weekly `schedule` | Jepsen test in a Docker cluster on the runner, through `coord-jepsen` ([jepsen.md](../operations/jepsen.md)); not part of `CI` |
+| `jepsen.yml` | `workflow_dispatch`, weekly `schedule`, `pull_request` touching the Jepsen harness | Jepsen test in a Docker cluster on the runner, through `coord-jepsen` ([jepsen.md](../operations/jepsen.md)); not part of `CI` |
 
 All actions are pinned to commit SHAs. Pull requests run with `contents: read`,
 no secrets and `persist-credentials: false`; `pull_request_target` is not
