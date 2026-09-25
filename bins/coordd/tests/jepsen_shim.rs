@@ -99,6 +99,16 @@ async fn each_operation_does_what_its_line_says() {
         ask(&mut session, &codec, json!({"f": "read", "key": "r"})).await,
         ok(Value::Null)
     );
+    // A compare against what that read reported for the absent key holds.
+    assert_eq!(
+        ask(
+            &mut session,
+            &codec,
+            json!({"f": "cas", "key": "r", "value": [null, 2]})
+        )
+        .await,
+        ok(json!([null, 2]))
+    );
     assert_eq!(
         ask(
             &mut session,

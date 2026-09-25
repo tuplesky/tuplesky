@@ -96,16 +96,29 @@ impl Codec {
     /// Put `new` at `key` if and only if its current value is `old`.
     ///
     /// `old` is compared as the stored bytes. Values are written as JSON
-    /// text by this codec only, so one value has one encoding.
+    /// text by this codec only, so one value has one encoding. A `null`
+    /// `old` is the value a read reports for an absent key, so it is
+    /// compared as absence -- version zero -- and not as the bytes `null`,
+    /// which an absent key never holds.
     pub fn cas(&self, key: &Value, old: &Value, new: &Value) -> LogicalRequest {
         let key = self.key(key);
-        self.request(CanonicalOperation::Txn(TxnOp {
-            compares: vec![Compare {
+        let compare = if old.is_null() {
+            Compare {
+                key: key.clone(),
+                target: CompareTarget::Version,
+                result: CompareResult::Equal,
+                operand: CompareOperand::Counter(0),
+            }
+        } else {
+            Compare {
                 key: key.clone(),
                 target: CompareTarget::Value,
                 result: CompareResult::Equal,
                 operand: CompareOperand::Bytes(encode(old)),
-            }],
+            }
+        };
+        self.request(CanonicalOperation::Txn(TxnOp {
+            compares: vec![compare],
             success: vec![BranchOp::Put(put(key, new))],
             failure: Vec::new(),
         }))
@@ -470,6 +483,25 @@ mod tests {
             request.validate().expect("valid");
             assert!(request.operation.is_canonical());
         }
+    }
+
+    #[test]
+    fn a_cas_from_null_compares_absence() {
+        let c = codec();
+        let target = |request: LogicalRequest| match request.operation {
+            CanonicalOperation::Txn(txn) => {
+                (txn.compares[0].target, txn.compares[0].operand.clone())
+            }
+            other => panic!("a cas is a transaction, not {other:?}"),
+        };
+        assert_eq!(
+            target(c.cas(&json!("k"), &Value::Null, &json!(1))),
+            (CompareTarget::Version, CompareOperand::Counter(0))
+        );
+        assert_eq!(
+            target(c.cas(&json!("k"), &json!(1), &json!(2))),
+            (CompareTarget::Value, CompareOperand::Bytes(b"1".to_vec()))
+        );
     }
 
     #[test]
