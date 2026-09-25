@@ -6247,6 +6247,9 @@ async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_
 /// takes: a live leader promising a higher ballot, converting to a
 /// follower in place with its store and its connections carrying on, and
 /// the domain serving under the new ballot straight away.
+///
+/// Unix only, as the signal is: `coordd` listens for it only there.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_operator_moves_leadership_and_the_old_leader_steps_down() {
     let dir = workspace("operator-elect");

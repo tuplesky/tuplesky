@@ -44,6 +44,14 @@ pub enum Refused {
     StaleBase,
     /// The queue is full. Flushing lowers it; the batch was not taken.
     QueueFull,
+    /// The domain is fenced at a newer promise than the ballot this batch
+    /// is stamped with, so it may not newly enter the journal (design
+    /// Section 4.8). Definite, like [`Refused::Rejected`], but expected:
+    /// a voter whose promise did not become durable goes back to the
+    /// ballot it had while the fence stays, and what it does there is
+    /// refused until it promises again. The barrier the batch carries is
+    /// definitely not committed.
+    Fenced,
     /// Refused for good: the batch may not become durable here at all.
     Rejected(String),
 }
@@ -54,6 +62,7 @@ impl core::fmt::Display for Refused {
             Refused::NotReady(why) => write!(f, "not ready: {why}"),
             Refused::StaleBase => f.write_str("the base no longer extends the frontier"),
             Refused::QueueFull => f.write_str("the queue is full"),
+            Refused::Fenced => f.write_str("fenced at a newer promise"),
             Refused::Rejected(why) => write!(f, "refused: {why}"),
         }
     }
@@ -397,6 +406,7 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
                 // is no longer its own.
                 crate::journaled::SubmitRefused::StaleBase { .. } => Refused::StaleBase,
                 crate::journaled::SubmitRefused::QueueFull => Refused::QueueFull,
+                crate::journaled::SubmitRefused::ObsoleteBallot { .. } => Refused::Fenced,
                 crate::journaled::SubmitRefused::NotReady(status) => {
                     Refused::NotReady(format!("{status:?}"))
                 }

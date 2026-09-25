@@ -32,11 +32,11 @@
 use coord_collector::frontend_frame;
 use coord_consensus::{AppliedOutcome, Follower, Leader, PayloadRecordV1, SyncDecision};
 use coord_core::effect::{Effect, PeerId, TimerId};
-use coord_core::event::{Event, StorageEvent};
+use coord_core::event::{Event, StorageError, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{Outbox, PendingSend};
 use coord_storage::journaled::TransitionKind;
-use coord_storage::{Applier, Persistence};
+use coord_storage::{Applier, Persistence, Refused};
 use coord_types::CommandId;
 use coord_types::ids::Ballot;
 
@@ -312,6 +312,9 @@ pub struct Node<P: Persistence> {
     pub rounds: u64,
     /// Commands applied since boot (diagnostic).
     pub executed: u64,
+    /// Protocol transitions the store refused at submit because it is
+    /// fenced at a newer promise (diagnostic, task-d01).
+    pub fenced: u64,
     withheld: u64,
     withheld_evidence: u64,
     /// Where the journal and materialization stages are recorded
@@ -336,6 +339,7 @@ impl<P: Persistence> Node<P> {
             frontend,
             rounds: 0,
             executed: 0,
+            fenced: 0,
             withheld: 0,
             withheld_evidence: 0,
             recorder: None,
@@ -596,6 +600,7 @@ impl<P: Persistence> Node<P> {
     ) -> Result<(Outbound, Vec<Effect>), DriveError> {
         let mut out = Outbound::default();
         let mut persisted = false;
+        let mut refused = Vec::new();
         for effect in effects {
             // A released result is the leader's release-gate output. It
             // is not a `SendWhenDurable` and rests on no barrier of its
@@ -625,11 +630,31 @@ impl<P: Persistence> Node<P> {
                     // and the execution redo is not one of them -- that
                     // comes from applying a command, which is where its
                     // position, revision and result are known.
-                    self.applier
+                    let barrier_id = batch.barrier;
+                    match self
+                        .applier
                         .store_mut()
                         .submit(batch, TransitionKind::Protocol)
-                        .map_err(|e| DriveError::Submit(e.to_string()))?;
-                    persisted = true;
+                    {
+                        Ok(()) => persisted = true,
+                        // The store is fenced at a promise above the ballot
+                        // this is stamped with: the voter's promise did not
+                        // become durable and it went back to the ballot it
+                        // had, and the fence did not (`Voter::follow_machine`).
+                        // The transition will never be durable here, which
+                        // is what the fence says of the work it refuses from
+                        // the queue, and it is said the same way: the
+                        // barrier fails and the machine hears so. A refusal
+                        // the voter expects is not a reason to stop serving.
+                        Err(Refused::Fenced) => {
+                            self.fenced += 1;
+                            refused.push(StorageEvent::Failed {
+                                barrier_id,
+                                error: StorageError::DefinitelyNotCommitted,
+                            });
+                        }
+                        Err(e) => return Err(DriveError::Submit(e.to_string())),
+                    }
                 }
                 Effect::SendWhenDurable {
                     context,
@@ -670,6 +695,10 @@ impl<P: Persistence> Node<P> {
         }
 
         let mut next = Vec::new();
+        for event in refused {
+            self.outbox.observe(&event);
+            next.extend(self.machine_mut().step(Event::Storage(event)));
+        }
         if persisted {
             // One lowering moves one group, and a group takes one batch
             // per domain. A round that submitted more than one -- two

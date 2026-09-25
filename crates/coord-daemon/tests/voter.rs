@@ -548,6 +548,9 @@ struct Stamped {
     stamps: Vec<Option<Ballot>>,
     /// Every ballot the store was fenced at, in order.
     fences: Vec<Ballot>,
+    /// Refuse every submission as fenced at a newer promise, as the
+    /// journaled store does for work stamped below its fence.
+    fenced_out: bool,
 }
 
 impl coord_storage::Persistence for Stamped {
@@ -574,6 +577,9 @@ impl coord_storage::Persistence for Stamped {
         kind: coord_storage::journaled::TransitionKind,
     ) -> Result<(), coord_storage::Refused> {
         self.stamps.push(self.ballot);
+        if self.fenced_out {
+            return Err(coord_storage::Refused::Fenced);
+        }
         coord_storage::Persistence::submit(&mut self.inner, batch, kind)
     }
     fn lower(&mut self) -> Result<coord_storage::Lowered, coord_store_api::engine::EngineError> {
@@ -626,6 +632,7 @@ fn stamped(me: u8) -> Voter<Stamped> {
             ballot: None,
             stamps: Vec::new(),
             fences: Vec::new(),
+            fenced_out: false,
         },
         alloc,
     )
@@ -767,6 +774,43 @@ fn a_new_leader_the_machine_refuses_moves_nothing() {
     assert!(out.peer.is_empty());
 }
 
+/// A transition the store refuses as fenced fails its barrier and the
+/// voter goes on serving (task-d01).
+///
+/// A voter whose promise did not become durable goes back to the ballot
+/// it had, and the store's fence stays where it was, so what it then asks
+/// to persist is stamped below the fence and refused. That refusal is
+/// expected, and a driver that took it as a fault would end the serve
+/// loop. Here the store refuses the promise row itself: the machine hears
+/// that its barrier definitely did not commit, sends no promise, and the
+/// voter follows it back.
+#[test]
+fn a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on() {
+    let mut voter = stamped(2);
+    voter.node_mut().applier_mut().store_mut().fenced_out = true;
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    let out = voter
+        .on_peer(
+            PeerProvenance::from_local_voter(r(1), inc()),
+            coord_consensus::ProtocolMessage::NewLeader { ballot: candidate }.encode(),
+        )
+        .expect("a refusal the voter expects does not end its turn");
+    assert_eq!(voter.node().fenced, 1);
+    assert!(
+        !messages(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::Promise { .. })),
+        "a promise went out that is not durable: {:?}",
+        messages(&out)
+    );
+    assert_eq!(voter.node().machine().promised(), ballot());
+    assert_eq!(voter.ballot(), ballot());
+}
+
 /// A leader that promises a higher ballot steps down in place: the same
 /// voter, store and outbox, following the candidate (task-d01).
 #[test]
@@ -823,6 +867,7 @@ fn the_store_records_under_the_ballot_the_voter_is_at() {
             ballot: None,
             stamps: Vec::new(),
             fences: Vec::new(),
+            fenced_out: false,
         },
         alloc,
     )
