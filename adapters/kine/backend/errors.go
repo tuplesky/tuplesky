@@ -17,6 +17,7 @@ const (
 	codeMalformedRequest        uint16 = 0x0003
 	codeNotAdmitted             uint16 = 0x0004
 	codeResultTooLarge          uint16 = 0x0005
+	codeRequestTooLarge         uint16 = 0x0006
 )
 
 // mapWireError turns an established error response into the gRPC status
@@ -33,6 +34,8 @@ func mapWireError(code uint16, detail []byte) error {
 		return status.Error(codes.Unavailable, "frontend backpressure: "+msg)
 	case codeResultTooLarge:
 		return status.Error(codes.ResourceExhausted, "result too large: "+msg)
+	case codeRequestTooLarge:
+		return status.Error(codes.InvalidArgument, "request too large: "+msg)
 	case codeRequestIdentityConflict:
 		return status.Error(codes.Internal, "request identity conflict: "+msg)
 	default:

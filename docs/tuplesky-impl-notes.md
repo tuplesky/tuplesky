@@ -3714,3 +3714,39 @@ executed long ago. Bounding recovery by an execution floor, a pruned
 ledger, or a durable "executed" answer is a protocol decision for
 `coord-consensus`, and this change does not make it. The plan now owns
 it as task-d05, a prerequisite of task-64.
+
+`coord-consensus`, and this change does not make it.
+
+## A request bound that bounded nothing
+
+The task-c01 follow-up. `limits.max_request_bytes` sized the collector's
+undelivered-bytes budget and fed the writer-queue capability check. It
+was enforced nowhere. A request was bounded only by what the wire
+carries, so lowering the setting shrank a budget and still admitted
+requests up to the protocol's limit. Such a request then took a
+collector slot and bytes sized for smaller ones.
+
+The admission gate now enforces it. The measure is the request's
+canonical logical encoding, compared with the setting plus 64 KiB. The
+64 KiB is the allowance the wire already grants the encoding's own tags
+and lengths over the protocol's request limit. At the default setting,
+which is that limit, the gate admits exactly what the wire carries and
+nothing changes. Below it, a larger request is refused as
+`AdmissionRefusal::RequestTooLarge`, after the checks that say whether
+the request is well formed and before a slot is reserved or a byte
+budgeted. A retry is refused the same way.
+
+The refusal needed a code of its own. None of the five fits: it is not
+malformed, not a matter of admission, and not backpressure, which the
+SDK retries. So `REQUEST_TOO_LARGE` (0x0006) is appended to the frozen
+codes, which are append-only. The SDK reports it as
+`RetryError::RequestTooLarge`, which is not retried. The Kine backend
+maps it to `InvalidArgument`, since the caller has to change the request
+and cannot just retry it.
+
+The tests are
+`a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot`
+and `the_default_bound_admits_what_the_wire_carries` (collector), plus
+`a_request_above_the_configured_bound_is_refused_and_one_below_is_served`,
+which sets the bound to 1 KiB in a real daemon. With the check removed,
+the first and the last fail.

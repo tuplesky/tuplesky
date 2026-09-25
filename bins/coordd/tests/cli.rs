@@ -6309,3 +6309,52 @@ async fn an_operator_moves_leadership_and_the_old_leader_steps_down() {
         coord_types::wire_v1::OutcomeV1::Ok { .. }
     ));
 }
+
+/// `limits.max_request_bytes` bounds what a caller may send, refused at
+/// the door with its own code (task-c01 follow-up).
+///
+/// It used to size the collector's undelivered-bytes budget and nothing
+/// else: a request above it was admitted whenever the wire carried it, so
+/// lowering the setting changed a budget and not what the domain took.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_above_the_configured_bound_is_refused_and_one_below_is_served() {
+    let dir = workspace("request-bytes");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let mut text = std::fs::read_to_string(&path).expect("read config");
+    text.push_str(
+        "\n[limits]\n\
+         max_request_bytes = 1024\n\
+         max_response_bytes = 8388608\n\
+         max_outstanding_per_session = 256\n\
+         max_live_subscriptions = 4096\n",
+    );
+    std::fs::write(&path, text).expect("write config");
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x52; 16]).await;
+    // Past the bound and its encoding allowance, well inside what the
+    // wire carries.
+    let large = vec![0x5a; 1024 + 64 * 1024 + 1];
+    let refused = ask(&caller.connection, &caller.put(1, b"k", &large))
+        .await
+        .unwrap_or_else(|| panic!("no answer to a large put\n{}", daemon.said()));
+    match response_of(&refused).outcome {
+        coord_types::wire_v1::OutcomeV1::Err { code, .. } => assert_eq!(
+            code,
+            coord_types::wire_v1::codes::REQUEST_TOO_LARGE,
+            "refused, but not for its size"
+        ),
+        other => panic!("a request past the bound was not refused: {other:?}"),
+    }
+    let served = ask(&caller.connection, &caller.put(2, b"k", b"small"))
+        .await
+        .unwrap_or_else(|| panic!("no answer to a small put\n{}", daemon.said()));
+    assert!(matches!(
+        response_of(&served).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}

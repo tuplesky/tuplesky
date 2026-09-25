@@ -47,12 +47,22 @@ pub struct Admitted {
 pub struct AdmissionLimits {
     /// Requests one session may have pending at this frontend.
     pub max_pending_per_session: usize,
+    /// The largest logical request this frontend admits, in bytes of its
+    /// canonical encoding beyond [`ENCODING_ALLOWANCE`].
+    pub max_request_bytes: usize,
 }
+
+/// What a request's canonical encoding may carry beyond
+/// `max_request_bytes`: its own tags and lengths. The wire grants the
+/// same allowance over the protocol's request limit, so a frontend at the
+/// default limit admits exactly what the wire carries.
+pub const ENCODING_ALLOWANCE: usize = 64 * 1024;
 
 impl Default for AdmissionLimits {
     fn default() -> Self {
         AdmissionLimits {
             max_pending_per_session: 256,
+            max_request_bytes: coord_types::logical_v1::limits::MAX_REQUEST_BYTES,
         }
     }
 }
@@ -75,6 +85,14 @@ pub enum AdmissionRefusal {
     SessionBusy {
         /// Requests pending for the session.
         pending: usize,
+    },
+    /// The request is larger than this frontend admits.
+    RequestTooLarge {
+        /// Bytes of the request's canonical encoding.
+        bytes: usize,
+        /// What this frontend admits: `max_request_bytes` and the
+        /// encoding allowance.
+        limit: usize,
     },
 }
 
@@ -115,6 +133,19 @@ impl Admission {
             return Err(AdmissionRefusal::RoleNotAdmitted(caller.role));
         }
         request.logical().map_err(|_| AdmissionRefusal::Malformed)?;
+        // Before any slot is taken or any byte is budgeted: a request this
+        // frontend will never admit costs it nothing, and is refused the
+        // same way on every retry.
+        let limit = self
+            .limits
+            .max_request_bytes
+            .saturating_add(ENCODING_ALLOWANCE);
+        if request.logical.as_slice().len() > limit {
+            return Err(AdmissionRefusal::RequestTooLarge {
+                bytes: request.logical.as_slice().len(),
+                limit,
+            });
+        }
         let key = &request.retry_key;
         if key.cluster_id != self.cluster {
             return Err(AdmissionRefusal::WrongCluster);
