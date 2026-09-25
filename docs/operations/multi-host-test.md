@@ -156,14 +156,19 @@ harness node-ready node=nN pid=PID api=10.0.0.N:7001 output=/opt/tuplesky/nN/coo
 
 and stays in the foreground until the daemon exits. The daemon's process
 identifier is written to `nN/coordd.pid`, and everything the daemon says is
-appended to `nN/coordd.log`, across restarts.
+appended to `nN/coordd.log`, across restarts. Stopping `start` itself does not
+stop the daemon: it does not forward signals, so a supervisor that stops the
+wrapper leaves `coordd` running. Stop the daemon by its process identifier
+(step 11).
 
-Without the harness binary, the same thing by hand:
+Without the harness binary, the same thing by hand, sending both of the
+daemon's streams to the log the next step reads (the mesh lines go to stderr,
+`coordd phase=live` to stdout):
 
 ```text
 cd /opt/tuplesky/nN
-coordd --config coordd.toml init     # once; refuses a store that exists
-coordd --config coordd.toml          # ready when it prints `coordd phase=live`
+coordd --config coordd.toml init                   # once; refuses a store that exists
+coordd --config coordd.toml >> coordd.log 2>&1 &   # ready when the log says `coordd phase=live`
 ```
 
 Start order between voters does not matter: every voter re-dials the others
@@ -200,12 +205,17 @@ RUN=/srv/tuplesky/run
 coord-harness issuer --dir $RUN &          # prints `issuer listening 10.0.0.9:7443`
 ```
 
-The endpoint binds loopback, or the host `--issuer-listen` named, and nothing
-else: it signs a token for any non-empty assertion, so where it listens is its
-whole containment. `--listen 0.0.0.0:7443` is accepted for a domain provisioned
-for a non-loopback issuer host, on that port only, when that host's address is
-not on an interface; the check is against the endpoint's certificate, so
-editing `harness.json` does not widen it.
+The endpoint signs a token for any non-empty assertion, so where it listens is
+its whole containment. What is enforced: it binds a loopback address always.
+Off loopback it binds only for a domain provisioned with a non-loopback
+`--issuer-listen` host, only on the port the provisioned URL names, and only at
+that host's own address or at the unspecified address (`0.0.0.0` or `[::]`).
+The URL's host has to be one the endpoint's certificate names, and never the
+issuer's own name `sts.tuplesky.harness`, which every issuer certificate
+carries. So editing `harness.json` does not widen it. What is not enforced:
+which interfaces the machine has. The unspecified address listens on all of
+them, so use it only where the provisioned address is not on an interface
+(behind NAT, say), and firewall the port.
 
 ```text
 kine-coord \
@@ -218,7 +228,10 @@ kine-coord \
 ```
 
 The listener is the `edge.listen` of `harness.json`. Ready when `kine-coord`
-prints `kine-coord: serving`.
+prints `kine-coord: serving`. Run it on the host that holds the run directory,
+or with the run directory at the same path, since the DSN names the assertion
+and the endpoint's CA by absolute path. Do not hand-edit the DSN's `sts=` host:
+the endpoint's certificate names the provisioned host and nothing else.
 
 ## 9. Serve requests through Kine
 
