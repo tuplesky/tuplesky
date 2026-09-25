@@ -93,8 +93,16 @@ jobs:
           restore-keys: jepsen-m2-
       - name: Install Leiningen and this repository's Jepsen
         run: |
+          # JDK 21: Jepsen compiles its Java sources with `--release 21`.
+          # The lein script runs `java` from PATH (the runner's default is
+          # 17), not JAVA_HOME's, so both PATH and JAVA_CMD name it.
           echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
           export JAVA_HOME=$JAVA_HOME_21_X64
+          export JAVA_CMD=$JAVA_HOME_21_X64/bin/java
+          export PATH="$JAVA_HOME_21_X64/bin:$PATH"
+          java -version
           mkdir -p "$HOME/bin"
           curl -fsSL -o "$HOME/bin/lein" \
             "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
