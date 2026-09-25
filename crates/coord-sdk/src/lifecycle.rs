@@ -88,6 +88,9 @@ pub enum RetryError {
     Malformed,
     /// The result does not fit the response bound.
     ResultTooLarge,
+    /// The request is larger than the frontend admits; retrying the same
+    /// request is refused the same way.
+    RequestTooLarge,
     /// Another frozen code.
     Other {
         /// Code.
@@ -529,6 +532,7 @@ impl<P: CredentialProvider> Client<P> {
                 }
                 codes::MALFORMED_REQUEST => Outcome::Failed(RetryError::Malformed),
                 codes::RESULT_TOO_LARGE => Outcome::Failed(RetryError::ResultTooLarge),
+                codes::REQUEST_TOO_LARGE => Outcome::Failed(RetryError::RequestTooLarge),
                 code => Outcome::Failed(RetryError::Other { code }),
             },
             OutcomeV1::Pending => {

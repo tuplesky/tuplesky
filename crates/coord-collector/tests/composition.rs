@@ -1564,6 +1564,7 @@ fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
         DOMAIN,
         AdmissionLimits {
             max_pending_per_session: 1,
+            ..AdmissionLimits::default()
         },
     );
     let (_, first) = request(1, put(b"a", b"1"), 0);
@@ -1658,6 +1659,7 @@ fn a_conflicting_retry_never_frees_the_original_request_s_slot() {
         DOMAIN,
         AdmissionLimits {
             max_pending_per_session: 1,
+            ..AdmissionLimits::default()
         },
     );
     let (_, first) = request(1, put(b"a", b"1"), 0);
@@ -1693,4 +1695,48 @@ fn a_conflicting_retry_never_frees_the_original_request_s_slot() {
     gate.settled(&first.retry_key);
     assert_eq!(gate.pending(&SESSION), 0);
     gate.admit(0, &caller(), &other).expect("the slot is free");
+}
+
+#[test]
+fn a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot() {
+    // `max_request_bytes` used to size the collector's budget and bound
+    // nothing a caller sent: lowering it changed the budget and not what
+    // was admitted. It is enforced at the door now, with its own reason,
+    // before any slot is reserved.
+    let mut gate = Admission::new(
+        CLUSTER,
+        DOMAIN,
+        AdmissionLimits {
+            max_pending_per_session: 1,
+            max_request_bytes: 1024,
+        },
+    );
+    let limit = 1024 + coord_collector::admission::ENCODING_ALLOWANCE;
+    let big = vec![0x5a; limit + 1];
+    let (_, large) = request(1, put(b"k", &big), 0);
+    assert!(matches!(
+        gate.admit(0, &caller(), &large),
+        Err(AdmissionRefusal::RequestTooLarge { bytes, limit: l }) if bytes > limit && l == limit
+    ));
+    assert_eq!(gate.pending(&SESSION), 0, "the refusal took no slot");
+    // A retry is refused the same way, and a request inside the bound is
+    // admitted into the one slot the refusals left free.
+    assert!(matches!(
+        gate.admit(0, &caller(), &large),
+        Err(AdmissionRefusal::RequestTooLarge { .. })
+    ));
+    let (_, small) = request(2, put(b"k", &vec![0x5a; 512]), 0);
+    gate.admit(0, &caller(), &small).expect("inside the bound");
+    assert_eq!(gate.pending(&SESSION), 1);
+}
+
+#[test]
+fn the_default_bound_admits_what_the_wire_carries() {
+    // At the protocol's own request limit the check changes nothing: the
+    // wire already carries a request's encoding up to the same allowance.
+    assert_eq!(
+        AdmissionLimits::default().max_request_bytes
+            + coord_collector::admission::ENCODING_ALLOWANCE,
+        coord_types::logical_v1::limits::MAX_REQUEST_BYTES + 64 * 1024
+    );
 }

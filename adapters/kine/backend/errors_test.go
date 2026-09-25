@@ -56,3 +56,15 @@ func TestRejectionReasonsMapToActionableStatuses(t *testing.T) {
 		t.Fatalf("outcome name %q", got)
 	}
 }
+
+// A request the frontend will never admit is the caller's to change, not
+// to retry: it maps to InvalidArgument, never to a retryable status.
+func TestARequestTooLargeIsNotRetried(t *testing.T) {
+	s, _ := status.FromError(mapWireError(codeRequestTooLarge, []byte("request too large")))
+	if s.Code() != codes.InvalidArgument {
+		t.Fatalf("code %s, want InvalidArgument", s.Code())
+	}
+	if !strings.Contains(s.Message(), "request too large") {
+		t.Fatalf("message %q does not name the reason", s.Message())
+	}
+}

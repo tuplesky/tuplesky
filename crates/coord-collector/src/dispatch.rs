@@ -189,6 +189,9 @@ impl Dispatcher {
                             AdmissionRefusal::SessionBusy { .. } => {
                                 (codes::BACKPRESSURE, "session busy")
                             }
+                            AdmissionRefusal::RequestTooLarge { .. } => {
+                                (codes::REQUEST_TOO_LARGE, "request too large")
+                            }
                             AdmissionRefusal::RoleNotAdmitted(_)
                             | AdmissionRefusal::WrongCluster
                             | AdmissionRefusal::WrongDomain
