@@ -5,7 +5,8 @@
 # real three-voter domain up, serves the etcd edge in front of it with
 # `kine-coord`, and then certifies the profile twice over: once with the
 # API server's own client library against the edge, and once with a real
-# Kubernetes control plane on top of it.
+# Kubernetes control plane on top of it. A third job provisions the same
+# composition for three hosts and runs it on this runner's loopback range.
 #
 # It is deliberately not part of `CI`. A qualification run reports what
 # the composition can and cannot do today, and a run that is red because
@@ -161,4 +162,42 @@ jobs:
             ${{ runner.temp }}/run/*.log
             ${{ runner.temp }}/run/n*/coordd.log
             ${{ runner.temp }}/run/harness.json
+          retention-days: 14
+
+  multi-host:
+    # The multi-host runbook (docs/operations/multi-host-test.md) rehearsed
+    # on one runner (task-d04): three voters on 127.0.0.2-4 with fixed
+    # ports, each run from a relocated bundle, the issuer and the edge on
+    # 127.0.0.5, a request through Kine, and a killed voter taken back.
+    name: multi-host domain on one runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: adapters/kine/go.mod
+          cache-dependency-path: adapters/kine/go.sum
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: certification
+      - name: Build the daemon, the harness and the Kine build
+        run: |
+          cargo build --locked --release -p coordd -p coord-harness
+          (cd adapters/kine && go build -o ../../target/release/kine-coord ./cmd/kine-coord)
+      - name: Provision for three hosts, serve through Kine, kill and restart a voter
+        run: scripts/e2e/multi-host-local.sh "$RUNNER_TEMP/multi-host"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: multi-host-logs
+          path: |
+            ${{ runner.temp }}/multi-host/*.log
+            ${{ runner.temp }}/multi-host/hosts/h*/*.log
+            ${{ runner.temp }}/multi-host/hosts/h*/n*/coordd.log
+            ${{ runner.temp }}/multi-host/harness.json
           retention-days: 14

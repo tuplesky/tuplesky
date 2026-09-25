@@ -172,6 +172,32 @@ impl Ca {
         incarnation: ReplicaIncarnation,
         role: PeerRole,
     ) -> Issued {
+        // Loopback as well: a catalog lists addresses a process can
+        // dial, and a harness has no DNS. It adds a way to reach the node
+        // and no authority whatsoever -- the URI is what carries the
+        // identity.
+        self.issue_node_at(name, cluster, node, incarnation, role, loopback())
+    }
+
+    /// The same credential, reachable at `reach` instead of loopback.
+    ///
+    /// A peer dials the host part of the catalog address it was given
+    /// and verifies the certificate against it, so a node listed at
+    /// `10.0.0.2` or `n2.example` has to carry that address or that name
+    /// or every handshake to it fails -- which reads as a network
+    /// problem and is not. The name is still only a way to reach the
+    /// node: the binder decides which voter answered from the URI, so a
+    /// certificate valid for the right host and the wrong replica is
+    /// refused exactly as before.
+    pub fn issue_node_at(
+        &self,
+        name: &str,
+        cluster: ClusterId,
+        node: ReplicaId,
+        incarnation: ReplicaIncarnation,
+        role: PeerRole,
+        reach: rcgen::SanType,
+    ) -> Issued {
         let identity = coord_node_issuer::NodeIdentity {
             cluster,
             node,
@@ -181,11 +207,7 @@ impl Ca {
         self.issue_leaf(
             &[name.to_owned()],
             vec![
-                // Loopback as well: a catalog lists addresses a process
-                // can dial, and a harness has no DNS. It adds a way to
-                // reach the node and no authority whatsoever -- the URI
-                // below is what carries the identity.
-                rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                reach,
                 rcgen::SanType::URI(
                     coord_node_issuer::node_uri(&identity)
                         .try_into()
@@ -197,13 +219,43 @@ impl Ca {
 
     /// Issue a server identity for a loopback listener.
     pub fn issue_server(&self, name: &str) -> Issued {
-        self.issue_leaf(
-            &[name.to_owned()],
-            vec![rcgen::SanType::IpAddress(std::net::IpAddr::V4(
-                std::net::Ipv4Addr::LOCALHOST,
-            ))],
-        )
+        self.issue_server_at(name, loopback())
     }
+
+    /// Issue a server identity for a listener reached at `reach`.
+    pub fn issue_server_at(&self, name: &str, reach: rcgen::SanType) -> Issued {
+        self.issue_leaf(&[name.to_owned()], vec![reach])
+    }
+}
+
+/// The loopback address, as a subject alternative name.
+fn loopback() -> rcgen::SanType {
+    rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+/// The subject alternative name a client checks when it dials `host`:
+/// an IP address for an IP literal, a DNS name otherwise. `None` for a
+/// string that is neither, so a typo in a host list is refused when the
+/// domain is provisioned rather than at the first handshake.
+pub fn reach(host: &str) -> Option<rcgen::SanType> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(rcgen::SanType::IpAddress(ip));
+    }
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if !valid {
+        return None;
+    }
+    Some(rcgen::SanType::DnsName(host.try_into().ok()?))
 }
 
 impl Default for Ca {

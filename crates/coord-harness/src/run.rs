@@ -38,6 +38,11 @@ impl Daemon {
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// Wait for it to exit, and say how it did.
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
 }
 
 impl Drop for Daemon {
@@ -140,22 +145,61 @@ impl From<std::io::Error> for RunError {
 /// an unmounted volume into a fresh, empty, valid voter.
 pub fn initialize(coordd: &Path, provisioned: &Provisioned) -> Result<(), RunError> {
     for node in &provisioned.voters {
-        if node.directory.join("state").is_dir() {
-            continue;
-        }
-        let output = Command::new(coordd)
-            .arg("--config")
-            .arg(&node.config)
-            .arg("init")
-            .output()?;
-        if !output.status.success() {
-            return Err(RunError::Init {
-                node: node.node.clone(),
-                output: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
+        initialize_node(coordd, &node.node, &node.config, &node.directory)?;
     }
     Ok(())
+}
+
+/// Create one node's first store generation, once.
+pub fn initialize_node(
+    coordd: &Path,
+    node: &str,
+    config: &Path,
+    directory: &Path,
+) -> Result<(), RunError> {
+    if directory.join("state").is_dir() {
+        return Ok(());
+    }
+    let output = coordd_in(coordd, config, directory)?.arg("init").output()?;
+    if !output.status.success() {
+        return Err(RunError::Init {
+            node: node.to_owned(),
+            output: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// `coordd --config <config>`, run where that configuration expects to
+/// be run.
+///
+/// A bundle provisioned for another host names its files relative to
+/// its own directory, and `coordd` opens a relative path against its
+/// working directory -- not against the configuration file -- so a
+/// bundle is run from inside itself, with the binary and the
+/// configuration named absolutely so that moving there does not lose
+/// them. A single-host configuration is run from wherever this process
+/// is, as it always was: its paths are whatever the run directory was
+/// given as, and a relative run directory is relative to here.
+fn coordd_in(coordd: &Path, config: &Path, directory: &Path) -> std::io::Result<Command> {
+    let bundle = std::fs::read_to_string(config)?.contains(crate::domain::BUNDLE_NOTE);
+    let mut command;
+    if bundle {
+        // A bare name is looked up on the search path, which moving does
+        // not change; anything with a separator is a path from here.
+        let program = if coordd.components().count() > 1 {
+            std::path::absolute(coordd)?
+        } else {
+            coordd.to_path_buf()
+        };
+        command = Command::new(program);
+        command.current_dir(directory);
+        command.arg("--config").arg(std::path::absolute(config)?);
+    } else {
+        command = Command::new(coordd);
+        command.arg("--config").arg(config);
+    }
+    Ok(command)
 }
 
 /// Start every committed voter and wait until each is serving.
@@ -167,17 +211,33 @@ pub fn initialize(coordd: &Path, provisioned: &Provisioned) -> Result<(), RunErr
 pub fn start_all(coordd: &Path, provisioned: &Provisioned) -> Result<Vec<Daemon>, RunError> {
     let mut running = Vec::new();
     for node in &provisioned.voters {
-        running.push(start(coordd, &node.node, &node.config, &node.directory)?);
+        running.push(start_node(
+            coordd,
+            &node.node,
+            &node.config,
+            &node.directory,
+        )?);
     }
     Ok(running)
 }
 
-fn start(coordd: &Path, node: &str, config: &Path, directory: &Path) -> Result<Daemon, RunError> {
+/// Start one node from its own directory and wait until it serves.
+///
+/// Its output is appended to `coordd.log` in that directory rather than
+/// replacing it: a voter restarted after it was killed is exactly the
+/// run whose earlier output someone will want to read.
+pub fn start_node(
+    coordd: &Path,
+    node: &str,
+    config: &Path,
+    directory: &Path,
+) -> Result<Daemon, RunError> {
     let log = directory.join("coordd.log");
-    let mut sink = std::fs::File::create(&log)?;
-    let mut child = Command::new(coordd)
-        .arg("--config")
-        .arg(config)
+    let mut sink = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)?;
+    let mut child = coordd_in(coordd, config, directory)?
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
