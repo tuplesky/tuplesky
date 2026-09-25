@@ -2874,7 +2874,21 @@ ceiling (10 s), and never stops. Every wait is jittered per voter and
 per attempt, so the survivors of one event do not dial in step. A
 failed dial to a voter whose link is held schedules nothing, because in
 a full mesh one of each pair's two connections is closed when they meet
-and the loser's error is not an unreachable voter.
+and the loser's error is not an unreachable voter. In practice the rule
+that decides is "held at the next look wins": the accepting end writes
+`HelloAck` before it registers the connection, so a collision loser's
+dial usually returns `Ok`. It schedules a floor dial, which the next
+pass cancels when it sees the link held.
+
+On the peer plane "held" means both lanes, control and bulk. Payload
+catch-up travels on the bulk lane, so a voter whose bulk lane alone
+closed, or whose bulk dial failed after its control dial succeeded, is
+dialled again for that lane. A dial counts as reaching the voter only
+if every lane it dialled did. An ended dial is taken at the top of every
+pass, not only by the loop's select, because that arm is polled after
+the voter's own work and both planes' sockets. On a busy domain it might
+never be reached, and a dial whose end is never taken leaves its voter
+in flight and never dialled again.
 
 The loop drives it through the `Deadline` mechanism it already had. It
 looks at which voters a connection is holding, starts the dials that are

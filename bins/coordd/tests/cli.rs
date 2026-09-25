@@ -984,7 +984,21 @@ fn reported(said: &str, prefix: &str) -> Vec<usize> {
 /// Whether a daemon's `prefix` count reached `full`, fell below it, and
 /// came back to it: a link lost and dialled again.
 fn healed(said: &str, prefix: &str, full: usize) -> bool {
-    let counts = reported(said, prefix);
+    came_back(&reported(said, prefix), full)
+}
+
+/// The bulk-lane counts a daemon reported on its `peers connected=`
+/// lines, in order.
+fn reported_bulk(said: &str) -> Vec<usize> {
+    said.lines()
+        .filter(|line| line.starts_with("peers connected="))
+        .filter_map(|line| line.split(' ').find_map(|w| w.strip_prefix("bulk=")))
+        .filter_map(|n| n.parse().ok())
+        .collect()
+}
+
+/// Whether `counts` reached `full`, fell below it, and came back to it.
+fn came_back(counts: &[usize], full: usize) -> bool {
     let Some(up) = counts.iter().position(|n| *n == full) else {
         return false;
     };
@@ -4910,9 +4924,14 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
 /// default and shortened here to three seconds. Dialled only when the
 /// serving loop started, a mesh had no way back from that but restarting
 /// its nodes: half a day after start the domain went quiet. Each voter
-/// here loses every link it holds, on the peer plane and on the api
-/// plane it submits over, and holds them all again -- and a request
-/// asked after the caps have run is established by all three.
+/// here loses every link it holds, on the peer plane -- both of its lanes,
+/// control and bulk -- and on the api plane it submits over, and holds
+/// them all again, and a request asked after the caps have run is
+/// established by all three.
+///
+/// Debug builds only: the cap is set through a knob a release build does
+/// not compile.
+#[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread")]
 async fn links_the_age_cap_ends_are_dialled_again_on_both_planes() {
     let dir = workspace("age-cap");
@@ -4928,6 +4947,7 @@ async fn links_the_age_cap_ends_are_dialled_again_on_both_planes() {
     for (n, node) in running.iter().enumerate() {
         assert!(
             node.waits_until(40, |said| healed(said, "peers connected=", 2)
+                && came_back(&reported_bulk(said), 2)
                 && healed(said, "voters submittable=", 2)),
             "voter {} did not get its links back after the age cap ended them:\n{}",
             n + 1,

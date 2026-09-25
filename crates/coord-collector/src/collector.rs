@@ -769,6 +769,14 @@ impl Collector {
     /// Nothing is owed that was not before, and a destination stalled for
     /// a reason repeating cannot change stays stalled. Returns how many
     /// commands moved.
+    ///
+    /// It cannot tell an entry waiting out its backoff from one
+    /// [`Collector::due_offers`] marked in flight, since both are `Missed`
+    /// with a later `next`, so it must not be called between those two:
+    /// between choosing an offer and reporting how it went
+    /// ([`Collector::offered`]). The serving loop makes and reports its
+    /// offers in one synchronous step, before it looks at its links, so
+    /// nothing is in flight when it calls this.
     pub fn reachable_again(&mut self, replica: &ReplicaId, now: MonotonicMillis) -> usize {
         let mut moved = 0;
         for entry in self.pending.values_mut() {

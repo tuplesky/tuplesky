@@ -464,6 +464,12 @@ impl PeerPlane {
         self.holds_lane(peer, coord_transport::Lane::Control)
     }
 
+    /// Whether connections are holding both of this peer's lanes, which
+    /// is what the re-dial schedule keeps up.
+    fn holds_both(&self, peer: &crate::peers::Peer) -> bool {
+        self.holds(peer) && self.holds_lane(peer, coord_transport::Lane::Bulk)
+    }
+
     /// Whether a connection is holding one of this peer's lanes.
     fn holds_lane(&self, peer: &crate::peers::Peer, lane: coord_transport::Lane) -> bool {
         self.transport.linked(peer.replica, peer.incarnation, lane)
@@ -1293,10 +1299,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// pass rather than at the backed-off time it had reached. Cheap when
     /// nothing is due: a look at a handful of links.
     fn redial(&mut self, api: &Transport) {
+        // Dials that have ended are taken here, on every pass, and not
+        // only by the loop's select: that arm is polled after the voter's
+        // own work and after both planes' sockets, so on a busy domain it
+        // may never be reached, and a dial whose end is never taken
+        // leaves its voter in flight -- never dialled again.
+        while let Some(done) = self.dials.try_join_next_with_id() {
+            self.dialled(done);
+        }
         let now = std::time::Instant::now();
         if let Some(plane) = &mut self.plane {
             for i in 0..plane.peers.len() {
-                let held = plane.holds(&plane.peers[i]);
+                // Both lanes: a voter whose bulk lane alone went is not
+                // held, or it would never be dialled again and payload
+                // transfer to it would stay down.
+                let held = plane.holds_both(&plane.peers[i]);
                 plane.redial.observe(i, held, now);
             }
             for i in plane.redial.due(now) {
@@ -1327,11 +1344,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             lane,
                         )
                         .await;
-                        if let Err(e) = result
-                            && lane == coord_transport::Lane::Control
-                        {
+                        if let Err(e) = result {
                             outcome.reached = false;
-                            outcome.error = Some(format!("{e:?}"));
+                            outcome
+                                .error
+                                .get_or_insert_with(|| format!("{lane:?}: {e:?}"));
                         }
                     }
                     outcome
@@ -1402,7 +1419,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 if reached {
                     p.dialled.1 += 1;
                 }
-                let held = p.peers.get(index).is_some_and(|peer| p.holds(peer));
+                let held = p.peers.get(index).is_some_and(|peer| p.holds_both(peer));
                 (p.peers.get(index).map(|peer| peer.replica), held)
             }
             Plane::Collector => {
