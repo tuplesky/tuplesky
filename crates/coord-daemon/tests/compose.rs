@@ -829,6 +829,24 @@ fn a_renewal_issuer_is_https_or_an_allowed_loopback_address() {
         ("https://user:secret@issuer.example", false, false),
         ("https://issuer.example/?next=x", false, false),
         ("ftp://issuer.example", true, false),
+        // A host and port the HTTP client would refuse, for either scheme.
+        ("https://issuer.example:not-a-port", false, false),
+        ("https://issuer.example:", false, false),
+        ("https://issuer.example:0", false, false),
+        ("https://issuer.example:65536", false, false),
+        ("https://issuer.example:8443:1", false, false),
+        ("https://:8443", false, false),
+        ("https://[::1", false, false),
+        ("https://[not-v6]:8443", false, false),
+        ("https://[::1]x", false, false),
+        ("https://issuer_example", false, false),
+        ("https://-issuer.example", false, false),
+        ("https://999.0.0.1", false, false),
+        ("http://127.0.0.1:x", true, false),
+        ("https://[2001:db8::1]:8443", false, true),
+        ("https://192.0.2.1", false, true),
+        ("https://issuer.example.:8443/base/", false, true),
+        ("http://LOCALHOST:9000", true, true),
     ] {
         let parsed = Config::parse(&renewal(&format!(
             "issuer = \"{url}\"\nassertion = \"/t\"\nlifetime_secs = 60\nallow_insecure_loopback = {allow}"

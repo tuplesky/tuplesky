@@ -260,7 +260,7 @@ pub fn inspect(
         role: identity.role,
         credential,
         leaf,
-        renewal: policy.decide(&leaf, now, seed),
+        renewal: crate::renewal::bounded(*policy, &leaf).decide(&leaf, now, seed),
     })
 }
 

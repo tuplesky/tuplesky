@@ -3120,7 +3120,7 @@ binder admits as `Renewal`. A caller bound before the renewal keeps
 being served after the old leaf's end: its connection's deadline is its
 own credential's, not this node's.
 
-### Four decisions the plan entry did not make
+### Five decisions the plan entry did not make
 
 - **The lifetime asked for is configured, not copied.** The issuer
   back-dates `notBefore` by its clock uncertainty, so a lifetime read off
@@ -3141,7 +3141,10 @@ own credential's, not this node's.
   host. That is for an issuer on the same host and for the tests, which
   serve `coord_node_issuer::router` in-process. A URL with userinfo, a
   query or a fragment is refused, so no report can carry a credential by
-  naming the issuer. `issuer_roots` pins the issuer's TLS roots.
+  naming the issuer. The host and port are checked for either scheme,
+  and the enroller parses the URL at startup as its client will, so a
+  URL the client would refuse fails the start and `--check` rather than
+  the first due attempt. `issuer_roots` pins the issuer's TLS roots.
 - **Only a node that renews stops at expiry.** A node configured with
   `[renewal]` ends its serving loop at `Expired` and exits with status 2,
   reporting `phase=quarantined reason=credential-expired`
@@ -3149,7 +3152,40 @@ own credential's, not this node's.
   before, and its startup report says `renewal not-configured` next to
   the leaf's `expires_at`. Stopping those too is right and is a behaviour
   change for every existing deployment, so it is left to be made
-  deliberately.
+  deliberately. The deadline is raced against the whole serving loop,
+  not only checked at the top of each pass: a pass can wait inside
+  itself on a slow caller, and nothing in it looks at the time while it
+  does. When the deadline wins, the loop is dropped wherever it was
+  waiting, as a crash would drop it.
+- **The spread fits the leaf.** `jitter_secs` (default an hour) is a
+  spread over a fleet, and a leaf lasts whatever the issuer granted. On
+  an hour-long leaf, due at forty minutes, an unbounded hour of jitter
+  put most nodes' due point past the end, clamped to a second before it:
+  one attempt, then the node stopped. The jitter is bounded to half the
+  window between the due point and the leaf's end, which keeps the
+  spread and leaves the other half for retries. `coordd inspect` reports
+  the same bounded due point.
+
+What the enroller checks before the first due point, when it is built at
+startup and under `--check`: that the node certificate file holds
+certificates only, since a renewal rewrites it with the chain alone and a
+key kept in the same file would be written away (the process serving on
+from memory, the next start refused, and for a voter no way back but a
+committed replacement); that the file is not read-only; and that a file
+can be created beside it. An install failure names the path. A renewed
+leaf must also keep every extended key usage the current one carries. The
+chain check verifies a leaf as a client certificate, so a clientAuth-only
+renewal would pass it and then fail every handshake the node serves.
+
+Two edges of the swap. An answer that lands at or past the leaf's end is
+not put into service, because the deadline does not move. The leaf is on
+disk, so a restart comes back on it. If the peer plane refuses a renewed
+leaf that the api plane took, the api plane goes back to the current one
+and the attempt fails like any other, so the two planes never present
+different leaves. The enroller classifies a voter's renewed key against a
+copy of the committed membership taken at startup. task-m03, which
+installs a new membership into the running daemon, has to reach that copy
+as well.
 
 X.509 counts the `notAfter` second as valid, and `RenewalPolicy` counts
 it as expired. The node stops at the start of that second. A peer that

@@ -595,6 +595,9 @@ pub struct Renewing {
     attempt: tokio::task::JoinSet<Result<crate::enroll::Credential, crate::enroll::Failure>>,
     /// The leaf reached its deadline and the loop ended on it.
     expired: bool,
+    /// The `notAfter` of the leaf being served on, in unix milliseconds,
+    /// for [`leaf_expired`] to wait on outside the loop.
+    deadline: tokio::sync::watch::Sender<u64>,
 }
 
 /// What renewal has done so far, for the report a stopping node makes.
@@ -620,13 +623,33 @@ impl Renewing {
         policy: coord_node_issuer::RenewalPolicy,
     ) -> Self {
         let seed = crate::renewal::seed(&current.identity.node);
+        let (deadline, _) =
+            tokio::sync::watch::channel(current.leaf.expires_at.saturating_mul(1000));
         Renewing {
             schedule: crate::renewal::Schedule::new(policy, current.leaf, seed),
             enroller: std::sync::Arc::new(enroller),
             current: std::sync::Arc::new(current),
             attempt: tokio::task::JoinSet::new(),
             expired: false,
+            deadline,
         }
+    }
+
+    /// Stop serving on the leaf: it has reached its `notAfter`. The
+    /// attempt in flight, if any, is aborted and never looked at again.
+    fn expire(&mut self) {
+        if self.expired {
+            return;
+        }
+        self.expired = true;
+        self.attempt.abort_all();
+        eprintln!(
+            "renewal expired expires_at={} attempts={} failed={}: this node's leaf \
+             is no longer valid and it stops serving on it; restart it on a renewed leaf",
+            self.schedule.leaf().expires_at,
+            self.schedule.attempts,
+            self.schedule.failures,
+        );
     }
 
     /// The leaf's validity, its due point and the policy's answer now, for
@@ -659,6 +682,39 @@ fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Resolves once the wall clock reaches the deadline `deadline` holds,
+/// following it as a renewal moves it; never, once nothing can move it
+/// and it has not been reached.
+///
+/// This is what bounds serving on a leaf, and it runs beside the serving
+/// loop rather than inside it (see `main`). The loop checks the leaf at
+/// the top of every pass, but a pass can wait inside itself -- a slow
+/// watch holding `Responder::admit`, a response that cannot be written
+/// -- and while it waits nothing in it looks at the time. Raced against
+/// the whole loop, the deadline ends it wherever it is waiting.
+pub async fn leaf_expired(mut deadline: tokio::sync::watch::Receiver<u64>) {
+    loop {
+        let at = *deadline.borrow_and_update();
+        let now = unix_millis();
+        if now >= at {
+            return;
+        }
+        let sleep = tokio::time::sleep(std::time::Duration::from_millis(at - now));
+        tokio::select! {
+            () = sleep => {}
+            changed = deadline.changed() => {
+                if changed.is_err() {
+                    // Nothing can move it any more: wait it out.
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        at.saturating_sub(unix_millis()),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
 }
 
 /// The renewal attempt out, or nothing for ever when there is none -- a
@@ -1566,6 +1622,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.renewal.as_ref().map(Renewing::report)
     }
 
+    /// The deadline of the leaf this node serves on, where renewal is
+    /// configured, for [`leaf_expired`] to race against [`Domain::run`].
+    pub fn leaf_deadline(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.renewal.as_ref().map(|r| r.deadline.subscribe())
+    }
+
+    /// The leaf reached its deadline while [`Domain::run`] was waiting
+    /// inside a pass, and the run was dropped there.
+    pub fn leaf_expired_while_serving(&mut self) {
+        if let Some(r) = self.renewal.as_mut() {
+            r.expire();
+        }
+    }
+
     /// Act on the leaf's schedule: start the enrollment that is due, or
     /// end serving on a leaf that has expired.
     ///
@@ -1584,15 +1654,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         }
         match r.schedule.step(unix_millis()) {
             crate::renewal::Step::Expired => {
-                r.expired = true;
-                r.attempt.abort_all();
-                eprintln!(
-                    "renewal expired expires_at={} attempts={} failed={}: this node's leaf \
-                     is no longer valid and it stops serving on it; restart it on a renewed leaf",
-                    r.schedule.leaf().expires_at,
-                    r.schedule.attempts,
-                    r.schedule.failures,
-                );
+                r.expire();
                 true
             }
             crate::renewal::Step::Enroll => {
@@ -1629,19 +1691,42 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         if r.expired {
             return;
         }
+        // An answer that lands at or past the leaf's end changes nothing:
+        // the deadline is the leaf's and an answer cannot move it. The
+        // renewed leaf is already on disk, so a restart comes back on it.
+        if now >= r.schedule.leaf().expires_at.saturating_mul(1000) {
+            r.expire();
+            return;
+        }
         let failure = match done {
             Ok(Ok(renewed)) => {
                 let chain = renewed.chain.clone();
-                let presented = api
-                    .set_identity(chain.clone(), renewed.key.clone_key())
-                    .and_then(|()| match &self.plane {
-                        Some(plane) => plane.transport.set_identity(chain, renewed.key.clone_key()),
-                        None => Ok(()),
-                    });
+                let presented = api.set_identity(chain.clone(), renewed.key.clone_key());
+                // Both planes present one leaf. If the peer plane refuses the
+                // renewed one, the api plane goes back to the current one,
+                // and the attempt fails like any other.
+                let presented = presented.and_then(|()| match &self.plane {
+                    Some(plane) => plane
+                        .transport
+                        .set_identity(chain, renewed.key.clone_key())
+                        .inspect_err(|_| {
+                            if let Err(e) =
+                                api.set_identity(r.current.chain.clone(), r.current.key.clone_key())
+                            {
+                                eprintln!(
+                                    "renewal: the api plane could not go back to the current \
+                                     leaf after the peer plane refused the renewed one: {e:?}"
+                                );
+                            }
+                        }),
+                    None => Ok(()),
+                });
                 match presented {
                     Ok(()) => {
                         let previous = r.schedule.leaf();
                         r.schedule.renewed(renewed.leaf);
+                        r.deadline
+                            .send_replace(renewed.leaf.expires_at.saturating_mul(1000));
                         r.current = std::sync::Arc::new(renewed);
                         eprintln!(
                             "renewal renewed expires_at={} previous={} due_at={} attempts={}",
@@ -3886,5 +3971,40 @@ mod tests {
             reading(false, "frontend-observer", Stage::Admission),
             Measure::Observed(_)
         ));
+    }
+
+    /// The leaf's deadline ends serving wherever the loop is waiting, and
+    /// follows a renewal that moves it.
+    #[tokio::test]
+    async fn the_leaf_deadline_ends_a_pass_that_is_waiting_and_follows_a_renewal() {
+        let now = super::unix_millis();
+        let (deadline, receiver) = tokio::sync::watch::channel(now + 150);
+        // A pass that never finishes on its own: expiry still wins.
+        let started = std::time::Instant::now();
+        let expired = tokio::select! {
+            () = std::future::pending::<()>() => false,
+            () = super::leaf_expired(receiver.clone()) => true,
+        };
+        assert!(expired);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(140));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // Renewed before the old deadline: the old one passes unnoticed,
+        // the new one ends it.
+        let now = super::unix_millis();
+        deadline.send_replace(now + 150);
+        let waiting = tokio::spawn(super::leaf_expired(receiver));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        deadline.send_replace(now + 600);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !waiting.is_finished(),
+            "ended at the deadline a renewal moved"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("ends at the moved deadline")
+            .expect("no panic");
+        assert!(super::unix_millis() >= now + 600);
     }
 }

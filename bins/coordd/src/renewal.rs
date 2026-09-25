@@ -122,12 +122,12 @@ impl Schedule {
 
     /// When the leaf turns due (unix seconds), for a report.
     pub const fn due_at(&self) -> u64 {
-        self.policy.due_at(&self.leaf, self.seed)
+        bounded(self.policy, &self.leaf).due_at(&self.leaf, self.seed)
     }
 
     /// The policy's answer for the leaf at `now_ms`, for a report.
     pub const fn decide(&self, now_ms: u64) -> Renewal {
-        self.policy.decide(&self.leaf, now_ms / 1000, self.seed)
+        bounded(self.policy, &self.leaf).decide(&self.leaf, now_ms / 1000, self.seed)
     }
 
     /// The leaf's `notAfter` in milliseconds.
@@ -217,6 +217,35 @@ pub fn seed(node: &coord_types::ids::ReplicaId) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&node.0[..8]);
     u64::from_be_bytes(bytes)
+}
+
+/// `policy` for `leaf`, with its jitter kept inside the first half of
+/// the window between the leaf's due point and its `notAfter`.
+///
+/// The jitter is a spread over a fleet, in seconds, and a leaf's
+/// lifetime is whatever the issuer granted. Unbounded, an hour of
+/// jitter on an hour-long leaf -- due at forty minutes -- pushes most
+/// nodes' due point past the expiry, where the policy clamps it to a
+/// second before it: one attempt, shorter than a request's own timeout,
+/// and then the node stops. Half the remaining window keeps the spread
+/// and leaves the other half for retries.
+pub const fn bounded(policy: RenewalPolicy, leaf: &Leaf) -> RenewalPolicy {
+    let lifetime = leaf.lifetime();
+    let den = if policy.renew_at_den == 0 {
+        1
+    } else {
+        policy.renew_at_den
+    };
+    let spent = lifetime / den * policy.renew_at_num;
+    let room = lifetime.saturating_sub(spent) / 2;
+    RenewalPolicy {
+        jitter_secs: if policy.jitter_secs < room {
+            policy.jitter_secs
+        } else {
+            room
+        },
+        ..policy
+    }
 }
 
 /// The renewal policy a configuration asks for: the default arithmetic,
@@ -398,5 +427,31 @@ mod tests {
             assert!(wait < C * 5 / 4 + Duration::from_millis(1), "{wait:?}");
             now = until_ms;
         }
+    }
+
+    #[test]
+    fn the_default_jitter_leaves_a_short_leaf_half_its_window_for_retries() {
+        // An hour-long leaf is due at forty minutes. The default hour of
+        // jitter would put most nodes past its end, at a second before it.
+        let leaf = Leaf {
+            issued_at: 1_000,
+            expires_at: 1_000 + 3_600,
+        };
+        let mut latest = 0;
+        for seed in 0..10_000u64 {
+            let s = Schedule::new(RenewalPolicy::default(), leaf, seed.wrapping_mul(0x9e37));
+            let due = s.due_at();
+            assert!(due >= 1_000 + 2_400, "seed {seed}: due at {due}");
+            assert!(due < 1_000 + 3_000, "seed {seed}: due at {due}");
+            latest = latest.max(due);
+        }
+        // Still a spread, not a single point.
+        assert!(latest > 1_000 + 2_400 + 300, "{latest}");
+        // And a long leaf keeps the whole configured hour.
+        let long = Leaf {
+            issued_at: 0,
+            expires_at: 90 * 86_400,
+        };
+        assert_eq!(bounded(RenewalPolicy::default(), &long).jitter_secs, 3_600);
     }
 }
