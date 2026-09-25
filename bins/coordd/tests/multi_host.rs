@@ -155,6 +155,12 @@ fn put(provisioned: &Provisioned, key: &[u8]) -> coord_types::logical_v1::Logica
 /// voter 3's own frontend, so it is the returned voter that serves it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_voter() {
+    // 127.0.0.2 and up are loopback on Linux and not assigned by default
+    // elsewhere (macOS): there is nothing to place a voter at.
+    if HOSTS.iter().any(|h| UdpSocket::bind((*h, 0)).is_err()) {
+        eprintln!("skipped: {HOSTS:?} are not all assigned on this machine");
+        return;
+    }
     let dir = workspace("placed");
     let api = free_everywhere(&[]);
     let peer = free_everywhere(&[api]);

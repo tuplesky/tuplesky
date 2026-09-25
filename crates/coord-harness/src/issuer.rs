@@ -342,7 +342,9 @@ impl Endpoint {
 /// has to name it: editing the description to point the endpoint
 /// somewhere else does not produce a certificate for somewhere else, so
 /// a loopback-provisioned domain cannot be talked into listening on the
-/// network after the fact.
+/// network after the fact. The issuer's own name is never such a host:
+/// every issuer certificate carries it, loopback ones included, so a
+/// URL naming it would pass the certificate check for any domain.
 fn permitted(
     address: SocketAddr,
     url: &str,
@@ -362,6 +364,9 @@ fn permitted(
         .unwrap_or(host);
     let port: u16 = port.parse().map_err(|_| refused())?;
     let named_ip = host.parse::<IpAddr>().ok();
+    if host.eq_ignore_ascii_case(crate::domain::ISSUER_NAME) {
+        return Err(refused());
+    }
     if named_ip.is_some_and(|ip| ip.is_loopback()) || port != address.port() {
         return Err(refused());
     }

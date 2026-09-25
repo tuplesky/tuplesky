@@ -524,10 +524,19 @@ fn a_host_list_that_does_not_place_every_voter_once_is_refused() {
         ("n1=10.0.0.1:1", "a missing port"),
         ("n1=bad_host!:1:2", "a host no certificate can name"),
         ("x1=10.0.0.1:1:2", "a voter name"),
+        ("n1=fd00::1:7101:7102", "an IPv6 host without brackets"),
         ("", "nothing"),
     ] {
         assert!(parse_hosts(spec).is_err(), "{why} was accepted: {spec}");
     }
+    assert!(Address::parse("fd00::1:7443").is_err(), "unbracketed IPv6");
+    assert_eq!(
+        Address::parse("[fd00::1]:7443").expect("bracketed"),
+        Address {
+            host: "fd00::1".into(),
+            port: 7443
+        }
+    );
 
     // Two voters may share a port on different hosts, which is what a
     // deployment does, and an IPv6 host is written in brackets.
@@ -619,6 +628,26 @@ fn the_issuer_leaves_loopback_only_for_the_host_it_was_provisioned_for() {
     value["issuer"]["url"] = serde_json::json!(format!("https://192.0.2.10:{port}"));
     std::fs::write(&description, serde_json::to_vec(&value).expect("json")).expect("write");
     assert!(refused(dir.path(), &format!("0.0.0.0:{port}")));
+    // Nor does pointing it at the issuer's own name, which the loopback
+    // certificate does carry, as every issuer certificate does.
+    value["issuer"]["url"] = serde_json::json!(format!(
+        "https://{}:{port}",
+        coord_harness::domain::ISSUER_NAME.to_ascii_uppercase()
+    ));
+    std::fs::write(&description, serde_json::to_vec(&value).expect("json")).expect("write");
+    assert!(refused(dir.path(), &format!("0.0.0.0:{port}")));
+
+    // And that name is refused as a place to provision the endpoint at.
+    let dir = tempfile::tempdir().expect("a run directory");
+    let error = provision(&Plan {
+        issuer_listen: Some(Address {
+            host: coord_harness::domain::ISSUER_NAME.into(),
+            port: free(),
+        }),
+        ..Plan::loopback(dir.path().to_path_buf(), 1, 0)
+    })
+    .expect_err("the issuer's own name is not a host");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {

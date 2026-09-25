@@ -3004,9 +3004,10 @@ address it dialled (`peers::server_name`), and the harness issued every
 node certificate for `127.0.0.1` only. Placing a node at `127.0.0.3`
 with an unchanged certificate gives three daemons that each start
 cleanly and never link: `peers connected=0 of 2` for ever, which reads
-as a firewall. That is the negative control of
-`multi_host.rs::a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_voter`:
-issued for loopback in a placed domain, no voter reaches the mesh. The
+as a firewall. That was checked by hand against
+`multi_host.rs::a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_voter`,
+with the placed nodes issued loopback-only certificates: no voter
+reached the mesh and the test failed. It is not a test of its own. The
 name is only reachability; the binder still decides which voter answered
 from the node-identity URI, so the extra SAN grants nothing.
 

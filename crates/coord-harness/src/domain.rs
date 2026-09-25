@@ -47,6 +47,11 @@ pub const EDGE_INTRUDER_NAME: &str = "not-the-apiserver.tuplesky.harness";
 /// The `iss` claim the domain's frontends require.
 pub const ISSUER: &str = "https://sts.tuplesky.harness";
 
+/// The name every credential endpoint certificate carries, whatever else
+/// it names. Because every one carries it, it says nothing about where an
+/// endpoint was provisioned to be reached, so it is never such a place.
+pub const ISSUER_NAME: &str = "sts.tuplesky.harness";
+
 /// The `aud`/`resource` the domain's frontends require, and the domain
 /// name in the configuration.
 pub const RESOURCE: &str = "tuplesky-harness";
@@ -248,7 +253,8 @@ impl Address {
         let port = port
             .parse()
             .map_err(|_| format!("`{port}` in `{text}` is not a port"))?;
-        let host = unbracket(host);
+        let host = bracketed(host)
+            .ok_or_else(|| format!("`{text}` names an IPv6 address without brackets"))?;
         if crate::pki::reach(host).is_none() {
             return Err(format!(
                 "`{host}` in `{text}` is neither an IP address nor a DNS name"
@@ -305,7 +311,8 @@ pub fn parse_hosts(spec: &str) -> Result<Vec<Host>, String> {
                 .filter(|p| *p > 0)
                 .ok_or_else(|| format!("`{text}` in `{entry}` is not a fixed port"))
         };
-        let host = unbracket(host);
+        let host = bracketed(host)
+            .ok_or_else(|| format!("`{entry}` names an IPv6 address without brackets"))?;
         if crate::pki::reach(host).is_none() {
             return Err(format!(
                 "`{host}` in `{entry}` is neither an IP address nor a DNS name"
@@ -350,10 +357,15 @@ pub fn parse_hosts(spec: &str) -> Result<Vec<Host>, String> {
     Ok(hosts)
 }
 
-fn unbracket(host: &str) -> &str {
-    host.strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
+/// The host part of an authority: an IPv6 literal without its brackets,
+/// or anything else as it is. `None` for an IPv6 literal written without
+/// them, whose last group would otherwise be read as the port.
+fn bracketed(host: &str) -> Option<&str> {
+    match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inside) => Some(inside),
+        None if host.contains([':', '[', ']']) => None,
+        None => Some(host),
+    }
 }
 
 /// `host:port`, with an IPv6 literal in brackets, as a catalog lists it
@@ -427,6 +439,14 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         voter_reach.push(reach(&host.host)?);
     }
     let edge_reach = plan.edge_host.as_deref().map(reach).transpose()?;
+    if let Some(at) = &plan.issuer_listen
+        && at.host.eq_ignore_ascii_case(ISSUER_NAME)
+    {
+        return Err(invalid(format!(
+            "`{ISSUER_NAME}` is the name every issuer certificate carries, not a host; \
+             --issuer-listen names the host the endpoint is reached at"
+        )));
+    }
     let issuer_reach = plan
         .issuer_listen
         .as_ref()
@@ -845,8 +865,8 @@ fn provision_issuer(
     let root = dir.join("issuer-ca.pem");
     std::fs::write(&root, ca.root_pem())?;
     let issued = match &at {
-        None => ca.issue_server("sts.tuplesky.harness"),
-        Some((_, reach)) => ca.issue_server_at("sts.tuplesky.harness", reach.clone()),
+        None => ca.issue_server(ISSUER_NAME),
+        Some((_, reach)) => ca.issue_server_at(ISSUER_NAME, reach.clone()),
     };
     let certificate = dir.join("issuer.pem");
     let key = dir.join("issuer.key");
