@@ -56,6 +56,29 @@ pub const ISSUER_NAME: &str = "sts.tuplesky.harness";
 /// name in the configuration.
 pub const RESOURCE: &str = "tuplesky-harness";
 
+/// The genesis admin's public key, beside the manifest it verifies. A
+/// node reads the manifest only through this key (task-43), so it is as
+/// much a part of the domain as the manifest is.
+pub const ADMIN_KEY: &str = "genesis-admin.pem";
+
+/// The genesis manifest at `manifest`, verified against the admin key
+/// beside it -- the same check a node makes before it uses anything in
+/// it.
+pub fn verified_genesis(
+    manifest: &Path,
+) -> std::io::Result<coord_membership::genesis::GenesisManifest> {
+    let pem = std::fs::read(manifest.with_file_name(ADMIN_KEY))?;
+    let admin = coord_membership::admin_key_from_pem(&pem)
+        .map_err(|e| std::io::Error::other(format!("genesis admin key: {e:?}")))?;
+    let token = std::fs::read_to_string(manifest)?;
+    coord_membership::verify_genesis(
+        &coord_membership::SignedGenesis(token.trim().to_owned()),
+        &admin,
+        coord_membership::PROTOCOL_VERSION,
+    )
+    .map_err(|e| std::io::Error::other(format!("genesis: {e:?}")))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -539,9 +562,12 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
             })
         })
         .collect();
-    write_json(
-        &manifest_path,
-        &serde_json::json!({
+    // Signed, because a node reads nothing else (task-43). The admin key
+    // is this provisioning's own and signs this one manifest: only its
+    // public half is written, beside the manifest, where every node's
+    // configuration names it.
+    let manifest: coord_membership::genesis::GenesisManifest =
+        serde_json::from_value(serde_json::json!({
             "cluster": hex(&cluster.0),
             "domain": hex(&domain.0),
             "epoch": 1,
@@ -550,8 +576,23 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
             "wif_rules": [{ "issuer": "harness" }],
             "admin": hex(&principal),
             "protocol_version": 1,
-        }),
-    )?;
+        }))
+        .map_err(std::io::Error::other)?;
+    let admin = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(std::io::Error::other)?;
+    let signed = coord_membership::sign_genesis_pem(
+        &manifest,
+        crate::pki::pem("PRIVATE KEY", &admin.serialize_der()).as_bytes(),
+    )
+    .map_err(|e| std::io::Error::other(format!("genesis: {e:?}")))?;
+    std::fs::write(&manifest_path, signed.0)?;
+    {
+        use rcgen::PublicKeyData;
+        std::fs::write(
+            dir.join(ADMIN_KEY),
+            crate::pki::pem("PUBLIC KEY", &admin.subject_public_key_info()),
+        )?;
+    }
 
     // Listeners. Both of a node's addresses go in one catalog entry:
     // which of them serves which plane is settled by dialling, because a
@@ -604,6 +645,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
             }
         } else {
             std::fs::copy(&manifest_path, directory.join("genesis.json"))?;
+            std::fs::copy(dir.join(ADMIN_KEY), directory.join(ADMIN_KEY))?;
             std::fs::copy(&catalog_path, directory.join("endpoints.bin"))?;
             Layout::Bundle
         };
@@ -809,6 +851,7 @@ fn node_config(
 {preamble}config_version = 2
 role = "voter-frontend-observer"
 cluster_manifest = "{manifest}"
+genesis_admin_key = "{admin_key}"
 cluster_endpoints = "{endpoints}"
 domain = "{resource}"
 state_directory = "{state}"
@@ -848,6 +891,7 @@ namespace = "{namespace}"
 "#,
         preamble = layout.preamble(),
         manifest = layout.shared("genesis.json"),
+        admin_key = layout.shared(ADMIN_KEY),
         endpoints = layout.shared("endpoints.bin"),
         state = layout.state_directory(),
         roots = layout.own("roots.pem"),

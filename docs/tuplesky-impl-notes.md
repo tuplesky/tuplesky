@@ -1370,7 +1370,9 @@ checkpoint directory stops only after both writes.
 A gap the pin does not cover: nothing in `coordd` verifies the
 manifest's signature (`verify_genesis` has no caller), so `init` pins
 whatever file it is handed. With a strict pin that is a bootstrap-time
-gap only, and it is recorded in the task-58 plan entry.
+gap only, and it is recorded in the task-58 plan entry. The task-43
+follow-up at the top of the stack closes it; see "A pinned genesis
+nobody had signed" below.
 
 ## A restore is the one operation that is allowed to lose things
 
@@ -3760,3 +3762,42 @@ The tests are
 `a_request_above_the_configured_bound_is_refused_and_one_below_is_served`,
 which sets the bound to 1 KiB in a real daemon and asks through the SDK
 as well. With the check removed, the first and the last fail.
+
+## A pinned genesis nobody had signed
+
+task-43, from the v1.5 review, as a follow-up branch at the top of the
+stack rather than on the task-43 branch itself: every branch after
+task-43 writes genesis and configuration fixtures of its own, and the
+change is one to all of them at once. `coordd` read the genesis manifest as
+plain JSON, and `verify_genesis` had no caller. So `init` pinned
+whatever file it was handed. Task-42's "signed/pinned genesis" held for
+the pin and not for the signature. The pin made the manifest immutable
+after `init`, but the manifest `init` pinned was an unauthenticated
+per-node file.
+
+The manifest file is now the token the admin signed. The configuration
+names the admin's public key in `genesis_admin_key`, a PEM P-256
+`PUBLIC KEY`, which is required and may not be empty. The only reader
+is `membership::read_manifest`: it verifies the token against that key
+before anything in it is used. `init` runs it before placement, so a
+manifest that does not verify pins nothing and leaves no store. Every
+start runs it before the pinned digest is compared. A file with the
+same content as plain JSON, or signed by another key, is refused as a
+genesis quarantine.
+
+`coord-membership` gained three pieces: `admin_key_from_pem`, which
+accepts only id-ecPublicKey on prime256v1 and refuses anything else as a
+key rather than failing every signature later; `sign_genesis_pem` for
+provisioning tools that hold a PKCS#8 key; and `PROTOCOL_VERSION`.
+
+The tests:
+
+- `a_manifest_the_admin_did_not_sign_is_refused_at_init_and_at_start`
+  covers four cases. `init` refuses the fixture as plain JSON and as
+  signed by a stranger, and leaves nothing behind. The signed fixture
+  initializes and starts. The same manifest unsigned is then refused at
+  the next start. With coordd falling back to plain JSON, it fails.
+- The pin test now swaps a voter in a manifest the same admin signed,
+  so what refuses it is the pin and not the signature.
+- A `coord-membership` test covers the PEM round trip, a wrong key, and
+  a key on another curve.
