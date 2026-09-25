@@ -583,6 +583,7 @@ fn main() -> ExitCode {
         let policy = renewal::policy(config.renewal.as_ref());
         return match membership::inspect(
             &config.cluster_manifest,
+            &config.genesis_admin_key,
             &config.identity.node_certificate,
             now_seconds(),
             &policy,
@@ -680,6 +681,7 @@ fn main() -> ExitCode {
     // be told who it was could be told it was somebody else.
     let placed = match membership::place(
         &config.cluster_manifest,
+        &config.genesis_admin_key,
         &config.identity.node_certificate,
         roles.votes(),
     ) {

@@ -80,7 +80,9 @@ What `--hosts` changes, and nothing else does:
   certificate against it; without the host in the certificate every
   handshake fails.
 * **Each `nN/` directory is a self-contained bundle.** It holds its own copy
-  of `genesis.json` and `endpoints.bin` beside its credentials, and its
+  of `genesis.json` (the manifest as the admin signed it), the admin's public
+  key `genesis-admin.pem` a node verifies it against at `init` and at every
+  start, and `endpoints.bin` beside its credentials, and its
   `coordd.toml` names every file relative to the bundle, with
   `state_directory = "."`. `coordd` opens a relative path against its
   *working directory*, not against the configuration file -- this task did

@@ -132,11 +132,8 @@ impl Caller {
         let key = rustls_pki_types::PrivateKeyDer::Pkcs8(issued.key.serialize_der().into());
         let roots = load_roots(&provisioned.trust_bundle)?;
 
-        let manifest_bytes = std::fs::read(&provisioned.manifest)
+        let manifest = coord_harness::domain::verified_genesis(&provisioned.manifest)
             .map_err(|e| CallerError::Material(format!("genesis: {e}")))?;
-        let manifest: coord_membership::genesis::GenesisManifest =
-            serde_json::from_slice(&manifest_bytes)
-                .map_err(|e| CallerError::Material(format!("genesis: {e}")))?;
         let membership = coord_membership::membership::Membership::from_genesis(&manifest)
             .map_err(|e| CallerError::Material(format!("membership: {e:?}")))?;
 

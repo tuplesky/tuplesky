@@ -1854,6 +1854,7 @@ Use strict typed TOML with unknown-field rejection; local capability must cover 
 config_version = 2
 role = "voter-frontend-observer"
 cluster_manifest = "/etc/coord/genesis.json"
+genesis_admin_key = "/etc/coord/genesis-admin.pem"
 domain = "control-plane-a"
 state_directory = "/var/lib/coord/control-plane-a"
 

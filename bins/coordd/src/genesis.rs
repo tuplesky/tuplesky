@@ -32,10 +32,11 @@
 //! reconfiguration path, and until then an edited manifest is a genesis
 //! quarantine like any other.
 //!
-//! What the pin does not do is authenticate the manifest: `coordd` reads
-//! it as JSON and nothing here verifies its signature. The pin makes the
-//! manifest immutable after `init`; the manifest `init` pins is whatever
-//! file it was handed. That gap is recorded in the task-58 plan entry.
+//! The pin does not authenticate the manifest; the signature does. The
+//! manifest reaches this module only through `membership::read_manifest`,
+//! which verifies it against the configured admin key first (task-43), so
+//! what `init` pins is a manifest the admin signed and what a start
+//! compares with the pin is one too.
 
 use coord_daemon::{NodeJournal, Startup, StartupError, StoreGenesis};
 use coord_membership::genesis::GenesisManifest;
