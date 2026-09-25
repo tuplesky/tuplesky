@@ -282,6 +282,18 @@ pub fn prepare(
     ))
 }
 
+/// The diagnostic of an apply the store refused because it is fenced at
+/// a newer promise than the ballot the batch is stamped with.
+pub const FENCED_APPLY: &str =
+    "an apply was refused: this voter's ballot is below its store's fence";
+
+/// Whether `error` is an apply the store refused as fenced (see
+/// [`submit`]). The fence is held in memory only, so a restart resumes at
+/// the promised ballot and heals it.
+pub fn is_fenced(error: &EngineError) -> bool {
+    error.diagnostic == FENCED_APPLY
+}
+
 /// Offer a prepared batch for durability.
 pub fn submit<P: Persistence>(
     store: &mut P,
@@ -295,6 +307,13 @@ pub fn submit<P: Persistence>(
         // command would take a position that is no longer its own, so
         // the plan is rebuilt rather than the batch retried.
         Err(Refused::StaleBase) => Ok(Submitted::Replan),
+        // Refused by the store's own fence: the voter's ballot fell back
+        // below a promise that did not become durable, and the fence did
+        // not. Not an engine fault, and said as what it is (`is_fenced`).
+        Err(Refused::Fenced) => Err(EngineError::new(
+            coord_store_api::engine::ErrorClass::Limit,
+            FENCED_APPLY.to_owned(),
+        )),
         Err(e) => Err(EngineError::new(
             coord_store_api::engine::ErrorClass::Limit,
             format!("submit refused: {e}"),
