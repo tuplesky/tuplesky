@@ -119,6 +119,27 @@ The Jepsen side is `jepsen.tuplesky`, in the `tuplesky/` directory of the
 It has not been run under Jepsen yet: the environment it was written in
 could not reach Clojars.
 
+### In a Docker cluster: the `jepsen` workflow
+
+`tuplesky/docker/` in that repository stands a Jepsen cluster up on one
+machine: Debian containers `n1`..`nN` with sshd on a Docker network, the
+machine itself as the control node, and an `/etc/hosts` block so the
+control node reaches the nodes by the names the certificates carry.
+`docker/smoke.sh` deploys a domain on it the way the test's DB does, over
+SSH, and fails unless every voter takes a write.
+
+`.github/workflows/jepsen.yml` runs that on a GitHub runner, by hand or
+weekly. It builds `coordd`, `coord-harness` and `coord-jepsen` in release
+mode, checks `tuplesky/jepsen` out at `jepsen-ref`, stands a five-node
+cluster up, smokes it, and runs one test (`workload`, `nemesis`,
+`time-limit` inputs; `--concurrency 2n`). The test's store directory is
+uploaded as an artifact, without the provisioned run directory, which
+holds the domain's fixture keys. The containers share the runner's clock,
+so the workflow does not offer the `clock` fault.
+
+Until `tuplesky/jepsen` merges the project, `jepsen-ref` defaults to its
+branch, `claude/tuplesky-jepsen-docker-tests`.
+
 ## Without Jepsen: `scripts/e2e/shim-stress.py`
 
 A smaller driver runs the shim against a local three-voter domain. It
@@ -142,11 +163,12 @@ and `history.json`.
 
 ## Findings
 
-These came from the stress driver, on this branch's base (the top of the
-task-43 follow-up stack, `b642bfb`), in debug builds on one machine. No
-history had an anomaly. Two liveness failures did occur, each after
-repeatedly killing and restarting one voter while the other two stayed
-up and linked.
+All of these are on this branch's base (the top of the task-43
+follow-up stack, `b642bfb`), in debug builds on one machine, inside a
+gVisor sandbox. No history had an anomaly. The first two sections came
+from the stress driver on one host: liveness failures after repeatedly
+killing and restarting one voter while the other two stayed up and
+linked. The third came from a deployment on containers.
 
 ### A restarted follower whose command table stays full
 
@@ -224,3 +246,26 @@ These are liveness failures. The histories around them were clean. But the
 second leaves a majority of live voters unable to serve, which is the
 fault tolerance the domain promises. They are reported here rather than
 fixed; `scripts/e2e/shim-stress.py --fault leader` is the reproduction.
+
+### In containers, a follower frontend that never completes a read
+
+Deployed on three containers the way `docker/smoke.sh` deploys (DNS names,
+separate network namespaces, bundles run from `/opt/tuplesky/nN`), the
+domain meshed on both planes and served writes through every voter. But
+every read-only transaction through voter 3's frontend stayed `Pending`
+until the shim's budget ran out (`fail`, `no-answer`), from the first
+request on. Reads through voters 1 and 2 were served. That includes the
+snapshot read that starts a writing transaction, so every transaction
+through voter 3 failed. Writes and compare-and-set through voter 3
+succeeded. It happened on two fresh deployments. Restarting voter 3's
+`coordd` cleared it.
+
+A read discloses data, so the frontend holds it `Pending` until its own
+replicated state shows the caller's session (the "not yet" of the output
+gate); a frontend whose replica never shows it would hold every read.
+That is a hypothesis, not a diagnosis. The same domain on one host's
+loopback range, with IP literals or with DNS names, served reads through
+all three voters. The container run was inside a gVisor sandbox, whose
+network stack may be part of it, so this needs confirming on a real
+kernel: the `jepsen` workflow's smoke step reports a read that does not
+come back as a warning, and the Jepsen test records it.
