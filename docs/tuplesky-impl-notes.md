@@ -3538,6 +3538,14 @@ has the store refuse a candidate's promise row as fenced. The voter
 sends no promise, follows the machine back to its ballot, and counts
 the refusal. Without the `Fenced` arm, the step fails.
 
+Left: an *application* transition stamped below the fence (a committed
+command applied after the stamp moved back) is refused by the same check,
+and it still ends the loop through `materialize::submit` as
+`DriveError::Engine`. Failing its barrier and forgetting it is not an
+answer there, because a committed command has to be applied at its
+position. The way out is for the voter to promise that ballot or a higher
+one again. That is not done here.
+
 **A campaign still under way is left to finish.** A campaign collects a
 report from a majority, and a report carries what its voter holds, so on
 a busy domain the collection can outlast the doubled patience. Replacing
