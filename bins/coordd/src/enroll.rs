@@ -68,6 +68,8 @@ pub struct Credential {
     spki: Vec<u8>,
     /// The DNS names and addresses the leaf is valid for.
     names: (BTreeSet<String>, BTreeSet<IpAddr>),
+    /// The extended key usages the leaf carries, by OID.
+    usages: BTreeSet<String>,
 }
 
 impl Credential {
@@ -87,6 +89,7 @@ impl Credential {
             leaf: read.leaf,
             spki: read.spki,
             names: read.names,
+            usages: read.usages,
         })
     }
 }
@@ -97,6 +100,9 @@ struct ReadLeaf {
     leaf: Leaf,
     spki: Vec<u8>,
     names: (BTreeSet<String>, BTreeSet<IpAddr>),
+    /// Extended key usages by OID; empty where the leaf has no such
+    /// extension, which X.509 reads as any usage.
+    usages: BTreeSet<String>,
 }
 
 fn read_leaf(der: &CertificateDer<'_>) -> Option<ReadLeaf> {
@@ -127,6 +133,25 @@ fn read_leaf(der: &CertificateDer<'_>) -> Option<ReadLeaf> {
             }
         }
     }
+    let mut usages = BTreeSet::new();
+    if let Ok(Some(eku)) = x509.extended_key_usage() {
+        let known = [
+            (eku.value.any, "2.5.29.37.0"),
+            (eku.value.server_auth, "1.3.6.1.5.5.7.3.1"),
+            (eku.value.client_auth, "1.3.6.1.5.5.7.3.2"),
+            (eku.value.code_signing, "1.3.6.1.5.5.7.3.3"),
+            (eku.value.email_protection, "1.3.6.1.5.5.7.3.4"),
+            (eku.value.time_stamping, "1.3.6.1.5.5.7.3.8"),
+            (eku.value.ocsp_signing, "1.3.6.1.5.5.7.3.9"),
+        ];
+        usages.extend(
+            known
+                .into_iter()
+                .filter(|(present, _)| *present)
+                .map(|(_, oid)| oid.to_owned()),
+        );
+        usages.extend(eku.value.other.iter().map(ToString::to_string));
+    }
     Some(ReadLeaf {
         identity: identity?,
         leaf: Leaf {
@@ -135,6 +160,7 @@ fn read_leaf(der: &CertificateDer<'_>) -> Option<ReadLeaf> {
         },
         spki: x509.public_key().raw.to_vec(),
         names: (dns, ips),
+        usages,
     })
 }
 
@@ -183,7 +209,7 @@ impl core::fmt::Display for Failure {
 pub struct Enroller {
     client: reqwest::Client,
     /// `{issuer}/enroll`.
-    url: String,
+    url: reqwest::Url,
     /// The assertion file.
     assertion: PathBuf,
     /// The lifetime asked for.
@@ -239,9 +265,25 @@ impl Enroller {
         let client = builder
             .build()
             .map_err(|e| format!("the issuer client could not be built: {e}"))?;
+        probe_certificate(Path::new(certificate))?;
+        // Parsed here, as the client will parse it, so a URL it would
+        // refuse stops the node at startup rather than at the first due
+        // attempt, hours later, to be retried until the leaf runs out.
+        let url = format!("{}/enroll", config.issuer.trim_end_matches('/'));
+        let url = reqwest::Url::parse(&url)
+            .ok()
+            .filter(|u| {
+                u.host_str().is_some_and(|h| !h.is_empty()) && u.port_or_known_default().is_some()
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the issuer URL {} is not one this node can reach",
+                    config.issuer
+                )
+            })?;
         Ok(Enroller {
             client,
-            url: format!("{}/enroll", config.issuer.trim_end_matches('/')),
+            url,
             assertion: PathBuf::from(&config.assertion),
             lifetime_secs: config.lifetime_secs,
             certificate: PathBuf::from(certificate),
@@ -270,7 +312,7 @@ impl Enroller {
         });
         let mut response = self
             .client
-            .post(&self.url)
+            .post(self.url.clone())
             .json(&body)
             .send()
             .await
@@ -367,6 +409,20 @@ pub fn accept(
             "it drops a name or address the current leaf is reached by",
         ));
     }
+    // What the leaf may be used for, as well as where: a node is a TLS
+    // server to its callers and peers and a client to the peers it dials,
+    // so a renewal restricted to one of those (clientAuth only, say) would
+    // pass the chain check -- which verifies it as a client certificate --
+    // and then fail every handshake of the other kind. No usages at all
+    // is X.509's "any", and a renewal that adds a restriction is refused.
+    let narrowed = if current.usages.is_empty() {
+        !read.usages.is_empty()
+    } else {
+        !read.usages.is_empty() && !current.usages.is_subset(&read.usages)
+    };
+    if narrowed {
+        return Err(refused("it drops a key usage the current leaf is used for"));
+    }
     if read.leaf.expires_at <= current.leaf.expires_at {
         return Err(refused("it does not outlive the leaf it would replace"));
     }
@@ -386,7 +442,75 @@ pub fn accept(
         leaf: read.leaf,
         spki: read.spki,
         names: read.names,
+        usages: read.usages,
     })
+}
+
+/// Whether the chain at `path` is one renewal can replace: a file of
+/// certificates only, which this process can write beside and over.
+///
+/// Checked when the enroller is built, at startup and under `--check`,
+/// rather than found at the first due point. A file that also holds the
+/// node's key would be rewritten with the renewed chain alone -- the key
+/// gone from disk, the process serving on from memory, and the next start
+/// refused, which for a voter is recoverable only through a committed
+/// replacement. A read-only mount would fail every attempt until the leaf
+/// ran out.
+fn probe_certificate(path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "cannot read the node certificate at {}: {e}",
+            path.display()
+        )
+    })?;
+    for line in text.lines() {
+        if let Some(label) = line
+            .trim()
+            .strip_prefix("-----BEGIN ")
+            .and_then(|rest| rest.strip_suffix("-----"))
+            && label != "CERTIFICATE"
+        {
+            return Err(format!(
+                "the node certificate at {} also holds a {label} section, and renewal rewrites \
+                 that file with certificates only; keep the key in a file of its own",
+                path.display()
+            ));
+        }
+    }
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        format!(
+            "cannot read the node certificate at {}: {e}",
+            path.display()
+        )
+    })?;
+    if metadata.permissions().readonly() {
+        return Err(format!(
+            "the node certificate at {} is read-only, and renewal replaces it",
+            path.display()
+        ));
+    }
+    let (directory, staged) = staging(path)
+        .ok_or_else(|| format!("the certificate path {} names no file", path.display()))?;
+    std::fs::File::create(&staged)
+        .and_then(|_| std::fs::remove_file(&staged))
+        .map_err(|e| {
+            format!(
+                "renewal cannot write beside the node certificate in {}: {e}",
+                directory.display()
+            )
+        })
+}
+
+/// The directory `path` is in, and the file a renewed chain is staged in
+/// before it is renamed over `path`.
+fn staging(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let name = path.file_name()?;
+    let directory = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let staged = directory.join(format!(".{}.renewing", name.to_string_lossy()));
+    Some((directory, staged))
 }
 
 /// Replace the chain at `path` with `chain`, atomically.
@@ -398,15 +522,13 @@ pub fn accept(
 fn install(path: &Path, chain: &[CertificateDer<'static>]) -> Result<(), Failure> {
     use std::io::Write;
 
-    let failed = |e: std::io::Error| Failure::Install(e.kind().to_string());
-    let name = path
-        .file_name()
-        .ok_or_else(|| Failure::Install("the certificate path names no file".into()))?;
-    let directory = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let staged = directory.join(format!(".{}.renewing", name.to_string_lossy()));
+    let failed = |e: std::io::Error| Failure::Install(format!("{}: {}", path.display(), e.kind()));
+    let (directory, staged) = staging(path).ok_or_else(|| {
+        Failure::Install(format!(
+            "the certificate path {} names no file",
+            path.display()
+        ))
+    })?;
     let permissions = std::fs::metadata(path).map_err(failed)?.permissions();
     let text: String = chain.iter().map(|c| pem("CERTIFICATE", c)).collect();
     let written = (|| {
@@ -574,6 +696,29 @@ mod tests {
             secs: i64,
             names: &[&str],
         ) -> CertificateDer<'static> {
+            self.issue_for(
+                key,
+                incarnation,
+                role,
+                secs,
+                names,
+                vec![
+                    rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                    rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                ],
+            )
+        }
+
+        /// The same, with these extended key usages.
+        fn issue_for(
+            &self,
+            key: &rcgen::KeyPair,
+            incarnation: u64,
+            role: PeerRole,
+            secs: i64,
+            names: &[&str],
+            usages: Vec<rcgen::ExtendedKeyUsagePurpose>,
+        ) -> CertificateDer<'static> {
             let identity = NodeIdentity {
                 cluster: coord_types::ids::ClusterId(CLUSTER),
                 node: coord_types::ids::ReplicaId([1; 16]),
@@ -584,10 +729,7 @@ mod tests {
             let now = time::OffsetDateTime::now_utc();
             params.not_before = now - time::Duration::seconds(5);
             params.not_after = now + time::Duration::seconds(secs);
-            params.extended_key_usages = vec![
-                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
-            ];
+            params.extended_key_usages = usages;
             let mut sans: Vec<rcgen::SanType> = names
                 .iter()
                 .map(|n| rcgen::SanType::DnsName((*n).try_into().unwrap()))
@@ -761,6 +903,86 @@ mod tests {
             1,
             "a staged file was left behind"
         );
+    }
+
+    /// A leaf only good as a client would pass the chain check, which
+    /// verifies it as one, and then fail every handshake this node serves.
+    #[test]
+    fn a_renewal_that_drops_a_key_usage_is_refused() {
+        let ca = new_ca();
+        let f = fixture(&ca);
+        let current = f.current(PeerRole::Voter);
+        let why = refused(accept(
+            &current,
+            f.issue_for(
+                &f.key,
+                1,
+                PeerRole::Voter,
+                600,
+                &["node.test"],
+                vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth],
+            ),
+            None,
+        ));
+        assert!(why.contains("key usage"), "{why}");
+        // Adding one is not narrowing.
+        let renewed = f.issue_for(
+            &f.key,
+            1,
+            PeerRole::Voter,
+            600,
+            &["node.test"],
+            vec![
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                rcgen::ExtendedKeyUsagePurpose::CodeSigning,
+            ],
+        );
+        accept(&current, renewed, None).expect("a renewal");
+    }
+
+    /// A certificate file renewal could not replace safely stops the node
+    /// when the enroller is built, not at the first due point.
+    #[test]
+    fn a_certificate_file_renewal_cannot_replace_is_refused_up_front() {
+        let dir = std::env::temp_dir().join(format!("coordd-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = new_ca();
+        let f = fixture(&ca);
+        let leaf = f.issue(&f.key, 1, PeerRole::Voter, 600, &["node.test"]);
+        let certificate = pem("CERTIFICATE", &leaf);
+
+        let alone = dir.join("alone.pem");
+        std::fs::write(&alone, &certificate).unwrap();
+        probe_certificate(&alone).expect("a file of certificates only");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "the probe left a file behind"
+        );
+
+        // The key beside the chain in one file would be written away.
+        let combined = dir.join("combined.pem");
+        std::fs::write(
+            &combined,
+            format!(
+                "{certificate}{}",
+                pem("PRIVATE KEY", &f.key.serialize_der())
+            ),
+        )
+        .unwrap();
+        let why = probe_certificate(&combined).expect_err("a key in the file");
+        assert!(why.contains("PRIVATE KEY"), "{why}");
+
+        let read_only = dir.join("read-only.pem");
+        std::fs::write(&read_only, &certificate).unwrap();
+        let mut permissions = std::fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&read_only, permissions).unwrap();
+        let why = probe_certificate(&read_only).expect_err("a read-only file");
+        assert!(why.contains("read-only"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

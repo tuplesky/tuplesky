@@ -341,7 +341,11 @@ const fn default_renewal_jitter() -> u64 {
 /// prefix of the string: `http://127.0.0.1.evil.example` starts with the
 /// loopback prefix and is not loopback at all. Userinfo is refused
 /// outright, since a URL that carries a credential would carry it into
-/// every report that names the issuer.
+/// every report that names the issuer. The host and port are checked
+/// here too, for either scheme: a URL the HTTP client would refuse is a
+/// configuration error to report at startup (and under `--check`), not
+/// one discovered at the first due attempt and retried until the leaf
+/// runs out.
 pub fn issuer_url_permitted(url: &str, insecure_loopback: bool) -> bool {
     let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (true, rest)
@@ -354,23 +358,66 @@ pub fn issuer_url_permitted(url: &str, insecure_loopback: bool) -> bool {
     if authority.is_empty() || authority.contains('@') || rest.contains(['?', '#']) {
         return false;
     }
+    let Some(host) = authority_host(authority) else {
+        return false;
+    };
     if secure {
         return true;
     }
     if !insecure_loopback {
         return false;
     }
-    let host = match authority.strip_prefix('[') {
-        Some(inside) => match inside.split_once(']') {
-            Some((host, after)) if after.is_empty() || after.starts_with(':') => host,
-            _ => return false,
-        },
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    host == "localhost"
+    host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The host of `authority` (`host`, `host:port`, `[v6]` or `[v6]:port`),
+/// if both it and the port are well formed. A bracketed host is an IPv6
+/// address; any other is an IPv4 address or a DNS name. A port is one
+/// to five digits naming a nonzero `u16`.
+fn authority_host(authority: &str) -> Option<&str> {
+    let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
+        let (host, after) = inside.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        match after {
+            "" => (host, None),
+            _ => (host, Some(after.strip_prefix(':')?)),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if let Some(port) = port
+        && !(port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p != 0))
+    {
+        return None;
+    }
+    if authority.starts_with('[') {
+        return Some(host);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels
+        .iter()
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+    {
+        // All numeric: an IPv4 address, or nothing.
+        return host.parse::<std::net::Ipv4Addr>().ok().map(|_| host);
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let well_formed = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    well_formed.then_some(host)
 }
 
 /// The daemon configuration.

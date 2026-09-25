@@ -1140,7 +1140,22 @@ fn main() -> ExitCode {
         if let Some(renewing) = renewing {
             domain = domain.with_renewal(renewing);
         }
-        domain.run(&mut transport, now_seconds).await;
+        // The leaf's deadline is raced against the whole loop, not only
+        // checked at the top of each pass: a pass can wait inside itself
+        // on a slow caller, and a node must not go on serving on a leaf
+        // past its notAfter while it does (task-d02).
+        match domain.leaf_deadline() {
+            Some(deadline) => {
+                let expired = tokio::select! {
+                    () = domain.run(&mut transport, now_seconds) => false,
+                    () = serve::leaf_expired(deadline) => true,
+                };
+                if expired {
+                    domain.leaf_expired_while_serving();
+                }
+            }
+            None => domain.run(&mut transport, now_seconds).await,
+        }
         eprintln!(
             "peers connected={} submittable={}",
             domain.reachable(),
