@@ -1135,6 +1135,7 @@ dependencies = [
  "coord-storage",
  "coord-storage-redb",
  "coord-store-api",
+ "coord-store-testkit",
  "coord-sts",
  "coord-transport",
  "coord-types",
