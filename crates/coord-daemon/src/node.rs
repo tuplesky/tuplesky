@@ -661,9 +661,8 @@ impl<P: Persistence> Node<P> {
                         // stall. Ended instead, it restarts as a follower
                         // of its ballot and campaigns.
                         Err(Refused::Fenced) if self.machine().leads() => {
-                            self.fenced += 1;
                             return Err(DriveError::Fenced(
-                                "a transition of this leader's own".into(),
+                                "a transition this voter made while leading".into(),
                             ));
                         }
                         Err(Refused::Fenced) => {
@@ -832,7 +831,11 @@ impl<P: Persistence> Node<P> {
                 // or above the fence moves it, and this voter does not
                 // make one on its own; a restart does.
                 if matches!(&e, coord_storage::ApplyError::Engine(engine) if coord_storage::materialize::is_fenced(engine)) {
-                    DriveError::Fenced(format!("the apply of {command:?}"))
+                    let id: String = command.0.0[..4]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    DriveError::Fenced(format!("the apply of command {id}"))
                 } else {
                     DriveError::Engine(format!("{e:?}"))
                 }

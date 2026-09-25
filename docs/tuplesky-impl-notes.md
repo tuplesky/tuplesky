@@ -3550,7 +3550,10 @@ promise that never resolves. The store wrapper now reports the refusal as
   out of proposal retries and stop proposing while still `Machine::Leader`.
   Neither it nor the voters holding its links would campaign, and the
   domain would stall. Stopped, it restarts as a follower of its ballot and
-  campaigns (the restart rule above).
+  campaigns (the restart rule above). This holds on every path. On the
+  peer path and the collector-submission path a `DriveError` is otherwise
+  only logged. A `Fenced` one is recorded instead (`Domain::fenced_stop`),
+  and the loop ends on its next pass with the same message as a turn.
   `a_leader_whose_work_is_refused_by_its_own_fence_stops` fences the
   promise, fails its row as a group failure would, and then submits: the
   step ends `Fenced`. Without the leader arm, it serves on.

@@ -127,7 +127,8 @@ pub struct Voter<P: Persistence> {
     /// The highest ballot the store was fenced at. A fence never moves
     /// back, so a voter whose promise did not become durable is below it,
     /// and a campaign for anything at or under it would be refused by its
-    /// own store.
+    /// own store. Compared within an epoch only (`highest`): a fence
+    /// from another epoch is not a bound on this one's ballots.
     fenced_at: Option<Ballot>,
 }
 

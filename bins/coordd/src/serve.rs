@@ -927,6 +927,12 @@ pub struct Domain<P: Persistence> {
     role_said: Option<(coord_types::ids::Ballot, bool)>,
     /// How many fenced transitions this voter has said it refused.
     fenced_said: u64,
+    /// What a peer's frame or a collector's submission was refused by
+    /// this voter's own fence for, where the refusal stops the voter
+    /// (`DriveError::Fenced`). Those paths only log a `DriveError`, so the
+    /// stop is recorded here and the loop ends on its next pass, as it
+    /// does for the same refusal on a turn.
+    fenced_stop: Option<String>,
 }
 
 /// The two planes a voter is dialled on.
@@ -1303,6 +1309,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             election,
             role_said: None,
             fenced_said: 0,
+            fenced_stop: None,
             peer_streak: 0,
             budgets,
             recorder,
@@ -1466,14 +1473,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             if self.renew() {
                 return;
             }
+            // A fenced refusal the event paths met since the last pass
+            // stops the voter here, as one met on a turn does below.
+            if let Some(what) = self.fenced_stop.take() {
+                say_fenced_stop(&what);
+                return;
+            }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
                 Err(coord_daemon::DriveError::Fenced(what)) => {
-                    eprintln!(
-                        "this voter stopped: {what} was refused by its store's fence, \
-                         which is at a promise above this voter's ballot. \
-                         A restart resumes at the promised ballot, as a follower that campaigns"
-                    );
+                    say_fenced_stop(&what);
                     return;
                 }
                 Err(e) => {
@@ -2904,6 +2913,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         self.frontend.follow(voter.node().machine().active());
                         self.carry(api, out, provenance);
                     }
+                    Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
                     Err(e) => eprintln!("this voter cannot carry out a peer's frame: {e}"),
                 }
             }
@@ -2971,6 +2981,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
                 self.frontend.counts.refused += 1;
             }
+            Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
         }
         self.route_parked(api);
@@ -3280,6 +3291,15 @@ fn addressed(
         replica: to.replica,
         incarnation,
     })
+}
+
+/// Why a voter stopped on its own fence, and what heals it.
+fn say_fenced_stop(what: &str) {
+    eprintln!(
+        "this voter stopped: {what} was refused by its store's fence, \
+         which is at a promise above this voter's ballot. \
+         A restart resumes at the promised ballot, as a follower that campaigns"
+    );
 }
 
 fn hex4(replica: &coord_types::ids::ReplicaId) -> String {
