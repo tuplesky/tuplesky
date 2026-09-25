@@ -321,11 +321,17 @@ pub struct RenewalConfig {
     /// same across restarts.
     #[serde(default = "default_renewal_jitter")]
     pub jitter_secs: u64,
-    /// Accept an `http://` issuer on a loopback address.
+    /// Accept an `http://` issuer on a loopback address. Test-only.
     ///
-    /// For an issuer on the same host and for tests: a loopback URL
-    /// never leaves the machine. Anything else is refused whatever this
-    /// says.
+    /// For the tests, which serve an issuer in-process: a loopback URL
+    /// never leaves the machine, and anything else is refused whatever
+    /// this says. It stays in the schema so one configuration parses in
+    /// every build, but only a build with debug assertions accepts it
+    /// set; a release build refuses it at validation
+    /// ([`ConfigError::TestOnlySwitch`]), because no insecure switch
+    /// belongs in a production artifact (design Section 20.5). A
+    /// production node renews at an `https://` issuer, with
+    /// [`RenewalConfig::issuer_roots`] where it is not publicly rooted.
     #[serde(default)]
     pub allow_insecure_loopback: bool,
 }
@@ -542,6 +548,28 @@ pub enum ConfigError {
     InsecureIssuer,
     /// A renewal that asks for no lifetime at all.
     ZeroLifetime,
+    /// A test-only switch set in a build without debug assertions. The
+    /// field is named.
+    TestOnlySwitch(&'static str),
+}
+
+/// Which build is validating: whether test-only switches may be set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Build {
+    /// Debug assertions on: the tests' build.
+    Test,
+    /// Debug assertions off: what ships.
+    Release,
+}
+
+impl Build {
+    const fn current() -> Build {
+        if cfg!(debug_assertions) {
+            Build::Test
+        } else {
+            Build::Release
+        }
+    }
 }
 
 /// Supported configuration schema version.
@@ -600,6 +628,10 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_as(Build::current())
+    }
+
+    fn validate_as(&self, build: Build) -> Result<(), ConfigError> {
         if self.config_version != CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion {
                 version: self.config_version,
@@ -684,6 +716,14 @@ impl Config {
             return Err(ConfigError::NoJournalShards);
         }
         if let Some(renewal) = &self.renewal {
+            // Refused before the URL is looked at, so a release build
+            // says which switch it will not honour rather than calling
+            // the loopback issuer insecure.
+            if renewal.allow_insecure_loopback && build == Build::Release {
+                return Err(ConfigError::TestOnlySwitch(
+                    "renewal.allow_insecure_loopback",
+                ));
+            }
             if !issuer_url_permitted(&renewal.issuer, renewal.allow_insecure_loopback) {
                 return Err(ConfigError::InsecureIssuer);
             }
@@ -751,4 +791,75 @@ fn engine_named(
         named: named.to_owned(),
         supported,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Build, CONFIG_VERSION, Config, ConfigError};
+
+    fn with_renewal(allow: bool) -> Config {
+        let text = format!(
+            r#"config_version = {CONFIG_VERSION}
+role = "voter-frontend-observer"
+cluster_manifest = "/etc/coord/genesis.json"
+domain = "control-plane-a"
+state_directory = "/var/lib/coord/a"
+
+[listen]
+api_quic = "[::]:7443"
+peer_quic = "[::]:7444"
+
+[capability]
+writer_queue_bytes = 16777216
+buffer_bytes_per_subscription = 8388608
+max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+shards = 1
+
+[identity]
+trust_bundle = "/etc/coord/roots.pem"
+node_certificate = "/etc/coord/node.pem"
+node_key = "/etc/coord/node.key"
+
+[sts]
+issuer = "https://sts.example"
+resource = "control-plane-a"
+jwks = "/etc/coord/sts-jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
+
+[renewal]
+issuer = "http://127.0.0.1:9000"
+assertion = "/var/run/secrets/token"
+lifetime_secs = 3600
+allow_insecure_loopback = {allow}
+"#
+        );
+        // Deserialized without validating, so each build's answer can be
+        // asked for from the one build the tests run in.
+        toml::from_str(&text).expect("the fixture parses")
+    }
+
+    #[test]
+    fn the_insecure_loopback_switch_is_honoured_only_by_a_test_build() {
+        let set = with_renewal(true);
+        assert_eq!(set.validate_as(Build::Test), Ok(()));
+        assert_eq!(
+            set.validate_as(Build::Release),
+            Err(ConfigError::TestOnlySwitch(
+                "renewal.allow_insecure_loopback"
+            ))
+        );
+        // Unset, the loopback http issuer is refused in either build, as
+        // it always was: the switch is what a release build will not
+        // honour, not a second way to reach the same refusal.
+        let unset = with_renewal(false);
+        for build in [Build::Test, Build::Release] {
+            assert_eq!(unset.validate_as(build), Err(ConfigError::InsecureIssuer));
+        }
+    }
 }
