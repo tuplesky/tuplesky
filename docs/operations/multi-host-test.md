@@ -88,7 +88,9 @@ What `--hosts` changes, and nothing else does:
   the examples use `/opt/tuplesky/nN`.
 * **The credential endpoint** (`--issuer-listen`) gets a certificate for its
   host and a URL naming it, so a Kine build on another host can exchange its
-  assertion there. Without the flag it stays on loopback.
+  assertion there. Without the flag it stays on loopback. `localhost` (and any
+  name under it) is refused as that host, because it only reaches the machine
+  it is resolved on; leave the flag out for a loopback endpoint.
 * **The storage edge** (`--edge-host`) gets a server certificate for its host
   and an endpoint URL naming it. An API server verifies the edge against the
   host of the endpoint it is configured with unless told otherwise.
@@ -210,9 +212,11 @@ its whole containment. What is enforced: it binds a loopback address always.
 Off loopback it binds only for a domain provisioned with a non-loopback
 `--issuer-listen` host, only on the port the provisioned URL names, and only at
 that host's own address or at the unspecified address (`0.0.0.0` or `[::]`).
-The URL's host has to be one the endpoint's certificate names, and never the
-issuer's own name `sts.tuplesky.harness`, which every issuer certificate
-carries. So editing `harness.json` does not widen it. What is not enforced:
+The endpoint's certificate names the issuer and exactly one host it is reached
+at, and the URL's host has to be that host. The issuer's own name
+`sts.tuplesky.harness`, which every issuer certificate carries, is not a host,
+and a host that only means loopback (a loopback address or `localhost`) never
+lets it bind anything else. So editing `harness.json` does not widen it. What is not enforced:
 which interfaces the machine has. The unspecified address listens on all of
 them, so use it only where the provisioned address is not on an interface
 (behind NAT, say), and firewall the port.

@@ -648,6 +648,46 @@ fn the_issuer_leaves_loopback_only_for_the_host_it_was_provisioned_for() {
     })
     .expect_err("the issuer's own name is not a host");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    // Nor is a name that only ever means the machine it is resolved on,
+    // which would otherwise be a DNS name bound at the wildcard.
+    for host in ["localhost", "Issuer.LOCALHOST."] {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let error = provision(&Plan {
+            issuer_listen: Some(Address {
+                host: host.into(),
+                port: free(),
+            }),
+            ..Plan::loopback(dir.path().to_path_buf(), 1, 0)
+        })
+        .expect_err("a loopback name is not a host other machines reach");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+    }
+
+    // Provisioned for a DNS name, the wildcard on its port is permitted,
+    // and a description naming any other host is not: the certificate
+    // names exactly one, and the URL has to be it.
+    let port = free();
+    let dir = tempfile::tempdir().expect("a run directory");
+    provision(&Plan {
+        issuer_listen: Some(Address {
+            host: "issuer.example".into(),
+            port,
+        }),
+        ..Plan::loopback(dir.path().to_path_buf(), 1, 0)
+    })
+    .expect("provisioned");
+    drop(
+        Endpoint::bind_on(dir.path(), Some(format!("0.0.0.0:{port}").parse().unwrap()))
+            .expect("the unspecified address on the provisioned port is permitted"),
+    );
+    let description = dir.path().join("harness.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&description).expect("read")).expect("json");
+    for host in ["localhost", "other.example", "192.0.2.10"] {
+        value["issuer"]["url"] = serde_json::json!(format!("https://{host}:{port}"));
+        std::fs::write(&description, serde_json::to_vec(&value).expect("json")).expect("write");
+        assert!(refused(dir.path(), &format!("0.0.0.0:{port}")), "{host}");
+    }
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {

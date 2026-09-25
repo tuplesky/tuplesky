@@ -3041,6 +3041,15 @@ Three smaller things the plan entry left open:
   name another host does not produce a certificate for that host, so
   the bind is still refused
   (`provision.rs::the_issuer_leaves_loopback_only_for_the_host_it_was_provisioned_for`).
+  The check is an allowlist: an issuer certificate names the issuer and
+  exactly one host (`issuer::reached_at`), and the URL has to name that
+  host. It was first written as a denylist, which missed the issuer's
+  own name: every issuer certificate carries it, loopback ones included,
+  so a URL naming it passed for any domain. A host that only means
+  loopback, a loopback address or `localhost` and the names under it,
+  never lets the endpoint bind anything else, and `--issuer-listen`
+  refuses `localhost` at provisioning. It would otherwise be a DNS name,
+  and a DNS name binds the wildcard.
 
 Provisioning without a host list was compared against the previous
 binary rather than only against a test written afterwards. Both wrote 45

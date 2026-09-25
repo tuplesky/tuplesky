@@ -338,13 +338,17 @@ impl Endpoint {
 /// for a host that is not loopback, and only on the port its URL names,
 /// either at that host's own address or at the unspecified address (for
 /// a host reached at an address that is not on any of its interfaces, or
-/// by name). Which host that is comes from the URL, and the certificate
-/// has to name it: editing the description to point the endpoint
-/// somewhere else does not produce a certificate for somewhere else, so
-/// a loopback-provisioned domain cannot be talked into listening on the
-/// network after the fact. The issuer's own name is never such a host:
-/// every issuer certificate carries it, loopback ones included, so a
-/// URL naming it would pass the certificate check for any domain.
+/// by name).
+///
+/// The host is taken from the certificate, not from the description: an
+/// issuer certificate names the issuer and exactly one host it is
+/// reached at ([`reached_at`]), and the URL has to name that host. So
+/// editing the description to point the endpoint somewhere else does not
+/// produce a certificate for somewhere else, and a URL naming the
+/// issuer's own name, which every issuer certificate carries, names no
+/// host at all. A loopback-provisioned certificate is reached at
+/// `127.0.0.1`, and a host that only means loopback (a loopback address,
+/// or `localhost`) never lets the endpoint bind anything else.
 fn permitted(
     address: SocketAddr,
     url: &str,
@@ -363,43 +367,71 @@ fn permitted(
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     let port: u16 = port.parse().map_err(|_| refused())?;
-    let named_ip = host.parse::<IpAddr>().ok();
-    if host.eq_ignore_ascii_case(crate::domain::ISSUER_NAME) {
+    let reached = reached_at(certificate).ok_or_else(refused)?;
+    if !reached.is(host) || reached.only_loopback() || port != address.port() {
         return Err(refused());
     }
-    if named_ip.is_some_and(|ip| ip.is_loopback()) || port != address.port() {
-        return Err(refused());
-    }
-    if !(address.ip().is_unspecified() || named_ip == Some(address.ip())) {
-        return Err(refused());
-    }
-    if !certificate_names(certificate, host, named_ip) {
+    let at = match reached {
+        Reach::Ip(ip) => Some(ip),
+        Reach::Dns(_) => None,
+    };
+    if !(address.ip().is_unspecified() || at == Some(address.ip())) {
         return Err(refused());
     }
     Ok(())
 }
 
-/// Whether `certificate` carries `host` as a subject alternative name.
-fn certificate_names(certificate: &CertificateDer<'_>, host: &str, ip: Option<IpAddr>) -> bool {
+/// The one host an issuer certificate is reached at.
+enum Reach {
+    Ip(IpAddr),
+    Dns(String),
+}
+
+impl Reach {
+    /// Whether a URL's `host` names this, and nothing else.
+    fn is(&self, host: &str) -> bool {
+        match self {
+            Reach::Ip(ip) => host.parse::<IpAddr>().is_ok_and(|named| named == *ip),
+            Reach::Dns(name) => host.parse::<IpAddr>().is_err() && name.eq_ignore_ascii_case(host),
+        }
+    }
+
+    /// Whether this reaches only the machine it is on.
+    fn only_loopback(&self) -> bool {
+        match self {
+            Reach::Ip(ip) => ip.is_loopback() || ip.is_unspecified(),
+            Reach::Dns(name) => crate::pki::loopback_name(name),
+        }
+    }
+}
+
+/// The subject alternative name of `certificate` that is not the
+/// issuer's own name, when there is exactly one. Anything else (none,
+/// two, or one of another type) is not a certificate this harness
+/// issued for an endpoint, and reaches nothing.
+fn reached_at(certificate: &CertificateDer<'_>) -> Option<Reach> {
     use x509_parser::extensions::GeneralName;
     use x509_parser::prelude::FromDer;
 
-    let Ok((_, parsed)) = x509_parser::certificate::X509Certificate::from_der(certificate) else {
-        return false;
-    };
-    let Ok(Some(names)) = parsed.subject_alternative_name() else {
-        return false;
-    };
-    names
-        .value
-        .general_names
-        .iter()
-        .any(|name| match (name, ip) {
-            (GeneralName::IPAddress(bytes), Some(IpAddr::V4(v4))) => *bytes == v4.octets(),
-            (GeneralName::IPAddress(bytes), Some(IpAddr::V6(v6))) => *bytes == v6.octets(),
-            (GeneralName::DNSName(dns), None) => dns.eq_ignore_ascii_case(host),
-            _ => false,
-        })
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate).ok()?;
+    let names = parsed.subject_alternative_name().ok()??;
+    let mut hosts = names.value.general_names.iter().filter(|name| {
+        !matches!(name, GeneralName::DNSName(dns)
+            if dns.eq_ignore_ascii_case(crate::domain::ISSUER_NAME))
+    });
+    let host = hosts.next()?;
+    if hosts.next().is_some() {
+        return None;
+    }
+    match host {
+        GeneralName::IPAddress(bytes) => match bytes.len() {
+            4 => Some(Reach::Ip(IpAddr::from(<[u8; 4]>::try_from(*bytes).ok()?))),
+            16 => Some(Reach::Ip(IpAddr::from(<[u8; 16]>::try_from(*bytes).ok()?))),
+            _ => None,
+        },
+        GeneralName::DNSName(dns) => Some(Reach::Dns((*dns).to_owned())),
+        _ => None,
+    }
 }
 
 /// A session identifier no other exchange of this process reuses.
