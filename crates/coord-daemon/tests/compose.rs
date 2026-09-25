@@ -851,6 +851,19 @@ fn a_renewal_issuer_is_https_or_an_allowed_loopback_address() {
         let parsed = Config::parse(&renewal(&format!(
             "issuer = \"{url}\"\nassertion = \"/t\"\nlifetime_secs = 60\nallow_insecure_loopback = {allow}"
         )));
+        // The switch itself is test-only: a release build refuses it set,
+        // before the URL is looked at (the unit test in `config.rs` asks
+        // both builds).
+        if allow && !cfg!(debug_assertions) {
+            assert_eq!(
+                parsed,
+                Err(ConfigError::TestOnlySwitch(
+                    "renewal.allow_insecure_loopback"
+                )),
+                "{url}"
+            );
+            continue;
+        }
         assert_eq!(
             parsed.is_ok(),
             ok,

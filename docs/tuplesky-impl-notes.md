@@ -3135,11 +3135,18 @@ own credential's, not this node's.
   peers refuse. The renewal check refuses such a leaf anyway, since it
   drops an address. Without this field it could never be issued one it
   accepts.
-- **Plain HTTP only for a loopback issuer the configuration allows.**
+- **Plain HTTP only for a loopback issuer, and only in a test build.**
   `issuer` must be `https://`. `allow_insecure_loopback = true` admits
   `http://` to `127.0.0.1`, `[::1]` or `localhost`, decided by parsing the
-  host. That is for an issuer on the same host and for the tests, which
-  serve `coord_node_issuer::router` in-process. A URL with userinfo, a
+  host. It is for the tests, which serve `coord_node_issuer::router`
+  in-process. The field stays in the schema, so one configuration parses
+  in every build, but only a build with debug assertions accepts it set.
+  A release build refuses it at validation as
+  `ConfigError::TestOnlySwitch("renewal.allow_insecure_loopback")`,
+  because Section 20.5 forbids insecure switches in production artifacts
+  and Section 22.1 already calls development HTTP loopback test-only. A
+  production node renews at an `https://` issuer, with `issuer_roots`
+  where the issuer is not publicly rooted. A URL with userinfo, a
   query or a fragment is refused, so no report can carry a credential by
   naming the issuer. The host and port are checked for either scheme,
   and the enroller parses the URL at startup as its client will, so a
