@@ -2094,86 +2094,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         connection: u64,
         frame: &Frame,
     ) -> Option<Vec<u8>> {
-        use coord_storage::retry::{Resolution, RetryBinding};
-
-        let MessageV1::Request(request) = decode(frame).ok()? else {
-            return None;
-        };
-        let key = request.retry_key;
-        // The connection must be bound, and bound to the session whose
-        // invocation this is. A retained result belongs to a session,
-        // and reading one is not something an unbound caller -- or a
-        // caller of another session -- may do.
-        let binding = self.frontend.frontend.binding(connection)?;
-        if !binding.active(health) || binding.session != key.session_id {
-            return None;
-        }
-        let logical = request.logical().ok()?;
-        let command = coord_types::CommandId::derive(&key, &logical).ok()?;
-        let resolved = {
-            let gated = self.backing.applier().store().reader().snapshot().ok()?;
-            coord_storage::retry::resolve(
-                gated.view(),
-                &RetryBinding {
-                    retry_key: key,
-                    command_id: command,
-                    retires: None,
-                },
-                |record| {
-                    coord_storage::apply::retained_is_authorized(
-                        gated.view(),
-                        &key.session_id,
-                        &logical,
-                        record,
-                    )
-                },
-            )
-            .ok()?
-        };
-        let record = match resolved {
-            Resolution::Result(record) => record,
-            // The command executed, and this caller may not have what it
-            // produced -- or may not execute at all any more. The same
-            // refusal the output gate gives a live result it will not
-            // disclose; the command is not proposed a second time.
-            Resolution::NoSession => {
-                return refusal(command, "the session may no longer execute");
-            }
-            Resolution::Unauthorized => {
-                return refusal(command, "output not authorized by current policy");
-            }
-            // Not executed, retired below the floor, or a retry key bound
-            // to another payload: replicated execution decides each of
-            // those at the command's own position, not this node from a
-            // record that is not this command's.
-            Resolution::Pending | Resolution::Retired { .. } | Resolution::Conflict { .. } => {
-                return None;
-            }
-        };
-        let response = coord_types::wire_v1::ResponseV1 {
-            command_id: command,
-            outcome: coord_types::wire_v1::OutcomeV1::Ok {
-                revision: record.revision,
-                result: coord_types::wire_v1::BoundedBytes::new(record.response.clone()).ok()?,
-            },
-        };
-        let delivery = coord_collector::Delivery {
+        retained_answer(
+            &mut self.frontend.frontend,
+            self.backing.applier().store(),
+            health,
             connection,
-            retry_key: key,
-            frame: MessageV1::Response(response).encode().ok()?,
-        };
-        let policy = StorePolicySource {
-            store: self.backing.applier().store(),
-            budget: ViewBudget::default(),
-        };
-        match self
-            .frontend
-            .frontend
-            .deliver_retained(delivery, command, &logical, &policy)
-        {
-            Delivered::Answer(delivery) => Some(delivery.frame),
-            Delivered::Unbound { .. } => None,
-        }
+            frame,
+        )
     }
 
     /// Answer the caller a delivery belongs to, gated against a fresh
@@ -2948,6 +2875,136 @@ impl core::fmt::Display for TransportError {
     }
 }
 
+/// What the durable record answers for a request, ahead of admission:
+/// the retained result, gated as a fresh one is, or a refusal from the
+/// record. `None` sends the request on to admission.
+///
+/// [`Domain::retained`] with what it reads named: the frontend that holds
+/// the caller's binding and this node's store. Split out so it can be
+/// asked of a frontend bound on a node whose projection is behind.
+fn retained_answer<P: Persistence>(
+    frontend: &mut BoundFrontend,
+    store: &P,
+    health: &ClockHealth,
+    connection: u64,
+    frame: &Frame,
+) -> Option<Vec<u8>> {
+    use coord_storage::retry::Resolution;
+
+    let MessageV1::Request(request) = decode(frame).ok()? else {
+        return None;
+    };
+    let key = request.retry_key;
+    // The connection must be bound, and bound to the session whose
+    // invocation this is. A retained result belongs to a session,
+    // and reading one is not something an unbound caller -- or a
+    // caller of another session -- may do.
+    let binding = frontend.binding(connection)?;
+    if !binding.active(health) || binding.session != key.session_id {
+        return None;
+    }
+    let logical = request.logical().ok()?;
+    let command = coord_types::CommandId::derive(&key, &logical).ok()?;
+    let resolved = {
+        let gated = store.reader().snapshot().ok()?;
+        resolve_retained(gated.view(), key, command, &logical).ok()??
+    };
+    let record = match resolved {
+        Resolution::Result(record) => record,
+        // The command executed, and this caller may not have what it
+        // produced -- or may not execute at all any more. The same
+        // refusal the output gate gives a live result it will not
+        // disclose; the command is not proposed a second time.
+        Resolution::NoSession => {
+            return refusal(command, "the session may no longer execute");
+        }
+        Resolution::Unauthorized => {
+            return refusal(command, "output not authorized by current policy");
+        }
+        // Not executed, retired below the floor, or a retry key bound
+        // to another payload: replicated execution decides each of
+        // those at the command's own position, not this node from a
+        // record that is not this command's.
+        Resolution::Pending | Resolution::Retired { .. } | Resolution::Conflict { .. } => {
+            return None;
+        }
+    };
+    let response = coord_types::wire_v1::ResponseV1 {
+        command_id: command,
+        outcome: coord_types::wire_v1::OutcomeV1::Ok {
+            revision: record.revision,
+            result: coord_types::wire_v1::BoundedBytes::new(record.response.clone()).ok()?,
+        },
+    };
+    let delivery = coord_collector::Delivery {
+        connection,
+        retry_key: key,
+        frame: MessageV1::Response(response).encode().ok()?,
+    };
+    let policy = StorePolicySource {
+        store,
+        budget: ViewBudget::default(),
+    };
+    match frontend.deliver_retained(delivery, command, &logical, &policy) {
+        Delivered::Answer(delivery) => Some(delivery.frame),
+        Delivered::Unbound { .. } => None,
+    }
+}
+
+/// What this node's record says about the invocation `key` names, before
+/// admission: `None` where it says nothing yet (task-j09).
+///
+/// A session this node has not projected yet is not a session that may
+/// no longer execute. A caller's binding is established from a committed
+/// session-creation command, and a replica that is behind -- one
+/// restarted a moment ago, above all -- reads no row for it until it
+/// catches up. `retry::resolve` answers `NoSession` for an absent row
+/// and for a present one that cannot execute alike; refusing on the
+/// first would tell a caller its session is gone on a domain that has
+/// just made it. So an absent row is `None`: the request goes on to
+/// admission, and execution decides it at its own position, as for any
+/// request with no record here. A present row is resolved as before, and
+/// one that can no longer execute -- retired, or its rule disabled or
+/// regenerated -- is still `NoSession`.
+///
+/// Absent is "not yet" rather than "gone" because a session row, once
+/// written, is never deleted within a cluster: every `SessionWrite` the
+/// planner makes carries a record (the type would let `None` delete the
+/// row; nothing plans one), retirement is a flag on the record,
+/// compaction does not touch `SessionV1`, and a local checkpoint carries
+/// every collection. Were a row ever deleted, the request would reach
+/// admission, `retry::admit` would answer `UnknownSession` and nothing
+/// would be recorded: a wasted round trip, not a second execution.
+fn resolve_retained<V: coord_store_api::OrderedRead>(
+    view: &V,
+    key: RetryKey,
+    command: CommandId,
+    logical: &coord_types::logical_v1::LogicalRequest,
+) -> Result<Option<coord_storage::retry::Resolution>, coord_store_api::EngineError> {
+    use coord_storage::retry::RetryBinding;
+    if view
+        .get(
+            coord_store_api::Collection::SessionV1.id(),
+            &coord_storage::codecs::session_key(&key.session_id),
+        )?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    coord_storage::retry::resolve(
+        view,
+        &RetryBinding {
+            retry_key: key,
+            command_id: command,
+            retires: None,
+        },
+        |record| {
+            coord_storage::apply::retained_is_authorized(view, &key.session_id, logical, record)
+        },
+    )
+    .map(Some)
+}
+
 impl core::error::Error for TransportError {}
 
 #[cfg(test)]
@@ -2959,6 +3016,341 @@ mod tests {
         PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed,
         ask_for_payloads_now, payload_batch_size, poll_api_first,
     };
+
+    /// A session this node has not projected yet is "not yet", not a
+    /// session that may no longer execute; one that is present and
+    /// retired is still refused (task-j09).
+    ///
+    /// A replica that is behind reads no row for a session the domain
+    /// has just created, and a caller bound to it asks at once. Before,
+    /// the lookup ahead of admission took `retry::resolve`'s `NoSession`
+    /// for that and refused the request; the multi-host test caught it
+    /// only under load. Here the three states are made directly on a
+    /// store: no row, a live row, a retired row.
+    #[test]
+    fn a_session_this_node_has_not_projected_is_not_yet_and_a_retired_one_is_refused() {
+        use coord_core::effect::{BootId, PersistBatch};
+        use coord_core::outbox::BarrierAllocator;
+        use coord_storage::retry::{self, Resolution, RetryBinding};
+        use coord_storage::{GroupLimits, StoreWorker};
+        use coord_store_testkit::model::ModelEngine;
+        use coord_types::ids::{
+            ClientInstanceId, ClusterId, DomainId, NamespaceId, PrincipalId, RequestSequence,
+            SessionId,
+        };
+        use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
+        use coord_types::{CommandId, RetryKey};
+
+        let incarnation = ReplicaIncarnation::new(1).unwrap();
+        let boot = BootId([1; 16]);
+        let mut worker = StoreWorker::open(
+            ModelEngine::new(),
+            boot,
+            incarnation,
+            GroupLimits::default(),
+        )
+        .unwrap();
+        let mut barriers = BarrierAllocator::new(incarnation, boot);
+        let session = SessionId([0x51; 16]);
+        let key = RetryKey {
+            cluster_id: ClusterId([1; 16]),
+            domain_id: DomainId([2; 16]),
+            session_id: session,
+            client_instance_id: ClientInstanceId([0xc1; 16]),
+            request_sequence: RequestSequence::new(1).unwrap(),
+        };
+        let mut logical = LogicalRequest::new(
+            NamespaceId([0x11; 16]),
+            CanonicalOperation::Put(PutOp {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease: None,
+                prev_kv: false,
+            }),
+        );
+        logical.canonicalize();
+        let command = CommandId::derive(&key, &logical).unwrap();
+        let ask = |worker: &StoreWorker<ModelEngine>| {
+            let gated = worker.reader().snapshot().unwrap();
+            let retained = super::resolve_retained(gated.view(), key, command, &logical).unwrap();
+            let resolved = retry::resolve(
+                gated.view(),
+                &RetryBinding {
+                    retry_key: key,
+                    command_id: command,
+                    retires: None,
+                },
+                |_| true,
+            )
+            .unwrap();
+            (retained, resolved)
+        };
+        let mut session_row = |worker: &mut StoreWorker<ModelEngine>, executable: bool| {
+            let updates = coord_storage::policy::bootstrap_session(
+                &session,
+                PrincipalId([0xaa; 16]),
+                4,
+                executable,
+            )
+            .unwrap();
+            worker
+                .submit(PersistBatch {
+                    barrier: barriers.allocate(),
+                    base: Some(worker.application_base()),
+                    updates,
+                })
+                .unwrap();
+            assert_eq!(worker.flush().unwrap().committed, 1);
+        };
+
+        // Behind: no row. `resolve` alone says `NoSession`, which is what
+        // was refused; the lookup says nothing, and admission decides.
+        assert_eq!(ask(&worker), (None, Resolution::NoSession));
+        // Projected and live, the request not executed: nothing retained.
+        session_row(&mut worker, true);
+        assert_eq!(
+            ask(&worker),
+            (Some(Resolution::Pending), Resolution::Pending)
+        );
+        // Present and retired: still refused from the record.
+        session_row(&mut worker, false);
+        assert_eq!(
+            ask(&worker),
+            (Some(Resolution::NoSession), Resolution::NoSession)
+        );
+    }
+
+    /// A caller bound on a node whose projection lacks its session row,
+    /// through the frontend's own establishment, is not refused when it
+    /// asks; once the row is there and retired, it is (task-j09).
+    ///
+    /// The binding comes from the session-creation command's outcome
+    /// (`settle`), which is how a caller binds on a replica that is
+    /// behind: nothing on this node has shown the row. The request it
+    /// then sends is asked of the lookup ahead of admission, which used
+    /// to answer `NOT_ADMITTED`, and then of admission itself.
+    #[test]
+    fn a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused() {
+        use coord_authn::ClockHealth;
+        use coord_collector::{
+            Action, Admission, AdmissionLimits, Collector, CollectorConfig, Delivery, Dispatcher,
+            MonotonicMillis,
+        };
+        use coord_core::effect::{BootId, PersistBatch};
+        use coord_core::outbox::BarrierAllocator;
+        use coord_session::{BindingConfig, BoundFrontend, Delivered, Ingress};
+        use coord_state::Response;
+        use coord_state::plan::Outcome;
+        use coord_state::policy::Action as PolicyAction;
+        use coord_storage::{GroupLimits, StoreWorker, WatchHub};
+        use coord_store_testkit::model::ModelEngine;
+        use coord_sts::{KeyRing, ServiceClaims, SigningKey};
+        use coord_types::ids::{
+            Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, KvRevision,
+            NamespaceId, PrincipalId, RequestSequence, SessionId,
+        };
+        use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
+        use coord_types::wire_v1::{
+            BoundedBytes, Frame, FrameReader, MessageV1, OutcomeV1, RequestV1, ResponseV1,
+            decode_stream,
+        };
+        use coord_types::{CommandId, RetryKey};
+
+        const CLUSTER: ClusterId = ClusterId([1; 16]);
+        const DOMAIN: DomainId = DomainId([2; 16]);
+        const SESSION: SessionId = SessionId([3; 16]);
+        const ALICE: PrincipalId = PrincipalId([0xa; 16]);
+        const NOW: u64 = 1_700_000_000;
+        const CONNECTION: u64 = 7;
+        let frame_of = |bytes: &[u8]| -> Frame {
+            let mut reader = FrameReader::new();
+            reader.push(bytes).unwrap();
+            reader.next_frame().unwrap().unwrap()
+        };
+        let health = ClockHealth::healthy(NOW, 5);
+
+        // This node's store: nothing of the session projected.
+        let incarnation = ReplicaIncarnation::new(1).unwrap();
+        let boot = BootId([1; 16]);
+        let mut store = StoreWorker::open(
+            ModelEngine::new(),
+            boot,
+            incarnation,
+            GroupLimits::default(),
+        )
+        .unwrap();
+        let hub = WatchHub::new(KvRevision::ZERO, KvRevision::ZERO);
+        fn policy(
+            store: &StoreWorker<ModelEngine>,
+        ) -> coord_session::StorePolicySource<'_, StoreWorker<ModelEngine>> {
+            coord_session::StorePolicySource {
+                store,
+                budget: coord_storage::views::ViewBudget::default(),
+            }
+        }
+
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let ring = KeyRing::new(SigningKey::from_pkcs8_der("sts-1", &key.serialize_der()).unwrap());
+        let config = BindingConfig {
+            issuer: "https://sts.cluster-1".into(),
+            resource: "tuplesky://cluster-1".into(),
+            jwks: ring.jwks(),
+            cluster: CLUSTER,
+            domain: DOMAIN,
+        };
+        let epoch = ConfigurationEpoch::new(1).unwrap();
+        let voters: Vec<_> = (0..3u8).map(|i| ReplicaId([i; 16])).collect();
+        let quorum = coord_consensus::BallotConfiguration::c2_default(
+            epoch,
+            Ballot {
+                epoch,
+                number: 0,
+                leader: voters[0],
+            },
+            voters.into_iter().collect(),
+        )
+        .unwrap();
+        let mut frontend = BoundFrontend::new(
+            Dispatcher::new(
+                Admission::new(CLUSTER, DOMAIN, AdmissionLimits::default()),
+                Collector::new(CollectorConfig {
+                    quorum,
+                    max_pending: 64,
+                    max_resolved: 16,
+                    max_undelivered_bytes: usize::MAX,
+                }),
+                16,
+            ),
+            config.clone(),
+            4,
+            64,
+        );
+
+        // Bind: the credential names a session this node has no row
+        // for, so the frontend establishes it by command...
+        let credential = ring
+            .sign(&ServiceClaims {
+                iss: config.issuer.clone(),
+                sub: hex(&ALICE.0),
+                aud: config.resource.clone(),
+                sid: hex(&SESSION.0),
+                scope: PolicyAction::FULL_CEILING,
+                rule: hex(&SESSION.0),
+                generation: 1,
+                jti: hex(&[9u8; 32]),
+                iat: NOW,
+                exp: NOW + 1000,
+            })
+            .unwrap()
+            .into_bytes();
+        let bind = frame_of(&coord_session::bind_frame(&credential).unwrap());
+        assert!(matches!(
+            frontend.on_frame(
+                &health,
+                MonotonicMillis::new(0),
+                CONNECTION,
+                &bind,
+                &hub,
+                &policy(&store)
+            ),
+            Ingress::Establishing(_)
+        ));
+        // ...and settles it from the command's outcome, which is the one
+        // way a binding exists before the projection has the row.
+        let establishment = coord_session::verify_bind(&config, &credential, &health, None)
+            .unwrap()
+            .establishment_key(&config);
+        let created = Response {
+            revision: KvRevision::new(1).unwrap(),
+            outcome: Outcome::SessionCreated { session: SESSION },
+        };
+        let created = Delivery {
+            connection: CONNECTION,
+            retry_key: establishment,
+            frame: MessageV1::Response(ResponseV1 {
+                command_id: CommandId(coord_types::identity::Digest32([0xee; 32])),
+                outcome: OutcomeV1::Ok {
+                    revision: Some(KvRevision::new(1).unwrap()),
+                    result: BoundedBytes::new(postcard::to_allocvec(&created).unwrap()).unwrap(),
+                },
+            })
+            .encode()
+            .unwrap(),
+        };
+        assert!(matches!(
+            frontend.deliver(created, &policy(&store)),
+            Delivered::Answer(_)
+        ));
+        assert!(frontend.binding(CONNECTION).is_some(), "not bound");
+
+        // The bound caller asks at once.
+        let mut logical = LogicalRequest::new(
+            NamespaceId([5; 16]),
+            CanonicalOperation::Put(PutOp {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                lease: None,
+                prev_kv: false,
+            }),
+        );
+        logical.canonicalize();
+        let retry = RetryKey {
+            cluster_id: CLUSTER,
+            domain_id: DOMAIN,
+            session_id: SESSION,
+            client_instance_id: ClientInstanceId([4; 16]),
+            request_sequence: RequestSequence::new(1).unwrap(),
+        };
+        let command = CommandId::derive(&retry, &logical).unwrap();
+        let request = frame_of(
+            &MessageV1::Request(RequestV1::new(retry, &logical, 0, 0).unwrap())
+                .encode()
+                .unwrap(),
+        );
+        let answered = super::retained_answer(&mut frontend, &store, &health, CONNECTION, &request);
+        assert!(
+            answered.is_none(),
+            "a session this node has not projected was refused ahead of admission: {:?}",
+            answered.as_deref().map(decode_stream)
+        );
+        assert!(matches!(
+            frontend.on_frame(
+                &health,
+                MonotonicMillis::new(0),
+                CONNECTION,
+                &request,
+                &hub,
+                &policy(&store)
+            ),
+            Ingress::Action(Action::FanOut(_))
+        ));
+
+        // Projected and retired, the same question is refused from the
+        // record, under the request's own command.
+        let mut barriers = BarrierAllocator::new(incarnation, boot);
+        store
+            .submit(PersistBatch {
+                barrier: barriers.allocate(),
+                base: Some(store.application_base()),
+                updates: coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, false)
+                    .unwrap(),
+            })
+            .unwrap();
+        assert_eq!(store.flush().unwrap().committed, 1);
+        let refused = super::retained_answer(&mut frontend, &store, &health, CONNECTION, &request)
+            .expect("a retired session is refused");
+        let messages = decode_stream(&refused).unwrap();
+        let [MessageV1::Response(response)] = messages.as_slice() else {
+            panic!("not one response")
+        };
+        assert_eq!(response.command_id, command);
+        assert!(
+            matches!(&response.outcome, OutcomeV1::Err { code, .. }
+                if *code == coord_collector::codes::NOT_ADMITTED),
+            "{:?}",
+            response.outcome
+        );
+    }
 
     /// Held evidence registers when it is due to be let go.
     ///

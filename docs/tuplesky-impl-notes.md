@@ -2946,3 +2946,50 @@ age rule that is safe against the initial dial race, and that is left
 for later. The third test waits for voter 1 to see both planes' links
 go before voter 2 is restarted. Restarting sooner made it fail about one
 run in ten, when the answer arrived after its forty-five-second bound.
+
+## A session a replica has not projected yet is not a refused one
+
+A task-j09 follow-up. Ahead of admission, a frontend looks its durable
+record up for a retained answer (`Domain::retained`). It went through
+`retry::resolve`, which answers `NoSession` both when the session row is
+absent and when it is present and can no longer execute, and the
+frontend refused both as "the session may no longer execute". On a
+voter that has just restarted and is still catching up, a caller binds
+(the binding comes from a committed session-creation command) and asks
+at once, before this node has projected that command. The session exists
+and the request was refused. The multi-host test found it under load: it
+failed 2 to 3 times in 8 from task-d01 up.
+
+`resolve_retained` now draws the line `retry::resolve` does not. An
+absent row is `None`: the request goes on to admission, and execution
+decides it at its own position, as for any request with no record here.
+A present row is resolved as before, and one that is retired, or whose
+rule is disabled or regenerated, is still refused. `retry::resolve`
+itself is unchanged, and the binding check still precedes all of this,
+so an unbound or foreign caller never reaches it.
+
+Absent means "not yet" because a session row, once written, is never
+deleted within a cluster. That is an invariant of the planner, not of
+the types: `Mutation::SessionWrite` carries an `Option`, and
+`materialize` maps `None` to a delete. Every `SessionWrite` the planner
+makes carries a record, retirement is a flag on it, compaction does not
+touch `SessionV1`, and a local checkpoint carries every collection. A
+cross-cluster restore drops sessions, but those retry keys fail
+`WrongCluster` at admission. Were a row ever deleted, the request would
+reach admission and `retry::admit` would answer `UnknownSession`: a
+wasted replicated round trip, never a second execution.
+
+`serve::tests::a_session_this_node_has_not_projected_is_not_yet_and_a_retired_one_is_refused`
+makes the three states on a model store: no row, a live row, a retired
+row. With no row, `retry::resolve` alone says `NoSession` and the lookup
+says nothing. Without the absent-row check, the test fails at the first
+state.
+`serve::tests::a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`
+asks it the way a caller does. It binds a real frontend over a store with
+no session row, through the frontend's own establishment: the bind is
+held, and the session-creation outcome settles it. The bound caller then
+sends a put, and the lookup ahead of admission (`retained_answer`, which
+`Domain::retained` calls with its frontend and store) says nothing. The
+frontend admits the put. With the row written retired, the same put is
+refused `NOT_ADMITTED` under its own command id. Without the absent-row
+check, the first question is refused and the test fails.
