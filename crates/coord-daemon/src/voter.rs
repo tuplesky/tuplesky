@@ -121,6 +121,9 @@ pub struct Voter<P: Persistence> {
     pub admitted: u64,
     /// Local submissions refused at the door since boot (diagnostic).
     pub refused: u64,
+    /// Queued transitions refused because a higher ballot was promised
+    /// (diagnostic, task-d01).
+    pub fenced: u64,
 }
 
 impl<P: Persistence> Voter<P> {
@@ -152,6 +155,7 @@ impl<P: Persistence> Voter<P> {
             origins: alloc_map::Origins::new(ORIGINS),
             admitted: 0,
             refused: 0,
+            fenced: 0,
         }
     }
 
@@ -192,13 +196,124 @@ impl<P: Persistence> Voter<P> {
     /// follower's `NewLeader`, and a promise row turning durable
     /// (`PromiseOutcome::Promised`) -- and neither is surfaced to the
     /// voter, so a promise for a higher ballot would still be stamped
-    /// with the one this voter was built at. Nothing in this build sends
-    /// `NewLeader`, so that cannot happen yet; the work that wires leader
-    /// election into the daemon has to call this on every adopted ballot
-    /// (the task-j08 plan entry records it).
+    /// with the one this voter was built at. Since task-d01 every ballot
+    /// the voter adopts comes through here: its own campaign
+    /// ([`Voter::campaign`]), a candidate's `NewLeader` (before the promise
+    /// row is written, see [`Voter::on_peer`]), and any promise the
+    /// machine made by another path ([`Voter::follow_machine`]).
     pub fn set_ballot(&mut self, ballot: Ballot) {
         self.ballot = ballot;
         self.node.applier_mut().store_mut().follow_ballot(ballot);
+    }
+
+    /// Campaign for the next ballot, led by this voter (task-d01).
+    ///
+    /// The order is the whole of the wiring. The ballot moves first, so
+    /// the promise this voter makes itself is stamped with the ballot it
+    /// promises; the campaign then queues that promise and asks the other
+    /// voters for theirs; and the store is fenced at the new ballot last,
+    /// which refuses what was still queued under the old one -- work the
+    /// old leader's ballot can no longer make durable -- and keeps the
+    /// promise row. A leader does not campaign, and nor does a voter whose
+    /// ballot number cannot be advanced.
+    ///
+    /// Returns the ballot campaigned for, or `None` when there was nothing
+    /// to do.
+    pub fn campaign(&mut self) -> Result<Option<(Ballot, Outbound)>, DriveError> {
+        if self.leads() {
+            return Ok(None);
+        }
+        let highest = highest(self.ballot, self.node.machine().promised());
+        let Ok(ballot) = highest.successor(self.ingress.replica()) else {
+            return Ok(None);
+        };
+        let before = self.ballot;
+        self.set_ballot(ballot);
+        let mut out = self.node.campaign(ballot, &self.ballot)?;
+        if self.node.machine().promised() != ballot {
+            // The machine refused to campaign (it has not booted, or the
+            // ballot is not one it can lead): nothing was promised, so
+            // nothing moves.
+            self.set_ballot(before);
+            return Ok(None);
+        }
+        out.absorb(self.fence()?);
+        Ok(Some((ballot, out)))
+    }
+
+    /// Publish a selection this voter bound durably before it last
+    /// stopped (see [`Node::resume_campaign`]); the voter is already at
+    /// the decision's ballot.
+    pub fn resume_campaign(
+        &mut self,
+        decision: coord_consensus::SyncDecision,
+    ) -> Result<Outbound, DriveError> {
+        self.node.resume_campaign(decision, &self.ballot)
+    }
+
+    /// Bring a voter whose link has come back onto the ballot this voter
+    /// leads (task-d01): a `NewLeader` for it, which the voter promises if
+    /// it has not already, and the Sync follows when its promise arrives
+    /// (see [`Voter::on_peer`]).
+    ///
+    /// A campaign asks every voter once, and a voter that was away then
+    /// -- down, or cut off -- never heard it: it comes back still leading,
+    /// or still following, a ballot the domain has left, and nothing
+    /// else would tell it. Nothing to say for the genesis ballot, which
+    /// every voter starts at.
+    pub fn welcome(&self, replica: ReplicaId) -> Outbound {
+        let mut out = Outbound::default();
+        if self.leads() && self.node.won().is_some() && replica != self.ingress.replica() {
+            out.peer.push((
+                PeerId {
+                    replica,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                coord_consensus::ProtocolMessage::NewLeader {
+                    ballot: self.ballot,
+                }
+                .encode(),
+            ));
+        }
+        out
+    }
+
+    /// Follow the machine after a step: adopt any higher ballot it has
+    /// promised, and change role when it has won a campaign or been
+    /// deposed (task-d01).
+    ///
+    /// Every entry point that steps the machine ends here, so a ballot
+    /// the machine moved to by any path reaches the store, and the store
+    /// is fenced at it.
+    pub fn follow_machine(&mut self) -> Result<Outbound, DriveError> {
+        let mut out = Outbound::default();
+        let promised = self.node.machine().promised();
+        if higher(&promised, &self.ballot) {
+            self.set_ballot(promised);
+            out.absorb(self.fence()?);
+        }
+        if let Some(changed) = self.node.change_role(&self.ballot)? {
+            out.absorb(changed);
+        }
+        Ok(out)
+    }
+
+    /// Fence the store at this voter's ballot and feed back the queued
+    /// transitions it refused, so no barrier waits for ever on work the
+    /// old ballot can no longer make durable.
+    fn fence(&mut self) -> Result<Outbound, DriveError> {
+        let refused = self
+            .node
+            .applier_mut()
+            .store_mut()
+            .fence(self.ballot)
+            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+        let mut out = Outbound::default();
+        for event in refused {
+            self.fenced += 1;
+            out.absorb(self.node.on_storage(event, &self.ballot)?);
+        }
+        Ok(out)
     }
 
     /// Local submissions waiting for a turn.
@@ -228,15 +343,64 @@ impl<P: Persistence> Voter<P> {
     }
 
     /// An authenticated frame from a peer.
+    ///
+    /// A candidate's `NewLeader` for a ballot above this voter's is
+    /// adopted *before* the machine sees it (task-d01): the promise row
+    /// the machine queues in reply is stamped with the ballot the store
+    /// follows, and stamped with the old one it would be a promise
+    /// recorded under a ballot this voter was leaving, which the fence at
+    /// the new ballot refuses. If the machine does not promise after all
+    /// -- a guard it applies and this does not -- the ballot goes back.
     pub fn on_peer(
         &mut self,
         provenance: PeerProvenance,
         frame: Vec<u8>,
     ) -> Result<Outbound, DriveError> {
-        self.node.on_event(
+        let before = self.ballot;
+        let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
+        if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot }) = &message
+            && higher(ballot, &self.ballot)
+        {
+            self.set_ballot(*ballot);
+        }
+        // A voter this leader welcomed back (see [`Voter::welcome`]) has
+        // promised its ballot: it is sent the selection the ballot was won
+        // with, which it missed, and follows from there. A promise that
+        // arrives after the campaign is won and from a voter that did get
+        // the Sync is answered too; a second copy of the active ballot's
+        // Sync changes nothing.
+        let mut out = Outbound::default();
+        if let Some(coord_consensus::ProtocolMessage::Promise {
+            ballot, replica, ..
+        }) = &message
+            && *replica == provenance.from()
+            && *ballot == self.ballot
+            && self.leads()
+            && let Some(decision) = self.node.won()
+        {
+            out.peer.push((
+                PeerId {
+                    replica: *replica,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                coord_consensus::ProtocolMessage::Sync(decision.clone()).encode(),
+            ));
+        }
+        out.absorb(self.node.on_event(
             Event::Peer(AuthenticatedPeerMessage::new(provenance, frame)),
             &self.ballot,
-        )
+        )?);
+        if self.ballot != before {
+            if self.node.machine().promised() == self.ballot {
+                // Promised: what is still queued under the ballot this
+                // voter left is refused now, as for its own campaign.
+                out.absorb(self.fence()?);
+            } else {
+                self.set_ballot(before);
+            }
+        }
+        out.absorb(self.follow_machine()?);
+        Ok(out)
     }
 
     /// A submission a collector made, from `origin`.
@@ -338,7 +502,7 @@ impl<P: Persistence> Voter<P> {
 
     /// How many payload transfers a peer has answered this replica
     /// with.
-    pub const fn payloads_answered(&self) -> u64 {
+    pub fn payloads_answered(&self) -> u64 {
         self.node.payloads_answered()
     }
 
@@ -436,4 +600,15 @@ fn parse(bytes: &[u8]) -> Result<coord_types::wire_v1::Frame, WireError> {
     })?;
     reader.finish()?;
     Ok(frame)
+}
+
+/// Whether `a` is a higher ballot than `b` of the same epoch.
+fn higher(a: &Ballot, b: &Ballot) -> bool {
+    a.compare_same_epoch(b) == Some(core::cmp::Ordering::Greater)
+}
+
+/// The higher of two ballots of the same epoch; `a` if they are not
+/// comparable.
+fn highest(a: Ballot, b: Ballot) -> Ballot {
+    if higher(&b, &a) { b } else { a }
 }

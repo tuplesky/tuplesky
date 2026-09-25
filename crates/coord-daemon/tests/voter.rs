@@ -20,6 +20,7 @@ use coord_consensus::{
     LearningMode, ReplicaRole,
 };
 use coord_core::effect::{BootId, PeerId};
+use coord_core::event::PeerProvenance;
 use coord_core::outbox::BarrierAllocator;
 use coord_daemon::LocalIngress;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
@@ -543,6 +544,10 @@ fn a_local_submission_does_not_skip_the_durability_gate() {
 struct Stamped {
     inner: StoreWorker<ModelEngine>,
     ballot: Option<Ballot>,
+    /// The ballot each transition was submitted under, in order.
+    stamps: Vec<Option<Ballot>>,
+    /// Every ballot the store was fenced at, in order.
+    fences: Vec<Ballot>,
 }
 
 impl coord_storage::Persistence for Stamped {
@@ -568,6 +573,7 @@ impl coord_storage::Persistence for Stamped {
         batch: coord_core::effect::PersistBatch,
         kind: coord_storage::journaled::TransitionKind,
     ) -> Result<(), coord_storage::Refused> {
+        self.stamps.push(self.ballot);
         coord_storage::Persistence::submit(&mut self.inner, batch, kind)
     }
     fn lower(&mut self) -> Result<coord_storage::Lowered, coord_store_api::engine::EngineError> {
@@ -589,6 +595,203 @@ impl coord_storage::Persistence for Stamped {
     fn follow_ballot(&mut self, ballot: Ballot) {
         self.ballot = Some(ballot);
     }
+    fn fence(
+        &mut self,
+        promised: Ballot,
+    ) -> Result<Vec<coord_core::event::StorageEvent>, coord_store_api::engine::EngineError> {
+        self.fences.push(promised);
+        coord_storage::Persistence::fence(&mut self.inner, promised)
+    }
+}
+
+/// A booted voter over a [`Stamped`] store: replica `me`, the leader of
+/// the genesis ballot when `me` is 0 and a follower otherwise.
+fn stamped(me: u8) -> Voter<Stamped> {
+    let boot = BootId([7; 16]);
+    let mut worker =
+        StoreWorker::open(ModelEngine::new(), boot, inc(), GroupLimits::default()).unwrap();
+    let mut alloc = BarrierAllocator::new(inc(), boot);
+    let base = worker.application_base();
+    worker
+        .submit(coord_core::effect::PersistBatch {
+            barrier: alloc.allocate(),
+            base: Some(base),
+            updates: bootstrap_updates(),
+        })
+        .unwrap();
+    worker.flush().unwrap();
+    let applier = Applier::new(
+        Stamped {
+            inner: worker,
+            ballot: None,
+            stamps: Vec::new(),
+            fences: Vec::new(),
+        },
+        alloc,
+    )
+    .unwrap();
+    let bootstrapped =
+        coord_storage::Persistence::application_base(applier.store()).execution_position;
+    let machine = if me == 0 {
+        let mut leader = Leader::new(
+            LeaderConfig {
+                identity: identity(0),
+                quorum: quorum(),
+                genesis: ballot(),
+                frontend: FRONTEND,
+                capacity: 64,
+            },
+            None,
+            bootstrapped,
+        );
+        leader.set_learning(LearningMode::Full);
+        Machine::Leader(Box::new(leader))
+    } else {
+        let mut follower = Follower::new(FollowerConfig {
+            identity: identity(me),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        })
+        .restore_execution(bootstrapped, []);
+        follower.set_learning(LearningMode::Full);
+        Machine::Follower(Box::new(follower))
+    };
+    let node = Node::new(machine, applier, FRONTEND);
+    let ingress = Ingress::new(
+        &membership(),
+        r(me),
+        PeerRole::Frontend,
+        IngressBudget::default(),
+    )
+    .expect("a committed voter");
+    let mut voter = Voter::new(node, ingress, (CLUSTER, DOMAIN), ballot());
+    voter.boot(boot, inc()).expect("boot");
+    voter
+}
+
+/// A `NewLeader` for `ballot`, as its candidate sends it.
+fn new_leader(voter: &mut Voter<Stamped>, from: u8, ballot: Ballot) -> coord_daemon::Outbound {
+    voter
+        .on_peer(
+            PeerProvenance::from_local_voter(r(from), inc()),
+            coord_consensus::ProtocolMessage::NewLeader { ballot }.encode(),
+        )
+        .expect("stepped")
+}
+
+/// The peer messages in `out`, decoded, with who they are for.
+fn messages(out: &coord_daemon::Outbound) -> Vec<(ReplicaId, coord_consensus::ProtocolMessage)> {
+    out.peer
+        .iter()
+        .filter_map(|(to, bytes)| {
+            coord_consensus::ProtocolMessage::decode(bytes)
+                .ok()
+                .map(|m| (to.replica, m))
+        })
+        .collect()
+}
+
+/// A voter's own campaign records its promise under the ballot it
+/// campaigns for, fences the store there, and asks every other voter
+/// (task-d01).
+///
+/// The order is what is under test. A promise row stamped with the
+/// ballot the voter was leaving is a promise recorded under a ballot it
+/// had already given up, and the fence at the new ballot then refuses it
+/// as obsolete -- a campaign that can never finish.
+#[test]
+fn a_campaign_records_its_promise_under_the_ballot_it_campaigns_for() {
+    let mut voter = stamped(1);
+    let (campaigned, out) = voter
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    assert_eq!(campaigned.leader, r(1));
+    assert!(campaigned.number > ballot().number);
+    assert_eq!(voter.ballot(), campaigned);
+    let store = voter.node().applier().store();
+    assert_eq!(store.stamps.last(), Some(&Some(campaigned)));
+    assert_eq!(store.fences, vec![campaigned]);
+    let asked: Vec<ReplicaId> = messages(&out)
+        .into_iter()
+        .filter(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::NewLeader { ballot } if *ballot == campaigned))
+        .map(|(to, _)| to)
+        .collect();
+    assert_eq!(asked, vec![r(0), r(2)]);
+    // A leader does not campaign against itself.
+    assert!(stamped(0).campaign().expect("stepped").is_none());
+}
+
+/// A candidate's `NewLeader` is promised under the candidate's ballot,
+/// and the promise goes back to it (task-d01).
+#[test]
+fn a_candidates_ballot_is_adopted_before_its_promise_is_recorded() {
+    let mut voter = stamped(2);
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    let out = new_leader(&mut voter, 1, candidate);
+    assert_eq!(voter.ballot(), candidate);
+    let store = voter.node().applier().store();
+    assert_eq!(store.stamps.last(), Some(&Some(candidate)));
+    assert_eq!(store.fences, vec![candidate]);
+    assert!(
+        messages(&out).iter().any(|(to, m)| *to == r(1)
+            && matches!(m, coord_consensus::ProtocolMessage::Promise { ballot, .. } if *ballot == candidate)),
+        "no promise went back to the candidate: {:?}",
+        messages(&out)
+    );
+}
+
+/// A `NewLeader` the machine does not promise leaves the voter's ballot
+/// where it was: adopting it early is only for the promise it is about to
+/// record (task-d01).
+#[test]
+fn a_new_leader_the_machine_refuses_moves_nothing() {
+    let mut voter = stamped(2);
+    // Sent by replica 1 in replica 0's name: the machine refuses it.
+    let forged = Ballot {
+        epoch: epoch(),
+        number: 5,
+        leader: r(0),
+    };
+    let out = new_leader(&mut voter, 1, forged);
+    assert_eq!(voter.ballot(), ballot());
+    let store = voter.node().applier().store();
+    assert_eq!(store.ballot, Some(ballot()));
+    assert!(store.fences.is_empty());
+    assert!(out.peer.is_empty());
+}
+
+/// A leader that promises a higher ballot steps down in place: the same
+/// voter, store and outbox, following the candidate (task-d01).
+#[test]
+fn a_leader_that_promises_a_higher_ballot_follows_it() {
+    let mut voter = stamped(0);
+    assert!(voter.leads());
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(2),
+    };
+    let out = new_leader(&mut voter, 2, candidate);
+    assert!(!voter.leads(), "the deposed leader still leads");
+    assert!(matches!(voter.node().machine(), Machine::Follower(_)));
+    assert_eq!(voter.ballot(), candidate);
+    assert!(
+        messages(&out)
+            .iter()
+            .any(|(to, m)| *to == r(2)
+                && matches!(m, coord_consensus::ProtocolMessage::Promise { .. })),
+        "{:?}",
+        messages(&out)
+    );
+    // And it welcomes nobody: it leads no ballot.
+    assert!(voter.welcome(r(1)).peer.is_empty());
 }
 
 /// What the store stamps on a transition is the ballot the machine is
@@ -618,6 +821,8 @@ fn the_store_records_under_the_ballot_the_voter_is_at() {
         Stamped {
             inner: worker,
             ballot: None,
+            stamps: Vec::new(),
+            fences: Vec::new(),
         },
         alloc,
     )
