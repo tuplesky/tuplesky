@@ -5373,10 +5373,11 @@ async fn until_past(unix: u64) {
 /// node reports the failed attempt, retries, and renews when the issuer
 /// answers. The renewed leaf is on disk under the same key with a later
 /// `notAfter`, so a restart would come back on it. A caller that bound
-/// before the renewal is still served after the old leaf's `notAfter`,
-/// and a caller arriving after that instant can connect at all -- which
-/// it cannot to a node still presenting the old leaf, because its
-/// handshake checks the server certificate's validity.
+/// before the renewal was authenticated under the old leaf, and the node
+/// ends that connection at the old leaf's `notAfter` -- no connection
+/// outlives the leaf this end presented on it -- while a caller arriving
+/// after that instant connects and is served under the renewed one,
+/// which it could not be by a node still presenting the old leaf.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
     let dir = workspace("renew");
@@ -5422,23 +5423,30 @@ async fn a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on() {
         "{new_not_after} <= {old_not_after}"
     );
 
-    // Past the old leaf's end: the caller that connected before the
-    // renewal is still connected and still served...
-    until_past(old_not_after + 1).await;
+    // Served before the old leaf's end...
     let answer = ask(&early.connection, &early.put(1, b"k", b"v"))
         .await
-        .unwrap_or_else(|| {
-            panic!(
-                "a caller connected before the renewal was not served after it:\n{}",
-                daemon.said()
-            )
-        });
+        .expect("a caller connected before the renewal is served inside the old leaf's life");
     assert!(matches!(
         response_of(&answer).outcome,
         coord_types::wire_v1::OutcomeV1::Ok { .. }
     ));
-    // ...and a new one can connect, which it could not to a node still
-    // presenting the old leaf.
+    // ...and closed at it: that connection was authenticated under the
+    // old leaf, and nothing is carried under a leaf past its end.
+    until_past(old_not_after + 1).await;
+    match early.connection.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(close)) => assert_eq!(
+            close.error_code,
+            quinn::VarInt::from_u32(coord_transport::CloseCode::Expired as u32),
+            "closed for something other than the leaf's end"
+        ),
+        other => panic!(
+            "a connection outlived the leaf it was authenticated under: {other:?}\n{}",
+            daemon.said()
+        ),
+    }
+    // A caller arriving now connects under the renewed leaf, which it
+    // could not to a node still presenting the old one.
     let late = Caller::bind(&daemon, &ca, &ring, [0x52; 16]).await;
     let answer = ask(&late.connection, &late.range(1, b"k"))
         .await
@@ -5534,6 +5542,73 @@ async fn with_the_issuer_down_a_node_serves_to_its_deadline_and_stops_there() {
         "the refusal did not say the leaf is not valid: {}",
         restarted.err
     );
+}
+
+/// A node that does not renew stops at its leaf's end the same way one
+/// that renews does (task-d02; design Sections 10.4, 20.4): the same
+/// exit status and the same quarantine reason, so an operator watches for
+/// one signal whatever the configuration. Before it stops, its transport
+/// has already ended the connection it accepted under that leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_does_not_renew_stops_at_its_leafs_end_like_one_that_does() {
+    let dir = workspace("no-renewal");
+    let (ca, ring, path, not_after) = short_lived_voter(&dir, 12);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+
+    let mut daemon = start(&path);
+    let report = daemon.out.lock().expect("not poisoned").clone();
+    assert!(
+        report.contains("renewal not-configured")
+            && report.contains(&format!("expires_at={not_after}")),
+        "the startup report does not say when this leaf ends:\n{report}"
+    );
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x54; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("a node inside its leaf's life serves");
+    assert!(matches!(
+        response_of(&answer).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a node without renewal kept serving past its leaf's end:\n{}",
+            daemon.said()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        unix_now() >= not_after,
+        "the node stopped before its leaf's end"
+    );
+    assert_eq!(status.code(), Some(2), "{}", daemon.said());
+    assert!(
+        daemon.waits_until(5, |said| said.contains("reason=credential-expired")),
+        "{}",
+        daemon.said()
+    );
+    let said = daemon.said();
+    assert!(said.contains("phase=quarantined"), "{said}");
+    assert!(
+        said.contains(&format!("renewal not-configured expires_at={not_after}:")),
+        "{said}"
+    );
+    // The caller's connection went with the leaf, not with the process:
+    // it was closed as expired, which a process that merely exited would
+    // not have said.
+    match caller.connection.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(close)) => assert_eq!(
+            close.error_code,
+            quinn::VarInt::from_u32(coord_transport::CloseCode::Expired as u32)
+        ),
+        other => panic!("the caller's connection ended for {other:?}"),
+    }
 }
 
 /// The renewed leaf of one voter of three is admitted by its peers as a

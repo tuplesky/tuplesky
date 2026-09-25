@@ -833,6 +833,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Every node stops serving at its leaf's end, renewing or not
+    // (task-d02). Where nothing renews it, the end is fixed here.
+    let leaf_expires_at = credential.leaf.expires_at;
     let renewing = match &config.renewal {
         Some(section) => {
             let enroller = match enroll::Enroller::new(
@@ -1144,17 +1147,20 @@ fn main() -> ExitCode {
         // checked at the top of each pass: a pass can wait inside itself
         // on a slow caller, and a node must not go on serving on a leaf
         // past its notAfter while it does (task-d02).
-        match domain.leaf_deadline() {
-            Some(deadline) => {
-                let expired = tokio::select! {
-                    () = domain.run(&mut transport, now_seconds) => false,
-                    () = serve::leaf_expired(deadline) => true,
-                };
-                if expired {
-                    domain.leaf_expired_while_serving();
-                }
-            }
-            None => domain.run(&mut transport, now_seconds).await,
+        //
+        // Every node, not only one that renews: a node without renewal
+        // stops at its leaf's end instead of half-serving past it -- its
+        // transports already refuse every handshake and end every
+        // connection there, so what would be left is a process that
+        // cannot reach anyone (design Sections 10.4, 20.4).
+        let (_fixed, deadline) = tokio::sync::watch::channel(leaf_expires_at.saturating_mul(1000));
+        let deadline = domain.leaf_deadline().unwrap_or(deadline);
+        let raced = tokio::select! {
+            () = domain.run(&mut transport, now_seconds) => false,
+            () = serve::leaf_expired(deadline) => true,
+        };
+        if raced {
+            domain.leaf_expired_while_serving();
         }
         eprintln!(
             "peers connected={} submittable={}",
@@ -1197,23 +1203,30 @@ crowded_out={}",
             counts.unclaimed,
             counts.crowded_out
         );
-        if let Some(r) = domain.renewal() {
+        let renewal = domain.renewal();
+        if let Some(r) = renewal {
             eprintln!(
                 "renewal renewed={} attempts={} failed={} expires_at={} expired={}",
                 r.renewed, r.attempts, r.failed, r.expires_at, r.expired
             );
-            // Not a fault of the store and not a crash: the credential
-            // this node is has ended. The process stops rather than serve
-            // on it, and says why in the phase an operator watches.
-            if r.expired {
-                let mut lifecycle = lifecycle;
-                lifecycle.quarantine(QuarantineReason::CredentialExpired);
-                eprintln!(
-                    "coordd phase={} reason=credential-expired",
-                    Diagnostics::snapshot(&roles, &lifecycle, 0).phase
-                );
-                return ExitCode::from(2);
-            }
+        } else if raced {
+            eprintln!(
+                "renewal not-configured expires_at={leaf_expires_at}: this node's leaf is no \
+                 longer valid and it stops serving on it; restart it on a renewed leaf"
+            );
+        }
+        // Not a fault of the store and not a crash: the credential this
+        // node is has ended. The process stops rather than serve on it,
+        // and says why in the phase an operator watches -- the same
+        // signal whether or not anything was renewing it.
+        if raced || renewal.is_some_and(|r| r.expired) {
+            let mut lifecycle = lifecycle;
+            lifecycle.quarantine(QuarantineReason::CredentialExpired);
+            eprintln!(
+                "coordd phase={} reason=credential-expired",
+                Diagnostics::snapshot(&roles, &lifecycle, 0).phase
+            );
+            return ExitCode::from(2);
         }
         ExitCode::from(1)
     })
