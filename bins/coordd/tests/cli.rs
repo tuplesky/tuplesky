@@ -958,6 +958,40 @@ impl Running {
     fn said(&self) -> String {
         self.said.lock().expect("not poisoned").clone()
     }
+
+    /// Wait up to `seconds` for what it has said to satisfy `test`.
+    fn waits_until(&self, seconds: u64, test: impl Fn(&str) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+        while std::time::Instant::now() < deadline {
+            if test(&self.said.lock().expect("not poisoned")) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+}
+
+/// The counts a daemon reported on its lines starting `prefix`, in order:
+/// `peers connected=` or `voters submittable=`, each followed by `N of M`.
+fn reported(said: &str, prefix: &str) -> Vec<usize> {
+    said.lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .filter_map(|rest| rest.split(' ').next()?.parse().ok())
+        .collect()
+}
+
+/// Whether a daemon's `prefix` count reached `full`, fell below it, and
+/// came back to it: a link lost and dialled again.
+fn healed(said: &str, prefix: &str, full: usize) -> bool {
+    let counts = reported(said, prefix);
+    let Some(up) = counts.iter().position(|n| *n == full) else {
+        return false;
+    };
+    let Some(down) = counts[up..].iter().position(|n| *n < full) else {
+        return false;
+    };
+    counts[up + down..].contains(&full)
 }
 
 impl Drop for Running {
@@ -969,11 +1003,18 @@ impl Drop for Running {
 
 /// Start `coordd` and leave it serving.
 fn start(config: &Path) -> Running {
+    start_with(config, &[])
+}
+
+/// Start `coordd` with `env` added to its environment and leave it
+/// serving.
+fn start_with(config: &Path, env: &[(&str, &str)]) -> Running {
     use std::io::{BufRead, BufReader};
 
     let mut child = Command::new(binary())
         .arg("--config")
         .arg(config)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4860,4 +4901,171 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
             s
         );
     }
+}
+
+/// Links a connection's age cap ends are dialled again, on both planes,
+/// with no restart (task-d03).
+///
+/// The transport ends every connection at its age cap, twelve hours by
+/// default and shortened here to three seconds. Dialled only when the
+/// serving loop started, a mesh had no way back from that but restarting
+/// its nodes: half a day after start the domain went quiet. Each voter
+/// here loses every link it holds, on the peer plane and on the api
+/// plane it submits over, and holds them all again -- and a request
+/// asked after the caps have run is established by all three.
+#[tokio::test(flavor = "multi_thread")]
+async fn links_the_age_cap_ends_are_dialled_again_on_both_planes() {
+    let dir = workspace("age-cap");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster
+        .configs
+        .iter()
+        .map(|c| start_with(c, &[("COORDD_TEST_CONNECTION_AGE_MS", "3000")]))
+        .collect();
+    for (n, node) in running.iter().enumerate() {
+        assert!(
+            node.waits_until(40, |said| healed(said, "peers connected=", 2)
+                && healed(said, "voters submittable=", 2)),
+            "voter {} did not get its links back after the age cap ended them:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x4d; 16]).await;
+    let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the healed mesh did not establish a request\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said(),
+                running[2].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&answer).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}
+
+/// A voter that is stopped and started again is dialled again by the
+/// ones that stayed up, on both planes (task-d03).
+///
+/// The restarted voter dials its peers itself when it starts, which
+/// brings its peer-plane links back from its own end. Its *collector*
+/// links from the others are what nobody restored: an inbound collector
+/// connection carries no replica identity, so the restarted voter's own
+/// dials do not make it submittable from the survivors. They have to
+/// dial it, and before this they never did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_voter_is_dialled_again_by_the_survivors() {
+    let dir = workspace("restart-voter");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    // Voter 3 goes away, and the survivors see it go. Killed, it closes
+    // nothing, so its links end at the transport's idle timeout.
+    drop(running.pop());
+    for node in &running {
+        assert!(
+            node.waits_until(50, |said| reported(said, "voters submittable=").last()
+                == Some(&1)),
+            "a survivor did not see voter 3 go:\n{}",
+            node.said()
+        );
+    }
+    running.push(start(&cluster.configs[2]));
+    for (n, node) in running.iter().take(2).enumerate() {
+        assert!(
+            node.waits_until(30, |said| healed(said, "voters submittable=", 2)
+                && reported(said, "peers connected=").last() == Some(&2)),
+            "survivor {} did not dial the restarted voter again:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+}
+
+/// A submission made while the voters it needs were unreachable is
+/// delivered when they come back, by its re-offer, and the caller gets
+/// its answer without asking again (task-d03).
+///
+/// Voter 1 is left alone: a put it takes cannot be established, because
+/// a majority is two. Voter 2 then comes back. Voter 1 has to dial it --
+/// its collector link to voter 2 died with voter 2 -- and the re-offer
+/// that was backing off has to go out when the link returns. Without the
+/// re-dial the caller waits for ever: voter 2's own dials give it a
+/// peer-plane link to voter 1, never a submission link from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_submission_made_while_its_voters_were_away_is_delivered_when_they_return() {
+    let dir = workspace("reoffer-return");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    // The session is bound while a majority is there: binding is itself
+    // a replicated command.
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x4e; 16]).await;
+    drop(running.pop());
+    drop(running.pop());
+    // Both planes, not only the submission links. A peer-plane link voter
+    // 1 dialled itself outlives the killed voter until the idle timeout,
+    // and while it is held a restarted voter 2's own dials lose the
+    // collision to it: the surviving connection is the one the lower
+    // replica identity dialled. Restarted inside that window, voter 2
+    // would reach the peer plane only when the stale link ended, which is
+    // the transport's idle timeout and not this test's subject.
+    assert!(
+        running[0].waits_until(50, |said| reported(said, "voters submittable=").last()
+            == Some(&0)
+            && reported(said, "peers connected=").last() == Some(&0)),
+        "voter 1 did not see the others go:\n{}",
+        running[0].said()
+    );
+
+    let put = caller.put(1, b"k", b"v");
+    let connection = caller.connection.clone();
+    let asked = tokio::spawn(async move { ask(&connection, &put).await });
+    // Long enough for the offer to voter 2 to have failed and backed off.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!asked.is_finished(), "a lone voter answered a put");
+
+    let back = start(&cluster.configs[1]);
+    let returned = std::time::Instant::now();
+    let answer = asked.await.expect("the ask ran").unwrap_or_else(|| {
+        panic!(
+            "the submission was never delivered to the returning voter\n-- 1 --\n{}\n-- 2 --\n{}",
+            running[0].said(),
+            back.said()
+        )
+    });
+    eprintln!(
+        "answered {:?} after voter 2 was serving again",
+        returned.elapsed()
+    );
+    eprintln!("-- 1 --\n{}\n-- 2 --\n{}", running[0].said(), back.said());
+    assert!(matches!(
+        response_of(&answer).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
 }

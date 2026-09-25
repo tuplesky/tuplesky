@@ -387,6 +387,8 @@ pub struct PeerPlane {
     /// The control and bulk counts last reported on stderr, so the report is
     /// repeated when it changes and not on every connection event.
     reported: Option<(usize, usize)>,
+    /// When each voter is dialled again after the first time (task-d03).
+    redial: crate::redial::Redial,
 }
 
 impl PeerPlane {
@@ -397,6 +399,8 @@ impl PeerPlane {
         me: coord_types::ids::ReplicaIncarnation,
         peers: Vec<crate::peers::Peer>,
     ) -> Self {
+        let redial =
+            crate::redial::Redial::new(peers.iter().map(|p| crate::redial::salt(&p.replica.0)));
         PeerPlane {
             transport,
             domain,
@@ -404,6 +408,7 @@ impl PeerPlane {
             peers,
             dialled: (0, 0),
             reported: None,
+            redial,
         }
     }
 
@@ -464,88 +469,6 @@ impl PeerPlane {
         self.transport.linked(peer.replica, peer.incarnation, lane)
     }
 
-    /// Try every voter not currently connected.
-    ///
-    /// The identity expected on the other end is the committed one, so a
-    /// certificate that is not this domain's voter at its committed
-    /// incarnation fails the handshake rather than becoming a peer. That
-    /// is the whole of what an address is trusted for.
-    pub async fn dial_missing(&mut self) {
-        // A voter's lanes are control and bulk; a unary lane is a
-        // collector's or a client's. Both are dialled, because both are
-        // used: what the protocol needs to make progress goes down the
-        // control lane, and a replica fetching the content of commands
-        // it missed moves whole payloads down the bulk one, which is
-        // what keeps catching up from starving the thing it is catching
-        // up with.
-        //
-        // Reachability stays the control lane's. A voter this node can
-        // vote with is reachable whether or not its bulk lane is up
-        // yet, and counting bulk would report a cluster that cannot
-        // form when what is actually true is that nobody has needed to
-        // catch up.
-        self.dial_lane(coord_transport::Lane::Control, true).await;
-        self.dial_lane(coord_transport::Lane::Bulk, false).await;
-    }
-
-    /// Dial every voter whose `lane` this node is not holding.
-    async fn dial_lane(&mut self, lane: coord_transport::Lane, counted: bool) {
-        let missing: Vec<crate::peers::Peer> = self
-            .peers
-            .iter()
-            .filter(|p| !self.holds_lane(p, lane))
-            .cloned()
-            .collect();
-        if counted {
-            self.dialled.0 += missing.len() as u64;
-        }
-        let transport = &self.transport;
-        let me = self.me;
-        let reached = concurrently(
-            missing
-                .iter()
-                .map(|peer| {
-                    boxed(dial(
-                        transport,
-                        peer,
-                        Some(me),
-                        coord_types::wire_v1::PeerRole::Voter,
-                        lane,
-                    ))
-                })
-                .collect(),
-        )
-        .await;
-        for (peer, outcome) in missing.iter().zip(reached) {
-            match outcome {
-                Ok(_) => {
-                    if counted {
-                        self.dialled.1 += 1;
-                    }
-                }
-                // Not a failure of anything: a voter this process cannot
-                // reach right now contributes no evidence and nothing
-                // else. It is reported because an operator wants to see
-                // a cluster that cannot form, and retried on the next
-                // occasion.
-                //
-                // Unless the link is held anyway. Both ends dial, one of
-                // the two connections loses the collision and is closed,
-                // and whichever end dialled it sees an error for a link
-                // it now has: reporting that as unreachable would make
-                // an ordinary mesh look broken.
-                Err(e) => {
-                    if counted && !self.holds_lane(peer, lane) {
-                        eprintln!(
-                            "cannot reach voter {} on the peer plane: {e:?}",
-                            hex4(&peer.replica)
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     /// Queue one protocol frame for a voter.
     fn send(
         &self,
@@ -601,15 +524,42 @@ pub struct CollectorLinks {
     peers: Vec<crate::peers::Peer>,
     /// Dials attempted and dials that reached a voter (diagnostic).
     pub dialled: (u64, u64),
+    /// The count last reported on stderr (see [`PeerPlane`]'s report).
+    reported: Option<usize>,
+    /// When each voter is dialled again after the first time (task-d03).
+    redial: crate::redial::Redial,
 }
 
 impl CollectorLinks {
     /// Links to `peers`, none of them held yet.
     pub fn new(peers: Vec<crate::peers::Peer>) -> Self {
+        let redial =
+            crate::redial::Redial::new(peers.iter().map(|p| crate::redial::salt(&p.replica.0)));
         CollectorLinks {
             peers,
             dialled: (0, 0),
+            reported: None,
+            redial,
         }
+    }
+
+    /// Say on stderr how many voters this process can submit to, when
+    /// that differs from what it last said.
+    fn report(&mut self, api: &Transport) {
+        if self.peers.is_empty() {
+            return;
+        }
+        let reachable = self.reachable(api);
+        if self.reported == Some(reachable) {
+            return;
+        }
+        self.reported = Some(reachable);
+        eprintln!(
+            "voters submittable={} of {} attempts={}",
+            reachable,
+            self.peers.len(),
+            self.dialled.0
+        );
     }
 
     /// Voters currently reachable for a submission: those whose unary
@@ -621,58 +571,6 @@ impl CollectorLinks {
     /// Whether this process holds a submission link to `peer`.
     fn holds(api: &Transport, peer: &crate::peers::Peer) -> bool {
         api.linked(peer.replica, peer.incarnation, coord_transport::Lane::Unary)
-    }
-
-    /// How many voters this process must reach to submit to all of them.
-    pub fn len(&self) -> usize {
-        self.peers.len()
-    }
-
-    /// Try every voter not currently linked.
-    ///
-    /// A voter this process cannot reach contributes nothing to a
-    /// submission and fails nothing: the quorum rule decides what that
-    /// costs. So a failed dial is reported and retried, never an error.
-    pub async fn dial_missing(&mut self, api: &Transport) {
-        let missing: Vec<crate::peers::Peer> = self
-            .peers
-            .iter()
-            .filter(|p| !Self::holds(api, p))
-            .cloned()
-            .collect();
-        self.dialled.0 += missing.len() as u64;
-        // A submission is unary work, on the lane a collector is
-        // granted: a bulk transfer or a watch backlog cannot delay it,
-        // and a voter's own control traffic is a different lane on a
-        // different plane.
-        let reached = concurrently(
-            missing
-                .iter()
-                .map(|peer| {
-                    boxed(dial(
-                        api,
-                        peer,
-                        None,
-                        coord_types::wire_v1::PeerRole::Frontend,
-                        coord_transport::Lane::Unary,
-                    ))
-                })
-                .collect(),
-        )
-        .await;
-        for (peer, outcome) in missing.iter().zip(reached) {
-            match outcome {
-                Ok(_) => self.dialled.1 += 1,
-                Err(e) => {
-                    if !Self::holds(api, peer) {
-                        eprintln!(
-                            "cannot reach voter {} to submit to it: {e:?}",
-                            hex4(&peer.replica)
-                        );
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -744,6 +642,35 @@ pub struct Domain<P: Persistence> {
     /// node so the journal and materialization points record into the
     /// same cells the snapshot reads.
     recorder: std::sync::Arc<coord_daemon::metrics::Recorder>,
+    /// Dials out after the first ones, one task each (task-d03). A dial is
+    /// mostly waiting -- an absent voter costs a whole handshake timeout
+    /// -- so it runs beside the loop rather than inside it, and ends with
+    /// the domain: a set aborts what it still holds when it is dropped.
+    dials: tokio::task::JoinSet<Dialled>,
+    /// Which plane and voter each dial in `dials` is for, so one that
+    /// ends without an answer still frees its voter's schedule.
+    dialling: BTreeMap<tokio::task::Id, (Plane, usize)>,
+}
+
+/// The two planes a voter is dialled on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plane {
+    /// The peer plane, as a voter.
+    Peer,
+    /// The api plane, as this domain's collector.
+    Collector,
+}
+
+/// How one dial out ended.
+struct Dialled {
+    plane: Plane,
+    /// The voter's place in its plane's list.
+    index: usize,
+    /// Whether the connection it opened was registered; on the peer plane,
+    /// the control lane's.
+    reached: bool,
+    /// Why not, when it was not.
+    error: Option<String>,
 }
 
 /// The stages this daemon has an instrumentation point for (task-61).
@@ -1087,6 +1014,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             no_plane_said: false,
             recurring: Recurring::default(),
             started: std::time::Instant::now(),
+            dials: tokio::task::JoinSet::new(),
+            dialling: BTreeMap::new(),
             peer_streak: 0,
             budgets,
             recorder,
@@ -1220,39 +1149,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// own turn -- its timers, its peers, its recovery -- so the loop
     /// only waits on a socket once the voter has nothing left to do.
     pub async fn run(&mut self, transport: &mut Transport, clock: impl Fn() -> u64) {
-        // Reach the other voters before serving. A submission that
-        // arrived first would still be correct -- an unreachable voter
-        // contributes nothing and the quorum rule decides -- but it
-        // would need the peers to answer it, and they are not there yet.
-        //
-        // Both planes at once: an absent voter costs a handshake
-        // timeout on each, and waiting out one plane's before starting
-        // the other's would make a process that is merely waiting look
-        // like one that cannot start.
-        let Domain { plane, links, .. } = self;
-        tokio::join!(
-            async {
-                if let Some(plane) = plane {
-                    plane.dial_missing().await;
-                    plane.report();
-                }
-            },
-            // The links this domain's collector submits over, which go
-            // to a different listener: the voters answer a submission
-            // with evidence, and evidence is the collector's to count,
-            // not a peer's to process.
-            async {
-                links.dial_missing(transport).await;
-                if links.len() > 0 {
-                    eprintln!(
-                        "voters submittable={} of {} attempts={}",
-                        links.reachable(transport),
-                        links.len(),
-                        links.dialled.0
-                    );
-                }
-            },
-        );
+        // Reach the other voters. The first dials are the re-dial
+        // schedule's, due at once, and go out on the loop's first pass
+        // as tasks of their own (task-d03): serving does not wait for
+        // them. It used to. Every absent voter then cost a whole
+        // handshake timeout per lane before this node served anything,
+        // so a voter restarted while another was down sat ten seconds
+        // deaf to the domain it had come back to -- and a submission
+        // arriving first was always correct anyway, since an unreachable
+        // voter contributes nothing and the quorum rule decides.
+        let now = std::time::Instant::now();
+        if let Some(plane) = &mut self.plane {
+            plane.redial.start(now);
+        }
+        self.links.redial.start(now);
         loop {
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
@@ -1276,6 +1186,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // so the collector's next due re-offer is registered as a
             // deadline (`Reoffers`) and the loop wakes for it.
             self.reoffer(transport);
+            // A link that went down is dialled again, and one that came
+            // back lets what was waiting for it go (task-d03).
+            self.redial(transport);
             // Two planes and one voter. The peer plane is polled first:
             // a vote, an adoption or a recovery summary from a peer is
             // the work that lets a caller's request finish, and a
@@ -1338,6 +1251,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     event = transport.next_event() => event.map(Arrived::Api),
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                    Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
+                        self.dialled(done);
+                        continue;
+                    }
                     () = sleep, if wake.is_some() => continue,
                 }
             } else {
@@ -1347,6 +1264,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                     event = transport.next_event() => event.map(Arrived::Api),
+                    Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
+                        self.dialled(done);
+                        continue;
+                    }
                     () = sleep, if wake.is_some() => continue,
                 }
             };
@@ -1360,6 +1281,149 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     self.on_peer_plane(transport, event);
                 }
                 None => return,
+            }
+        }
+    }
+
+    /// Keep both planes' links to the other voters up (task-d03).
+    ///
+    /// Looks at which voters a connection is holding, starts the dials the
+    /// schedule says are due, and tells the collector about a voter whose
+    /// submission link has come back, so what it is owed goes on the next
+    /// pass rather than at the backed-off time it had reached. Cheap when
+    /// nothing is due: a look at a handful of links.
+    fn redial(&mut self, api: &Transport) {
+        let now = std::time::Instant::now();
+        if let Some(plane) = &mut self.plane {
+            for i in 0..plane.peers.len() {
+                let held = plane.holds(&plane.peers[i]);
+                plane.redial.observe(i, held, now);
+            }
+            for i in plane.redial.due(now) {
+                let peer = plane.peers[i].clone();
+                // Only the lanes that are down: a bulk lane still up is
+                // not dialled again because the control lane went.
+                let lanes: Vec<coord_transport::Lane> =
+                    [coord_transport::Lane::Control, coord_transport::Lane::Bulk]
+                        .into_iter()
+                        .filter(|lane| !plane.holds_lane(&peer, *lane))
+                        .collect();
+                plane.dialled.0 += 1;
+                let dialer = plane.transport.dialer();
+                let me = plane.me;
+                let task = self.dials.spawn(async move {
+                    let mut outcome = Dialled {
+                        plane: Plane::Peer,
+                        index: i,
+                        reached: true,
+                        error: None,
+                    };
+                    for lane in lanes {
+                        let result = dial(
+                            &dialer,
+                            &peer,
+                            Some(me),
+                            coord_types::wire_v1::PeerRole::Voter,
+                            lane,
+                        )
+                        .await;
+                        if let Err(e) = result
+                            && lane == coord_transport::Lane::Control
+                        {
+                            outcome.reached = false;
+                            outcome.error = Some(format!("{e:?}"));
+                        }
+                    }
+                    outcome
+                });
+                self.dialling.insert(task.id(), (Plane::Peer, i));
+            }
+            plane.report();
+        }
+        let links = &mut self.links;
+        for i in 0..links.peers.len() {
+            let held = CollectorLinks::holds(api, &links.peers[i]);
+            if links.redial.observe(i, held, now) == crate::redial::Change::Returned {
+                let replica = links.peers[i].replica;
+                let at = MonotonicMillis::new(
+                    u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                self.frontend
+                    .frontend
+                    .dispatcher_mut()
+                    .reachable_again(&replica, at);
+            }
+        }
+        for i in links.redial.due(now) {
+            let peer = links.peers[i].clone();
+            links.dialled.0 += 1;
+            let dialer = api.dialer();
+            let task = self.dials.spawn(async move {
+                let result = dial(
+                    &dialer,
+                    &peer,
+                    None,
+                    coord_types::wire_v1::PeerRole::Frontend,
+                    coord_transport::Lane::Unary,
+                )
+                .await;
+                Dialled {
+                    plane: Plane::Collector,
+                    index: i,
+                    reached: result.is_ok(),
+                    error: result.err().map(|e| format!("{e:?}")),
+                }
+            });
+            self.dialling.insert(task.id(), (Plane::Collector, i));
+        }
+        links.report(api);
+    }
+
+    /// A dial started by [`Domain::redial`] has ended.
+    fn dialled(&mut self, done: Result<(tokio::task::Id, Dialled), tokio::task::JoinError>) {
+        let now = std::time::Instant::now();
+        let (plane, index, reached, error) = match done {
+            Ok((id, d)) => {
+                self.dialling.remove(&id);
+                (d.plane, d.index, d.reached, d.error)
+            }
+            // A dial task that did not finish -- aborted, or it panicked
+            // -- still frees its voter's schedule, or the voter would be
+            // left in flight and never dialled again.
+            Err(e) => match self.dialling.remove(&e.id()) {
+                Some((plane, index)) => (plane, index, false, Some(format!("{e}"))),
+                None => return,
+            },
+        };
+        let (name, held) = match plane {
+            Plane::Peer => {
+                let Some(p) = &mut self.plane else { return };
+                p.redial.finished(index, reached, now);
+                if reached {
+                    p.dialled.1 += 1;
+                }
+                let held = p.peers.get(index).is_some_and(|peer| p.holds(peer));
+                (p.peers.get(index).map(|peer| peer.replica), held)
+            }
+            Plane::Collector => {
+                self.links.redial.finished(index, reached, now);
+                if reached {
+                    self.links.dialled.1 += 1;
+                }
+                // Whether it is held is known on the next pass; a failed
+                // dial is said below only when the link is not up.
+                (self.links.peers.get(index).map(|peer| peer.replica), false)
+            }
+        };
+        // A voter that stays away is dialled for as long as it does, so
+        // this is a condition and is said less as it goes on.
+        if let (Some(error), Some(replica), false) = (error, name, held) {
+            let what = match plane {
+                Plane::Peer => "cannot reach a voter on the peer plane",
+                Plane::Collector => "cannot reach a voter to submit to it",
+            };
+            if let Some(n) = self.recurring.seen(what) {
+                eprintln!("{what}: voter {} {error} ({n} so far)", hex4(&replica));
             }
         }
     }
@@ -1397,7 +1461,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             started: self.started,
         }
         .next_deadline();
-        [expiry, parked, reoffer].into_iter().flatten().min()
+        // A voter whose link is down is dialled again on a schedule, and
+        // nothing arrives to say the schedule has come due.
+        let redial = self
+            .plane
+            .as_ref()
+            .and_then(|p| p.redial.next_deadline())
+            .into_iter()
+            .chain(self.links.redial.next_deadline())
+            .min();
+        [expiry, parked, reoffer, redial]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases
@@ -2288,9 +2364,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // transport's own answer, from whether a connection is
             // holding that link's lane, and in a full mesh one
             // connection of every pair is closed as soon as the two
-            // meet. Re-dialling here would answer that with a storm;
-            // periodic reconnection belongs with the timer loop. What
-            // does happen here is the report: the count of voters held
+            // meet. Re-dialling here would answer that with a storm, so
+            // it is the re-dial schedule's (`Domain::redial`, on the
+            // loop's next pass): a voter whose link is still held after
+            // this close costs nothing, and one that lost it is dialled
+            // at the floor, jittered. What does happen here is the
+            // report: the count of voters held
             // is what an operator reads to see a mesh form, and it is
             // said again whenever a connection's coming or going
             // changed it.
@@ -2611,7 +2690,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
 /// throughout, so a certificate that is not this domain's voter at its
 /// committed incarnation fails the handshake whichever address answered.
 async fn dial(
-    transport: &Transport,
+    transport: &coord_transport::Dialer,
     peer: &crate::peers::Peer,
     me: Option<coord_types::ids::ReplicaIncarnation>,
     role: coord_types::wire_v1::PeerRole,
@@ -2634,53 +2713,6 @@ async fn dial(
         }
     }
     Err(last)
-}
-
-/// One future, type-erased so a set of them can be driven together.
-fn boxed<'a, T: 'a>(
-    future: impl core::future::Future<Output = T> + 'a,
-) -> core::pin::Pin<Box<dyn core::future::Future<Output = T> + 'a>> {
-    Box::pin(future)
-}
-
-/// Drive every future to completion on this task, concurrently, and
-/// answer in the order they were given.
-///
-/// Dialling is almost entirely waiting, and a voter that is not there
-/// costs a whole handshake timeout. One at a time, the wait would be
-/// the sum of every absent voter's -- and a process that has not
-/// started serving yet looks, from outside, exactly like one that
-/// cannot.
-///
-/// This is one task, not a task each: the futures borrow the endpoint
-/// they dial through, and nothing here outlives the call.
-async fn concurrently<T>(
-    work: Vec<core::pin::Pin<Box<dyn core::future::Future<Output = T> + '_>>>,
-) -> Vec<T> {
-    let mut work: Vec<Option<_>> = work.into_iter().map(Some).collect();
-    let mut done: Vec<Option<T>> = work.iter().map(|_| None).collect();
-    core::future::poll_fn(move |cx| {
-        let mut waiting = false;
-        for (slot, answer) in work.iter_mut().zip(done.iter_mut()) {
-            let Some(future) = slot else { continue };
-            match future.as_mut().poll(cx) {
-                core::task::Poll::Ready(value) => {
-                    *answer = Some(value);
-                    *slot = None;
-                }
-                core::task::Poll::Pending => waiting = true,
-            }
-        }
-        if waiting {
-            return core::task::Poll::Pending;
-        }
-        core::task::Poll::Ready(
-            done.iter_mut()
-                .map(|answer| answer.take().expect("every future finished"))
-                .collect(),
-        )
-    })
-    .await
 }
 
 /// The peer a protocol frame may actually be sent to.
@@ -2864,7 +2896,19 @@ fn endpoint(
     // The transport's limits are its own (streams, windows, deadlines);
     // the semantic limits the configuration states are the frontend's,
     // and are enforced where the meaning is, not at the framing.
-    let limits = coord_transport::Limits::default();
+    #[allow(unused_mut)]
+    let mut limits = coord_transport::Limits::default();
+    // A test build can shorten the connection age cap, so the test that
+    // shows a capped connection is dialled again (task-d03) does not wait
+    // the twelve hours a real one lasts. Compiled out of a release build:
+    // the cap there is the transport's, and is not configuration.
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("COORDD_TEST_CONNECTION_AGE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        limits.max_connection_age = std::time::Duration::from_millis(ms);
+    }
     Transport::with_socket(socket, identity, std::sync::Arc::new(binder), limits)
         .map_err(|e| TransportError::Endpoint(format!("{e:?}")))
 }

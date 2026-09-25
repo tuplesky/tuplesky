@@ -758,6 +758,33 @@ impl Collector {
         out
     }
 
+    /// A destination's link has come back: what it is owed on the
+    /// congestion schedule falls due at `now` rather than at its own next
+    /// attempt (task-d03).
+    ///
+    /// The schedule backs off while a destination refuses, so a voter
+    /// that was away for a while is owed its submissions up to a ceiling
+    /// later than it could take them. The runtime that holds the sockets
+    /// is the one that sees the link return; this is how it says so.
+    /// Nothing is owed that was not before, and a destination stalled for
+    /// a reason repeating cannot change stays stalled. Returns how many
+    /// commands moved.
+    pub fn reachable_again(&mut self, replica: &ReplicaId, now: MonotonicMillis) -> usize {
+        let mut moved = 0;
+        for entry in self.pending.values_mut() {
+            if entry.dissemination.envelope.is_none() {
+                continue;
+            }
+            if let Some(Owed::Missed { next, .. }) = entry.dissemination.owed.get_mut(replica)
+                && *next > now
+            {
+                *next = now;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     /// When the next re-offer falls due, on the clock `due_offers` is
     /// given, or `None` when nothing is owed on the congestion schedule.
     ///
