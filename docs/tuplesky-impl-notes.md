@@ -3630,3 +3630,84 @@ the voter test fails. The stamp is still what the plan requires. A
 promise recorded under the ballot the voter was leaving is a record that
 says the wrong thing, and a store that queued across rounds would refuse
 it.
+
+### Repeated leader kills
+
+The Jepsen shim's stress run (#98, `--fault leader`) kills whichever
+voter leads every 25 s. On this chain it found three faults, all reached
+only after a voter has served for a while, and the domain never elected
+again:
+
+- the restarted voter stopped with "batch refused: the queue is full";
+- on its next restarts it panicked at `expect("installed")` in
+  `Follower::advance_sync`;
+- the survivors campaigned ballot after ballot and none of them won.
+
+Each has a deterministic test that fails without its fix.
+
+**A candidate asks again until it has every payload.** A candidate asked
+each promised voter once for every payload its selection lacked. A peer
+answers at most `MAX_PAYLOAD_TRANSFER` (8), so a candidate behind by more
+than that got one batch and then waited for ever. The runtime's paced
+asks went to the leader of the ballot it followed, which is the voter
+whose loss started the campaign. Now:
+
+- the campaign's missing set counts as missing, so those paced asks
+  cover it;
+- `request_payloads` asks the promised voters, not that leader, for a
+  bounded batch of it;
+- the campaign asks for the next batch as soon as the last was answered
+  in full, or when a voter promises that was not asked yet.
+
+Test: `a_candidate_missing_more_payloads_than_one_answer_carries_still_wins`.
+
+**A retired command installs as executed.** A Sync names what every
+reporter's durable ledger holds, which includes commands a voter already
+executed and retired. `phase_of` answers EXECUTED from the tombstone, so
+the installation took such an entry as ready and then found no record.
+That was the follower's panic, and `Leader::repropose` had the same one.
+Both now skip a command with no record.
+
+A leader without the record cannot re-propose the command, so a voter
+holding it at ACCEPT would wait for a vote that never comes. To close
+that, the candidate marks as committed every selected entry it executed
+itself. It does so only when the executed dependencies agree with the
+entry, or when the record is gone.
+
+Test: `a_sync_naming_commands_this_voter_retired_installs_without_them`.
+
+**A step that asks for more than the queue holds lowers first.**
+Installing a Sync writes one row per selected command, and a new leader
+re-proposes each one. `Node::one_round` submitted them all before
+lowering any, the journaled store's queue (256 batches) refused the rest,
+and the voter stopped. When it came back, it met the same selection. Now:
+
+- `Persistence::has_room` answers the queue's own bounds;
+- before each submit, `one_round` lowers what is queued until there is
+  room, and feeds what became durable to the outbox and the machine;
+- a lowering that moves nothing leaves the refusal to `submit`.
+
+Test: `a_step_that_asks_for_more_than_the_queue_holds_is_carried_out`.
+
+**What the stress run shows now.** With these fixes, five leader kills
+in 120 s produce no exit and no panic, and every election completes. The
+final read is still not served. The cause is the limit below, not
+anything in this list.
+
+**What is left: recovery carries the whole history.** Dependency rows
+are never deleted, and `DurableLedger` reports every one. So a report,
+and the Sync selected from reports, names every command the domain ever
+ran. A voter remembers the commands it retired only for its last
+`capacity` retirements. It cannot tell an older command it executed
+from one it never heard of: `phase_of` answers `None` for both.
+
+- The candidate treats such a command as missing its payload.
+- A follower installs it as a placeholder.
+- Either way the table fills, and new work is refused as
+  `Backpressure`.
+
+In the deterministic cluster, with capacity 32, 200 commands before a
+leader loss leave the candidate waiting on 160 payloads for commands it
+executed long ago. Bounding recovery by an execution floor, a pruned
+ledger, or a durable "executed" answer is a protocol decision for
+`coord-consensus`, and this change does not make it.
