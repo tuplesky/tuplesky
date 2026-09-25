@@ -707,6 +707,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "coord-jepsen"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "coord-harness",
+ "coord-membership",
+ "coord-sdk",
+ "coord-session",
+ "coord-state",
+ "coord-transport",
+ "coord-types",
+ "postcard",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "coord-journal-api"
 version = "0.1.0"
 dependencies = [
@@ -1127,6 +1147,7 @@ dependencies = [
  "coord-core",
  "coord-daemon",
  "coord-harness",
+ "coord-jepsen",
  "coord-journal-api",
  "coord-journal-raft-engine",
  "coord-membership",
