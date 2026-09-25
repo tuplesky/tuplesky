@@ -2089,25 +2089,63 @@ fn a_voter_whose_key_the_configuration_does_not_commit_to_stops_at_startup() {
 /// its own address -- are handed ephemeral ports; asking the kernel for
 /// one here too meant a port released by this test could be the next
 /// one the kernel gave a neighbour, and the daemon then found its named
-/// address taken. A port outside that range can only collide with
-/// another test's named port, and the tests do not draw at random:
-/// each process owns a slice of that range keyed by its process id and
-/// hands its ports out in order, so two tests alive at the same time
-/// name the same port only when their ids are a few hundred apart.
-/// The probe below still catches the residue -- a port some live
-/// socket already holds -- and a slice that runs dry continues into
-/// the next.
+/// address taken.
+///
+/// Below that range, each process owns a slice of 100 ports outright.
+/// It holds an exclusive lock on a file named for the slice for as long
+/// as it runs, so no other process of this suite alive at the same time
+/// draws from it. Keying the slice by process id alone was not enough: a
+/// restart test releases a voter's port while the voter is down, and a
+/// process whose id fell in the same slice could bind that port in the
+/// meantime, so the restarted voter found its named address taken
+/// (`Address already in use`). The kernel drops the lock when the
+/// process ends, however it ends. The probe below still catches a port
+/// something outside this suite holds, and a slice that runs dry takes
+/// another one.
 fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
     const FIRST: u32 = 10000;
     const SLICE: u32 = 100;
     // 227 slices of 100 end at 32700, still below the ephemeral range.
     const SLICES: u32 = 227;
-    static DRAWN: AtomicU32 = AtomicU32::new(0);
-    let own = (std::process::id() % SLICES) * SLICE;
-    for _ in 0..1000 {
-        let drawn = DRAWN.fetch_add(1, Ordering::Relaxed);
-        let port = u16::try_from(FIRST + (own + drawn) % (SLICES * SLICE)).expect("below 32768");
+    // The slice being drawn from, the next port in it, and the lock
+    // files of every slice this process has claimed.
+    static OWNED: Mutex<(Option<u32>, u32, Vec<std::fs::File>)> = Mutex::new((None, 0, Vec::new()));
+
+    let claim = |held: &mut Vec<std::fs::File>, after: u32| -> u32 {
+        let dir = std::env::temp_dir().join("coordd-cli-ports");
+        std::fs::create_dir_all(&dir).expect("a directory for the port locks");
+        for step in 0..SLICES {
+            let slice = (after + step) % SLICES;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(format!("slice-{slice}")))
+                .expect("a port lock file");
+            if file.try_lock().is_ok() {
+                held.push(file);
+                return slice;
+            }
+        }
+        panic!("every port slice in 10000..32700 is held by another test process");
+    };
+
+    let mut owned = OWNED.lock().expect("not poisoned");
+    let (slice, drawn, held) = &mut *owned;
+    for _ in 0..SLICES * SLICE {
+        let current = match *slice {
+            Some(current) if *drawn < SLICE => current,
+            previous => {
+                let start = previous.map_or(std::process::id() % SLICES, |p| p + 1);
+                let claimed = claim(held, start);
+                *slice = Some(claimed);
+                *drawn = 0;
+                claimed
+            }
+        };
+        let port = u16::try_from(FIRST + current * SLICE + *drawn).expect("below 32768");
+        *drawn += 1;
         if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
