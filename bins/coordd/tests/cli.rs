@@ -4939,20 +4939,20 @@ async fn a_quorum_keeps_answering_past_its_table_capacity() {
             s
         );
     }
-    // And the hold is released, not merely filled. Under this load
-    // every voter meets a command whose submission the transport
-    // dropped, so every voter should have let evidence go on the
-    // window rather than carried it until something newer needed the
-    // room. A run where this is false is a run where the hold has
-    // stopped expiring, which is how the bound gets reached.
-    for (n, s) in said.iter().enumerate() {
-        assert!(
-            s.contains("let go of evidence no submission named inside the window"),
-            "voter {} never released held evidence, so the window is not expiring:\n{}",
-            n + 1,
-            s
-        );
-    }
+    // That the hold is released on its window, not merely filled, is
+    // not asserted here. A release needs a submission the transport
+    // dropped under this load, and whether one is dropped on a given
+    // run, to a given voter, is not something this test controls: an
+    // assertion on it is a race outcome, not an invariant. The release
+    // is covered deterministically instead, at three levels:
+    // `coord-daemon`'s `parked.rs` (the next expiry is the oldest hold,
+    // and moves on when it goes), `serve.rs`'s
+    // `held_evidence_registers_its_own_next_expiry` (the serving loop
+    // registers that deadline), and `repair.rs`'s
+    // `a_duplicate_after_the_hold_expired_repairs_the_callers_evidence`
+    // (three voters over real stores let a hold expire and repair).
+    // What only this load shows stays above: the table does not fill,
+    // every caller is answered, and the hold's bound is never reached.
 }
 
 /// Links a connection's age cap ends are dialled again, on both planes,
