@@ -116,6 +116,18 @@ pub trait Persistence {
     /// because a durable journal record is never a failed batch.
     fn unmaterialized(&self) -> usize;
 
+    /// Whether the queue has room for `batch` now.
+    ///
+    /// Only the queue's own bounds, which is the refusal a caller can do
+    /// something about: lowering what is queued makes the room. Every
+    /// other guard is still [`Persistence::submit`]'s. A coordinator
+    /// whose queue has no bound, or whose bound this does not model,
+    /// says yes and lets `submit` answer.
+    fn has_room(&self, batch: &PersistBatch) -> bool {
+        let _ = batch;
+        true
+    }
+
     /// Take `batch` for durability, as a transition of `kind`.
     ///
     /// `kind` is what the journal records the transition as; a
@@ -219,6 +231,10 @@ impl<E: coord_store_api::engine::LocalEngine> Persistence for crate::worker::Sto
         // The projection is the record: there is nothing between them to
         // be owed.
         0
+    }
+
+    fn has_room(&self, batch: &PersistBatch) -> bool {
+        crate::worker::StoreWorker::has_room(self, batch)
     }
 
     fn submit(&mut self, batch: PersistBatch, _kind: TransitionKind) -> Result<(), Refused> {
@@ -368,6 +384,10 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
 
     fn unmaterialized(&self) -> usize {
         self.store.unmaterialized(self.domain)
+    }
+
+    fn has_room(&self, batch: &PersistBatch) -> bool {
+        self.store.has_room(self.domain, batch)
     }
 
     fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {

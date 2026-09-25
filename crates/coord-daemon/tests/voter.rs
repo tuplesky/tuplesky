@@ -559,6 +559,9 @@ struct Stamped {
     hold: bool,
     /// The barriers taken while holding, in order.
     held: Vec<coord_core::effect::BarrierId>,
+    /// How many batches the queue holds, as the journaled store bounds
+    /// it: past this, a submission is refused as full.
+    room: Option<usize>,
 }
 
 impl coord_storage::Persistence for Stamped {
@@ -578,6 +581,10 @@ impl coord_storage::Persistence for Stamped {
     }
     fn unmaterialized(&self) -> usize {
         coord_storage::Persistence::unmaterialized(&self.inner)
+    }
+    fn has_room(&self, _batch: &coord_core::effect::PersistBatch) -> bool {
+        self.room
+            .is_none_or(|room| coord_storage::Persistence::queued(&self.inner) < room)
     }
     fn submit(
         &mut self,
@@ -600,6 +607,12 @@ impl coord_storage::Persistence for Stamped {
             && stamp.compare_same_epoch(&fence) == Some(core::cmp::Ordering::Less)
         {
             return Err(coord_storage::Refused::Fenced);
+        }
+        if self
+            .room
+            .is_some_and(|room| coord_storage::Persistence::queued(&self.inner) >= room)
+        {
+            return Err(coord_storage::Refused::QueueFull);
         }
         if self.hold {
             self.held.push(batch.barrier);
@@ -661,6 +674,7 @@ fn stamped(me: u8) -> Voter<Stamped> {
             below_fence: false,
             hold: false,
             held: Vec::new(),
+            room: None,
         },
         alloc,
     )
@@ -1000,6 +1014,7 @@ fn the_store_records_under_the_ballot_the_voter_is_at() {
             below_fence: false,
             hold: false,
             held: Vec::new(),
+            room: None,
         },
         alloc,
     )
@@ -1033,4 +1048,68 @@ fn the_store_records_under_the_ballot_the_voter_is_at() {
     voter.set_ballot(adopted);
     assert_eq!(voter.ballot(), adopted);
     assert_eq!(voter.node().applier().store().ballot, Some(adopted));
+}
+
+/// A step that asks for more batches than the store's queue holds is
+/// carried out, not refused.
+///
+/// Installing a Sync writes a row per selected command, and a selection
+/// names what every reporter still holds -- on a domain that has served
+/// for a while, far more than the journaled store's queue depth. The
+/// round submitted them all before lowering any, the queue refused the
+/// rest as full, and the voter stopped: the follower installing the new
+/// leader's Sync, exactly when the domain was electing one, and it met
+/// the same Sync again when it came back. Here the queue holds two, and
+/// the Sync names six commands this follower holds.
+#[test]
+fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
+    let mut voter = stamped(2);
+    let held: Vec<coord_types::CommandId> = (1..=6).map(command_of).collect();
+    for sequence in 1..=6 {
+        voter.route().offer(&submission(sequence)).expect("room");
+        voter.serve_local(1).expect("served");
+    }
+    let candidate = Ballot {
+        epoch: epoch(),
+        number: 1,
+        leader: r(1),
+    };
+    new_leader(&mut voter, 1, candidate);
+    voter.node_mut().applier_mut().store_mut().room = Some(2);
+    let before = voter.node().applier().store().stamps.len();
+    let decision = coord_consensus::SyncDecision {
+        ballot: candidate,
+        source_ballot: ballot(),
+        entries: held
+            .iter()
+            .map(|c| {
+                (
+                    *c,
+                    coord_consensus::SyncEntry {
+                        command: *c,
+                        phase: coord_consensus::Phase::Accept,
+                        deps: Vec::new(),
+                        path: coord_consensus::empty_path(),
+                        paths: Vec::new(),
+                        seqnum: 0,
+                    },
+                )
+            })
+            .collect(),
+        reproposed: BTreeSet::new(),
+    };
+    voter
+        .on_peer(
+            PeerProvenance::from_local_voter(r(1), inc()),
+            coord_consensus::ProtocolMessage::Sync(decision).encode(),
+        )
+        .expect("the Sync is installed, not refused as full");
+    let store = voter.node().applier().store();
+    assert!(
+        store.stamps.len() - before > 2,
+        "more batches than the queue holds were submitted: {}",
+        store.stamps.len() - before
+    );
+    assert_eq!(coord_storage::Persistence::queued(store), 0);
+    assert_eq!(voter.node().held(), 0, "every send was released");
 }

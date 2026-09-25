@@ -31,7 +31,7 @@
 
 use coord_collector::frontend_frame;
 use coord_consensus::{AppliedOutcome, Follower, Leader, PayloadRecordV1, SyncDecision};
-use coord_core::effect::{Effect, PeerId, TimerId};
+use coord_core::effect::{Effect, PeerId, PersistBatch, TimerId};
 use coord_core::event::{Event, StorageError, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{Outbox, PendingSend};
@@ -608,6 +608,7 @@ impl<P: Persistence> Node<P> {
         let mut out = Outbound::default();
         let mut persisted = false;
         let mut refused = Vec::new();
+        let mut next = Vec::new();
         for effect in effects {
             // A released result is the leader's release-gate output. It
             // is not a `SendWhenDurable` and rests on no barrier of its
@@ -638,6 +639,7 @@ impl<P: Persistence> Node<P> {
                     // comes from applying a command, which is where its
                     // position, revision and result are known.
                     let barrier_id = batch.barrier;
+                    self.make_room(&batch, &mut next)?;
                     match self
                         .applier
                         .store_mut()
@@ -713,7 +715,6 @@ impl<P: Persistence> Node<P> {
             }
         }
 
-        let mut next = Vec::new();
         for event in refused {
             self.outbox.observe(&event);
             next.extend(self.machine_mut().step(Event::Storage(event)));
@@ -737,21 +738,7 @@ impl<P: Persistence> Node<P> {
             // the next round lowers again.
             let mut attempts = self.applier.store().queued() + 1;
             loop {
-                let store = self.applier.store_mut();
-                let outcome =
-                    Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
-                        .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
-                // Indeterminate is not "failed": the group's outcome is
-                // unknown, so the caller reconciles rather than assuming
-                // either answer. It surfaces as an engine failure here so
-                // it cannot be mistaken for a clean round.
-                if outcome.indeterminate {
-                    return Err(DriveError::Engine("group outcome indeterminate".into()));
-                }
-                for event in outcome.events {
-                    self.outbox.observe(&event);
-                    next.extend(self.machine_mut().step(Event::Storage(event)));
-                }
+                self.lower_once(&mut next)?;
                 attempts -= 1;
                 if self.applier.store().queued() == 0 || attempts == 0 {
                     break;
@@ -786,6 +773,57 @@ impl<P: Persistence> Node<P> {
             out.peer.push((to, frame));
         }
         Ok((out, next))
+    }
+
+    /// Lower one group and hand what it made durable to the outbox and
+    /// the machine; the machine's answers join `next`.
+    fn lower_once(&mut self, next: &mut Vec<Effect>) -> Result<(), DriveError> {
+        let store = self.applier.store_mut();
+        let outcome = Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
+            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+        // Indeterminate is not "failed": the group's outcome is unknown,
+        // so the caller reconciles rather than assuming either answer. It
+        // surfaces as an engine failure here so it cannot be mistaken for
+        // a clean round.
+        if outcome.indeterminate {
+            return Err(DriveError::Engine("group outcome indeterminate".into()));
+        }
+        for event in outcome.events {
+            self.outbox.observe(&event);
+            next.extend(self.machine_mut().step(Event::Storage(event)));
+        }
+        Ok(())
+    }
+
+    /// Lower what is queued until the store has room for `batch`.
+    ///
+    /// One step of a machine can ask for more batches than the queue
+    /// holds. Installing a Sync writes a row per selected command and a
+    /// new leader re-proposes each of them, and a selection names what
+    /// every reporter still holds, which on a domain that has served for
+    /// a while is far more than the queue's depth. Refused as full, the
+    /// voter stopped -- the new leader, or the follower installing its
+    /// Sync, exactly when the domain was electing one -- and it met the
+    /// same selection when it came back. The queue drains by lowering,
+    /// which the end of the round does anyway; it happens here as well,
+    /// as often as the batch needs. A lowering that moves nothing leaves
+    /// the refusal to `submit`, as before.
+    fn make_room(
+        &mut self,
+        batch: &PersistBatch,
+        next: &mut Vec<Effect>,
+    ) -> Result<(), DriveError> {
+        while !self.applier.store().has_room(batch) {
+            let before = self.applier.store().queued();
+            if before == 0 {
+                break;
+            }
+            self.lower_once(next)?;
+            if self.applier.store().queued() >= before {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Apply every command whose turn has come, in order.
