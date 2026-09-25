@@ -2984,3 +2984,12 @@ makes the three states on a model store: no row, a live row, a retired
 row. With no row, `retry::resolve` alone says `NoSession` and the lookup
 says nothing. Without the absent-row check, the test fails at the first
 state.
+`serve::tests::a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`
+asks it the way a caller does. It binds a real frontend over a store with
+no session row, through the frontend's own establishment: the bind is
+held, and the session-creation outcome settles it. The bound caller then
+sends a put, and the lookup ahead of admission (`retained_answer`, which
+`Domain::retained` calls with its frontend and store) says nothing. The
+frontend admits the put. With the row written retired, the same put is
+refused `NOT_ADMITTED` under its own command id. Without the absent-row
+check, the first question is refused and the test fails.
