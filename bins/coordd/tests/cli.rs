@@ -2744,14 +2744,16 @@ fn a_manifest_the_admin_did_not_sign_is_refused_at_init_and_at_start() {
     let init = run(&path, &["init"]);
     assert_eq!(init.code, Some(2), "{}{}", init.out, init.err);
     assert!(init.err.contains("does not verify"), "{}", init.err);
-    assert!(
-        !dir.join("state").exists()
-            || std::fs::read_dir(dir.join("state"))
-                .expect("dir")
-                .next()
-                .is_none(),
-        "an unsigned manifest left a store behind"
-    );
+    for store in ["state", "journal"] {
+        assert!(
+            !dir.join(store).exists()
+                || std::fs::read_dir(dir.join(store))
+                    .expect("dir")
+                    .next()
+                    .is_none(),
+            "an unsigned manifest left a {store} behind"
+        );
+    }
 
     // Signed by somebody else: refused the same way.
     let stranger = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");

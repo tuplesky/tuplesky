@@ -191,6 +191,10 @@ pub fn sign_genesis_pem(
 
 /// The admin public key a manifest is verified against, from its PEM
 /// encoding (`PUBLIC KEY`, P-256).
+///
+/// Exactly one PEM section, and it is the key: a file that carries
+/// another section beside it, or bytes after the key's own encoding, is
+/// not taken to mean whichever part a parser happens to read first.
 pub fn admin_key_from_pem(pem: &[u8]) -> Result<DecodingKey, GenesisError> {
     use rustls_pki_types::SubjectPublicKeyInfoDer;
     use rustls_pki_types::pem::PemObject;
@@ -198,9 +202,20 @@ pub fn admin_key_from_pem(pem: &[u8]) -> Result<DecodingKey, GenesisError> {
     // id-ecPublicKey over prime256v1: the only key ES256 verifies with.
     const EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
     const P256: &str = "1.2.840.10045.3.1.7";
+    let text = core::str::from_utf8(pem).map_err(|_| GenesisError::AdminKey)?;
+    let sections: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("-----BEGIN "))
+        .collect();
+    if sections != ["PUBLIC KEY-----"] {
+        return Err(GenesisError::AdminKey);
+    }
     let der = SubjectPublicKeyInfoDer::from_pem_slice(pem).map_err(|_| GenesisError::AdminKey)?;
-    let (_, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(&der)
+    let (rest, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(&der)
         .map_err(|_| GenesisError::AdminKey)?;
+    if !rest.is_empty() {
+        return Err(GenesisError::AdminKey);
+    }
     let curve = spki
         .algorithm
         .parameters
