@@ -758,6 +758,41 @@ impl Collector {
         out
     }
 
+    /// A destination's link has come back: what it is owed on the
+    /// congestion schedule falls due at `now` rather than at its own next
+    /// attempt (task-d03).
+    ///
+    /// The schedule backs off while a destination refuses, so a voter
+    /// that was away for a while is owed its submissions up to a ceiling
+    /// later than it could take them. The runtime that holds the sockets
+    /// is the one that sees the link return; this is how it says so.
+    /// Nothing is owed that was not before, and a destination stalled for
+    /// a reason repeating cannot change stays stalled. Returns how many
+    /// commands moved.
+    ///
+    /// It cannot tell an entry waiting out its backoff from one
+    /// [`Collector::due_offers`] marked in flight, since both are `Missed`
+    /// with a later `next`, so it must not be called between those two:
+    /// between choosing an offer and reporting how it went
+    /// ([`Collector::offered`]). The serving loop makes and reports its
+    /// offers in one synchronous step, before it looks at its links, so
+    /// nothing is in flight when it calls this.
+    pub fn reachable_again(&mut self, replica: &ReplicaId, now: MonotonicMillis) -> usize {
+        let mut moved = 0;
+        for entry in self.pending.values_mut() {
+            if entry.dissemination.envelope.is_none() {
+                continue;
+            }
+            if let Some(Owed::Missed { next, .. }) = entry.dissemination.owed.get_mut(replica)
+                && *next > now
+            {
+                *next = now;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     /// When the next re-offer falls due, on the clock `due_offers` is
     /// given, or `None` when nothing is owed on the congestion schedule.
     ///

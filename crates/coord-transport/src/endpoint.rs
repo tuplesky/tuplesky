@@ -684,6 +684,179 @@ pub struct Transport {
     lane_transport: [Arc<quinn::TransportConfig>; 4],
 }
 
+/// What opening a connection needs of a [`Transport`], and nothing else:
+/// no event queue, so it can be cloned into a task of its own.
+///
+/// A dial is almost entirely waiting -- a voter that is not there costs a
+/// whole handshake timeout -- and a runtime that dials from its serving
+/// loop cannot afford to wait inside that loop. A `Dialer` lets it dial
+/// from a spawned task instead; the connection it opens is registered on
+/// the same endpoint and announced on the same event queue as one opened
+/// through [`Transport::connect`], because it is the same code.
+#[derive(Clone)]
+pub struct Dialer {
+    endpoint: quinn::Endpoint,
+    shared: Arc<Shared>,
+    client_tls: [Arc<QuicClientConfig>; 2],
+    lane_transport: [Arc<quinn::TransportConfig>; 4],
+}
+
+impl Dialer {
+    /// Open a `lane` connection to `addr` as `local_role`, expecting the
+    /// remote to be `expected` (its certificate is bound to that identity
+    /// before anything is sent). Registered on `HelloAck`.
+    pub async fn connect(
+        &self,
+        addr: SocketAddr,
+        server_name: &str,
+        local_role: PeerRole,
+        local_incarnation: Option<ReplicaIncarnation>,
+        lane: Lane,
+        expected: BoundIdentity,
+    ) -> Result<ConnectionId, TransportError> {
+        if !role_lanes(local_role).contains(&lane) {
+            return Err(TransportError::LaneNotAdmitted(lane));
+        }
+        let class = role_class(local_role);
+        let tls = match class {
+            Class::Api => self.client_tls[0].clone(),
+            Class::Peer => self.client_tls[1].clone(),
+        };
+        let mut config = quinn::ClientConfig::new(tls);
+        config.transport_config(self.lane_transport[lane.index()].clone());
+        let connecting = self
+            .endpoint
+            .connect_with(config, addr, server_name)
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
+        let limits = self.shared.limits;
+        let conn = match timeout(limits.handshake_timeout, connecting).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(TransportError::Connect(e.to_string())),
+            Err(_) => return Err(TransportError::Rejected(CloseReason::Timeout)),
+        };
+        let id = self.shared.next_id();
+        match self
+            .negotiate_outgoing(&conn, local_role, local_incarnation, lane, &expected)
+            .await
+        {
+            Ok((identity, control_recv)) => {
+                let peer = Peer::new(
+                    id,
+                    conn.clone(),
+                    class,
+                    lane,
+                    identity.clone(),
+                    false,
+                    &self.shared.limits.lanes[lane.index()],
+                );
+                spawn_expiry(&self.shared, &peer);
+                self.shared.register(peer.clone());
+                self.shared
+                    .emit(TransportEvent::Connected {
+                        connection: id,
+                        class,
+                        lane,
+                        identity,
+                        remote: conn.remote_address(),
+                    })
+                    .await;
+                tokio::spawn(serve(self.shared.clone(), peer, control_recv));
+                Ok(id)
+            }
+            Err(reason) => {
+                close_connection(&conn, None, &reason).await;
+                Err(TransportError::Rejected(reason))
+            }
+        }
+    }
+
+    async fn negotiate_outgoing(
+        &self,
+        conn: &quinn::Connection,
+        local_role: PeerRole,
+        local_incarnation: Option<ReplicaIncarnation>,
+        lane: Lane,
+        expected: &BoundIdentity,
+    ) -> Result<(BoundIdentity, ControlStream), CloseReason> {
+        let shared = &self.shared;
+        let certs = peer_certs(conn)?;
+        // Bind the server's certificate to the identity we expect before
+        // sending anything: a valid certificate for the wrong node is a
+        // rejection, not a peer.
+        let claim = HelloV1 {
+            role: expected.role,
+            cluster_id: shared.cluster,
+            domain_id: shared.domain,
+            incarnation: expected.incarnation,
+            capabilities: BoundedVec::new(Vec::new())
+                .map_err(|_| CloseReason::Rejected("caps".into()))?,
+        };
+        let bound = shared
+            .binder
+            .bind(&certs, &claim)
+            .map_err(|e| CloseReason::Rejected(format!("{e:?}")))?;
+        if bound.replica != expected.replica || bound.incarnation != expected.incarnation {
+            return Err(CloseReason::Rejected("identity".into()));
+        }
+        let (mut send, recv) = timeout(shared.limits.handshake_timeout, conn.open_bi())
+            .await
+            .map_err(|_| CloseReason::Timeout)?
+            .map_err(|e| CloseReason::Transport(e.to_string()))?;
+        // Exactly one lane, and it is this connection's.
+        //
+        // The endpoint's own capabilities say which lanes it grants --
+        // a voter grants control and bulk, a collector grants three --
+        // but a `Hello` declares the lane *being opened*, and a peer
+        // that saw two would have no way to tell which stream is which.
+        // So the endpoint's other lanes are filtered out here rather
+        // than announced alongside.
+        let mut capabilities: Vec<u16> = shared
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|c| Lane::of_capability(*c).is_none())
+            .collect();
+        capabilities.push(lane.capability());
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        let hello = MessageV1::Hello(HelloV1 {
+            role: local_role,
+            cluster_id: shared.cluster,
+            domain_id: shared.domain,
+            incarnation: local_incarnation,
+            capabilities: BoundedVec::new(capabilities)
+                .map_err(|_| CloseReason::Rejected("caps".into()))?,
+        })
+        .encode()
+        .map_err(|e| CloseReason::Malformed(format!("{e:?}")))?;
+        send.write_all(&hello)
+            .await
+            .map_err(|e| CloseReason::Transport(e.to_string()))?;
+        let mut control = ControlStream::new(recv);
+        let frame = control
+            .next_frame(shared.limits.handshake_timeout)
+            .await
+            .map_err(frame_reason)?;
+        match decode(&frame) {
+            Ok(MessageV1::HelloAck(ack)) => {
+                tokio::spawn(park_control(send, conn.clone()));
+                Ok((
+                    BoundIdentity {
+                        role: bound.role,
+                        replica: bound.replica,
+                        incarnation: bound.incarnation,
+                        capabilities: ack.capabilities.as_slice().to_vec(),
+                    },
+                    control,
+                ))
+            }
+            Ok(MessageV1::Close(c)) => Err(CloseReason::PeerClosed { code: c.code }),
+            Ok(_) => Err(CloseReason::Malformed("expected hello ack".into())),
+            Err(e) => Err(CloseReason::Malformed(format!("{e:?}"))),
+        }
+    }
+}
+
 fn tls_err(e: impl std::fmt::Display) -> TransportError {
     TransportError::Tls(e.to_string())
 }
@@ -919,145 +1092,26 @@ impl Transport {
         lane: Lane,
         expected: BoundIdentity,
     ) -> Result<ConnectionId, TransportError> {
-        if !role_lanes(local_role).contains(&lane) {
-            return Err(TransportError::LaneNotAdmitted(lane));
-        }
-        let class = role_class(local_role);
-        let tls = match class {
-            Class::Api => self.client_tls[0].clone(),
-            Class::Peer => self.client_tls[1].clone(),
-        };
-        let mut config = quinn::ClientConfig::new(tls);
-        config.transport_config(self.lane_transport[lane.index()].clone());
-        let connecting = self
-            .endpoint
-            .connect_with(config, addr, server_name)
-            .map_err(|e| TransportError::Connect(e.to_string()))?;
-        let limits = self.shared.limits;
-        let conn = match timeout(limits.handshake_timeout, connecting).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(TransportError::Connect(e.to_string())),
-            Err(_) => return Err(TransportError::Rejected(CloseReason::Timeout)),
-        };
-        let id = self.shared.next_id();
-        match self
-            .negotiate_outgoing(&conn, local_role, local_incarnation, lane, &expected)
+        self.dialer()
+            .connect(
+                addr,
+                server_name,
+                local_role,
+                local_incarnation,
+                lane,
+                expected,
+            )
             .await
-        {
-            Ok((identity, control_recv)) => {
-                let peer = Peer::new(
-                    id,
-                    conn.clone(),
-                    class,
-                    lane,
-                    identity.clone(),
-                    false,
-                    &self.shared.limits.lanes[lane.index()],
-                );
-                spawn_expiry(&self.shared, &peer);
-                self.shared.register(peer.clone());
-                self.shared
-                    .emit(TransportEvent::Connected {
-                        connection: id,
-                        class,
-                        lane,
-                        identity,
-                        remote: conn.remote_address(),
-                    })
-                    .await;
-                tokio::spawn(serve(self.shared.clone(), peer, control_recv));
-                Ok(id)
-            }
-            Err(reason) => {
-                close_connection(&conn, None, &reason).await;
-                Err(TransportError::Rejected(reason))
-            }
-        }
     }
 
-    async fn negotiate_outgoing(
-        &self,
-        conn: &quinn::Connection,
-        local_role: PeerRole,
-        local_incarnation: Option<ReplicaIncarnation>,
-        lane: Lane,
-        expected: &BoundIdentity,
-    ) -> Result<(BoundIdentity, ControlStream), CloseReason> {
-        let shared = &self.shared;
-        let certs = peer_certs(conn)?;
-        // Bind the server's certificate to the identity we expect before
-        // sending anything: a valid certificate for the wrong node is a
-        // rejection, not a peer.
-        let claim = HelloV1 {
-            role: expected.role,
-            cluster_id: shared.cluster,
-            domain_id: shared.domain,
-            incarnation: expected.incarnation,
-            capabilities: BoundedVec::new(Vec::new())
-                .map_err(|_| CloseReason::Rejected("caps".into()))?,
-        };
-        let bound = shared
-            .binder
-            .bind(&certs, &claim)
-            .map_err(|e| CloseReason::Rejected(format!("{e:?}")))?;
-        if bound.replica != expected.replica || bound.incarnation != expected.incarnation {
-            return Err(CloseReason::Rejected("identity".into()));
-        }
-        let (mut send, recv) = timeout(shared.limits.handshake_timeout, conn.open_bi())
-            .await
-            .map_err(|_| CloseReason::Timeout)?
-            .map_err(|e| CloseReason::Transport(e.to_string()))?;
-        // Exactly one lane, and it is this connection's.
-        //
-        // The endpoint's own capabilities say which lanes it grants --
-        // a voter grants control and bulk, a collector grants three --
-        // but a `Hello` declares the lane *being opened*, and a peer
-        // that saw two would have no way to tell which stream is which.
-        // So the endpoint's other lanes are filtered out here rather
-        // than announced alongside.
-        let mut capabilities: Vec<u16> = shared
-            .capabilities
-            .iter()
-            .copied()
-            .filter(|c| Lane::of_capability(*c).is_none())
-            .collect();
-        capabilities.push(lane.capability());
-        capabilities.sort_unstable();
-        capabilities.dedup();
-        let hello = MessageV1::Hello(HelloV1 {
-            role: local_role,
-            cluster_id: shared.cluster,
-            domain_id: shared.domain,
-            incarnation: local_incarnation,
-            capabilities: BoundedVec::new(capabilities)
-                .map_err(|_| CloseReason::Rejected("caps".into()))?,
-        })
-        .encode()
-        .map_err(|e| CloseReason::Malformed(format!("{e:?}")))?;
-        send.write_all(&hello)
-            .await
-            .map_err(|e| CloseReason::Transport(e.to_string()))?;
-        let mut control = ControlStream::new(recv);
-        let frame = control
-            .next_frame(shared.limits.handshake_timeout)
-            .await
-            .map_err(frame_reason)?;
-        match decode(&frame) {
-            Ok(MessageV1::HelloAck(ack)) => {
-                tokio::spawn(park_control(send, conn.clone()));
-                Ok((
-                    BoundIdentity {
-                        role: bound.role,
-                        replica: bound.replica,
-                        incarnation: bound.incarnation,
-                        capabilities: ack.capabilities.as_slice().to_vec(),
-                    },
-                    control,
-                ))
-            }
-            Ok(MessageV1::Close(c)) => Err(CloseReason::PeerClosed { code: c.code }),
-            Ok(_) => Err(CloseReason::Malformed("expected hello ack".into())),
-            Err(e) => Err(CloseReason::Malformed(format!("{e:?}"))),
+    /// A handle that opens connections on this endpoint from anywhere,
+    /// a spawned task included (see [`Dialer`]).
+    pub fn dialer(&self) -> Dialer {
+        Dialer {
+            endpoint: self.endpoint.clone(),
+            shared: self.shared.clone(),
+            client_tls: self.client_tls.clone(),
+            lane_transport: self.lane_transport.clone(),
         }
     }
 

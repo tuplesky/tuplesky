@@ -48,7 +48,7 @@ pub mod sched;
 pub use budget::{Budget, BudgetError, BudgetLimits};
 pub use config::{ALPN_API, ALPN_PEER, Class, ClientIdentity, Limits, LocalIdentity, TlsProfile};
 pub use endpoint::{
-    CloseCode, CloseReason, ConnectionId, Destination, RequestError, Responder, SendError,
+    CloseCode, CloseReason, ConnectionId, Destination, Dialer, RequestError, Responder, SendError,
     Transport, TransportError, TransportEvent,
 };
 pub use frames::{FrameError, KIND_PEER_EVIDENCE, evidence_frame};

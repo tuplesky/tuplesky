@@ -206,6 +206,38 @@ fn a_full_queue_costs_that_destination_and_is_offered_again_by_itself() {
     assert!(c.due_offers(MonotonicMillis::new(u64::MAX), 16).is_empty());
 }
 
+/// A voter whose link comes back is offered what it is owed on the next
+/// pass, not at the backed-off time its schedule had reached (task-d03).
+/// Only that voter's obligations move, and nothing is owed that was not.
+#[test]
+fn a_returning_link_brings_its_reoffers_forward() {
+    let mut c = collector(8, usize::MAX);
+    let (command, plan) = fan_out(&mut c, 1);
+    report_one(&mut c, 0, &plan, r(2), OfferOutcome::Unreachable);
+    let next = c.next_due().expect("owed on the schedule");
+    assert!(
+        next > MonotonicMillis::new(10),
+        "the floor is in the future"
+    );
+    assert!(c.due_offers(MonotonicMillis::new(10), 16).is_empty());
+
+    // Another voter coming back owes nothing and moves nothing.
+    assert_eq!(c.reachable_again(&r(1), MonotonicMillis::new(10)), 0);
+    assert_eq!(c.next_due(), Some(next));
+
+    assert_eq!(c.reachable_again(&r(2), MonotonicMillis::new(10)), 1);
+    assert_eq!(c.next_due(), Some(MonotonicMillis::new(10)));
+    let due = c.due_offers(MonotonicMillis::new(10), 16);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].command, command);
+    assert_eq!(due[0].targets, vec![r(2)]);
+
+    // Once delivered there is nothing left to bring forward.
+    report_one(&mut c, 10, &due[0], r(2), OfferOutcome::Queued);
+    assert_eq!(c.reachable_again(&r(2), MonotonicMillis::new(20)), 0);
+    assert_eq!(c.next_due(), None);
+}
+
 /// A destination that is unreachable rather than busy is on the same
 /// schedule: both are delivery backpressure, and both pass.
 #[test]
