@@ -304,8 +304,9 @@ again.
   node with a `[renewal]` section in its `coordd.toml` renews its own leaf
   while it serves (task-d02): it enrolls at the issuer when the leaf falls
   due and keeps serving, its connections moving to the renewed leaf as the
-  old one's end closes them. Every node, renewing or not, stops at its
-  leaf's `notAfter` with `reason=credential-expired`. The harness issues
+  old one's end closes them. A node holding a collector leaf renews that
+  one the same way, under the same section. Every node, renewing or not,
+  stops at the `notAfter` of either leaf with `reason=credential-expired`. The harness issues
   its leaves from a local test authority valid until the year 4096 and
   writes no `[renewal]` section, so a test domain never renews and never
   needs to; the startup report says `renewal not-configured`. Testing

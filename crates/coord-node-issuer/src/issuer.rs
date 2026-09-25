@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 use crate::ca::Ca;
 use crate::identity::node_uri;
 use crate::policy::{RolePolicy, authorize};
+use coord_types::wire_v1::PeerRole;
 
 /// A signed node certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,17 @@ pub struct NodeRequest {
     pub incarnation: u64,
     /// Requested lifetime in seconds.
     pub lifetime_secs: u64,
+    /// The role asked for, where the request names one.
+    ///
+    /// A choice among the rules the verified workload already holds,
+    /// never a grant: the certificate's role is still the matched
+    /// policy's. It exists because one process can hold two credentials
+    /// for the same node -- a node certificate and a collector's, which
+    /// names the same node as `Frontend` (task-d02) -- and presents the
+    /// same workload assertion for both, so without it the first rule
+    /// matching the workload would answer both renewals. `None` keeps
+    /// that first-match rule.
+    pub role: Option<PeerRole>,
 }
 
 /// Why enrollment failed. Bounded; never key material.
@@ -140,6 +152,7 @@ impl NodeIssuer {
             &identity,
             node,
             incarnation,
+            request.role,
             request.lifetime_secs,
         )
         .map_err(IssueError::Policy)?;

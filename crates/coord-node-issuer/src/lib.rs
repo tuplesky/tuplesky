@@ -42,7 +42,7 @@ pub mod policy;
 
 pub use ca::{Ca, CaError};
 pub use http::{IssuerState, SignClock, SystemSignClock, router};
-pub use identity::{NodeIdentity, node_uri, parse_node_uri};
+pub use identity::{NodeIdentity, node_uri, parse_node_uri, role_of, role_str};
 pub use issuer::{IssueError, Issued, NodeIssuer, NodeRequest};
 pub use lifecycle::{Leaf, Renewal, RenewalPolicy};
 pub use policy::{NodePolicy, PolicyError, RolePolicy};

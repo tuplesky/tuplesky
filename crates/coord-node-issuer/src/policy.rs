@@ -77,18 +77,24 @@ fn matches(
 }
 
 /// Build the node policy for `identity` requesting `node`/`incarnation`
-/// with `lifetime_secs`, under the first matching rule.
+/// with `lifetime_secs`, under the first matching rule -- the first
+/// granting `role`, where the request names one.
+///
+/// The role narrows which of the workload's own rules answers; it adds
+/// nothing a rule does not grant. A workload with no rule for that role
+/// is refused as it would be with no rule at all.
 pub fn authorize(
     rules: &[RolePolicy],
     identity: &VerifiedIdentity,
     node: ReplicaId,
     incarnation: ReplicaIncarnation,
+    role: Option<PeerRole>,
     lifetime_secs: u64,
 ) -> Result<NodePolicy, PolicyError> {
     let attrs = coord_authn::receipt::attributes(identity);
     let rule = rules
         .iter()
-        .find(|r| matches(r, identity, &attrs))
+        .find(|r| matches(r, identity, &attrs) && role.is_none_or(|role| r.role == role))
         .ok_or(PolicyError::NoRule)?;
     if !rule.nodes.contains(&node) {
         return Err(PolicyError::NodeNotAuthorized);

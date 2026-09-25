@@ -1191,6 +1191,41 @@ impl Transport {
         Ok(())
     }
 
+    /// Present `chain` and `key` from now on when dialling an API-class
+    /// peer, in place of the separate credential this endpoint was built
+    /// with ([`LocalIdentity::api_client`]; task-d02).
+    ///
+    /// The collector's leaf renewed, as [`Transport::set_identity`] is
+    /// the node's: dials that begin after this call present it, a
+    /// [`Dialer`] taken before included, and nothing already open is
+    /// touched -- a connection dialled under the old leaf ends at that
+    /// leaf's end, or at its peer's deadline or the age cap, and is
+    /// dialled again under this one. The node's own leaf, which every
+    /// handshake this endpoint accepts presents, is not changed.
+    ///
+    /// Refused, with nothing replaced, on an endpoint built without a
+    /// separate credential: there the node's own leaf is what an
+    /// API-class dial presents, and a second principal is not something
+    /// a renewal adds.
+    pub fn set_api_client(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<(), TransportError> {
+        let mut tls = self.shared.tls.lock().unwrap();
+        if tls.collector.is_none() {
+            return Err(TransportError::Tls(
+                "this endpoint dials as the node itself and holds no separate credential".into(),
+            ));
+        }
+        let config = client_config(&tls.provider, &tls.roots, ALPN_API, &chain, &key)?;
+        let until = Shared::until(self.shared.binder.as_ref(), &chain);
+        tls.client[0] = config.clone();
+        tls.collector = Some(config);
+        tls.collector_until = until;
+        Ok(())
+    }
+
     /// The fixed TLS profile.
     pub const fn tls_profile() -> TlsProfile {
         TlsProfile::FIXED

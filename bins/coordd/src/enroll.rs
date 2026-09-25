@@ -309,6 +309,12 @@ impl Enroller {
             "node": hex(&current.identity.node.0),
             "incarnation": current.identity.incarnation.get(),
             "lifetime_secs": self.lifetime_secs,
+            // The role this leaf already has. One workload can hold two
+            // credentials for the same node -- the node's and the
+            // collector's -- and presents one assertion for both, so the
+            // issuer is told which of its rules for that workload
+            // answers. It grants nothing a rule does not.
+            "role": coord_node_issuer::role_str(current.identity.role),
         });
         let mut response = self
             .client

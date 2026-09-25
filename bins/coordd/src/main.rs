@@ -605,6 +605,28 @@ fn main() -> ExitCode {
                         "not-configured"
                     },
                 );
+                // The collector's leaf, where this process holds one: it
+                // is renewed under the same section and ends serving the
+                // same way (task-d02).
+                if let Some(path) = &config.identity.collector_certificate {
+                    match membership::inspect_leaf(path, now_seconds(), &policy) {
+                        Ok((leaf, renewal)) => println!(
+                            "collector leaf issued_at={} expires_at={} renewal={} driver={}",
+                            leaf.issued_at,
+                            leaf.expires_at,
+                            renewal_state(&renewal),
+                            if config.renewal.is_some() {
+                                "configured"
+                            } else {
+                                "not-configured"
+                            },
+                        ),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -826,43 +848,78 @@ fn main() -> ExitCode {
     // and the report says when this leaf ends and whether anything will
     // renew it, because an operator reading a startup report is the one
     // who has to know that a node without renewal goes out at `notAfter`.
-    let credential = match enroll::Credential::of(identity.chain, identity.key, identity.roots) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
+    //
+    // Every leaf this process presents is settled the same way: the
+    // node's, and the collector's where it holds one. Each is renewed
+    // where `[renewal]` is configured, under the same section and each
+    // under its own key, and each ends this node's serving at its
+    // `notAfter` either way (task-d02).
+    let coord_transport::LocalIdentity {
+        chain,
+        key,
+        roots,
+        api_client,
+        ..
+    } = identity;
+    let mut renewings = Vec::new();
+    let mut leaf_ends = Vec::new();
+    let mut leaves = vec![(
+        serve::Principal::Node,
+        enroll::Credential::of(chain, key, roots.clone()),
+        config.identity.node_certificate.as_str(),
+        roles.votes(),
+    )];
+    if let (Some(collector), Some(path)) = (api_client, &config.identity.collector_certificate) {
+        leaves.push((
+            serve::Principal::Collector,
+            enroll::Credential::of(collector.chain, collector.key, roots.clone()),
+            path.as_str(),
+            // A collector's leaf names the node's identity as `Frontend`:
+            // it is never a voter's key, and committed membership has
+            // nothing to say about it.
+            false,
+        ));
+    }
+    for (principal, credential, certificate, votes) in leaves {
+        let credential = match credential {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        };
+        leaf_ends.push((principal, credential.leaf.expires_at));
+        match &config.renewal {
+            Some(section) => {
+                let enroller = match enroll::Enroller::new(
+                    section,
+                    certificate,
+                    placed.membership.clone(),
+                    votes,
+                ) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let renewing = serve::Renewing::new(
+                    principal,
+                    enroller,
+                    credential,
+                    renewal::policy(Some(section)),
+                );
+                println!("{}", renewing.describe(now_seconds().saturating_mul(1000)));
+                renewings.push(renewing);
+            }
+            None => println!(
+                "{} not-configured issued_at={} expires_at={}",
+                principal.label(),
+                credential.leaf.issued_at,
+                credential.leaf.expires_at
+            ),
         }
-    };
-    // Every node stops serving at its leaf's end, renewing or not
-    // (task-d02). Where nothing renews it, the end is fixed here.
-    let leaf_expires_at = credential.leaf.expires_at;
-    let renewing = match &config.renewal {
-        Some(section) => {
-            let enroller = match enroll::Enroller::new(
-                section,
-                &config.identity.node_certificate,
-                placed.membership.clone(),
-                roles.votes(),
-            ) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::from(2);
-                }
-            };
-            let renewing =
-                serve::Renewing::new(enroller, credential, renewal::policy(Some(section)));
-            println!("{}", renewing.describe(now_seconds().saturating_mul(1000)));
-            Some(renewing)
-        }
-        None => {
-            println!(
-                "renewal not-configured issued_at={} expires_at={}",
-                credential.leaf.issued_at, credential.leaf.expires_at
-            );
-            None
-        }
-    };
+    }
     if cli.check {
         return ExitCode::SUCCESS;
     }
@@ -1140,7 +1197,7 @@ fn main() -> ExitCode {
         // Every role renews the same way: a collector or an observer asks
         // for exactly the leaf it has, and is refused anything that would
         // name another role (task-d02).
-        if let Some(renewing) = renewing {
+        for renewing in renewings {
             domain = domain.with_renewal(renewing);
         }
         // The leaf's deadline is raced against the whole loop, not only
@@ -1153,14 +1210,33 @@ fn main() -> ExitCode {
         // transports already refuse every handshake and end every
         // connection there, so what would be left is a process that
         // cannot reach anyone (design Sections 10.4, 20.4).
-        let (_fixed, deadline) = tokio::sync::watch::channel(leaf_expires_at.saturating_mul(1000));
-        let deadline = domain.leaf_deadline().unwrap_or(deadline);
+        //
+        // Every leaf this process presents, too: the collector's ends a
+        // frontend's reach to the other voters as surely as the node's
+        // ends the node's.
+        let mut fixed = Vec::new();
+        let deadlines = leaf_ends
+            .iter()
+            .map(|&(principal, expires_at)| {
+                let deadline = domain.leaf_deadline(principal).unwrap_or_else(|| {
+                    // Nothing renews this one, so nothing moves it; the
+                    // sender is kept so the deadline is waited out rather
+                    // than read as closed.
+                    let (sender, deadline) =
+                        tokio::sync::watch::channel(expires_at.saturating_mul(1000));
+                    fixed.push(sender);
+                    deadline
+                });
+                (principal, deadline)
+            })
+            .collect();
         let raced = tokio::select! {
-            () = domain.run(&mut transport, now_seconds) => false,
-            () = serve::leaf_expired(deadline) => true,
+            () = domain.run(&mut transport, now_seconds) => None,
+            principal = serve::first_leaf_expired(deadlines) => Some(principal),
         };
-        if raced {
-            domain.leaf_expired_while_serving();
+        drop(fixed);
+        if let Some(principal) = raced {
+            domain.leaf_expired_while_serving(principal);
         }
         eprintln!(
             "peers connected={} submittable={}",
@@ -1203,23 +1279,38 @@ crowded_out={}",
             counts.unclaimed,
             counts.crowded_out
         );
-        let renewal = domain.renewal();
-        if let Some(r) = renewal {
+        let renewals = domain.renewals();
+        for r in &renewals {
             eprintln!(
-                "renewal renewed={} attempts={} failed={} expires_at={} expired={}",
-                r.renewed, r.attempts, r.failed, r.expires_at, r.expired
-            );
-        } else if raced {
-            eprintln!(
-                "renewal not-configured expires_at={leaf_expires_at}: this node's leaf is no \
-                 longer valid and it stops serving on it; restart it on a renewed leaf"
+                "{} renewed={} attempts={} failed={} expires_at={} expired={}",
+                r.principal.label(),
+                r.renewed,
+                r.attempts,
+                r.failed,
+                r.expires_at,
+                r.expired
             );
         }
-        // Not a fault of the store and not a crash: the credential this
-        // node is has ended. The process stops rather than serve on it,
-        // and says why in the phase an operator watches -- the same
-        // signal whether or not anything was renewing it.
-        if raced || renewal.is_some_and(|r| r.expired) {
+        if let Some(principal) = raced
+            && !renewals.iter().any(|r| r.principal == principal)
+        {
+            let expires_at = leaf_ends
+                .iter()
+                .find(|(p, _)| *p == principal)
+                .map_or(0, |(_, at)| *at);
+            eprintln!(
+                "{} not-configured expires_at={expires_at}: {} is no longer valid and this \
+                 node stops serving on it; restart it on a renewed leaf",
+                principal.label(),
+                principal.leaf(),
+            );
+        }
+        // Not a fault of the store and not a crash: a credential this
+        // node presents has ended. The process stops rather than serve on
+        // it, and says why in the phase an operator watches -- the same
+        // signal whichever leaf it was and whether or not anything was
+        // renewing it.
+        if raced.is_some() || renewals.iter().any(|r| r.expired) {
             let mut lifecycle = lifecycle;
             lifecycle.quarantine(QuarantineReason::CredentialExpired);
             eprintln!(
