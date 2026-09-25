@@ -384,12 +384,21 @@ impl LogicalRequest {
 
     /// Validate limits, rules and canonical form.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        self.cost().map(|_| ())
+    }
+
+    /// Validate, and say what the request costs against the request
+    /// bound: the bytes of the keys, values and range ends it carries,
+    /// never more than [`limits::MAX_REQUEST_BYTES`]. The same count
+    /// [`LogicalRequest::validate`] bounds, so a frontend that bounds
+    /// requests more tightly compares against what the protocol does.
+    pub fn cost(&self) -> Result<usize, ValidationError> {
         if self.schema_version != SCHEMA_VERSION {
             // A different version is not this type's schema; treat as too
             // large/unsupported rather than silently reinterpreting.
             return Err(ValidationError::RequestTooLarge);
         }
-        self.operation.validate()
+        self.operation.cost()
     }
 
     /// Canonical postcard encoding (the identity payload). Fails only when
@@ -420,6 +429,12 @@ impl CanonicalOperation {
     /// Validate limits and schema rules. Non-canonical transactions are
     /// rejected so two encodings of one logical request cannot exist.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        self.cost().map(|_| ())
+    }
+
+    /// Validate, and say what the operation costs against the request
+    /// bound (see [`LogicalRequest::cost`]).
+    pub fn cost(&self) -> Result<usize, ValidationError> {
         let mut cost = 0usize;
         match self {
             CanonicalOperation::Range(r) => cost += validate_range(r)?,
@@ -544,7 +559,7 @@ impl CanonicalOperation {
         if cost > limits::MAX_REQUEST_BYTES {
             return Err(ValidationError::RequestTooLarge);
         }
-        Ok(())
+        Ok(cost)
     }
 }
 

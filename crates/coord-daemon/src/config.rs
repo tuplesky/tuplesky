@@ -25,7 +25,10 @@ pub struct ListenConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
-    /// Largest logical request accepted.
+    /// Largest logical request accepted, as the protocol counts one: the
+    /// bytes of the keys, values and range ends it carries
+    /// (`LogicalRequest::cost`). A frontend refuses a larger one at
+    /// admission with `REQUEST_TOO_LARGE`.
     pub max_request_bytes: usize,
     /// Largest response / complete watch revision.
     pub max_response_bytes: usize,

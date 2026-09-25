@@ -47,16 +47,13 @@ pub struct Admitted {
 pub struct AdmissionLimits {
     /// Requests one session may have pending at this frontend.
     pub max_pending_per_session: usize,
-    /// The largest logical request this frontend admits, in bytes of its
-    /// canonical encoding beyond [`ENCODING_ALLOWANCE`].
+    /// The largest logical request this frontend admits, as the protocol
+    /// counts one ([`coord_types::logical_v1::LogicalRequest::cost`]): the
+    /// bytes of the keys, values and range ends it carries. At the
+    /// default, the protocol's own bound, no request that validates is
+    /// refused for its size.
     pub max_request_bytes: usize,
 }
-
-/// What a request's canonical encoding may carry beyond
-/// `max_request_bytes`: its own tags and lengths. The wire grants the
-/// same allowance over the protocol's request limit, so a frontend at the
-/// default limit admits exactly what the wire carries.
-pub const ENCODING_ALLOWANCE: usize = 64 * 1024;
 
 impl Default for AdmissionLimits {
     fn default() -> Self {
@@ -88,10 +85,9 @@ pub enum AdmissionRefusal {
     },
     /// The request is larger than this frontend admits.
     RequestTooLarge {
-        /// Bytes of the request's canonical encoding.
+        /// What the request costs, as the protocol counts it.
         bytes: usize,
-        /// What this frontend admits: `max_request_bytes` and the
-        /// encoding allowance.
+        /// What this frontend admits: `max_request_bytes`.
         limit: usize,
     },
 }
@@ -132,18 +128,18 @@ impl Admission {
         if caller.role != PeerRole::Client {
             return Err(AdmissionRefusal::RoleNotAdmitted(caller.role));
         }
-        request.logical().map_err(|_| AdmissionRefusal::Malformed)?;
+        let cost = request
+            .logical()
+            .ok()
+            .and_then(|logical| logical.cost().ok())
+            .ok_or(AdmissionRefusal::Malformed)?;
         // Before any slot is taken or any byte is budgeted: a request this
         // frontend will never admit costs it nothing, and is refused the
         // same way on every retry.
-        let limit = self
-            .limits
-            .max_request_bytes
-            .saturating_add(ENCODING_ALLOWANCE);
-        if request.logical.as_slice().len() > limit {
+        if cost > self.limits.max_request_bytes {
             return Err(AdmissionRefusal::RequestTooLarge {
-                bytes: request.logical.as_slice().len(),
-                limit,
+                bytes: cost,
+                limit: self.limits.max_request_bytes,
             });
         }
         let key = &request.retry_key;

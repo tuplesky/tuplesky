@@ -1711,12 +1711,15 @@ fn a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot()
             max_request_bytes: 1024,
         },
     );
-    let limit = 1024 + coord_collector::admission::ENCODING_ALLOWANCE;
-    let big = vec![0x5a; limit + 1];
-    let (_, large) = request(1, put(b"k", &big), 0);
+    // The bound is what the protocol counts, the bytes of the key and
+    // the value, with no allowance on top: 1024 is admitted, 1025 is not.
+    let (_, large) = request(1, put(b"k", &vec![0x5a; 1024]), 0);
     assert!(matches!(
         gate.admit(0, &caller(), &large),
-        Err(AdmissionRefusal::RequestTooLarge { bytes, limit: l }) if bytes > limit && l == limit
+        Err(AdmissionRefusal::RequestTooLarge {
+            bytes: 1025,
+            limit: 1024
+        })
     ));
     assert_eq!(gate.pending(&SESSION), 0, "the refusal took no slot");
     // A retry is refused the same way, and a request inside the bound is
@@ -1725,18 +1728,27 @@ fn a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot()
         gate.admit(0, &caller(), &large),
         Err(AdmissionRefusal::RequestTooLarge { .. })
     ));
-    let (_, small) = request(2, put(b"k", &vec![0x5a; 512]), 0);
-    gate.admit(0, &caller(), &small).expect("inside the bound");
+    let (_, small) = request(2, put(b"k", &vec![0x5a; 1023]), 0);
+    gate.admit(0, &caller(), &small)
+        .expect("exactly at the bound");
     assert_eq!(gate.pending(&SESSION), 1);
 }
 
 #[test]
-fn the_default_bound_admits_what_the_wire_carries() {
-    // At the protocol's own request limit the check changes nothing: the
-    // wire already carries a request's encoding up to the same allowance.
+fn the_default_bound_refuses_nothing_the_protocol_admits() {
+    // At the default the bound is the protocol's own request limit, which
+    // every request that validates is already within -- a request past it
+    // cannot even be built -- so the check refuses nothing. The largest
+    // single write the protocol allows is admitted.
+    let limits = AdmissionLimits::default();
     assert_eq!(
-        AdmissionLimits::default().max_request_bytes
-            + coord_collector::admission::ENCODING_ALLOWANCE,
-        coord_types::logical_v1::limits::MAX_REQUEST_BYTES + 64 * 1024
+        limits.max_request_bytes,
+        coord_types::logical_v1::limits::MAX_REQUEST_BYTES
     );
+    let mut gate = Admission::new(CLUSTER, DOMAIN, limits);
+    let key = vec![0x6b; coord_types::logical_v1::limits::MAX_KEY_BYTES];
+    let value = vec![0x5a; coord_types::logical_v1::limits::MAX_VALUE_BYTES];
+    let (_, largest) = request(1, put(&key, &value), 0);
+    gate.admit(0, &caller(), &largest)
+        .expect("the protocol's largest write");
 }

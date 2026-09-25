@@ -6336,9 +6336,9 @@ async fn a_request_above_the_configured_bound_is_refused_and_one_below_is_served
 
     let daemon = start(&path);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x52; 16]).await;
-    // Past the bound and its encoding allowance, well inside what the
-    // wire carries.
-    let large = vec![0x5a; 1024 + 64 * 1024 + 1];
+    // Past the bound -- the key and the value, as the protocol counts a
+    // request -- and well inside what the wire carries.
+    let large = vec![0x5a; 2048];
     let refused = ask(&caller.connection, &caller.put(1, b"k", &large))
         .await
         .unwrap_or_else(|| panic!("no answer to a large put\n{}", daemon.said()));
@@ -6357,4 +6357,25 @@ async fn a_request_above_the_configured_bound_is_refused_and_one_below_is_served
         response_of(&served).outcome,
         coord_types::wire_v1::OutcomeV1::Ok { .. }
     ));
+
+    // Through the SDK, which accepts an answer only under the command
+    // identity it allocated: the refusal has to carry the invocation's
+    // own, or the SDK drops it as unexpected and the request never ends.
+    let mut sdk = SdkCaller::bind(&dir, &daemon, &ca, &ring, [0x53; 16]).await;
+    let mut logical = coord_types::logical_v1::LogicalRequest::new(
+        coord_types::ids::NamespaceId([0x5e; 16]),
+        coord_types::logical_v1::CanonicalOperation::Put(coord_types::logical_v1::PutOp {
+            key: b"k".to_vec(),
+            value: large,
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    logical.canonicalize();
+    let completion = sdk.ask(1, &logical).await;
+    assert_eq!(
+        completion.outcome,
+        coord_sdk::Outcome::Failed(coord_sdk::RetryError::RequestTooLarge),
+        "{completion:?}"
+    );
 }

@@ -199,7 +199,18 @@ impl Dispatcher {
                                 (codes::NOT_ADMITTED, "not admitted")
                             }
                         };
-                        return self.respond(connection, key, command_of(&key), code, detail);
+                        // The invocation's own command identity wherever the
+                        // request is well formed -- a size refusal above all,
+                        // which is decided only after it is -- so the caller
+                        // can match the answer to what it asked. Only a
+                        // request whose logical part does not decode falls
+                        // back to an identity of the retry key alone.
+                        let command = request
+                            .logical()
+                            .ok()
+                            .and_then(|logical| CommandId::derive(&key, &logical).ok())
+                            .unwrap_or_else(|| command_of(&key));
+                        return self.respond(connection, key, command, code, detail);
                     }
                 };
                 let reserved = admitted.reserved;

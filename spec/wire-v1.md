@@ -216,8 +216,15 @@ certificate binds one role and the role that may act for other
 principals is not the voter's. Frozen error codes of `ResponseV1::Err` are `wire_v1::codes` in
 `coord-types` (`0x0001` request identity conflict, `0x0002`
 backpressure, `0x0003` malformed request, `0x0004` not admitted, `0x0005`
-result too large; append-only); pending and unknown outcomes use
-the `Pending` and `Unknown` outcomes, not error codes.
+result too large, `0x0006` request too large; append-only); pending and
+unknown outcomes use the `Pending` and `Unknown` outcomes, not error
+codes. `0x0006` is a permanent refusal: what the request carries, as
+the protocol counts it against its request limit (the bytes of its keys,
+values and range ends), exceeds the frontend's configured
+`max_request_bytes`. It is decided before
+anything is reserved, is answered under the invocation's own command
+identity, and is the same answer on every retry, so a client does not
+retry it.
 
 ## API session binding (task-37)
 
