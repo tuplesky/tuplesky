@@ -89,6 +89,10 @@ struct EnrollBody {
     node: String,
     incarnation: u64,
     lifetime_secs: u64,
+    /// The role asked for (`voter`, `frontend`, ...), where the request
+    /// names one; see [`NodeRequest::role`].
+    #[serde(default)]
+    role: Option<String>,
 }
 
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
@@ -159,12 +163,18 @@ async fn enroll(State(state): State<Arc<IssuerState>>, Json(body): Json<EnrollBo
     let (Some(csr_der), Some(node)) = (b64url_decode(&body.csr), unhex16(&body.node)) else {
         return error(StatusCode::BAD_REQUEST, "malformed");
     };
+    let role = match body.role.as_deref().map(crate::identity::role_of) {
+        None => None,
+        Some(Some(role)) => Some(role),
+        Some(None) => return error(StatusCode::BAD_REQUEST, "malformed"),
+    };
     let request = NodeRequest {
         assertion: body.assertion,
         csr_der,
         node,
         incarnation: body.incarnation,
         lifetime_secs: body.lifetime_secs,
+        role,
     };
     let clock = state.clock.read();
     match state.issuer.lock().await.enroll(&request, &clock) {

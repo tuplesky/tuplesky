@@ -9,7 +9,7 @@ use coord_authn::{
     ClockHealth, IssuerConfig, JwksLimits, KubernetesMode, Registry, WifVerifier, WorkloadKind,
 };
 use coord_node_issuer::{
-    Ca, CaError, IssueError, NodeIssuer, NodeRequest, RolePolicy, parse_node_uri,
+    Ca, CaError, IssueError, NodeIssuer, NodeRequest, PolicyError, RolePolicy, parse_node_uri,
 };
 use coord_types::ids::{ClusterId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::PeerRole;
@@ -161,6 +161,7 @@ fn request(idp: &Idp, csr_der: Vec<u8>, node: u8, incarnation: u64, lifetime: u6
         node: [node; 16],
         incarnation,
         lifetime_secs: lifetime,
+        role: None,
     }
 }
 
@@ -230,6 +231,54 @@ fn cold_enrollment_works_before_any_voter_and_binds_the_node_identity() {
     // The CA certificate is served for bootstrap; the CA key never leaves.
     assert!(!issuer.ca().certificate().is_empty());
     assert_eq!(issuer.issued, 1);
+}
+
+/// One workload, two credentials for the same node: a node certificate
+/// as `Voter` and a collector's as `Frontend` (task-d02). A request that
+/// names its role is answered by the workload's rule for that role; one
+/// that names none keeps the first-match rule; and a role the workload
+/// holds no rule for is refused as having no rule, never granted.
+#[test]
+fn a_request_that_names_its_role_is_answered_by_that_rule_of_the_workload() {
+    let provider = idp();
+    let (cert, key) = ca(NOW, 86_400);
+    let ca = Ca::load(&cert, &key, NOW).unwrap();
+    let frontend = RolePolicy {
+        role: PeerRole::Frontend,
+        dns_names: vec!["collector-0.cluster-1.internal".into()],
+        ..policy()
+    };
+    let mut issuer = NodeIssuer::new(verifier(&provider), ca, vec![policy(), frontend]);
+    let role_of =
+        |issued: coord_node_issuer::Issued| parse_node_uri(&issued.node_uri).unwrap().role;
+
+    let (csr_der, _) = csr(vec![KeyUsagePurpose::DigitalSignature], IsCa::NoCa);
+    let first = issuer
+        .enroll(&request(&provider, csr_der.clone(), 1, 2, 300), &clock(NOW))
+        .unwrap();
+    assert_eq!(
+        role_of(first),
+        PeerRole::Voter,
+        "no role named: the first rule"
+    );
+
+    for role in [PeerRole::Voter, PeerRole::Frontend] {
+        let named = NodeRequest {
+            role: Some(role),
+            ..request(&provider, csr_der.clone(), 1, 2, 300)
+        };
+        assert_eq!(role_of(issuer.enroll(&named, &clock(NOW)).unwrap()), role);
+    }
+
+    // Naming a role is choosing among the workload's rules, not a grant.
+    let observer = NodeRequest {
+        role: Some(PeerRole::Observer),
+        ..request(&provider, csr_der, 1, 2, 300)
+    };
+    assert_eq!(
+        issuer.enroll(&observer, &clock(NOW)).map(|_| ()),
+        Err(IssueError::Policy(PolicyError::NoRule))
+    );
 }
 
 #[test]

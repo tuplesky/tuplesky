@@ -32,7 +32,8 @@ fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-const fn role_str(role: PeerRole) -> &'static str {
+/// The name a role goes by in a node URI and an enrollment request.
+pub const fn role_str(role: PeerRole) -> &'static str {
     match role {
         PeerRole::Voter => "voter",
         PeerRole::Observer => "observer",
@@ -43,7 +44,8 @@ const fn role_str(role: PeerRole) -> &'static str {
     }
 }
 
-fn role_of(s: &str) -> Option<PeerRole> {
+/// The role `s` names, as [`role_str`] writes it.
+pub fn role_of(s: &str) -> Option<PeerRole> {
     Some(match s {
         "voter" => PeerRole::Voter,
         "observer" => PeerRole::Observer,

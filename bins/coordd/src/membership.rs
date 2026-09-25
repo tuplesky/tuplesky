@@ -264,6 +264,21 @@ pub fn inspect(
     })
 }
 
+/// The validity window of the leaf at `certificate_path` and what to do
+/// about it at `now`, as the serving loop decides it: for the collector's
+/// leaf, which committed membership has nothing to say about (task-d02).
+pub fn inspect_leaf(
+    certificate_path: &str,
+    now: u64,
+    policy: &coord_node_issuer::RenewalPolicy,
+) -> Result<(coord_node_issuer::Leaf, coord_node_issuer::Renewal), IdentityError> {
+    let (identity, leaf) = leaf_identity(certificate_path)?;
+    let leaf = validity(&leaf);
+    let seed = crate::renewal::seed(&identity.node);
+    let renewal = crate::renewal::bounded(*policy, &leaf).decide(&leaf, now, seed);
+    Ok((leaf, renewal))
+}
+
 /// The leaf's validity window in unix seconds.
 fn validity(leaf: &CertificateDer<'_>) -> coord_node_issuer::Leaf {
     x509_parser::certificate::X509Certificate::from_der(leaf).map_or(
