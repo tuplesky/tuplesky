@@ -2136,13 +2136,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self.frontend.follow(voter.node().machine().active());
         // Work queued under a ballot this voter has left can no longer be
         // made durable, and the store refuses it rather than holding it.
-        if voter.fenced > self.fenced_said {
+        // So is work stamped under a ballot below its promise, after a
+        // promise that did not become durable took the voter back.
+        let fenced = voter.fenced + voter.node().fenced;
+        if fenced > self.fenced_said {
             eprintln!(
-                "this voter refused {} transition(s) queued under a ballot it left: \
+                "this voter refused {} transition(s) under a ballot below its promise: \
                  definitely not committed",
-                voter.fenced - self.fenced_said
+                fenced - self.fenced_said
             );
-            self.fenced_said = voter.fenced;
+            self.fenced_said = fenced;
         }
         let role = (voter.ballot(), voter.leads());
         if self.role_said != Some(role) {

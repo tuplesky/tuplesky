@@ -3501,6 +3501,21 @@ fence does not move back. Work stamped below it is refused and counted
 until the voter promises that ballot or a higher one again. A voter that
 does not vote is always safe.
 
+What refused means matters, because the refusal lands in the serve loop.
+Work already queued is refused by the fence itself and its barriers fail.
+Work the machine asks for afterwards is refused at submit, where the
+journaled store answers `ObsoleteBallot`. That used to surface as
+`DriveError::Submit`, and on the turn path a `DriveError` ends the serve
+loop as a voter that cannot make its transitions durable. Now the store
+wrapper reports it as `Refused::Fenced`, and `Node::one_round` turns it
+into what the fence reports for queued work: the barrier failed,
+`DefinitelyNotCommitted`, fed back to the machine. The send that waited
+on it is never released, and the voter serves on. Every other refusal at
+submit still ends the loop. `a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on`
+has the store refuse a candidate's promise row as fenced. The voter
+sends no promise, follows the machine back to its ballot, and counts
+the refusal. Without the `Fenced` arm, the step fails.
+
 **A campaign still under way is left to finish.** A campaign collects a
 report from a majority, and a report carries what its voter holds, so on
 a busy domain the collection can outlast the doubled patience. Replacing

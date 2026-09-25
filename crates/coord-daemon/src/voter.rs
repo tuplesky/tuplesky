@@ -312,9 +312,12 @@ impl<P: Persistence> Voter<P> {
             // the machine is back at the ballot it had. The voter follows
             // it, so what the machine does is stamped with the ballot it
             // does it under. The store's fence does not move back. Work
-            // stamped below it is refused, and counted, until the voter
-            // promises that ballot or a higher one again. A voter that
-            // does not vote is always safe.
+            // stamped below it is refused at submit, and counted, until
+            // the voter promises that ballot or a higher one again. The
+            // refusal reaches the machine as a failed barrier
+            // (`Node::one_round`), so the transition it asked for is
+            // definitely not committed and the voter goes on serving. A
+            // voter that does not vote is always safe.
             self.set_ballot(promised);
         }
         if let Some(changed) = self.node.change_role(&self.ballot)? {
