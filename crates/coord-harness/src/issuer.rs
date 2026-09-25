@@ -19,11 +19,18 @@
 //! claims, and the frontend that accepts it runs the same verification
 //! it runs in production.
 //!
-//! Consequently this endpoint is refused outside a loopback bind, and it
-//! is in a `test-only` crate that no production artifact can reach.
+//! Consequently this endpoint binds loopback, and it is in a `test-only`
+//! crate that no production artifact can reach. The one exception is a
+//! domain provisioned for several hosts (task-d04), whose Kine build may
+//! run on a host other than the endpoint's: there it may bind the host
+//! it was provisioned for, and only that. The opt-in is made when the
+//! domain is provisioned, because that is when the endpoint's
+//! certificate is issued -- a bind address given later could not change
+//! what the certificate names, and the check below is against the
+//! certificate, not against a setting anyone can edit.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -72,7 +79,8 @@ pub enum IssuerError {
     Key(String),
     /// The TLS material is not usable.
     Tls(String),
-    /// The endpoint was asked to bind something other than loopback.
+    /// The endpoint was asked to bind something other than loopback or
+    /// the host its certificate was provisioned for.
     NotLoopback(String),
 }
 
@@ -82,9 +90,11 @@ impl std::fmt::Display for IssuerError {
             IssuerError::Io(e) => write!(f, "{e}"),
             IssuerError::Key(e) => write!(f, "signing key: {e}"),
             IssuerError::Tls(e) => write!(f, "tls: {e}"),
-            IssuerError::NotLoopback(a) => {
-                write!(f, "the harness issuer binds loopback only, not {a}")
-            }
+            IssuerError::NotLoopback(a) => write!(
+                f,
+                "the harness issuer binds loopback, or the host it was provisioned \
+                 for with --issuer-listen, not {a}"
+            ),
         }
     }
 }
@@ -176,19 +186,38 @@ impl Minter {
 }
 
 impl Endpoint {
-    /// Load the provisioned material and bind the endpoint.
+    /// Load the provisioned material and bind the endpoint where it was
+    /// provisioned to listen.
     pub fn bind(dir: &Path) -> Result<Self, IssuerError> {
+        Endpoint::bind_on(dir, None)
+    }
+
+    /// The same, binding `listen` instead of the provisioned listener
+    /// when one is given: `coord-harness issuer --listen`.
+    ///
+    /// Whatever is asked, the bind is refused unless [`permitted`] allows
+    /// it: loopback, or the host the certificate was provisioned for.
+    pub fn bind_on(dir: &Path, listen: Option<SocketAddr>) -> Result<Self, IssuerError> {
         let provisioned = Provisioned::read(dir)?;
-        if !provisioned.issuer.listen.starts_with("127.0.0.1:") {
-            return Err(IssuerError::NotLoopback(provisioned.issuer.listen.clone()));
-        }
-        let minter = Minter::of(&provisioned)?;
+        let address = match listen {
+            Some(address) => address,
+            None => provisioned
+                .issuer
+                .listen
+                .parse()
+                .map_err(|_| IssuerError::NotLoopback(provisioned.issuer.listen.clone()))?,
+        };
 
         let chain: Vec<CertificateDer<'static>> =
             CertificateDer::pem_file_iter(&provisioned.issuer.certificate)
                 .map_err(|e| IssuerError::Tls(format!("{e}")))?
                 .collect::<Result<_, _>>()
                 .map_err(|e| IssuerError::Tls(format!("{e}")))?;
+        let leaf = chain
+            .first()
+            .ok_or_else(|| IssuerError::Tls("the endpoint has no certificate".into()))?;
+        permitted(address, &provisioned.issuer.url, leaf)?;
+        let minter = Minter::of(&provisioned)?;
         let key = PrivateKeyDer::from_pem_file(&provisioned.issuer.key)
             .map_err(|e| IssuerError::Tls(format!("{e}")))?;
         let mut tls = rustls::ServerConfig::builder()
@@ -200,7 +229,7 @@ impl Endpoint {
         // instead of a hang.
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-        let listener = TcpListener::bind(&provisioned.issuer.listen)?;
+        let listener = TcpListener::bind(address)?;
         Ok(Endpoint {
             minter,
             tls: Arc::new(tls),
@@ -299,6 +328,109 @@ impl Endpoint {
             return None;
         }
         self.minter.mint_token().map(|(token, _)| token)
+    }
+}
+
+/// Whether the endpoint may bind `address`.
+///
+/// Loopback always: that is the endpoint this harness has always run.
+/// Anything else only for a domain provisioned with `--issuer-listen`
+/// for a host that is not loopback, and only on the port its URL names,
+/// either at that host's own address or at the unspecified address (for
+/// a host reached at an address that is not on any of its interfaces, or
+/// by name).
+///
+/// The host is taken from the certificate, not from the description: an
+/// issuer certificate names the issuer and exactly one host it is
+/// reached at ([`reached_at`]), and the URL has to name that host. So
+/// editing the description to point the endpoint somewhere else does not
+/// produce a certificate for somewhere else, and a URL naming the
+/// issuer's own name, which every issuer certificate carries, names no
+/// host at all. A loopback-provisioned certificate is reached at
+/// `127.0.0.1`, and a host that only means loopback (a loopback address,
+/// or `localhost`) never lets the endpoint bind anything else.
+fn permitted(
+    address: SocketAddr,
+    url: &str,
+    certificate: &CertificateDer<'_>,
+) -> Result<(), IssuerError> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    let refused = || IssuerError::NotLoopback(address.to_string());
+    let (host, port) = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .ok_or_else(refused)?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let port: u16 = port.parse().map_err(|_| refused())?;
+    let reached = reached_at(certificate).ok_or_else(refused)?;
+    if !reached.is(host) || reached.only_loopback() || port != address.port() {
+        return Err(refused());
+    }
+    let at = match reached {
+        Reach::Ip(ip) => Some(ip),
+        Reach::Dns(_) => None,
+    };
+    if !(address.ip().is_unspecified() || at == Some(address.ip())) {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+/// The one host an issuer certificate is reached at.
+enum Reach {
+    Ip(IpAddr),
+    Dns(String),
+}
+
+impl Reach {
+    /// Whether a URL's `host` names this, and nothing else.
+    fn is(&self, host: &str) -> bool {
+        match self {
+            Reach::Ip(ip) => host.parse::<IpAddr>().is_ok_and(|named| named == *ip),
+            Reach::Dns(name) => host.parse::<IpAddr>().is_err() && name.eq_ignore_ascii_case(host),
+        }
+    }
+
+    /// Whether this reaches only the machine it is on.
+    fn only_loopback(&self) -> bool {
+        match self {
+            Reach::Ip(ip) => ip.is_loopback() || ip.is_unspecified(),
+            Reach::Dns(name) => crate::pki::loopback_name(name),
+        }
+    }
+}
+
+/// The subject alternative name of `certificate` that is not the
+/// issuer's own name, when there is exactly one. Anything else (none,
+/// two, or one of another type) is not a certificate this harness
+/// issued for an endpoint, and reaches nothing.
+fn reached_at(certificate: &CertificateDer<'_>) -> Option<Reach> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::FromDer;
+
+    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate).ok()?;
+    let names = parsed.subject_alternative_name().ok()??;
+    let mut hosts = names.value.general_names.iter().filter(|name| {
+        !matches!(name, GeneralName::DNSName(dns)
+            if dns.eq_ignore_ascii_case(crate::domain::ISSUER_NAME))
+    });
+    let host = hosts.next()?;
+    if hosts.next().is_some() {
+        return None;
+    }
+    match host {
+        GeneralName::IPAddress(bytes) => match bytes.len() {
+            4 => Some(Reach::Ip(IpAddr::from(<[u8; 4]>::try_from(*bytes).ok()?))),
+            16 => Some(Reach::Ip(IpAddr::from(<[u8; 16]>::try_from(*bytes).ok()?))),
+            _ => None,
+        },
+        GeneralName::DNSName(dns) => Some(Reach::Dns((*dns).to_owned())),
+        _ => None,
     }
 }
 

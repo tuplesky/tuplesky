@@ -59,3 +59,9 @@ x509-parser.workspace = true
 coord-types.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true
+# The multi-host acceptance provisions with the harness and asks through
+# the benchmark's caller (task-d04). Both are test-only crates, and this
+# is a development edge: the dependency policy keeps them out of the
+# daemon itself.
+coord-harness.workspace = true
+coord-wan-bench.workspace = true
