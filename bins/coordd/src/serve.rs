@@ -193,6 +193,22 @@ pub struct Counts {
 }
 
 impl Frontend {
+    /// Count evidence under `active`, the ballot the voter beside this
+    /// collector votes in (task-d01). A ballot change voids what was
+    /// counted under the old one. Only this process's own collector: a
+    /// frontend with no voter beside it has nothing to follow (the
+    /// task-d01 plan entry records the gap).
+    fn follow(&mut self, active: coord_types::ids::Ballot) {
+        if self.frontend.dispatcher_mut().ballot() != active
+            && let Ok(quorum) = coord_consensus::BallotConfiguration::c2_default(
+                active.epoch,
+                active,
+                self.membership.voters().map(|v| v.node).collect(),
+            )
+        {
+            self.frontend.dispatcher_mut().reconfigure(quorum);
+        }
+    }
     /// Build the frontend this configuration describes.
     ///
     /// `local` is the ingress of a voter running in this process, where
@@ -906,9 +922,6 @@ pub struct Domain<P: Persistence> {
     renewals: Vec<Renewing>,
     /// When this voter campaigns (task-d01); `None` where no voter runs.
     election: Option<crate::election::Election>,
-    /// What resuming a bound campaign at startup produced, carried out on
-    /// the first turn.
-    resumed: Option<coord_daemon::Outbound>,
     /// The ballot and role this voter last said it had, so the line is
     /// said when either changes and not on every turn.
     role_said: Option<(coord_types::ids::Ballot, bool)>,
@@ -1288,20 +1301,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             dialling: BTreeMap::new(),
             renewals: Vec::new(),
             election,
-            resumed: None,
             role_said: None,
             fenced_said: 0,
             peer_streak: 0,
             budgets,
             recorder,
         }
-    }
-
-    /// Carry out `resumed` on the first turn: what resuming a campaign
-    /// this voter had bound before it stopped produced (task-d01).
-    pub fn with_resumed(mut self, resumed: Option<coord_daemon::Outbound>) -> Self {
-        self.resumed = resumed;
-        self
     }
 
     /// A bounded, secret-free metrics snapshot of this node (task-61).
@@ -1450,13 +1455,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // register for the signal serves without it: it is a convenience,
         // not something the domain's progress depends on.
         let mut operator = if self.election.is_some() {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("this voter cannot be asked to campaign: {e}");
-                    None
-                }
-            }
+            operator_signal()
         } else {
             None
         };
@@ -2039,9 +2038,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return Ok(false);
         };
         let (mut out, refused) = voter.serve_local(self.budgets.local_per_turn)?;
-        if let Some(resumed) = self.resumed.take() {
-            out.absorb(resumed);
-        }
         // Leadership (task-d01): campaign when this voter has had no
         // leader for its patience, or an operator asked, and follow
         // whatever ballot the machine has moved to by any path.
@@ -2060,7 +2056,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             .any(|peer| peer.replica == ballot.leader && p.holds(peer))
                     }));
             let majority = (held + 1) * 2 > voters;
-            if let Some(why) = election.observe(led, majority, std::time::Instant::now())
+            let campaigning = voter.node().machine().campaigning();
+            if let Some(why) =
+                election.observe(led, majority, campaigning, std::time::Instant::now())
                 && let Some((campaigned, o)) = voter.campaign()?
             {
                 let why = match why {
@@ -2135,22 +2133,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         let provenance = voter.provenance();
-        // The collector counts evidence under the ballot its voter votes
-        // in, and a ballot change voids what it counted under the old one
-        // (task-d01). Only this process's own collector: a frontend with
-        // no voter beside it has nothing to follow (the task-d01 plan
-        // entry records the gap).
-        let active = voter.node().machine().active();
-        let dispatcher = self.frontend.frontend.dispatcher_mut();
-        if dispatcher.ballot() != active
-            && let Ok(quorum) = coord_consensus::BallotConfiguration::c2_default(
-                active.epoch,
-                active,
-                self.frontend.membership.voters().map(|v| v.node).collect(),
-            )
-        {
-            self.frontend.frontend.dispatcher_mut().reconfigure(quorum);
-        }
+        self.frontend.follow(voter.node().machine().active());
         // Work queued under a ballot this voter has left can no longer be
         // made durable, and the store refuses it rather than holding it.
         if voter.fenced > self.fenced_said {
@@ -2903,6 +2886,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 match voter.on_peer(provenance, payload) {
                     Ok(out) => {
                         let provenance = voter.provenance();
+                        // Before the frame's output reaches the collector
+                        // beside this voter: evidence the step that
+                        // activated a ballot produced is counted under
+                        // that ballot, not refused as the old one's.
+                        self.frontend.follow(voter.node().machine().active());
                         self.carry(api, out, provenance);
                     }
                     Err(e) => eprintln!("this voter cannot carry out a peer's frame: {e}"),
@@ -3308,11 +3296,38 @@ fn command_of_frame(frame: &Frame) -> Option<CommandId> {
     }
 }
 
+/// The signal an operator asks a voter to campaign with (`SIGUSR1`),
+/// where the platform has one.
+#[cfg(unix)]
+type OperatorSignal = tokio::signal::unix::Signal;
+/// No such signal off Unix: leadership moves only by election there.
+#[cfg(not(unix))]
+type OperatorSignal = std::convert::Infallible;
+
+#[cfg(unix)]
+fn operator_signal() -> Option<OperatorSignal> {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("this voter cannot be asked to campaign: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn operator_signal() -> Option<OperatorSignal> {
+    None
+}
+
 /// The next operator request, or never where there is no signal to wait
 /// on: a `select!` arm needs a future either way.
-async fn next_signal(signal: Option<&mut tokio::signal::unix::Signal>) -> Option<()> {
+async fn next_signal(signal: Option<&mut OperatorSignal>) -> Option<()> {
     match signal {
+        #[cfg(unix)]
         Some(s) => s.recv().await,
+        #[cfg(not(unix))]
+        Some(never) => match *never {},
         None => std::future::pending().await,
     }
 }

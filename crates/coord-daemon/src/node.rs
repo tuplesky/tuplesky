@@ -183,6 +183,15 @@ impl Machine {
         matches!(self, Machine::Leader(_))
     }
 
+    /// Whether this replica has a campaign of its own under way: still
+    /// collecting promises or reports, or bound and not yet active.
+    pub const fn campaigning(&self) -> bool {
+        match self {
+            Machine::Leader(_) => false,
+            Machine::Follower(m) => m.campaign_state().is_some(),
+        }
+    }
+
     /// The next command whose turn it is to be applied, if any.
     pub fn next_executable(&self) -> Option<CommandId> {
         match self {

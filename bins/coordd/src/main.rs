@@ -1021,16 +1021,16 @@ fn main() -> ExitCode {
     // frontend reads. One writer, one domain: a second handle on this
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
-    let (backing, resumed) = if roles.votes() {
+    let backing = if roles.votes() {
         match voter(&placed, applier, boot) {
-            Ok((v, resumed)) => (serve::Backing::Voting(Box::new(v)), resumed),
+            Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
                 eprintln!("{e}");
                 return ExitCode::from(2);
             }
         }
     } else {
-        (serve::Backing::Serving(Box::new(applier)), None)
+        serve::Backing::Serving(Box::new(applier))
     };
     // The local route is the voter's to hand over, and it exists only
     // because a voter is running here. A frontend-only process gets
@@ -1100,9 +1100,7 @@ fn main() -> ExitCode {
         // Where this node keeps its own recovery images, and how much
         // unrepresented journal it tolerates before making one. Local
         // to this node: no replicated result depends on the answer.
-        .with_checkpoints(checkpoints, config.limits.checkpoint_after_records)
-        // What resuming a bound campaign produced, sent on the first turn.
-        .with_resumed(resumed);
+        .with_checkpoints(checkpoints, config.limits.checkpoint_after_records);
     println!(
         "frontend ready waiting={} voting={}",
         domain.waiting(),
@@ -1338,13 +1336,7 @@ fn voter(
     placed: &membership::Placed,
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
-) -> Result<
-    (
-        coord_daemon::Voter<store::Persistence>,
-        Option<coord_daemon::Outbound>,
-    ),
-    String,
-> {
+) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
         ReplicaRole,
@@ -1421,11 +1413,29 @@ fn voter(
         )
         .map_err(|e| format!("this replica recovered a ballot it cannot vote in: {e:?}"))?
     };
-    // Only the genesis leader, and only at the genesis ballot, comes back
-    // leading. A replica that won a later ballot comes back following it
-    // and finishes or repeats its campaign: leading is something a ballot
-    // gives, and a restart is not a campaign.
-    let machine = if placed.replica == ballot.leader && promised == ballot {
+    // Only the genesis leader, only at the genesis ballot, and only on a
+    // store that has never taken part in anything comes back leading.
+    //
+    // A leader's command table, its proposals and its sequence numbers
+    // live in memory. A leader that restarts with any of it gone and goes
+    // on leading the ballot it had would propose again from sequence zero
+    // with no memory of what it proposed before: its followers accept
+    // (they check the ballot and the leader, not that sequences only go
+    // up), a new command takes an order that contradicts one the domain
+    // already committed, and replicas diverge with nothing to detect it.
+    // So a leader that stopped does not continue its ballot. It comes
+    // back following that ballot -- which names itself, and which it does
+    // not lead, so the election counts it leaderless -- and campaigns for
+    // the next one, whose recovery rebuilds what it lost from a majority.
+    // Leading is something a ballot gives, and a restart is not a
+    // campaign.
+    let fresh = recovered.promise.is_none()
+        && recovered.records.is_empty()
+        && recovered.payloads.is_empty()
+        && recovered.executed.is_empty()
+        && recovered.syncs.is_empty()
+        && recovered.frontier.get() == 0;
+    let machine = if placed.replica == ballot.leader && promised == ballot && fresh {
         let mut leader = Leader::new_sealed(
             LeaderConfig {
                 identity,
@@ -1480,28 +1490,20 @@ fn voter(
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
-    // A campaign that bound its selection and then stopped publishes that
-    // selection and no other (task-26); the serving loop carries out what
-    // it produced on its first turn.
-    let resumed = match recovered.resumable_sync(&placed.replica) {
-        Some(decision) if promised != ballot => {
-            println!(
-                "this voter resumes its campaign for ballot {}",
-                promised.number
-            );
-            Some(
-                voter
-                    .resume_campaign(decision.clone())
-                    .and_then(|mut out| {
-                        out.absorb(voter.follow_machine()?);
-                        Ok(out)
-                    })
-                    .map_err(|e| format!("this voter cannot resume its campaign: {e}"))?,
-            )
-        }
-        _ => None,
-    };
-    Ok((voter, resumed))
+    // A campaign that bound its selection and then stopped is not taken
+    // up: taking it up would make this replica the proposer of that
+    // ballot again, with the same memory loss as above if it had led it
+    // before it stopped. Its selection is published by nobody -- never a
+    // different one (task-26) -- and the next campaign's recovery reads
+    // what the voters that received it kept.
+    if recovered.resumable_sync(&placed.replica).is_some() && promised != ballot {
+        println!(
+            "this voter had bound the selection of ballot {} and does not take it up: \
+             it campaigns again",
+            promised.number
+        );
+    }
+    Ok(voter)
 }
 
 /// The higher of two ballots of one epoch; `a` when they are not
