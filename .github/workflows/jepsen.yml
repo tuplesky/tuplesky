@@ -93,6 +93,11 @@ jobs:
           restore-keys: jepsen-m2-
       - name: Install Leiningen and this repository's Jepsen
         run: |
+          # Jepsen's perf checker plots with gnuplot, and Elle renders an
+          # anomaly's cycle with graphviz; without them a clean history is
+          # reported :unknown.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
           # JDK 21: Jepsen compiles its Java sources with `--release 21`.
           # The lein script runs `java` from PATH (the runner's default is
           # 17), not JAVA_HOME's, so both PATH and JAVA_CMD name it.
@@ -128,17 +133,24 @@ jobs:
             --nemesis "$NEMESIS" \
             --time-limit "$TIME_LIMIT" \
             --concurrency 2n
+      - name: Pack the Jepsen store
+        if: always()
+        # Jepsen names each run's directory by its start time, and
+        # upload-artifact refuses a path with a colon in it, so the store
+        # travels as one archive. Not the provisioned run directory: it
+        # holds the domain's fixture keys and bundles. The histories,
+        # results and each voter's log are in the test's own directory.
+        run: |
+          if [ -d jepsen/tuplesky/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store.tgz" --exclude=tuplesky-runs \
+              -C jepsen/tuplesky store
+          fi
       - name: Upload the Jepsen store
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: jepsen-store-${{ env.WORKLOAD }}
-          # Not the provisioned run directory: it holds the domain's
-          # fixture keys and bundles. The histories, results and each
-          # voter's log are in the test's own directory.
-          path: |
-            jepsen/tuplesky/store
-            !jepsen/tuplesky/store/tuplesky-runs
+          path: ${{ runner.temp }}/jepsen-store.tgz
           retention-days: 14
           if-no-files-found: warn
       - name: Take the cluster down

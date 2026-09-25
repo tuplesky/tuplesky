@@ -168,7 +168,8 @@ follow-up stack, `b642bfb`), in debug builds on one machine, inside a
 gVisor sandbox. No history had an anomaly. The first two sections came
 from the stress driver on one host: liveness failures after repeatedly
 killing and restarting one voter while the other two stayed up and
-linked. The third came from a deployment on containers.
+linked. The third came from a deployment on containers, and reproduced
+on a GitHub runner; the fourth from the first Jepsen run there.
 
 ### A restarted follower whose command table stays full
 
@@ -265,7 +266,21 @@ replicated state shows the caller's session (the "not yet" of the output
 gate); a frontend whose replica never shows it would hold every read.
 That is a hypothesis, not a diagnosis. The same domain on one host's
 loopback range, with IP literals or with DNS names, served reads through
-all three voters. The container run was inside a gVisor sandbox, whose
-network stack may be part of it, so this needs confirming on a real
-kernel: the `jepsen` workflow's smoke step reports a read that does not
-come back as a warning, and the Jepsen test records it.
+all three voters.
+
+It is not the sandbox. The first `jepsen` workflow run on a GitHub runner
+(a real kernel, five containers) reproduced it on three of five voters:
+voters 1 and 2 served the smoke step's read back, and voters 3, 4 and 5
+each took the write and then held the read `Pending` for the shim's whole
+budget (`{"type":"fail","error":"pending"}`).
+
+### Under Jepsen: a domain that no longer binds sessions
+
+That same run went on to the Jepsen test: list-append, five minutes of
+kill, pause and partition faults, then healing and 60 seconds of
+recovery. Elle found no anomaly in the 364 transactions (100 ok, 264
+fail, 0 info), and no voter panicked. But when the test ended, a session
+could not be bound on any of the five voters (`bind: Timeout` from every
+shim). The domain was not serving 60 seconds after every fault was healed.
+The histories and voter logs are in the workflow's `jepsen-store`
+artifact from the next run on.
