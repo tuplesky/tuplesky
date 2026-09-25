@@ -1,0 +1,40 @@
+[package]
+name = "coord-jepsen"
+description = "Jepsen client shim: one bound native session driven by JSON lines, reporting each operation as ok, fail or info (test-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[package.metadata.tuplesky]
+# A Jepsen test's client (design Sections 12.3, 21.5). It drives a
+# provisioned domain over the real client path from a control node and
+# reports what each operation came to; the dependency policy keeps it
+# out of every production, core and tool crate.
+role = "test-only"
+
+[lib]
+name = "coord_jepsen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coord-jepsen"
+path = "src/bin/coord-jepsen.rs"
+
+[dependencies]
+coord-types.workspace = true
+coord-state.workspace = true
+coord-harness.workspace = true
+coord-membership.workspace = true
+coord-sdk.workspace = true
+coord-session.workspace = true
+coord-transport.workspace = true
+clap.workspace = true
+postcard.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "io-std"] }
