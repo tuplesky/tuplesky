@@ -3995,7 +3995,11 @@ identity per executed command, and is the one thing here that still
 grows with the history.
 
 **History is left out of reports.** A command is *forgotten* when this
-replica executed it and keeps neither a record nor a tombstone. A report
+replica executed it and retired it longer ago than its last `capacity`
+retirements. That window is kept apart from the tombstones: those also
+keep every key's latest command for the guards, however old, so with
+commands on ever new keys they grow with the keys, and a report bounded
+by them would too. (The domain uses one conservative key today.) A report
 leaves forgotten commands out, so it names what the voter has not
 executed, and what it executed recently. A Sync, selected from a
 majority of reports, is bounded the same way. A voter that has not
@@ -4025,7 +4029,23 @@ sweeps at once: every dependency row comes back as a record, and it
 used to report all of them to the first candidate that asked, which
 after a kill is straight away.
 
-### Two liveness gaps found on the way
+**A candidate that far behind does not lead.** The selection names what
+it lacks only as a dependency of the oldest command it carries, since
+every reporter left that command out. Before binding, a candidate checks
+every dependency of a selected entry: one that the selection does not
+carry and the candidate has not committed means it is behind every
+reporter's window. Bound and won, the ballot would have a leader that can
+never execute again. Its execution was guarded, so this was never a
+wrong result, but it was a domain without a working leader. The
+candidate abandons the campaign, records `Behind`, and does not campaign
+again this boot; a voter that is not behind leads instead.
+
+**Restarts stay swept.** A restarted voter sweeps what it forgot as it
+restores its execution frontier, and `coordd` then restores the payload
+rows. Those used to come back in full, a payload per command ever
+executed until the next sweep. Forgotten commands' payloads now stay out.
+
+### Liveness gaps found on the way
 
 - **A new leader served only its own proposals' payloads.** A recovered
   command it had no reason to propose again (one it executed) was never
@@ -4035,8 +4055,10 @@ after a kill is straight away.
   A voter whose promise for that ballot was still to come refused it, and
   was then promised to a ballot it could never synchronize to. A leader
   receiving it before its own deposing promise dropped it the same way.
-  Both now keep the highest such Sync and install it once the promise is
-  durable. This had been hidden: the new leader's re-proposals used to
+  Both now keep the highest such Sync, and only from its ballot's leader,
+  and install it once the promise is durable. Kept by arrival instead, a
+  lower Sync arriving second replaced the higher one, which was then
+  lost. This had been hidden: the new leader's re-proposals used to
   bring such a voter back as a side effect.
 
 ### What the tests show
@@ -4059,6 +4081,23 @@ after a kill is straight away.
   r1's promise request is held back until r2 has won and published its
   Sync. r1 then synchronizes and serves. Without the fix it stays
   unsynchronized.
+- `graph.rs` `history_on_distinct_keys_is_forgotten_past_the_window`:
+  forty commands, each on its own key, through a table of four. Every one
+  keeps its tombstone as its key's latest, and only the last four are
+  still reported. Negative control: bounded by the tombstones, all forty
+  are.
+- `activation.rs` `a_candidate_behind_every_reporters_window_does_not_win`:
+  r2 misses 200 commands, the leader goes, and r2 campaigns first. It
+  does not win and does not campaign again; r1 leads, and the next
+  command executes. Negative control: without the check, r2 wins and the
+  cluster never settles.
+- `activation.rs` `a_leader_keeps_the_highest_sync_ahead_of_it`: Syncs of
+  ballots 2 and then 1, and one of ballot 3 relayed by a voter that does
+  not lead it, leave ballot 2's kept. Negative control: kept by arrival,
+  the relayed one is kept.
+- The election test above also restores payloads the way `coordd` does,
+  and a restarted follower holds no more payloads than records. Negative
+  control: restoring every payload row fails it.
 - The deterministic cluster's `settle` is now bounded, so a cluster that
   cannot converge fails with a message instead of hanging the test run.
 
@@ -4070,7 +4109,7 @@ after a kill is straight away.
 - A voter further behind than every majority reporter's window is not
   brought up by recovery, and nothing else brings it up yet. The
   checkpoint path is what should.
-- A candidate further behind than the window can still win an election,
-  and cannot then execute what the others forgot. Refusing such a
-  candidate, or bringing it up before it leads, is future work.
+- Bringing a candidate that far behind up before it leads, rather than
+  standing it down (above), is future work with the rest of the
+  checkpoint path.
 - Proposals a voter never received (task-d07).
