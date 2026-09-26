@@ -519,6 +519,15 @@ recovery by what the voters executed. #101 has the leader re-send, every
   1250 `ok`. At 180 s (`n1`, `n4` and `n5` killed, `n3` isolated) it
   stopped again, and served nothing for the remaining three minutes.
 
+With #100 alone (`5d76a80`, [run 36232733098](https://github.com/tuplesky/tuplesky/actions/runs/36232733098)):
+`:valid? true`, at least 1904 `ok` (times and counts are from the job
+log, which starts about 30 s into the test). The domain stopped at 80 s, when all five
+nodes were killed, and served again from about 180 s, after the restart
+and the healing of a partition. It stopped again at about 220 s (`n3`
+killed) and did not serve through the faults that followed, but the
+final reads at the end of the run were served on every node: the first
+run whose final reads were.
+
 But #101 also stalls a read. With it, the `jepsen_shim` test's first read
 through voter 2, right after that voter binds its session, stays
 `Pending` for the shim's whole budget, every time. Without #101's re-send
