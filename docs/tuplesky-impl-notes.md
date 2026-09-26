@@ -3674,6 +3674,8 @@ that, the candidate marks as committed every selected entry it executed
 itself. It does so only when the executed dependencies agree with the
 entry, or when the record is gone.
 
+`commit_executed` visits the selected entries only, not `reproposed`. A command the candidate executed cannot be re-proposed only: it was committed, so a majority accepted it at a ballot no lower than the one it committed under. The promised majority intersects that majority, and accepting requires the ballot to be synced, so the source ballot's reports carry the command at ACCEPT or above, and the selection puts it in `entries`.
+
 Test: `a_sync_naming_commands_this_voter_retired_installs_without_them`.
 
 **A step that asks for more than the queue holds lowers first.**
@@ -3710,4 +3712,5 @@ In the deterministic cluster, with capacity 32, 200 commands before a
 leader loss leave the candidate waiting on 160 payloads for commands it
 executed long ago. Bounding recovery by an execution floor, a pruned
 ledger, or a durable "executed" answer is a protocol decision for
-`coord-consensus`, and this change does not make it.
+`coord-consensus`, and this change does not make it. The plan now owns
+it as task-d05, a prerequisite of task-64.

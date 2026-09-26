@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 99 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d04` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 100 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d05` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, and `task-d05` from the Jepsen client's leader-kill run, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -32,7 +32,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-j01 through task-j10 | Shared journal, materialization, local checkpoint, runtime composition and multi-group qualification | task-j06 separately optional |
 | task-o01 through task-o06 | Finalized streams, regional observers/relays, Kine watch/read integration | Capability-specific gates |
 | task-m01 through task-m05 | Authoritative discovery, full-client Kine and integrated membership | Operational production requirement |
-| task-d01 through task-d04 | Daemon runtime wiring (election, leaf renewal, reconnection) and multi-host test provisioning | Required before task-64/task-65 qualification and task-66 |
+| task-d01 through task-d05 | Daemon runtime wiring (election, leaf renewal, reconnection), recovery bounded by execution, and multi-host test provisioning | Required before task-64/task-65 qualification and task-66 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -125,7 +125,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-61](#task-61) | Complete bounded observability and operator diagnostics | task-31, task-43, task-53, task-57 |
 | [task-62](#task-62) | Build and run the matched native WAN benchmark matrix | task-29, task-32, task-43, task-53, task-61 |
 | [task-63](#task-63) | Measure Kine end-to-end overhead and regression budgets | task-48, task-61, task-62 |
-| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03 |
+| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05 |
 | [task-65](#task-65) | Package and qualify supported deployment targets | task-43, task-48, task-59, task-60, task-61, task-d02, task-d04 |
 | [task-66](#task-66) | Close security, supply-chain and production release gates | task-58, task-59, task-60, task-63, task-64, task-65, task-d02, task-q01 |
 | [task-s01](#task-s01) | Define the portable engine contract and logical collection registry | task-02, task-04 |
@@ -160,6 +160,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d02](#task-d02) | Drive leaf renewal inside the serving daemon | task-41, task-43, task-58 |
 | [task-d03](#task-d03) | Re-dial peers and collector links on a timer | task-43, task-j08, task-c01 |
 | [task-d04](#task-d04) | Provision a multi-host test domain and write its runbook | task-43, task-48, task-d03 |
+| [task-d05](#task-d05) | Bound recovery reports and Syncs by what the voters executed | task-26, task-53, task-d01 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64 |
 
 ## Task specifications
@@ -1017,7 +1018,7 @@ The other two came out of chasing the WAN matrix's open finding with this task's
 <a id="task-64"></a>
 ### task-64: Run mixed-fault qualification and automatic minimization
 
-**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03.  
+**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05.  
 **Design:** Sections 12, 21, 23 G6.
 
 **Implement:** Minimize combined storage/network/clock/issuer/queue/format/lease/watch/handoff faults. Retain actual redb reference suite and reusable oracles; composed journal and observer integration is explicitly exercised by later qualification. Leader loss and re-election under every fault class is in the matrix, which is why task-d01 is a prerequisite: before it a leader-region outage is an outage of the domain, and the matrix would measure the absence of an election rather than its safety.
@@ -1464,9 +1465,26 @@ A surviving three-voter majority progresses only after required leader recovery,
 
 **Acceptance:** A provision with three distinct non-loopback addresses on the local range (for example `127.0.0.2` through `127.0.0.4`, so the test runs on one CI runner while exercising non-default SANs and catalog entries) comes up, serves a request through Kine, and rejoins a killed and restarted voter (task-d03). Provisioning without `--hosts` is byte-for-byte what it was, and the Kubernetes certification workflow still passes. The runbook is followed literally once on three real hosts and the markers it names are recorded in the document. `coord-harness` stays test-only in the production dependency graph.
 
-**Status:** The tooling and runbook merge with the real-hosts run recorded as not done. That run is the maintainer's, on their own test nodes, on a build carrying task-d03's both-lanes re-dial and task-d01's restart rule (or without restarting the leader host); it lands as a follow-up documentation PR on task-d04, and task-d04 stays open until it does.
+**Status:** The tooling and runbook merge with the real-hosts run recorded as not done. That run is the maintainer's, on their own test nodes, on a build carrying task-d03's both-lanes re-dial, task-d01's restart rule and task-d05's bounded recovery (or without restarting or losing the leader host); it lands as a follow-up documentation PR on task-d04, and task-d04 stays open until it does.
 
 **Review boundary:** Test tooling and documentation. No production provisioning tool: signed genesis, catalog signing and node issuance for production remain task-42/task-43 and task-65 concerns. No weakening of identity checks or of the token service's test-only status, and no change to `coordd` beyond what a relocatable bundle strictly needs, which is expected to be nothing.
+
+<a id="task-d05"></a>
+### task-d05: Bound recovery reports and Syncs by what the voters executed
+
+**Prerequisites:** task-26, task-53, task-d01.  
+**Design:** Sections 4.8–4.9.
+
+**Implement:** Recovery today carries the whole history. Dependency rows are never pruned, `DurableLedger` reports every one, and so a report, and the Sync selected from reports, names every command the domain ever ran. A voter remembers only its last `capacity` retirements, so for an older command it executed `phase_of` answers `None`, the same answer as for a command it never heard of. After enough history, every election leaves the candidate asking for payloads of commands it executed long ago, or a follower installing placeholders for them, until the table fills and new work is refused as `Backpressure`. The Jepsen client's leader-kill run shows this as a domain that elects but never serves its final read. The deterministic cluster shows it too: at capacity 32, 200 commands before a leader loss leave the candidate waiting on 160 payloads. Bound what recovery carries by what the voters have executed. The mechanism is this task's decision, under task-26's rules. Three candidates:
+- an execution floor below which no voter reports and every voter treats a selected command as executed, established from what a quorum has executed (task-53's floors are the model);
+- a pruned ledger, whose dependency rows go once every voter has executed them;
+- a durable "executed" answer the machine can consult for any command, not only the last `capacity`.
+
+Whichever it is, a lagging voter below the floor catches up by the checkpoint path, not by recovery.
+
+**Acceptance:** In the deterministic cluster, an election after more history than the table holds completes, and the new ballot serves, with no payload asked for a command every voter executed. A voter that executed less than the floor is brought up by a checkpoint, and a command above it is still recovered exactly as before. The Jepsen client's leader-kill run (`--fault leader`) serves its final read. Reports and Syncs are bounded by the live window, not by history.
+
+**Review boundary:** `coord-consensus` recovery and its durable rows, plus the daemon wiring the floor needs. No change to selection among commands above the floor, to the commit rule, or to what a command's dependencies are. Nothing below the floor is re-executed, and nothing above it is skipped.
 
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report
@@ -1488,7 +1506,7 @@ task-s01, task-s02 feed the strict storage reference through task-07. Optional t
 
 G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacement/restore/upgrade through task-60 rather than merely all-voter task-51, and G6 task-66 including task-q01. Fixed-member observer previews may precede dynamic membership, but general production combines both. Code merged is not evidence that acceptance passed.
 
-**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption, and becomes a prerequisite of task-m03. The unenforced `max_request_bytes` bound is an open follow-up on task-c01. A review of what a manual test on separate hosts would meet added two more: task-d03 re-dials peers and collector links on a timer, since both planes are dialled once at startup and every connection ends at the transport's age cap, so a mesh heals today only by restarting nodes; it is a prerequisite of task-d01 and task-64. task-d04 provisions a multi-host test domain from the harness and writes the runbook; it is a prerequisite of task-65. None of these changes the design: each is work the design already required and the plan had not named.
+**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption, and becomes a prerequisite of task-m03. The unenforced `max_request_bytes` bound is an open follow-up on task-c01. A review of what a manual test on separate hosts would meet added two more: task-d03 re-dials peers and collector links on a timer, since both planes are dialled once at startup and every connection ends at the transport's age cap, so a mesh heals today only by restarting nodes; it is a prerequisite of task-d01 and task-64. task-d04 provisions a multi-host test domain from the harness and writes the runbook; it is a prerequisite of task-65. The Jepsen client's leader-kill run added one more: task-d05 bounds recovery reports and Syncs by what the voters executed, since both carry the whole history today and an election after enough of it cannot complete or leaves the new ballot refusing work; it is a prerequisite of task-64, and task-d04's real-hosts run waits on it. None of these changes the design: each is work the design already required and the plan had not named.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
