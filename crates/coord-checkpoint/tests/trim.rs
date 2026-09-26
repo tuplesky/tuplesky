@@ -1193,6 +1193,61 @@ fn recovery_after_a_trim_knows_how_far_the_store_executed() {
 }
 
 #[test]
+fn a_record_that_names_a_trimmed_command_executes_after_a_restart() {
+    // A trim removes the dependency rows of an executed prefix and keeps
+    // its executed rows. Recovery read executed identities only through
+    // the dependency rows, so a trimmed command came back unknown, and a
+    // record written after the trim that names it -- the first proposal
+    // after a reclaim names the retired latest -- failed the execution
+    // guard on every restart (task-d05).
+    let mut engine = trimmable_store();
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    let e = epoch(EPOCH);
+    assert!(
+        !protocol_keys(&engine).contains(&dependency_key(e, &command(8))),
+        "the fixture trims command 8's dependency row"
+    );
+    // Command 9 arrives after the trim, committed, naming command 8.
+    apply(
+        &mut engine,
+        &[
+            StoreUpdate {
+                collection: Collection::ProtocolV1.id(),
+                key: dependency_key(e, &command(9)),
+                value: Some(encode_dependency(&record(Phase::Commit, &[8])).unwrap()),
+            },
+            StoreUpdate {
+                collection: Collection::PayloadV1.id(),
+                key: payload_key(&command(9)),
+                value: Some(encode_payload(&payload_of(9)).unwrap()),
+            },
+        ],
+    );
+    let view = engine.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, e, ViewBudget::default()).unwrap();
+    for n in [7u8, 8] {
+        assert!(
+            recovered.history.contains(&command(n)),
+            "command {n} was executed, and its executed row says so"
+        );
+    }
+    // A table restored the way `coordd` restores one answers EXECUTED for
+    // the trimmed command, so the record naming it passes the guard.
+    let mut table = coord_consensus::CommandTable::restore(Some(32), recovered.records.clone());
+    for c in recovered
+        .history
+        .iter()
+        .chain(recovered.executed.iter().map(|(c, _)| c))
+    {
+        table.restore_executed(c);
+    }
+    assert_eq!(table.phase_of(&command(8)), Some(Phase::Executed));
+    table
+        .execute(command(9))
+        .expect("a record naming a trimmed command executes");
+}
+
+#[test]
 fn a_trim_keeps_every_dependency_a_retained_command_can_reach() {
     // Pinning only direct dependencies left a retained command able to
     // reach an executed command whose own dependency had been deleted,
