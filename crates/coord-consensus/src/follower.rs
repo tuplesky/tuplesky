@@ -1746,12 +1746,17 @@ impl Follower {
             // Nothing kept to publish again: adopted before a restart --
             // the evidence store is this boot's, so the acknowledgement,
             // if it was ever sent, went with it -- or kept past the
-            // store's bound. The proposal is then taken as the first one
-            // was: adopted again, which writes the same row and publishes
-            // the acknowledgement once it is durable. Without that the
-            // leader re-sent it for ever and, with a voter down, never
-            // learned it. A command executed and retired here goes the
-            // way it always did, below.
+            // store's bound. Without an answer the leader re-sent it for
+            // ever and, with a voter down, never learned it.
+            //
+            // A command decided here is answered from its durable record,
+            // to the leader alone (below). One only accepted is taken as
+            // the first proposal was: adopted again, which writes the
+            // same row and publishes the acknowledgement once it is
+            // durable.
+            if self.table.phase_of(&command) >= Some(Phase::Commit) {
+                return self.acknowledge_decided(&proposal, from);
+            }
             self.adopted.remove(&command);
         }
         if self.table.record(&command).is_none()
@@ -1760,7 +1765,7 @@ impl Follower {
             // Executed here and retired: there is no record to adopt the
             // order into and nothing left to decide. Held, it would wait
             // for ever for an adoption that cannot happen (task-d05).
-            return self.acknowledge_executed(&proposal, from);
+            return self.acknowledge_decided(&proposal, from);
         }
         // A proposal asserts something about a command. Where this
         // replica already holds that command's payload and accepted it
@@ -1817,20 +1822,24 @@ impl Follower {
         self.advance_pending()
     }
 
-    /// Answer a proposal for a command this replica executed and retired
-    /// with an adoption acknowledgement, to `leader` alone (task-d07).
+    /// Answer a proposal for a command decided here -- committed or
+    /// executed, retired or not -- with an adoption acknowledgement, to
+    /// `leader` alone (task-d07).
     ///
     /// The leader sends a proposal again only while it lacks this
-    /// replica's vote, and a replica that executed the command may be the
-    /// vote it lacks: it learned the command from the leader's proposal
+    /// replica's adoption, and a replica that decided the command may be
+    /// what it lacks: it learned the command from the leader's proposal
     /// and its own acknowledgement, which then went missing, and a
-    /// restart took the evidence it could have published again. Executed
-    /// here, the command is decided, under the dependencies of its durable
-    /// record. The acknowledgement goes only when the proposal carries
-    /// those dependencies and the admission the record holds, so it
-    /// claims nothing this replica did not adopt; a command it keeps no
-    /// record of any more is left alone.
-    fn acknowledge_executed(&mut self, proposal: &FastAck, leader: ReplicaId) -> Vec<Effect> {
+    /// restart took the evidence it could have published again. Decided
+    /// here, the command's dependencies are those of its durable record,
+    /// and a commit does not change them. The acknowledgement goes only
+    /// when the proposal carries those dependencies and the admission the
+    /// record holds, so it claims nothing this replica did not adopt;
+    /// without a durable record (none yet, or swept as history) nothing is
+    /// sent. The record is durable, so the acknowledgement waits for
+    /// nothing; and it goes to the leader only, since no submitter is
+    /// waiting on it.
+    fn acknowledge_decided(&mut self, proposal: &FastAck, leader: ReplicaId) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -1850,13 +1859,12 @@ impl Follower {
             admission: proposal.admission,
         };
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
-        let requires: Vec<BarrierId> = self.pending.keys().copied().collect();
         let Some(outbox) = self.outbox.as_mut() else {
             return Vec::new();
         };
         outbox.publish(PendingSend {
             context,
-            requires,
+            requires: Vec::new(),
             to: PeerId {
                 replica: leader,
                 incarnation: ReplicaIncarnation::ZERO,

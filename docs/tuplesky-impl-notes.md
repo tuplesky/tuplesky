@@ -4163,16 +4163,20 @@ Three triggers were known:
 ### The re-send
 
 - **`Leader::resend_unvoted(per_voter)`** sends each voter, again, the
-  durable proposals of the ballot it has not voted on. They go oldest
+  durable proposals of the ballot it has not adopted. They go oldest
   first, at most `RESEND_PER_VOTER` (16) per voter per call, as the same
   proposal: the same sequence number, dependencies, paths and admission.
   The admission is now kept in `Proposal`, so a re-send is the same
   proposal even after the leader's record was retired.
-- **What a voter lacks is read from its votes.** The chain is total, so
-  a voter that voted on a proposal holds every earlier one. Only
-  proposals after the latest it voted on are sent. One it never
-  acknowledges stops being sent once it votes on a later one: a
-  duplicate it already adopted, or a command it executed and retired.
+- **What a voter lacks is read from its adoption acknowledgements.**
+  Only those say it received a proposal. A fast acknowledgement goes
+  out when the payload arrives, with no sequence number, proposal or
+  not. Counted as a vote, it credited a fast-set voter with a proposal
+  it never received and with every one before it. The chain is total,
+  so a voter that adopted a proposal holds every earlier one, and only
+  proposals after the latest it adopted are sent. One it never
+  acknowledges -- a command it executed and keeps no record of -- stops
+  being sent once it adopts a later one.
 - **A duplicate proposal is re-acknowledged.** A follower that receives
   a proposal it already adopted or holds publishes to the leader, again,
   what it acknowledged for that command in this ballot. It is the same
@@ -4183,11 +4187,13 @@ Three triggers were known:
   boot, so a restarted one had nothing to publish again. When nothing is
   kept, a duplicate proposal of an adoption restored from the rows is
   adopted again: the same row is written, and acknowledged once it is
-  durable. A proposal for a command the follower executed and retired is
-  answered with an adoption acknowledgement to the leader, but only when
-  it carries the dependencies and admission of the follower's durable
-  record. Executed, the command is decided under those; a command it
-  keeps no record of any more is left alone.
+  durable. A proposal for a command the follower has decided --
+  committed or executed, retired or not -- is answered with an adoption
+  acknowledgement to the leader alone, and only when it carries the
+  dependencies and admission of the follower's durable record. Decided,
+  the command's dependencies are those; a command it keeps no durable
+  record of any more is left alone. Nothing is written for it, and no
+  frontend is sent evidence of it.
 - **A new leader publishes its re-proposals in batches.**
   `from_recovered` makes every re-proposal durable, but publishes only
   the first `REPROPOSE_BATCH` (32). The re-send delivers the rest,
@@ -4195,6 +4201,31 @@ Three triggers were known:
 - **`coordd` drives it.** A leader calls it every `RESEND_INTERVAL`
   (250 ms), from the serve loop, and wakes for it on a quiet domain,
   since the voter it re-sends to is the one not sending.
+- **The numbers.** 250 ms is tuned for a release build. A debug build's
+  adoption can take longer, so there a re-send often races the first
+  vote; the duplicate is answered from what was kept, which costs a
+  frame. `REPROPOSE_BATCH` (32) and `RESEND_PER_VOTER` (16) together
+  stay under the 64-frame control lane to a voter, with room left for
+  the leader's other traffic on it.
+
+### The regression the shim test found
+
+With the first version of this change carried on #98,
+`jepsen_shim::each_operation_does_what_its_line_says` failed every time:
+the first read through voter 2 stayed pending. Traced with temporary
+logging:
+- The domain's first proposal goes out before the followers are linked,
+  and neither receives it. Before this change the collector's re-offer
+  made the leader republish it to every voter until it was learned.
+- The re-send sent it to voter 3 only. Voter 2 is in the fast set and had
+  fast-acknowledged the command when its payload arrived, and that
+  counted as having voted on it.
+- Voter 3 adopted it, the leader learned the command from that, and
+  republishing stopped. Voter 2 never got the proposal, held everything
+  after it, and never executed the session that the read waits for.
+
+Counting only adoption acknowledgements closes it: the whole shim test
+file passed 10 of 10 runs, where it had failed on the first run before.
 
 ### What the tests show
 
@@ -4202,6 +4233,10 @@ Three triggers were known:
   - `a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend`:
     r2 misses c1's proposal. Before the re-send, it has executed nothing;
     after it, every voter executes c1, c2.
+  - `a_fast_acknowledgement_does_not_stand_for_the_proposal`: r1, in
+    the fast set, receives c1's payload but not its proposal. Negative
+    control: counting its fast acknowledgement as a vote, r1 never
+    executes c1.
   - `a_lost_acknowledgement_is_published_again_on_a_resend`: with r1
     down, r2's acknowledgement is dropped. The command commits only once
     the re-send draws the re-acknowledgement. Negative control: without
