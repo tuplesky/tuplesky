@@ -127,6 +127,8 @@ struct Cluster {
     cut: Vec<(u8, u8)>,
     /// Sync frames between these pairs are dropped (everything else flows).
     drop_sync: Vec<(u8, u8)>,
+    /// Nodes that do not fetch the payloads they lack.
+    no_fetch: Vec<usize>,
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
 }
 
@@ -180,6 +182,7 @@ impl Cluster {
             seed,
             cut: Vec::new(),
             drop_sync: Vec::new(),
+            no_fetch: Vec::new(),
             frontend: Vec::new(),
         }
     }
@@ -320,7 +323,7 @@ impl Cluster {
             }
             // Fetch payloads a follower lacks from the ballot's leader.
             for i in 0..self.nodes.len() {
-                if !self.nodes[i].alive {
+                if !self.nodes[i].alive || self.no_fetch.contains(&i) {
                     continue;
                 }
                 if let Some(Role::Follower(f)) = self.nodes[i].role.as_mut()
@@ -341,6 +344,12 @@ impl Cluster {
     }
 
     fn admit(&mut self, seq: u64, key: u8) -> CommandId {
+        let all: Vec<usize> = (0..self.nodes.len()).collect();
+        self.admit_at(seq, key, &all)
+    }
+
+    /// The same, with the submission reaching only `at`.
+    fn admit_at(&mut self, seq: u64, key: u8, at: &[usize]) -> CommandId {
         let request = LogicalRequest::new(
             NamespaceId([5; 16]),
             CanonicalOperation::Put(PutOp {
@@ -361,7 +370,7 @@ impl Cluster {
         let frame = MessageV1::Request(RequestV1::new(rk, &request, 0, 0).unwrap())
             .encode()
             .unwrap();
-        for i in 0..self.nodes.len() {
+        for &i in at {
             if !self.nodes[i].alive {
                 continue;
             }
@@ -671,6 +680,51 @@ fn a_sync_naming_commands_this_voter_retired_installs_without_them() {
             submitted.len() + 1,
             "node {i}"
         );
+    }
+}
+
+/// A leader whose table is full still orders its next command after
+/// the one before it, so a follower still behind that one cannot execute
+/// the next one first (task-d06).
+///
+/// The table reclaims exactly when it is full, and before it computes the
+/// next command's dependencies. Retirement used to clear the key's latest
+/// command, so the first command a full leader proposed named no
+/// dependency. Here r2 never gets command 32's payload, so it cannot
+/// execute it; command 33 is the first the leader proposes after its
+/// table filled. With the chain broken, r2 found 33 committed and ready,
+/// with nothing ordering it after 32, and executed it first: the same
+/// committed commands in two orders. Every replica must execute them in
+/// one.
+#[test]
+fn a_follower_behind_a_full_leader_executes_in_the_leaders_order() {
+    let mut cluster = Cluster::new(21);
+    let capacity = 32u64;
+    let mut order = Vec::new();
+    for n in 1..capacity {
+        order.push(cluster.admit(n, n as u8));
+        cluster.settle();
+    }
+    // Command 32 reaches r0 and r1 only, and r2 does not fetch it.
+    cluster.no_fetch = vec![2];
+    order.push(cluster.admit_at(capacity, capacity as u8, &[0, 1]));
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, order, "the leader ran 32");
+    // The leader's table is full; command 33 is proposed after a reclaim.
+    order.push(cluster.admit(capacity + 1, (capacity + 1) as u8));
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, order);
+    let behind = &cluster.nodes[2].executed;
+    assert_eq!(
+        behind[..],
+        order[..behind.len()],
+        "r2 executed out of the leader's order"
+    );
+    // Once r2 has the payload, it catches up in the same order.
+    cluster.no_fetch.clear();
+    cluster.settle();
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, order, "node {i}");
     }
 }
 

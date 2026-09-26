@@ -483,10 +483,23 @@ impl CommandTable {
     }
 
     /// Forget an executed command. Unresolved acceptance is never deleted
-    /// for capacity. An executed command needs no successor to order after
-    /// it (its effects are complete), so the conflict index stops naming
-    /// it; what the table keeps is a tombstone saying that it executed,
-    /// so the guards can still answer for it.
+    /// for capacity. What the table keeps is a tombstone saying that it
+    /// executed, so the guards can still answer for it.
+    ///
+    /// The conflict index keeps naming it where it is a key's latest
+    /// command. It used to stop: an executed command's effects are
+    /// complete, so it seemed to need no successor ordered after it. That
+    /// holds on the replica that executed it and nowhere else. The table
+    /// reclaims exactly when it is full, before it computes the next
+    /// command's dependencies, so the first command a full leader proposed
+    /// named no dependency at all. A follower still behind it -- a payload
+    /// missing, its own table full -- found that command ready, with
+    /// nothing ordering it after the backlog, and executed it first: the
+    /// same committed set in two orders, and a frontend on that follower
+    /// answering from a state the leader never had. Named, the retired
+    /// command costs a replica that already executed it nothing (the
+    /// tombstone answers EXECUTED) and costs a lagging one the wait until
+    /// it has executed it, which is the order every replica must keep.
     ///
     /// The tombstone is unconditional, and that is the point. A
     /// dependency is named by whoever holds the evidence, and not all of
@@ -501,11 +514,14 @@ impl CommandTable {
     ///
     /// What bounds the memory is recency, not reference counting: the
     /// oldest tombstone goes once there are more of them than the table
-    /// has room for records. A leader names as a dependency only a
-    /// command still live in its own table, which is the same size, so a
-    /// replica that remembers its last `capacity` retirements remembers
-    /// every command a leader can still name. An unbounded table keeps
-    /// them all, which is what unbounded means.
+    /// has room for records -- except one that is still some key's latest
+    /// command, which the next proposal on that key will name, and which
+    /// the guards must go on answering for. There is at most one of those
+    /// per key. A leader names as a dependency only a command live in its
+    /// own table or its key's latest, so a replica that remembers its last
+    /// `capacity` retirements and every key's latest remembers every
+    /// command a leader can still name. An unbounded table keeps them all,
+    /// which is what unbounded means.
     pub fn retire(&mut self, command: &CommandId) -> Result<(), RetireError> {
         let keys = match self.records.get(command) {
             None => return Err(RetireError::Unknown),
@@ -517,9 +533,6 @@ impl CommandTable {
         self.records.remove(command);
         for key in &keys {
             if let Some(state) = self.keys.get_mut(key) {
-                if state.last == Some(*command) {
-                    state.last = None;
-                }
                 state.log.forget(command);
             }
         }
@@ -527,10 +540,21 @@ impl CommandTable {
             self.retired.push_back(*command);
         }
         if let Some(bound) = self.capacity {
+            let mut latest = Vec::new();
             while self.retired.len() > bound {
-                if let Some(oldest) = self.retired.pop_front() {
+                let Some(oldest) = self.retired.pop_front() else {
+                    break;
+                };
+                if self.keys.values().any(|k| k.last == Some(oldest)) {
+                    latest.push(oldest);
+                } else {
                     self.executed.remove(&oldest);
                 }
+            }
+            // Kept, and kept in the queue, so each goes in its turn once a
+            // newer command has taken its key.
+            for command in latest.into_iter().rev() {
+                self.retired.push_front(command);
             }
         }
         Ok(())
