@@ -309,6 +309,10 @@ pub struct Follower {
     /// that ballot for ever. Kept, it is installed the moment the promise
     /// is made, which is the order the protocol meant (task-d05).
     early_sync: Option<(ReplicaId, SyncDecision)>,
+    /// The commit frontier the leader of the current ballot announced:
+    /// every proposal of the ballot up to this sequence number is
+    /// committed there (task-d09). Reset with the ballot.
+    leader_committed: Option<u64>,
     rejections: Vec<FollowerRejection>,
     /// What this replica published to the frontend for each command it
     /// still remembers, kept so an exact duplicate submission can offer
@@ -422,6 +426,7 @@ impl Follower {
             rejections: Vec::new(),
             resumed,
             early_sync: None,
+            leader_committed: None,
         }
         .resume_sync()
     }
@@ -542,6 +547,7 @@ impl Follower {
             rejections: Vec::new(),
             resumed: None,
             early_sync: None,
+            leader_committed: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
         }
     }
@@ -961,6 +967,7 @@ impl Follower {
         self.votes.clear();
         self.held.clear();
         self.adopted.clear();
+        self.leader_committed = None;
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
                 let _ = self.table.expect(*c);
@@ -1197,14 +1204,14 @@ impl Follower {
     /// on a shared, bounded lane; rotating because a bound that always
     /// took the same prefix would leave the rest of the set unasked for
     /// ever. See [`MAX_PAYLOAD_TRANSFER`].
-    fn payload_batch(&mut self, mut missing: Vec<CommandId>) -> Vec<CommandId> {
-        if missing.len() <= MAX_PAYLOAD_TRANSFER {
+    fn payload_batch(&mut self, mut missing: Vec<CommandId>, room: usize) -> Vec<CommandId> {
+        if missing.len() <= room {
             return missing;
         }
         let start = self.payload_cursor % missing.len();
-        self.payload_cursor = start.wrapping_add(MAX_PAYLOAD_TRANSFER);
+        self.payload_cursor = start.wrapping_add(room);
         missing.rotate_left(start);
-        missing.truncate(MAX_PAYLOAD_TRANSFER);
+        missing.truncate(room);
         missing
     }
 
@@ -1232,10 +1239,23 @@ impl Follower {
             _ => alloc::vec![from],
         };
         let commands = if campaign_missing.is_empty() {
-            let missing = self.missing_payloads();
-            self.payload_batch(missing)
+            // What the leader has committed comes first, in its order: a
+            // replica behind it executes nothing until the command whose
+            // turn it is arrives, and a rotation through thousands of
+            // missing payloads reaches that one once per pass (task-d09).
+            // Half the ask, so the rotation still moves.
+            let mut due = self.due_payloads();
+            due.truncate(MAX_PAYLOAD_TRANSFER / 2);
+            let missing: Vec<CommandId> = self
+                .missing_payloads()
+                .into_iter()
+                .filter(|c| !due.contains(c))
+                .collect();
+            let room = MAX_PAYLOAD_TRANSFER - due.len();
+            due.extend(self.payload_batch(missing, room));
+            due
         } else {
-            self.payload_batch(campaign_missing)
+            self.payload_batch(campaign_missing, MAX_PAYLOAD_TRANSFER)
         };
         if commands.is_empty() || sources.is_empty() {
             return Vec::new();
@@ -1329,7 +1349,98 @@ impl Follower {
     }
 
     fn learn(&mut self) {
-        self.learner.commit_learned(&mut self.table, &self.votes);
+        loop {
+            let learned = self.learner.commit_learned(&mut self.table, &self.votes);
+            if !self.commit_through_leader() && learned.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Commit what this replica adopted from the current ballot's leader
+    /// up to the frontier that leader announced (task-d09). Returns
+    /// whether anything was committed.
+    ///
+    /// Sound because the leader's commit is a decision under the
+    /// crash-fault model, and an adoption here took the dependencies of
+    /// that leader's proposal for that sequence number, which is the one
+    /// its commit was over. Only a durable adoption counts, as only a
+    /// durable adoption counts as this replica's vote. An adoption
+    /// restored from before a restart has no sequence number of this
+    /// ballot, so it waits for the re-sent proposal to be adopted again.
+    /// Sequence order, because a dependency needs to be committed first
+    /// and was proposed first.
+    fn commit_through_leader(&mut self) -> bool {
+        let Some(through) = self.leader_committed else {
+            return false;
+        };
+        let mut ready: Vec<(u64, CommandId)> = self
+            .adopted
+            .iter()
+            .filter(|(c, (seqnum, durable))| {
+                *durable && *seqnum <= through && self.table.phase_of(c) == Some(Phase::Accept)
+            })
+            .map(|(c, (seqnum, _))| (*seqnum, *c))
+            .collect();
+        ready.sort_unstable();
+        let mut progressed = false;
+        for (_, command) in ready {
+            progressed |= self.table.commit(command).is_ok();
+        }
+        progressed
+    }
+
+    /// Whether `command` is the next this replica can adopt, and the
+    /// leader has already committed it (task-d09).
+    ///
+    /// Such a command is let into a full table. The table fills with
+    /// later commands while this replica is behind -- their payloads
+    /// arrive by submission and transfer in no particular order -- and
+    /// none of them can be adopted before the command whose turn it is.
+    /// Refused, that command held every one of them for ever. Admitted,
+    /// it is adopted, committed from the frontier and executed at once,
+    /// so it makes room rather than taking it. Only a held proposal of
+    /// this ballot within the frontier qualifies, with every dependency
+    /// at least ACCEPT, so the table exceeds its bound by the commands
+    /// whose turn has come and no more.
+    fn decided_and_due(&self, command: &CommandId) -> bool {
+        let Some(through) = self.leader_committed else {
+            return false;
+        };
+        self.held.get(command).is_some_and(|h| {
+            h.proposal.seqnum.is_some_and(|s| s <= through)
+                && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d)).is_ok()
+        })
+    }
+
+    /// The held proposals within the leader's frontier whose payload this
+    /// replica lacks, in the leader's order (task-d09).
+    fn due_payloads(&self) -> Vec<CommandId> {
+        let Some(through) = self.leader_committed else {
+            return Vec::new();
+        };
+        let mut due: Vec<(u64, CommandId)> = self
+            .held
+            .iter()
+            .filter(|(c, _)| !self.payloads.contains_key(c))
+            .filter_map(|(c, h)| h.proposal.seqnum.map(|s| (s, *c)))
+            .filter(|(s, _)| *s <= through)
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, c)| c).collect()
+    }
+
+    /// The leader of the current ballot announced its commit frontier.
+    fn on_committed(&mut self, from: ReplicaId, ballot: Ballot, through: u64) -> Vec<Effect> {
+        if from != self.config.quorum.leader() || ballot != self.config.quorum.ballot() {
+            return Vec::new();
+        }
+        if self.leader_committed.is_some_and(|known| known >= through) {
+            return Vec::new();
+        }
+        self.leader_committed = Some(through);
+        self.learn();
+        Vec::new()
     }
 
     /// Choose the learning predicates (full, or the forced slow path for
@@ -1622,11 +1733,15 @@ impl Follower {
         // beside the identity is the admission: a second presentation of
         // this command under different attested facts conflicts here
         // instead of quietly replacing what this replica accepted.
-        let init = match self.table.initialize(
-            command,
-            payload.admission_digest(),
-            alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()],
-        ) {
+        let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
+        let initialized = if self.decided_and_due(&command) {
+            self.table
+                .initialize_beyond_capacity(command, payload.admission_digest(), keys)
+        } else {
+            self.table
+                .initialize(command, payload.admission_digest(), keys)
+        };
+        let init = match initialized {
             Ok(i) => i,
             Err(InitError::Backpressure) => {
                 // No room for this command -- and returning here would
@@ -2192,6 +2307,9 @@ impl Follower {
             // A seal report is a coordinator's to count, never a
             // voter's to act on.
             ProtocolMessage::Sealed { .. } => Vec::new(),
+            ProtocolMessage::Committed { ballot, through } => {
+                self.on_committed(from.replica, ballot, through)
+            }
             ProtocolMessage::Promise {
                 ballot, replica, ..
             } => {

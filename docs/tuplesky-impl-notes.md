@@ -4327,3 +4327,129 @@ file passed 10 of 10 runs, where it had failed on the first run before.
   The Jepsen run is `:valid? true`, but the five-node domain still stops
   serving for minutes after partitions and pauses. That is open on #98,
   and no cause has been traced to this task.
+
+## The leader carries the decision to every voter
+
+task-d09, the root cause of the five-node Jepsen stall that remained with
+task-d05 through task-d07 carried (#98). A follower commits a command
+only from the acknowledgements it receives itself: its `VoteSet` needs
+the leader's proposal and a majority's adoptions, or the fast set's
+evidence. Every acknowledgement is published once, to every voter, on a
+lane that refuses a frame when its queue is full, and nothing publishes a
+missed one to that follower again. No message carried a decision from
+the leader to a follower outside an election's Sync.
+
+With three voters that never showed: the leader's proposal and the
+follower's own adoption are already a majority, which is why the
+three-voter stress runs passed. With five, a follower needs two of its
+peers' acknowledgements as well. In the Jepsen runs a ring partition left
+two followers seeing the leader and one peer that was paused or cut off
+itself:
+- they adopted every command and could commit none of them;
+- the chain is total (task-d06), so nothing after the first missed
+  quorum could commit either;
+- within a table's worth they refused every payload as backpressure;
+- the leader lost both votes, and the domain served nothing to the end
+  of the run, through the heal.
+
+### The frontier
+
+- **`Leader::committed_through`** is the highest sequence number of the
+  ballot whose whole prefix is committed at the leader with its batch
+  durable. Every sequence number below the next went to a proposal of
+  the ballot, and one no longer in `proposals` was forgotten, which only
+  happens to a command executed long ago.
+- **`Leader::announce_committed`** sends it to every other voter as
+  `ProtocolMessage::Committed { ballot, through }`. `Machine::
+  resend_unvoted` calls it after the re-send, so `coordd` sends it every
+  `RESEND_INTERVAL` (250 ms). The frame is a few bytes and carries the
+  whole frontier, so a dropped one is repaired by the next; it needs no
+  barrier, since the frontier counts only durable batches. It is the
+  last variant, so the payload-transfer discriminants stay where
+  `is_payload_transfer` expects them.
+- **A follower commits what it adopted up to it.** Only a frontier from
+  the leader of the follower's current ballot is taken, and it is reset
+  with the ballot. Every durable adoption of that ballot at or below it
+  is committed, in sequence order. `learn` alternates this with the
+  acknowledgement rule until neither commits anything more.
+- **Why it is sound.** The leader's commit is a decision under the
+  crash-fault model. An adoption here took the dependencies of that
+  leader's proposal with that sequence number, which is what its commit
+  was over. Only a durable adoption counts, as only a durable adoption
+  counts as this replica's vote. The frontier commits nothing the
+  follower did not adopt: a command it holds initialized without the
+  proposal stays where it is.
+
+### A full table admits the command whose turn has come
+
+The first version of the tests found a second stall behind the first.
+- The frontier committed the eight commands the follower had adopted,
+  and they executed.
+- The payloads it then asked for arrived in no particular order, and
+  the table filled again with later commands.
+- None of those can be adopted before the next command in the chain,
+  and that one was refused as backpressure. So were its later
+  retries, for ever.
+
+In the Jepsen runs the same happens with submissions: new commands'
+payloads reach a follower that is behind and fill its table ahead of the
+commands it needs. Two changes close it.
+- **Admission.** A payload whose held proposal is within the frontier,
+  with every dependency at least ACCEPT, initializes past the table's
+  capacity (`CommandTable::initialize_beyond_capacity`). It is adopted,
+  committed and executed at once, so it makes room rather than taking
+  it. Only the commands whose turn has come qualify, so the table
+  exceeds its bound by those and no more.
+- **The ask.** A follower's bounded payload ask names first, and in the
+  leader's order, the held proposals within the frontier whose payload
+  it lacks: half the ask, so the rotation through the rest still moves.
+  Before, the one command whose turn had come was reached once per
+  rotation through a missing set of thousands.
+
+### What the tests show
+
+`crates/coord-consensus/tests/frontier.rs` runs five voters, so a follower
+needs its peers:
+- `a_follower_that_hears_only_the_leader_executes_what_it_commits`: r3
+  receives every proposal and no peer's acknowledgement. The re-send
+  alone leaves it at ACCEPT on all ten commands; the frontier executes
+  them.
+- `two_followers_cut_from_their_peers_both_execute`: the ring partition,
+  with r3 and r4.
+- `a_follower_whose_table_filled_while_it_could_not_learn_catches_up`:
+  a table of eight, 32 commands, backpressure on r3; it executes all 32
+  in the leader's order.
+- `a_follower_asks_first_for_what_the_leader_committed_in_its_order`:
+  the first ask after the frontier arrives leads with the four lowest
+  sequence numbers it lacks.
+- `the_frontier_commits_nothing_the_follower_did_not_adopt`: r3 receives
+  payloads and no proposals; the frontier reaches it and nothing moves
+  past PRE-ACCEPT, until the proposals do.
+- `a_frontier_from_another_voter_is_ignored`, and
+  `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed`
+  (three of five voters down: the frontier stays, then moves once they
+  are back).
+
+Negative controls, each run and failing:
+- with a follower that ignores the frontier, six of the seven fail; the
+  leader's own frontier test is the one that passes;
+- without admission past capacity, the full-table test executes the
+  first eight and stops;
+- without the ordered ask, the ask test leads with other commands.
+
+### What is left
+
+- **A follower restarted under a live leader.** Its adoptions come back
+  from the rows without the ballot's sequence numbers, so the frontier
+  cannot commit them. The leader counted them before the restart and
+  does not re-send them, and it cannot tell the follower restarted: the
+  incarnation comes from the node's credential, not its boot. A new
+  ballot's Sync repairs it. task-d10's voter-reported frontier is what
+  closes it under the same leader.
+- **Rate.** Repair is still task-d07's 16 proposals per voter per 250 ms,
+  and payloads 8 per ask from the leader alone. task-d10 makes both
+  flow-controlled.
+- **A voter behind the leader's retention** has no path back without a
+  checkpoint: task-d08.
+- **Acceptance on Jepsen.** The five-node Jepsen run is task-d09's
+  acceptance and has not run with this change; it needs #98 to carry it.

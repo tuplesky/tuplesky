@@ -141,6 +141,24 @@ pub enum ProtocolMessage {
         /// Sealing replica.
         replica: ReplicaId,
     },
+    /// The leader's commit frontier (task-d09): every proposal of
+    /// `ballot` with a sequence number up to `through` is committed at
+    /// the leader, and its batch is durable there.
+    ///
+    /// A follower otherwise learns a command only from acknowledgements
+    /// it receives itself, each published once on a lane that drops
+    /// frames. One missed quorum left it at ACCEPT on that command, and
+    /// with the chain total on everything after it, for good. With this
+    /// it commits what it adopted from the leader of `ballot` up to the
+    /// frontier. The leader publishes it again on its re-send timer, so a
+    /// lost frame is repaired by the next one.
+    Committed {
+        /// The ballot the sequence numbers are in; its leader is the
+        /// sender.
+        ballot: Ballot,
+        /// Highest sequence number of the committed prefix.
+        through: u64,
+    },
 }
 
 impl ProtocolMessage {
@@ -169,6 +187,7 @@ impl ProtocolMessage {
             | ProtocolMessage::PayloadRequest { .. }
             | ProtocolMessage::SealRequest { .. }
             | ProtocolMessage::Sealed { .. }
+            | ProtocolMessage::Committed { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }
