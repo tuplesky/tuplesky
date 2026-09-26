@@ -387,9 +387,13 @@ fn a_hot_key_keeps_working_after_its_executed_predecessor_is_retired() {
     assert!(!t.tombstones().contains(&cmd(0)));
     assert!(t.tombstones().contains(&cmd(1)));
     assert!(t.tombstones().contains(&cmd(2)));
-    // The key's next command depends on nothing: the index was cleared.
+    // The key's next command still depends on the latest one, retired
+    // as it is (task-d06): a replica that has not executed c2 yet must not
+    // execute c3 first, and one that has reads c2's tombstone as EXECUTED.
     let i3 = t.initialize(cmd(3), payload(3), k("hot")).unwrap();
-    assert_eq!(i3.deps, vec![]);
+    assert_eq!(i3.deps, vec![cmd(2)]);
+    t.accept(cmd(3), i3.deps)
+        .expect("the tombstone answers for c2");
 }
 
 /// A command retired before the evidence that names it arrives is still
@@ -511,4 +515,92 @@ fn a_full_table_reclaims_what_it_executed_and_nothing_else() {
     roomy.initialize(cmd(1), payload(1), k("key")).unwrap();
     assert_eq!(roomy.phase_of(&cmd(0)), Some(Phase::Executed));
     assert_eq!(roomy.len(), 2);
+}
+
+/// Run `command` through to EXECUTED under its own dependencies.
+fn run_through(
+    t: &mut CommandTable,
+    command: CommandId,
+    i: u8,
+    keys: Vec<Vec<u8>>,
+) -> Vec<CommandId> {
+    let deps = t.initialize(command, payload(i), keys).unwrap().deps;
+    t.accept(command, deps.clone()).unwrap();
+    t.commit(command).unwrap();
+    t.execute(command).unwrap();
+    deps
+}
+
+/// The command after a reclaim still depends on the key's latest command,
+/// retired or not (task-d06).
+///
+/// The table reclaims exactly when it is full, and before it computes the
+/// next command's dependencies. Retirement used to clear the key's latest,
+/// so the first command a full leader proposed named no dependency at all;
+/// a follower still behind the command it should have named found it
+/// ready and executed it first. On the leader nothing looked wrong: what
+/// it retired had executed there.
+#[test]
+fn the_command_after_a_reclaim_still_depends_on_the_last_one() {
+    let capacity = 4u8;
+    let mut t = CommandTable::with_capacity(usize::from(capacity));
+    let mut previous = None;
+    for i in 1..=capacity {
+        let deps = run_through(&mut t, cmd(i), i, k("conservative"));
+        assert_eq!(deps, previous.into_iter().collect::<Vec<_>>());
+        previous = Some(cmd(i));
+    }
+    // Full, so this reclaims every executed record first.
+    let next = t
+        .initialize(cmd(100), payload(100), k("conservative"))
+        .unwrap();
+    assert_eq!(
+        next.deps,
+        vec![cmd(capacity)],
+        "the chain broke at the reclaim"
+    );
+    assert!(t.record(&cmd(capacity)).is_none(), "it was retired");
+    assert_eq!(t.phase_of(&cmd(capacity)), Some(Phase::Executed));
+    assert_eq!(t.conflicts(&k("conservative")), vec![cmd(100)]);
+}
+
+/// A key's latest command keeps its tombstone however many retirements
+/// follow on other keys, because the next command on that key will name
+/// it and the guards must answer for it (task-d06). Every other tombstone
+/// still goes by age.
+#[test]
+fn a_keys_latest_tombstone_outlives_the_bound() {
+    let capacity = 2u8;
+    let mut t = CommandTable::with_capacity(usize::from(capacity));
+    run_through(&mut t, cmd(1), 1, k("quiet"));
+    t.retire(&cmd(1)).unwrap();
+    for i in 2..=8u8 {
+        run_through(&mut t, cmd(i), i, k("busy"));
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        t.tombstones().contains(&cmd(1)),
+        "the quiet key's latest lost its tombstone"
+    );
+    assert!(!t.tombstones().contains(&cmd(2)), "an old tombstone stayed");
+    let next = t.initialize(cmd(50), payload(50), k("quiet")).unwrap();
+    assert_eq!(next.deps, vec![cmd(1)]);
+    t.accept(cmd(50), next.deps)
+        .expect("the guard answers for it");
+    // Superseded, it goes in its turn.
+    t.commit(cmd(50)).unwrap();
+    t.execute(cmd(50)).unwrap();
+    t.retire(&cmd(50)).unwrap();
+    for i in 9..=12u8 {
+        run_through(&mut t, cmd(i), i, k("busy"));
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        !t.tombstones().contains(&cmd(1)),
+        "a superseded tombstone stayed"
+    );
+    assert!(
+        t.tombstones().contains(&cmd(50)),
+        "the quiet key's new latest"
+    );
 }
