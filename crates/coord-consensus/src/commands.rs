@@ -672,8 +672,12 @@ impl CommandTable {
             .step(budget, |c| match self.records.get(c) {
                 Some(r) => r.payload.is_some().then(|| r.deps.clone()),
                 // A retired executed dependency: complete, nothing beyond it
-                // is still needed for ordering.
-                None => self.executed.contains(c).then(Vec::new),
+                // is still needed for ordering. Any executed command, not
+                // only one still in the tombstone window: a restart retires
+                // everything it executed at once, and a record still live
+                // after it can reach further back than the window
+                // (task-d05).
+                None => self.history.contains(c).then(Vec::new),
             })
             .map_err(|dep| GuardViolation::DependencyUnknown { dep })
     }
