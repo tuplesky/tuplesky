@@ -188,10 +188,10 @@ Where they stand on the stack at `afc0df6`:
 
 | Finding | Status |
 | --- | --- |
-| A follower that acknowledges writes the domain does not keep | Open. Intermittent: 1 of 2 Jepsen runs and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
+| A follower that acknowledges writes the domain does not keep | Fix in review: #99. Intermittent: 1 of 2 Jepsen runs and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
 | A restarted follower whose table stays full | Open: task-d05. Recovery carries the whole history (below). |
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
-| A follower that started late never completes a read | Open. Reproduced on `afc0df6`. |
+| A follower that started late never completes a read | Open: a plan task in #99. Reproduced on `afc0df6`. |
 | No sessions after healing, under Jepsen | Open: task-d05. Recovery carries the whole history (below). |
 
 The second and the last are the limit task-d01's notes now record as
@@ -254,9 +254,31 @@ Later, voter 2 served reads of the main lineage again.
 Five more pause runs were clean: three on `afc0df6` and two on
 `d3cb8f0`, the stack before task-d01. Two clean runs do not clear
 `d3cb8f0`. A client cannot make replicas diverge, so the cause is in the
-domain. The lead is how a follower whose table is full, and whose record
-then disagrees with the leader's release, came to answer from a state
-the leader never had.
+domain.
+
+The cause, from review and confirmed by the tests in #99: once the
+leader's command table is full, the dependency chain stops being total.
+The leader initializes every command with the conservative key alone,
+and its dependencies are that key's last command. But `initialize`
+reclaims before it computes them, and retiring a key's last command
+cleared it. So the first proposal after a reclaim carried no dependency
+at all:
+
+* On the leader, that is invisible: everything it retired had executed.
+* A follower still behind (its table full, or a proposal missed as in
+  the late-follower finding) commits that command on the leader's
+  proposal and its own adoption. With nothing ordering it after the
+  backlog, it executes it first.
+
+The same committed set then runs in two orders on two replicas. A
+follower's frontend answers from its own execution record
+(`settle_from_records`, and `retained_answer` for a retry), so the
+follower's `ok`s reflected its own order. The leader's release, where
+the collector held it, disagreed: `release-record-mismatch`.
+
+#99 keeps a retired command as its key's latest, so the chain stays
+total. It also stops a node whose execution contradicts the leader's
+release, instead of logging the mismatch.
 
 ### A restarted follower whose command table stays full
 
@@ -370,8 +392,8 @@ stays `Pending`. Voter 1 serves the first key. Voter 3 had not recovered
 test), reads through voter 3 are served. The voters that stalled on
 containers and on the runner were the last ones started.
 
-The likely cause is in review on this change. A follower that misses one
-`Proposal` never learns that command exists:
+The likely cause, from review (a plan task in #99): a follower that
+misses one `Proposal` never learns that command exists:
 
 * a frame to a peer that is not linked yet is dropped;
 * nothing re-sends it: `welcome` sends only `NewLeader` and the bound Sync;
