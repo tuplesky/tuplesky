@@ -417,6 +417,15 @@ impl Leader {
             effects.extend(leader.repropose(*c, deps));
             last = Some(*c);
         }
+        // The first fresh proposal of this ballot follows the recovered
+        // order's tail. Re-proposing moved nothing in the table, so its
+        // latest command is still the payload that reached this voter
+        // last, which can sit in the middle of that order: a command
+        // proposed after it would not wait for the tail on a replica
+        // still behind it, and would execute first there (task-d06).
+        if let Some(tail) = last {
+            leader.table.anchor(CONSERVATIVE_KEY, tail);
+        }
         effects.extend(leader.release());
         (leader, effects)
     }
