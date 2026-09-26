@@ -1486,7 +1486,7 @@ Whichever it is, a lagging voter below the floor catches up by the checkpoint pa
 
 **Acceptance:** In the deterministic cluster, an election after more history than the table holds completes, and the new ballot serves, with no payload asked for a command every voter executed. A voter that executed less than the floor is brought up by a checkpoint, and a command above it is still recovered exactly as before. The Jepsen client's leader-kill run (`--fault leader`) serves its final read. Reports and Syncs are bounded by the live window, not by history.
 
-**Review boundary:** `coord-consensus` recovery and its durable rows, plus the daemon wiring the floor needs. No change to selection among commands above the floor, to the commit rule, or to what a command's dependencies are. Nothing below the floor is re-executed, and nothing above it is skipped.
+**Review boundary:** `coord-consensus` recovery and its durable rows, plus the daemon wiring the floor needs. No change to selection among commands above the floor, to the commit rule, or to what a command's dependencies are beyond task-d06's rule (a retired command stays its key's latest). A key's latest can sit below the floor on a quiet key, so whatever answers for commands below the floor answers for it as executed. Nothing below the floor is re-executed, and nothing above it is skipped.
 
 <a id="task-d06"></a>
 ### task-d06: Keep one execution order on every replica when a table reclaims
