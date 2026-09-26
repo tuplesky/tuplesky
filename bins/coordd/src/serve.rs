@@ -879,6 +879,9 @@ pub struct Domain<P: Persistence> {
     /// that ask was for, so a partial answer is not mistaken for a
     /// complete one.
     asked: Option<(std::time::Instant, u64, u64)>,
+    /// When this leader last sent its voters the proposals they had not
+    /// voted on (task-d07).
+    resent: Option<std::time::Instant>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
@@ -1062,6 +1065,12 @@ impl Deadline for coord_daemon::parked::Parked {
 /// the first time -- its own proposal was not durable yet -- and nothing
 /// else is going to happen on an idle domain to prompt a second try.
 const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How often a leader sends its voters, again, the proposals they have
+/// not voted on (task-d07). Longer than a round trip on any link this
+/// serves, so a vote on its way is not answered with a second copy, and
+/// short enough that a voter that missed a proposal is not held long.
+const RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Something in a domain that has work due at a time rather than on an
 /// event.
@@ -1301,6 +1310,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
             asked: None,
+            resent: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
             undeliverable: BTreeMap::new(),
@@ -1499,7 +1509,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // source, so nothing will wake the loop on its behalf.
             self.pump_watches(&ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS))
                 .await;
-            self.settle_from_records();
+            // A release this node's own execution contradicts stops it
+            // here, before anything else this pass can answer a caller
+            // from that execution (task-d06).
+            if let Some(command) = self.settle_from_records() {
+                say_diverged(&command);
+                return;
+            }
             // A submission a destination could not take is offered
             // again here, on the collector's schedule and within a
             // per-turn budget. It goes after the voter's own turn and
@@ -2034,7 +2050,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .election
             .as_ref()
             .and_then(crate::election::Election::next_deadline);
-        [expiry, parked, reoffer, redial, renewal, election]
+        // A leader re-sends on its interval whether or not anything
+        // arrives: the voter it is re-sending to is the one not sending.
+        let resend = match &self.backing {
+            Backing::Voting(voter) if voter.leads() => self.resent.map(|at| at + RESEND_INTERVAL),
+            _ => None,
+        };
+        [expiry, parked, reoffer, redial, renewal, election, resend]
             .into_iter()
             .flatten()
             .min()
@@ -2140,6 +2162,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         } else {
             self.asked = None;
+        }
+        // A proposal a voter never received -- not linked yet, refused by
+        // a full lane, or ahead of its Sync -- is sent again by the
+        // leader, paced, until the voter has voted on it (task-d07).
+        if voter.leads() {
+            let now = std::time::Instant::now();
+            if self
+                .resent
+                .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
+            {
+                self.resent = Some(now);
+                out.absorb(voter.resend_proposals()?);
+            }
+        } else {
+            self.resent = None;
         }
         // Expiry is the leader's to schedule, and every candidate it
         // produces is conditional: nothing here decides that a key
@@ -2590,12 +2627,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     ///
     /// Bounded per turn, and cheap when nothing is half held, which is
     /// nearly always.
-    fn settle_from_records(&mut self) {
+    ///
+    /// Returns the command whose leader's release and this node's own
+    /// execution record disagree, if one does (task-d06). That is replicas
+    /// executing the same committed commands in different orders, and
+    /// every answer this node's frontend gives from its own record -- a
+    /// retry, a delivery whose half was lost -- then comes from a state
+    /// the domain did not decide. So nothing this pass settled goes out,
+    /// and the caller stops the node.
+    #[must_use]
+    fn settle_from_records(&mut self) -> Option<String> {
         let half = self.frontend.frontend.dispatcher_mut().half_established();
         if half.is_empty() {
-            return;
+            return None;
         }
-        let mut deliveries = Vec::new();
         // Bounded per turn and rotated across turns: the bound is on
         // this turn's reads, and the rotation is what keeps it from
         // becoming a bound on which commands are ever read.
@@ -2603,37 +2648,37 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
         self.settle_cursor = cursor;
         let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
-        for (command, record) in records {
-            match self.frontend.frontend.dispatcher_mut().settle_from_record(
+        // The release this collector holds and what this node executed
+        // disagreeing is not an ordinary outcome: every replica executes
+        // the committed commands in one order, and this node's frontend
+        // answers from its own record of that order. So the node stops
+        // (task-d06) rather than go on answering from it, and nothing
+        // this pass read from the same record goes out.
+        let dispatcher = self.frontend.frontend.dispatcher_mut();
+        match coord_daemon::settle::offer(records, |command, record| {
+            dispatcher.settle_from_record(
                 command,
                 record.result_digest,
                 record.revision,
                 &record.response,
-            ) {
-                Ok(delivery) => {
-                    self.frontend.counts.settled_from_record += 1;
-                    deliveries.extend(delivery);
+            )
+        }) {
+            coord_daemon::settle::Settled::Offered {
+                settled,
+                deliveries,
+            } => {
+                self.frontend.counts.settled_from_record += settled;
+                for delivery in deliveries {
+                    self.answer(delivery);
                 }
-                // The release this collector holds and what this node
-                // executed disagree. Neither is believed; said, because
-                // it is the one outcome here that is not ordinary.
-                Err(coord_collector::SettleError::Mismatch) => {
-                    let head: String = command.as_bytes()[..4]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    let said = format!("release-record-mismatch({head})");
-                    if let Some(n) = self.recurring.seen(&said) {
-                        eprintln!(
-                            "this node's durable record and the leader's release disagree: {said} ({n} so far)"
-                        );
-                    }
-                }
-                Err(_) => {}
+                None
             }
-        }
-        for delivery in deliveries {
-            self.answer(delivery);
+            coord_daemon::settle::Settled::Diverged(command) => Some(
+                command.as_bytes()[..4]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            ),
         }
     }
 
@@ -3295,6 +3340,16 @@ fn addressed(
         replica: to.replica,
         incarnation,
     })
+}
+
+/// Why a node stopped on a release its own execution contradicts.
+fn say_diverged(command: &str) {
+    eprintln!(
+        "this node stopped: release-record-mismatch({command}): the leader's release of that \
+         command and this node's own execution of it disagree, so this node executed the \
+         domain's commands in another order than the leader. Its store holds a history the \
+         domain did not decide, and this node does not answer from it"
+    );
 }
 
 /// Why a voter stopped on its own fence, and what heals it.

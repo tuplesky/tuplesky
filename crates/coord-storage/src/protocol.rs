@@ -62,6 +62,17 @@ pub struct RecoveredProtocol {
     /// Trimming may remove the dependency rows of executed commands, so
     /// this is what still has rows, not the whole executed history.
     pub executed: Vec<(CommandId, ExecutionPosition)>,
+    /// Every other executed identity: commands whose `executed_v1` row
+    /// survives and whose dependency row does not, in key order
+    /// (task-d05).
+    ///
+    /// A checkpoint trim removes the dependency rows of an executed
+    /// prefix and keeps its executed rows. Read only through the
+    /// dependency rows, those commands came back unknown, and a live
+    /// record naming one -- the first proposal after a reclaim names the
+    /// retired latest -- failed the execution guard on every restart.
+    /// This is the executed answer for them.
+    pub history: Vec<CommandId>,
     /// The durable execution frontier: how far this store has actually
     /// executed, whatever protocol rows survive.
     pub frontier: ExecutionPosition,
@@ -76,6 +87,7 @@ impl Default for RecoveredProtocol {
             syncs: Vec::new(),
             payloads: Vec::new(),
             executed: Vec::new(),
+            history: Vec::new(),
             frontier: ExecutionPosition::ZERO,
         }
     }
@@ -251,6 +263,7 @@ pub fn read_protocol<V: OrderedRead>(
         }
     }
     executed.sort_by_key(|(_, p)| *p);
+    let history = read_history(view, &records, budget)?;
     let frontier = crate::lowering::DurableMeta::read(view)?
         .frontier
         .execution_position;
@@ -261,6 +274,55 @@ pub fn read_protocol<V: OrderedRead>(
         syncs,
         payloads,
         executed,
+        history,
         frontier,
     })
+}
+
+/// Every executed identity without a dependency row among `records`,
+/// read from `executed_v1` itself (task-d05).
+///
+/// Paged within `budget` per page, and not charged to the recovery's
+/// running total: the answer is one identity per command executed, which
+/// the machine keeps in memory for the life of the process anyway (its
+/// executed answer). It grows with the history until a floor lets
+/// `executed_v1` forget a prefix every voter executed, which is the same
+/// bound that set is waiting for.
+fn read_history<V: OrderedRead>(
+    view: &V,
+    records: &[(CommandId, CommandRecord)],
+    budget: ViewBudget,
+) -> Result<Vec<CommandId>, EngineError> {
+    let known: std::collections::BTreeSet<CommandId> = records.iter().map(|(c, _)| *c).collect();
+    let mut history = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            Collection::ExecutedV1.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.clone(),
+                max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
+                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+            },
+        )?;
+        for row in &page.rows {
+            let id: [u8; 32] = row
+                .key
+                .as_slice()
+                .try_into()
+                .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
+            let command = CommandId(Digest32(id));
+            if !known.contains(&command) {
+                history.push(command);
+            }
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    Ok(history)
 }

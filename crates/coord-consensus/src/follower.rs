@@ -164,11 +164,41 @@ pub enum FollowerRejection {
     },
     /// A campaign was requested for a ballot this replica cannot lead.
     CannotLead,
+    /// This replica is further behind than recovery carries anyone: a
+    /// selection it was about to bind depends on `missing`, which the
+    /// selection does not carry and this replica has not committed. The
+    /// campaign was abandoned, and this replica does not campaign again
+    /// this boot (task-d05).
+    Behind {
+        /// The dependency the selection leaves this replica without.
+        missing: CommandId,
+    },
 }
 
 /// A report owed once every batch submitted before the cut is durable.
 /// A recovery report this replica owes a candidate.
 type ReportDue = crate::role::PendingReport;
+
+/// Report every command this replica executed as committed (task-d05).
+///
+/// A commit is not written as a row, so a durable record says ACCEPT for
+/// a command long executed. Reported as ACCEPT, the selection had the new
+/// leader propose it again and wait for votes -- from voters that had
+/// executed and retired it and had no record left to vote from. Executing
+/// a command means it was committed, under the dependencies its record
+/// holds, so that is what the report says, and the selection installs it
+/// as committed wherever it goes.
+pub(crate) fn report_executed_as_committed(report: &mut RecoveryReport, table: &CommandTable) {
+    for entry in &mut report.entries {
+        if entry.phase < Phase::Commit && table.phase_of(&entry.command) == Some(Phase::Executed) {
+            entry.phase = Phase::Commit;
+        }
+    }
+}
+
+/// How many times the command table's capacity the durable ledger may
+/// hold before the records of forgotten commands are swept.
+pub(crate) const HISTORY_SWEEP: usize = 4;
 
 /// How many times the command table's own capacity of leader proposals
 /// this replica will hold while it has no room to record them.
@@ -252,6 +282,9 @@ pub struct Follower {
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
+    /// Set when a selection showed this replica further behind than
+    /// recovery carries anyone; it does not campaign again this boot.
+    behind: Option<CommandId>,
     report_due: Option<ReportDue>,
     sync_pending: BTreeMap<CommandId, SyncEntry>,
     /// The Sync whose synchronized-ballot row is in flight: the new ballot
@@ -264,6 +297,18 @@ pub struct Follower {
     /// A selection read back from durable state that this replica had
     /// synchronized to but not finished installing.
     resumed: Option<SyncDecision>,
+    /// A Sync from its ballot's leader that arrived before this replica
+    /// promised that ballot, kept until it does.
+    ///
+    /// The Sync is published once, to every voter, as soon as the new
+    /// leader's selection is durable, and nothing publishes it again. A
+    /// voter whose promise is still on its way -- the leader counted a
+    /// majority without it, or this replica was answering another
+    /// candidate first -- used to refuse it and was then left promised to
+    /// a ballot it could never synchronize to, holding every proposal of
+    /// that ballot for ever. Kept, it is installed the moment the promise
+    /// is made, which is the order the protocol meant (task-d05).
+    early_sync: Option<(ReplicaId, SyncDecision)>,
     rejections: Vec<FollowerRejection>,
     /// What this replica published to the frontend for each command it
     /// still remembers, kept so an exact duplicate submission can offer
@@ -369,12 +414,14 @@ impl Follower {
             ledger,
             learner: Learner::new(executed_through),
             campaign: None,
+            behind: None,
             report_due: None,
             sync_pending: BTreeMap::new(),
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
             resumed,
+            early_sync: None,
         }
         .resume_sync()
     }
@@ -403,15 +450,27 @@ impl Follower {
     /// after `through`. Called before boot on a recovered follower; the
     /// rows are the materializer's, written in the same batch as the
     /// application rows (Section 6.5), so this never invents execution.
+    ///
+    /// The executed records are then retired, in the order they executed,
+    /// and what that leaves forgotten is swept (task-d05). Every durable
+    /// dependency row comes back as a record, so a voter restarted after
+    /// a long history held all of it as live records, and reported all of
+    /// it to the first candidate that asked -- which after a kill is
+    /// straight away.
     pub fn restore_execution(
         mut self,
         through: ExecutionPosition,
         executed: impl IntoIterator<Item = CommandId>,
     ) -> Self {
-        for c in executed {
-            self.table.restore_executed(&c);
-            self.adopted.entry(c).or_insert((u64::MAX, true));
+        let executed: Vec<CommandId> = executed.into_iter().collect();
+        for c in &executed {
+            self.table.restore_executed(c);
+            self.adopted.entry(*c).or_insert((u64::MAX, true));
         }
+        for c in &executed {
+            let _ = self.table.retire(c);
+        }
+        self.sweep_history();
         self.learner = Learner::with_mode(through, self.learner.mode());
         self
     }
@@ -429,6 +488,12 @@ impl Follower {
                 continue;
             }
             self.bindings.insert(p.retry_key, c);
+            // History stays swept: `restore_execution` has just forgotten
+            // it, and reloading it here would hold a payload per command
+            // ever executed until the next sweep (task-d05).
+            if self.table.forgotten(&c) {
+                continue;
+            }
             self.payloads.insert(c, p);
             self.served_payloads.insert(c);
         }
@@ -465,6 +530,7 @@ impl Follower {
             learner: state.learner,
             deferred: BTreeMap::new(),
             campaign: None,
+            behind: None,
             // A report owed to a candidate is an obligation of the replica,
             // not of the role it held when the request arrived: dropping it
             // would stall a candidate that needs this replica's majority.
@@ -475,6 +541,7 @@ impl Follower {
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
             resumed: None,
+            early_sync: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
         }
     }
@@ -524,6 +591,10 @@ impl Follower {
         };
         if ballot.leader != self.config.identity.replica {
             self.rejections.push(FollowerRejection::CannotLead);
+            return Vec::new();
+        }
+        if let Some(missing) = self.behind {
+            self.rejections.push(FollowerRejection::Behind { missing });
             return Vec::new();
         }
         let Ok(config) = BallotConfiguration::c2_default(
@@ -669,6 +740,18 @@ impl Follower {
         }
         if campaign.binding().is_none() && !campaign.is_durable() {
             let decision = campaign.decision().expect("selected").clone();
+            // A candidate further behind than every reporter's window
+            // would win and then never execute again: the selection names
+            // what it lacks only as a dependency, since every reporter
+            // executed it long ago and leaves it out, and nothing it binds
+            // brings it. It is not this replica's to lead; another voter
+            // is, and this one waits to be brought up (task-d05).
+            if let Some(missing) = Self::selection_gap(&self.table, &decision) {
+                self.rejections.push(FollowerRejection::Behind { missing });
+                self.behind = Some(missing);
+                self.campaign = None;
+                return Vec::new();
+            }
             // A selected command this replica never stored (it was down
             // while the request was admitted) needs its payload before the
             // result is bound: the new leader re-proposes from payloads,
@@ -786,6 +869,21 @@ impl Follower {
     /// the ballot's fast set is activated and ballot-scoped votes reset.
     pub fn on_sync(&mut self, from: ReplicaId, decision: SyncDecision) -> Vec<Effect> {
         let promised = self.ballots.promised();
+        if from == decision.ballot.leader
+            && decision.ballot.compare_same_epoch(&promised) == Some(core::cmp::Ordering::Greater)
+        {
+            // Ahead of this replica's promise: kept, not refused. Only the
+            // highest such Sync is worth keeping, since a promise for it
+            // would void every lower one.
+            let higher = self.early_sync.as_ref().is_none_or(|(_, kept)| {
+                decision.ballot.compare_same_epoch(&kept.ballot)
+                    == Some(core::cmp::Ordering::Greater)
+            });
+            if higher {
+                self.early_sync = Some((from, decision));
+            }
+            return Vec::new();
+        }
         if decision.ballot != promised || from != decision.ballot.leader {
             self.rejections.push(FollowerRejection::SyncRejected {
                 ballot: decision.ballot,
@@ -1015,6 +1113,13 @@ impl Follower {
                 payload_present: false,
             });
         }
+        // History is left out: a command this replica executed and keeps
+        // nothing else about. Every command a report names is one the
+        // candidate may need to install or fetch, and reporting the whole
+        // history made a report, and the Sync selected from reports, grow
+        // without bound (task-d05).
+        report.entries.retain(|e| !self.table.forgotten(&e.command));
+        report_executed_as_committed(&mut report, &self.table);
         report.entries.sort_by_key(|e| e.command);
         report
     }
@@ -1050,6 +1155,26 @@ impl Follower {
             .filter(|c| table.phase_of(c).is_none())
             .copied()
             .collect()
+    }
+
+    /// A dependency of a selected entry that the selection does not carry
+    /// and this replica has not committed (task-d05).
+    ///
+    /// A reporter that adopted an entry held its dependencies at ACCEPT
+    /// or beyond, so a dependency no majority report names is one every
+    /// such reporter executed and forgot. A replica without it committed
+    /// cannot get it from this selection, and cannot execute past it.
+    fn selection_gap(table: &CommandTable, decision: &SyncDecision) -> Option<CommandId> {
+        decision
+            .entries
+            .values()
+            .flat_map(|e| e.deps.iter())
+            .find(|d| {
+                !decision.entries.contains_key(d)
+                    && !decision.reproposed.contains(d)
+                    && table.phase_of(d) < Some(Phase::Commit)
+            })
+            .copied()
     }
 
     /// What this replica's own campaign is waiting for before it can bind
@@ -1170,7 +1295,37 @@ impl Follower {
             outcome,
         )?;
         self.learn();
+        self.forget_history();
         Ok(alloc::vec![Effect::Established(result)])
+    }
+
+    /// Drop the durable records and payloads of commands this replica
+    /// keeps nothing else about ([`CommandTable::forgotten`]), once there
+    /// are enough of them to be worth a pass (task-d05).
+    ///
+    /// Neither is reported or served for such a command any more, so
+    /// keeping them made the memory of a long-running voter grow with its
+    /// history. The sweep runs when the ledger has outgrown a multiple of
+    /// the table, so it is amortized over the growth that made it
+    /// necessary.
+    fn forget_history(&mut self) {
+        if self.ledger.len() <= self.config.capacity.saturating_mul(HISTORY_SWEEP) {
+            return;
+        }
+        self.sweep_history();
+    }
+
+    /// The sweep itself, whatever the ledger's size.
+    fn sweep_history(&mut self) {
+        let table = &self.table;
+        self.ledger.retain(|c| !table.forgotten(c));
+        self.payloads.retain(|c, _| !table.forgotten(c));
+        self.served_payloads.retain(|c| !table.forgotten(c));
+        self.votes.retain(|c, _| !table.forgotten(c));
+        // The adoption order of a forgotten command decides nothing more,
+        // and kept without its payload it would read as a payload still
+        // missing.
+        self.adopted.retain(|c, _| !table.forgotten(c));
     }
 
     fn learn(&mut self) {
@@ -1575,9 +1730,42 @@ impl Follower {
             return Vec::new();
         }
         let command = proposal.command;
-        if self.adopted.contains_key(&command) || self.held.contains_key(&command) {
-            // Duplicate proposal: converges without change.
+        if self.held.contains_key(&command) {
+            // Duplicate proposal of one still held: nothing acknowledged yet.
             return Vec::new();
+        }
+        if self.adopted.contains_key(&command) {
+            // Duplicate proposal: converges without change -- except that
+            // the leader sends a proposal again only when it has no vote
+            // from this replica for it (task-d07). An acknowledgement that
+            // was lost on the way is published to the leader again, as it
+            // was published the first time.
+            if self.kept_evidence(&command) {
+                return self.reacknowledge(command, from);
+            }
+            // Nothing kept to publish again: adopted before a restart --
+            // the evidence store is this boot's, so the acknowledgement,
+            // if it was ever sent, went with it -- or kept past the
+            // store's bound. Without an answer the leader re-sent it for
+            // ever and, with a voter down, never learned it.
+            //
+            // A command decided here is answered from its durable record,
+            // to the leader alone (below). One only accepted is taken as
+            // the first proposal was: adopted again, which writes the
+            // same row and publishes the acknowledgement once it is
+            // durable.
+            if self.table.phase_of(&command) >= Some(Phase::Commit) {
+                return self.acknowledge_decided(&proposal, from);
+            }
+            self.adopted.remove(&command);
+        }
+        if self.table.record(&command).is_none()
+            && self.table.phase_of(&command) == Some(Phase::Executed)
+        {
+            // Executed here and retired: there is no record to adopt the
+            // order into and nothing left to decide. Held, it would wait
+            // for ever for an adoption that cannot happen (task-d05).
+            return self.acknowledge_decided(&proposal, from);
         }
         // A proposal asserts something about a command. Where this
         // replica already holds that command's payload and accepted it
@@ -1632,6 +1820,101 @@ impl Follower {
         }
         self.held.insert(command, HeldProposal { proposal });
         self.advance_pending()
+    }
+
+    /// Answer a proposal for a command decided here -- committed or
+    /// executed, retired or not -- with an adoption acknowledgement, to
+    /// `leader` alone (task-d07).
+    ///
+    /// The leader sends a proposal again only while it lacks this
+    /// replica's adoption, and a replica that decided the command may be
+    /// what it lacks: it learned the command from the leader's proposal
+    /// and its own acknowledgement, which then went missing, and a
+    /// restart took the evidence it could have published again. Decided
+    /// here, the command's dependencies are those of its durable record,
+    /// and a commit does not change them. The acknowledgement goes only
+    /// when the proposal carries those dependencies and the admission the
+    /// record holds, so it claims nothing this replica did not adopt;
+    /// without a durable record (none yet, or swept as history) nothing is
+    /// sent. The record is durable, so the acknowledgement waits for
+    /// nothing; and it goes to the leader only, since no submitter is
+    /// waiting on it.
+    fn acknowledge_decided(&mut self, proposal: &FastAck, leader: ReplicaId) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let Some(record) = self.ledger.record(&proposal.command) else {
+            return Vec::new();
+        };
+        if !crate::vote::same_set(&record.deps, &proposal.deps)
+            || record.payload != Some(proposal.admission)
+        {
+            return Vec::new();
+        }
+        let ballot = self.config.quorum.ballot();
+        let ack = SlowAck {
+            replica: self.config.identity.replica,
+            ballot,
+            command: proposal.command,
+            admission: proposal.admission,
+        };
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let Some(outbox) = self.outbox.as_mut() else {
+            return Vec::new();
+        };
+        outbox.publish(PendingSend {
+            context,
+            requires: Vec::new(),
+            to: PeerId {
+                replica: leader,
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            frame: ProtocolMessage::SlowAck(ack).encode(),
+        });
+        self.release()
+    }
+
+    /// Whether this boot kept what this replica acknowledged for `command`
+    /// in the current ballot.
+    fn kept_evidence(&self, command: &CommandId) -> bool {
+        let ballot = self.config.quorum.ballot();
+        self.replay.kept(command).iter().any(|e| e.ballot == ballot)
+    }
+
+    /// Publish to `leader` again what this replica acknowledged for
+    /// `command` in the current ballot.
+    ///
+    /// The same frames, under the context and barriers they were first
+    /// published with, so the outbox judges them exactly as it did then.
+    /// Nothing is recomputed or voted again. Bounded by the leader's
+    /// pacing: it re-sends a proposal only while a vote is missing.
+    fn reacknowledge(&mut self, command: CommandId, leader: ReplicaId) -> Vec<Effect> {
+        let ballot = self.config.quorum.ballot();
+        let sends: Vec<PendingSend> = self
+            .replay
+            .kept(&command)
+            .iter()
+            .filter(|e| e.ballot == ballot)
+            .map(|e| PendingSend {
+                context: e.context,
+                requires: e.requires.clone(),
+                to: PeerId {
+                    replica: leader,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: e.frame.clone(),
+            })
+            .collect();
+        if sends.is_empty() {
+            return Vec::new();
+        }
+        let Some(outbox) = self.outbox.as_mut() else {
+            return Vec::new();
+        };
+        for send in sends {
+            outbox.publish(send);
+        }
+        self.release()
     }
 
     /// Adopt every held proposal whose payload is initialized and whose
@@ -1724,6 +2007,20 @@ impl Follower {
     }
 
     fn on_storage(&mut self, event: &StorageEvent) -> Vec<Effect> {
+        let mut out = self.on_storage_event(event);
+        // A Sync that arrived ahead of this replica's promise is installed
+        // once the promise is this replica's: its row is durable, so the
+        // promised ballot is the Sync's.
+        let promised = self.ballots.promised();
+        if let Some((leader, decision)) =
+            self.early_sync.take_if(|(_, kept)| kept.ballot == promised)
+        {
+            out.extend(self.on_sync(leader, decision));
+        }
+        out
+    }
+
+    fn on_storage_event(&mut self, event: &StorageEvent) -> Vec<Effect> {
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.observe(event);
         }

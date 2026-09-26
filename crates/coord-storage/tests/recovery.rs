@@ -717,7 +717,14 @@ impl Cluster {
             .promise
             .as_ref()
             .map_or(ballot(0, 0), |p| p.synced);
-        let executed: Vec<CommandId> = recovered.executed.iter().map(|(c, _)| *c).collect();
+        // As `coordd` restores it: identities a trim left without a
+        // dependency row first, then the ones that still have rows.
+        let executed: Vec<CommandId> = recovered
+            .history
+            .iter()
+            .copied()
+            .chain(recovered.executed.iter().map(|(c, _)| *c))
+            .collect();
         let resume = recovered.resumable_sync(&r(i as u8)).cloned();
         let mut f = Follower::recover(
             FollowerConfig {

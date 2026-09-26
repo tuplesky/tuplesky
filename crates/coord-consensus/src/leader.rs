@@ -18,7 +18,7 @@
 //! Follower acknowledgements are collected per command and nothing more:
 //! learning is not decided here.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use coord_core::capability::{AdmissionFacts, ReleasedResult, admission_digest};
@@ -157,6 +157,9 @@ pub struct Proposal {
     pub path: Digest32,
     /// Per-key path anchors published with the proposal.
     pub paths: PathAnchors,
+    /// The admission digest the proposal carries, kept so a re-send is
+    /// the same proposal even after the record has been retired.
+    pub admission: Digest32,
     /// Whether the batch is durable.
     pub durable: bool,
     /// The rows of the batch, kept so a definitely rejected write can be
@@ -200,6 +203,14 @@ pub enum FenceReason {
 /// before the leader stops leading.
 pub const MAX_PROPOSAL_ATTEMPTS: u32 = 3;
 
+/// How many re-proposals a new leader publishes at once; the rest go out
+/// through [`Leader::resend_unvoted`] (task-d07).
+pub const REPROPOSE_BATCH: usize = 32;
+
+/// How many proposals one call of [`Leader::resend_unvoted`] sends to one
+/// voter at most (task-d07).
+pub const RESEND_PER_VOTER: usize = 16;
+
 /// The leader machine of one domain.
 #[derive(Debug)]
 pub struct Leader {
@@ -219,6 +230,13 @@ pub struct Leader {
     /// dropped when the hold is full.
     early_order: VecDeque<CommandId>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
+    /// Payloads this replica knows to be durable without having proposed
+    /// them in this ballot: what it recovered, or made durable as a
+    /// follower. A leader that serves only its own durable proposals
+    /// cannot serve the payload of a recovered command it has no reason
+    /// to propose again -- one it already executed -- and a voter that
+    /// lacks it would ask for ever (task-d05).
+    served_payloads: BTreeSet<CommandId>,
     ledger: DurableLedger,
     learner: Learner,
     seqnum: u64,
@@ -281,6 +299,7 @@ impl Leader {
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             payloads: BTreeMap::new(),
+            served_payloads: BTreeSet::new(),
             ledger: DurableLedger::new(),
             learner: Learner::new(executed_through),
             seqnum: 0,
@@ -325,6 +344,7 @@ impl Leader {
                 .values()
                 .filter(|p| p.durable)
                 .map(|p| p.command)
+                .chain(self.served_payloads)
                 .collect(),
             learner: self.learner,
             boot: self.boot,
@@ -364,6 +384,7 @@ impl Leader {
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             payloads: state.payloads,
+            served_payloads: state.served_payloads,
             ledger: state.ledger,
             learner: state.learner,
             seqnum: 0,
@@ -405,24 +426,82 @@ impl Leader {
         // chaining re-proposals after an arbitrary entry lets a
         // re-proposed command become executable before an earlier one.
         let mut last = order.last().copied();
+        // Published in a first batch; the rest go out through the re-send,
+        // oldest first, as votes come back. A new leader after a long
+        // history used to put its whole selection on each follower's
+        // control lane in one pass, and the lane refused dozens of them
+        // (task-d07).
+        let mut published = 0usize;
         for c in order {
-            let deps = decision.entries[&c].deps.clone();
-            effects.extend(leader.repropose(c, deps));
+            let entry = &decision.entries[&c];
+            // A command selected as committed that this leader executed
+            // has nothing left to decide: the Sync carries the commit, and
+            // every voter installing it commits the command without a vote.
+            // Proposing it again only spent the lanes -- a new leader after
+            // a long history proposed hundreds of such commands in one
+            // pass, and the lanes refused the ones it had not executed
+            // along with them (task-d05).
+            if entry.phase >= Phase::Commit && leader.table.phase_of(&c) == Some(Phase::Executed) {
+                continue;
+            }
+            let deps = entry.deps.clone();
+            let publish = published < REPROPOSE_BATCH;
+            published += 1;
+            effects.extend(leader.repropose(c, deps, publish));
         }
         for c in &decision.reproposed {
             if leader.table.phase_of(c).is_none() {
                 continue;
             }
             let deps = last.map_or_else(Vec::new, |l| alloc::vec![l]);
-            effects.extend(leader.repropose(*c, deps));
+            let publish = published < REPROPOSE_BATCH;
+            published += 1;
+            effects.extend(leader.repropose(*c, deps, publish));
             last = Some(*c);
+        }
+        // The first fresh proposal of this ballot follows the recovered
+        // order's tail. Re-proposing moved nothing in the table, so its
+        // latest command is still the payload that reached this voter
+        // last, which can sit in the middle of that order: a command
+        // proposed after it would not wait for the tail on a replica
+        // still behind it, and would execute first there (task-d06).
+        if let Some(tail) = last {
+            leader.table.anchor(CONSERVATIVE_KEY, tail);
         }
         effects.extend(leader.release());
         (leader, effects)
     }
 
-    /// Propose a known command under this ballot with `deps`.
-    fn repropose(&mut self, command: CommandId, deps: Vec<CommandId>) -> Vec<Effect> {
+    /// Drop the durable records, payloads, proposals and votes of
+    /// forgotten commands, as a follower does (task-d05). A forgotten
+    /// command executed long ago: nothing is decided, released or served
+    /// for it any more.
+    fn forget_history(&mut self) {
+        if self.ledger.len()
+            <= self
+                .config
+                .capacity
+                .saturating_mul(crate::follower::HISTORY_SWEEP)
+        {
+            return;
+        }
+        let table = &self.table;
+        self.ledger.retain(|c| !table.forgotten(c));
+        self.payloads.retain(|c, _| !table.forgotten(c));
+        self.served_payloads.retain(|c| !table.forgotten(c));
+        self.proposals.retain(|c, _| !table.forgotten(c));
+        self.votes.retain(|c, _| !table.forgotten(c));
+    }
+
+    /// Propose a known command under this ballot with `deps`. With
+    /// `publish` false the proposal is recorded and made durable but not
+    /// sent: [`Leader::resend_unvoted`] sends it, paced (task-d07).
+    fn repropose(
+        &mut self,
+        command: CommandId,
+        deps: Vec<CommandId>,
+        publish: bool,
+    ) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
@@ -478,22 +557,25 @@ impl Leader {
             admission: record.payload.unwrap_or_else(|| admission_digest(None, 0)),
             seqnum: Some(seqnum),
         };
-        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
-        let outbox = self.outbox.as_mut().expect("booted");
-        for voter in &self.config.identity.voters {
-            if *voter == self.config.identity.replica {
-                continue;
+        if publish {
+            let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+            let outbox = self.outbox.as_mut().expect("booted");
+            for voter in &self.config.identity.voters {
+                if *voter == self.config.identity.replica {
+                    continue;
+                }
+                outbox.publish(PendingSend {
+                    context,
+                    requires: alloc::vec![barrier],
+                    to: PeerId {
+                        replica: *voter,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame: ProtocolMessage::Proposal(proposal.clone()).encode(),
+                });
             }
-            outbox.publish(PendingSend {
-                context,
-                requires: alloc::vec![barrier],
-                to: PeerId {
-                    replica: *voter,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
-                frame: ProtocolMessage::Proposal(proposal.clone()).encode(),
-            });
         }
+        let admission = proposal.admission;
         let mut set = VoteSet::new(self.config.quorum.clone(), command);
         set.add(Vote::Fast(proposal)).expect("leader proposal");
         self.votes.insert(command, set);
@@ -507,6 +589,7 @@ impl Leader {
                 deps,
                 path: record.path,
                 paths: record.paths.clone(),
+                admission,
                 durable: false,
                 updates: updates.clone(),
                 attempts: 1,
@@ -518,6 +601,98 @@ impl Leader {
             base: None,
             updates,
         })]
+    }
+
+    /// Send each voter, again, the proposals of this ballot it has not
+    /// adopted, oldest first and at most `per_voter` of them (task-d07).
+    ///
+    /// The protocol assumes a proposal reaches every voter, and the
+    /// transport drops a frame by design when a lane is full or the peer
+    /// is not linked yet, so re-sending is the protocol's job. A voter
+    /// that never received a proposal holds everything after it -- every
+    /// later proposal depends on it through the conservative key -- and
+    /// executes nothing more until a Sync realigns it.
+    ///
+    /// What a voter lacks is read from its adoption acknowledgements, the
+    /// only votes that say it received a proposal: a fast acknowledgement
+    /// goes out when the payload arrives, proposal or not, and a voter
+    /// that fast-acknowledged a command it never received the proposal of
+    /// used to be credited with it -- and with every proposal before it.
+    /// The dependency chain is total, so a voter that adopted a proposal
+    /// holds every earlier one, and only proposals after the latest it
+    /// adopted are sent. One it never acknowledges -- a command it
+    /// executed and retired and keeps no record of -- stops being sent
+    /// once it adopts a later one. Only durable proposals go: a proposal
+    /// still becoming durable has its first send queued behind its batch
+    /// already.
+    ///
+    /// Paced by the caller, which calls it on a timer rather than per
+    /// event; bounded per voter per call, so a voter that is gone costs
+    /// at most `per_voter` frames each time.
+    pub fn resend_unvoted(&mut self, per_voter: usize) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if !self.is_leading() || per_voter == 0 {
+            return Vec::new();
+        }
+        let mut order: Vec<(u64, CommandId)> = self
+            .proposals
+            .values()
+            .filter(|p| p.durable)
+            .map(|p| (p.seqnum, p.command))
+            .collect();
+        order.sort();
+        let me = self.config.identity.replica;
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let mut sends = Vec::new();
+        for voter in &self.config.identity.voters {
+            if *voter == me {
+                continue;
+            }
+            let voted = |c: &CommandId| self.votes.get(c).is_some_and(|v| v.adopted_by(voter));
+            let through = order
+                .iter()
+                .filter(|(_, c)| voted(c))
+                .map(|(s, _)| *s)
+                .max();
+            for (seqnum, command) in order
+                .iter()
+                .filter(|(s, c)| through.is_none_or(|t| *s > t) && !voted(c))
+                .take(per_voter)
+            {
+                let p = &self.proposals[command];
+                let frame = ProtocolMessage::Proposal(FastAck {
+                    replica: me,
+                    ballot,
+                    command: *command,
+                    deps: p.deps.clone(),
+                    paths: p.paths.clone(),
+                    path: p.path,
+                    admission: p.admission,
+                    seqnum: Some(*seqnum),
+                })
+                .encode();
+                sends.push(PendingSend {
+                    context,
+                    requires: alloc::vec![p.barrier],
+                    to: PeerId {
+                        replica: *voter,
+                        incarnation: ReplicaIncarnation::ZERO,
+                    },
+                    frame,
+                });
+            }
+        }
+        if sends.is_empty() {
+            return Vec::new();
+        }
+        let outbox = self.outbox.as_mut().expect("booted");
+        for send in sends {
+            outbox.publish(send);
+        }
+        self.release()
     }
 
     /// Deliver the report owed to a candidate once every batch before the
@@ -559,9 +734,16 @@ impl Leader {
     }
 
     /// The recovery report for `ballot` from durable state at this cut.
+    ///
+    /// History this replica keeps nothing else about is left out, as a
+    /// follower leaves it out (task-d05).
     pub fn report(&self, ballot: Ballot) -> RecoveryReport {
-        self.ledger
-            .report(self.config.identity.replica, ballot, self.ballots.synced())
+        let mut report =
+            self.ledger
+                .report(self.config.identity.replica, ballot, self.ballots.synced());
+        report.entries.retain(|e| !self.table.forgotten(&e.command));
+        crate::follower::report_executed_as_committed(&mut report, &self.table);
+        report
     }
 
     /// The next command to execute through the materializer, if any.
@@ -595,6 +777,7 @@ impl Leader {
             outcome,
         )?;
         self.learn();
+        self.forget_history();
         // A command whose result was released speculatively is already
         // disclosed; releasing it again would answer one caller twice.
         // A command whose result was *not* is only disclosed here.
@@ -1126,6 +1309,7 @@ impl Leader {
                 deps: init.deps,
                 path: init.path,
                 paths: init.paths,
+                admission: init.payload,
                 durable: false,
                 updates,
                 attempts: 1,
@@ -1433,7 +1617,25 @@ impl Leader {
             }
             ProtocolMessage::Sync(decision) => {
                 // A deposed leader carries the Sync into its follower role.
-                if self.deposed() {
+                // So does one whose deposing promise has not arrived yet:
+                // the Sync of a higher ballot is published once, and the
+                // follower this leader becomes keeps it until it promises
+                // that ballot (task-d05). Only a Sync from its ballot's
+                // leader is kept, and only the highest: Syncs of two
+                // higher ballots can arrive in either order, and the
+                // lower one, kept last, would be refused once the higher
+                // promise is made, with the Sync that matches it gone.
+                let above = |b: &Ballot| {
+                    decision.ballot.compare_same_epoch(b) == Some(core::cmp::Ordering::Greater)
+                };
+                let kept = self
+                    .pending_sync
+                    .as_ref()
+                    .is_none_or(|(_, kept)| above(&kept.ballot));
+                if from.replica == decision.ballot.leader
+                    && kept
+                    && (self.deposed() || above(&self.config.quorum.ballot()))
+                {
                     self.pending_sync = Some((from.replica, decision));
                 }
                 Vec::new()
@@ -1487,7 +1689,9 @@ impl Leader {
             .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
         let responses: Vec<ProtocolMessage> = commands
             .iter()
-            .filter(|c| self.proposals.get(c).is_some_and(|p| p.durable))
+            .filter(|c| {
+                self.proposals.get(c).is_some_and(|p| p.durable) || self.served_payloads.contains(c)
+            })
             .filter_map(|c| {
                 self.payloads
                     .get(c)

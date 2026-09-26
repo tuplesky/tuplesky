@@ -70,6 +70,8 @@ serde_json.workspace = true
 # daemon itself.
 coord-harness.workspace = true
 coord-wan-bench.workspace = true
+# The Jepsen client shim, driven against a running domain; test-only too.
+coord-jepsen.workspace = true
 time.workspace = true
 axum.workspace = true
 coord-authn.workspace = true

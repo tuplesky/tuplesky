@@ -123,6 +123,28 @@ pub struct CommandTable {
     /// The same commands in the order they were retired, so the oldest
     /// is the one dropped when the memory reaches its bound.
     retired: VecDeque<CommandId>,
+    /// Every command this replica executed and retired, however long
+    /// ago: the executed answer (task-d05).
+    ///
+    /// The tombstones above are bounded by recency, and what they bound is
+    /// what this replica still keeps *about* a command (the evidence it
+    /// can replay, for one). Whether it executed the command at all is a
+    /// different question, and one recovery asks of commands far older
+    /// than any recency bound: a Sync names commands by identity, and a
+    /// replica that answered "unknown" for one it executed long ago
+    /// treated it as work still to do -- a placeholder, a payload to
+    /// fetch, a table filling with history. So that answer is kept for
+    /// every command, at the cost of one identity each.
+    history: BTreeSet<CommandId>,
+    /// The last `capacity` commands retired, in the order they were: the
+    /// window a recovery report still names (task-d05).
+    ///
+    /// Not the tombstones. Those also keep every key's latest command for
+    /// the guards, however old, so with commands on ever new keys they
+    /// grow with the keys; a report bounded by them grew with them.
+    recent: VecDeque<CommandId>,
+    /// The same commands, for lookup.
+    recent_set: BTreeSet<CommandId>,
     capacity: Option<usize>,
 }
 
@@ -134,6 +156,9 @@ impl CommandTable {
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
+            history: BTreeSet::new(),
+            recent: VecDeque::new(),
+            recent_set: BTreeSet::new(),
             capacity: None,
         }
     }
@@ -145,6 +170,9 @@ impl CommandTable {
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
+            history: BTreeSet::new(),
+            recent: VecDeque::new(),
+            recent_set: BTreeSet::new(),
             capacity: Some(capacity),
         }
     }
@@ -163,6 +191,9 @@ impl CommandTable {
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
+            history: BTreeSet::new(),
+            recent: VecDeque::new(),
+            recent_set: BTreeSet::new(),
             capacity,
         };
         for (c, r) in records {
@@ -383,11 +414,12 @@ impl CommandTable {
     }
 
     /// Phase of an initialized command; a placeholder reports none. A
-    /// retired command a live record depends on reports `Executed`.
+    /// command this replica executed and retired reports `Executed`,
+    /// however long ago it was retired.
     pub fn phase_of(&self, command: &CommandId) -> Option<Phase> {
         match self.records.get(command) {
             Some(r) => r.payload.is_some().then_some(r.phase),
-            None => self.executed.contains(command).then_some(Phase::Executed),
+            None => self.history.contains(command).then_some(Phase::Executed),
         }
     }
 
@@ -423,6 +455,26 @@ impl CommandTable {
         record.deps = deps;
         record.phase = Phase::Accept;
         Ok(())
+    }
+
+    /// Make `command` the latest command on `key`: the next command
+    /// initialized on the key depends on it.
+    ///
+    /// The latest command on a key is the tail of the order, the command
+    /// no other command of the key depends on ([`CommandTable::restore`]
+    /// rebuilds it that way). `initialize` moves it on every payload,
+    /// which on a leader is its own proposal order and on a follower is
+    /// arrival order. A follower that wins an election re-proposes the
+    /// recovered order without initializing anything, so its latest is
+    /// still whatever payload reached it last, possibly a command in the
+    /// middle of that order. The new leader anchors the recovered tail
+    /// here, before its first fresh proposal (task-d06).
+    ///
+    /// The path log is left as it is: it digests this replica's own
+    /// appends, and the leader's paths reach the followers in its
+    /// proposals, not through this.
+    pub fn anchor(&mut self, key: &[u8], command: CommandId) {
+        self.keys.entry(key.to_vec()).or_default().last = Some(command);
     }
 
     /// Adopt the leader's order and path evidence for a command
@@ -473,20 +525,39 @@ impl CommandTable {
 
     /// Mark a command executed from durable evidence (its executed identity
     /// row) without consulting the guards: the materializer already applied
-    /// it at its position. Unknown commands are ignored.
+    /// it at its position.
+    ///
+    /// A command with no record here is one whose rows are gone (a trimmed
+    /// prefix): it is remembered as executed, which is all there is left
+    /// to say about it.
     pub fn restore_executed(&mut self, command: &CommandId) {
-        if let Some(r) = self.records.get_mut(command)
-            && r.payload.is_some()
-        {
-            r.phase = Phase::Executed;
+        match self.records.get_mut(command) {
+            Some(r) if r.payload.is_some() => r.phase = Phase::Executed,
+            Some(_) => {}
+            None => {
+                self.history.insert(*command);
+            }
         }
     }
 
     /// Forget an executed command. Unresolved acceptance is never deleted
-    /// for capacity. An executed command needs no successor to order after
-    /// it (its effects are complete), so the conflict index stops naming
-    /// it; what the table keeps is a tombstone saying that it executed,
-    /// so the guards can still answer for it.
+    /// for capacity. What the table keeps is a tombstone saying that it
+    /// executed, so the guards can still answer for it.
+    ///
+    /// The conflict index keeps naming it where it is a key's latest
+    /// command. It used to stop: an executed command's effects are
+    /// complete, so it seemed to need no successor ordered after it. That
+    /// holds on the replica that executed it and nowhere else. The table
+    /// reclaims exactly when it is full, before it computes the next
+    /// command's dependencies, so the first command a full leader proposed
+    /// named no dependency at all. A follower still behind it -- a payload
+    /// missing, its own table full -- found that command ready, with
+    /// nothing ordering it after the backlog, and executed it first: the
+    /// same committed set in two orders, and a frontend on that follower
+    /// answering from a state the leader never had. Named, the retired
+    /// command costs a replica that already executed it nothing (the
+    /// tombstone answers EXECUTED) and costs a lagging one the wait until
+    /// it has executed it, which is the order every replica must keep.
     ///
     /// The tombstone is unconditional, and that is the point. A
     /// dependency is named by whoever holds the evidence, and not all of
@@ -501,11 +572,14 @@ impl CommandTable {
     ///
     /// What bounds the memory is recency, not reference counting: the
     /// oldest tombstone goes once there are more of them than the table
-    /// has room for records. A leader names as a dependency only a
-    /// command still live in its own table, which is the same size, so a
-    /// replica that remembers its last `capacity` retirements remembers
-    /// every command a leader can still name. An unbounded table keeps
-    /// them all, which is what unbounded means.
+    /// has room for records -- except one that is still some key's latest
+    /// command, which the next proposal on that key will name, and which
+    /// the guards must go on answering for. There is at most one of those
+    /// per key. A leader names as a dependency only a command live in its
+    /// own table or its key's latest, so a replica that remembers its last
+    /// `capacity` retirements and every key's latest remembers every
+    /// command a leader can still name. An unbounded table keeps them all,
+    /// which is what unbounded means.
     pub fn retire(&mut self, command: &CommandId) -> Result<(), RetireError> {
         let keys = match self.records.get(command) {
             None => return Err(RetireError::Unknown),
@@ -517,20 +591,39 @@ impl CommandTable {
         self.records.remove(command);
         for key in &keys {
             if let Some(state) = self.keys.get_mut(key) {
-                if state.last == Some(*command) {
-                    state.last = None;
-                }
                 state.log.forget(command);
             }
         }
+        self.history.insert(*command);
         if self.executed.insert(*command) {
             self.retired.push_back(*command);
         }
+        if let Some(bound) = self.capacity
+            && self.recent_set.insert(*command)
+        {
+            self.recent.push_back(*command);
+            while self.recent.len() > bound {
+                if let Some(oldest) = self.recent.pop_front() {
+                    self.recent_set.remove(&oldest);
+                }
+            }
+        }
         if let Some(bound) = self.capacity {
+            let mut latest = Vec::new();
             while self.retired.len() > bound {
-                if let Some(oldest) = self.retired.pop_front() {
+                let Some(oldest) = self.retired.pop_front() else {
+                    break;
+                };
+                if self.keys.values().any(|k| k.last == Some(oldest)) {
+                    latest.push(oldest);
+                } else {
                     self.executed.remove(&oldest);
                 }
+            }
+            // Kept, and kept in the queue, so each goes in its turn once a
+            // newer command has taken its key.
+            for command in latest.into_iter().rev() {
+                self.retired.push_front(command);
             }
         }
         Ok(())
@@ -540,6 +633,26 @@ impl CommandTable {
     /// having executed.
     pub fn tombstones(&self) -> &BTreeSet<CommandId> {
         &self.executed
+    }
+
+    /// Whether this replica executed `command` and retired it longer ago
+    /// than its last `capacity` retirements (task-d05).
+    ///
+    /// Such a command is history. Every voter that reports it has
+    /// executed it, and a recovery report, a Sync and the payloads a
+    /// replica serves leave it out; a voter that has not executed it by
+    /// then is further behind than recovery carries anyone, and catches
+    /// up another way. It may still be a key's latest command, kept as a
+    /// tombstone for the guards: that answers for it when a proposal
+    /// names it, and needs nothing of the report. An unbounded table
+    /// keeps every tombstone, and forgets only what it never held a
+    /// record of.
+    pub fn forgotten(&self, command: &CommandId) -> bool {
+        self.history.contains(command)
+            && match self.capacity {
+                Some(_) => !self.recent_set.contains(command),
+                None => !self.executed.contains(command),
+            }
     }
 
     /// Start an exact closure traversal from an initialized command.

@@ -1,0 +1,161 @@
+# Jepsen tests through the native client (docs/operations/jepsen.md).
+#
+# Stands a domain up across a cluster of Debian containers on this runner,
+# one voter per container, and runs the `jepsen.tuplesky` test from the
+# `tuplesky/jepsen` repository against it with this runner as the control
+# node. Each Jepsen process drives the domain through `coord-jepsen`.
+#
+# Like the Kubernetes certification, this is a qualification run and not
+# part of `CI`: it is dispatched, weekly, or run once for a pull request
+# that changes the Jepsen harness itself. A Jepsen run that finds an anomaly or a crash is
+# doing its job; its store directory is uploaded either way.
+name: jepsen
+
+on:
+  workflow_dispatch:
+    inputs:
+      jepsen-ref:
+        description: Branch, tag or commit of tuplesky/jepsen to run
+        default: claude/tuplesky-jepsen-docker-tests
+      workload:
+        description: "append, wr or register"
+        default: append
+      nemesis:
+        description: "Comma-separated faults (kill, pause, partition), or none. Not clock: the containers share this runner's clock."
+        default: kill,pause,partition
+      time-limit:
+        description: Seconds of workload before healing
+        default: "300"
+      nodes:
+        description: Voters (containers), 3 or 5
+        default: "5"
+  # A change to the Jepsen harness itself runs it once, on the pull
+  # request, with the defaults. Not a required check.
+  pull_request:
+    paths:
+      - .github/workflows/jepsen.yml
+      - crates/coord-jepsen/**
+  schedule:
+    # Weekly, after the Kubernetes certification.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Scheduled runs have no inputs; these are the dispatch defaults.
+  JEPSEN_REF: ${{ inputs.jepsen-ref || 'claude/tuplesky-jepsen-docker-tests' }}
+  WORKLOAD: ${{ inputs.workload || 'append' }}
+  NEMESIS: ${{ inputs.nemesis || 'kill,pause,partition' }}
+  TIME_LIMIT: ${{ inputs.time-limit || '300' }}
+  NODES: ${{ inputs.nodes || '5' }}
+  LEIN_VERSION: 2.11.2
+  LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
+
+jobs:
+  jepsen:
+    name: jepsen (docker cluster)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: tuplesky
+          persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: tuplesky/jepsen
+          ref: ${{ env.JEPSEN_REF }}
+          path: jepsen
+          persist-credentials: false
+      - name: Install the exact Rust toolchain from rust-toolchain.toml
+        working-directory: tuplesky
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          workspaces: tuplesky
+          key: jepsen
+      - name: Build the daemon, the harness and the Jepsen client
+        working-directory: tuplesky
+        run: cargo build --locked --release -p coordd -p coord-harness -p coord-jepsen
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+          key: jepsen-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/tuplesky/project.clj') }}
+          restore-keys: jepsen-m2-
+      - name: Install Leiningen and this repository's Jepsen
+        run: |
+          # Jepsen's perf checker plots with gnuplot, and Elle renders an
+          # anomaly's cycle with graphviz; without them a clean history is
+          # reported :unknown.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          # JDK 21: Jepsen compiles its Java sources with `--release 21`.
+          # The lein script runs `java` from PATH (the runner's default is
+          # 17), not JAVA_HOME's, so both PATH and JAVA_CMD name it.
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          export JAVA_CMD=$JAVA_HOME_21_X64/bin/java
+          export PATH="$JAVA_HOME_21_X64/bin:$PATH"
+          java -version
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" \
+            "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+          echo "$LEIN_SHA256  $HOME/bin/lein" | sha256sum -c -
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          (cd jepsen/jepsen && "$HOME/bin/lein" install)
+      - name: Run the Jepsen project's unit tests
+        working-directory: jepsen/tuplesky
+        run: lein test
+      - name: Stand the cluster up
+        run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
+      - name: Deploy a domain on it and put a write through every voter
+        run: |
+          jepsen/tuplesky/docker/smoke.sh --dir "$RUNNER_TEMP/cluster" \
+            --bin-dir "$GITHUB_WORKSPACE/tuplesky/target/release"
+      - name: Run the Jepsen test
+        working-directory: jepsen/tuplesky
+        run: |
+          lein run test \
+            --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
+            --username root \
+            --bin-dir "$GITHUB_WORKSPACE/tuplesky/target/release" \
+            --workload "$WORKLOAD" \
+            --nemesis "$NEMESIS" \
+            --time-limit "$TIME_LIMIT" \
+            --concurrency 2n
+      - name: Pack the Jepsen store
+        if: always()
+        # Jepsen names each run's directory by its start time, and
+        # upload-artifact refuses a path with a colon in it, so the store
+        # travels as one archive. Not the provisioned run directory: it
+        # holds the domain's fixture keys and bundles. The histories,
+        # results and each voter's log are in the test's own directory.
+        run: |
+          if [ -d jepsen/tuplesky/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store.tgz" --exclude=tuplesky-runs \
+              -C jepsen/tuplesky store
+          fi
+      - name: Upload the Jepsen store
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jepsen-store-${{ env.WORKLOAD }}
+          path: ${{ runner.temp }}/jepsen-store.tgz
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Take the cluster down
+        if: always()
+        run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"
