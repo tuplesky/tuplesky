@@ -176,7 +176,7 @@ and `history.json`.
 ## Findings
 
 One finding is a safety failure: a follower acknowledged writes that the
-domain does not keep. Elle caught it once on the runner, and the stress
+domain does not keep. Elle caught it twice on the runner, and the stress
 driver once on loopback. The other four are liveness failures. The
 second and third came from the stress driver on one host (debug builds,
 a gVisor sandbox, the stack at `b642bfb`), repeatedly killing and
@@ -188,7 +188,7 @@ Where they stand on the stack at `afc0df6`:
 
 | Finding | Status |
 | --- | --- |
-| A follower that acknowledges writes the domain does not keep | Fix in review: #99. Intermittent: 1 of 2 Jepsen runs and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
+| A follower that acknowledges writes the domain does not keep | Fix in review: #99. Intermittent: 2 of 4 Jepsen runs (on `afc0df6` and `1f277c9`) and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
 | A restarted follower whose table stays full | Open: task-d05. Recovery carries the whole history (below). |
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | Open: a plan task in #99. Reproduced on `afc0df6`. |
@@ -229,7 +229,20 @@ update went through voters 1 and 3. So voter 3 evaluated guards against
 a state the other voters did not have.
 
 The next run, on `2ca6ca4` (the same code; only docs changed), was
-`:valid? true` (396 transactions).
+`:valid? true` (396 transactions), and so was the one on `0bd3405`
+(stack `1f277c9`; 372 transactions). The one after that, on `cfa8e79`
+(the same stack, docs changed;
+[run 36208087749](https://github.com/tuplesky/tuplesky/actions/runs/36208087749)),
+was `:valid? false` again, with the same shape:
+
+* G1a;
+* dirty updates;
+* a lost update on key 18;
+* G2-item-realtime, G0 and non-adjacent cycles.
+
+This time both failed appends that were read later came from processes
+1 and 6, bound to voter 2. The lost update's two transactions went
+through voters 2 and 3.
 
 **On loopback.** `shim-stress.py --fault pause --keys 3 --interval 10`
 on `afc0df6` reproduced it without Jepsen, 2.7 s into the run and before
