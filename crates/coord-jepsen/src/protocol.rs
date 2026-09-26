@@ -68,7 +68,7 @@ async fn run(session: &mut Session, codec: &Codec, request: &Value) -> Result<Ve
         Some("read") => {
             let key = field(request, "key")?;
             let answer = session
-                .execute(&codec.read(std::slice::from_ref(key)))
+                .execute_read(&codec.read(std::slice::from_ref(key)))
                 .await;
             Ok(ops::read_verdict(answer, |r| {
                 Ok(ops::snapshot(r, 1)?.remove(0).value)
@@ -108,7 +108,7 @@ async fn run(session: &mut Session, codec: &Codec, request: &Value) -> Result<Ve
 
 async fn txn(session: &mut Session, codec: &Codec, mops: &[Micro]) -> Verdict {
     let keys = ops::keys_of(mops);
-    let answer = session.execute(&codec.read(&keys)).await;
+    let answer = session.execute_read(&codec.read(&keys)).await;
     let seen = match answer {
         Answer::Established(response) => match ops::snapshot(&response, keys.len()) {
             Ok(seen) => seen,

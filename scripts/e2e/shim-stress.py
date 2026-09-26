@@ -22,7 +22,9 @@ full Elle run:
 * no element appears twice in a list;
 * no append reported `fail` is ever read;
 * an append reported `ok` is in every read that began after it ended;
-* a read that began after another read ended is not shorter.
+* a read that began after another read ended is not shorter;
+* no two ok transactions read the same value of a key and then both
+  append to it (a lost update).
 
 Exit status: 0 clean, 1 an anomaly, 2 the domain did not serve the final
 read (a liveness failure; the history checks still ran). The run
@@ -235,6 +237,21 @@ def check(ops, final):
             problems += [f"key {k}: failed append {v} was read" for v in r if v in failed]
             problems += [f"key {k}: read {r2} began after read {r} ended and is shorter"
                          for r2, s2, _ in rs if s2 > e and len(r2) < len(r)]
+    # Two ok transactions that read the same value of a key and then both
+    # appended to it: one append was lost (or the guard did not hold).
+    seen = {}
+    for _, _, mops, answer, _, _ in ops:
+        if answer["type"] != "ok":
+            continue
+        read = {}
+        for m in answer["value"]:
+            if m[0] == "r" and m[1] not in read:
+                read[m[1]] = tuple(m[2] or [])
+            elif m[0] == "append" and m[1] in read:
+                seen.setdefault((m[1], read[m[1]]), []).append(m[2])
+                del read[m[1]]
+    problems += [f"key {k}: appends {vs} all read {list(r)} first (lost update)"
+                 for (k, r), vs in seen.items() if len(vs) > 1]
     for _, _, mops, answer, _, t1 in ops:
         if answer["type"] != "ok":
             continue

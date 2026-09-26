@@ -67,7 +67,13 @@ history. The shim is `fail` only where it knows:
   Both are `info`. Everything else that is not `ok` is `info`, including
   `NOT_ADMITTED`: a denied disclosure of an executed command is
   `NOT_ADMITTED` too.
-* A read is `fail` whenever it did not complete: it had no effect.
+* A read is `fail` whenever it did not complete: it had no effect. Its
+  identity is retired with it (`abandon`), not kept for a resolution
+  nobody will ask for: the session's acknowledged floor is a contiguous
+  prefix, so one kept identity would hold it, and a window of requests
+  later every request of the session would be refused
+  `RetryOutOfWindow`. A write whose outcome is unknown keeps its
+  identity; the client reports it `info` and starts a new process.
 * Before calling an outcome unknown, the shim resolves it. An attempt
   whose answer does not come within `--attempt-ms` becomes unknown in the
   SDK, which asks the frontend about the invocation's identity
@@ -152,8 +158,10 @@ list-append transactions on a few contended keys, kills and restarts a
 voter (or pauses one) every so often, one at a time, reads every key at
 the end, and checks the history with the checks a list-append history
 can be held to without Elle: every read of a key is a prefix of the
-final list, nothing appears twice, no failed append is read, and an
-append reported `ok` is in every read that began after it.
+final list, nothing appears twice, no failed append is read, an append
+reported `ok` is in every read that began after it, and no two `ok`
+transactions read the same value of a key and then both appended to it
+(a lost update).
 
 ```text
 cargo build -p coordd -p coord-harness -p coord-jepsen
@@ -167,24 +175,26 @@ and `history.json`.
 
 ## Findings
 
-No history, from the stress driver or from Jepsen, had an anomaly. All
-four findings are liveness failures. The first two came from the stress
-driver on one host (debug builds, a gVisor sandbox, the stack at
-`b642bfb`), repeatedly killing and restarting one voter while the other
-two stayed up. The third came from a container deployment and reproduces
-on a GitHub runner and on loopback. The fourth came from the Jepsen runs
-on the runner.
+One finding is a safety failure: a follower acknowledged writes that the
+domain does not keep. Elle caught it once on the runner, and the stress
+driver once on loopback. The other four are liveness failures. The
+second and third came from the stress driver on one host (debug builds,
+a gVisor sandbox, the stack at `b642bfb`), repeatedly killing and
+restarting one voter while the other two stayed up. The fourth came from
+a container deployment and reproduces on a GitHub runner and on
+loopback. The fifth came from the Jepsen runs on the runner.
 
 Where they stand on the stack at `afc0df6`:
 
 | Finding | Status |
 | --- | --- |
+| A follower that acknowledges writes the domain does not keep | Open. Intermittent: 1 of 2 Jepsen runs and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
 | A restarted follower whose table stays full | Open. Recovery carries the whole history (below). |
-| A restarted voter that panics, then no election | Fixed on task-d01 (`fe09234`, `f2d4dfb`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 1's full tables. |
+| A restarted voter that panics, then no election | Fixed on task-d01 (`fe09234`, `f2d4dfb`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | Open. Reproduced on `afc0df6`. |
 | No sessions after healing, under Jepsen | Open. Recovery carries the whole history (below). |
 
-The first and the last are the limit task-d01's notes now record as
+The second and the last are the limit task-d01's notes now record as
 "recovery carries the whole history": dependency rows are never pruned,
 so every recovery report and every Sync names every command the domain
 has run, and a voter cannot tell a long-retired command from an unknown
@@ -196,6 +206,56 @@ coming back. But voters 2 and 3 refused every submission with
 290 operations, no anomaly). Deciding what bounds it (an execution floor, a pruned
 ledger, or a durable "executed" answer) is a `coord-consensus` protocol
 decision, and it is in no task yet.
+
+### A follower that acknowledges writes the domain does not keep
+
+**Under Jepsen.** The workflow run on `c6fd65a` (stack `afc0df6`;
+[run 36202048860](https://github.com/tuplesky/tuplesky/actions/runs/36202048860))
+was `:valid? false`. Elle found these anomalies:
+
+* G1a: a transaction reported `fail` (`guard-failed`) whose append was
+  read later;
+* dirty updates;
+* a lost update: two `ok` transactions both read key 32 as absent, and
+  both appended to it;
+* incompatible orders on some twenty keys, such as reads `[1]` and `[2]`
+  of key 43;
+* a PL-1 cycle.
+
+Every failed append that was read later came from Jepsen processes 2
+and 7. Both are bound to voter 3. The two transactions of the lost
+update went through voters 1 and 3. So voter 3 evaluated guards against
+a state the other voters did not have.
+
+The next run, on `2ca6ca4` (the same code; only docs changed), was
+`:valid? true` (396 transactions).
+
+**On loopback.** `shim-stress.py --fault pause --keys 3 --interval 10`
+on `afc0df6` reproduced it without Jepsen, 2.7 s into the run and before
+the first pause:
+
+* Voter 2 acknowledged about 30 appends to key 1 as `ok`. Its reads
+  showed them for 20 s, the list forking after element 151 into
+  `149, 174, 229, …`.
+* Voters 1 and 3 read `160, 162, 170, …` from the same point, and none
+  of voter 2's appends is in the final read.
+* Voter 2 followed ballot 0 throughout; no election or recovery ran, so
+  task-d01's recovery changes are not involved.
+* Its log shows the order:
+  1. `Duplicate` refusals, past 256;
+  2. `Backpressure`;
+  3. `this node's durable record and the leader's release disagree:
+     release-record-mismatch(a340ea17)`, one command, past 2048;
+  4. `QueueFull` on its bulk lane to the leader.
+
+Later, voter 2 served reads of the main lineage again.
+
+Five more pause runs were clean: three on `afc0df6` and two on
+`d3cb8f0`, the stack before task-d01. Two clean runs do not clear
+`d3cb8f0`. A client cannot make replicas diverge, so the cause is in the
+domain. The lead is how a follower whose table is full, and whose record
+then disagrees with the leader's release, came to answer from a state
+the leader never had.
 
 ### A restarted follower whose command table stays full
 

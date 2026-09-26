@@ -234,6 +234,12 @@ impl Session {
         Ok(this)
     }
 
+    /// The sequences of this session whose identities are retired: a
+    /// contiguous prefix, the floor the session acknowledges.
+    pub fn retired_through(&self) -> u64 {
+        self.client.retired_through()
+    }
+
     /// The SDK's clock: milliseconds since the session opened.
     fn now(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -316,7 +322,40 @@ impl Session {
 
     /// Carry `request` to an answer: established, refused before
     /// submission, or unknown once the budget is spent.
+    ///
+    /// An unknown outcome keeps its identity bound, so a later session
+    /// of the same instance could still resolve it; the caller reports
+    /// it `info`.
     pub async fn execute(&mut self, request: &LogicalRequest) -> Answer {
+        self.carry(request, false).await
+    }
+
+    /// [`Session::execute`] for a request that only reads, whose caller
+    /// reports an unknown outcome as `fail` and never asks about it
+    /// again.
+    ///
+    /// Its identity is retired instead of kept. The session's
+    /// acknowledged floor is a contiguous prefix, so one kept identity
+    /// holds the floor where it is, and a window of requests later every
+    /// request of the session is refused `RetryOutOfWindow`: a process
+    /// whose read once timed out would fail everything after. A read has
+    /// no effect to resolve, so giving its retained result up loses
+    /// nothing.
+    pub async fn execute_read(&mut self, request: &LogicalRequest) -> Answer {
+        self.carry(request, true).await
+    }
+
+    /// Give up on `id` whose outcome is not known: retire its identity
+    /// (`retire`) or keep it bound for a later resolution.
+    fn give_up(&mut self, id: coord_sdk::RequestId, retire: bool) {
+        if retire {
+            self.client.abandon(id);
+        } else {
+            self.client.forget(id);
+        }
+    }
+
+    async fn carry(&mut self, request: &LogicalRequest, retire_unknown: bool) -> Answer {
         let deadline = Instant::now() + self.timing.budget;
         let attempt_ms = u32::try_from(self.timing.attempt.as_millis()).unwrap_or(u32::MAX);
         let id = match self.client.submit(self.now(), request, attempt_ms) {
@@ -325,14 +364,12 @@ impl Session {
         };
         let mut last = String::from("no-answer");
         loop {
-            if let Some(answer) = self.finished(id) {
+            if let Some(answer) = self.finished(id, retire_unknown) {
                 return answer;
             }
             if Instant::now() >= deadline {
-                // Keep the identity bound: the invocation may still be
-                // resolved by a later session of the same instance, and
-                // nothing about it is claimed here beyond "not known".
-                self.client.forget(id);
+                // Nothing about it is claimed here beyond "not known".
+                self.give_up(id, retire_unknown);
                 return Answer::Unknown(last);
             }
             if self.connection.is_none() {
@@ -410,7 +447,7 @@ impl Session {
 
     /// The final answer for `id`, if the SDK has one. An unknown
     /// completion is not final: the SDK resolves it.
-    fn finished(&mut self, id: coord_sdk::RequestId) -> Option<Answer> {
+    fn finished(&mut self, id: coord_sdk::RequestId, retire_unknown: bool) -> Option<Answer> {
         let completions: Vec<Completion> = self.client.take_completions();
         let done = completions
             .into_iter()
@@ -425,7 +462,7 @@ impl Session {
                 Some(coord_sdk::RequestState::Done(Outcome::Unknown))
             ) =>
             {
-                self.client.forget(id);
+                self.give_up(id, retire_unknown);
                 return Some(Answer::Unknown("resolved-unknown".into()));
             }
             None => return None,

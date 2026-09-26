@@ -227,6 +227,15 @@ async fn a_write_whose_frontend_is_gone_is_info_and_a_read_is_fail() {
     // answer from here on.
     drop(daemons.remove(2));
 
+    // A read that is never answered is `fail`, and its identity is
+    // retired with it: kept bound, it would hold the session's
+    // acknowledged floor, and a window later every request of the
+    // session would be refused as out of window.
+    let floor = session.retired_through();
+    let answer = ask(&mut session, &codec, json!({"f": "read", "key": "g"})).await;
+    assert_eq!(answer["type"], "fail", "{answer}");
+    assert_eq!(session.retired_through(), floor + 1);
+
     for line in [
         json!({"f": "write", "key": "g", "value": 2}),
         json!({"f": "cas", "key": "g", "value": [1, 2]}),
