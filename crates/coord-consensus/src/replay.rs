@@ -227,11 +227,6 @@ impl EvidenceStore {
         Ok(sends)
     }
 
-    /// What this replica published for `command`, as it was published.
-    pub fn kept(&self, command: &CommandId) -> &[RetainedEvidence] {
-        self.own.get(command).map_or(&[], Vec::as_slice)
-    }
-
     /// How often `command`'s evidence has been published again this boot.
     pub fn repairs_of(&self, command: &CommandId) -> u32 {
         self.repairs.get(command).copied().unwrap_or(0)

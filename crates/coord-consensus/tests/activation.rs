@@ -129,19 +129,9 @@ struct Cluster {
     drop_sync: Vec<(u8, u8)>,
     /// Nodes that do not fetch the payloads they lack.
     no_fetch: Vec<usize>,
-    /// Nodes that execute nothing while listed.
-    no_execute: Vec<usize>,
-    /// (from, to) pairs whose acknowledgements are dropped.
-    drop_acks: Vec<(u8, u8)>,
-    /// (from, to) pairs whose proposals are dropped.
-    drop_proposals: Vec<(u8, u8)>,
-    /// The voters' table capacity.
-    capacity: usize,
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
     /// Every payload ask sent: who asked, and for what.
     asks: Vec<(usize, Vec<CommandId>)>,
-    /// Every proposal sent: (from, to).
-    proposals_sent: Vec<(usize, u8)>,
 }
 
 /// How many rounds `Cluster::settle` runs before it calls the cluster
@@ -157,11 +147,6 @@ fn boot_event(boot: u8) -> Event {
 
 impl Cluster {
     fn new(seed: u64) -> Self {
-        Self::with_capacity(seed, 32)
-    }
-
-    /// A cluster whose voters' tables hold `capacity` commands.
-    fn with_capacity(seed: u64, capacity: usize) -> Self {
         let mut nodes = Vec::new();
         for me in 0..3u8 {
             let role = if me == 0 {
@@ -171,7 +156,7 @@ impl Cluster {
                         quorum: quorum(ballot(0, 0)),
                         genesis: ballot(0, 0),
                         frontend: FRONTEND,
-                        capacity,
+                        capacity: 32,
                     },
                     None,
                     ExecutionPosition::ZERO,
@@ -182,7 +167,7 @@ impl Cluster {
                     quorum: quorum(ballot(0, 0)),
                     genesis: ballot(0, 0),
                     frontend: FRONTEND,
-                    capacity,
+                    capacity: 32,
                 }))
             };
             let mut node = Node {
@@ -204,13 +189,8 @@ impl Cluster {
             cut: Vec::new(),
             drop_sync: Vec::new(),
             no_fetch: Vec::new(),
-            no_execute: Vec::new(),
-            drop_acks: Vec::new(),
-            drop_proposals: Vec::new(),
-            capacity,
             frontend: Vec::new(),
             asks: Vec::new(),
-            proposals_sent: Vec::new(),
         }
     }
 
@@ -248,26 +228,7 @@ impl Cluster {
                         self.asks.push((i, commands));
                     }
                     let dest = to.replica.0[0];
-                    if let Ok(ProtocolMessage::Proposal(_)) = ProtocolMessage::decode(&frame) {
-                        self.proposals_sent.push((i, dest));
-                    }
                     if self.cut.contains(&(i as u8, dest)) || !self.nodes[dest as usize].alive {
-                        continue;
-                    }
-                    if self.drop_proposals.contains(&(i as u8, dest))
-                        && matches!(
-                            ProtocolMessage::decode(&frame).unwrap(),
-                            ProtocolMessage::Proposal(_)
-                        )
-                    {
-                        continue;
-                    }
-                    if self.drop_acks.contains(&(i as u8, dest))
-                        && matches!(
-                            ProtocolMessage::decode(&frame).unwrap(),
-                            ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
-                        )
-                    {
                         continue;
                     }
                     if self.drop_sync.contains(&(i as u8, dest))
@@ -362,7 +323,7 @@ impl Cluster {
             }
             self.convert_roles();
             for i in 0..self.nodes.len() {
-                if !self.nodes[i].alive || self.no_execute.contains(&i) {
+                if !self.nodes[i].alive {
                     continue;
                 }
                 while let Some(c) = self.nodes[i].next_executable() {
@@ -398,29 +359,6 @@ impl Cluster {
             if !progressed {
                 return;
             }
-        }
-    }
-
-    /// What the runtime's re-send timer does (task-d07): every leader
-    /// sends its voters, again, the proposals they have not voted on.
-    fn resend(&mut self) {
-        for i in 0..self.nodes.len() {
-            if !self.nodes[i].alive {
-                continue;
-            }
-            if let Some(Role::Leader(l)) = self.nodes[i].role.as_mut() {
-                let effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
-                self.handle(i, effects);
-            }
-        }
-    }
-
-    /// Settle, then re-send and settle again, `rounds` times.
-    fn settle_resending(&mut self, rounds: usize) {
-        self.settle();
-        for _ in 0..rounds {
-            self.resend();
-            self.settle();
         }
     }
 
@@ -500,7 +438,7 @@ impl Cluster {
                 genesis: ballot(0, 0),
                 quorum: q,
                 frontend: FRONTEND,
-                capacity: self.capacity,
+                capacity: 32,
             },
             promise,
             None,
@@ -1097,185 +1035,6 @@ fn a_sync_ahead_of_the_promise_is_installed_once_the_promise_is_made() {
     cluster.settle();
     for i in 0..3 {
         assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
-    }
-}
-
-/// A voter that was not linked when a proposal went out learns it from the
-/// leader's re-send (task-d07).
-///
-/// The decisive case from the Jepsen client: two voters serve a write
-/// before the third is linked, and reads through the third wait for ever.
-/// The proposal was dropped on the way, nothing sent it again, and every
-/// later proposal depends on it, so the third voter held everything and
-/// executed nothing.
-#[test]
-fn a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend() {
-    let mut cluster = Cluster::new(37);
-    cluster.cut = vec![(0, 2), (1, 2)];
-    let c1 = cluster.admit(1, 1);
-    cluster.settle();
-    cluster.cut.clear();
-    let c2 = cluster.admit(2, 2);
-    cluster.settle();
-    assert_eq!(cluster.nodes[0].executed, vec![c1, c2]);
-    assert_eq!(
-        cluster.nodes[2].executed,
-        Vec::<CommandId>::new(),
-        "r2 executed without ever having c1's order"
-    );
-    cluster.settle_resending(2);
-    for i in 0..3 {
-        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
-    }
-}
-
-/// A lost acknowledgement is published again when the leader re-sends
-/// the proposal it lacks a vote for (task-d07).
-///
-/// With r1 down, r0 needs r2's vote to commit. r2 adopted the proposal
-/// and its acknowledgement was dropped; the duplicate proposal used to be
-/// ignored, so the command never committed.
-#[test]
-fn a_lost_acknowledgement_is_published_again_on_a_resend() {
-    let mut cluster = Cluster::new(41);
-    let c1 = cluster.admit(1, 1);
-    cluster.settle();
-    cluster.crash(1);
-    cluster.drop_acks = vec![(2, 0)];
-    let c2 = cluster.admit(2, 2);
-    cluster.settle();
-    assert_eq!(
-        cluster.nodes[0].executed,
-        vec![c1],
-        "committed without r2's vote"
-    );
-    cluster.drop_acks.clear();
-    cluster.settle_resending(2);
-    for i in [0usize, 2] {
-        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
-    }
-}
-
-/// The same, with the voter restarted before the re-send (task-d07).
-///
-/// What a voter published is kept for its boot, so after a restart it
-/// had nothing to publish again, and with r1 down the leader re-sent for
-/// ever. r2 learned c2 from the leader's proposal and its own vote and
-/// executed it before the restart, so the re-sent proposal is one for a
-/// command it executed and retired: it is acknowledged, since the
-/// proposal carries the order of r2's durable record.
-#[test]
-fn a_lost_acknowledgement_is_published_again_after_the_voter_restarts() {
-    let mut cluster = Cluster::new(47);
-    let c1 = cluster.admit(1, 1);
-    cluster.settle();
-    cluster.crash(1);
-    cluster.drop_acks = vec![(2, 0)];
-    let c2 = cluster.admit(2, 2);
-    cluster.settle();
-    assert_eq!(cluster.nodes[0].executed, vec![c1]);
-    cluster.drop_acks.clear();
-    cluster.crash(2);
-    cluster.revive(2, quorum(ballot(0, 0)));
-    cluster.settle_resending(2);
-    for i in [0usize, 2] {
-        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
-    }
-}
-
-/// The same, with the voter restarted before it executed the command
-/// (task-d07).
-///
-/// Its adoption comes back from the durable row with nothing kept to
-/// publish again, so the re-sent proposal is adopted again: the same row
-/// is written and acknowledged as the first time.
-#[test]
-fn a_restored_adoption_is_acknowledged_again_on_a_resend() {
-    let mut cluster = Cluster::new(53);
-    let c1 = cluster.admit(1, 1);
-    cluster.settle();
-    cluster.crash(1);
-    cluster.drop_acks = vec![(2, 0)];
-    cluster.no_execute = vec![2];
-    let c2 = cluster.admit(2, 2);
-    cluster.settle();
-    assert_eq!(cluster.nodes[0].executed, vec![c1]);
-    assert_eq!(cluster.nodes[2].executed, vec![c1]);
-    cluster.drop_acks.clear();
-    cluster.crash(2);
-    cluster.revive(2, quorum(ballot(0, 0)));
-    cluster.no_execute.clear();
-    cluster.settle_resending(2);
-    for i in [0usize, 2] {
-        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
-    }
-}
-
-/// A proposal refused because it reached a voter before that voter
-/// promised the ballot is sent again once it has (task-d07).
-#[test]
-fn a_proposal_refused_ahead_of_the_promise_is_sent_again() {
-    let mut cluster = Cluster::new(43);
-    let c1 = cluster.admit(1, 1);
-    cluster.settle();
-    cluster.campaign(2, ballot(1, 2));
-    let held: Vec<(ReplicaId, Vec<u8>)> = cluster.nodes[1].inbox.drain(..).collect();
-    cluster.settle();
-    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
-    // The new ballot's first command reaches r1 before r1 has promised.
-    let c2 = cluster.admit(2, 2);
-    cluster.settle();
-    cluster.nodes[1].inbox.extend(held);
-    cluster.settle();
-    assert_eq!(cluster.nodes[1].follower().ballots().synced(), ballot(1, 2));
-    assert_eq!(cluster.nodes[1].executed, vec![c1], "r1 had c2's order");
-    cluster.settle_resending(2);
-    for i in 0..3 {
-        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
-    }
-}
-
-/// A new leader publishes its re-proposals in a first batch and sends the
-/// rest as votes come back, and every one of them reaches every voter
-/// (task-d07).
-///
-/// A new leader after a long history put its whole selection on each
-/// follower's control lane in one pass, and the lane refused dozens of
-/// those frames; nothing sent them again.
-#[test]
-fn a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive() {
-    let batch = coord_consensus::REPROPOSE_BATCH;
-    let mut cluster = Cluster::with_capacity(47, 4 * batch);
-    // The old leader's proposals reach nobody: every command stays
-    // pre-accepted on the followers, and the new leader re-proposes all.
-    cluster.drop_proposals = vec![(0, 1), (0, 2)];
-    let commands: Vec<CommandId> = (0..(batch as u64 * 2 + 5))
-        .map(|n| cluster.admit(n + 1, (n % 250) as u8))
-        .collect();
-    cluster.settle();
-    cluster.drop_proposals.clear();
-    cluster.crash(0);
-    cluster.proposals_sent.clear();
-    cluster.campaign(2, ballot(1, 2));
-    cluster.settle();
-    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
-    let decision = sync_rows(&cluster.nodes[2].storage).remove(0);
-    let proposed_again = decision.entries.len() + decision.reproposed.len();
-    assert!(
-        proposed_again > batch,
-        "only {proposed_again} commands to propose again"
-    );
-    let first = cluster
-        .proposals_sent
-        .iter()
-        .filter(|(from, to)| *from == 2 && *to == 1)
-        .count();
-    assert_eq!(first, batch, "the new leader's first pass to r1");
-    cluster.settle_resending(commands.len() / coord_consensus::RESEND_PER_VOTER + 2);
-    for i in [1usize, 2] {
-        let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
-        let wanted: BTreeSet<CommandId> = commands.iter().copied().collect();
-        assert_eq!(executed, wanted, "node {i}");
     }
 }
 

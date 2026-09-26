@@ -294,14 +294,6 @@ impl VoteSet {
         })
     }
 
-    /// Whether `replica` has voted on this command: the leader by its
-    /// proposal, any other voter by a fast or slow acknowledgement.
-    pub fn has_voted(&self, replica: &ReplicaId) -> bool {
-        self.leader.as_ref().is_some_and(|l| l.replica == *replica)
-            || self.fast.contains_key(replica)
-            || self.slow.contains(replica)
-    }
-
     /// The learning predicate over the counted votes. Fast learning is
     /// preferred when both hold; both need the leader proposal.
     pub fn learned(&self) -> Option<Learned> {
