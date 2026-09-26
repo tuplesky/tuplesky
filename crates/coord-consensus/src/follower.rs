@@ -1730,13 +1730,29 @@ impl Follower {
             return Vec::new();
         }
         let command = proposal.command;
-        if self.adopted.contains_key(&command) || self.held.contains_key(&command) {
+        if self.held.contains_key(&command) {
+            // Duplicate proposal of one still held: nothing acknowledged yet.
+            return Vec::new();
+        }
+        if self.adopted.contains_key(&command) {
             // Duplicate proposal: converges without change -- except that
             // the leader sends a proposal again only when it has no vote
             // from this replica for it (task-d07). An acknowledgement that
             // was lost on the way is published to the leader again, as it
             // was published the first time.
-            return self.reacknowledge(command, from);
+            if self.kept_evidence(&command) {
+                return self.reacknowledge(command, from);
+            }
+            // Nothing kept to publish again: adopted before a restart --
+            // the evidence store is this boot's, so the acknowledgement,
+            // if it was ever sent, went with it -- or kept past the
+            // store's bound. The proposal is then taken as the first one
+            // was: adopted again, which writes the same row and publishes
+            // the acknowledgement once it is durable. Without that the
+            // leader re-sent it for ever and, with a voter down, never
+            // learned it. A command executed and retired here goes the
+            // way it always did, below.
+            self.adopted.remove(&command);
         }
         if self.table.record(&command).is_none()
             && self.table.phase_of(&command) == Some(Phase::Executed)
@@ -1744,7 +1760,7 @@ impl Follower {
             // Executed here and retired: there is no record to adopt the
             // order into and nothing left to decide. Held, it would wait
             // for ever for an adoption that cannot happen (task-d05).
-            return Vec::new();
+            return self.acknowledge_executed(&proposal, from);
         }
         // A proposal asserts something about a command. Where this
         // replica already holds that command's payload and accepted it
@@ -1799,6 +1815,62 @@ impl Follower {
         }
         self.held.insert(command, HeldProposal { proposal });
         self.advance_pending()
+    }
+
+    /// Answer a proposal for a command this replica executed and retired
+    /// with an adoption acknowledgement, to `leader` alone (task-d07).
+    ///
+    /// The leader sends a proposal again only while it lacks this
+    /// replica's vote, and a replica that executed the command may be the
+    /// vote it lacks: it learned the command from the leader's proposal
+    /// and its own acknowledgement, which then went missing, and a
+    /// restart took the evidence it could have published again. Executed
+    /// here, the command is decided, under the dependencies of its durable
+    /// record. The acknowledgement goes only when the proposal carries
+    /// those dependencies and the admission the record holds, so it
+    /// claims nothing this replica did not adopt; a command it keeps no
+    /// record of any more is left alone.
+    fn acknowledge_executed(&mut self, proposal: &FastAck, leader: ReplicaId) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let Some(record) = self.ledger.record(&proposal.command) else {
+            return Vec::new();
+        };
+        if !crate::vote::same_set(&record.deps, &proposal.deps)
+            || record.payload != Some(proposal.admission)
+        {
+            return Vec::new();
+        }
+        let ballot = self.config.quorum.ballot();
+        let ack = SlowAck {
+            replica: self.config.identity.replica,
+            ballot,
+            command: proposal.command,
+            admission: proposal.admission,
+        };
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let requires: Vec<BarrierId> = self.pending.keys().copied().collect();
+        let Some(outbox) = self.outbox.as_mut() else {
+            return Vec::new();
+        };
+        outbox.publish(PendingSend {
+            context,
+            requires,
+            to: PeerId {
+                replica: leader,
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            frame: ProtocolMessage::SlowAck(ack).encode(),
+        });
+        self.release()
+    }
+
+    /// Whether this boot kept what this replica acknowledged for `command`
+    /// in the current ballot.
+    fn kept_evidence(&self, command: &CommandId) -> bool {
+        let ballot = self.config.quorum.ballot();
+        self.replay.kept(command).iter().any(|e| e.ballot == ballot)
     }
 
     /// Publish to `leader` again what this replica acknowledged for
