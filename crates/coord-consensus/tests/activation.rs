@@ -129,6 +129,8 @@ struct Cluster {
     drop_sync: Vec<(u8, u8)>,
     /// Nodes that do not fetch the payloads they lack.
     no_fetch: Vec<usize>,
+    /// Nodes that execute nothing while listed.
+    no_execute: Vec<usize>,
     /// (from, to) pairs whose acknowledgements are dropped.
     drop_acks: Vec<(u8, u8)>,
     /// (from, to) pairs whose proposals are dropped.
@@ -202,6 +204,7 @@ impl Cluster {
             cut: Vec::new(),
             drop_sync: Vec::new(),
             no_fetch: Vec::new(),
+            no_execute: Vec::new(),
             drop_acks: Vec::new(),
             drop_proposals: Vec::new(),
             capacity,
@@ -359,7 +362,7 @@ impl Cluster {
             }
             self.convert_roles();
             for i in 0..self.nodes.len() {
-                if !self.nodes[i].alive {
+                if !self.nodes[i].alive || self.no_execute.contains(&i) {
                     continue;
                 }
                 while let Some(c) = self.nodes[i].next_executable() {
@@ -1147,6 +1150,61 @@ fn a_lost_acknowledgement_is_published_again_on_a_resend() {
         "committed without r2's vote"
     );
     cluster.drop_acks.clear();
+    cluster.settle_resending(2);
+    for i in [0usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
+    }
+}
+
+/// The same, with the voter restarted before the re-send (task-d07).
+///
+/// What a voter published is kept for its boot, so after a restart it
+/// had nothing to publish again, and with r1 down the leader re-sent for
+/// ever. r2 learned c2 from the leader's proposal and its own vote and
+/// executed it before the restart, so the re-sent proposal is one for a
+/// command it executed and retired: it is acknowledged, since the
+/// proposal carries the order of r2's durable record.
+#[test]
+fn a_lost_acknowledgement_is_published_again_after_the_voter_restarts() {
+    let mut cluster = Cluster::new(47);
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.crash(1);
+    cluster.drop_acks = vec![(2, 0)];
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, vec![c1]);
+    cluster.drop_acks.clear();
+    cluster.crash(2);
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.settle_resending(2);
+    for i in [0usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
+    }
+}
+
+/// The same, with the voter restarted before it executed the command
+/// (task-d07).
+///
+/// Its adoption comes back from the durable row with nothing kept to
+/// publish again, so the re-sent proposal is adopted again: the same row
+/// is written and acknowledged as the first time.
+#[test]
+fn a_restored_adoption_is_acknowledged_again_on_a_resend() {
+    let mut cluster = Cluster::new(53);
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.crash(1);
+    cluster.drop_acks = vec![(2, 0)];
+    cluster.no_execute = vec![2];
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, vec![c1]);
+    assert_eq!(cluster.nodes[2].executed, vec![c1]);
+    cluster.drop_acks.clear();
+    cluster.crash(2);
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.no_execute.clear();
     cluster.settle_resending(2);
     for i in [0usize, 2] {
         assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");

@@ -4179,6 +4179,15 @@ Three triggers were known:
   frames, under the context and barriers they were first published
   with. A lost acknowledgement used to be as final as a lost proposal:
   with one voter down, the command never committed.
+- **Across a restart too.** What a follower published is kept for its
+  boot, so a restarted one had nothing to publish again. When nothing is
+  kept, a duplicate proposal of an adoption restored from the rows is
+  adopted again: the same row is written, and acknowledged once it is
+  durable. A proposal for a command the follower executed and retired is
+  answered with an adoption acknowledgement to the leader, but only when
+  it carries the dependencies and admission of the follower's durable
+  record. Executed, the command is decided under those; a command it
+  keeps no record of any more is left alone.
 - **A new leader publishes its re-proposals in batches.**
   `from_recovered` makes every re-proposal durable, but publishes only
   the first `REPROPOSE_BATCH` (32). The re-send delivers the rest,
@@ -4197,6 +4206,13 @@ Three triggers were known:
     down, r2's acknowledgement is dropped. The command commits only once
     the re-send draws the re-acknowledgement. Negative control: without
     the re-acknowledgement it never commits.
+  - `a_lost_acknowledgement_is_published_again_after_the_voter_restarts`:
+    the same, with r2 restarted after executing c2 and before the re-send.
+    Negative control: without the acknowledgement for an executed
+    command, c2 never commits on r0.
+  - `a_restored_adoption_is_acknowledged_again_on_a_resend`: the same,
+    with r2 restarted before it executed c2. Negative control: without
+    adopting again, c2 never commits on r0.
   - `a_proposal_refused_ahead_of_the_promise_is_sent_again`: the new
     ballot's first command reaches r1 before r1 promised. After its Sync,
     r1 lacks it until the re-send.
