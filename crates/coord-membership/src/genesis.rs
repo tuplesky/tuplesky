@@ -73,7 +73,12 @@ pub enum GenesisError {
         /// The manifest's version.
         version: u32,
     },
+    /// The admin key is not a PEM-encoded P-256 public key.
+    AdminKey,
 }
+
+/// The protocol version this build's genesis manifests carry.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -169,6 +174,64 @@ pub fn sign_genesis(
     encode(&header, &claims, key)
         .map(SignedGenesis)
         .map_err(|_| GenesisError::Signature)
+}
+
+/// Sign a manifest with the admin key given as PEM (PKCS#8 `PRIVATE
+/// KEY`, P-256): what provisioning tools hold.
+pub fn sign_genesis_pem(
+    manifest: &GenesisManifest,
+    private_pem: &[u8],
+) -> Result<SignedGenesis, GenesisError> {
+    use rustls_pki_types::PrivatePkcs8KeyDer;
+    use rustls_pki_types::pem::PemObject;
+    let der =
+        PrivatePkcs8KeyDer::from_pem_slice(private_pem).map_err(|_| GenesisError::AdminKey)?;
+    sign_genesis(manifest, &EncodingKey::from_ec_der(der.secret_pkcs8_der()))
+}
+
+/// The admin public key a manifest is verified against, from its PEM
+/// encoding (`PUBLIC KEY`, P-256).
+///
+/// Exactly one PEM section, and it is the key: a file that carries
+/// another section beside it, or bytes after the key's own encoding, is
+/// not taken to mean whichever part a parser happens to read first.
+pub fn admin_key_from_pem(pem: &[u8]) -> Result<DecodingKey, GenesisError> {
+    use rustls_pki_types::SubjectPublicKeyInfoDer;
+    use rustls_pki_types::pem::PemObject;
+    use x509_parser::prelude::FromDer;
+    // id-ecPublicKey over prime256v1: the only key ES256 verifies with.
+    const EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+    const P256: &str = "1.2.840.10045.3.1.7";
+    let text = core::str::from_utf8(pem).map_err(|_| GenesisError::AdminKey)?;
+    let sections: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("-----BEGIN "))
+        .collect();
+    if sections != ["PUBLIC KEY-----"] {
+        return Err(GenesisError::AdminKey);
+    }
+    let der = SubjectPublicKeyInfoDer::from_pem_slice(pem).map_err(|_| GenesisError::AdminKey)?;
+    let (rest, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(&der)
+        .map_err(|_| GenesisError::AdminKey)?;
+    if !rest.is_empty() {
+        return Err(GenesisError::AdminKey);
+    }
+    let curve = spki
+        .algorithm
+        .parameters
+        .as_ref()
+        .and_then(|p| p.as_oid().ok())
+        .map(|oid| oid.to_id_string());
+    let point = &spki.subject_public_key.data;
+    if spki.algorithm.algorithm.to_id_string() != EC_PUBLIC_KEY
+        || curve.as_deref() != Some(P256)
+        || point.len() != 65
+        || point[0] != 0x04
+    {
+        return Err(GenesisError::AdminKey);
+    }
+    DecodingKey::from_ec_components(&b64url(&point[1..33]), &b64url(&point[33..65]))
+        .map_err(|_| GenesisError::AdminKey)
 }
 
 /// Verify a delivered manifest against the pinned public key.

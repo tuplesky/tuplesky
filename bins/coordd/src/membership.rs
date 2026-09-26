@@ -18,6 +18,13 @@
 //! bundle did not issue, or whose key it does not hold, since reading an
 //! identity out of a leaf anybody could sign would be the same as being
 //! told it.
+//!
+//! The manifest is read only through its signature. The file holds the
+//! manifest as the admin signed it, and it is verified against the admin
+//! public key the configuration names before anything in it is used --
+//! at `init`, so that what is pinned was signed, and at every start, so
+//! that what is served was. A file that is valid JSON and signed by
+//! nobody is not a genesis.
 
 use coord_membership::genesis::GenesisManifest;
 use coord_membership::membership::Membership;
@@ -31,6 +38,18 @@ use x509_parser::prelude::FromDer;
 /// Why this node could not establish who it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IdentityError {
+    /// The admin public key could not be read, or is not a P-256 key.
+    AdminKey {
+        /// Where this node looked.
+        path: String,
+        /// Why.
+        reason: String,
+    },
+    /// The manifest is not signed by the admin key, or not signed at all.
+    Unsigned {
+        /// Where the manifest is.
+        path: String,
+    },
     /// The genesis manifest could not be read or parsed.
     Manifest {
         /// Where this node looked.
@@ -76,6 +95,14 @@ impl core::fmt::Display for IdentityError {
             IdentityError::Manifest { path, reason } => {
                 write!(f, "cannot read the genesis manifest at {path}: {reason}")
             }
+            IdentityError::AdminKey { path, reason } => {
+                write!(f, "cannot use the genesis admin key at {path}: {reason}")
+            }
+            IdentityError::Unsigned { path } => write!(
+                f,
+                "genesis quarantine: the manifest at {path} does not verify against \
+                 the genesis admin key, so nothing in it is used and nothing is pinned"
+            ),
             IdentityError::Membership { reason } => {
                 write!(
                     f,
@@ -112,6 +139,45 @@ impl core::fmt::Display for IdentityError {
 
 impl core::error::Error for IdentityError {}
 
+/// The genesis manifest at `manifest_path`, verified against the admin
+/// public key at `admin_key_path` -- and only if it verifies.
+pub fn read_manifest(
+    manifest_path: &str,
+    admin_key_path: &str,
+) -> Result<GenesisManifest, IdentityError> {
+    let pem = std::fs::read(admin_key_path).map_err(|e| IdentityError::AdminKey {
+        path: admin_key_path.to_owned(),
+        reason: e.to_string(),
+    })?;
+    let admin = coord_membership::genesis::admin_key_from_pem(&pem).map_err(|_| {
+        IdentityError::AdminKey {
+            path: admin_key_path.to_owned(),
+            reason: "not a PEM-encoded P-256 public key".into(),
+        }
+    })?;
+    let text = std::fs::read_to_string(manifest_path).map_err(|e| IdentityError::Manifest {
+        path: manifest_path.to_owned(),
+        reason: e.to_string(),
+    })?;
+    let signed = coord_membership::genesis::SignedGenesis(text.trim().to_owned());
+    coord_membership::genesis::verify_genesis(
+        &signed,
+        &admin,
+        coord_membership::genesis::PROTOCOL_VERSION,
+    )
+    .map_err(|e| match e {
+        coord_membership::genesis::GenesisError::Signature
+        | coord_membership::genesis::GenesisError::Algorithm
+        | coord_membership::genesis::GenesisError::Malformed => IdentityError::Unsigned {
+            path: manifest_path.to_owned(),
+        },
+        other => IdentityError::Manifest {
+            path: manifest_path.to_owned(),
+            reason: format!("{other:?}"),
+        },
+    })
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -139,18 +205,11 @@ pub struct Placed {
 /// need only be of this cluster.
 pub fn place(
     manifest_path: &str,
+    admin_key_path: &str,
     certificate_path: &str,
     votes: bool,
 ) -> Result<Placed, IdentityError> {
-    let text = std::fs::read(manifest_path).map_err(|e| IdentityError::Manifest {
-        path: manifest_path.to_owned(),
-        reason: e.to_string(),
-    })?;
-    let manifest: GenesisManifest =
-        serde_json::from_slice(&text).map_err(|e| IdentityError::Manifest {
-            path: manifest_path.to_owned(),
-            reason: e.to_string(),
-        })?;
+    let manifest = read_manifest(manifest_path, admin_key_path)?;
     let membership =
         Membership::from_genesis(&manifest).map_err(|e| IdentityError::Membership {
             reason: format!("{e:?}"),
@@ -224,19 +283,12 @@ pub struct Inspected {
 /// report that is useful *because* the node cannot serve yet.
 pub fn inspect(
     manifest_path: &str,
+    admin_key_path: &str,
     certificate_path: &str,
     now: u64,
     policy: &coord_node_issuer::RenewalPolicy,
 ) -> Result<Inspected, IdentityError> {
-    let text = std::fs::read(manifest_path).map_err(|e| IdentityError::Manifest {
-        path: manifest_path.to_owned(),
-        reason: e.to_string(),
-    })?;
-    let manifest: GenesisManifest =
-        serde_json::from_slice(&text).map_err(|e| IdentityError::Manifest {
-            path: manifest_path.to_owned(),
-            reason: e.to_string(),
-        })?;
+    let manifest = read_manifest(manifest_path, admin_key_path)?;
     let membership =
         Membership::from_genesis(&manifest).map_err(|e| IdentityError::Membership {
             reason: format!("{e:?}"),

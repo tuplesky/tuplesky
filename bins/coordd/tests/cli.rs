@@ -92,6 +92,71 @@ fn genesis(dir: &Path, voter_one_key: Option<&[u8]>) {
     genesis_of(dir, 3, voter_one_key);
 }
 
+/// This directory's genesis admin: its private key, created on first use
+/// and kept beside the manifest so a test can sign again with it, and its
+/// public key where the configuration names it.
+fn admin_key(dir: &Path) -> Vec<u8> {
+    let private = dir.join("genesis-admin.key");
+    if let Ok(held) = std::fs::read(&private) {
+        return held;
+    }
+    use rcgen::PublicKeyData;
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("admin key");
+    let secret = pem("PRIVATE KEY", &key.serialize_der());
+    std::fs::write(&private, &secret).expect("admin private key");
+    std::fs::write(
+        dir.join("genesis-admin.pem"),
+        pem("PUBLIC KEY", &key.subject_public_key_info()),
+    )
+    .expect("admin key");
+    secret.into_bytes()
+}
+
+/// Write `manifest` as the admin signed it, which is the only form a
+/// node reads.
+fn write_genesis(dir: &Path, manifest: &serde_json::Value) {
+    let manifest: coord_membership::GenesisManifest =
+        serde_json::from_value(manifest.clone()).expect("a manifest");
+    let signed = coord_membership::sign_genesis_pem(&manifest, &admin_key(dir)).expect("signed");
+    std::fs::write(dir.join("genesis.json"), signed.0).expect("write manifest");
+}
+
+/// This directory's manifest, read the way a node reads it: through the
+/// admin's signature.
+fn read_genesis(dir: &Path) -> coord_membership::GenesisManifest {
+    let admin = coord_membership::admin_key_from_pem(
+        &std::fs::read(dir.join("genesis-admin.pem")).expect("admin key"),
+    )
+    .expect("key");
+    coord_membership::verify_genesis(
+        &coord_membership::SignedGenesis(
+            std::fs::read_to_string(dir.join("genesis.json")).expect("read"),
+        ),
+        &admin,
+        coord_membership::PROTOCOL_VERSION,
+    )
+    .expect("the fixture is signed")
+}
+
+/// Re-sign this directory's manifest after `edit`: the same admin, a
+/// different manifest.
+fn resign(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let signed = std::fs::read_to_string(dir.join("genesis.json")).expect("read");
+    let admin = coord_membership::admin_key_from_pem(
+        &std::fs::read(dir.join("genesis-admin.pem")).expect("admin key"),
+    )
+    .expect("key");
+    let manifest = coord_membership::verify_genesis(
+        &coord_membership::SignedGenesis(signed),
+        &admin,
+        coord_membership::PROTOCOL_VERSION,
+    )
+    .expect("the fixture is signed");
+    let mut value = serde_json::to_value(&manifest).expect("json");
+    edit(&mut value);
+    write_genesis(dir, &value);
+}
+
 /// The same manifest with `count` committed voters.
 ///
 /// One voter is a real configuration, not a shortcut: its quorum is
@@ -122,11 +187,7 @@ fn genesis_of(dir: &Path, count: u8, voter_one_key: Option<&[u8]>) {
         "admin": hex(&[0xa; 16]),
         "protocol_version": 1,
     });
-    std::fs::write(
-        dir.join("genesis.json"),
-        serde_json::to_vec_pretty(&manifest).expect("manifest"),
-    )
-    .expect("write manifest");
+    write_genesis(dir, &manifest);
 }
 
 /// The domain's certificate authority: one root, everything else issued
@@ -427,6 +488,7 @@ fn config_only(dir: &Path) -> PathBuf {
         r#"config_version = 2
 role = "voter-frontend-observer"
 cluster_manifest = "{root}/genesis.json"
+genesis_admin_key = "{root}/genesis-admin.pem"
 cluster_endpoints = "{root}/endpoints.bin"
 domain = "control-plane-test"
 state_directory = "{root}"
@@ -2299,11 +2361,7 @@ fn three_voters(dir: &Path) -> Cluster {
         "admin": hex(&[0xa; 16]),
         "protocol_version": 1,
     });
-    std::fs::write(
-        dir.join("genesis.json"),
-        serde_json::to_vec_pretty(&manifest).expect("manifest"),
-    )
-    .expect("write manifest");
+    write_genesis(dir, &manifest);
 
     // One catalog, attested by voter 1, naming every voter's peer
     // listener. The same file for all three: an address book is not
@@ -2339,6 +2397,7 @@ fn three_voters(dir: &Path) -> Cluster {
                 r#"config_version = 2
 role = "voter-frontend-observer"
 cluster_manifest = "{root}/genesis.json"
+genesis_admin_key = "{root}/genesis-admin.pem"
 cluster_endpoints = "{root}/endpoints.bin"
 domain = "control-plane-test"
 state_directory = "{node}"
@@ -2625,14 +2684,13 @@ fn a_node_serves_only_under_the_genesis_it_was_initialized_with() {
         );
     }
 
-    // The same cluster and domain, and this node still a voter under the
-    // key it holds; the third voter swapped for a stranger.
+    // The same cluster and domain, and this node still a voter; the third
+    // voter swapped for a stranger -- signed by the same admin, so what
+    // refuses it is the pin and not the signature.
     let manifest = std::fs::read_to_string(dir.join("genesis.json")).expect("read");
-    std::fs::write(
-        dir.join("genesis.json"),
-        manifest.replace(&hex(&[3; 16]), &hex(&[4; 16])),
-    )
-    .expect("swap a voter");
+    resign(&dir, |m| {
+        m["voters"][2]["node"] = serde_json::json!(hex(&[4; 16]))
+    });
     let refused =
         comes_up(&path).expect_err("a node started under a genesis it was not initialized with");
     assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
@@ -2656,6 +2714,74 @@ fn a_node_serves_only_under_the_genesis_it_was_initialized_with() {
             refused.out, refused.err
         );
     }
+}
+
+/// A manifest is read only through the admin's signature: at `init`,
+/// where an unsigned one pins nothing, and at every start, where a
+/// signed manifest replaced by the same content unsigned is refused.
+///
+/// Without the check the pin was a pin of whatever file `init` was
+/// handed -- task-42's "signed genesis" held for the pin and not for the
+/// signature.
+#[test]
+fn a_manifest_the_admin_did_not_sign_is_refused_at_init_and_at_start() {
+    let dir = workspace("unsigned");
+    let path = config(&dir);
+    let signed = std::fs::read_to_string(dir.join("genesis.json")).expect("read");
+
+    // The same manifest, as plain JSON.
+    let manifest = coord_membership::verify_genesis(
+        &coord_membership::SignedGenesis(signed.clone()),
+        &coord_membership::admin_key_from_pem(
+            &std::fs::read(dir.join("genesis-admin.pem")).expect("admin key"),
+        )
+        .expect("key"),
+        coord_membership::PROTOCOL_VERSION,
+    )
+    .expect("the fixture is signed");
+    let plain = serde_json::to_vec_pretty(&manifest).expect("json");
+    std::fs::write(dir.join("genesis.json"), &plain).expect("unsign");
+    let init = run(&path, &["init"]);
+    assert_eq!(init.code, Some(2), "{}{}", init.out, init.err);
+    assert!(init.err.contains("does not verify"), "{}", init.err);
+    for store in ["state", "journal"] {
+        assert!(
+            !dir.join(store).exists()
+                || std::fs::read_dir(dir.join(store))
+                    .expect("dir")
+                    .next()
+                    .is_none(),
+            "an unsigned manifest left a {store} behind"
+        );
+    }
+
+    // Signed by somebody else: refused the same way.
+    let stranger = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key");
+    let forged = coord_membership::sign_genesis_pem(
+        &manifest,
+        pem("PRIVATE KEY", &stranger.serialize_der()).as_bytes(),
+    )
+    .expect("signed");
+    std::fs::write(dir.join("genesis.json"), &forged.0).expect("forge");
+    let init = run(&path, &["init"]);
+    assert_eq!(init.code, Some(2), "{}{}", init.out, init.err);
+    assert!(init.err.contains("does not verify"), "{}", init.err);
+
+    // Signed, it initializes and starts; unsigned again, the next start is
+    // refused although the content is the manifest it pinned.
+    std::fs::write(dir.join("genesis.json"), &signed).expect("sign");
+    let init = run(&path, &["init"]);
+    assert_eq!(init.code, Some(0), "{}{}", init.out, init.err);
+    if let Err(refused) = comes_up(&path) {
+        panic!(
+            "the node refused its signed genesis: {}{}",
+            refused.out, refused.err
+        );
+    }
+    std::fs::write(dir.join("genesis.json"), &plain).expect("unsign");
+    let refused = comes_up(&path).expect_err("a node started under an unsigned manifest");
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(refused.err.contains("does not verify"), "{}", refused.err);
 }
 
 /// An initialization that stopped after it created the store and before
@@ -2904,10 +3030,7 @@ impl SdkCaller {
         // the same manifest the daemon read: what it is dialing is a
         // voter of this domain because the configuration says the
         // certificate it presented is, or it is nobody.
-        let manifest: coord_membership::genesis::GenesisManifest = serde_json::from_slice(
-            &std::fs::read(dir.join("genesis.json")).expect("the manifest is readable"),
-        )
-        .expect("a manifest");
+        let manifest: coord_membership::genesis::GenesisManifest = read_genesis(dir);
         let membership =
             coord_membership::membership::Membership::from_genesis(&manifest).expect("membership");
         let identity = coord_transport::LocalIdentity {
@@ -3463,11 +3586,7 @@ fn genesis_of_incarnation(dir: &Path, voter_one_key: &[u8], incarnation: u64) {
         "admin": hex(&[0xa; 16]),
         "protocol_version": 1,
     });
-    std::fs::write(
-        dir.join("genesis.json"),
-        serde_json::to_vec_pretty(&manifest).expect("manifest"),
-    )
-    .expect("write manifest");
+    write_genesis(dir, &manifest);
 }
 
 /// A replacement whose first start fails after it has begun finishes on
@@ -4100,11 +4219,7 @@ fn genesis_of_cluster(dir: &Path, cluster: [u8; 16], voter_one_key: &[u8]) {
         "admin": hex(&[0xa; 16]),
         "protocol_version": 1,
     });
-    std::fs::write(
-        dir.join("genesis.json"),
-        serde_json::to_vec_pretty(&manifest).expect("manifest"),
-    )
-    .expect("write manifest");
+    write_genesis(dir, &manifest);
 }
 
 /// An operator's fencing attestation, as the runbook has them write it.

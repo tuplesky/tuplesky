@@ -437,7 +437,8 @@ pub struct Config {
     pub config_version: u32,
     /// Role specification (e.g. `voter-frontend-observer`).
     pub role: String,
-    /// Genesis manifest path.
+    /// Genesis manifest path: the manifest as the admin signed it (an
+    /// ES256 token), never as plain JSON.
     pub cluster_manifest: String,
     /// A signed endpoint catalog naming where this epoch's voters are.
     ///
@@ -452,6 +453,10 @@ pub struct Config {
     /// discover it has nobody to talk to.
     #[serde(default)]
     pub cluster_endpoints: Option<String>,
+
+    /// The admin public key (PEM, P-256) the manifest is verified against
+    /// at `init` and at every start.
+    pub genesis_admin_key: String,
     /// Domain name.
     pub domain: String,
     /// State directory.
@@ -742,6 +747,7 @@ impl Config {
             ("state.root", &self.state.root),
             ("journal.root", &self.journal.root),
             ("cluster_manifest", &self.cluster_manifest),
+            ("genesis_admin_key", &self.genesis_admin_key),
             ("identity.trust_bundle", &self.identity.trust_bundle),
             ("identity.node_certificate", &self.identity.node_certificate),
             ("identity.node_key", &self.identity.node_key),
@@ -805,6 +811,7 @@ mod tests {
             r#"config_version = {CONFIG_VERSION}
 role = "voter-frontend-observer"
 cluster_manifest = "/etc/coord/genesis.json"
+genesis_admin_key = "/etc/coord/genesis-admin.pem"
 domain = "control-plane-a"
 state_directory = "/var/lib/coord/a"
 
