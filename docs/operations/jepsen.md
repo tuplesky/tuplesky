@@ -173,6 +173,25 @@ and its behaviour under faults have something to be compared with:
 
 Its store is the `jepsen-store-etcd-append` artifact.
 
+The first paired run, on `65336cf`
+([run 36273802438](https://github.com/tuplesky/tuplesky/actions/runs/36273802438)),
+was `:valid? true` for both, with etcd 3.7.2. Each test draws its own
+random fault schedule, so the two are not fault-for-fault comparable, and
+etcd's append workload has no final reads:
+
+| | etcd 3.7.2 | TupleSky (`65336cf`) |
+| --- | --- | --- |
+| Operations completed | 1215: 540 `ok`, 136 `fail`, 539 `info` | 654: 344 `ok`, 310 `fail` |
+| While healthy | about 15 `ok` a second (240 s to 260 s) | about 17 `ok` a second (first 20 s) |
+| The fault that stopped it | every node killed at about 5 s, started again at about 220 s | a majority paused from about 20 s to about 180 s, partitions until 240 s |
+| After the fault | served again within 20 s of the restart, through every node | served nothing for the rest of the run, final reads included; `n5` never served |
+| Refused as a request error | 135 transactions that name a key twice (`duplicate key given in txn request`) | none |
+
+The comparison that holds across schedules is the last fault's aftermath:
+etcd was serving again within seconds of its nodes coming back, and the
+TupleSky domain was not, minutes after its majority returned and after
+healing.
+
 ## Without Jepsen: `scripts/e2e/shim-stress.py`
 
 A smaller driver runs the shim against a local three-voter domain. It
