@@ -192,11 +192,11 @@ Where they stand on the stack at `afc0df6`:
 | Finding | Status |
 | --- | --- |
 | A follower that acknowledges writes the domain does not keep | Fix in review: #99, carried here until the stack has it. Intermittent: 2 of 4 Jepsen runs without the fix (on `afc0df6` and `1f277c9`) and 1 of 4 local pause runs on `afc0df6`; none in the three runs with it so far ([run 36209260989](https://github.com/tuplesky/tuplesky/actions/runs/36209260989), 339 transactions; [run 36211748702](https://github.com/tuplesky/tuplesky/actions/runs/36211748702), 1177 transactions, 873 ok; [run 36212421247](https://github.com/tuplesky/tuplesky/actions/runs/36212421247), 1955 transactions, 1545 ok). Seen in ballot 0, with no recovery. |
-| A restarted follower whose table stays full | Open: task-d05. Recovery carries the whole history (below). |
+| A restarted follower whose table stays full | task-d05: in review in #100, carried here. Recovery carries the whole history (below). |
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
-| A follower that started late never completes a read | Open: a plan task in #99. Reproduced on `afc0df6`. |
-| No sessions after healing, under Jepsen | Open: task-d05. Recovery carries the whole history (below). |
-| The domain stops serving at its first election | Open: task-d05, and a gap no task owns (re-proposals are never re-sent). It decides every Jepsen run's throughput (below). |
+| A follower that started late never completes a read | In review in #101 (the leader re-sends unvoted proposals). Reproduced on `afc0df6`. Not carried here: #101 stalls a read (below). |
+| No sessions after healing, under Jepsen | task-d05: in review in #100, carried here. Recovery carries the whole history (below). |
+| The domain stops serving at its first election | In review: #100 (the table capacity and bounded recovery) and #101 (re-sending lost proposals). With both, a first election is survived but a later one is not (below). It decides every Jepsen run's throughput. |
 
 The second and the last are the limit task-d01's notes now record as
 "recovery carries the whole history": dependency rows are never pruned,
@@ -299,9 +299,10 @@ release, instead of logging the mismatch. After an election, a new
 leader anchors the recovered tail as the key's latest command before it
 proposes anything new, so the chain stays total across ballots too.
 
-This change carries #99's code and tests, without its plan and notes
-edits, so the `jepsen` workflow runs against the fix. They drop out of
-it when the stack it is rebased on has them.
+This change carries #99's and #100's code and tests, without their plan
+and notes edits, so the `jepsen` workflow runs against them. They drop
+out of it when the stack it is rebased on has them. It carried #101's
+too, and stopped (see "With #100 and #101" below).
 
 ### A restarted follower whose command table stays full
 
@@ -491,6 +492,40 @@ repair a lost proposal closes the second: the leader re-sending what is
 unvoted, or the follower asking for the order of a command it holds at
 PRE-ACCEPT behind the Sync. That is the same gap as the late follower's
 missed proposal (above).
+
+#### With #100 and #101
+
+#100 makes the table capacity configuration (default 1024) and bounds
+recovery by what the voters executed. #101 has the leader re-send, every
+250 ms, the proposals a voter has not voted on. With both carried (`325c664`):
+
+* `shim-stress.py --fault majority` passes: the leader and one other
+  voter killed together, four times. Service resumed after every
+  election, the final read was served, and there was no anomaly (1556 of
+  2101 operations `ok`).
+* `shim-stress.py --fault leader` survives the first leader kill (voter
+  1 leads ballot 1). After the second, voter 1 restarts as a candidate
+  and stops itself on every restart with
+  `batch refused: Guard(DependencyUnknown { dep: 7146a150… })`, and so
+  does voter 3 when it campaigns next. Both had passed a checkpoint
+  (`baseline` 4096 and 4097) and recovered more records (1617 to 1685)
+  than the table holds. So a candidate's durable batch names a
+  dependency the store does not know. The final read is not served (exit
+  2), and there was no anomaly.
+* The `jepsen` workflow ([run 36231375038](https://github.com/tuplesky/tuplesky/actions/runs/36231375038))
+  was `:valid? true`, with about 1940 `ok`. For the first time the domain
+  served again after an election: it stopped at 40 s, when all five nodes
+  were killed, and from 100 s to 180 s `n2`, `n3` and `n4` served about
+  1250 `ok`. At 180 s (`n1`, `n4` and `n5` killed, `n3` isolated) it
+  stopped again, and served nothing for the remaining three minutes.
+
+But #101 also stalls a read. With it, the `jepsen_shim` test's first read
+through voter 2, right after that voter binds its session, stays
+`Pending` for the shim's whole budget, every time. Without #101's re-send
+the test passes, and so it does with the re-send kept but its frames
+dropped: the leader re-sends two proposals to voter 3 once in the run,
+and that alone stalls voter 2's read. So this change carries #99 and
+#100 only, until #101 has a fix.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
