@@ -604,7 +604,7 @@ impl Leader {
     }
 
     /// Send each voter, again, the proposals of this ballot it has not
-    /// voted on, oldest first and at most `per_voter` of them (task-d07).
+    /// adopted, oldest first and at most `per_voter` of them (task-d07).
     ///
     /// The protocol assumes a proposal reaches every voter, and the
     /// transport drops a frame by design when a lane is full or the peer
@@ -613,13 +613,18 @@ impl Leader {
     /// later proposal depends on it through the conservative key -- and
     /// executes nothing more until a Sync realigns it.
     ///
-    /// What a voter lacks is read from its votes: the dependency chain is
-    /// total, so a voter that voted on a proposal holds every earlier one,
-    /// and only proposals after the latest it voted on are sent. One it
-    /// never acknowledges -- a duplicate it already adopted, a command it
-    /// executed and retired -- stops being sent once it votes on a later
-    /// one. Only durable proposals go: a proposal still becoming durable
-    /// has its first send queued behind its batch already.
+    /// What a voter lacks is read from its adoption acknowledgements, the
+    /// only votes that say it received a proposal: a fast acknowledgement
+    /// goes out when the payload arrives, proposal or not, and a voter
+    /// that fast-acknowledged a command it never received the proposal of
+    /// used to be credited with it -- and with every proposal before it.
+    /// The dependency chain is total, so a voter that adopted a proposal
+    /// holds every earlier one, and only proposals after the latest it
+    /// adopted are sent. One it never acknowledges -- a command it
+    /// executed and retired and keeps no record of -- stops being sent
+    /// once it adopts a later one. Only durable proposals go: a proposal
+    /// still becoming durable has its first send queued behind its batch
+    /// already.
     ///
     /// Paced by the caller, which calls it on a timer rather than per
     /// event; bounded per voter per call, so a voter that is gone costs
@@ -646,7 +651,7 @@ impl Leader {
             if *voter == me {
                 continue;
             }
-            let voted = |c: &CommandId| self.votes.get(c).is_some_and(|v| v.has_voted(voter));
+            let voted = |c: &CommandId| self.votes.get(c).is_some_and(|v| v.adopted_by(voter));
             let through = order
                 .iter()
                 .filter(|(_, c)| voted(c))

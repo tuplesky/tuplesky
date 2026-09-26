@@ -1129,6 +1129,41 @@ fn a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend() {
     }
 }
 
+/// The same for a voter in the fast set, which acknowledges a command as
+/// soon as its payload arrives (task-d07).
+///
+/// That fast acknowledgement carries no sequence number and says nothing
+/// about the proposal. Counted as a vote, it credited r1 with c1's
+/// proposal, which never reached it, and with every proposal before its
+/// latest acknowledgement, so the proposal r1 lacked was the one never
+/// sent again. In the Jepsen shim test this stalled every read through
+/// that voter: the domain's first proposal went out before the followers
+/// were linked, the re-send reached only the voter outside the fast set,
+/// and once its adoption let the leader learn the command, nothing sent
+/// it again.
+#[test]
+fn a_fast_acknowledgement_does_not_stand_for_the_proposal() {
+    let mut cluster = Cluster::new(59);
+    // r1 receives c1's payload, and so acknowledges it fast, but not its
+    // proposal.
+    cluster.cut = vec![(0, 1), (2, 1)];
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut.clear();
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, vec![c1, c2]);
+    assert_eq!(
+        cluster.nodes[1].executed,
+        Vec::<CommandId>::new(),
+        "r1 executed without c1's order"
+    );
+    cluster.settle_resending(2);
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
+    }
+}
+
 /// A lost acknowledgement is published again when the leader re-sends
 /// the proposal it lacks a vote for (task-d07).
 ///

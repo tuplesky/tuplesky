@@ -294,12 +294,16 @@ impl VoteSet {
         })
     }
 
-    /// Whether `replica` has voted on this command: the leader by its
-    /// proposal, any other voter by a fast or slow acknowledgement.
-    pub fn has_voted(&self, replica: &ReplicaId) -> bool {
-        self.leader.as_ref().is_some_and(|l| l.replica == *replica)
-            || self.fast.contains_key(replica)
-            || self.slow.contains(replica)
+    /// Whether `replica` has acknowledged the leader's proposal of this
+    /// command: an adoption acknowledgement, which a follower publishes
+    /// only once it holds the proposal.
+    ///
+    /// A fast acknowledgement does not say as much. A follower publishes
+    /// it when the payload arrives, with no sequence number, before and
+    /// independently of any proposal, so it is no evidence that the
+    /// proposal ever reached that follower (task-d07).
+    pub fn adopted_by(&self, replica: &ReplicaId) -> bool {
+        self.slow.contains(replica)
     }
 
     /// The learning predicate over the counted votes. Fast learning is
