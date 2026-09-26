@@ -937,13 +937,6 @@ pub struct Domain<P: Persistence> {
     /// stop is recorded here and the loop ends on its next pass, as it
     /// does for the same refusal on a turn.
     fenced_stop: Option<String>,
-    /// The command whose leader's release and this node's own execution
-    /// record disagreed, if one has (task-d06). That is replicas executing
-    /// the same committed commands in different orders, and this node's
-    /// frontend answers from its own execution record (a retry, and a
-    /// delivery whose release was lost), so the node stops rather than
-    /// answer again from a state the domain did not decide.
-    diverged: Option<String>,
 }
 
 /// The two planes a voter is dialled on.
@@ -1321,7 +1314,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             role_said: None,
             fenced_said: 0,
             fenced_stop: None,
-            diverged: None,
             peer_streak: 0,
             budgets,
             recorder,
@@ -1491,10 +1483,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 say_fenced_stop(&what);
                 return;
             }
-            if let Some(command) = self.diverged.take() {
-                say_diverged(&command);
-                return;
-            }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
                 Err(coord_daemon::DriveError::Fenced(what)) => {
@@ -1511,7 +1499,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // source, so nothing will wake the loop on its behalf.
             self.pump_watches(&ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS))
                 .await;
-            self.settle_from_records();
+            // A release this node's own execution contradicts stops it
+            // here, before anything else this pass can answer a caller
+            // from that execution (task-d06).
+            if let Some(command) = self.settle_from_records() {
+                say_diverged(&command);
+                return;
+            }
             // A submission a destination could not take is offered
             // again here, on the collector's schedule and within a
             // per-turn budget. It goes after the voter's own turn and
@@ -2602,10 +2596,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     ///
     /// Bounded per turn, and cheap when nothing is half held, which is
     /// nearly always.
-    fn settle_from_records(&mut self) {
+    ///
+    /// Returns the command whose leader's release and this node's own
+    /// execution record disagree, if one does (task-d06). That is replicas
+    /// executing the same committed commands in different orders, and
+    /// every answer this node's frontend gives from its own record -- a
+    /// retry, a delivery whose half was lost -- then comes from a state
+    /// the domain did not decide. So nothing this pass settled goes out,
+    /// and the caller stops the node.
+    #[must_use]
+    fn settle_from_records(&mut self) -> Option<String> {
         let half = self.frontend.frontend.dispatcher_mut().half_established();
         if half.is_empty() {
-            return;
+            return None;
         }
         let mut deliveries = Vec::new();
         // Bounded per turn and rotated across turns: the bound is on
@@ -2631,13 +2634,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // ordinary outcome: every replica executes the committed
                 // commands in one order, and this node's frontend answers
                 // from its own record of that order. So the node stops
-                // (task-d06) rather than go on answering from it.
+                // (task-d06) rather than go on answering from it, and the
+                // deliveries this pass read from the same record do not
+                // go out either.
                 Err(coord_collector::SettleError::Mismatch) => {
-                    let head: String = command.as_bytes()[..4]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    self.diverged.get_or_insert(head);
+                    return Some(
+                        command.as_bytes()[..4]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect(),
+                    );
                 }
                 Err(_) => {}
             }
@@ -2645,6 +2651,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         for delivery in deliveries {
             self.answer(delivery);
         }
+        None
     }
 
     /// Which collector this voter owes a frame to, where it knows.
