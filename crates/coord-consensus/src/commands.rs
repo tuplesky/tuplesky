@@ -314,6 +314,31 @@ impl CommandTable {
         payload: Digest32,
         keys: Vec<Vec<u8>>,
     ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, true)
+    }
+
+    /// [`CommandTable::initialize`] past the table's capacity (task-d09).
+    ///
+    /// For a command whose turn has come and that is already decided
+    /// elsewhere: a full table of later commands, none of which can be
+    /// adopted before it, would otherwise hold it out for ever. The
+    /// caller vouches for that; the table cannot tell.
+    pub fn initialize_beyond_capacity(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, false)
+    }
+
+    fn initialize_bounded(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+        bounded: bool,
+    ) -> Result<Initialized, InitError> {
         match self.records.get(&command) {
             Some(existing) if existing.payload.is_some() => {
                 return Err(if existing.payload == Some(payload) {
@@ -324,7 +349,7 @@ impl CommandTable {
             }
             Some(_) => {}
             None => {
-                if self.full_after_reclaim() {
+                if bounded && self.full_after_reclaim() {
                     return Err(InitError::Backpressure);
                 }
             }

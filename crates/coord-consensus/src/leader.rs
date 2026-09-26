@@ -695,6 +695,77 @@ impl Leader {
         self.release()
     }
 
+    /// The highest sequence number of this ballot whose whole prefix is
+    /// committed here with its batch durable, if any (task-d09).
+    ///
+    /// Every sequence number below `seqnum` went to a proposal of this
+    /// ballot. One that is no longer in `proposals` was forgotten, which
+    /// only happens to a command executed long ago. So the prefix ends
+    /// just before the lowest proposal that is either not durable or not
+    /// committed.
+    pub fn committed_through(&self) -> Option<u64> {
+        let open = self
+            .proposals
+            .values()
+            .filter(|p| {
+                !(p.durable
+                    && (p.executed || self.table.phase_of(&p.command) >= Some(Phase::Commit)))
+            })
+            .map(|p| p.seqnum)
+            .min();
+        match open {
+            Some(first) => first.checked_sub(1),
+            None => self.seqnum.checked_sub(1),
+        }
+    }
+
+    /// Tell every other voter this ballot's commit frontier (task-d09).
+    ///
+    /// Learning is otherwise all-to-all: a follower commits a command
+    /// from the acknowledgements it receives itself, each published once
+    /// on a lane that drops frames by design, and nothing publishes a
+    /// missed one again to it. The leader's commit is a decision under
+    /// the crash-fault model, and the proposal the follower adopted
+    /// carries the leader's dependencies, so a follower that adopted a
+    /// proposal at or below the frontier may commit it without the
+    /// acknowledgements it missed.
+    ///
+    /// Paced by the caller with the re-send. The frame is small and
+    /// carries the whole frontier, so one that is dropped is repaired by
+    /// the next. It needs no barrier: the frontier counts only proposals
+    /// whose batch is durable.
+    pub fn announce_committed(&mut self) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if !self.is_leading() {
+            return Vec::new();
+        }
+        let Some(through) = self.committed_through() else {
+            return Vec::new();
+        };
+        let me = self.config.identity.replica;
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let frame = ProtocolMessage::Committed { ballot, through }.encode();
+        let outbox = self.outbox.as_mut().expect("booted");
+        for voter in &self.config.identity.voters {
+            if *voter == me {
+                continue;
+            }
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: frame.clone(),
+            });
+        }
+        self.release()
+    }
+
     /// Deliver the report owed to a candidate once every batch before the
     /// cut is durable.
     fn deliver_due_report(&mut self) -> Vec<Effect> {
@@ -1667,6 +1738,7 @@ impl Leader {
                 }
             }
             ProtocolMessage::Sealed { .. }
+            | ProtocolMessage::Committed { .. }
             | ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. }
