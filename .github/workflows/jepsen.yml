@@ -5,6 +5,11 @@
 # `tuplesky/jepsen` repository against it with this runner as the control
 # node. Each Jepsen process drives the domain through `coord-jepsen`.
 #
+# Beside it, on a runner of its own, `etcd-baseline` runs Jepsen's own etcd
+# test (jepsen-io/etcd) against etcd on the same cluster, with the same
+# workload, faults, time limit, concurrency, rate and fault interval, so a
+# run's throughput and fault behaviour have a baseline to compare with.
+#
 # Like the Kubernetes certification, this is a qualification run and not
 # part of `CI`: it is dispatched, weekly, or run once for a pull request
 # that changes the Jepsen harness itself. A Jepsen run that finds an anomaly or a crash is
@@ -29,6 +34,9 @@ on:
       nodes:
         description: Voters (containers), 3 or 5
         default: "5"
+      etcd-version:
+        description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it"
+        default: latest
   # A change to the Jepsen harness itself runs it once, on the pull
   # request, with the defaults. Not a required check.
   pull_request:
@@ -55,6 +63,10 @@ env:
   NEMESIS: ${{ inputs.nemesis || 'kill,pause,partition' }}
   TIME_LIMIT: ${{ inputs.time-limit || '300' }}
   NODES: ${{ inputs.nodes || '5' }}
+  ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
+  # jepsen-io/etcd, pinned; its head when the baseline was added.
+  ETCD_TEST_REPO: jepsen-io/etcd
+  ETCD_TEST_REF: b47cc401f27bfb7c28afd9ac088b5f0dca4501b8
   LEIN_VERSION: 2.11.2
   LEIN_SHA256: f83e3de252cb09d301f18f1912acffa807b54c1c9a96772ae63847a946032bd4
 
@@ -153,6 +165,98 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: jepsen-store-${{ env.WORKLOAD }}
+          path: ${{ runner.temp }}/jepsen-store.tgz
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Take the cluster down
+        if: always()
+        run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"
+
+  etcd-baseline:
+    name: etcd baseline (docker cluster)
+    if: ${{ (inputs.etcd-version || 'latest') != 'none' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: tuplesky/jepsen
+          ref: ${{ env.JEPSEN_REF }}
+          path: jepsen
+          persist-credentials: false
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ env.ETCD_TEST_REPO }}
+          ref: ${{ env.ETCD_TEST_REF }}
+          path: etcd-test
+          persist-credentials: false
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+          key: jepsen-etcd-m2-${{ hashFiles('etcd-test/project.clj') }}
+          restore-keys: jepsen-etcd-m2-
+      - name: Install Leiningen
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" \
+            "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+          echo "$LEIN_SHA256  $HOME/bin/lein" | sha256sum -c -
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Choose the etcd version
+        run: |
+          # `latest` is the highest stable (x.y.z) release tag of etcd-io/etcd,
+          # read when the job runs; anything else must be a version.
+          if [ "$ETCD_VERSION" = latest ]; then
+            ETCD_VERSION=$(git ls-remote --tags --refs https://github.com/etcd-io/etcd.git 'v*' \
+              | sed -n 's#.*refs/tags/v\([0-9]*\.[0-9]*\.[0-9]*\)$#\1#p' | sort -V | tail -n 1)
+          fi
+          if ! [[ "$ETCD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::not an etcd version: '$ETCD_VERSION'"; exit 1
+          fi
+          echo "ETCD_VERSION=$ETCD_VERSION" >> "$GITHUB_ENV"
+          echo "etcd baseline: etcd $ETCD_VERSION, $ETCD_TEST_REPO@$ETCD_TEST_REF" >> "$GITHUB_STEP_SUMMARY"
+      - name: Let the etcd test start etcd 3.6 and later
+        working-directory: etcd-test
+        # The test passes --enable-v2, which etcd 3.6 removed ("flag provided
+        # but not defined"). The workloads here use only the v3 API.
+        run: sed -i '/^[[:space:]]*:--enable-v2$/d' src/jepsen/etcd/db.clj
+      - name: Stand the cluster up
+        run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
+      - name: Run the etcd test
+        working-directory: etcd-test
+        # The tuplesky test's rate (20/s) and fault interval (30 s) rather
+        # than the etcd test's defaults (200/s, 5 s).
+        run: |
+          lein run test \
+            --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
+            --username root \
+            --version "$ETCD_VERSION" \
+            --workload "$WORKLOAD" \
+            --nemesis "$NEMESIS" \
+            --nemesis-interval 30 \
+            --rate 20 \
+            --time-limit "$TIME_LIMIT" \
+            --concurrency 2n
+      - name: Pack the Jepsen store
+        if: always()
+        run: |
+          if [ -d etcd-test/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store.tgz" -C etcd-test store
+          fi
+      - name: Upload the Jepsen store
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jepsen-store-etcd-${{ env.WORKLOAD }}
           path: ${{ runner.temp }}/jepsen-store.tgz
           retention-days: 14
           if-no-files-found: warn

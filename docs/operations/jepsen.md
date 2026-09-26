@@ -150,6 +150,29 @@ so the workflow does not offer the `clock` fault.
 Until `tuplesky/jepsen` merges the project, `jepsen-ref` defaults to its
 branch, `claude/tuplesky-jepsen-docker-tests`.
 
+Beside it, on a runner of its own, the `etcd-baseline` job runs Jepsen's
+own etcd test ([jepsen-io/etcd](https://github.com/jepsen-io/etcd),
+pinned) against etcd on the same kind of cluster, so a run's throughput
+and its behaviour under faults have something to be compared with:
+
+* **etcd version:** the `etcd-version` input. `latest`, the default, is
+  the highest stable release tag of etcd-io/etcd when the job runs; the
+  version used is in the job summary. `none` skips the baseline.
+* **Same test shape:** the same workload, faults, time limit and
+  `--concurrency 2n` as the TupleSky test, and the TupleSky test's rate
+  (20 requests a second) and fault interval (30 s) rather than the etcd
+  test's defaults (200 and 5 s). The append workload is the same Elle
+  list-append over 3 keys, with transactions of up to 4 operations,
+  checked for strict serializability.
+* **What differs:** the fault targets are each test's own (etcd's also
+  aim at the leader), and after healing the etcd test waits 10 s before
+  its final reads, where the TupleSky test waits 60 s.
+* **One change to the etcd test:** it starts etcd with `--enable-v2`,
+  which etcd 3.6 removed, so the job deletes that flag before running it.
+  The workloads use only the v3 API.
+
+Its store is the `jepsen-store-etcd-append` artifact.
+
 ## Without Jepsen: `scripts/e2e/shim-stress.py`
 
 A smaller driver runs the shim against a local three-voter domain. It
