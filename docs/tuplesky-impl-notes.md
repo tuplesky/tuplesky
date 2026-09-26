@@ -3717,6 +3717,16 @@ ledger, or a durable "executed" answer is a protocol decision for
 `coord-consensus`, and this change does not make it. The plan now owns
 it as task-d05, a prerequisite of task-64.
 
+**A limit of this change: a campaign that is making progress is still
+abandoned.** The election timer gives a campaign until its ceiling
+(16 s). A candidate still gathering payloads when that passes is
+replaced by the next ballot, which starts from scratch, even if it had
+most of what it needed. With the whole history to fetch at eight
+payloads an answer, that is how a restarted voter campaigned for ever
+in the Jepsen runs. With task-d05 a campaign fetches only the live
+window, so it is short and this rarely matters. It is recorded here
+because task-d05 removes it in practice, not by design.
+
 ## A request bound that bounded nothing
 
 The task-c01 follow-up. `limits.max_request_bytes` sized the collector's
