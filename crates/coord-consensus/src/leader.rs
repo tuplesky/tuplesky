@@ -18,7 +18,7 @@
 //! Follower acknowledgements are collected per command and nothing more:
 //! learning is not decided here.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use coord_core::capability::{AdmissionFacts, ReleasedResult, admission_digest};
@@ -219,6 +219,13 @@ pub struct Leader {
     /// dropped when the hold is full.
     early_order: VecDeque<CommandId>,
     payloads: BTreeMap<CommandId, PayloadRecordV1>,
+    /// Payloads this replica knows to be durable without having proposed
+    /// them in this ballot: what it recovered, or made durable as a
+    /// follower. A leader that serves only its own durable proposals
+    /// cannot serve the payload of a recovered command it has no reason
+    /// to propose again -- one it already executed -- and a voter that
+    /// lacks it would ask for ever (task-d05).
+    served_payloads: BTreeSet<CommandId>,
     ledger: DurableLedger,
     learner: Learner,
     seqnum: u64,
@@ -281,6 +288,7 @@ impl Leader {
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             payloads: BTreeMap::new(),
+            served_payloads: BTreeSet::new(),
             ledger: DurableLedger::new(),
             learner: Learner::new(executed_through),
             seqnum: 0,
@@ -325,6 +333,7 @@ impl Leader {
                 .values()
                 .filter(|p| p.durable)
                 .map(|p| p.command)
+                .chain(self.served_payloads)
                 .collect(),
             learner: self.learner,
             boot: self.boot,
@@ -364,6 +373,7 @@ impl Leader {
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
             payloads: state.payloads,
+            served_payloads: state.served_payloads,
             ledger: state.ledger,
             learner: state.learner,
             seqnum: 0,
@@ -406,7 +416,18 @@ impl Leader {
         // re-proposed command become executable before an earlier one.
         let mut last = order.last().copied();
         for c in order {
-            let deps = decision.entries[&c].deps.clone();
+            let entry = &decision.entries[&c];
+            // A command selected as committed that this leader executed
+            // has nothing left to decide: the Sync carries the commit, and
+            // every voter installing it commits the command without a vote.
+            // Proposing it again only spent the lanes -- a new leader after
+            // a long history proposed hundreds of such commands in one
+            // pass, and the lanes refused the ones it had not executed
+            // along with them (task-d05).
+            if entry.phase >= Phase::Commit && leader.table.phase_of(&c) == Some(Phase::Executed) {
+                continue;
+            }
+            let deps = entry.deps.clone();
             effects.extend(leader.repropose(c, deps));
         }
         for c in &decision.reproposed {
@@ -428,6 +449,27 @@ impl Leader {
         }
         effects.extend(leader.release());
         (leader, effects)
+    }
+
+    /// Drop the durable records, payloads, proposals and votes of
+    /// forgotten commands, as a follower does (task-d05). A forgotten
+    /// command executed long ago: nothing is decided, released or served
+    /// for it any more.
+    fn forget_history(&mut self) {
+        if self.ledger.len()
+            <= self
+                .config
+                .capacity
+                .saturating_mul(crate::follower::HISTORY_SWEEP)
+        {
+            return;
+        }
+        let table = &self.table;
+        self.ledger.retain(|c| !table.forgotten(c));
+        self.payloads.retain(|c, _| !table.forgotten(c));
+        self.served_payloads.retain(|c| !table.forgotten(c));
+        self.proposals.retain(|c, _| !table.forgotten(c));
+        self.votes.retain(|c, _| !table.forgotten(c));
     }
 
     /// Propose a known command under this ballot with `deps`.
@@ -568,9 +610,16 @@ impl Leader {
     }
 
     /// The recovery report for `ballot` from durable state at this cut.
+    ///
+    /// History this replica keeps nothing else about is left out, as a
+    /// follower leaves it out (task-d05).
     pub fn report(&self, ballot: Ballot) -> RecoveryReport {
-        self.ledger
-            .report(self.config.identity.replica, ballot, self.ballots.synced())
+        let mut report =
+            self.ledger
+                .report(self.config.identity.replica, ballot, self.ballots.synced());
+        report.entries.retain(|e| !self.table.forgotten(&e.command));
+        crate::follower::report_executed_as_committed(&mut report, &self.table);
+        report
     }
 
     /// The next command to execute through the materializer, if any.
@@ -604,6 +653,7 @@ impl Leader {
             outcome,
         )?;
         self.learn();
+        self.forget_history();
         // A command whose result was released speculatively is already
         // disclosed; releasing it again would answer one caller twice.
         // A command whose result was *not* is only disclosed here.
@@ -1442,7 +1492,15 @@ impl Leader {
             }
             ProtocolMessage::Sync(decision) => {
                 // A deposed leader carries the Sync into its follower role.
-                if self.deposed() {
+                // So does one whose deposing promise has not arrived yet:
+                // the Sync of a higher ballot is published once, and the
+                // follower this leader becomes keeps it until it promises
+                // that ballot (task-d05).
+                let higher = decision
+                    .ballot
+                    .compare_same_epoch(&self.config.quorum.ballot())
+                    == Some(core::cmp::Ordering::Greater);
+                if self.deposed() || higher {
                     self.pending_sync = Some((from.replica, decision));
                 }
                 Vec::new()
@@ -1496,7 +1554,9 @@ impl Leader {
             .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
         let responses: Vec<ProtocolMessage> = commands
             .iter()
-            .filter(|c| self.proposals.get(c).is_some_and(|p| p.durable))
+            .filter(|c| {
+                self.proposals.get(c).is_some_and(|p| p.durable) || self.served_payloads.contains(c)
+            })
             .filter_map(|c| {
                 self.payloads
                     .get(c)

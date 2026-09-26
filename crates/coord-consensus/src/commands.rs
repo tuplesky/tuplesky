@@ -123,6 +123,19 @@ pub struct CommandTable {
     /// The same commands in the order they were retired, so the oldest
     /// is the one dropped when the memory reaches its bound.
     retired: VecDeque<CommandId>,
+    /// Every command this replica executed and retired, however long
+    /// ago: the executed answer (task-d05).
+    ///
+    /// The tombstones above are bounded by recency, and what they bound is
+    /// what this replica still keeps *about* a command (the evidence it
+    /// can replay, for one). Whether it executed the command at all is a
+    /// different question, and one recovery asks of commands far older
+    /// than any recency bound: a Sync names commands by identity, and a
+    /// replica that answered "unknown" for one it executed long ago
+    /// treated it as work still to do -- a placeholder, a payload to
+    /// fetch, a table filling with history. So that answer is kept for
+    /// every command, at the cost of one identity each.
+    history: BTreeSet<CommandId>,
     capacity: Option<usize>,
 }
 
@@ -134,6 +147,7 @@ impl CommandTable {
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
+            history: BTreeSet::new(),
             capacity: None,
         }
     }
@@ -145,6 +159,7 @@ impl CommandTable {
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
+            history: BTreeSet::new(),
             capacity: Some(capacity),
         }
     }
@@ -163,6 +178,7 @@ impl CommandTable {
             keys: BTreeMap::new(),
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
+            history: BTreeSet::new(),
             capacity,
         };
         for (c, r) in records {
@@ -383,11 +399,12 @@ impl CommandTable {
     }
 
     /// Phase of an initialized command; a placeholder reports none. A
-    /// retired command a live record depends on reports `Executed`.
+    /// command this replica executed and retired reports `Executed`,
+    /// however long ago it was retired.
     pub fn phase_of(&self, command: &CommandId) -> Option<Phase> {
         match self.records.get(command) {
             Some(r) => r.payload.is_some().then_some(r.phase),
-            None => self.executed.contains(command).then_some(Phase::Executed),
+            None => self.history.contains(command).then_some(Phase::Executed),
         }
     }
 
@@ -493,12 +510,18 @@ impl CommandTable {
 
     /// Mark a command executed from durable evidence (its executed identity
     /// row) without consulting the guards: the materializer already applied
-    /// it at its position. Unknown commands are ignored.
+    /// it at its position.
+    ///
+    /// A command with no record here is one whose rows are gone (a trimmed
+    /// prefix): it is remembered as executed, which is all there is left
+    /// to say about it.
     pub fn restore_executed(&mut self, command: &CommandId) {
-        if let Some(r) = self.records.get_mut(command)
-            && r.payload.is_some()
-        {
-            r.phase = Phase::Executed;
+        match self.records.get_mut(command) {
+            Some(r) if r.payload.is_some() => r.phase = Phase::Executed,
+            Some(_) => {}
+            None => {
+                self.history.insert(*command);
+            }
         }
     }
 
@@ -556,6 +579,7 @@ impl CommandTable {
                 state.log.forget(command);
             }
         }
+        self.history.insert(*command);
         if self.executed.insert(*command) {
             self.retired.push_back(*command);
         }
@@ -584,6 +608,19 @@ impl CommandTable {
     /// having executed.
     pub fn tombstones(&self) -> &BTreeSet<CommandId> {
         &self.executed
+    }
+
+    /// Whether this replica executed `command` so long ago that it keeps
+    /// nothing about it but that answer: no record and no tombstone
+    /// (task-d05).
+    ///
+    /// Such a command is history. Every voter that reports it has
+    /// executed it, and a recovery report, a Sync and the payloads a
+    /// replica serves leave it out; a voter that has not executed it by
+    /// then is further behind than recovery carries anyone, and catches
+    /// up another way.
+    pub fn forgotten(&self, command: &CommandId) -> bool {
+        self.history.contains(command) && !self.executed.contains(command)
     }
 
     /// Start an exact closure traversal from an initialized command.

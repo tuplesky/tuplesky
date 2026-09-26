@@ -67,14 +67,17 @@ const fn default_checkpoint_after() -> u64 {
 }
 
 /// The command table capacity a configuration that names none gets.
-pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = 4096;
+pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = 1024;
 /// The smallest command table capacity a voter is configured with. A
 /// table must hold a proposal's worth of in-flight commands and still
 /// reclaim, and the follower's held-proposal bound is a multiple of it.
 pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
-/// The largest: a bound on the memory a table and the structures sized
-/// from it (retired tombstones, replay evidence, held proposals) may take.
-pub const MAX_COMMAND_TABLE_CAPACITY: usize = 1 << 20;
+/// The largest. A Sync is selected from a majority of reports, and each
+/// report names up to about twice the table (its live records and its
+/// tombstones), so the table bounds the Sync -- which is written as one
+/// row and sent as one frame. At this capacity a worst-case Sync for five
+/// voters is about 1.6 MiB, inside the row's 2 MiB.
+pub const MAX_COMMAND_TABLE_CAPACITY: usize = 1536;
 
 const fn default_command_table_capacity() -> usize {
     DEFAULT_COMMAND_TABLE_CAPACITY
