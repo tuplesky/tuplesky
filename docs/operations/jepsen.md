@@ -188,7 +188,7 @@ Where they stand on the stack at `afc0df6`:
 
 | Finding | Status |
 | --- | --- |
-| A follower that acknowledges writes the domain does not keep | Fix in review: #99. Intermittent: 2 of 4 Jepsen runs (on `afc0df6` and `1f277c9`) and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
+| A follower that acknowledges writes the domain does not keep | Fix in review: #99, carried here until the stack has it. Intermittent: 2 of 4 Jepsen runs (on `afc0df6` and `1f277c9`) and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
 | A restarted follower whose table stays full | Open: task-d05. Recovery carries the whole history (below). |
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | Open: a plan task in #99. Reproduced on `afc0df6`. |
@@ -291,7 +291,9 @@ the collector held it, disagreed: `release-record-mismatch`.
 
 #99 keeps a retired command as its key's latest, so the chain stays
 total. It also stops a node whose execution contradicts the leader's
-release, instead of logging the mismatch.
+release, instead of logging the mismatch. This change carries #99's two
+code commits, so the `jepsen` workflow runs against the fix. They drop
+out of it when the stack it is rebased on has them.
 
 ### A restarted follower whose command table stays full
 
