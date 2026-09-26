@@ -669,3 +669,55 @@ fn history_on_distinct_keys_is_forgotten_past_the_window() {
 fn alloc_key(i: u8) -> Vec<u8> {
     vec![b'k', i]
 }
+
+/// The closure of a record stops at any command this replica executed and
+/// retired, however long ago, not only at one still in the tombstone
+/// window (task-d05).
+///
+/// A restart retires every executed record at once, and the tombstones
+/// then keep only the last `capacity` of them. A record still live after
+/// the restart -- committed, not yet executed -- whose dependencies reach
+/// further back met a command the guards answer EXECUTED for and the
+/// closure called unknown. Executing it failed as `DependencyUnknown` on
+/// every restart: the `--fault leader` stop on #98.
+#[test]
+fn a_closure_stops_at_history_older_than_the_tombstones() {
+    let record = |phase: Phase, deps: &[u8]| coord_consensus::CommandRecord {
+        phase,
+        deps: deps.iter().copied().map(cmd).collect(),
+        keys: k("conservative"),
+        payload: Some(payload(0)),
+        paths: Vec::new(),
+        synced_seq: None,
+        path: empty_path(),
+    };
+    // Six commands executed in a chain, and a seventh, committed and not
+    // executed, that depends on the first.
+    let mut rows: Vec<_> = (1..=6u8)
+        .map(|i| {
+            let deps: Vec<u8> = if i == 1 { Vec::new() } else { vec![i - 1] };
+            (cmd(i), record(Phase::Accept, &deps))
+        })
+        .collect();
+    rows.push((cmd(7), record(Phase::Commit, &[1])));
+    let mut t = CommandTable::restore(Some(2), rows);
+    for i in 1..=6u8 {
+        t.restore_executed(&cmd(i));
+    }
+    for i in 1..=6u8 {
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        !t.tombstones().contains(&cmd(1)),
+        "command 1 left the window"
+    );
+    assert_eq!(t.phase_of(&cmd(1)), Some(Phase::Executed));
+    let cursor = t.closure_start(cmd(7)).unwrap();
+    let ClosureProgress::Complete(closure) = t
+        .closure_step(cursor, usize::MAX)
+        .expect("the closure stops at an executed command")
+    else {
+        panic!("an unbounded step completes");
+    };
+    assert_eq!(closure.members, BTreeSet::from([cmd(1)]));
+}

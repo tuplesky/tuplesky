@@ -4012,6 +4012,27 @@ restores them first. The scan is paged, and grows with the history just
 as the set does, until the same floor lets `executed_v1` forget a
 prefix.
 
+**The closure stops at that answer too.** Executing a command walks its
+closure, and the walk stopped only at a retired command still in the
+tombstone window. A restart retires everything it executed at once --
+about 2,000 commands in the `--fault leader` runs, against a capacity of
+1024 -- and the window then holds the last `capacity` of them. A record
+still live after the restart can reach further back than that: the
+guards answered EXECUTED for the command it reached, and the walk called
+it unknown. Executing that record failed as `DependencyUnknown` on every
+restart, which is the `--fault leader` stop that remained after the fix
+above; it needs no checkpoint. The walk now stops at any command this
+replica executed.
+
+Checked with #98's `shim-stress.py`, on #98's head with and without this
+change:
+- **Without it**, `--fault leader`: voter 1 stopped on every restart with
+  `DependencyUnknown`, and the final read was not served (exit 2).
+- **With it**:
+  - `--fault leader`, three runs: exit 0 every time, no voter stopped,
+    and no anomaly;
+  - `--fault majority`, one run: exit 0 as well.
+
 **History is left out of reports.** A command is *forgotten* when this
 replica executed it and retired it longer ago than its last `capacity`
 retirements. That window is kept apart from the tombstones: those also
@@ -4113,6 +4134,10 @@ executed until the next sweep. Forgotten commands' payloads now stay out.
   ballots 2 and then 1, and one of ballot 3 relayed by a voter that does
   not lead it, leave ballot 2's kept. Negative control: kept by arrival,
   the relayed one is kept.
+- `graph.rs` `a_closure_stops_at_history_older_than_the_tombstones`: six
+  commands executed and retired through a table of two, and a committed
+  seventh that depends on the first. Its closure completes. Negative
+  control: stopping only at tombstones, it fails as `DependencyUnknown`.
 - `trim.rs` `a_record_that_names_a_trimmed_command_executes_after_a_restart`:
   a trim removes commands 7 and 8's dependency rows, and command 9,
   written after it, names 8. Recovery returns 7 and 8 as executed, and a
