@@ -554,6 +554,12 @@ impl<P: Persistence> Voter<P> {
         self.node.payloads_answered()
     }
 
+    /// Send this ballot's voters, again, the proposals they have not voted
+    /// on. Only a leader sends anything (task-d07).
+    pub fn resend_proposals(&mut self) -> Result<Outbound, DriveError> {
+        self.node.resend_proposals(&self.ballot)
+    }
+
     /// Ask this ballot's leader for the payloads this replica lacks.
     pub fn request_payloads(&mut self) -> Result<Outbound, DriveError> {
         let leader = self.ballot.leader;
