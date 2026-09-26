@@ -155,8 +155,9 @@ branch, `claude/tuplesky-jepsen-docker-tests`.
 A smaller driver runs the shim against a local three-voter domain. It
 provisions a domain into a new directory, runs several clients doing
 list-append transactions on a few contended keys, kills and restarts a
-voter (or pauses one) every so often, one at a time, reads every key at
-the end, and checks the history with the checks a list-append history
+voter (or pauses one) every so often, one at a time, or kills the leader
+and one other voter at once (`--fault majority`), reads every key at the
+end, and checks the history with the checks a list-append history
 can be held to without Elle: every read of a key is a prefix of the
 final list, nothing appears twice, no failed append is read, an append
 reported `ok` is in every read that began after it, and no two `ok`
@@ -170,19 +171,21 @@ scripts/e2e/shim-stress.py /tmp/stress-run --seconds 120 --fault leader
 
 It exits 0 when the history is clean and the domain served the final
 read, 1 on an anomaly, and 2 when the history is clean but the domain did
-not serve the final read. The directory keeps each voter's `coordd.log`
-and `history.json`.
+not serve the final read. It prints the `ok` operations per 10 seconds,
+so a domain that stops serving shows when. The directory keeps each
+voter's `coordd.log` and `history.json`.
 
 ## Findings
 
 One finding is a safety failure: a follower acknowledged writes that the
 domain does not keep. Elle caught it twice on the runner, and the stress
-driver once on loopback. The other four are liveness failures. The
+driver once on loopback. The other five are liveness failures. The
 second and third came from the stress driver on one host (debug builds,
 a gVisor sandbox, the stack at `b642bfb`), repeatedly killing and
 restarting one voter while the other two stayed up. The fourth came from
 a container deployment and reproduces on a GitHub runner and on
-loopback. The fifth came from the Jepsen runs on the runner.
+loopback. The fifth came from the Jepsen runs on the runner, and the
+sixth from reading every Jepsen run's history against its faults.
 
 Where they stand on the stack at `afc0df6`:
 
@@ -193,6 +196,7 @@ Where they stand on the stack at `afc0df6`:
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | Open: a plan task in #99. Reproduced on `afc0df6`. |
 | No sessions after healing, under Jepsen | Open: task-d05. Recovery carries the whole history (below). |
+| The domain stops serving at its first election | Open: task-d05, and a gap no task owns (re-proposals are never re-sent). It decides every Jepsen run's throughput (below). |
 
 The second and the last are the limit task-d01's notes now record as
 "recovery carries the whole history": dependency rows are never pruned,
@@ -431,6 +435,62 @@ payload or by the leader re-sending held proposals when a link returns.
 It also accounts for more of the failed Jepsen transactions than the
 faults do: every transaction through a stalled voter fails at its
 snapshot read.
+
+### The domain stops serving at its first election
+
+The Jepsen runs' throughput varied from 71 to 1545 `ok` transactions, with
+or without #99's fix. Every run has the same shape. Each node serves
+about 80 transactions per 20 seconds. Then, at the first fault that
+costs the leader (`n1` leads ballot 0) or the quorum, the domain stops,
+and it never serves again, through healing and restarts:
+
+| Run | Head | `ok` | The fault it stopped at |
+| --- | --- | --- | --- |
+| [36195265925](https://github.com/tuplesky/tuplesky/actions/runs/36195265925) | `b2914db` (`d3cb8f0`) | 92 | ~5 s: `n2`, `n4`, `n5` killed |
+| [36206455426](https://github.com/tuplesky/tuplesky/actions/runs/36206455426) | `0bd3405` | 71 | ~5 s: majority paused, partition, `n3` killed |
+| [36212421247](https://github.com/tuplesky/tuplesky/actions/runs/36212421247) | `20edd4e` | 1545 | ~85 s: `n1`, `n2`, `n3` killed (it survived pauses and partitions that left `n1` leading) |
+| [36217564906](https://github.com/tuplesky/tuplesky/actions/runs/36217564906) | `e761a9f` | 92, then 93 on a rerun | ~5 s: `n1` killed |
+
+So the count measures how long the random schedule takes to reach an
+election, not the domain's speed. The stress driver reproduces it on
+loopback: one kill of the leader, restarted five seconds later, and no
+operation succeeds for the rest of the run (`--fault leader` and
+`--fault majority`). The same happened on `b642bfb` (the first leader-kill
+runs), so it predates task-d01 and #99. Two causes, each enough to stop
+recovery, were found with temporary logging of the campaign and of the
+followers:
+
+1. **The candidate cannot bind its selection.** `coordd` builds every
+   voter with a command table of 64 (`bins/coordd/src/main.rs`). A
+   voter retires what it executed, and past the tombstone bound it
+   cannot tell a retired command from an unknown one. The selection
+   names the whole history (task-d05): with 387 commands executed, the
+   restarted voter's campaign counted 330 of them as payloads it lacks.
+   It asked the promised voters for them and got them back one at a
+   time (they retire what they executed the same way). The campaign
+   timed out before it had them all, and the next ballot started over,
+   for ever. With the capacity raised, the same campaign lacked only
+   the ten commands it re-proposes, fetched them, and led.
+2. **The new leader's re-proposals are lost, and never re-sent.** With
+   the table capacity raised (a local experiment, not a proposal), the
+   campaign binds and the voter leads. It then re-proposes the whole
+   selection at once, about 350 commands. Its control lane to each
+   follower holds 64 frames (`QueueFull { lane: Control }`: 85 and 143
+   frames refused), and a re-proposal that does not arrive is never
+   sent again. The follower's own comment says so: "the leader does not
+   re-propose, and there is no message to ask it for an order it
+   already sent". The command stays at PRE-ACCEPT on that follower,
+   and the conservative key chains everything after it. So every later
+   proposal is held there (27 to 63 held and growing), and nothing
+   commits. A re-proposal that arrives before the follower has
+   installed the Sync is refused as `FencedByPromise` and lost the same
+   way.
+
+Bounding what recovery carries (task-d05) shrinks both. Only a way to
+repair a lost proposal closes the second: the leader re-sending what is
+unvoted, or the follower asking for the order of a command it holds at
+PRE-ACCEPT behind the Sync. That is the same gap as the late follower's
+missed proposal (above).
 
 ### Under Jepsen: a domain that no longer binds sessions
 

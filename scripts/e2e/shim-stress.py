@@ -11,8 +11,9 @@ recorded. See docs/operations/jepsen.md.
 
 Faults: `none`, `leader` (kill the voter that last said it leads, then
 restart it), `random` (kill any voter, then restart it), `pause` (SIGSTOP
-a voter for eight seconds). One voter at a time, so a majority is always
-up.
+a voter for eight seconds), all one voter at a time so a majority is
+always up; and `majority` (kill the leader and one other voter at once,
+restart both five seconds later), which takes the quorum away.
 
 The checks are the ones a list-append history can be held to without a
 full Elle run:
@@ -50,7 +51,7 @@ def parse():
     p.add_argument("--bin", default=os.path.join(ROOT, "target", "debug"),
                    help="directory holding coordd, coord-harness and coord-jepsen")
     p.add_argument("--seconds", type=float, default=120)
-    p.add_argument("--fault", choices=["none", "leader", "random", "pause"], default="leader")
+    p.add_argument("--fault", choices=["none", "leader", "random", "pause", "majority"], default="leader")
     p.add_argument("--clients", type=int, default=6)
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--interval", type=float, default=20, help="seconds between faults")
@@ -173,6 +174,22 @@ def leader():
 def nemesis():
     stop.wait(5)
     while not stop.is_set() and A.fault != "none":
+        if A.fault == "majority":
+            # Two of three at once, the leader among them: the domain has
+            # no quorum until they are back.
+            first = leader()
+            pair = [first, random.choice([m for m in (1, 2, 3) if m != first])]
+            for m in pair:
+                if daemons[m].poll() is None:
+                    daemons[m].kill()
+                    daemons[m].wait()
+            log(f"killed voters {pair}")
+            stop.wait(5)
+            for m in pair:
+                start(m)
+            log(f"restarted voters {pair}")
+            stop.wait(A.interval)
+            continue
         n = leader() if A.fault == "leader" else random.randint(1, 3)
         if daemons[n].poll() is not None:
             log(f"voter {n} is not running (exit {daemons[n].returncode}); restarting it")
@@ -297,6 +314,16 @@ def main():
         if op[3]["type"] != "ok":
             reasons[op[3].get("error")] = reasons.get(op[3].get("error"), 0) + 1
     log(f"{len(ops)} operations {kinds}; not ok: {reasons}")
+    # ok operations per 10 s, so a domain that stops serving shows where.
+    if ops:
+        t0 = min(op[4] for op in ops)
+        windows = {}
+        for op in ops:
+            if op[3]["type"] == "ok":
+                w = int((op[4] - t0) // 10) * 10
+                windows[w] = windows.get(w, 0) + 1
+        last = int((max(op[4] for op in ops) - t0) // 10) * 10
+        log("ok per 10 s: " + " ".join(f"{w}s:{windows.get(w, 0)}" for w in range(0, last + 1, 10)))
     for n in (1, 2, 3):
         panics = [l for l in said(n).splitlines() if "panicked at" in l]
         if panics:
