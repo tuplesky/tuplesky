@@ -909,3 +909,52 @@ fn a_renewal_issuer_is_https_or_an_allowed_loopback_address() {
         Err(ConfigError::Parse(_))
     ));
 }
+
+/// The command table's capacity is configuration, within bounds
+/// (task-d05).
+///
+/// Nothing sets it and a voter gets the raised default; a value inside
+/// the bounds is taken as written; one outside them is refused and the
+/// setting is named, rather than a voter starting with a table that
+/// cannot reclaim or cannot be allocated.
+#[test]
+fn the_command_table_capacity_is_configuration_within_bounds() {
+    use coord_daemon::config::{
+        DEFAULT_COMMAND_TABLE_CAPACITY, MAX_COMMAND_TABLE_CAPACITY, MIN_COMMAND_TABLE_CAPACITY,
+    };
+    let unset = Config::parse(&base_config("")).unwrap();
+    assert_eq!(
+        unset.limits.command_table_capacity,
+        DEFAULT_COMMAND_TABLE_CAPACITY
+    );
+    let limits = |capacity: usize| {
+        base_config(&format!(
+            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
+             command_table_capacity = {capacity}\n"
+        ))
+    };
+    for capacity in [
+        MIN_COMMAND_TABLE_CAPACITY,
+        100_000,
+        MAX_COMMAND_TABLE_CAPACITY,
+    ] {
+        let config = Config::parse(&limits(capacity)).unwrap();
+        assert_eq!(config.limits.command_table_capacity, capacity);
+    }
+    for capacity in [
+        0,
+        MIN_COMMAND_TABLE_CAPACITY - 1,
+        MAX_COMMAND_TABLE_CAPACITY + 1,
+    ] {
+        assert_eq!(
+            Config::parse(&limits(capacity)),
+            Err(ConfigError::OutOfRange {
+                field: "limits.command_table_capacity",
+                min: MIN_COMMAND_TABLE_CAPACITY as u64,
+                max: MAX_COMMAND_TABLE_CAPACITY as u64,
+            }),
+            "{capacity}"
+        );
+    }
+}

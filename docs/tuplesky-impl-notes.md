@@ -3945,3 +3945,36 @@ disagrees. The votes-only case has nothing to compare against.
   window, a lagging replica meets that limit as a stall, not as a fork.
 - A replica that already forked is not repaired by this change. The
   divergence stop keeps it from answering from its record.
+
+## Recovery bounded by what the voters executed
+
+task-d05, from the Jepsen client's runs on #98. No run served past its
+first election. Every node served about 80 transactions per 20 s until
+the first fault that cost the leader or the quorum. From then on the
+domain served nothing, through healing and restarts. The `ok` counts
+measured how long the random fault schedule took to reach an election,
+not anything about the fixes.
+
+### The table capacity is configuration
+
+`coordd` gave both voter configurations a command table of 64, with
+nothing to change it. Recovery names the whole history, and a candidate
+must hold the whole selection. So past about twice that many executed
+commands, a voter cannot tell retired history from unknown commands. It
+asks for payloads it executed long ago, eight to an answer, and cannot
+hold them anyway. With 387 commands executed, a restarted voter's
+campaign counted 330 missing payloads and never bound.
+
+`limits.command_table_capacity` now sets it.
+- The default is 4096.
+- The accepted range is 32 to 2^20. A value outside it is refused at
+  start, naming the setting.
+- It is a local memory bound, and voters of one domain may differ. No
+  replicated result depends on it, so it is not one of the security
+  gate's switches (design 20.5).
+- It moves the cliff; it does not remove it. A domain whose history is
+  well past the capacity still cannot elect a leader until recovery is
+  bounded, which is the rest of this task. Until then it lets the Jepsen
+  and stress runs reach the fault paths past their first election.
+- Payloads are not bounded by it: a voter keeps every payload it has
+  seen in memory, whatever the table holds.
