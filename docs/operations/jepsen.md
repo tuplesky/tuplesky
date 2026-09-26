@@ -194,7 +194,7 @@ Where they stand on the stack at `afc0df6`:
 | A follower that acknowledges writes the domain does not keep | Fix in review: #99, carried here until the stack has it. Intermittent: 2 of 4 Jepsen runs without the fix (on `afc0df6` and `1f277c9`) and 1 of 4 local pause runs on `afc0df6`; none in the three runs with it so far ([run 36209260989](https://github.com/tuplesky/tuplesky/actions/runs/36209260989), 339 transactions; [run 36211748702](https://github.com/tuplesky/tuplesky/actions/runs/36211748702), 1177 transactions, 873 ok; [run 36212421247](https://github.com/tuplesky/tuplesky/actions/runs/36212421247), 1955 transactions, 1545 ok). Seen in ballot 0, with no recovery. |
 | A restarted follower whose table stays full | task-d05: in review in #100, carried here. Recovery carries the whole history (below). |
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
-| A follower that started late never completes a read | In review in #101 (the leader re-sends unvoted proposals). Reproduced on `afc0df6`. Not carried here: #101 stalls a read (below). |
+| A follower that started late never completes a read | In review in #101 (the leader re-sends unvoted proposals), carried here. Reproduced on `afc0df6`. |
 | No sessions after healing, under Jepsen | task-d05: in review in #100, carried here. Recovery carries the whole history (below). |
 | The domain stops serving at its first election | In review: #100 (the table capacity and bounded recovery) and #101 (re-sending lost proposals). With both, a first election is survived but a later one is not (below). It decides every Jepsen run's throughput. |
 
@@ -299,10 +299,9 @@ release, instead of logging the mismatch. After an election, a new
 leader anchors the recovered tail as the key's latest command before it
 proposes anything new, so the chain stays total across ballots too.
 
-This change carries #99's and #100's code and tests, without their plan
-and notes edits, so the `jepsen` workflow runs against them. They drop
-out of it when the stack it is rebased on has them. It carried #101's
-too, and stopped (see "With #100 and #101" below).
+This change carries #99's, #100's and #101's code and tests, without
+their plan and notes edits, so the `jepsen` workflow runs against them.
+They drop out of it when the stack it is rebased on has them.
 
 ### A restarted follower whose command table stays full
 
@@ -533,8 +532,25 @@ through voter 2, right after that voter binds its session, stays
 `Pending` for the shim's whole budget, every time. Without #101's re-send
 the test passes, and so it does with the re-send kept but its frames
 dropped: the leader re-sends two proposals to voter 3 once in the run,
-and that alone stalls voter 2's read. So this change carries #99 and
-#100 only, until #101 has a fix.
+and that alone stalls voter 2's read. The cause, found on #101: a
+fast-set voter's fast acknowledgement of the payload was read as having
+received the proposal, so the proposal it lacked was the one never sent
+again. #101 now counts only adoptions (`e7383da`), and with it the test
+passes every time; this change carries #101 again from `20d2a9d`.
+
+With #100's fix for the checkpoint trim (`f26cbee`) and #101's, both
+`shim-stress.py --fault leader` and `--fault majority` still end without
+the final read (exit 2, no anomaly). Voters stop on every restart with
+`Guard(DependencyUnknown)` on a candidate's or a follower's durable batch,
+after a checkpoint (`baseline` 4096 and 8192), and with #99 and #100 alone
+(`482fd9f`) the same happens. Recovery restores no executed identity
+from the executed rows (`history=0`) in any of these restarts, so the
+unknown dependency is not a trimmed command.
+The `jepsen` workflow on `20d2a9d`
+([run 36260245651](https://github.com/tuplesky/tuplesky/actions/runs/36260245651))
+was `:valid? true`, with 633 `ok`. It served again after its first
+election (80 s to 140 s), stopped when all five nodes were killed at
+160 s, and did not serve again, final reads included.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
