@@ -3976,6 +3976,10 @@ campaign counted 330 missing payloads and never bound.
   for five voters is about 1.6 MiB. `compose.rs`
   `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame` builds
   that worst case and writes it.
+- The default is near the ceiling on purpose. A worst-case Sync at 1024
+  is already about two thirds of a row, and the default is what the
+  fault runs exercise, so it is set as high as leaves room for a
+  majority's reports to vary.
 - It is a local setting, and voters of one domain may differ. No
   replicated result depends on it, so it is not one of the security
   gate's switches (design 20.5).
@@ -3993,6 +3997,20 @@ EXECUTED from it. `restore_executed` fills it from the executed-identity
 rows, including rows whose dependency record is gone. It costs one
 identity per executed command, and is the one thing here that still
 grows with the history.
+
+**Recovery reads that answer from `executed_v1` itself.** It used to
+find executed identities only through the dependency rows, and a
+checkpoint trim removes those for an executed prefix while keeping its
+executed rows. A restarted voter then answered "unknown" for every
+trimmed command. A record written after the trim that names one -- the
+first proposal after a reclaim names the retired latest -- failed the
+execution guard as `DependencyUnknown`, on every restart, since the
+state is durable. That is how two voters of the #98 stress run stopped
+for good. `read_protocol` now pages through `executed_v1` and returns
+the identities without a dependency row as `history`, and `coordd`
+restores them first. The scan is paged, and grows with the history just
+as the set does, until the same floor lets `executed_v1` forget a
+prefix.
 
 **History is left out of reports.** A command is *forgotten* when this
 replica executed it and retired it longer ago than its last `capacity`
@@ -4095,6 +4113,11 @@ executed until the next sweep. Forgotten commands' payloads now stay out.
   ballots 2 and then 1, and one of ballot 3 relayed by a voter that does
   not lead it, leave ballot 2's kept. Negative control: kept by arrival,
   the relayed one is kept.
+- `trim.rs` `a_record_that_names_a_trimmed_command_executes_after_a_restart`:
+  a trim removes commands 7 and 8's dependency rows, and command 9,
+  written after it, names 8. Recovery returns 7 and 8 as executed, and a
+  table restored as `coordd` restores one executes 9. Negative control:
+  read through the dependency rows alone, 7 and 8 are unknown.
 - The election test above also restores payloads the way `coordd` does,
   and a restarted follower holds no more payloads than records. Negative
   control: restoring every payload row fails it.
@@ -4103,9 +4126,13 @@ executed until the next sweep. Forgotten commands' payloads now stay out.
 
 ### What is left
 
-- The executed-identity set grows by one identity per command. A floor
-  that lets it forget a prefix every voter executed needs task-53's
-  checkpoint path wired into `coordd`, which it is not.
+- The executed-identity set, and the `executed_v1` scan that restores
+  it, grow by one identity per command. A floor that lets them forget a
+  prefix every voter executed needs task-53's checkpoint path wired into
+  `coordd`, which it is not.
+- History is swept from `applied`, so a leader that stops executing keeps
+  a ledger above the sweep bound until its next execution. It is
+  harmless: nothing is added to it meanwhile.
 - A voter further behind than every majority reporter's window is not
   brought up by recovery, and nothing else brings it up yet. The
   checkpoint path is what should.

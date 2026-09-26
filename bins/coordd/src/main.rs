@@ -1399,11 +1399,12 @@ fn voter(
         applier.store().application_base().execution_position
     };
     println!(
-        "recovered promise={:?} records={} payloads={} executed={} frontier={} position={}",
+        "recovered promise={:?} records={} payloads={} executed={} history={} frontier={} position={}",
         recovered.promise.as_ref().map(|p| p.promised.number),
         recovered.records.len(),
         recovered.payloads.len(),
         recovered.executed.len(),
+        recovered.history.len(),
         recovered.frontier.get(),
         executed_through.get(),
     );
@@ -1452,6 +1453,7 @@ fn voter(
         && recovered.records.is_empty()
         && recovered.payloads.is_empty()
         && recovered.executed.is_empty()
+        && recovered.history.is_empty()
         && recovered.syncs.is_empty()
         && recovered.frontier.get() == 0;
     let machine = if placed.replica == ballot.leader && promised == ballot && fresh {
@@ -1488,7 +1490,17 @@ fn voter(
             recovered.syncs.clone(),
             executed_through,
         )
-        .restore_execution(executed_through, recovered.executed.iter().map(|(c, _)| *c))
+        // The executed identities whose dependency rows a trim removed
+        // first: they are older than every surviving one, and they are
+        // the executed answer for what a live record may still name.
+        .restore_execution(
+            executed_through,
+            recovered
+                .history
+                .iter()
+                .copied()
+                .chain(recovered.executed.iter().map(|(c, _)| *c)),
+        )
         .restore_payloads(recovered.payloads.clone());
         follower.set_learning(LearningMode::Full);
         coord_daemon::Machine::Follower(Box::new(follower))
