@@ -1040,7 +1040,7 @@ fn main() -> ExitCode {
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
     let backing = if roles.votes() {
-        match voter(&placed, applier, boot) {
+        match voter(&placed, applier, boot, config.limits.command_table_capacity) {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
                 eprintln!("{e}");
@@ -1354,6 +1354,7 @@ fn voter(
     placed: &membership::Placed,
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
+    capacity: usize,
 ) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
@@ -1398,11 +1399,12 @@ fn voter(
         applier.store().application_base().execution_position
     };
     println!(
-        "recovered promise={:?} records={} payloads={} executed={} frontier={} position={}",
+        "recovered promise={:?} records={} payloads={} executed={} history={} frontier={} position={}",
         recovered.promise.as_ref().map(|p| p.promised.number),
         recovered.records.len(),
         recovered.payloads.len(),
         recovered.executed.len(),
+        recovered.history.len(),
         recovered.frontier.get(),
         executed_through.get(),
     );
@@ -1451,6 +1453,7 @@ fn voter(
         && recovered.records.is_empty()
         && recovered.payloads.is_empty()
         && recovered.executed.is_empty()
+        && recovered.history.is_empty()
         && recovered.syncs.is_empty()
         && recovered.frontier.get() == 0;
     let machine = if placed.replica == ballot.leader && promised == ballot && fresh {
@@ -1460,7 +1463,7 @@ fn voter(
                 quorum,
                 genesis: ballot,
                 frontend: collector,
-                capacity: 64,
+                capacity,
             },
             recovered.promise.clone(),
             // A replica comes back sealed because its row says so
@@ -1478,7 +1481,7 @@ fn voter(
                 quorum,
                 genesis: ballot,
                 frontend: collector,
-                capacity: 64,
+                capacity,
             },
             recovered.promise.clone(),
             recovered.seal,
@@ -1487,7 +1490,17 @@ fn voter(
             recovered.syncs.clone(),
             executed_through,
         )
-        .restore_execution(executed_through, recovered.executed.iter().map(|(c, _)| *c))
+        // The executed identities whose dependency rows a trim removed
+        // first: they are older than every surviving one, and they are
+        // the executed answer for what a live record may still name.
+        .restore_execution(
+            executed_through,
+            recovered
+                .history
+                .iter()
+                .copied()
+                .chain(recovered.executed.iter().map(|(c, _)| *c)),
+        )
         .restore_payloads(recovered.payloads.clone());
         follower.set_learning(LearningMode::Full);
         coord_daemon::Machine::Follower(Box::new(follower))

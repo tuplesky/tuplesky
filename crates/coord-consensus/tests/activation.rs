@@ -4,7 +4,7 @@
 //! give the same selection; a crash after the Sync was bound republishes
 //! the same result and never reselects under the same ballot.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, CommandRecord, ConfigurationIdentity, Follower,
@@ -130,7 +130,13 @@ struct Cluster {
     /// Nodes that do not fetch the payloads they lack.
     no_fetch: Vec<usize>,
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
+    /// Every payload ask sent: who asked, and for what.
+    asks: Vec<(usize, Vec<CommandId>)>,
 }
+
+/// How many rounds `Cluster::settle` runs before it calls the cluster
+/// stuck. Far more than any test here needs to converge.
+const SETTLE_STEPS: u32 = 100_000;
 
 fn boot_event(boot: u8) -> Event {
     Event::Boot {
@@ -184,6 +190,7 @@ impl Cluster {
             drop_sync: Vec::new(),
             no_fetch: Vec::new(),
             frontend: Vec::new(),
+            asks: Vec::new(),
         }
     }
 
@@ -214,6 +221,11 @@ impl Cluster {
                         self.frontend
                             .push((from, ProtocolMessage::decode(&frame).unwrap()));
                         continue;
+                    }
+                    if let Ok(ProtocolMessage::PayloadRequest { commands }) =
+                        ProtocolMessage::decode(&frame)
+                    {
+                        self.asks.push((i, commands));
                     }
                     let dest = to.replica.0[0];
                     if self.cut.contains(&(i as u8, dest)) || !self.nodes[dest as usize].alive {
@@ -280,7 +292,14 @@ impl Cluster {
     }
 
     fn settle(&mut self) {
+        // A cluster that cannot converge -- a campaign asking for payloads
+        // for ever, a follower re-asking for what nobody serves -- keeps
+        // making "progress" without end. Bounded, that is a failure with
+        // a message rather than a test that never returns.
+        let mut steps = 0u32;
         loop {
+            steps += 1;
+            assert!(steps < SETTLE_STEPS, "the cluster did not settle");
             let mut progressed = false;
             let candidates: Vec<usize> = (0..self.nodes.len())
                 .filter(|i| self.nodes[*i].alive && !self.nodes[*i].inbox.is_empty())
@@ -431,7 +450,10 @@ impl Cluster {
         .restore_execution(
             ExecutionPosition::new(self.nodes[i].executed.len() as u64).unwrap(),
             self.nodes[i].executed.iter().copied(),
-        );
+        )
+        // As `coordd` restores a voter: the payload rows go back in after
+        // the execution frontier.
+        .restore_payloads(payload_rows(&self.nodes[i].storage));
         self.nodes[i].boot += 1;
         let boot = self.nodes[i].boot;
         f.step(boot_event(boot));
@@ -787,6 +809,232 @@ fn a_new_leaders_first_command_follows_the_recovered_tail() {
     cluster.settle();
     for i in [1usize, 2] {
         assert_eq!(cluster.nodes[i].executed, vec![b, c, d], "node {i}");
+    }
+}
+
+/// An election after more history than the table holds completes in one
+/// campaign, asks for no payload of a command the candidate executed,
+/// carries a selection bounded by the table rather than the history, and
+/// the new ballot serves (task-d05).
+///
+/// The candidate used to answer "unknown" for every command it had
+/// executed and retired past its tombstone window, so a selection naming
+/// the whole history left it asking for the payloads of commands it ran
+/// long ago, eight to an answer, into a table that could not hold them.
+/// At capacity 32 and 200 commands it waited on 160 payloads, and in
+/// `coordd` the campaign timed out and restarted for ever. Every report
+/// named the whole history too, so a Sync grew with it until it could no
+/// longer be written as a row.
+#[test]
+fn an_election_after_more_history_than_the_table_holds_asks_for_nothing_executed() {
+    let capacity = 32usize;
+    let history = 400u64;
+    let mut cluster = Cluster::new(29);
+    let mut submitted = Vec::new();
+    for n in 0..history {
+        submitted.push(cluster.admit(n + 1, (n % 250) as u8));
+        cluster.settle();
+    }
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+    // What a voter reports, and keeps durable records of in memory, is
+    // bounded by its table, not by the history -- a restarted voter too,
+    // whose every durable row comes back.
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    for i in 1..3 {
+        let f = cluster.nodes[i].follower();
+        let reported = f.report(ballot(1, 2)).entries.len();
+        assert!(
+            reported <= 2 * capacity + 1,
+            "node {i} reports {reported} commands"
+        );
+        assert!(
+            f.ledger().len() <= 4 * capacity + 8,
+            "node {i} keeps {} durable records",
+            f.ledger().len()
+        );
+        let payloads = submitted.iter().filter(|c| f.payload(c).is_some()).count();
+        assert!(
+            payloads <= 4 * capacity + 8,
+            "node {i} holds {payloads} payloads"
+        );
+    }
+    cluster.crash(0);
+    cluster.asks.clear();
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(
+        matches!(cluster.nodes[2].role, Some(Role::Leader(_))),
+        "the candidate did not win in one campaign"
+    );
+    let executed: BTreeSet<CommandId> = submitted.iter().copied().collect();
+    for (who, commands) in &cluster.asks {
+        for c in commands {
+            assert!(
+                !executed.contains(c),
+                "node {who} asked for the payload of {c:?}, which every voter executed"
+            );
+        }
+    }
+    let decision = sync_rows(&cluster.nodes[2].storage).remove(0);
+    let selected = decision.entries.len() + decision.reproposed.len();
+    assert!(
+        selected <= 4 * capacity,
+        "the Sync names {selected} commands of a {history}-command history"
+    );
+    let Some(Role::Leader(leader)) = &cluster.nodes[2].role else {
+        unreachable!()
+    };
+    assert!(
+        leader.table().records().count() <= capacity,
+        "the new leader holds {} records",
+        leader.table().records().count()
+    );
+    let next = cluster.admit(1000, 7);
+    cluster.settle();
+    for i in [1usize, 2] {
+        assert_eq!(cluster.nodes[i].executed.last(), Some(&next), "node {i}");
+        assert_eq!(
+            cluster.nodes[i].executed.len() as u64,
+            history + 1,
+            "node {i}"
+        );
+    }
+}
+
+/// A candidate further behind than every reporter's window does not win
+/// (task-d05).
+///
+/// Its peers leave out of their reports what they executed long ago, so
+/// the selection names what the candidate lacks only as a dependency of
+/// the oldest command it does carry. Bound and won, that ballot would
+/// have a leader that can never execute again. The candidate abandons
+/// the campaign and stops campaigning, and a voter that is not behind
+/// leads instead.
+#[test]
+fn a_candidate_behind_every_reporters_window_does_not_win() {
+    let history = 200u64;
+    let mut cluster = Cluster::new(41);
+    cluster.crash(2);
+    let mut submitted = Vec::new();
+    for n in 0..history {
+        submitted.push(cluster.admit(n + 1, 1));
+        cluster.settle();
+    }
+    assert_eq!(cluster.nodes[1].executed, submitted);
+    // r2 comes back with nothing, and the leader goes: r1 and r2 are the
+    // majority left, and r2 campaigns first.
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.crash(0);
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(
+        !matches!(cluster.nodes[2].role, Some(Role::Leader(_))),
+        "a candidate {history} commands behind won"
+    );
+    let rejections = cluster.nodes[2].follower_mut().take_rejections();
+    assert!(
+        rejections
+            .iter()
+            .any(|r| matches!(r, FollowerRejection::Behind { .. })),
+        "{rejections:?}"
+    );
+    // It does not campaign again this boot.
+    cluster.campaign(2, ballot(2, 2));
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(1, 2)
+    );
+    // r0 comes back and r1, which is not behind, leads. r2 stays where
+    // it is -- what brings it up is a checkpoint, not a payload -- so its
+    // asks, which no voter can answer, are left out of the harness.
+    cluster.no_fetch.push(2);
+    cluster.revive(0, quorum(ballot(0, 0)));
+    cluster.campaign(1, ballot(3, 1));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    let next = cluster.admit(1000, 1);
+    cluster.settle();
+    for i in [0usize, 1] {
+        assert_eq!(cluster.nodes[i].executed.last(), Some(&next), "node {i}");
+    }
+}
+
+/// A leader keeps the highest of the Syncs ahead of it, and only from
+/// their ballots' leaders (task-d05).
+///
+/// Syncs of two higher ballots can reach a leader in either order before
+/// the promise that deposes it. Keeping the last one kept the lower one
+/// when it came second, and the follower the leader becomes refuses it
+/// once it promises the higher ballot, with the one Sync that matched
+/// gone.
+#[test]
+fn a_leader_keeps_the_highest_sync_ahead_of_it() {
+    let mut cluster = Cluster::new(43);
+    let sync = |b: Ballot| SyncDecision {
+        ballot: b,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: BTreeSet::new(),
+    };
+    for (from, b) in [
+        (2u8, ballot(2, 2)),
+        (1, ballot(1, 1)),
+        // Relayed by a voter that does not lead it.
+        (1, ballot(3, 2)),
+    ] {
+        let effects = cluster.nodes[0].step(peer_event(r(from), ProtocolMessage::Sync(sync(b))));
+        assert!(effects.is_empty());
+    }
+    let Some(Role::Leader(leader)) = &cluster.nodes[0].role else {
+        unreachable!()
+    };
+    assert_eq!(
+        leader.pending_sync().map(|(from, d)| (*from, d.ballot)),
+        Some((r(2), ballot(2, 2)))
+    );
+}
+
+/// A Sync that reaches a voter before that voter has promised its ballot
+/// is installed once the promise is made (task-d05).
+///
+/// The new leader publishes its Sync once, as soon as its selection is
+/// durable, and it can count a majority without a slower voter. That voter
+/// used to refuse a Sync for a ballot it had not promised yet and was then
+/// left promised to a ballot it could never synchronize to: every proposal
+/// of the ballot held, nothing executed, for good.
+#[test]
+fn a_sync_ahead_of_the_promise_is_installed_once_the_promise_is_made() {
+    let mut cluster = Cluster::new(31);
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.campaign(2, ballot(1, 2));
+    // r1's promise request is held back: r0 and r2 elect r2 without it, and
+    // r2's Sync reaches r1 first.
+    let held: Vec<(ReplicaId, Vec<u8>)> = cluster.nodes[1].inbox.drain(..).collect();
+    assert!(
+        held.iter().any(|(_, f)| matches!(
+            ProtocolMessage::decode(f),
+            Ok(ProtocolMessage::NewLeader { .. })
+        )),
+        "the campaign's promise request was not in r1's inbox"
+    );
+    cluster.settle();
+    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), ballot(0, 0));
+    cluster.nodes[1].inbox.extend(held);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[1].follower().ballots().synced(),
+        ballot(1, 2),
+        "r1 never synchronized to the ballot it promised"
+    );
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2], "node {i}");
     }
 }
 

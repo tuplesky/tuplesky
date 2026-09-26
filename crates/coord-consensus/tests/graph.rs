@@ -604,3 +604,68 @@ fn a_keys_latest_tombstone_outlives_the_bound() {
         "the quiet key's new latest"
     );
 }
+
+/// A command this replica executed is answered for as executed however
+/// long ago it was retired, and the tombstones stay bounded (task-d05).
+///
+/// The tombstones are a recency window: what this replica still keeps
+/// about a command. Recovery asks a different question of commands far
+/// older than that window -- did this replica execute it at all -- and a
+/// replica that answered "unknown" for its own history treated it as work
+/// to do: a placeholder, a payload to fetch, a table filling with it.
+#[test]
+fn an_executed_command_is_answered_for_long_after_its_tombstone_went() {
+    let capacity = 2u8;
+    let mut t = CommandTable::with_capacity(usize::from(capacity));
+    for i in 1..=40u8 {
+        run_through(&mut t, cmd(i), i, k("conservative"));
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        t.tombstones().len() <= usize::from(capacity) + 1,
+        "the tombstones grew with the history: {}",
+        t.tombstones().len()
+    );
+    assert!(!t.tombstones().contains(&cmd(1)));
+    for i in 1..=40u8 {
+        assert_eq!(t.phase_of(&cmd(i)), Some(Phase::Executed), "command {i}");
+    }
+    // A command never seen is still unknown.
+    assert_eq!(t.phase_of(&cmd(99)), None);
+    // Restored from an executed identity whose rows are gone, a command is
+    // remembered as executed too.
+    let mut restored = CommandTable::with_capacity(usize::from(capacity));
+    restored.restore_executed(&cmd(7));
+    assert_eq!(restored.phase_of(&cmd(7)), Some(Phase::Executed));
+    assert!(restored.record(&cmd(7)).is_none());
+}
+
+/// What a report still names is the last `capacity` retirements, however
+/// many keys there are (task-d05).
+///
+/// The tombstones keep every key's latest command for the guards, and
+/// with commands on ever new keys every one of them is some key's latest:
+/// a report bounded by the tombstones grew with the keys. The domain uses
+/// one conservative key today, so this is the table's contract rather
+/// than a case `coordd` meets.
+#[test]
+fn history_on_distinct_keys_is_forgotten_past_the_window() {
+    let capacity = 4usize;
+    let mut t = CommandTable::with_capacity(capacity);
+    for i in 1..=40u8 {
+        let key = alloc_key(i);
+        run_through(&mut t, cmd(i), i, vec![key]);
+        t.retire(&cmd(i)).unwrap();
+    }
+    // Each command is its key's latest, so each keeps its tombstone.
+    assert_eq!(t.tombstones().len(), 40);
+    let remembered: Vec<u8> = (1..=40u8).filter(|i| !t.forgotten(&cmd(*i))).collect();
+    assert_eq!(remembered, vec![37, 38, 39, 40]);
+    for i in 1..=40u8 {
+        assert_eq!(t.phase_of(&cmd(i)), Some(Phase::Executed), "command {i}");
+    }
+}
+
+fn alloc_key(i: u8) -> Vec<u8> {
+    vec![b'k', i]
+}

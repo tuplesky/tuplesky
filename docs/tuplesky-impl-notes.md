@@ -3945,3 +3945,198 @@ disagrees. The votes-only case has nothing to compare against.
   window, a lagging replica meets that limit as a stall, not as a fork.
 - A replica that already forked is not repaired by this change. The
   divergence stop keeps it from answering from its record.
+
+## Recovery bounded by what the voters executed
+
+task-d05, from the Jepsen client's runs on #98. No run served past its
+first election. Every node served about 80 transactions per 20 s until
+the first fault that cost the leader or the quorum. From then on the
+domain served nothing, through healing and restarts. The `ok` counts
+measured how long the random fault schedule took to reach an election,
+not anything about the fixes.
+
+### The table capacity is configuration
+
+`coordd` gave both voter configurations a command table of 64, with
+nothing to change it. Recovery names the whole history, and a candidate
+must hold the whole selection. So past about twice that many executed
+commands, a voter cannot tell retired history from unknown commands. It
+asks for payloads it executed long ago, eight to an answer, and cannot
+hold them anyway. With 387 commands executed, a restarted voter's
+campaign counted 330 missing payloads and never bound.
+
+`limits.command_table_capacity` now sets it.
+- The default is 1024.
+- The accepted range is 32 to 1536. A value outside it is refused at
+  start, naming the setting.
+- The maximum comes from the Sync, not from memory. A report names up to
+  about twice the table: its live records and its tombstones. A Sync is
+  selected from a majority of reports, and it is written as one row
+  (about 2 MiB) and sent as one frame (4 MiB). At 1536 a worst-case Sync
+  for five voters is about 1.6 MiB. `compose.rs`
+  `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame` builds
+  that worst case and writes it.
+- The default is near the ceiling on purpose. A worst-case Sync at 1024
+  is already about two thirds of a row, and the default is what the
+  fault runs exercise, so it is set as high as leaves room for a
+  majority's reports to vary.
+- It is a local setting, and voters of one domain may differ. No
+  replicated result depends on it, so it is not one of the security
+  gate's switches (design 20.5).
+
+### Recovery is bounded by what the voters executed
+
+The design choice among the plan's three candidates is the third: a
+durable "executed" answer, plus a report that leaves out history.
+
+**The executed answer.** `CommandTable` keeps the identity of every
+command it executed and retired, however long ago. The tombstones stay a
+recency window (what the replica still keeps *about* a command); the new
+set only answers "did this replica execute it". `phase_of` answers
+EXECUTED from it. `restore_executed` fills it from the executed-identity
+rows, including rows whose dependency record is gone. It costs one
+identity per executed command, and is the one thing here that still
+grows with the history.
+
+**Recovery reads that answer from `executed_v1` itself.** It used to
+find executed identities only through the dependency rows, and a
+checkpoint trim removes those for an executed prefix while keeping its
+executed rows. A restarted voter then answered "unknown" for every
+trimmed command. A record written after the trim that names one -- the
+first proposal after a reclaim names the retired latest -- failed the
+execution guard as `DependencyUnknown`, on every restart, since the
+state is durable. That is how two voters of the #98 stress run stopped
+for good. `read_protocol` now pages through `executed_v1` and returns
+the identities without a dependency row as `history`, and `coordd`
+restores them first. The scan is paged, and grows with the history just
+as the set does, until the same floor lets `executed_v1` forget a
+prefix.
+
+**History is left out of reports.** A command is *forgotten* when this
+replica executed it and retired it longer ago than its last `capacity`
+retirements. That window is kept apart from the tombstones: those also
+keep every key's latest command for the guards, however old, so with
+commands on ever new keys they grow with the keys, and a report bounded
+by them would too. (The domain uses one conservative key today.) A report
+leaves forgotten commands out, so it names what the voter has not
+executed, and what it executed recently. A Sync, selected from a
+majority of reports, is bounded the same way. A voter that has not
+executed a command every majority reporter forgot is further behind than
+recovery carries anyone; it catches up by the checkpoint path.
+
+**Executed means committed.** A commit is not written as a row, so a
+durable record says ACCEPT for a command long executed. Reports now say
+COMMIT for every command the reporter executed, and the selection
+installs it as committed wherever it goes. Before, it went out as
+ACCEPT: the new leader proposed it again and waited for votes from
+voters that had executed and retired it, which had no record to vote
+from. A follower that receives a proposal for a command it executed and
+retired now drops it rather than holding it for ever.
+
+**A new leader proposes nothing it executed.** A selected command
+installed as committed that the leader already executed has nothing left
+to decide. Re-proposing it only spent the lanes: the Jepsen run's leader
+re-proposed about 350 commands in one pass, and the lanes refused the
+ones that mattered along with them.
+
+**Memory follows the window.** When a voter's durable ledger outgrows
+four times its table, it drops the durable records, payloads, served
+payloads, proposals, votes and adoption orders of forgotten commands. A
+restarted voter retires everything it executed, in execution order, and
+sweeps at once: every dependency row comes back as a record, and it
+used to report all of them to the first candidate that asked, which
+after a kill is straight away.
+
+**A candidate that far behind does not lead.** The selection names what
+it lacks only as a dependency of the oldest command it carries, since
+every reporter left that command out. Before binding, a candidate checks
+every dependency of a selected entry: one that the selection does not
+carry and the candidate has not committed means it is behind every
+reporter's window. Bound and won, the ballot would have a leader that can
+never execute again. Its execution was guarded, so this was never a
+wrong result, but it was a domain without a working leader. The
+candidate abandons the campaign, records `Behind`, and does not campaign
+again this boot; a voter that is not behind leads instead.
+
+**Restarts stay swept.** A restarted voter sweeps what it forgot as it
+restores its execution frontier, and `coordd` then restores the payload
+rows. Those used to come back in full, a payload per command ever
+executed until the next sweep. Forgotten commands' payloads now stay out.
+
+### Liveness gaps found on the way
+
+- **A new leader served only its own proposals' payloads.** A recovered
+  command it had no reason to propose again (one it executed) was never
+  served, and a voter lacking it asked for ever. The leader now keeps the
+  payloads it recovered as servable.
+- **A Sync ahead of the promise was refused.** The Sync is published once.
+  A voter whose promise for that ballot was still to come refused it, and
+  was then promised to a ballot it could never synchronize to. A leader
+  receiving it before its own deposing promise dropped it the same way.
+  Both now keep the highest such Sync, and only from its ballot's leader,
+  and install it once the promise is durable. Kept by arrival instead, a
+  lower Sync arriving second replaced the higher one, which was then
+  lost. This had been hidden: the new leader's re-proposals used to
+  bring such a voter back as a side effect.
+
+### What the tests show
+
+- `graph.rs` `an_executed_command_is_answered_for_long_after_its_tombstone_went`:
+  forty commands through a table of two. The tombstones stay bounded, and
+  every command still reads as EXECUTED.
+- `activation.rs`
+  `an_election_after_more_history_than_the_table_holds_asks_for_nothing_executed`:
+  400 commands at capacity 32, then a follower restart and a leader loss.
+  - A follower's report stays at about twice the table, restarted or not.
+  - The candidate wins in one campaign and asks for no payload of a
+    command every voter executed.
+  - The Sync names at most four times the table.
+  - The new ballot serves.
+  - Negative controls: without the executed answer the cluster never
+    settles; without the report window a follower reports 112 commands
+    where the bound is 65.
+- `activation.rs` `a_sync_ahead_of_the_promise_is_installed_once_the_promise_is_made`:
+  r1's promise request is held back until r2 has won and published its
+  Sync. r1 then synchronizes and serves. Without the fix it stays
+  unsynchronized.
+- `graph.rs` `history_on_distinct_keys_is_forgotten_past_the_window`:
+  forty commands, each on its own key, through a table of four. Every one
+  keeps its tombstone as its key's latest, and only the last four are
+  still reported. Negative control: bounded by the tombstones, all forty
+  are.
+- `activation.rs` `a_candidate_behind_every_reporters_window_does_not_win`:
+  r2 misses 200 commands, the leader goes, and r2 campaigns first. It
+  does not win and does not campaign again; r1 leads, and the next
+  command executes. Negative control: without the check, r2 wins and the
+  cluster never settles.
+- `activation.rs` `a_leader_keeps_the_highest_sync_ahead_of_it`: Syncs of
+  ballots 2 and then 1, and one of ballot 3 relayed by a voter that does
+  not lead it, leave ballot 2's kept. Negative control: kept by arrival,
+  the relayed one is kept.
+- `trim.rs` `a_record_that_names_a_trimmed_command_executes_after_a_restart`:
+  a trim removes commands 7 and 8's dependency rows, and command 9,
+  written after it, names 8. Recovery returns 7 and 8 as executed, and a
+  table restored as `coordd` restores one executes 9. Negative control:
+  read through the dependency rows alone, 7 and 8 are unknown.
+- The election test above also restores payloads the way `coordd` does,
+  and a restarted follower holds no more payloads than records. Negative
+  control: restoring every payload row fails it.
+- The deterministic cluster's `settle` is now bounded, so a cluster that
+  cannot converge fails with a message instead of hanging the test run.
+
+### What is left
+
+- The executed-identity set, and the `executed_v1` scan that restores
+  it, grow by one identity per command. A floor that lets them forget a
+  prefix every voter executed needs task-53's checkpoint path wired into
+  `coordd`, which it is not.
+- History is swept from `applied`, so a leader that stops executing keeps
+  a ledger above the sweep bound until its next execution. It is
+  harmless: nothing is added to it meanwhile.
+- A voter further behind than every majority reporter's window is not
+  brought up by recovery, and nothing else brings it up yet. The
+  checkpoint path is what should.
+- Bringing a candidate that far behind up before it leads, rather than
+  standing it down (above), is future work with the rest of the
+  checkpoint path.
+- Proposals a voter never received (task-d07).

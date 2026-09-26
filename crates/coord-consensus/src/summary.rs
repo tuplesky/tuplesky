@@ -98,6 +98,24 @@ impl DurableLedger {
         self.records.iter()
     }
 
+    /// How many durable records the ledger holds.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the ledger holds no durable record.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Keep only the durable records of the commands `keep` names. Staged
+    /// batches are untouched: what is not durable yet is not the ledger's
+    /// to forget.
+    pub fn retain(&mut self, keep: impl Fn(&CommandId) -> bool) {
+        self.records.retain(|c, _| keep(c));
+        self.sequences.retain(|c, _| keep(c));
+    }
+
     /// Barriers still outstanding (the cut must wait for them).
     pub fn outstanding(&self) -> Vec<BarrierId> {
         self.staged.keys().copied().collect()
