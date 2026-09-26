@@ -267,6 +267,165 @@ pub struct IdentityConfig {
     pub collector_key: Option<String>,
 }
 
+/// Renewing this node's leaf while it serves (task-d02; design Sections
+/// 10.4, 20.4).
+///
+/// A node certificate is short-lived on purpose, so a node that serves
+/// longer than one lifetime has to renew it in place. It does so the way
+/// it was first enrolled: at the node issuer, presenting a workload
+/// assertion and a request signed with the key it already holds -- the
+/// committed key, so what comes back is a renewal and not a replacement.
+///
+/// Optional. Without it the node serves on the leaf it started with until
+/// that leaf's `notAfter`, and is put back by restarting it on a renewed
+/// one; the startup report says renewal is not configured.
+///
+/// Paths and a URL, nothing secret: the assertion is read from its file
+/// at each attempt and never held in the configuration or printed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenewalConfig {
+    /// The node issuer's base URL. Enrollment is posted to
+    /// `{issuer}/enroll`.
+    ///
+    /// `https://` always, except a loopback `http://` URL where
+    /// [`RenewalConfig::allow_insecure_loopback`] says so. The issuer
+    /// hands this node the credential its peers authenticate it by, and
+    /// a response nothing authenticated could only be refused here
+    /// afterwards, if it could be refused at all.
+    pub issuer: String,
+    /// A file holding the workload assertion the issuer verifies (a
+    /// projected service-account token, for instance).
+    ///
+    /// Read at every attempt, because the platform rotates it in place;
+    /// a copy taken at startup would expire long before the leaf does.
+    pub assertion: String,
+    /// PEM roots for the issuer's own TLS certificate. Absent, the public
+    /// web roots are used; present, only these are.
+    #[serde(default)]
+    pub issuer_roots: Option<String>,
+    /// The lifetime to ask for, in seconds.
+    ///
+    /// Stated rather than copied from the leaf being renewed. The issuer
+    /// back-dates each leaf by its clock uncertainty, so a lifetime read
+    /// off one leaf is a little longer than the one asked for it, and a
+    /// node that asked for "the same again" would ask for a little more
+    /// each time -- until the issuer's policy refused it, at a due point,
+    /// on a node that had renewed without trouble for weeks. The issuer's
+    /// policy bounds it either way, and a lifetime past the policy's is a
+    /// refusal the node reports at every attempt.
+    pub lifetime_secs: u64,
+    /// The window renewal is spread over after the leaf turns due, in
+    /// seconds, so a fleet issued together does not renew together. Each
+    /// node's point in it is derived from its own identity, so it is the
+    /// same across restarts.
+    #[serde(default = "default_renewal_jitter")]
+    pub jitter_secs: u64,
+    /// Accept an `http://` issuer on a loopback address. Test-only.
+    ///
+    /// For the tests, which serve an issuer in-process: a loopback URL
+    /// never leaves the machine, and anything else is refused whatever
+    /// this says. It stays in the schema so one configuration parses in
+    /// every build, but only a build with debug assertions accepts it
+    /// set; a release build refuses it at validation
+    /// ([`ConfigError::TestOnlySwitch`]), because no insecure switch
+    /// belongs in a production artifact (design Section 20.5). A
+    /// production node renews at an `https://` issuer, with
+    /// [`RenewalConfig::issuer_roots`] where it is not publicly rooted.
+    #[serde(default)]
+    pub allow_insecure_loopback: bool,
+}
+
+const fn default_renewal_jitter() -> u64 {
+    3600
+}
+
+/// Whether `url` is an issuer this node may enroll at: `https://`, or a
+/// loopback `http://` where `insecure_loopback` allows it.
+///
+/// The scheme and host are decided by parsing the authority, never by a
+/// prefix of the string: `http://127.0.0.1.evil.example` starts with the
+/// loopback prefix and is not loopback at all. Userinfo is refused
+/// outright, since a URL that carries a credential would carry it into
+/// every report that names the issuer. The host and port are checked
+/// here too, for either scheme: a URL the HTTP client would refuse is a
+/// configuration error to report at startup (and under `--check`), not
+/// one discovered at the first due attempt and retried until the leaf
+/// runs out.
+pub fn issuer_url_permitted(url: &str, insecure_loopback: bool) -> bool {
+    let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') || rest.contains(['?', '#']) {
+        return false;
+    }
+    let Some(host) = authority_host(authority) else {
+        return false;
+    };
+    if secure {
+        return true;
+    }
+    if !insecure_loopback {
+        return false;
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The host of `authority` (`host`, `host:port`, `[v6]` or `[v6]:port`),
+/// if both it and the port are well formed. A bracketed host is an IPv6
+/// address; any other is an IPv4 address or a DNS name. A port is one
+/// to five digits naming a nonzero `u16`.
+fn authority_host(authority: &str) -> Option<&str> {
+    let (host, port) = if let Some(inside) = authority.strip_prefix('[') {
+        let (host, after) = inside.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        match after {
+            "" => (host, None),
+            _ => (host, Some(after.strip_prefix(':')?)),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if let Some(port) = port
+        && !(port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p != 0))
+    {
+        return None;
+    }
+    if authority.starts_with('[') {
+        return Some(host);
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels
+        .iter()
+        .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+    {
+        // All numeric: an IPv4 address, or nothing.
+        return host.parse::<std::net::Ipv4Addr>().ok().map(|_| host);
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let well_formed = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    well_formed.then_some(host)
+}
+
 /// The daemon configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -311,6 +470,10 @@ pub struct Config {
     /// Permissions this domain's genesis grants (see [`GrantConfig`]).
     #[serde(default)]
     pub grant: Vec<GrantConfig>,
+    /// Renewing this node's leaf while it serves (see
+    /// [`RenewalConfig`]). Absent, the node never renews in place.
+    #[serde(default)]
+    pub renewal: Option<RenewalConfig>,
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
@@ -380,6 +543,33 @@ pub enum ConfigError {
         /// What needs it.
         needed_by: &'static str,
     },
+    /// The issuer a node renews at is not one it may trust with that:
+    /// not `https://`, and not a loopback URL explicitly allowed.
+    InsecureIssuer,
+    /// A renewal that asks for no lifetime at all.
+    ZeroLifetime,
+    /// A test-only switch set in a build without debug assertions. The
+    /// field is named.
+    TestOnlySwitch(&'static str),
+}
+
+/// Which build is validating: whether test-only switches may be set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Build {
+    /// Debug assertions on: the tests' build.
+    Test,
+    /// Debug assertions off: what ships.
+    Release,
+}
+
+impl Build {
+    const fn current() -> Build {
+        if cfg!(debug_assertions) {
+            Build::Test
+        } else {
+            Build::Release
+        }
+    }
 }
 
 /// Supported configuration schema version.
@@ -438,6 +628,10 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_as(Build::current())
+    }
+
+    fn validate_as(&self, build: Build) -> Result<(), ConfigError> {
         if self.config_version != CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion {
                 version: self.config_version,
@@ -521,6 +715,22 @@ impl Config {
         if self.journal.shards == 0 {
             return Err(ConfigError::NoJournalShards);
         }
+        if let Some(renewal) = &self.renewal {
+            // Refused before the URL is looked at, so a release build
+            // says which switch it will not honour rather than calling
+            // the loopback issuer insecure.
+            if renewal.allow_insecure_loopback && build == Build::Release {
+                return Err(ConfigError::TestOnlySwitch(
+                    "renewal.allow_insecure_loopback",
+                ));
+            }
+            if !issuer_url_permitted(&renewal.issuer, renewal.allow_insecure_loopback) {
+                return Err(ConfigError::InsecureIssuer);
+            }
+            if renewal.lifetime_secs == 0 {
+                return Err(ConfigError::ZeroLifetime);
+            }
+        }
         // An empty path is not a default: it resolves to the working
         // directory, which is where a process would silently create a
         // second, empty generation beside the real one.
@@ -540,6 +750,16 @@ impl Config {
                 ("sts.resource", &sts.resource),
                 ("sts.jwks", &sts.jwks),
             ]
+        }))
+        .chain(self.renewal.iter().flat_map(|renewal| {
+            [("renewal.assertion", &renewal.assertion)]
+                .into_iter()
+                .chain(
+                    renewal
+                        .issuer_roots
+                        .iter()
+                        .map(|roots| ("renewal.issuer_roots", roots)),
+                )
         })) {
             if path.trim().is_empty() {
                 return Err(ConfigError::EmptyPath(name));
@@ -571,4 +791,75 @@ fn engine_named(
         named: named.to_owned(),
         supported,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Build, CONFIG_VERSION, Config, ConfigError};
+
+    fn with_renewal(allow: bool) -> Config {
+        let text = format!(
+            r#"config_version = {CONFIG_VERSION}
+role = "voter-frontend-observer"
+cluster_manifest = "/etc/coord/genesis.json"
+domain = "control-plane-a"
+state_directory = "/var/lib/coord/a"
+
+[listen]
+api_quic = "[::]:7443"
+peer_quic = "[::]:7444"
+
+[capability]
+writer_queue_bytes = 16777216
+buffer_bytes_per_subscription = 8388608
+max_live_subscriptions = 4096
+
+[state]
+root = "state"
+
+[journal]
+root = "journal"
+shards = 1
+
+[identity]
+trust_bundle = "/etc/coord/roots.pem"
+node_certificate = "/etc/coord/node.pem"
+node_key = "/etc/coord/node.key"
+
+[sts]
+issuer = "https://sts.example"
+resource = "control-plane-a"
+jwks = "/etc/coord/sts-jwks.json"
+trust_rule = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c"
+
+[renewal]
+issuer = "http://127.0.0.1:9000"
+assertion = "/var/run/secrets/token"
+lifetime_secs = 3600
+allow_insecure_loopback = {allow}
+"#
+        );
+        // Deserialized without validating, so each build's answer can be
+        // asked for from the one build the tests run in.
+        toml::from_str(&text).expect("the fixture parses")
+    }
+
+    #[test]
+    fn the_insecure_loopback_switch_is_honoured_only_by_a_test_build() {
+        let set = with_renewal(true);
+        assert_eq!(set.validate_as(Build::Test), Ok(()));
+        assert_eq!(
+            set.validate_as(Build::Release),
+            Err(ConfigError::TestOnlySwitch(
+                "renewal.allow_insecure_loopback"
+            ))
+        );
+        // Unset, the loopback http issuer is refused in either build, as
+        // it always was: the switch is what a release build will not
+        // honour, not a second way to reach the same refusal.
+        let unset = with_renewal(false);
+        for build in [Build::Test, Build::Release] {
+            assert_eq!(unset.validate_as(build), Err(ConfigError::InsecureIssuer));
+        }
+    }
 }

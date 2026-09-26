@@ -193,6 +193,8 @@ pub struct TestBinder {
     /// the age cap alone, which is what every test that is not about
     /// credential expiry wants.
     expires_at: Option<u64>,
+    /// Ends stated for one leaf, overriding `expires_at` for it.
+    ends: HashMap<Vec<u8>, Option<u64>>,
 }
 
 impl TestBinder {
@@ -203,6 +205,7 @@ impl TestBinder {
             domain,
             known: HashMap::new(),
             expires_at: None,
+            ends: HashMap::new(),
         }
     }
 
@@ -214,6 +217,18 @@ impl TestBinder {
     pub const fn expiring_at(mut self, unix_seconds: u64) -> Self {
         self.expires_at = Some(unix_seconds);
         self
+    }
+
+    /// Register an issued identity whose credential ends at `until`
+    /// (unix seconds; `None` for no stated end), whatever
+    /// [`TestBinder::expiring_at`] says for the others.
+    ///
+    /// The transport asks the binder about its own leaf as well as its
+    /// peers' (task-d02), so a test that is about one end's leaf needs
+    /// the two answers to differ.
+    pub fn register_until(&mut self, identity: &TestIdentity, until: Option<u64>) {
+        self.register(identity);
+        self.ends.insert(identity.chain[0].as_ref().to_vec(), until);
     }
 
     /// Register an issued identity.
@@ -257,7 +272,10 @@ impl IdentityBinder for TestBinder {
         })
     }
 
-    fn expires_at(&self, _certs: &[CertificateDer<'_>]) -> Option<u64> {
-        self.expires_at
+    fn expires_at(&self, certs: &[CertificateDer<'_>]) -> Option<u64> {
+        certs
+            .first()
+            .and_then(|leaf| self.ends.get(leaf.as_ref()).copied())
+            .unwrap_or(self.expires_at)
     }
 }

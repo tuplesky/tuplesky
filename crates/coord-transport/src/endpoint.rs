@@ -403,6 +403,11 @@ pub enum TransportError {
     Rejected(CloseReason),
     /// The dialing role may not open that lane.
     LaneNotAdmitted(Lane),
+    /// The credential this endpoint would present has reached its end.
+    /// Nothing is dialled under it: a handshake under an expired leaf is
+    /// one the far end should refuse, and one it did not would be
+    /// serving on a credential nobody vouches for any more.
+    CredentialExpired,
 }
 
 impl From<std::io::Error> for TransportError {
@@ -518,9 +523,60 @@ struct Shared {
     node_budget: Arc<Budget>,
     next: AtomicU64,
     accept_permits: Arc<Semaphore>,
+    /// What this endpoint presents, and what it needs in order to present
+    /// another leaf later (task-d02; see [`Transport::set_identity`]).
+    tls: Mutex<Tls>,
+}
+
+/// The TLS material an endpoint builds its configurations from.
+///
+/// Kept so a renewed leaf can be put into service without rebuilding the
+/// endpoint. The roots and the plane this endpoint serves do not change
+/// with a renewal; the client configurations do, and they are read here
+/// at every dial rather than copied into each [`Dialer`], so a dialer
+/// taken before a renewal presents the renewed leaf on its next dial.
+struct Tls {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    roots: Arc<rustls::RootCertStore>,
+    serves: Option<Class>,
+    /// The client configurations, `[api, peer]`.
+    client: [Arc<QuicClientConfig>; 2],
+    /// The api-class client configuration of a separate collector
+    /// credential, where the process has one. A renewal of the node's
+    /// leaf does not touch it: it is another principal's credential.
+    collector: Option<Arc<QuicClientConfig>>,
+    /// When the node's own leaf ends, in unix seconds, as the binder
+    /// reads it; `u64::MAX` where the binder does not answer. Every
+    /// handshake this endpoint accepts presents that leaf, and so does
+    /// every dial except an api-class one under the collector's.
+    node_until: u64,
+    /// The same for the collector credential, where there is one.
+    collector_until: u64,
 }
 
 impl Shared {
+    /// The client configuration a dial of `class` presents now, and when
+    /// the credential in it ends.
+    fn client_tls(&self, class: Class) -> (Arc<QuicClientConfig>, u64) {
+        let tls = self.tls.lock().unwrap();
+        match class {
+            Class::Api if tls.collector.is_some() => (tls.client[0].clone(), tls.collector_until),
+            Class::Api => (tls.client[0].clone(), tls.node_until),
+            Class::Peer => (tls.client[1].clone(), tls.node_until),
+        }
+    }
+
+    /// When the leaf an accepted handshake presents ends.
+    fn serving_until(&self) -> u64 {
+        self.tls.lock().unwrap().node_until
+    }
+
+    /// When a credential this endpoint presents ends, as the binder reads
+    /// it -- the same answer it gives for a peer's (design Section 10.4).
+    fn until(binder: &dyn IdentityBinder, chain: &[CertificateDer<'_>]) -> u64 {
+        binder.expires_at(chain).unwrap_or(u64::MAX)
+    }
+
     fn next_id(&self) -> ConnectionId {
         ConnectionId(self.next.fetch_add(1, Ordering::SeqCst))
     }
@@ -680,7 +736,6 @@ pub struct Transport {
     endpoint: quinn::Endpoint,
     shared: Arc<Shared>,
     events: [mpsc::Receiver<TransportEvent>; 4],
-    client_tls: [Arc<QuicClientConfig>; 2],
     lane_transport: [Arc<quinn::TransportConfig>; 4],
 }
 
@@ -697,7 +752,6 @@ pub struct Transport {
 pub struct Dialer {
     endpoint: quinn::Endpoint,
     shared: Arc<Shared>,
-    client_tls: [Arc<QuicClientConfig>; 2],
     lane_transport: [Arc<quinn::TransportConfig>; 4],
 }
 
@@ -718,10 +772,12 @@ impl Dialer {
             return Err(TransportError::LaneNotAdmitted(lane));
         }
         let class = role_class(local_role);
-        let tls = match class {
-            Class::Api => self.client_tls[0].clone(),
-            Class::Peer => self.client_tls[1].clone(),
-        };
+        // Read at the dial, not when the dialer was taken: a renewed
+        // leaf (task-d02) is what the next dial presents.
+        let (tls, until) = self.shared.client_tls(class);
+        if unix_millis() >= until.saturating_mul(1000) {
+            return Err(TransportError::CredentialExpired);
+        }
         let mut config = quinn::ClientConfig::new(tls);
         config.transport_config(self.lane_transport[lane.index()].clone());
         let connecting = self
@@ -749,7 +805,7 @@ impl Dialer {
                     false,
                     &self.shared.limits.lanes[lane.index()],
                 );
-                spawn_expiry(&self.shared, &peer);
+                spawn_expiry(&self.shared, &peer, until);
                 self.shared.register(peer.clone());
                 self.shared
                     .emit(TransportEvent::Connected {
@@ -857,8 +913,107 @@ impl Dialer {
     }
 }
 
+/// Wall-clock milliseconds: a credential's end is a wall-clock instant.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn tls_err(e: impl std::fmt::Display) -> TransportError {
     TransportError::Tls(e.to_string())
+}
+
+/// The server configuration an endpoint presents `chain` and `key` with.
+///
+/// One function for the endpoint's first identity and for every renewed
+/// one, so a renewal cannot quietly serve under a different profile.
+fn server_config(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    roots: &Arc<rustls::RootCertStore>,
+    serves: Option<Class>,
+    chain: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+    limits: &Limits,
+) -> Result<quinn::ServerConfig, TransportError> {
+    // One endpoint serves both ALPNs, and rustls decides client
+    // authentication before the negotiated ALPN is visible to the
+    // verifier, so presence is relaxed here and the plane's contract
+    // is enforced in `negotiate_incoming`: a peer-class connection,
+    // and every API role that acts for others, is rejected without a
+    // certificate. `allow_unauthenticated` relaxes presence only: a
+    // certificate that is presented is still chained to `roots` by the
+    // same verifier, so peer authentication is unchanged.
+    let verifier = WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
+        .allow_unauthenticated()
+        .build()
+        .map_err(tls_err)?;
+    let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(tls_err)?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain.to_vec(), key.clone_key())
+        .map_err(tls_err)?;
+    server.alpn_protocols = match serves {
+        Some(Class::Api) => vec![ALPN_API.to_vec()],
+        Some(Class::Peer) => vec![ALPN_PEER.to_vec()],
+        None => vec![ALPN_API.to_vec(), ALPN_PEER.to_vec()],
+    };
+    server.max_early_data_size = TlsProfile::FIXED.max_early_data_size;
+    let quic_server = QuicServerConfig::try_from(server).map_err(tls_err)?;
+    // Accepted connections start with the floor of every lane's
+    // limits (credit can only be raised once advertised); the lane
+    // declared in `Hello` raises them to its own.
+    let floor = lane::transport_config(
+        &LaneLimits::floor(&limits.lanes),
+        limits.idle_timeout,
+        limits.keep_alive,
+    )
+    .map_err(TransportError::Tls)?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+    server_config
+        .transport_config(floor)
+        .migration(TlsProfile::FIXED.server_migration)
+        .max_incoming(limits.max_connections);
+    Ok(server_config)
+}
+
+/// A client configuration offering `alpn` and presenting `chain`.
+fn client_config(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    roots: &Arc<rustls::RootCertStore>,
+    alpn: &[u8],
+    chain: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+) -> Result<Arc<QuicClientConfig>, TransportError> {
+    let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(tls_err)?
+        .with_root_certificates(roots.clone())
+        .with_client_auth_cert(chain.to_vec(), key.clone_key())
+        .map_err(tls_err)?;
+    client.alpn_protocols = vec![alpn.to_vec()];
+    client.enable_early_data = TlsProfile::FIXED.client_early_data;
+    Ok(Arc::new(
+        QuicClientConfig::try_from(client).map_err(tls_err)?,
+    ))
+}
+
+/// The node's `[api, peer]` client configurations: both present the
+/// node's own leaf, except that an api-class dial presents the separate
+/// collector credential where the process has one.
+fn node_client_configs(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    roots: &Arc<rustls::RootCertStore>,
+    chain: &[CertificateDer<'static>],
+    key: &PrivateKeyDer<'static>,
+    collector: &Option<Arc<QuicClientConfig>>,
+) -> Result<[Arc<QuicClientConfig>; 2], TransportError> {
+    let api = match collector {
+        Some(config) => config.clone(),
+        None => client_config(provider, roots, ALPN_API, chain, key)?,
+    };
+    Ok([api, client_config(provider, roots, ALPN_PEER, chain, key)?])
 }
 
 impl Transport {
@@ -889,33 +1044,14 @@ impl Transport {
         limits: Limits,
     ) -> Result<Transport, TransportError> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        // One endpoint serves both ALPNs, and rustls decides client
-        // authentication before the negotiated ALPN is visible to the
-        // verifier, so presence is relaxed here and the plane's contract
-        // is enforced in `negotiate_incoming`: a peer-class connection,
-        // and every API role that acts for others, is rejected without a
-        // certificate. `allow_unauthenticated` relaxes presence only: a
-        // certificate that is presented is still chained to `local.roots`
-        // by the same verifier, so peer authentication is unchanged.
-        let verifier =
-            WebPkiClientVerifier::builder_with_provider(local.roots.clone(), provider.clone())
-                .allow_unauthenticated()
-                .build()
-                .map_err(tls_err)?;
-        let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(tls_err)?
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(local.chain.clone(), local.key.clone_key())
-            .map_err(tls_err)?;
-        server.alpn_protocols = match local.serves {
-            Some(Class::Api) => vec![ALPN_API.to_vec()],
-            Some(Class::Peer) => vec![ALPN_PEER.to_vec()],
-            None => vec![ALPN_API.to_vec(), ALPN_PEER.to_vec()],
-        };
-        server.max_early_data_size = TlsProfile::FIXED.max_early_data_size;
-        let quic_server = QuicServerConfig::try_from(server).map_err(tls_err)?;
-
+        let server_config = server_config(
+            &provider,
+            &local.roots,
+            local.serves,
+            &local.chain,
+            &local.key,
+            &limits,
+        )?;
         let lane_config = |i: usize| {
             lane::transport_config(&limits.lanes[i], limits.idle_timeout, limits.keep_alive)
                 .map_err(TransportError::Tls)
@@ -926,20 +1062,6 @@ impl Transport {
             lane_config(2)?,
             lane_config(3)?,
         ];
-        // Accepted connections start with the floor of every lane's
-        // limits (credit can only be raised once advertised); the lane
-        // declared in `Hello` raises them to its own.
-        let floor = lane::transport_config(
-            &LaneLimits::floor(&limits.lanes),
-            limits.idle_timeout,
-            limits.keep_alive,
-        )
-        .map_err(TransportError::Tls)?;
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-        server_config
-            .transport_config(floor)
-            .migration(TlsProfile::FIXED.server_migration)
-            .max_incoming(limits.max_connections);
 
         // Which principal this endpoint dials as. The peer plane is
         // always the node itself; an API-class dial may be somebody
@@ -947,30 +1069,27 @@ impl Transport {
         // runs a voter *and* that domain's collector is two principals.
         // What it serves as is unaffected: a caller validating this
         // node's server certificate still sees the node.
-        let client_for = |alpn: &[u8],
-                          chain: &[CertificateDer<'static>],
-                          key: &PrivateKeyDer<'static>|
-         -> Result<Arc<QuicClientConfig>, TransportError> {
-            let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(tls_err)?
-                .with_root_certificates(local.roots.clone())
-                .with_client_auth_cert(chain.to_vec(), key.clone_key())
-                .map_err(tls_err)?;
-            client.alpn_protocols = vec![alpn.to_vec()];
-            client.enable_early_data = TlsProfile::FIXED.client_early_data;
-            Ok(Arc::new(
-                QuicClientConfig::try_from(client).map_err(tls_err)?,
-            ))
+        let collector = match &local.api_client {
+            Some(other) => Some(client_config(
+                &provider,
+                &local.roots,
+                ALPN_API,
+                &other.chain,
+                &other.key,
+            )?),
+            None => None,
         };
-        let (api_chain, api_key) = match &local.api_client {
-            Some(other) => (other.chain.as_slice(), &other.key),
-            None => (local.chain.as_slice(), &local.key),
-        };
-        let client_tls = [
-            client_for(ALPN_API, api_chain, api_key)?,
-            client_for(ALPN_PEER, &local.chain, &local.key)?,
-        ];
+        let node_until = Shared::until(binder.as_ref(), &local.chain);
+        let collector_until = local.api_client.as_ref().map_or(u64::MAX, |other| {
+            Shared::until(binder.as_ref(), &other.chain)
+        });
+        let client_tls = node_client_configs(
+            &provider,
+            &local.roots,
+            &local.chain,
+            &local.key,
+            &collector,
+        )?;
 
         let runtime = quinn::default_runtime()
             .ok_or_else(|| TransportError::Tls("no async runtime for the endpoint".into()))?;
@@ -980,6 +1099,8 @@ impl Transport {
             socket,
             runtime,
         )?;
+        // A fallback only: every dial here names its configuration
+        // (`Dialer::connect`), so a renewal need not replace this one.
         let mut default_client = quinn::ClientConfig::new(client_tls[1].clone());
         default_client.transport_config(lane_transport[Lane::Control.index()].clone());
         endpoint.set_default_client_config(default_client);
@@ -1005,15 +1126,69 @@ impl Transport {
             )),
             next: AtomicU64::new(1),
             accept_permits: Arc::new(Semaphore::new(limits.max_connections.max(1))),
+            tls: Mutex::new(Tls {
+                provider,
+                roots: local.roots,
+                serves: local.serves,
+                client: client_tls,
+                collector,
+                node_until,
+                collector_until,
+            }),
         });
         tokio::spawn(accept_loop(endpoint.clone(), shared.clone()));
         Ok(Transport {
             endpoint,
             shared,
             events: [rx0, rx1, rx2, rx3],
-            client_tls,
             lane_transport,
         })
+    }
+
+    /// Present `chain` and `key` from now on, in both directions, without
+    /// touching a connection that is already open (task-d02).
+    ///
+    /// A renewed leaf is put into service here. Handshakes that begin
+    /// after this call present it: incoming ones through the endpoint's
+    /// server configuration, outgoing ones through the client
+    /// configuration every [`Dialer`] reads at its next dial, including
+    /// a dialer taken before this call. A connection already open was
+    /// authenticated under the leaf it presented then and keeps it, and
+    /// ends where it always would: at the end of that leaf, at the
+    /// credential deadline its peer holds for it, or at the age cap. A
+    /// node renews long before its leaf ends, so those connections are
+    /// re-dialled under the new leaf in the meantime rather than all at
+    /// once here: closing them at the swap would turn every renewal into
+    /// an outage of every link the node holds, which is exactly what
+    /// renewing early exists to avoid.
+    ///
+    /// Everything is built before anything is replaced, so a chain or
+    /// key the TLS stack refuses leaves the endpoint presenting what it
+    /// presented before. A separate collector credential
+    /// ([`LocalIdentity::api_client`]) is another principal's and is left
+    /// as it is.
+    pub fn set_identity(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<(), TransportError> {
+        let mut tls = self.shared.tls.lock().unwrap();
+        let server = server_config(
+            &tls.provider,
+            &tls.roots,
+            tls.serves,
+            &chain,
+            &key,
+            &self.shared.limits,
+        )?;
+        let client = node_client_configs(&tls.provider, &tls.roots, &chain, &key, &tls.collector)?;
+        let until = Shared::until(self.shared.binder.as_ref(), &chain);
+        // New handshakes only: quinn hands an existing connection's
+        // state nothing from here.
+        self.endpoint.set_server_config(Some(server));
+        tls.client = client;
+        tls.node_until = until;
+        Ok(())
     }
 
     /// The fixed TLS profile.
@@ -1110,7 +1285,6 @@ impl Transport {
         Dialer {
             endpoint: self.endpoint.clone(),
             shared: self.shared.clone(),
-            client_tls: self.client_tls.clone(),
             lane_transport: self.lane_transport.clone(),
         }
     }
@@ -1533,6 +1707,23 @@ async fn accept_loop(endpoint: quinn::Endpoint, shared: Arc<Shared>) {
 
 async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
     let id = shared.next_id();
+    // Read before the handshake: a renewal only ever moves it later, so
+    // a leaf swapped in while this handshake runs can only make the
+    // bound early, never late.
+    let until = shared.serving_until();
+    if unix_millis() >= until.saturating_mul(1000) {
+        // This endpoint's own leaf has ended: nothing is accepted under
+        // it, whoever is asking.
+        incoming.refuse();
+        shared
+            .emit(TransportEvent::Closed {
+                connection: id,
+                lane: None,
+                reason: CloseReason::Expired,
+            })
+            .await;
+        return;
+    }
     let conn = match timeout(shared.limits.handshake_timeout, incoming).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
@@ -1567,7 +1758,7 @@ async fn serve_incoming(shared: Arc<Shared>, incoming: quinn::Incoming) {
                 true,
                 &shared.limits.lanes[lane.index()],
             );
-            spawn_expiry(&shared, &peer);
+            spawn_expiry(&shared, &peer, until);
             shared.register(peer.clone());
             shared
                 .emit(TransportEvent::Connected {
@@ -1859,14 +2050,30 @@ async fn read_uni(
     }
 }
 
-/// Close `peer` when its credential ends or its age cap is reached
-/// (task-58).
+/// Close `peer` when its credential ends, when the credential this end
+/// presented on it ends (`local_until`, unix seconds), or at its age cap,
+/// whichever comes first (task-58, task-d02; design Sections 10.4, 20.4).
+///
+/// Both ends were authenticated once, at the handshake, and each by a
+/// credential with an end. A connection that outlived this end's leaf
+/// would go on carrying frames from a node whose credential nobody
+/// vouches for any more -- the peer's own bound says the same thing
+/// from the other side, but only where the peer enforces one. A node
+/// that renews has put a newer leaf into service long before the old one
+/// ends, so what closes here is a connection the peer then re-dials
+/// under the new one; a node that does not renew stops serving at its
+/// leaf's end rather than half-serving past it.
 ///
 /// Racing the connection's own close keeps the task's life the
 /// connection's life: a cap measured in hours would otherwise leave one
 /// sleeping task per connection ever made.
-fn spawn_expiry(shared: &Arc<Shared>, peer: &Arc<Peer>) {
-    let life = shared.credential_life(&peer.conn);
+fn spawn_expiry(shared: &Arc<Shared>, peer: &Arc<Peer>, local_until: u64) {
+    let local = Duration::from_millis(
+        local_until
+            .saturating_mul(1000)
+            .saturating_sub(unix_millis()),
+    );
+    let life = shared.credential_life(&peer.conn).min(local);
     let peer = peer.clone();
     tokio::spawn(async move {
         tokio::select! {

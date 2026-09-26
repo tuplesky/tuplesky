@@ -43,6 +43,16 @@ pub struct RolePolicy {
     pub max_lifetime_secs: u64,
     /// Endpoint DNS names the certificate may carry.
     pub dns_names: Vec<String>,
+    /// Endpoint IP addresses the certificate may carry.
+    ///
+    /// An endpoint catalog may list a voter by IP literal, and a peer
+    /// dialling one checks the address against the certificate's IP
+    /// SANs, not its DNS names. A policy that could only grant names
+    /// would issue a node reached by address a certificate its peers
+    /// refuse -- and a renewal (task-d02) would take away the address
+    /// the node's first certificate carried, which ends the node's
+    /// reachability at the moment it was meant to extend it.
+    pub ip_addresses: Vec<std::net::IpAddr>,
 }
 
 /// The node identity and certificate shape a policy authorizes.
@@ -52,6 +62,8 @@ pub struct NodePolicy {
     pub identity: NodeIdentity,
     /// Endpoint DNS names.
     pub dns_names: Vec<String>,
+    /// Endpoint IP addresses.
+    pub ip_addresses: Vec<std::net::IpAddr>,
     /// Certificate lifetime in seconds.
     pub lifetime_secs: u64,
 }
@@ -95,6 +107,7 @@ pub fn authorize(
             role: rule.role,
         },
         dns_names: rule.dns_names.clone(),
+        ip_addresses: rule.ip_addresses.clone(),
         lifetime_secs,
     })
 }

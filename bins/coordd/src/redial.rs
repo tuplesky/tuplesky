@@ -207,7 +207,7 @@ impl Redial {
 ///
 /// Deterministic, so a schedule can be tested, and different per voter
 /// and per attempt, which is all jitter has to be.
-fn jitter(wait: Duration, salt: u64, attempts: u64, ceiling: Duration) -> Duration {
+pub fn jitter(wait: Duration, salt: u64, attempts: u64, ceiling: Duration) -> Duration {
     let draw = splitmix(salt ^ attempts.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     // A fraction in [0, 1) with 16 bits of resolution.
     let fraction = (draw >> 48) as u32;

@@ -3068,3 +3068,219 @@ by design. The Kine half is `scripts/e2e/multi-host-local.sh`, which
 the certification workflow runs. Neither is the runbook followed on
 three real hosts, and `docs/operations/multi-host-test.md` says so
 rather than recording markers nobody has seen.
+
+## A credential that is renewed early never has to be extended
+
+task-d02. task-58 made the renewal arithmetic and left it reachable only
+through `coordd inspect`: a serving node built its endpoint identity
+once, never asked the issuer for anything, and went out at its leaf's
+`notAfter` until an operator restarted it on a renewed one. Short-lived
+leaves are the design's answer to revocation, and without a driver they
+were also a scheduled outage of every node.
+
+The driver is three pieces, split the way `redial` split task-d03's.
+
+- **`bins/coordd/src/renewal.rs`** is the schedule. It is handed unix
+  milliseconds and answers `Wait`, `Enroll`, `InFlight` or `Expired`, one
+  enrollment at a time. A failure waits a jittered backoff that doubles
+  from one second to five minutes. A wait that would cross the deadline
+  becomes one last attempt a second before it, and after that the
+  deadline itself. `Expired` wins over everything, an attempt in flight
+  included: while one is out, the loop is woken at the deadline, not when
+  the attempt answers.
+- **`bins/coordd/src/enroll.rs`** asks the issuer and judges the answer.
+  It posts to `/enroll` over a client with no redirects, no environment
+  proxy and bounded time. The assertion is read from its file at every
+  attempt, because the platform rotates it in place. The request is
+  signed with the key the node already holds, which is what makes the
+  answer a renewal of the committed key. The answer is refused, and the
+  node stays on its current leaf, unless it names the same cluster,
+  node, incarnation and role, certifies the same key, classifies as
+  `Renewal` against committed membership (for a voter), keeps every DNS
+  name and address of the current leaf, ends later, and chains to the
+  trust bundle under the check a start makes (`coord_daemon::verify_chain`,
+  now shared by both). An accepted leaf is written over
+  `node_certificate` atomically, beside it and renamed, with the file's
+  own mode, before anything presents it. So what a node serves on is
+  always what a restart would come back on.
+- **`Transport::set_identity`** puts it into service. The endpoint's
+  server configuration is replaced through `quinn::Endpoint::
+  set_server_config`, which only new incoming handshakes see. The client
+  configurations moved out of `Transport` and `Dialer` into the
+  endpoint's shared state, read at each dial, so a dialer taken before
+  the renewal presents the new leaf on its next dial. Nothing already
+  connected is touched.
+
+That last point is the no-drop property: a renewal closes nothing at
+the swap, because the old leaf's end already reaches every connection
+made under it, and it is still hours away when a node renews. Each peer
+holds the old leaf's `notAfter` as the deadline of every connection it
+authenticated under it (task-58). The node holds the same deadline from
+its own side: every connection ends at the earliest of the peer's
+credential deadline, the end of the leaf this end presented on it, and
+the age cap (design Sections 10.4, 20.4). Those close as `Expired`, and
+task-d03's re-dial brings them back under the new leaf, which the peer
+binder admits as `Renewal`. A caller connected before the renewal is
+served on its connection up to the old leaf's end and then reconnects
+under the new one.
+
+The transport asks the binder for its own leaf's end, as it does for a
+peer's, so one component answers both. Past that end it refuses every
+handshake in either direction: a dial returns
+`TransportError::CredentialExpired`, and an incoming one is refused
+before the TLS exchange and reported as a `Closed` with `Expired`.
+`set_identity` moves the end to the renewed leaf's for handshakes that
+start after it. A handshake that started before is bounded by the end
+read before it, which a renewal only moves later.
+
+### Five decisions the plan entry did not make
+
+- **The lifetime asked for is configured, not copied.** The issuer
+  back-dates `notBefore` by its clock uncertainty, so a lifetime read off
+  the current leaf is a little longer than the one asked for it. A node
+  that asked for "the same again" would ask for more on every renewal,
+  until the issuer's policy refused it at some due point weeks in. So
+  `renewal.lifetime_secs` is required.
+- **The issuer grants addresses as well as names.** `RolePolicy` gained
+  `ip_addresses`. A catalog may list a voter by IP literal, and a peer
+  dialling it checks the certificate's IP SANs. An issuer that could only
+  grant DNS names would renew a node reached by address into a leaf its
+  peers refuse. The renewal check refuses such a leaf anyway, since it
+  drops an address. Without this field it could never be issued one it
+  accepts.
+- **Plain HTTP only for a loopback issuer, and only in a test build.**
+  `issuer` must be `https://`. `allow_insecure_loopback = true` admits
+  `http://` to `127.0.0.1`, `[::1]` or `localhost`, decided by parsing the
+  host. It is for the tests, which serve `coord_node_issuer::router`
+  in-process. The field stays in the schema, so one configuration parses
+  in every build, but only a build with debug assertions accepts it set.
+  A release build refuses it at validation as
+  `ConfigError::TestOnlySwitch("renewal.allow_insecure_loopback")`,
+  because Section 20.5 forbids insecure switches in production artifacts
+  and Section 22.1 already calls development HTTP loopback test-only. A
+  production node renews at an `https://` issuer, with `issuer_roots`
+  where the issuer is not publicly rooted. A URL with userinfo, a
+  query or a fragment is refused, so no report can carry a credential by
+  naming the issuer. The host and port are checked for either scheme,
+  and the enroller parses the URL at startup as its client will, so a
+  URL the client would refuse fails the start and `--check` rather than
+  the first due attempt. `issuer_roots` pins the issuer's TLS roots.
+- **Every node stops at its leaf's end, renewing or not.** A node
+  ends its serving loop there and exits with status 2, reporting
+  `phase=quarantined reason=credential-expired`
+  (`QuarantineReason::CredentialExpired`), so an operator watches for one
+  signal whatever the configuration. A node without `[renewal]` says
+  `renewal not-configured` next to its leaf's `expires_at` at startup,
+  and `renewal not-configured expires_at=N: ...` when it stops. Its
+  transports already refuse every handshake and end every connection at
+  that instant, so what it would otherwise leave is a process that
+  reaches nobody: the intended fail-closed is to stop rather than
+  half-serve. This is a behaviour change for a deployment on
+  short-lived leaves that does not renew. The harness's leaves are valid
+  until the year 4096. The deadline is raced against the whole serving
+  loop, not only checked at the top of each pass: a pass can wait inside
+  itself on a slow caller, and nothing in it looks at the time while it
+  does. When the deadline wins, the loop is dropped wherever it was
+  waiting, as a crash would drop it.
+- **The spread fits the leaf.** `jitter_secs` (default an hour) is a
+  spread over a fleet, and a leaf lasts whatever the issuer granted. On
+  an hour-long leaf, due at forty minutes, an unbounded hour of jitter
+  put most nodes' due point past the end, clamped to a second before it:
+  one attempt, then the node stopped. The jitter is bounded to half the
+  window between the due point and the leaf's end, which keeps the
+  spread and leaves the other half for retries. `coordd inspect` reports
+  the same bounded due point.
+
+What the enroller checks before the first due point, when it is built at
+startup and under `--check`: that the node certificate file holds
+certificates only, since a renewal rewrites it with the chain alone and a
+key kept in the same file would be written away (the process serving on
+from memory, the next start refused, and for a voter no way back but a
+committed replacement); that the file is not read-only; and that a file
+can be created beside it. An install failure names the path. A renewed
+leaf must also keep every extended key usage the current one carries. The
+chain check verifies a leaf as a client certificate, so a clientAuth-only
+renewal would pass it and then fail every handshake the node serves.
+
+Two edges of the swap. An answer that lands at or past the leaf's end is
+not put into service, because the deadline does not move. The leaf is on
+disk, so a restart comes back on it. If the peer plane refuses a renewed
+leaf that the api plane took, the api plane goes back to the current one
+and the attempt fails like any other, so the two planes never present
+different leaves. The enroller classifies a voter's renewed key against a
+copy of the committed membership taken at startup. task-m03, which
+installs a new membership into the running daemon, has to reach that copy
+as well.
+
+X.509 counts the `notAfter` second as valid, and `RenewalPolicy` counts
+it as expired. The node stops at the start of that second. A peer that
+re-dials within it can still complete a handshake under the old leaf,
+and closes the connection at once, because its deadline has passed. The
+three-voter test waits two seconds past the boundary and then requires
+the mesh to stay quiet, because a count read at the boundary can say
+`2` for a node its peers are about to refuse.
+
+### What the tests show
+
+`bins/coordd/tests/cli.rs` runs real daemons against an issuer served
+in-process over loopback HTTP. The issuer signs with the domain's own CA
+and verifies a Kubernetes-style assertion the node reads from a file.
+
+- `a_leaf_that_falls_due_is_renewed_in_place_and_serving_carries_on`: a
+  single voter holds a thirty-second leaf, and the issuer is down at the
+  due point. The node reports the failed attempt, and the issuer is
+  started. The node renews, and the file holds the same key with a later
+  end. A caller bound before the renewal is served until the old leaf's
+  end, and its connection is closed there as `Expired`. A new caller
+  then connects and is served under the renewed leaf.
+- `with_the_issuer_down_a_node_serves_to_its_deadline_and_stops_there`:
+  an eighteen-second leaf and no issuer. The node serves a put after the
+  due point and exits with status 2 at the deadline, not before. When
+  the issuer comes back afterwards, a restart is refused before any
+  store is opened.
+- `a_node_that_does_not_renew_stops_at_its_leafs_end_like_one_that_does`:
+  a twelve-second leaf and no `[renewal]`. The node serves a put, then
+  exits with status 2 and `reason=credential-expired` at the leaf's end,
+  not before. Its caller's connection was closed as `Expired`.
+- `peers_admit_a_voters_renewed_leaf`: voter 1 of three renews. The old
+  leaf's end closes its links, both peers take it back and hold it, with
+  no identity refusal. A request through voter 1, the leader, is
+  established.
+- `coord-transport`'s
+  `a_renewed_identity_is_presented_on_new_handshakes_and_open_ones_are_left_alone`
+  shows the swap at the transport. A warm link carries a frame after it.
+  A node that admits only the renewed leaf can connect in, and a dialer
+  taken before the swap presents the renewed leaf.
+- `coord-transport`'s
+  `a_connection_ends_with_the_leaf_this_end_presented_and_nothing_is_made_under_it_after`
+  shows the local bound. The far end states no end for the leaf, so
+  only this end's rule closes the connection. Past the leaf's end, a dial
+  is refused as `CredentialExpired` and an incoming handshake is refused.
+  After `set_identity`, both directions work again.
+
+Negative controls, run by hand. With the driver disabled (`renew`
+doing nothing), all three renewing daemon tests fail. Without the local
+bound in `spawn_expiry`, the transport test fails when the connection
+outlives the leaf. Without the dial refusal, it fails because the dial
+succeeds, and without the accept refusal, it fails because the
+handshake is accepted. With the deadline raced only where renewal is
+configured, the non-renewing daemon test fails because the node keeps
+running. With the leaf renewed and
+written but never swapped into the transports, the single-voter test
+fails when the late caller's handshake reports `certificate expired`,
+and the three-voter test fails when the peers do not take voter 1 back.
+
+### What is left
+
+- **A separate collector credential is not renewed here.** A process
+  that runs a voter and its domain's frontend submits to other voters as
+  the collector, with its own certificate (`collector_certificate`).
+  That certificate is another principal's, and `set_identity` leaves it
+  as it is. The transport bounds the collector's connections by that
+  certificate's end and dials nothing under it afterwards. Renewing it is
+  the follow-up on this task: the same enroller, as role `Frontend`,
+  under the same key.
+- **The trust bundle is not reloaded.** A staged CA rotation that
+  replaces the bundle still needs a restart. A leaf renewed under a new
+  root that the running node does not yet trust is refused by the chain
+  check, and the node stays on the leaf it has.

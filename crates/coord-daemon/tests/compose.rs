@@ -801,3 +801,103 @@ node_key = "/n.key"
         );
     }
 }
+
+/// Renewal is optional, and where it is configured the issuer it names
+/// is one this node may take its credential from (task-d02).
+#[test]
+fn a_renewal_issuer_is_https_or_an_allowed_loopback_address() {
+    let renewal = |body: &str| base_config(&format!("\n[renewal]\n{body}\n"));
+    // Absent: nothing renews, and nothing is required.
+    assert_eq!(Config::parse(&base_config("")).unwrap().renewal, None);
+    let config = Config::parse(&renewal(
+        "issuer = \"https://issuer.example:8443\"\nassertion = \"/var/run/secrets/token\"\nlifetime_secs = 86400",
+    ))
+    .unwrap();
+    let section = config.renewal.expect("configured");
+    assert_eq!(section.jitter_secs, 3600, "the default spread");
+    assert_eq!(section.lifetime_secs, 86400);
+    // Plain HTTP is refused, loopback included, unless explicitly allowed
+    // -- and then only on loopback, decided by parsing the host rather
+    // than by a prefix of the string.
+    for (url, allow, ok) in [
+        ("http://127.0.0.1:9000", false, false),
+        ("http://127.0.0.1:9000", true, true),
+        ("http://[::1]:9000", true, true),
+        ("http://localhost:9000", true, true),
+        ("http://127.0.0.1.evil.example", true, false),
+        ("http://issuer.example", true, false),
+        ("https://user:secret@issuer.example", false, false),
+        ("https://issuer.example/?next=x", false, false),
+        ("ftp://issuer.example", true, false),
+        // A host and port the HTTP client would refuse, for either scheme.
+        ("https://issuer.example:not-a-port", false, false),
+        ("https://issuer.example:", false, false),
+        ("https://issuer.example:0", false, false),
+        ("https://issuer.example:65536", false, false),
+        ("https://issuer.example:8443:1", false, false),
+        ("https://:8443", false, false),
+        ("https://[::1", false, false),
+        ("https://[not-v6]:8443", false, false),
+        ("https://[::1]x", false, false),
+        ("https://issuer_example", false, false),
+        ("https://-issuer.example", false, false),
+        ("https://999.0.0.1", false, false),
+        ("http://127.0.0.1:x", true, false),
+        ("https://[2001:db8::1]:8443", false, true),
+        ("https://192.0.2.1", false, true),
+        ("https://issuer.example.:8443/base/", false, true),
+        ("http://LOCALHOST:9000", true, true),
+    ] {
+        let parsed = Config::parse(&renewal(&format!(
+            "issuer = \"{url}\"\nassertion = \"/t\"\nlifetime_secs = 60\nallow_insecure_loopback = {allow}"
+        )));
+        // The switch itself is test-only: a release build refuses it set,
+        // before the URL is looked at (the unit test in `config.rs` asks
+        // both builds).
+        if allow && !cfg!(debug_assertions) {
+            assert_eq!(
+                parsed,
+                Err(ConfigError::TestOnlySwitch(
+                    "renewal.allow_insecure_loopback"
+                )),
+                "{url}"
+            );
+            continue;
+        }
+        assert_eq!(
+            parsed.is_ok(),
+            ok,
+            "{url} allow={allow}: {:?}",
+            parsed.err()
+        );
+        if !ok {
+            assert_eq!(parsed, Err(ConfigError::InsecureIssuer), "{url}");
+        }
+    }
+    // A lifetime of nothing, none at all, an empty path, and an unknown
+    // key are refused.
+    assert!(matches!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \"/t\""
+        )),
+        Err(ConfigError::Parse(_))
+    ));
+    assert_eq!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \"/t\"\nlifetime_secs = 0"
+        )),
+        Err(ConfigError::ZeroLifetime)
+    );
+    assert_eq!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \" \"\nlifetime_secs = 60"
+        )),
+        Err(ConfigError::EmptyPath("renewal.assertion"))
+    );
+    assert!(matches!(
+        Config::parse(&renewal(
+            "issuer = \"https://i.example\"\nassertion = \"/t\"\nlifetime_secs = 60\nextend_deadline = true"
+        )),
+        Err(ConfigError::Parse(_))
+    ));
+}

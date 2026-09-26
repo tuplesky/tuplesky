@@ -18,11 +18,13 @@
 //! configuration every replica agreed on.
 
 mod backup;
+mod enroll;
 mod genesis;
 mod leases;
 mod membership;
 mod peers;
 mod redial;
+mod renewal;
 mod serve;
 mod store;
 
@@ -575,7 +577,9 @@ fn main() -> ExitCode {
     // to understand. The operator-facing answer to "why is this node not
     // voting" has to be available precisely when the node cannot serve.
     if let Some(Command::Inspect) = cli.command {
-        let policy = coord_node_issuer::RenewalPolicy::default();
+        // The policy the serving loop runs, so the due point reported
+        // here is the one the node acts on.
+        let policy = renewal::policy(config.renewal.as_ref());
         return match membership::inspect(
             &config.cluster_manifest,
             &config.identity.node_certificate,
@@ -591,10 +595,15 @@ fn main() -> ExitCode {
                     credential_state(&report.credential),
                 );
                 println!(
-                    "leaf issued_at={} expires_at={} renewal={}",
+                    "leaf issued_at={} expires_at={} renewal={} driver={}",
                     report.leaf.issued_at,
                     report.leaf.expires_at,
                     renewal_state(&report.renewal),
+                    if config.renewal.is_some() {
+                        "configured"
+                    } else {
+                        "not-configured"
+                    },
                 );
                 ExitCode::SUCCESS
             }
@@ -661,7 +670,7 @@ fn main() -> ExitCode {
     // certificate has to be one this domain issued, held by this
     // process, before any store is opened under it: a self-signed leaf
     // claiming a voter's node URI would otherwise open that voter's store.
-    if let Err(e) = coord_daemon::load_identity(
+    let identity = match coord_daemon::load_identity(
         &config.identity,
         placed.membership.cluster(),
         placed.membership.domain(),
@@ -669,11 +678,15 @@ fn main() -> ExitCode {
         coord_transport::Class::Api,
         Some(placed.replica),
     )
-    .and_then(|identity| coord_daemon::verify_identity(&identity, &config.identity))
-    {
-        eprintln!("{e}");
-        return ExitCode::from(2);
-    }
+    .and_then(|identity| {
+        coord_daemon::verify_identity(&identity, &config.identity).map(|()| identity)
+    }) {
+        Ok(identity) => identity,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     println!(
         "node replica={} incarnation={} role={:?} voters={}",
         short(&placed.replica.0),
@@ -807,6 +820,49 @@ fn main() -> ExitCode {
         return restore(&config, &placed, dir, fencing, *plan);
     }
 
+    // Renewal is settled before anything is opened (task-d02), and before
+    // `--check` answers. A configuration that names an issuer this node
+    // cannot use stops it here, not at the due point hours into serving;
+    // and the report says when this leaf ends and whether anything will
+    // renew it, because an operator reading a startup report is the one
+    // who has to know that a node without renewal goes out at `notAfter`.
+    let credential = match enroll::Credential::of(identity.chain, identity.key, identity.roots) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    // Every node stops serving at its leaf's end, renewing or not
+    // (task-d02). Where nothing renews it, the end is fixed here.
+    let leaf_expires_at = credential.leaf.expires_at;
+    let renewing = match &config.renewal {
+        Some(section) => {
+            let enroller = match enroll::Enroller::new(
+                section,
+                &config.identity.node_certificate,
+                placed.membership.clone(),
+                roles.votes(),
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let renewing =
+                serve::Renewing::new(enroller, credential, renewal::policy(Some(section)));
+            println!("{}", renewing.describe(now_seconds().saturating_mul(1000)));
+            Some(renewing)
+        }
+        None => {
+            println!(
+                "renewal not-configured issued_at={} expires_at={}",
+                credential.leaf.issued_at, credential.leaf.expires_at
+            );
+            None
+        }
+    };
     if cli.check {
         return ExitCode::SUCCESS;
     }
@@ -1081,7 +1137,31 @@ fn main() -> ExitCode {
         if voting {
             domain = domain.with_expiry(crate::leases::Expiry::new(cluster_id, domain_id));
         }
-        domain.run(&mut transport, now_seconds).await;
+        // Every role renews the same way: a collector or an observer asks
+        // for exactly the leaf it has, and is refused anything that would
+        // name another role (task-d02).
+        if let Some(renewing) = renewing {
+            domain = domain.with_renewal(renewing);
+        }
+        // The leaf's deadline is raced against the whole loop, not only
+        // checked at the top of each pass: a pass can wait inside itself
+        // on a slow caller, and a node must not go on serving on a leaf
+        // past its notAfter while it does (task-d02).
+        //
+        // Every node, not only one that renews: a node without renewal
+        // stops at its leaf's end instead of half-serving past it -- its
+        // transports already refuse every handshake and end every
+        // connection there, so what would be left is a process that
+        // cannot reach anyone (design Sections 10.4, 20.4).
+        let (_fixed, deadline) = tokio::sync::watch::channel(leaf_expires_at.saturating_mul(1000));
+        let deadline = domain.leaf_deadline().unwrap_or(deadline);
+        let raced = tokio::select! {
+            () = domain.run(&mut transport, now_seconds) => false,
+            () = serve::leaf_expired(deadline) => true,
+        };
+        if raced {
+            domain.leaf_expired_while_serving();
+        }
         eprintln!(
             "peers connected={} submittable={}",
             domain.reachable(),
@@ -1123,6 +1203,31 @@ crowded_out={}",
             counts.unclaimed,
             counts.crowded_out
         );
+        let renewal = domain.renewal();
+        if let Some(r) = renewal {
+            eprintln!(
+                "renewal renewed={} attempts={} failed={} expires_at={} expired={}",
+                r.renewed, r.attempts, r.failed, r.expires_at, r.expired
+            );
+        } else if raced {
+            eprintln!(
+                "renewal not-configured expires_at={leaf_expires_at}: this node's leaf is no \
+                 longer valid and it stops serving on it; restart it on a renewed leaf"
+            );
+        }
+        // Not a fault of the store and not a crash: the credential this
+        // node is has ended. The process stops rather than serve on it,
+        // and says why in the phase an operator watches -- the same
+        // signal whether or not anything was renewing it.
+        if raced || renewal.is_some_and(|r| r.expired) {
+            let mut lifecycle = lifecycle;
+            lifecycle.quarantine(QuarantineReason::CredentialExpired);
+            eprintln!(
+                "coordd phase={} reason=credential-expired",
+                Diagnostics::snapshot(&roles, &lifecycle, 0).phase
+            );
+            return ExitCode::from(2);
+        }
         ExitCode::from(1)
     })
 }

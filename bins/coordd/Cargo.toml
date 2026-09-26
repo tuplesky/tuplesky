@@ -40,6 +40,11 @@ quinn.workspace = true
 coord-types.workspace = true
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# Leaf renewal (task-d02): the enrollment request is signed with the
+# node's own key, and posted to the node issuer over a hardened client.
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 coord-sdk.workspace = true
@@ -65,3 +70,6 @@ serde_json.workspace = true
 # daemon itself.
 coord-harness.workspace = true
 coord-wan-bench.workspace = true
+time.workspace = true
+axum.workspace = true
+coord-authn.workspace = true
