@@ -452,6 +452,45 @@ pub fn accept(
     })
 }
 
+/// Check that `credential` is this node's collector: issued by the trust
+/// bundle, held under its own key, naming this node at this incarnation,
+/// in a role that may submit on a caller's behalf.
+///
+/// The node's own leaf gets the chain check at startup and is what the
+/// node's identity is read from; the collector's leaf was only read. A
+/// collector leaf for another node or incarnation was accepted and then
+/// renewed faithfully, since a renewal is compared with the leaf it
+/// replaces, not with the node. So the collector's leaf is tied to the
+/// node here, once, before anything presents it (task-d02).
+pub fn collector_for(
+    credential: &Credential,
+    cluster: coord_types::ids::ClusterId,
+    node: coord_types::ids::ReplicaId,
+    incarnation: coord_types::ids::ReplicaIncarnation,
+) -> Result<(), String> {
+    coord_daemon::verify_chain(&credential.chain, &credential.key, &credential.roots)
+        .map_err(|e| e.to_string())?;
+    let named = &credential.identity;
+    if named.cluster != cluster || named.node != node {
+        return Err("it names another node".into());
+    }
+    if named.incarnation != incarnation {
+        return Err(format!(
+            "it names incarnation {}, and this node is incarnation {}",
+            named.incarnation.get(),
+            incarnation.get()
+        ));
+    }
+    match named.role {
+        coord_types::wire_v1::PeerRole::Frontend
+        | coord_types::wire_v1::PeerRole::KineCollector => Ok(()),
+        other => Err(format!(
+            "it names the role {}, which may not submit on a caller's behalf",
+            coord_node_issuer::role_str(other)
+        )),
+    }
+}
+
 /// Whether the chain at `path` is one renewal can replace: a file of
 /// certificates only, which this process can write beside and over.
 ///
@@ -780,6 +819,66 @@ mod tests {
             Err(other) => panic!("refused for the wrong reason: {other}"),
             Ok(_) => panic!("accepted"),
         }
+    }
+
+    /// A collector leaf is this node's only if it chains to the trust
+    /// bundle under its own key and names this node, at this incarnation,
+    /// in a submitting role; anything else is refused for what it is.
+    #[test]
+    fn a_collector_leaf_must_be_this_nodes() {
+        use coord_types::ids::{ClusterId, ReplicaId, ReplicaIncarnation};
+        let ca = new_ca();
+        let f = fixture(&ca);
+        let cluster = ClusterId(CLUSTER);
+        let node = ReplicaId([1; 16]);
+        let first = ReplicaIncarnation::new(1).unwrap();
+        for role in [PeerRole::Frontend, PeerRole::KineCollector] {
+            collector_for(&f.current(role), cluster, node, first).expect("this node's collector");
+        }
+        let why = collector_for(
+            &f.current(PeerRole::Frontend),
+            cluster,
+            ReplicaId([2; 16]),
+            first,
+        )
+        .unwrap_err();
+        assert!(why.contains("another node"), "{why}");
+        let why = collector_for(
+            &f.current(PeerRole::Frontend),
+            ClusterId([0x22; 16]),
+            node,
+            first,
+        )
+        .unwrap_err();
+        assert!(why.contains("another node"), "{why}");
+        let why = collector_for(
+            &f.current(PeerRole::Frontend),
+            cluster,
+            node,
+            ReplicaIncarnation::new(2).unwrap(),
+        )
+        .unwrap_err();
+        assert!(why.contains("incarnation 1"), "{why}");
+        let why = collector_for(&f.current(PeerRole::Voter), cluster, node, first).unwrap_err();
+        assert!(why.contains("role voter"), "{why}");
+        // Issued by another authority: the leaf names this node, and
+        // nothing this domain trusts said so.
+        let stranger = new_ca();
+        let mut foreign = fixture(&stranger).current(PeerRole::Frontend);
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der.clone()).unwrap();
+        foreign.roots = Arc::new(roots);
+        let why = collector_for(&foreign, cluster, node, first).unwrap_err();
+        assert!(why.contains("not issued by the trust bundle"), "{why}");
+        // Held under a key that is not the leaf's.
+        let mut unheld = f.current(PeerRole::Frontend);
+        let other = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        unheld.key = Arc::new(
+            PrivateKeyDer::from_pem_slice(pem("PRIVATE KEY", &other.serialize_der()).as_bytes())
+                .unwrap(),
+        );
+        let why = collector_for(&unheld, cluster, node, first).unwrap_err();
+        assert!(why.contains("not the leaf's"), "{why}");
     }
 
     #[test]

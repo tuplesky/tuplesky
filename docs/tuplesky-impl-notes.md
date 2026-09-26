@@ -3327,6 +3327,18 @@ key, same names, a later end, and a chain to the trust bundle.
   leaf, its deadline is fixed at startup, and the stop names it: `renewal
   not-configured expires_at=N: this node's leaf ...` or `collector
   renewal not-configured expires_at=N: this node's collector leaf ...`.
+- **The collector's leaf is tied to the node at start.** Before this,
+  it was only read: the chain and the key file's mode, no chain check
+  and no look at whom it names. So a collector leaf for another node or
+  incarnation was presented as this node's, and renewal kept it so,
+  because a renewed leaf is compared with the leaf it replaces and not
+  with the node. `enroll::collector_for` now makes the node leaf's
+  start-up check of it (`verify_chain`), and then requires it to name
+  this node's cluster, replica and incarnation, in `Frontend` or
+  `KineCollector`. A refusal stops the start, and `--check`, with status
+  2 and `the collector certificate at P is not this node's collector:
+  ...`. The gap predates this change (task-j08 introduced the
+  credential); renewal is what made it last.
 - **Both leaves are reported.** The startup report has a `renewal ...`
   line and a `collector renewal ...` line, `configured` with the due point
   or `not-configured`. `coordd inspect` adds `collector leaf issued_at=
@@ -3335,6 +3347,16 @@ key, same names, a later end, and a chain to the trust bundle.
 
 ### What the tests show
 
+- `enroll::tests::a_collector_leaf_must_be_this_nodes`: leaves in
+  `Frontend` and `KineCollector` for this node pass. Each of these is
+  refused for what it is: another node, another cluster, another
+  incarnation, the voter role, a leaf from another authority, and a key
+  that is not the leaf's.
+- `cli::a_collector_leaf_for_another_node_is_refused_at_start`: the same
+  domain issues this node a collector leaf naming replica 2, then one
+  naming this node as a voter. `--check` refuses each with status 2 and
+  opens no store. With the check in `main` disabled, both pass `--check`
+  and the test fails.
 - `coord-node-issuer`'s
   `a_request_that_names_its_role_is_answered_by_that_rule_of_the_workload`:
   one workload holds a voter rule and then a frontend rule for the same

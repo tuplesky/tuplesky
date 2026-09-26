@@ -888,6 +888,22 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+        // The node's leaf was verified above and is what this node is;
+        // the collector's has to be shown to be this node's, or a leaf
+        // for another node would be presented, and renewed, as ours.
+        if principal == serve::Principal::Collector
+            && let Err(why) = enroll::collector_for(
+                &credential,
+                placed.membership.cluster(),
+                placed.replica,
+                placed.incarnation,
+            )
+        {
+            eprintln!(
+                "the collector certificate at {certificate} is not this node's collector: {why}"
+            );
+            return ExitCode::from(2);
+        }
         leaf_ends.push((principal, credential.leaf.expires_at));
         match &config.renewal {
             Some(section) => {
