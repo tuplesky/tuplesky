@@ -879,6 +879,9 @@ pub struct Domain<P: Persistence> {
     /// that ask was for, so a partial answer is not mistaken for a
     /// complete one.
     asked: Option<(std::time::Instant, u64, u64)>,
+    /// When this leader last sent its voters the proposals they had not
+    /// voted on (task-d07).
+    resent: Option<std::time::Instant>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
@@ -1062,6 +1065,12 @@ impl Deadline for coord_daemon::parked::Parked {
 /// the first time -- its own proposal was not durable yet -- and nothing
 /// else is going to happen on an idle domain to prompt a second try.
 const PAYLOAD_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How often a leader sends its voters, again, the proposals they have
+/// not voted on (task-d07). Longer than a round trip on any link this
+/// serves, so a vote on its way is not answered with a second copy, and
+/// short enough that a voter that missed a proposal is not held long.
+const RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Something in a domain that has work due at a time rather than on an
 /// event.
@@ -1301,6 +1310,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
             asked: None,
+            resent: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
             undeliverable: BTreeMap::new(),
@@ -2040,7 +2050,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .election
             .as_ref()
             .and_then(crate::election::Election::next_deadline);
-        [expiry, parked, reoffer, redial, renewal, election]
+        // A leader re-sends on its interval whether or not anything
+        // arrives: the voter it is re-sending to is the one not sending.
+        let resend = match &self.backing {
+            Backing::Voting(voter) if voter.leads() => self.resent.map(|at| at + RESEND_INTERVAL),
+            _ => None,
+        };
+        [expiry, parked, reoffer, redial, renewal, election, resend]
             .into_iter()
             .flatten()
             .min()
@@ -2146,6 +2162,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         } else {
             self.asked = None;
+        }
+        // A proposal a voter never received -- not linked yet, refused by
+        // a full lane, or ahead of its Sync -- is sent again by the
+        // leader, paced, until the voter has voted on it (task-d07).
+        if voter.leads() {
+            let now = std::time::Instant::now();
+            if self
+                .resent
+                .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
+            {
+                self.resent = Some(now);
+                out.absorb(voter.resend_proposals()?);
+            }
+        } else {
+            self.resent = None;
         }
         // Expiry is the leader's to schedule, and every candidate it
         // produces is conditional: nothing here decides that a key

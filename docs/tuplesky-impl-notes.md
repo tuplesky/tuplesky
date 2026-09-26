@@ -4140,3 +4140,134 @@ executed until the next sweep. Forgotten commands' payloads now stay out.
   standing it down (above), is future work with the rest of the
   checkpoint path.
 - Proposals a voter never received (task-d07).
+
+## A proposal is sent until every voter has voted on it
+
+task-d07, cause 2 of "no domain serves past its first election" (#98), and
+the Jepsen client's finding 3. The protocol assumes a proposal reaches
+every voter. The transport drops a frame by design when a lane is full
+or the peer is not linked yet, and nothing sent a proposal again. A voter
+that missed one held everything after it, since every later proposal
+depends on it through the conservative key, and executed nothing more
+until a Sync realigned it. Writes still succeeded where the leader
+answered them; reads through that voter waited for ever.
+
+Three triggers were known:
+- a voter not linked yet when the proposal went out: the last voters
+  started, in the Jepsen runs;
+- a frame a full lane refused: a new leader re-proposed its whole
+  selection in one pass, and a 64-frame control lane refused dozens;
+- a re-proposal that reached a follower before its Sync, refused as
+  `FencedByPromise`.
+
+### The re-send
+
+- **`Leader::resend_unvoted(per_voter)`** sends each voter, again, the
+  durable proposals of the ballot it has not adopted. They go oldest
+  first, at most `RESEND_PER_VOTER` (16) per voter per call, as the same
+  proposal: the same sequence number, dependencies, paths and admission.
+  The admission is now kept in `Proposal`, so a re-send is the same
+  proposal even after the leader's record was retired.
+- **What a voter lacks is read from its adoption acknowledgements.**
+  Only those say it received a proposal. A fast acknowledgement goes
+  out when the payload arrives, with no sequence number, proposal or
+  not. Counted as a vote, it credited a fast-set voter with a proposal
+  it never received and with every one before it. The chain is total,
+  so a voter that adopted a proposal holds every earlier one, and only
+  proposals after the latest it adopted are sent. One it never
+  acknowledges -- a command it executed and keeps no record of -- stops
+  being sent once it adopts a later one.
+- **A duplicate proposal is re-acknowledged.** A follower that receives
+  a proposal it already adopted or holds publishes to the leader, again,
+  what it acknowledged for that command in this ballot. It is the same
+  frames, under the context and barriers they were first published
+  with. A lost acknowledgement used to be as final as a lost proposal:
+  with one voter down, the command never committed.
+- **Across a restart too.** What a follower published is kept for its
+  boot, so a restarted one had nothing to publish again. When nothing is
+  kept, a duplicate proposal of an adoption restored from the rows is
+  adopted again: the same row is written, and acknowledged once it is
+  durable. A proposal for a command the follower has decided --
+  committed or executed, retired or not -- is answered with an adoption
+  acknowledgement to the leader alone, and only when it carries the
+  dependencies and admission of the follower's durable record. Decided,
+  the command's dependencies are those; a command it keeps no durable
+  record of any more is left alone. Nothing is written for it, and no
+  frontend is sent evidence of it.
+- **A new leader publishes its re-proposals in batches.**
+  `from_recovered` makes every re-proposal durable, but publishes only
+  the first `REPROPOSE_BATCH` (32). The re-send delivers the rest,
+  oldest first, as votes come back.
+- **`coordd` drives it.** A leader calls it every `RESEND_INTERVAL`
+  (250 ms), from the serve loop, and wakes for it on a quiet domain,
+  since the voter it re-sends to is the one not sending.
+- **The numbers.** 250 ms is tuned for a release build. A debug build's
+  adoption can take longer, so there a re-send often races the first
+  vote; the duplicate is answered from what was kept, which costs a
+  frame. `REPROPOSE_BATCH` (32) and `RESEND_PER_VOTER` (16) together
+  stay under the 64-frame control lane to a voter, with room left for
+  the leader's other traffic on it.
+
+### The regression the shim test found
+
+With the first version of this change carried on #98,
+`jepsen_shim::each_operation_does_what_its_line_says` failed every time:
+the first read through voter 2 stayed pending. Traced with temporary
+logging:
+- The domain's first proposal goes out before the followers are linked,
+  and neither receives it. Before this change the collector's re-offer
+  made the leader republish it to every voter until it was learned.
+- The re-send sent it to voter 3 only. Voter 2 is in the fast set and had
+  fast-acknowledged the command when its payload arrived, and that
+  counted as having voted on it.
+- Voter 3 adopted it, the leader learned the command from that, and
+  republishing stopped. Voter 2 never got the proposal, held everything
+  after it, and never executed the session that the read waits for.
+
+Counting only adoption acknowledgements closes it: the whole shim test
+file passed 10 of 10 runs, where it had failed on the first run before.
+
+### What the tests show
+
+- `activation.rs`:
+  - `a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend`:
+    r2 misses c1's proposal. Before the re-send, it has executed nothing;
+    after it, every voter executes c1, c2.
+  - `a_fast_acknowledgement_does_not_stand_for_the_proposal`: r1, in
+    the fast set, receives c1's payload but not its proposal. Negative
+    control: counting its fast acknowledgement as a vote, r1 never
+    executes c1.
+  - `a_lost_acknowledgement_is_published_again_on_a_resend`: with r1
+    down, r2's acknowledgement is dropped. The command commits only once
+    the re-send draws the re-acknowledgement. Negative control: without
+    the re-acknowledgement it never commits.
+  - `a_lost_acknowledgement_is_published_again_after_the_voter_restarts`:
+    the same, with r2 restarted after executing c2 and before the re-send.
+    Negative control: without the acknowledgement for an executed
+    command, c2 never commits on r0.
+  - `a_restored_adoption_is_acknowledged_again_on_a_resend`: the same,
+    with r2 restarted before it executed c2. Negative control: without
+    adopting again, c2 never commits on r0.
+  - `a_proposal_refused_ahead_of_the_promise_is_sent_again`: the new
+    ballot's first command reaches r1 before r1 promised. After its Sync,
+    r1 lacks it until the re-send.
+  - `a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive`:
+    69 commands to propose again, and the first pass to a follower is 32.
+    All 69 arrive through the re-send. Negative control: publishing all
+    at once sends 69.
+- `multi_host.rs` `a_voter_started_after_the_first_write_serves_reads`:
+  the decisive case, with real daemons. Voters 1 and 2 serve a write,
+  voter 3 starts afterwards, and a read through voter 3 is served.
+  Negative control: with the serve loop's re-send removed, the read is
+  not served.
+
+### What is left
+
+- A voter that never votes (it is gone) is sent up to 16 proposals per
+  interval, and they are dropped at its unlinked lane. It is bounded, not
+  free.
+- The trailing proposal of a quiet domain, which a voter holds but never
+  acknowledges (it executed and retired it), is re-sent each interval
+  until a newer proposal draws a vote.
+- `shim-stress.py --fault leader` and `--fault majority`, and the Jepsen
+  workflow, were not run on this branch; they are in the acceptance.
