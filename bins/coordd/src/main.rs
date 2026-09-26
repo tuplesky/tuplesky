@@ -18,6 +18,7 @@
 //! configuration every replica agreed on.
 
 mod backup;
+mod election;
 mod enroll;
 mod genesis;
 mod leases;
@@ -1403,7 +1404,54 @@ fn voter(
         recovered.frontier.get(),
         executed_through.get(),
     );
-    let machine = if placed.replica == ballot.leader {
+    // Where this replica left off (task-d01). The genesis ballot is where
+    // every replica of the epoch starts, not where one that has been
+    // through an election comes back: a promise row above it is the
+    // ballot it had moved to, and the ballot it was synchronized to is the
+    // one it votes and counts in. A replica that comes back at the genesis
+    // ballot after the domain elected another leader would lead or follow
+    // a ballot nobody else is in any more.
+    let promised = recovered
+        .promise
+        .as_ref()
+        .map_or(ballot, |p| highest(ballot, p.promised));
+    let active = recovered
+        .promise
+        .as_ref()
+        .map_or(ballot, |p| highest(ballot, p.synced));
+    let quorum = if active == ballot {
+        quorum
+    } else {
+        coord_consensus::BallotConfiguration::c2_default(
+            m.epoch(),
+            active,
+            m.voters().map(|v| v.node).collect(),
+        )
+        .map_err(|e| format!("this replica recovered a ballot it cannot vote in: {e:?}"))?
+    };
+    // Only the genesis leader, only at the genesis ballot, and only on a
+    // store that has never taken part in anything comes back leading.
+    //
+    // A leader's command table, its proposals and its sequence numbers
+    // live in memory. A leader that restarts with any of it gone and goes
+    // on leading the ballot it had would propose again from sequence zero
+    // with no memory of what it proposed before: its followers accept
+    // (they check the ballot and the leader, not that sequences only go
+    // up), a new command takes an order that contradicts one the domain
+    // already committed, and replicas diverge with nothing to detect it.
+    // So a leader that stopped does not continue its ballot. It comes
+    // back following that ballot -- which names itself, and which it does
+    // not lead, so the election counts it leaderless -- and campaigns for
+    // the next one, whose recovery rebuilds what it lost from a majority.
+    // Leading is something a ballot gives, and a restart is not a
+    // campaign.
+    let fresh = recovered.promise.is_none()
+        && recovered.records.is_empty()
+        && recovered.payloads.is_empty()
+        && recovered.executed.is_empty()
+        && recovered.syncs.is_empty()
+        && recovered.frontier.get() == 0;
+    let machine = if placed.replica == ballot.leader && promised == ballot && fresh {
         let mut leader = Leader::new_sealed(
             LeaderConfig {
                 identity,
@@ -1453,12 +1501,35 @@ fn voter(
         coord_daemon::Node::new(machine, applier, collector),
         ingress,
         (m.cluster(), m.domain()),
-        ballot,
+        promised,
     );
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
+    // A campaign that bound its selection and then stopped is not taken
+    // up: taking it up would make this replica the proposer of that
+    // ballot again, with the same memory loss as above if it had led it
+    // before it stopped. Its selection is published by nobody -- never a
+    // different one (task-26) -- and the next campaign's recovery reads
+    // what the voters that received it kept.
+    if recovered.resumable_sync(&placed.replica).is_some() && promised != ballot {
+        println!(
+            "this voter had bound the selection of ballot {} and does not take it up: \
+             it campaigns again",
+            promised.number
+        );
+    }
     Ok(voter)
+}
+
+/// The higher of two ballots of one epoch; `a` when they are not
+/// comparable.
+fn highest(a: coord_types::ids::Ballot, b: coord_types::ids::Ballot) -> coord_types::ids::Ballot {
+    if b.compare_same_epoch(&a) == Some(core::cmp::Ordering::Greater) {
+        b
+    } else {
+        a
+    }
 }
 
 /// Wall-clock seconds. A binding's validity is stated in them, so this

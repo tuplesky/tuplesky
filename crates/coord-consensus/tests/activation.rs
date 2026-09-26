@@ -582,6 +582,98 @@ fn learned_outcomes_survive_a_lost_leader_and_lost_commit_notifications() {
     );
 }
 
+/// A candidate missing more payloads than one answer carries still wins.
+///
+/// A peer answers a payload request with at most `MAX_PAYLOAD_TRANSFER`
+/// payloads, however many were asked for. The campaign asked each
+/// promised voter once, for everything it lacked, so a candidate behind
+/// by more than that bound got the first batch and then waited for the
+/// rest for ever: nobody was left to ask, and the runtime's paced asks
+/// went to the ballot's old leader, which is the voter that is gone.
+/// Repeated leader kills make exactly this candidate -- a voter that
+/// missed a stretch of work -- and the survivors never elected anyone.
+#[test]
+fn a_candidate_missing_more_payloads_than_one_answer_carries_still_wins() {
+    let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
+    let mut cluster = Cluster::new(13);
+    // r2 is down while r0 and r1 serve well past one answer's worth.
+    cluster.crash(2);
+    let mut submitted = Vec::new();
+    for n in 0..(bound * 2 + 3) as u8 {
+        submitted.push(cluster.admit(u64::from(n) + 1, n));
+        cluster.settle();
+    }
+    assert_eq!(cluster.nodes[1].executed, submitted);
+    // r2 comes back holding nothing, and the leader is lost.
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.crash(0);
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(
+        matches!(cluster.nodes[2].role, Some(Role::Leader(_))),
+        "the candidate is still waiting for payloads: {:?}",
+        cluster.nodes[2].follower().missing_payloads().len()
+    );
+    for i in [1usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, submitted, "node {i}");
+    }
+}
+
+/// A Sync naming commands a voter already executed and retired installs
+/// without them.
+///
+/// `phase_of` answers EXECUTED for a retired command from its tombstone,
+/// so the Sync installation took such an entry as ready and then found no
+/// record to install: a panic, on exactly the voter a new leader most
+/// needs -- one that served past its table's capacity before the leader
+/// was lost.
+#[test]
+fn a_sync_naming_commands_this_voter_retired_installs_without_them() {
+    let mut cluster = Cluster::new(17);
+    let mut submitted = Vec::new();
+    for n in 0..48u8 {
+        submitted.push(cluster.admit(u64::from(n) + 1, n));
+        cluster.settle();
+    }
+    // r1 retired some of what it executed, and r2 still holds what r1
+    // retired.
+    let retired: Vec<CommandId> = submitted
+        .iter()
+        .copied()
+        .filter(|c| cluster.nodes[1].follower().table().record(c).is_none())
+        .collect();
+    assert!(!retired.is_empty(), "r1 retired nothing");
+    cluster.crash(0);
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    let decision = sync_rows(&cluster.nodes[2].storage).remove(0);
+    assert!(
+        retired.iter().any(|c| decision.entries.contains_key(c)),
+        "the Sync names a command r1 retired"
+    );
+    // What the candidate executed is selected as committed: no voter can
+    // be left holding it at ACCEPT, waiting for a re-proposal that a
+    // leader without the record cannot make.
+    for c in &cluster.nodes[2].executed {
+        if let Some(entry) = decision.entries.get(c) {
+            assert_eq!(entry.phase, Phase::Commit, "{c:?}");
+        }
+    }
+    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), ballot(1, 2));
+    // The new ballot serves; r1 executes what comes next, once.
+    let next = cluster.admit(100, 100);
+    cluster.settle();
+    for i in [1usize, 2] {
+        assert_eq!(cluster.nodes[i].executed.last(), Some(&next), "node {i}");
+        assert_eq!(
+            cluster.nodes[i].executed.len(),
+            submitted.len() + 1,
+            "node {i}"
+        );
+    }
+}
+
 #[test]
 fn competing_campaigns_and_delayed_replies_cannot_establish_divergence() {
     let mut cluster = Cluster::new(7);

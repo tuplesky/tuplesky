@@ -450,6 +450,17 @@ impl Dispatcher {
         self.collector.reachable_again(replica, now)
     }
 
+    /// The ballot evidence is counted under changed: see
+    /// [`crate::Collector::reconfigure`] (task-d01).
+    pub fn reconfigure(&mut self, quorum: coord_consensus::BallotConfiguration) {
+        self.collector.reconfigure(quorum);
+    }
+
+    /// The ballot evidence is counted under.
+    pub fn ballot(&self) -> coord_types::ids::Ballot {
+        self.collector.quorum().ballot()
+    }
+
     /// When the next re-offer falls due, on the clock `due_offers` is
     /// given; see [`crate::Collector::next_due`].
     pub fn next_due(&self) -> Option<MonotonicMillis> {

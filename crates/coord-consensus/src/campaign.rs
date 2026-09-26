@@ -12,8 +12,10 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use coord_core::effect::BarrierId;
+use coord_types::CommandId;
 use coord_types::ids::{Ballot, ReplicaId};
 
+use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select};
 use crate::summary::{PageError, ReportAssembler, ReportPage};
@@ -139,6 +141,40 @@ impl Campaign {
         let decision = select(&self.config, &reports)?;
         self.decision = Some(decision);
         Ok(self.decision.as_ref())
+    }
+
+    /// Mark committed every selected entry this candidate executed.
+    ///
+    /// Executing a command means it was committed, and a commit is not
+    /// written as a row: every report can say ACCEPT for a command the
+    /// candidate has long executed. Re-proposing it is how the other
+    /// voters would have learned the commit, but a candidate that retired
+    /// what it executed has no record left to re-propose from, and a
+    /// voter holding the command at ACCEPT would then wait for a vote
+    /// that never comes, with everything after it waiting too. Selected
+    /// as committed, it is committed wherever the selection is installed.
+    ///
+    /// `executed` answers with the dependencies the candidate executed
+    /// the command under, or `Some(None)` for one retired since, whose
+    /// dependencies it no longer holds. An entry whose dependencies
+    /// disagree with the executed ones is left as selected.
+    pub fn commit_executed(
+        &mut self,
+        executed: impl Fn(&CommandId) -> Option<Option<Vec<CommandId>>>,
+    ) {
+        let Some(decision) = self.decision.as_mut() else {
+            return;
+        };
+        for (command, entry) in &mut decision.entries {
+            if entry.phase >= Phase::Commit {
+                continue;
+            }
+            match executed(command) {
+                Some(None) => entry.phase = Phase::Commit,
+                Some(Some(deps)) if deps == entry.deps => entry.phase = Phase::Commit,
+                _ => {}
+            }
+        }
     }
 
     /// The selection, once made.

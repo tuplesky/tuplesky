@@ -193,6 +193,22 @@ pub struct Counts {
 }
 
 impl Frontend {
+    /// Count evidence under `active`, the ballot the voter beside this
+    /// collector votes in (task-d01). A ballot change voids what was
+    /// counted under the old one. Only this process's own collector: a
+    /// frontend with no voter beside it has nothing to follow (the
+    /// task-d01 plan entry records the gap).
+    fn follow(&mut self, active: coord_types::ids::Ballot) {
+        if self.frontend.dispatcher_mut().ballot() != active
+            && let Ok(quorum) = coord_consensus::BallotConfiguration::c2_default(
+                active.epoch,
+                active,
+                self.membership.voters().map(|v| v.node).collect(),
+            )
+        {
+            self.frontend.dispatcher_mut().reconfigure(quorum);
+        }
+    }
     /// Build the frontend this configuration describes.
     ///
     /// `local` is the ingress of a voter running in this process, where
@@ -389,6 +405,9 @@ pub struct PeerPlane {
     reported: Option<(usize, usize)>,
     /// When each voter is dialled again after the first time (task-d03).
     redial: crate::redial::Redial,
+    /// Whether each voter's control lane was held when last looked at,
+    /// so one that comes back is welcomed once (task-d01).
+    control_held: Vec<bool>,
 }
 
 impl PeerPlane {
@@ -401,6 +420,7 @@ impl PeerPlane {
     ) -> Self {
         let redial =
             crate::redial::Redial::new(peers.iter().map(|p| crate::redial::salt(&p.replica.0)));
+        let control_held = vec![false; peers.len()];
         PeerPlane {
             transport,
             domain,
@@ -409,6 +429,7 @@ impl PeerPlane {
             dialled: (0, 0),
             reported: None,
             redial,
+            control_held,
         }
     }
 
@@ -899,6 +920,19 @@ pub struct Domain<P: Persistence> {
     /// configured (task-d02): the node's, and the collector's where it
     /// holds one.
     renewals: Vec<Renewing>,
+    /// When this voter campaigns (task-d01); `None` where no voter runs.
+    election: Option<crate::election::Election>,
+    /// The ballot and role this voter last said it had, so the line is
+    /// said when either changes and not on every turn.
+    role_said: Option<(coord_types::ids::Ballot, bool)>,
+    /// How many fenced transitions this voter has said it refused.
+    fenced_said: u64,
+    /// What a peer's frame or a collector's submission was refused by
+    /// this voter's own fence for, where the refusal stops the voter
+    /// (`DriveError::Fenced`). Those paths only log a `DriveError`, so the
+    /// stop is recorded here and the loop ends on its next pass, as it
+    /// does for the same refusal on a turn.
+    fenced_stop: Option<String>,
 }
 
 /// The two planes a voter is dialled on.
@@ -1244,6 +1278,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Compose `frontend` over `backing`.
     pub fn new(frontend: Frontend, mut backing: Backing<P>, budgets: Budgets) -> Self {
         let recorder = std::sync::Arc::new(recorder(matches!(backing, Backing::Voting(_))));
+        let election = match &backing {
+            Backing::Voting(voter) => Some(crate::election::Election::new(crate::redial::salt(
+                &voter.provenance().from().0,
+            ))),
+            Backing::Serving(_) => None,
+        };
         if let Backing::Voting(voter) = &mut backing {
             voter
                 .node_mut()
@@ -1266,6 +1306,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             dials: tokio::task::JoinSet::new(),
             dialling: BTreeMap::new(),
             renewals: Vec::new(),
+            election,
+            role_said: None,
+            fenced_said: 0,
+            fenced_stop: None,
             peer_streak: 0,
             budgets,
             recorder,
@@ -1413,6 +1457,15 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             plane.redial.start(now);
         }
         self.links.redial.start(now);
+        // An operator moves leadership by asking a voter to campaign
+        // (task-d01). Only where a voter runs, and a process that cannot
+        // register for the signal serves without it: it is a convenience,
+        // not something the domain's progress depends on.
+        let mut operator = if self.election.is_some() {
+            operator_signal()
+        } else {
+            None
+        };
         loop {
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
@@ -1420,8 +1473,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             if self.renew() {
                 return;
             }
+            // A fenced refusal the event paths met since the last pass
+            // stops the voter here, as one met on a turn does below.
+            if let Some(what) = self.fenced_stop.take() {
+                say_fenced_stop(&what);
+                return;
+            }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
+                Err(coord_daemon::DriveError::Fenced(what)) => {
+                    say_fenced_stop(&what);
+                    return;
+                }
                 Err(e) => {
                     eprintln!("this voter cannot make its transitions durable: {e}");
                     return;
@@ -1515,6 +1578,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                         self.attempted(transport, i, done);
                         continue;
                     }
+                    Some(()) = next_signal(operator.as_mut()) => {
+                        self.requested();
+                        continue;
+                    }
                     () = sleep, if wake.is_some() => continue,
                 }
             } else {
@@ -1530,6 +1597,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     }
                     (i, done) = next_attempt(&mut self.renewals) => {
                         self.attempted(transport, i, done);
+                        continue;
+                    }
+                    Some(()) = next_signal(operator.as_mut()) => {
+                        self.requested();
                         continue;
                     }
                     () = sleep, if wake.is_some() => continue,
@@ -1566,12 +1637,22 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             self.dialled(done);
         }
         let now = std::time::Instant::now();
+        let mut returned = Vec::new();
         if let Some(plane) = &mut self.plane {
             for i in 0..plane.peers.len() {
+                // A voter whose control lane came back is welcomed into
+                // the ballot this node leads (task-d01): that lane is the
+                // one NewLeader and Sync travel on.
+                let control = plane.holds(&plane.peers[i]);
+                let was = std::mem::replace(&mut plane.control_held[i], control);
+                if control && !was {
+                    returned.push(plane.peers[i].replica);
+                }
                 // Both lanes: a voter whose bulk lane alone went is not
                 // held, or it would never be dialled again and payload
                 // transfer to it would stay down.
-                let held = plane.holds_both(&plane.peers[i]);
+                let held =
+                    control && plane.holds_lane(&plane.peers[i], coord_transport::Lane::Bulk);
                 plane.redial.observe(i, held, now);
             }
             for i in plane.redial.due(now) {
@@ -1652,6 +1733,29 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             self.dialling.insert(task.id(), (Plane::Collector, i));
         }
         links.report(api);
+        // A voter that was away when this one won its ballot never heard
+        // the campaign, and is told now (task-d01).
+        if let Backing::Voting(voter) = &self.backing {
+            let mut out = coord_daemon::Outbound::default();
+            for replica in returned {
+                out.absorb(voter.welcome(replica));
+            }
+            if !out.is_empty() {
+                let provenance = voter.provenance();
+                self.carry(api, out, provenance);
+            }
+        }
+    }
+
+    /// An operator asked this voter to campaign (`SIGUSR1`, task-d01).
+    fn requested(&mut self) {
+        match self.election.as_mut() {
+            Some(election) => {
+                election.request();
+                eprintln!("this voter was asked to campaign");
+            }
+            None => eprintln!("this process runs no voter to campaign"),
+        }
     }
 
     /// A dial started by [`Domain::redial`] has ended.
@@ -1920,7 +2024,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     + std::time::Duration::from_millis(r.schedule.wake_at(now).saturating_sub(now))
             })
             .min();
-        [expiry, parked, reoffer, redial, renewal]
+        // A voter without a leader campaigns when its patience runs out,
+        // and nothing arrives to say it has.
+        let election = self
+            .election
+            .as_ref()
+            .and_then(crate::election::Election::next_deadline);
+        [expiry, parked, reoffer, redial, renewal, election]
             .into_iter()
             .flatten()
             .min()
@@ -1945,6 +2055,41 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return Ok(false);
         };
         let (mut out, refused) = voter.serve_local(self.budgets.local_per_turn)?;
+        // Leadership (task-d01): campaign when this voter has had no
+        // leader for its patience, or an operator asked, and follow
+        // whatever ballot the machine has moved to by any path.
+        if let Some(election) = self.election.as_mut() {
+            let ballot = voter.ballot();
+            let me = voter.provenance().from();
+            let (held, voters) = self
+                .plane
+                .as_ref()
+                .map_or((0, 1), |p| (p.reachable(), p.peers.len() + 1));
+            let led = voter.leads()
+                || (ballot.leader != me
+                    && self.plane.as_ref().is_some_and(|p| {
+                        p.peers
+                            .iter()
+                            .any(|peer| peer.replica == ballot.leader && p.holds(peer))
+                    }));
+            let majority = (held + 1) * 2 > voters;
+            let campaigning = voter.node().machine().campaigning();
+            if let Some(why) =
+                election.observe(led, majority, campaigning, std::time::Instant::now())
+                && let Some((campaigned, o)) = voter.campaign()?
+            {
+                let why = match why {
+                    crate::election::Why::Leaderless => "no leader",
+                    crate::election::Why::Requested => "asked to",
+                };
+                eprintln!(
+                    "this voter campaigns for ballot {} ({why})",
+                    campaigned.number
+                );
+                out.absorb(o);
+            }
+        }
+        out.absorb(voter.follow_machine()?);
         out.absorb(voter.execute()?);
         // A command whose identity this replica learned from evidence
         // and whose content nobody sent it. Execution stops at it
@@ -2005,6 +2150,36 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         let provenance = voter.provenance();
+        self.frontend.follow(voter.node().machine().active());
+        // Work queued under a ballot this voter has left can no longer be
+        // made durable, and the store refuses it rather than holding it.
+        // So is work stamped under a ballot below its promise, after a
+        // promise that did not become durable took the voter back.
+        let fenced = voter.fenced + voter.node().fenced;
+        if fenced > self.fenced_said {
+            eprintln!(
+                "this voter refused {} transition(s) under a ballot below its promise: \
+                 definitely not committed",
+                fenced - self.fenced_said
+            );
+            self.fenced_said = fenced;
+        }
+        let role = (voter.ballot(), voter.leads());
+        if self.role_said != Some(role) {
+            self.role_said = Some(role);
+            let (ballot, leads) = role;
+            if leads {
+                eprintln!("this voter leads ballot {}", ballot.number);
+            } else if ballot.leader == provenance.from() {
+                eprintln!("this voter is a candidate for ballot {}", ballot.number);
+            } else {
+                eprintln!(
+                    "this voter follows ballot {} led by {}",
+                    ballot.number,
+                    hex4(&ballot.leader)
+                );
+            }
+        }
         let did = !refused.is_empty() || !out.is_empty();
         // A refusal at the voter's door is silent to the caller, whose
         // stream is held for an answer that is not coming. The reason is
@@ -2731,8 +2906,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 match voter.on_peer(provenance, payload) {
                     Ok(out) => {
                         let provenance = voter.provenance();
+                        // Before the frame's output reaches the collector
+                        // beside this voter: evidence the step that
+                        // activated a ballot produced is counted under
+                        // that ballot, not refused as the old one's.
+                        self.frontend.follow(voter.node().machine().active());
                         self.carry(api, out, provenance);
                     }
+                    Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
                     Err(e) => eprintln!("this voter cannot carry out a peer's frame: {e}"),
                 }
             }
@@ -2800,6 +2981,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
                 self.frontend.counts.refused += 1;
             }
+            Err(DriveError::Fenced(what)) => self.fenced_stop = Some(what),
             Err(e) => eprintln!("this voter cannot carry out a submission: {e}"),
         }
         self.route_parked(api);
@@ -3111,6 +3293,15 @@ fn addressed(
     })
 }
 
+/// Why a voter stopped on its own fence, and what heals it.
+fn say_fenced_stop(what: &str) {
+    eprintln!(
+        "this voter stopped: {what} was refused by its store's fence, \
+         which is at a promise above this voter's ballot. \
+         A restart resumes at the promised ballot, as a follower that campaigns"
+    );
+}
+
 fn hex4(replica: &coord_types::ids::ReplicaId) -> String {
     replica.0[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -3133,6 +3324,42 @@ fn command_of_frame(frame: &Frame) -> Option<CommandId> {
             .ok()
             .map(|r| r.established().command()),
         _ => None,
+    }
+}
+
+/// The signal an operator asks a voter to campaign with (`SIGUSR1`),
+/// where the platform has one.
+#[cfg(unix)]
+type OperatorSignal = tokio::signal::unix::Signal;
+/// No such signal off Unix: leadership moves only by election there.
+#[cfg(not(unix))]
+type OperatorSignal = std::convert::Infallible;
+
+#[cfg(unix)]
+fn operator_signal() -> Option<OperatorSignal> {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("this voter cannot be asked to campaign: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn operator_signal() -> Option<OperatorSignal> {
+    None
+}
+
+/// The next operator request, or never where there is no signal to wait
+/// on: a `select!` arm needs a future either way.
+async fn next_signal(signal: Option<&mut OperatorSignal>) -> Option<()> {
+    match signal {
+        #[cfg(unix)]
+        Some(s) => s.recv().await,
+        #[cfg(not(unix))]
+        Some(never) => match *never {},
+        None => std::future::pending().await,
     }
 }
 

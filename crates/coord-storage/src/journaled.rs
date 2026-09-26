@@ -1199,6 +1199,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         self.domains.get(&domain).map_or(0, |d| d.queued_bytes)
     }
 
+    /// Whether a domain's queue has room for `batch` under its bounds:
+    /// whether [`JournaledStore::submit`] would refuse it as
+    /// [`SubmitRefused::QueueFull`], and nothing else. An unknown domain
+    /// has no queue to be full.
+    pub fn has_room(&self, domain: DomainId, batch: &PersistBatch) -> bool {
+        self.domains.get(&domain).is_none_or(|state| {
+            state.queue.len() < self.limits.max_queued_per_domain
+                && state.queued_bytes + batch_bytes(batch)
+                    <= self.limits.max_queued_bytes_per_domain
+        })
+    }
+
     /// Durable records of a domain still waiting for the projection.
     pub fn unmaterialized(&self, domain: DomainId) -> usize {
         self.domains.get(&domain).map_or(0, |d| d.pending.len())

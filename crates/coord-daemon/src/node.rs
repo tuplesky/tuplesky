@@ -30,13 +30,13 @@
 //! real time and real randomness.
 
 use coord_collector::frontend_frame;
-use coord_consensus::{AppliedOutcome, Follower, Leader, PayloadRecordV1};
-use coord_core::effect::{Effect, PeerId, TimerId};
-use coord_core::event::{Event, StorageEvent};
+use coord_consensus::{AppliedOutcome, Follower, Leader, PayloadRecordV1, SyncDecision};
+use coord_core::effect::{Effect, PeerId, PersistBatch, TimerId};
+use coord_core::event::{Event, StorageError, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{Outbox, PendingSend};
 use coord_storage::journaled::TransitionKind;
-use coord_storage::{Applier, Persistence};
+use coord_storage::{Applier, Persistence, Refused};
 use coord_types::CommandId;
 use coord_types::ids::Ballot;
 
@@ -143,9 +143,53 @@ impl Machine {
         }
     }
 
+    /// The highest ballot this replica has promised, counting a promise
+    /// whose row is not durable yet (task-d01).
+    ///
+    /// Counting the one in flight is the point. The store stamps what it
+    /// records with the ballot the voter holds, and a promise row stamped
+    /// with the ballot before it is a promise recorded under a ballot the
+    /// replica had already left -- which a fence at the new ballot then
+    /// refuses as obsolete.
+    pub fn promised(&self) -> Ballot {
+        let ballots = match self {
+            Machine::Leader(m) => m.ballots(),
+            Machine::Follower(m) => m.ballots(),
+        };
+        let durable = ballots.promised();
+        match ballots.in_flight() {
+            Some(pending)
+                if pending.ballot.compare_same_epoch(&durable)
+                    == Some(core::cmp::Ordering::Greater) =>
+            {
+                pending.ballot
+            }
+            _ => durable,
+        }
+    }
+
+    /// The ballot this replica votes and counts in: the one whose Sync it
+    /// adopted, which a promise to a higher ballot does not change until
+    /// that ballot's Sync arrives.
+    pub fn active(&self) -> Ballot {
+        match self {
+            Machine::Leader(m) => m.config_quorum().ballot(),
+            Machine::Follower(m) => m.quorum().ballot(),
+        }
+    }
+
     /// Whether this replica currently leads.
     pub const fn leads(&self) -> bool {
         matches!(self, Machine::Leader(_))
+    }
+
+    /// Whether this replica has a campaign of its own under way: still
+    /// collecting promises or reports, or bound and not yet active.
+    pub const fn campaigning(&self) -> bool {
+        match self {
+            Machine::Leader(_) => false,
+            Machine::Follower(m) => m.campaign_state().is_some(),
+        }
     }
 
     /// The next command whose turn it is to be applied, if any.
@@ -233,6 +277,12 @@ pub enum DriveError {
     /// make its own transitions durable must stop, not carry on from
     /// memory.
     Engine(String),
+    /// This voter's store is fenced at a promise above the ballot a
+    /// transition was stamped with, and the voter cannot serve on: a
+    /// leader's own work, or a committed command's apply, refused by the
+    /// fence (task-d01). The fence is held in memory only, so a restart
+    /// resumes at the promised ballot, as a follower that campaigns.
+    Fenced(String),
     /// A frame the collector is owed could not be encoded. The round is
     /// refused rather than the frame dropped: evidence that is silently
     /// lost looks exactly like a voter that did not answer.
@@ -244,6 +294,7 @@ impl core::fmt::Display for DriveError {
         match self {
             DriveError::Submit(e) => write!(f, "batch refused: {e}"),
             DriveError::Engine(e) => write!(f, "engine failed: {e}"),
+            DriveError::Fenced(e) => write!(f, "fenced at a newer promise: {e}"),
             DriveError::Encode(e) => write!(f, "frame not encodable: {e}"),
         }
     }
@@ -258,7 +309,9 @@ impl core::error::Error for DriveError {}
 /// and in nothing else the driver can see, which is why it is a
 /// parameter rather than two drivers.
 pub struct Node<P: Persistence> {
-    machine: Machine,
+    /// Always `Some` outside [`Node::change_role`], which takes it for the
+    /// length of a role conversion: the machines convert by value.
+    machine: Option<Machine>,
     applier: Applier<P>,
     outbox: Outbox,
     frontend: PeerId,
@@ -266,6 +319,9 @@ pub struct Node<P: Persistence> {
     pub rounds: u64,
     /// Commands applied since boot (diagnostic).
     pub executed: u64,
+    /// Protocol transitions the store refused at submit because it is
+    /// fenced at a newer promise (diagnostic, task-d01).
+    pub fenced: u64,
     withheld: u64,
     withheld_evidence: u64,
     /// Where the journal and materialization stages are recorded
@@ -273,6 +329,10 @@ pub struct Node<P: Persistence> {
     recorder: Option<std::sync::Arc<Recorder>>,
     /// The command execution is waiting for a payload for, if any.
     awaiting: Option<CommandId>,
+    /// The selection this replica won its ballot with, while it leads
+    /// that ballot (task-d01). A voter that was away when it was
+    /// published is sent it again when it promises the ballot.
+    won: Option<SyncDecision>,
 }
 
 impl<P: Persistence> Node<P> {
@@ -280,16 +340,18 @@ impl<P: Persistence> Node<P> {
     pub fn new(machine: Machine, applier: Applier<P>, frontend: PeerId) -> Self {
         let boot = applier.store().boot();
         Node {
-            machine,
+            machine: Some(machine),
             applier,
             outbox: Outbox::new(boot),
             frontend,
             rounds: 0,
             executed: 0,
+            fenced: 0,
             withheld: 0,
             withheld_evidence: 0,
             recorder: None,
             awaiting: None,
+            won: None,
         }
     }
 
@@ -326,13 +388,105 @@ impl<P: Persistence> Node<P> {
     }
 
     /// The machine.
-    pub const fn machine(&self) -> &Machine {
-        &self.machine
+    pub fn machine(&self) -> &Machine {
+        self.machine
+            .as_ref()
+            .expect("a node always holds a machine")
+    }
+
+    fn machine_mut(&mut self) -> &mut Machine {
+        self.machine
+            .as_mut()
+            .expect("a node always holds a machine")
+    }
+
+    /// Start a campaign for `ballot`, which names this replica as its
+    /// leader, and carry out what that produced (task-d01).
+    ///
+    /// Only a follower campaigns: a leader already leads, and its ballot
+    /// is the one a campaign would be trying to replace. The caller moves
+    /// the voter's ballot to `ballot` first, so the promise this replica
+    /// makes itself is stamped with the ballot it promises.
+    pub fn campaign(&mut self, ballot: Ballot, at: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = match self.machine_mut() {
+            Machine::Follower(f) => f.campaign(ballot),
+            Machine::Leader(_) => Vec::new(),
+        };
+        self.carry_out(effects, at)
+    }
+
+    /// Publish a selection this replica bound durably before it last
+    /// stopped, and carry out what that produced.
+    ///
+    /// A campaign that bound its Sync and then crashed must publish that
+    /// Sync and no other at its ballot (task-26); this is how a restart
+    /// finishes it rather than leaving the bound selection unpublished.
+    pub fn resume_campaign(
+        &mut self,
+        decision: SyncDecision,
+        at: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let effects = match self.machine_mut() {
+            Machine::Follower(f) => f.resume_campaign(decision),
+            Machine::Leader(_) => Vec::new(),
+        };
+        self.carry_out(effects, at)
+    }
+
+    /// Change role when the machine says so, and carry out what the
+    /// change produced; `None` when nothing changed (task-d01).
+    ///
+    /// The machines decide and never convert themselves: a follower that
+    /// won its campaign reports it (`won`), and a leader that promised a
+    /// higher ballot reports that it is `deposed`. The conversion is the
+    /// driver's, and it happens here, in place, with the store, the outbox
+    /// and every connection carrying on -- the same replica at a different
+    /// ballot, which is what [`Machine`] says a role is. A deposed leader
+    /// that already holds the new leader's Sync replays it into the
+    /// follower it becomes, so the selection is adopted rather than lost.
+    pub fn change_role(&mut self, at: &Ballot) -> Result<Option<Outbound>, DriveError> {
+        let change = match self.machine() {
+            Machine::Follower(f) => f.won().is_some(),
+            Machine::Leader(l) => l.deposed(),
+        };
+        if !change {
+            return Ok(None);
+        }
+        let machine = self.machine.take().expect("a node always holds a machine");
+        let (machine, effects) = match machine {
+            Machine::Follower(f) => {
+                let decision = f.won().cloned().expect("checked above");
+                let quorum = f.quorum().clone();
+                let (leader, effects) =
+                    Leader::from_recovered(f.into_recovered(), quorum, &decision);
+                self.won = Some(decision);
+                (Machine::Leader(Box::new(leader)), effects)
+            }
+            Machine::Leader(l) => {
+                let quorum = l.config_quorum();
+                let pending = l.pending_sync().cloned();
+                let mut follower = Follower::from_recovered(l.into_recovered(), quorum);
+                self.won = None;
+                let effects = match pending {
+                    Some((from, decision)) => follower.on_sync(from, decision),
+                    None => Vec::new(),
+                };
+                (Machine::Follower(Box::new(follower)), effects)
+            }
+        };
+        self.machine = Some(machine);
+        self.carry_out(effects, at).map(Some)
+    }
+
+    /// The selection this replica won the ballot it leads with; `None`
+    /// for a leader of the genesis ballot, which nobody campaigned for.
+    pub const fn won(&self) -> Option<&SyncDecision> {
+        self.won.as_ref()
     }
 
     /// Take what the machine refused since the last call, rendered.
     pub fn take_rejections(&mut self) -> Vec<String> {
-        self.machine.take_rejections()
+        self.machine_mut().take_rejections()
     }
 
     /// The command this replica cannot execute because it does not hold
@@ -348,26 +502,26 @@ impl<P: Persistence> Node<P> {
         frame: &[u8],
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
-        let effects = self.machine.propose_service(frame);
+        let effects = self.machine_mut().propose_service(frame);
         self.carry_out(effects, ballot)
     }
 
     /// Whether this replica is holding a command it knows by identity
     /// and not by content.
     pub fn wants_payloads(&self) -> bool {
-        self.machine.wants_payloads()
+        self.machine().wants_payloads()
     }
 
     /// How many commands this replica knows by identity and not by
     /// content.
     pub fn missing_payloads(&self) -> usize {
-        self.machine.missing_payloads()
+        self.machine().missing_payloads()
     }
 
     /// How many payload transfers a peer has answered this replica
     /// with.
-    pub const fn payloads_answered(&self) -> u64 {
-        self.machine.payloads_answered()
+    pub fn payloads_answered(&self) -> u64 {
+        self.machine().payloads_answered()
     }
 
     /// Ask `from` for the payloads this replica lacks.
@@ -376,7 +530,7 @@ impl<P: Persistence> Node<P> {
         from: coord_types::ids::ReplicaId,
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
-        let effects = self.machine.request_payloads(from);
+        let effects = self.machine_mut().request_payloads(from);
         self.carry_out(effects, ballot)
     }
 
@@ -418,7 +572,7 @@ impl<P: Persistence> Node<P> {
     /// context names an older one is dropped when it is finally released,
     /// because the state it described has been superseded.
     pub fn on_event(&mut self, event: Event, ballot: &Ballot) -> Result<Outbound, DriveError> {
-        let effects = self.machine.step(event);
+        let effects = self.machine_mut().step(event);
         self.carry_out(effects, ballot)
     }
 
@@ -453,6 +607,8 @@ impl<P: Persistence> Node<P> {
     ) -> Result<(Outbound, Vec<Effect>), DriveError> {
         let mut out = Outbound::default();
         let mut persisted = false;
+        let mut refused = Vec::new();
+        let mut next = Vec::new();
         for effect in effects {
             // A released result is the leader's release-gate output. It
             // is not a `SendWhenDurable` and rests on no barrier of its
@@ -482,11 +638,44 @@ impl<P: Persistence> Node<P> {
                     // and the execution redo is not one of them -- that
                     // comes from applying a command, which is where its
                     // position, revision and result are known.
-                    self.applier
+                    let barrier_id = batch.barrier;
+                    self.make_room(&batch, &mut next)?;
+                    match self
+                        .applier
                         .store_mut()
                         .submit(batch, TransitionKind::Protocol)
-                        .map_err(|e| DriveError::Submit(e.to_string()))?;
-                    persisted = true;
+                    {
+                        Ok(()) => persisted = true,
+                        // The store is fenced at a promise above the ballot
+                        // this is stamped with: the voter's promise did not
+                        // become durable and it went back to the ballot it
+                        // had, and the fence did not (`Voter::follow_machine`).
+                        // The transition will never be durable here, which
+                        // is what the fence says of the work it refuses from
+                        // the queue, and it is said the same way: the
+                        // barrier fails and the machine hears so. A refusal
+                        // the voter expects is not a reason to stop serving.
+                        // A leader does not serve on from here. Every batch
+                        // it makes is stamped below the fence and refused
+                        // the same way, so it would stop proposing while
+                        // still leading, and neither it nor the voters that
+                        // hold its links would campaign: the domain would
+                        // stall. Ended instead, it restarts as a follower
+                        // of its ballot and campaigns.
+                        Err(Refused::Fenced) if self.machine().leads() => {
+                            return Err(DriveError::Fenced(
+                                "a transition this voter made while leading".into(),
+                            ));
+                        }
+                        Err(Refused::Fenced) => {
+                            self.fenced += 1;
+                            refused.push(StorageEvent::Failed {
+                                barrier_id,
+                                error: StorageError::DefinitelyNotCommitted,
+                            });
+                        }
+                        Err(e) => return Err(DriveError::Submit(e.to_string())),
+                    }
                 }
                 Effect::SendWhenDurable {
                     context,
@@ -526,7 +715,10 @@ impl<P: Persistence> Node<P> {
             }
         }
 
-        let mut next = Vec::new();
+        for event in refused {
+            self.outbox.observe(&event);
+            next.extend(self.machine_mut().step(Event::Storage(event)));
+        }
         if persisted {
             // One lowering moves one group, and a group takes one batch
             // per domain. A round that submitted more than one -- two
@@ -546,21 +738,7 @@ impl<P: Persistence> Node<P> {
             // the next round lowers again.
             let mut attempts = self.applier.store().queued() + 1;
             loop {
-                let store = self.applier.store_mut();
-                let outcome =
-                    Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
-                        .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
-                // Indeterminate is not "failed": the group's outcome is
-                // unknown, so the caller reconciles rather than assuming
-                // either answer. It surfaces as an engine failure here so
-                // it cannot be mistaken for a clean round.
-                if outcome.indeterminate {
-                    return Err(DriveError::Engine("group outcome indeterminate".into()));
-                }
-                for event in outcome.events {
-                    self.outbox.observe(&event);
-                    next.extend(self.machine.step(Event::Storage(event)));
-                }
+                self.lower_once(&mut next)?;
                 attempts -= 1;
                 if self.applier.store().queued() == 0 || attempts == 0 {
                     break;
@@ -597,6 +775,57 @@ impl<P: Persistence> Node<P> {
         Ok((out, next))
     }
 
+    /// Lower one group and hand what it made durable to the outbox and
+    /// the machine; the machine's answers join `next`.
+    fn lower_once(&mut self, next: &mut Vec<Effect>) -> Result<(), DriveError> {
+        let store = self.applier.store_mut();
+        let outcome = Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
+            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+        // Indeterminate is not "failed": the group's outcome is unknown,
+        // so the caller reconciles rather than assuming either answer. It
+        // surfaces as an engine failure here so it cannot be mistaken for
+        // a clean round.
+        if outcome.indeterminate {
+            return Err(DriveError::Engine("group outcome indeterminate".into()));
+        }
+        for event in outcome.events {
+            self.outbox.observe(&event);
+            next.extend(self.machine_mut().step(Event::Storage(event)));
+        }
+        Ok(())
+    }
+
+    /// Lower what is queued until the store has room for `batch`.
+    ///
+    /// One step of a machine can ask for more batches than the queue
+    /// holds. Installing a Sync writes a row per selected command and a
+    /// new leader re-proposes each of them, and a selection names what
+    /// every reporter still holds, which on a domain that has served for
+    /// a while is far more than the queue's depth. Refused as full, the
+    /// voter stopped -- the new leader, or the follower installing its
+    /// Sync, exactly when the domain was electing one -- and it met the
+    /// same selection when it came back. The queue drains by lowering,
+    /// which the end of the round does anyway; it happens here as well,
+    /// as often as the batch needs. A lowering that moves nothing leaves
+    /// the refusal to `submit`, as before.
+    fn make_room(
+        &mut self,
+        batch: &PersistBatch,
+        next: &mut Vec<Effect>,
+    ) -> Result<(), DriveError> {
+        while !self.applier.store().has_room(batch) {
+            let before = self.applier.store().queued();
+            if before == 0 {
+                break;
+            }
+            self.lower_once(next)?;
+            if self.applier.store().queued() >= before {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Apply every command whose turn has come, in order.
     ///
     /// Materialization is ordered and it is not optional: a command the
@@ -611,12 +840,12 @@ impl<P: Persistence> Node<P> {
     /// the preview's behaviour and not the architecture's.
     pub fn execute(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let mut out = Outbound::default();
-        while let Some(command) = self.machine.next_executable() {
+        while let Some(command) = self.machine().next_executable() {
             // A command whose turn has come but whose payload this
             // replica does not hold is not something to skip past: the
             // order is the whole of the guarantee, and going on would
             // apply a later command first.
-            let Some(payload) = self.machine.payload(&command) else {
+            let Some(payload) = self.machine().payload(&command) else {
                 // Not something to skip past -- the order is the whole
                 // of the guarantee -- and not a fault either. A replica
                 // learns a command's identity from evidence and its
@@ -633,9 +862,24 @@ impl<P: Persistence> Node<P> {
             let outcome = Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
                 applier.apply(command, &payload)
             })
-            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+            .map_err(|e| {
+                // A committed command has to be applied at its position,
+                // so a refused apply cannot be failed and forgotten the
+                // way a protocol transition is. Nothing but a promise at
+                // or above the fence moves it, and this voter does not
+                // make one on its own; a restart does.
+                if matches!(&e, coord_storage::ApplyError::Engine(engine) if coord_storage::materialize::is_fenced(engine)) {
+                    let id: String = command.0.0[..4]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    DriveError::Fenced(format!("the apply of command {id}"))
+                } else {
+                    DriveError::Engine(format!("{e:?}"))
+                }
+            })?;
             self.executed += 1;
-            let effects = self.machine.applied(command, &outcome)?;
+            let effects = self.machine_mut().applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);
         }
         Ok(out)
@@ -649,7 +893,7 @@ impl<P: Persistence> Node<P> {
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
         self.outbox.observe(&event);
-        let effects = self.machine.step(Event::Storage(event));
+        let effects = self.machine_mut().step(Event::Storage(event));
         self.carry_out(effects, ballot)
     }
 

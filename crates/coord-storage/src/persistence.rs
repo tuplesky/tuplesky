@@ -44,6 +44,14 @@ pub enum Refused {
     StaleBase,
     /// The queue is full. Flushing lowers it; the batch was not taken.
     QueueFull,
+    /// The domain is fenced at a newer promise than the ballot this batch
+    /// is stamped with, so it may not newly enter the journal (design
+    /// Section 4.8). Definite, like [`Refused::Rejected`], but expected:
+    /// a voter whose promise did not become durable goes back to the
+    /// ballot it had while the fence stays, and what it does there is
+    /// refused until it promises again. The barrier the batch carries is
+    /// definitely not committed.
+    Fenced,
     /// Refused for good: the batch may not become durable here at all.
     Rejected(String),
 }
@@ -54,6 +62,7 @@ impl core::fmt::Display for Refused {
             Refused::NotReady(why) => write!(f, "not ready: {why}"),
             Refused::StaleBase => f.write_str("the base no longer extends the frontier"),
             Refused::QueueFull => f.write_str("the queue is full"),
+            Refused::Fenced => f.write_str("fenced at a newer promise"),
             Refused::Rejected(why) => write!(f, "refused: {why}"),
         }
     }
@@ -106,6 +115,18 @@ pub trait Persistence {
     /// deliberately reports no event for a deferred materialization,
     /// because a durable journal record is never a failed batch.
     fn unmaterialized(&self) -> usize;
+
+    /// Whether the queue has room for `batch` now.
+    ///
+    /// Only the queue's own bounds, which is the refusal a caller can do
+    /// something about: lowering what is queued makes the room. Every
+    /// other guard is still [`Persistence::submit`]'s. A coordinator
+    /// whose queue has no bound, or whose bound this does not model,
+    /// says yes and lets `submit` answer.
+    fn has_room(&self, batch: &PersistBatch) -> bool {
+        let _ = batch;
+        true
+    }
 
     /// Take `batch` for durability, as a transition of `kind`.
     ///
@@ -162,6 +183,22 @@ pub trait Persistence {
     fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {
         let _ = ballot;
     }
+
+    /// Stop admitting transitions of any ballot below `promised`, and
+    /// report the queued ones refused because of it (design Section 4.8),
+    /// so no barrier waits for ever on a transition that will never be
+    /// journaled.
+    ///
+    /// Called when this replica promises a higher ballot, after its own
+    /// promise row has been queued under that ballot. A coordinator with
+    /// no journal and no queue has nothing to fence and reports nothing.
+    fn fence(
+        &mut self,
+        promised: coord_types::ids::Ballot,
+    ) -> Result<Vec<StorageEvent>, EngineError> {
+        let _ = promised;
+        Ok(Vec::new())
+    }
 }
 
 /// The reference path: the projection is itself the durable record.
@@ -194,6 +231,10 @@ impl<E: coord_store_api::engine::LocalEngine> Persistence for crate::worker::Sto
         // The projection is the record: there is nothing between them to
         // be owed.
         0
+    }
+
+    fn has_room(&self, batch: &PersistBatch) -> bool {
+        crate::worker::StoreWorker::has_room(self, batch)
     }
 
     fn submit(&mut self, batch: PersistBatch, _kind: TransitionKind) -> Result<(), Refused> {
@@ -345,11 +386,29 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
         self.store.unmaterialized(self.domain)
     }
 
+    fn has_room(&self, batch: &PersistBatch) -> bool {
+        self.store.has_room(self.domain, batch)
+    }
+
     fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {
         self.ballot = coord_types::ids::Ballot {
             epoch: self.application_base().configuration,
             ..ballot
         };
+    }
+
+    fn fence(
+        &mut self,
+        promised: coord_types::ids::Ballot,
+    ) -> Result<Vec<StorageEvent>, EngineError> {
+        // In the stamp's epoch, for the same reason `follow_ballot` uses
+        // it: the fence is compared with the stamps, and a fence in the
+        // machine's epoch would compare as incomparable with every one.
+        let promised = coord_types::ids::Ballot {
+            epoch: self.application_base().configuration,
+            ..promised
+        };
+        self.store.fence(self.domain, promised).map_err(engine)
     }
 
     fn submit(&mut self, batch: PersistBatch, kind: TransitionKind) -> Result<(), Refused> {
@@ -367,6 +426,7 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
                 // is no longer its own.
                 crate::journaled::SubmitRefused::StaleBase { .. } => Refused::StaleBase,
                 crate::journaled::SubmitRefused::QueueFull => Refused::QueueFull,
+                crate::journaled::SubmitRefused::ObsoleteBallot { .. } => Refused::Fenced,
                 crate::journaled::SubmitRefused::NotReady(status) => {
                     Refused::NotReady(format!("{status:?}"))
                 }

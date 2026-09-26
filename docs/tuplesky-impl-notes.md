@@ -3386,3 +3386,331 @@ Negative controls, run by hand. With `role` left out of the request, the
 three-voter test fails: every attempt comes back as a voter and is refused
 as a change of role. With the renewed collector leaf never put into
 service, it fails because voter 1's collector links do not come back.
+
+## A domain whose leader stops has no leader
+
+task-d01. The protocol machines could campaign, win, and step down, but
+nothing in `coordd` ever asked them to. The genesis ballot's leader was
+the only leader a domain had, and stopping that one process stopped
+every write.
+
+**When to campaign** is `bins/coordd/src/election.rs`, a schedule handed
+time so it is tested without a clock. A voter is without a leader when
+it does not lead and holds no control link to the voter its ballot
+names, or when its ballot names itself and it does not lead (a restarted
+leader, or a campaign of its own not yet won). No heartbeat was added:
+the transport keeps a link to every voter, re-dials it (task-d03), and
+closes one whose peer stopped answering at its idle timeout. A voter
+without a leader waits a jittered patience (1 s, scaled into 0.75 to
+1.25), campaigns only while it can reach a majority of voters counting
+itself, and doubles its wait after each campaign that produced no leader,
+up to 16 s. An operator asks a voter to campaign with `SIGUSR1`. The
+request goes on the next pass that can reach a majority, whether or not
+the voter has a leader. Patience and ceiling are constants, not
+settings. The configuration schema is unchanged.
+
+**How a campaign goes** is `Voter::campaign`. The ballot moves first, to
+the successor of the highest ballot the voter holds or has promised, so
+the promise it makes itself is recorded under the ballot it promises.
+The follower machine then campaigns. The store is fenced at the new
+ballot last, which refuses what was still queued under the old one. A
+candidate's `NewLeader` is adopted the same way in `Voter::on_peer`. If
+it is above the voter's ballot, the voter moves to it before the machine
+steps, fences if the machine promised, and moves back if it did not.
+`Voter::follow_machine` runs after every peer frame and on every turn.
+It adopts any higher ballot the machine promised by another path and
+changes role when the machine says so. A follower that won converts with
+`Leader::from_recovered`. A deposed leader converts with
+`Follower::from_recovered` and replays the Sync it received while it
+still led. The conversion happens in place inside `Node`. The store, the
+outbox and every connection carry on.
+
+**A voter that missed the election** would never hear it. A campaign
+asks every voter once. One that was down or cut off comes back still
+leading, or still following, a ballot the domain has left. So a leader
+that won a ballot keeps the selection it won with (`Node::won`). When a
+voter's control link returns, the leader sends it `NewLeader` for its
+ballot and the Sync it won with (`Voter::welcome`). Both are needed. A
+voter that had promised the ballot but not received its Sync before it
+stopped refuses a `NewLeader` for a ballot it has already promised, so
+it would send no promise and never be sent the Sync on one. A voter
+that has not promised refuses the Sync, harmlessly, and promises on the
+`NewLeader`, and its promise is answered with the Sync again. A second
+copy of the active ballot's Sync changes nothing.
+
+**A restart comes back at the ballot it had, and never leading it.**
+`main.rs` used to start every replica at the genesis ballot, as its
+leader or as a follower. It now starts at the ballot the recovered
+promise row holds and votes in the configuration of the ballot it was
+synchronized to. It comes back as a follower of that ballot. The one
+exception is the genesis leader on a store that has taken part in
+nothing: no promise, no records, no payloads, nothing executed, no Sync,
+and a zero frontier. A leader's command table, its proposals and its
+sequence numbers live in memory. A leader that restarted and went on
+leading its ballot would propose again from sequence zero with no memory
+of what it had proposed. Its followers would accept, since they check
+the ballot and the leader and not that sequences only go up, and a new
+command could take an order that contradicts one the domain had already
+committed. Replicas would diverge with nothing to detect it. The
+survivors cannot prevent this, because a leader killed and restarted
+before its links idle out was never missed. A restarted leader is
+instead a follower of a ballot that names itself and that it does not
+lead, which the election counts as leaderless. It campaigns for the next
+ballot, and that ballot's recovery rebuilds from a majority what the
+leader lost. A campaign whose Sync was bound before a stop is not taken
+up either, since taking it up would make the replica that ballot's
+proposer again. Nobody publishes that selection. Task-26 forbids
+publishing a different one, not publishing none, and the next campaign's
+recovery reads what the voters that received it kept. Every restart of
+a single-voter domain is therefore a campaign of one, a patience after
+start.
+
+**The collector follows its voter.** Evidence is counted under a ballot's
+configuration. The co-located collector is reconfigured when the ballot
+its voter votes in has changed: after every peer frame, before that
+frame's output reaches it, and on every turn. Waiting for the turn would
+have the evidence produced by the step that activated a ballot refused
+as the old ballot's, and recovered only by a re-offer. That voids what it counted
+under the old ballot, and its pending commands collect afresh. A
+frontend-only process has no voter to follow. It keeps counting under
+the genesis ballot and establishes nothing after an election. That gap
+stays open until the collector learns the ballot from the evidence it
+is sent.
+
+**Seen on stderr:**
+
+- `this voter leads ballot N`, `this voter follows ballot N led by X`,
+  or `this voter is a candidate for ballot N`, whenever the role or
+  ballot changes.
+- `this voter campaigns for ballot N (no leader)` or `(asked to)`.
+- A count of transitions the fence refused, as definitely not committed.
+
+The acceptance tests are these:
+
+- `the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_returns`
+  runs three daemons and kills the genesis leader. The survivors elect
+  one of themselves once the leader's links end at the idle timeout. A
+  read returns the value written under the old leader, and a write is
+  established. The old leader, restarted, follows ballot 1 and the
+  domain keeps serving. Without the campaign the survivors never elect.
+  Without the welcome the old leader comes back leading ballot 0.
+- `a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_its_ballot`
+  kills the genesis leader and starts it again at once, while the
+  survivors still hold its old links. It does not lead ballot 0. It
+  leads ballot 1, the survivors follow it, and every voter reads the
+  value written before and then the value written after. With the old
+  restart rule it comes back leading ballot 0.
+- `an_operator_moves_leadership_and_the_old_leader_steps_down` sends
+  `SIGUSR1` to voter 3 while voter 1 leads. Voter 1 converts in place and
+  the domain serves under ballot 1.
+- In process, `a_follower_that_campaigns_leads_and_the_domain_serves_under_its_ballot`,
+  `two_candidates_at_once_end_with_one_leader` and
+  `a_leader_that_missed_the_election_authorizes_nothing` show the three
+  cases. A campaign is won by a majority. Two simultaneous candidates end
+  with the higher ballot's leader and one execution per command. A leader
+  cut off from the election gets nothing established and nothing
+  executed on its word. Without the role change the first fails.
+- The voter tests check the ordering. A campaign's promise and a
+  candidate's promise are each submitted under the ballot promised and
+  fenced there. A `NewLeader` the machine refuses moves nothing.
+
+**A promise that does not become durable** moves the voter back. The
+machine counts a promise in flight as promised, so the voter fences at
+it. If the row then fails, the machine is back at the ballot it had, and
+`follow_machine` brings the voter's ballot back to it, so what the
+machine does is stamped with the ballot it does it under. The store's
+fence does not move back. Work stamped below it is refused and counted
+until the voter promises that ballot or a higher one again. A voter that
+does not vote is always safe.
+
+What refused means matters, because the refusal lands in the serve loop.
+Work already queued is refused by the fence itself, and its barriers fail.
+Work the machine asks for afterwards is refused at submit, where the
+journaled store answers `ObsoleteBallot`. That used to surface as
+`DriveError::Submit`. On the turn path, a `DriveError` ends the serve
+loop. On the peer path and the connection-submission path, it is logged
+and serving continues. In that case the `?` in `Voter::on_peer` also
+skips the revert, leaving a stamp at the candidate's ballot with a
+promise that never resolves. The store wrapper now reports the refusal as
+`Refused::Fenced`. What happens next depends on the role:
+
+- **A follower serves on.** `Node::one_round` turns the refusal into what
+  the fence reports for queued work: the barrier failed,
+  `DefinitelyNotCommitted`, fed back to the machine. The send that waited
+  on it is never released. This also closes the peer-path case above for
+  `Fenced`. Every other refusal at submit still ends the loop on the turn
+  path. `a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on`
+  has the store refuse a candidate's promise row as fenced. The voter
+  sends no promise, follows the machine back to its ballot, and counts
+  the refusal.
+- **A leader stops**, with `DriveError::Fenced`. A leader whose promise
+  to a candidate failed still leads its old ballot, because
+  `Leader::deposed` reads the durable promise. Every batch it makes is
+  then stamped below the fence and refused. If it served on, it would run
+  out of proposal retries and stop proposing while still `Machine::Leader`.
+  Neither it nor the voters holding its links would campaign, and the
+  domain would stall. Stopped, it restarts as a follower of its ballot and
+  campaigns (the restart rule above). This holds on every path. On the
+  peer path and the collector-submission path a `DriveError` is otherwise
+  only logged. A `Fenced` one is recorded instead (`Domain::fenced_stop`),
+  and the loop ends on its next pass with the same message as a turn.
+  `a_leader_whose_work_is_refused_by_its_own_fence_stops` fences the
+  promise, fails its row as a group failure would, and then submits: the
+  step ends `Fenced`. Without the leader arm, it serves on.
+- **A follower's own campaign goes above the fence.** `Voter` keeps the
+  highest ballot it fenced at, and `campaign` takes the successor of the
+  highest of its ballot, its promise and that fence. After a candidate's
+  promise fails, the successor of the first two alone is the old number
+  plus one under the voter's own id. Where the candidate's id is higher,
+  that ballot is below the fence, and the voter's own store would refuse
+  the campaign every time. `a_follower_below_its_own_fence_campaigns_above_it`
+  shows the campaign accepted above the fence. Without the fence in the
+  successor, it is refused.
+- **A fenced apply stops, and says why.** An application transition
+  stamped below the fence is refused by the same check. It is a committed
+  command being applied, and the batch carries the voter's current stamp,
+  not the ballot the command was committed under. Failing its barrier and
+  forgetting it is not an answer, because a committed command has to be
+  applied at its position. `materialize::submit` reports it as
+  `FENCED_APPLY`, and `Node::execute` turns that into `DriveError::Fenced`.
+  The serve loop then says the voter stopped because its store's fence is
+  above its ballot, and that a restart resumes at the promised ballot, as
+  a follower that campaigns. The fence is held in memory only (it is not
+  written, or restored at open or replay), and a promise row that
+  definitely failed leaves no trace, so a restart heals every variant of
+  this state. `composed.rs::a_transition_stamped_below_the_fence_is_refused_as_fenced`
+  shows both kinds reaching the driver as fenced through `JournaledDomain`.
+
+Re-promising is not done here. A driver-initiated re-promise would be a
+second path to a promise. A machine-side one needs the machine to keep the
+candidate, which `PromiseOutcome::Failed` drops; that is a
+`coord-consensus` change, and promise rules belong to task-26. Releasing
+the fence on a failed promise would be safe only if keyed to
+`DefinitelyNotCommitted`, and `PromiseOutcome::Failed` is not keyed to the
+failure class. The eventual fix is the machine-level re-promise. Until
+then, a leader stops where serving on would stall, and so does an apply.
+One harmless leftover: after a fenced promise, a follower's `report_due`
+still requires the failed barrier until the next promise or campaign
+replaces it.
+
+**A campaign still under way is left to finish.** A campaign collects a
+report from a majority, and a report carries what its voter holds, so on
+a busy domain the collection can outlast the doubled patience. Replacing
+it would discard it and raise the ballot every voter must promise again.
+While a campaign of the voter's own is live, a leaderless voter waits for
+it up to the schedule's ceiling (16 s) after it started. An operator's
+request is not held back.
+
+Recorded, not changed:
+
+- A leader that becomes a follower drops its proposals, its votes, its
+  early votes and the task-c02 replay store (`Follower::from_recovered`
+  keeps the table and the records). Retries are then served from the
+  table and the record path only.
+- A stale leader that reconnects to a follower of the higher ballot, but
+  not to that ballot's leader, keeps leading its own until the new
+  leader's welcome reaches it. That affects liveness only, because a
+  majority has promised the higher ballot and nothing is established on
+  its word.
+- A follower whose control link to the leader closes, while it still
+  holds another voter, campaigns after about a second. That churn is
+  bounded by the idle timeout: a link closes on a real departure or
+  after 30 s of silence, not on a short blip.
+- `SIGUSR1` exists only on Unix. Elsewhere leadership moves by election
+  alone, and the operator-request arm never fires.
+- A CLI election test waits for the transport's idle timeout plus
+  patience, 45 to 70 s, because a killed process closes nothing.
+
+**Surfacing the ballot before the promise is recorded** matters only
+where a promise row can still be queued when the fence arrives. In
+`coordd` it cannot: `Node` drives storage until nothing is queued within
+the round that produced the row, so the row is durable before the fence
+is set. With the pre-adoption removed, the daemon tests still pass while
+the voter test fails. The stamp is still what the plan requires. A
+promise recorded under the ballot the voter was leaving is a record that
+says the wrong thing, and a store that queued across rounds would refuse
+it.
+
+### Repeated leader kills
+
+The Jepsen shim's stress run (#98, `--fault leader`) kills whichever
+voter leads every 25 s. On this chain it found three faults, all reached
+only after a voter has served for a while, and the domain never elected
+again:
+
+- the restarted voter stopped with "batch refused: the queue is full";
+- on its next restarts it panicked at `expect("installed")` in
+  `Follower::advance_sync`;
+- the survivors campaigned ballot after ballot and none of them won.
+
+Each has a deterministic test that fails without its fix.
+
+**A candidate asks again until it has every payload.** A candidate asked
+each promised voter once for every payload its selection lacked. A peer
+answers at most `MAX_PAYLOAD_TRANSFER` (8), so a candidate behind by more
+than that got one batch and then waited for ever. The runtime's paced
+asks went to the leader of the ballot it followed, which is the voter
+whose loss started the campaign. Now:
+
+- the campaign's missing set counts as missing, so those paced asks
+  cover it;
+- `request_payloads` asks the promised voters, not that leader, for a
+  bounded batch of it;
+- the campaign asks for the next batch as soon as the last was answered
+  in full, or when a voter promises that was not asked yet.
+
+Test: `a_candidate_missing_more_payloads_than_one_answer_carries_still_wins`.
+
+**A retired command installs as executed.** A Sync names what every
+reporter's durable ledger holds, which includes commands a voter already
+executed and retired. `phase_of` answers EXECUTED from the tombstone, so
+the installation took such an entry as ready and then found no record.
+That was the follower's panic, and `Leader::repropose` had the same one.
+Both now skip a command with no record.
+
+A leader without the record cannot re-propose the command, so a voter
+holding it at ACCEPT would wait for a vote that never comes. To close
+that, the candidate marks as committed every selected entry it executed
+itself. It does so only when the executed dependencies agree with the
+entry, or when the record is gone.
+
+`commit_executed` visits the selected entries only, not `reproposed`. A command the candidate executed cannot be re-proposed only: it was committed, so a majority accepted it at a ballot no lower than the one it committed under. The promised majority intersects that majority, and accepting requires the ballot to be synced, so the source ballot's reports carry the command at ACCEPT or above, and the selection puts it in `entries`.
+
+Test: `a_sync_naming_commands_this_voter_retired_installs_without_them`.
+
+**A step that asks for more than the queue holds lowers first.**
+Installing a Sync writes one row per selected command, and a new leader
+re-proposes each one. `Node::one_round` submitted them all before
+lowering any, the journaled store's queue (256 batches) refused the rest,
+and the voter stopped. When it came back, it met the same selection. Now:
+
+- `Persistence::has_room` answers the queue's own bounds;
+- before each submit, `one_round` lowers what is queued until there is
+  room, and feeds what became durable to the outbox and the machine;
+- a lowering that moves nothing leaves the refusal to `submit`.
+
+Test: `a_step_that_asks_for_more_than_the_queue_holds_is_carried_out`.
+
+**What the stress run shows now.** With these fixes, five leader kills
+in 120 s produce no exit and no panic, and every election completes. The
+final read is still not served. The cause is the limit below, not
+anything in this list.
+
+**What is left: recovery carries the whole history.** Dependency rows
+are never deleted, and `DurableLedger` reports every one. So a report,
+and the Sync selected from reports, names every command the domain ever
+ran. A voter remembers the commands it retired only for its last
+`capacity` retirements. It cannot tell an older command it executed
+from one it never heard of: `phase_of` answers `None` for both.
+
+- The candidate treats such a command as missing its payload.
+- A follower installs it as a placeholder.
+- Either way the table fills, and new work is refused as
+  `Backpressure`.
+
+In the deterministic cluster, with capacity 32, 200 commands before a
+leader loss leave the candidate waiting on 160 payloads for commands it
+executed long ago. Bounding recovery by an execution floor, a pruned
+ledger, or a durable "executed" answer is a protocol decision for
+`coord-consensus`, and this change does not make it. The plan now owns
+it as task-d05, a prerequisite of task-64.

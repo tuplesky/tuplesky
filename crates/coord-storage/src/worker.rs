@@ -184,6 +184,13 @@ impl<E: LocalEngine> StoreWorker<E> {
         self.queue.len()
     }
 
+    /// Whether the queue has room for `batch`: whether
+    /// [`StoreWorker::submit`] would refuse it as
+    /// [`SubmitError::QueueFull`], and nothing else.
+    pub fn has_room(&self, batch: &PersistBatch) -> bool {
+        self.queued_bytes + batch_bytes(batch) <= self.limits.max_queued_bytes
+    }
+
     /// The engine (for harnesses that crash and reopen it).
     pub fn engine_mut(&mut self) -> &mut E {
         &mut self.engine

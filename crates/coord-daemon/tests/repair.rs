@@ -338,6 +338,8 @@ struct Cluster {
     /// reset -- what it published for a submitter it did not know, and
     /// so what a repair has to publish again.
     published: Vec<usize>,
+    /// A voter that has stopped: nothing reaches it and it does nothing.
+    down: Option<usize>,
 }
 
 impl Cluster {
@@ -359,6 +361,7 @@ impl Cluster {
             releases: Vec::new(),
             counted: Vec::new(),
             published: vec![0; 3],
+            down: None,
         }
     }
 
@@ -478,11 +481,17 @@ impl Cluster {
         loop {
             let mut moved = false;
             while let Some((to, prov, bytes)) = self.peers.pop_front() {
+                if self.down == Some(to) {
+                    continue;
+                }
                 let out = self.voters[to].on_peer(prov, bytes).expect("driven");
                 self.carry(to, out);
                 moved = true;
             }
             for i in 0..3 {
+                if self.down == Some(i) {
+                    continue;
+                }
                 let out = self.voters[i].execute().expect("executed");
                 if !out.is_empty() {
                     moved = true;
@@ -890,4 +899,164 @@ fn the_record_alone_settles_nothing() {
         Err(SettleError::Uncorroborated)
     );
     assert!(w.collector.is_pending(&command));
+}
+
+/// A follower that campaigns while the leader is away leads the next
+/// ballot, the other survivor follows it, and the domain establishes a
+/// command under it with the two that are left (task-d01).
+///
+/// Everything here but the decision to campaign is coordd's: the ballot
+/// the voter moves to before its promise is recorded, the role change
+/// when the campaign is won, the collector counting under the new ballot.
+/// What was established under the old leader is kept -- the new leader's
+/// Sync carries it -- and nothing is executed twice.
+#[test]
+fn a_follower_that_campaigns_leads_and_the_domain_serves_under_its_ballot() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert_eq!(w.releases.len(), 1, "the first command was established");
+
+    // The leader stops.
+    w.down = Some(0);
+    let (campaigned, out) = w.voters[1]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    w.carry(1, out);
+    w.settle();
+    assert!(
+        w.voters[1].leads(),
+        "the candidate did not win with a majority: {:?}",
+        w.rejections()
+    );
+    assert_eq!(w.voters[1].ballot(), campaigned);
+    assert_eq!(w.voters[2].ballot(), campaigned);
+    assert!(!w.voters[2].leads());
+    assert_eq!(w.voters[1].node().machine().active(), campaigned);
+    assert_eq!(w.voters[2].node().machine().active(), campaigned);
+
+    // The collector counts under the new ballot, as coordd has it do when
+    // its voter moves.
+    w.collector.reconfigure(
+        BallotConfiguration::c2_default(epoch(), campaigned, (0..3).map(r).collect()).unwrap(),
+    );
+    let second = w.submit(2);
+    for i in 1..3 {
+        w.deliver_submission(i, &second);
+    }
+    w.settle();
+    let command = w.command(2);
+    assert!(
+        w.releases.iter().any(|r| r.command == command),
+        "the second command was not established under the new ballot: {:?} {:?}",
+        w.progress,
+        w.rejected
+    );
+    assert_eq!(
+        &w.executed()[1..],
+        [2, 2],
+        "each survivor executed each command once"
+    );
+}
+
+/// Two survivors that campaign at the same moment end with one leader,
+/// and the domain serves under its ballot with no divergence (task-d01).
+///
+/// Each candidate's `NewLeader` reaches the other. The higher of the two
+/// ballots is promised and the lower refused, so the one whose ballot
+/// lost follows the other rather than both leading.
+#[test]
+fn two_candidates_at_once_end_with_one_leader() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+    }
+    w.settle();
+    w.down = Some(0);
+    let (b1, out1) = w.voters[1].campaign().expect("stepped").expect("campaigns");
+    let (b2, out2) = w.voters[2].campaign().expect("stepped").expect("campaigns");
+    assert_ne!(b1, b2);
+    w.carry(1, out1);
+    w.carry(2, out2);
+    w.settle();
+    let leaders: Vec<usize> = (1..3).filter(|i| w.voters[*i].leads()).collect();
+    assert_eq!(leaders.len(), 1, "{leaders:?}: {:?}", w.rejections());
+    let winner = leaders[0];
+    let ballot = w.voters[winner].ballot();
+    assert_eq!(w.voters[1].ballot(), ballot);
+    assert_eq!(w.voters[2].ballot(), ballot);
+    assert_eq!(
+        ballot,
+        if b1.compare_same_epoch(&b2) == Some(core::cmp::Ordering::Greater) {
+            b1
+        } else {
+            b2
+        }
+    );
+
+    w.collector.reconfigure(
+        BallotConfiguration::c2_default(epoch(), ballot, (0..3).map(r).collect()).unwrap(),
+    );
+    let second = w.submit(2);
+    for i in 1..3 {
+        w.deliver_submission(i, &second);
+    }
+    w.settle();
+    let command = w.command(2);
+    assert!(w.releases.iter().any(|r| r.command == command));
+    assert_eq!(&w.executed()[1..], [2, 2]);
+}
+
+/// A leader that never heard the election goes on proposing under the
+/// old ballot, and nothing it says authorizes anything: the survivors do
+/// not vote for it and the collector, counting under the new ballot,
+/// establishes nothing on its word (Section 4.8, task-d01).
+#[test]
+fn a_leader_that_missed_the_election_authorizes_nothing() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+    }
+    w.settle();
+    w.down = Some(0);
+    let (campaigned, out) = w.voters[1].campaign().expect("stepped").expect("campaigns");
+    w.carry(1, out);
+    w.settle();
+    assert!(w.voters[1].leads());
+    w.collector.reconfigure(
+        BallotConfiguration::c2_default(epoch(), campaigned, (0..3).map(r).collect()).unwrap(),
+    );
+
+    // The old leader is cut off, not stopped: it takes the next
+    // submission and proposes it under the genesis ballot, and what it
+    // sends still reaches the others.
+    assert!(w.voters[0].leads());
+    let second = w.submit(2);
+    let command = w.command(2);
+    w.deliver_submission(0, &second);
+    w.settle();
+    assert!(
+        !w.releases.iter().any(|r| r.command == command),
+        "the old ballot's leader had a command established"
+    );
+    assert_eq!(
+        &w.executed()[1..],
+        [1, 1],
+        "a survivor executed the old ballot's proposal"
+    );
+
+    // The new ballot's leader and its follower establish it.
+    for i in 1..3 {
+        w.deliver_submission(i, &second);
+    }
+    w.settle();
+    assert!(w.releases.iter().any(|r| r.command == command));
+    assert_eq!(&w.executed()[1..], [2, 2]);
 }

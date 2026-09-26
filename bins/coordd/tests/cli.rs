@@ -5988,3 +5988,324 @@ async fn peers_admit_a_voters_renewed_leaf() {
         assert!(!node.said().contains("renewal expired"), "{}", node.said());
     }
 }
+
+/// The value a `Range` of one key answered with, if any.
+fn read_value(answer: &coord_types::wire_v1::Frame) -> Option<Vec<u8>> {
+    let response = response_of(answer);
+    let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+        panic!("the read was not answered with a result: {response:?}");
+    };
+    let read: coord_state::Response =
+        postcard::from_bytes(result.as_slice()).expect("the read's result decodes");
+    match read.outcome {
+        coord_state::Outcome::Range { items, .. } => items.first().map(|i| i.entry.value.clone()),
+        other => panic!("a range was answered with {other:?}"),
+    }
+}
+
+/// A leader killed and started again before anyone noticed it had gone
+/// does not go on leading the ballot it had (task-d01).
+///
+/// Its command table, proposals and sequence numbers were in memory. Had
+/// it resumed the genesis ballot it would have proposed again from
+/// sequence zero, its followers would have accepted -- the survivors
+/// still hold its old links, so nobody else campaigns -- and a new command
+/// could have been ordered against one the domain had already committed.
+/// It comes back following the ballot that names it, which it does not
+/// lead, campaigns for the next one, and leads that only once a majority's
+/// reports have rebuilt what it lost. What was written before is what
+/// every voter reads after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_its_ballot() {
+    let dir = workspace("leader-restart");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_to_say("this voter leads ballot 0"),
+        "{}",
+        running[0].said()
+    );
+    let before = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x61; 16]).await;
+    let put = ask(&before.connection, &before.put(1, b"k", b"before"))
+        .await
+        .expect("the domain established a write while its leader was up");
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // Killed and started again at once: the survivors still hold its old
+    // links, so as far as they know it never went.
+    drop(running.remove(0));
+    let back = start(&cluster.configs[0]);
+    running.insert(0, back);
+    assert!(
+        running[0].waits_until(120, |said| said.contains("this voter leads ballot 1")),
+        "the restarted leader did not win the next ballot:\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said(),
+        running[2].said()
+    );
+    assert!(
+        !running[0].said().contains("this voter leads ballot 0"),
+        "the restarted leader resumed the genesis ballot:\n{}",
+        running[0].said()
+    );
+    for node in &running[1..] {
+        assert!(
+            node.waits_until(30, |said| said.contains("this voter follows ballot 1")),
+            "a survivor did not follow the restarted leader's new ballot:\n{}",
+            node.said()
+        );
+    }
+    // A survivor's collector link to the old process is a connection to
+    // nothing until the transport's idle timeout ends it (the restart
+    // collision window task-d03 records), and what it submits meanwhile
+    // waits for the link that replaces it. So each survivor is asked
+    // through once that link is back.
+    for node in &running[1..] {
+        assert!(
+            node.waits_until(90, |said| healed(said, "voters submittable=", 2)),
+            "a survivor's collector did not get its link to the restarted leader back:\n{}",
+            node.said()
+        );
+    }
+
+    // Written before, read after, at every voter; and a write after is
+    // what every voter reads next.
+    let callers = [
+        Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x62; 16]).await,
+        Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x63; 16]).await,
+        Caller::bind(&running[2], &cluster.ca, &cluster.ring, [0x64; 16]).await,
+    ];
+    for (n, caller) in callers.iter().enumerate() {
+        let read = ask(&caller.connection, &caller.range(1, b"k"))
+            .await
+            .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
+        assert_eq!(
+            read_value(&read).as_deref(),
+            Some(&b"before"[..]),
+            "voter {}",
+            n + 1
+        );
+    }
+    let put = ask(&callers[0].connection, &callers[0].put(2, b"k", b"after"))
+        .await
+        .expect("the new ballot established a write");
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+    for (n, caller) in callers.iter().enumerate() {
+        let read = ask(&caller.connection, &caller.range(3, b"k"))
+            .await
+            .unwrap_or_else(|| panic!("voter {} did not answer a read", n + 1));
+        assert_eq!(
+            read_value(&read).as_deref(),
+            Some(&b"after"[..]),
+            "voter {}",
+            n + 1
+        );
+    }
+}
+
+/// The survivors of a stopped leader elect one of themselves and go on
+/// serving; the old leader, started again, follows the new one; and what
+/// was established before is still there (task-d01).
+///
+/// Before this a domain served only while the voter the genesis ballot
+/// names was up: nothing chose another leader, so stopping one process
+/// stopped every write. The survivors notice the leader has gone when
+/// its links end -- a killed process closes nothing, so at the
+/// transport's idle timeout -- and one of them campaigns. The old
+/// leader comes back following the genesis ballot, which names it and
+/// which it does not lead, and is told the domain has moved on when the
+/// new leader sees its link return.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_returns() {
+    let dir = workspace("elect");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let mut running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    assert!(
+        running[0].waits_to_say("this voter leads ballot 0"),
+        "voter 1 does not lead the genesis ballot:\n{}",
+        running[0].said()
+    );
+    let before = Caller::bind(&running[1], &cluster.ca, &cluster.ring, [0x4f; 16]).await;
+    let put = ask(&before.connection, &before.put(1, b"k", b"before"))
+        .await
+        .expect("the domain established a write while its leader was up");
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // The genesis leader goes away.
+    let leader = running.remove(0);
+    drop(leader);
+    let elected = |said: &str| said.contains("this voter leads ballot 1");
+    let followed = |said: &str| said.contains("this voter follows ballot 1");
+    assert!(
+        running[0].waits_until(90, |said| elected(said) || followed(said))
+            && running[1].waits_until(30, |said| elected(said) || followed(said))
+            && (running[0].waits_until(30, elected) || running[1].waits_until(1, elected)),
+        "the survivors did not elect a leader:\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said()
+    );
+    let leaders = running.iter().filter(|n| elected(&n.said())).count();
+    assert_eq!(
+        leaders,
+        1,
+        "not exactly one leader of ballot 1:\n-- 2 --\n{}\n-- 3 --\n{}",
+        running[0].said(),
+        running[1].said()
+    );
+
+    // They serve: a write is established by the two that are left, and
+    // the write made under the old leader is still what a read sees
+    // before it.
+    let after = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x50; 16]).await;
+    let read = ask(&after.connection, &after.range(1, b"k"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the new leader's domain did not answer a read\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said()
+            )
+        });
+    assert_eq!(read_value(&read).as_deref(), Some(&b"before"[..]));
+    let put = ask(&after.connection, &after.put(2, b"k", b"after"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the new leader's domain did not establish a write\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+
+    // The old leader comes back, and follows.
+    let back = start(&cluster.configs[0]);
+    assert!(
+        back.waits_until(60, |said| said.contains("this voter follows ballot 1")),
+        "the old leader did not follow the new ballot when it came back:\n{}",
+        back.said()
+    );
+    assert!(
+        !back.said().contains("this voter leads ballot 1"),
+        "{}",
+        back.said()
+    );
+    // And the domain it came back to still serves, with it in it.
+    let put = ask(&after.connection, &after.put(3, b"k2", b"again"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the domain stopped serving when the old leader returned\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                back.said(),
+                running[0].said(),
+                running[1].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}
+
+/// An operator moves leadership on purpose by asking a voter to campaign
+/// (`SIGUSR1`), and the leader it replaces steps down while it is running
+/// (task-d01).
+///
+/// The leader here is up throughout, so this is the path a failure never
+/// takes: a live leader promising a higher ballot, converting to a
+/// follower in place with its store and its connections carrying on, and
+/// the domain serving under the new ballot straight away.
+///
+/// Unix only, as the signal is: `coordd` listens for it only there.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_moves_leadership_and_the_old_leader_steps_down() {
+    let dir = workspace("operator-elect");
+    let cluster = three_voters(&dir);
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    for node in &running {
+        assert!(
+            node.waits_to_say("voters submittable=2 of 2"),
+            "{}",
+            node.said()
+        );
+    }
+    let caller = Caller::bind(&running[0], &cluster.ca, &cluster.ring, [0x51; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"one"))
+        .await
+        .expect("the domain established a write under its first leader");
+
+    let asked = std::process::Command::new("kill")
+        .args(["-USR1", &running[2].child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(asked.success());
+    assert!(
+        running[2].waits_until(20, |said| said.contains("this voter leads ballot 1")),
+        "voter 3 did not take the lead it was asked to:\n{}",
+        running[2].said()
+    );
+    for (n, node) in running.iter().take(2).enumerate() {
+        assert!(
+            node.waits_until(20, |said| said
+                .contains("this voter follows ballot 1 led by 03030303")),
+            "voter {} did not follow the new ballot:\n{}",
+            n + 1,
+            node.said()
+        );
+    }
+
+    let read = ask(&caller.connection, &caller.range(2, b"k"))
+        .await
+        .unwrap_or_else(|| panic!("no answer to a read\n{}", running[0].said()));
+    assert_eq!(read_value(&read).as_deref(), Some(&b"one"[..]));
+    let put = ask(&caller.connection, &caller.put(3, b"k", b"two"))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the domain did not establish a write under its new leader\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+                running[0].said(),
+                running[1].said(),
+                running[2].said()
+            )
+        });
+    assert!(matches!(
+        response_of(&put).outcome,
+        coord_types::wire_v1::OutcomeV1::Ok { .. }
+    ));
+}
