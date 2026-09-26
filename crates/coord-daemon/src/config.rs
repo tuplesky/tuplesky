@@ -47,10 +47,37 @@ pub struct Limits {
     /// makes a restart replay further.
     #[serde(default = "default_checkpoint_after")]
     pub checkpoint_after_records: u64,
+    /// Commands a voter's command table holds at once (task-d05): the
+    /// ones it still owes work on, and the executed ones it has not
+    /// retired yet.
+    ///
+    /// A local memory bound and an operational setting, not a safety
+    /// switch: no replicated result depends on it, and voters of one
+    /// domain may differ. It is also, until recovery is bounded by what
+    /// the voters executed, how much history an election can carry: a
+    /// candidate must hold the whole selection, so a domain whose history
+    /// is well past this many commands cannot elect a leader. Raising it
+    /// moves that cliff; it does not remove it.
+    #[serde(default = "default_command_table_capacity")]
+    pub command_table_capacity: usize,
 }
 
 const fn default_checkpoint_after() -> u64 {
     4096
+}
+
+/// The command table capacity a configuration that names none gets.
+pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = 4096;
+/// The smallest command table capacity a voter is configured with. A
+/// table must hold a proposal's worth of in-flight commands and still
+/// reclaim, and the follower's held-proposal bound is a multiple of it.
+pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
+/// The largest: a bound on the memory a table and the structures sized
+/// from it (retired tombstones, replay evidence, held proposals) may take.
+pub const MAX_COMMAND_TABLE_CAPACITY: usize = 1 << 20;
+
+const fn default_command_table_capacity() -> usize {
+    DEFAULT_COMMAND_TABLE_CAPACITY
 }
 
 impl Default for Limits {
@@ -61,6 +88,7 @@ impl Default for Limits {
             max_outstanding_per_session: 256,
             max_live_subscriptions: 4096,
             checkpoint_after_records: default_checkpoint_after(),
+            command_table_capacity: default_command_table_capacity(),
         }
     }
 }
@@ -556,6 +584,15 @@ pub enum ConfigError {
     InsecureIssuer,
     /// A renewal that asks for no lifetime at all.
     ZeroLifetime,
+    /// A setting outside the range this build accepts.
+    OutOfRange {
+        /// Which setting.
+        field: &'static str,
+        /// The smallest value accepted.
+        min: u64,
+        /// The largest value accepted.
+        max: u64,
+    },
     /// A test-only switch set in a build without debug assertions. The
     /// field is named.
     TestOnlySwitch(&'static str),
@@ -709,6 +746,15 @@ impl Config {
             return Err(ConfigError::InvalidListener("admin_http"));
         }
         capability_covers(&self.capability, &self.limits)?;
+        if !(MIN_COMMAND_TABLE_CAPACITY..=MAX_COMMAND_TABLE_CAPACITY)
+            .contains(&self.limits.command_table_capacity)
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.command_table_capacity",
+                min: MIN_COMMAND_TABLE_CAPACITY as u64,
+                max: MAX_COMMAND_TABLE_CAPACITY as u64,
+            });
+        }
         // Durable state is opened under the name this build implements or
         // it is not opened at all. A name this build does not serve is a
         // different store, not a compatible one, and the manifest is what

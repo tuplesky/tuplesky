@@ -1040,7 +1040,7 @@ fn main() -> ExitCode {
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
     let backing = if roles.votes() {
-        match voter(&placed, applier, boot) {
+        match voter(&placed, applier, boot, config.limits.command_table_capacity) {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
                 eprintln!("{e}");
@@ -1354,6 +1354,7 @@ fn voter(
     placed: &membership::Placed,
     applier: coord_storage::Applier<store::Persistence>,
     boot: coord_core::effect::BootId,
+    capacity: usize,
 ) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     use coord_consensus::{
         ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig, LearningMode,
@@ -1460,7 +1461,7 @@ fn voter(
                 quorum,
                 genesis: ballot,
                 frontend: collector,
-                capacity: 64,
+                capacity,
             },
             recovered.promise.clone(),
             // A replica comes back sealed because its row says so
@@ -1478,7 +1479,7 @@ fn voter(
                 quorum,
                 genesis: ballot,
                 frontend: collector,
-                capacity: 64,
+                capacity,
             },
             recovered.promise.clone(),
             recovered.seal,
