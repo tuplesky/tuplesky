@@ -552,6 +552,27 @@ was `:valid? true`, with 633 `ok`. It served again after its first
 election (80 s to 140 s), stopped when all five nodes were killed at
 160 s, and did not serve again, final reads included.
 
+The cause was in the execution walk (#100, `751a71b`). A restart retires
+every executed record at once, about 2,000 here against a capacity of
+1024, and the walk over a command's closure stopped only at a retired
+command still in the tombstone window. A record still live after the
+restart could reach past the window: the guards answered EXECUTED for
+it, and the walk called it unknown. The walk now stops at any command
+the table has executed. With it (`6d248cc`), `--fault leader` and
+`--fault majority` each passed twice: service resumed after every
+election, voters restarted after checkpoints (`baseline` up to 9404)
+and came back, the final read was served, and there was no anomaly.
+
+The `jepsen` workflow on `6d248cc`
+([run 36272474606](https://github.com/tuplesky/tuplesky/actions/runs/36272474606))
+was `:valid? true`, with 988 `ok`, but its five nodes still stall. It
+served until about 80 s, then nothing until about 200 s, through
+partitions, pauses and their healing. The final reads were served
+through `n1`, `n2` and `n5` but not `n3` or `n4`. Through `n4` no
+operation succeeded in the whole run, and through `n3` only 14, all in
+the first 20 s. The stress driver's three voters no longer show this;
+the five-node cluster, with partitions, still does.
+
 ### Under Jepsen: a domain that no longer binds sessions
 
 That same run went on to the Jepsen test: list-append, five minutes of
