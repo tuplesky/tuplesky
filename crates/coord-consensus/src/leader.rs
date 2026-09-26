@@ -1495,12 +1495,22 @@ impl Leader {
                 // So does one whose deposing promise has not arrived yet:
                 // the Sync of a higher ballot is published once, and the
                 // follower this leader becomes keeps it until it promises
-                // that ballot (task-d05).
-                let higher = decision
-                    .ballot
-                    .compare_same_epoch(&self.config.quorum.ballot())
-                    == Some(core::cmp::Ordering::Greater);
-                if self.deposed() || higher {
+                // that ballot (task-d05). Only a Sync from its ballot's
+                // leader is kept, and only the highest: Syncs of two
+                // higher ballots can arrive in either order, and the
+                // lower one, kept last, would be refused once the higher
+                // promise is made, with the Sync that matches it gone.
+                let above = |b: &Ballot| {
+                    decision.ballot.compare_same_epoch(b) == Some(core::cmp::Ordering::Greater)
+                };
+                let kept = self
+                    .pending_sync
+                    .as_ref()
+                    .is_none_or(|(_, kept)| above(&kept.ballot));
+                if from.replica == decision.ballot.leader
+                    && kept
+                    && (self.deposed() || above(&self.config.quorum.ballot()))
+                {
                     self.pending_sync = Some((from.replica, decision));
                 }
                 Vec::new()

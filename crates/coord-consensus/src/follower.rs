@@ -164,6 +164,15 @@ pub enum FollowerRejection {
     },
     /// A campaign was requested for a ballot this replica cannot lead.
     CannotLead,
+    /// This replica is further behind than recovery carries anyone: a
+    /// selection it was about to bind depends on `missing`, which the
+    /// selection does not carry and this replica has not committed. The
+    /// campaign was abandoned, and this replica does not campaign again
+    /// this boot (task-d05).
+    Behind {
+        /// The dependency the selection leaves this replica without.
+        missing: CommandId,
+    },
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -273,6 +282,9 @@ pub struct Follower {
     ledger: DurableLedger,
     learner: Learner,
     campaign: Option<Campaign>,
+    /// Set when a selection showed this replica further behind than
+    /// recovery carries anyone; it does not campaign again this boot.
+    behind: Option<CommandId>,
     report_due: Option<ReportDue>,
     sync_pending: BTreeMap<CommandId, SyncEntry>,
     /// The Sync whose synchronized-ballot row is in flight: the new ballot
@@ -402,6 +414,7 @@ impl Follower {
             ledger,
             learner: Learner::new(executed_through),
             campaign: None,
+            behind: None,
             report_due: None,
             sync_pending: BTreeMap::new(),
             won: None,
@@ -475,6 +488,12 @@ impl Follower {
                 continue;
             }
             self.bindings.insert(p.retry_key, c);
+            // History stays swept: `restore_execution` has just forgotten
+            // it, and reloading it here would hold a payload per command
+            // ever executed until the next sweep (task-d05).
+            if self.table.forgotten(&c) {
+                continue;
+            }
             self.payloads.insert(c, p);
             self.served_payloads.insert(c);
         }
@@ -511,6 +530,7 @@ impl Follower {
             learner: state.learner,
             deferred: BTreeMap::new(),
             campaign: None,
+            behind: None,
             // A report owed to a candidate is an obligation of the replica,
             // not of the role it held when the request arrived: dropping it
             // would stall a candidate that needs this replica's majority.
@@ -571,6 +591,10 @@ impl Follower {
         };
         if ballot.leader != self.config.identity.replica {
             self.rejections.push(FollowerRejection::CannotLead);
+            return Vec::new();
+        }
+        if let Some(missing) = self.behind {
+            self.rejections.push(FollowerRejection::Behind { missing });
             return Vec::new();
         }
         let Ok(config) = BallotConfiguration::c2_default(
@@ -716,6 +740,18 @@ impl Follower {
         }
         if campaign.binding().is_none() && !campaign.is_durable() {
             let decision = campaign.decision().expect("selected").clone();
+            // A candidate further behind than every reporter's window
+            // would win and then never execute again: the selection names
+            // what it lacks only as a dependency, since every reporter
+            // executed it long ago and leaves it out, and nothing it binds
+            // brings it. It is not this replica's to lead; another voter
+            // is, and this one waits to be brought up (task-d05).
+            if let Some(missing) = Self::selection_gap(&self.table, &decision) {
+                self.rejections.push(FollowerRejection::Behind { missing });
+                self.behind = Some(missing);
+                self.campaign = None;
+                return Vec::new();
+            }
             // A selected command this replica never stored (it was down
             // while the request was admitted) needs its payload before the
             // result is bound: the new leader re-proposes from payloads,
@@ -1119,6 +1155,26 @@ impl Follower {
             .filter(|c| table.phase_of(c).is_none())
             .copied()
             .collect()
+    }
+
+    /// A dependency of a selected entry that the selection does not carry
+    /// and this replica has not committed (task-d05).
+    ///
+    /// A reporter that adopted an entry held its dependencies at ACCEPT
+    /// or beyond, so a dependency no majority report names is one every
+    /// such reporter executed and forgot. A replica without it committed
+    /// cannot get it from this selection, and cannot execute past it.
+    fn selection_gap(table: &CommandTable, decision: &SyncDecision) -> Option<CommandId> {
+        decision
+            .entries
+            .values()
+            .flat_map(|e| e.deps.iter())
+            .find(|d| {
+                !decision.entries.contains_key(d)
+                    && !decision.reproposed.contains(d)
+                    && table.phase_of(d) < Some(Phase::Commit)
+            })
+            .copied()
     }
 
     /// What this replica's own campaign is waiting for before it can bind

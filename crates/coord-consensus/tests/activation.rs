@@ -450,7 +450,10 @@ impl Cluster {
         .restore_execution(
             ExecutionPosition::new(self.nodes[i].executed.len() as u64).unwrap(),
             self.nodes[i].executed.iter().copied(),
-        );
+        )
+        // As `coordd` restores a voter: the payload rows go back in after
+        // the execution frontier.
+        .restore_payloads(payload_rows(&self.nodes[i].storage));
         self.nodes[i].boot += 1;
         let boot = self.nodes[i].boot;
         f.step(boot_event(boot));
@@ -852,6 +855,11 @@ fn an_election_after_more_history_than_the_table_holds_asks_for_nothing_executed
             "node {i} keeps {} durable records",
             f.ledger().len()
         );
+        let payloads = submitted.iter().filter(|c| f.payload(c).is_some()).count();
+        assert!(
+            payloads <= 4 * capacity + 8,
+            "node {i} holds {payloads} payloads"
+        );
     }
     cluster.crash(0);
     cluster.asks.clear();
@@ -894,6 +902,99 @@ fn an_election_after_more_history_than_the_table_holds_asks_for_nothing_executed
             "node {i}"
         );
     }
+}
+
+/// A candidate further behind than every reporter's window does not win
+/// (task-d05).
+///
+/// Its peers leave out of their reports what they executed long ago, so
+/// the selection names what the candidate lacks only as a dependency of
+/// the oldest command it does carry. Bound and won, that ballot would
+/// have a leader that can never execute again. The candidate abandons
+/// the campaign and stops campaigning, and a voter that is not behind
+/// leads instead.
+#[test]
+fn a_candidate_behind_every_reporters_window_does_not_win() {
+    let history = 200u64;
+    let mut cluster = Cluster::new(41);
+    cluster.crash(2);
+    let mut submitted = Vec::new();
+    for n in 0..history {
+        submitted.push(cluster.admit(n + 1, 1));
+        cluster.settle();
+    }
+    assert_eq!(cluster.nodes[1].executed, submitted);
+    // r2 comes back with nothing, and the leader goes: r1 and r2 are the
+    // majority left, and r2 campaigns first.
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.crash(0);
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(
+        !matches!(cluster.nodes[2].role, Some(Role::Leader(_))),
+        "a candidate {history} commands behind won"
+    );
+    let rejections = cluster.nodes[2].follower_mut().take_rejections();
+    assert!(
+        rejections
+            .iter()
+            .any(|r| matches!(r, FollowerRejection::Behind { .. })),
+        "{rejections:?}"
+    );
+    // It does not campaign again this boot.
+    cluster.campaign(2, ballot(2, 2));
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(1, 2)
+    );
+    // r0 comes back and r1, which is not behind, leads. r2 stays where
+    // it is -- what brings it up is a checkpoint, not a payload -- so its
+    // asks, which no voter can answer, are left out of the harness.
+    cluster.no_fetch.push(2);
+    cluster.revive(0, quorum(ballot(0, 0)));
+    cluster.campaign(1, ballot(3, 1));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    let next = cluster.admit(1000, 1);
+    cluster.settle();
+    for i in [0usize, 1] {
+        assert_eq!(cluster.nodes[i].executed.last(), Some(&next), "node {i}");
+    }
+}
+
+/// A leader keeps the highest of the Syncs ahead of it, and only from
+/// their ballots' leaders (task-d05).
+///
+/// Syncs of two higher ballots can reach a leader in either order before
+/// the promise that deposes it. Keeping the last one kept the lower one
+/// when it came second, and the follower the leader becomes refuses it
+/// once it promises the higher ballot, with the one Sync that matched
+/// gone.
+#[test]
+fn a_leader_keeps_the_highest_sync_ahead_of_it() {
+    let mut cluster = Cluster::new(43);
+    let sync = |b: Ballot| SyncDecision {
+        ballot: b,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: BTreeSet::new(),
+    };
+    for (from, b) in [
+        (2u8, ballot(2, 2)),
+        (1, ballot(1, 1)),
+        // Relayed by a voter that does not lead it.
+        (1, ballot(3, 2)),
+    ] {
+        let effects = cluster.nodes[0].step(peer_event(r(from), ProtocolMessage::Sync(sync(b))));
+        assert!(effects.is_empty());
+    }
+    let Some(Role::Leader(leader)) = &cluster.nodes[0].role else {
+        unreachable!()
+    };
+    assert_eq!(
+        leader.pending_sync().map(|(from, d)| (*from, d.ballot)),
+        Some((r(2), ballot(2, 2)))
+    );
 }
 
 /// A Sync that reaches a voter before that voter has promised its ballot

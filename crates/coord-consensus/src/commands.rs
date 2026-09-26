@@ -136,6 +136,15 @@ pub struct CommandTable {
     /// fetch, a table filling with history. So that answer is kept for
     /// every command, at the cost of one identity each.
     history: BTreeSet<CommandId>,
+    /// The last `capacity` commands retired, in the order they were: the
+    /// window a recovery report still names (task-d05).
+    ///
+    /// Not the tombstones. Those also keep every key's latest command for
+    /// the guards, however old, so with commands on ever new keys they
+    /// grow with the keys; a report bounded by them grew with them.
+    recent: VecDeque<CommandId>,
+    /// The same commands, for lookup.
+    recent_set: BTreeSet<CommandId>,
     capacity: Option<usize>,
 }
 
@@ -148,6 +157,8 @@ impl CommandTable {
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
             history: BTreeSet::new(),
+            recent: VecDeque::new(),
+            recent_set: BTreeSet::new(),
             capacity: None,
         }
     }
@@ -160,6 +171,8 @@ impl CommandTable {
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
             history: BTreeSet::new(),
+            recent: VecDeque::new(),
+            recent_set: BTreeSet::new(),
             capacity: Some(capacity),
         }
     }
@@ -179,6 +192,8 @@ impl CommandTable {
             executed: BTreeSet::new(),
             retired: VecDeque::new(),
             history: BTreeSet::new(),
+            recent: VecDeque::new(),
+            recent_set: BTreeSet::new(),
             capacity,
         };
         for (c, r) in records {
@@ -583,6 +598,16 @@ impl CommandTable {
         if self.executed.insert(*command) {
             self.retired.push_back(*command);
         }
+        if let Some(bound) = self.capacity
+            && self.recent_set.insert(*command)
+        {
+            self.recent.push_back(*command);
+            while self.recent.len() > bound {
+                if let Some(oldest) = self.recent.pop_front() {
+                    self.recent_set.remove(&oldest);
+                }
+            }
+        }
         if let Some(bound) = self.capacity {
             let mut latest = Vec::new();
             while self.retired.len() > bound {
@@ -610,17 +635,24 @@ impl CommandTable {
         &self.executed
     }
 
-    /// Whether this replica executed `command` so long ago that it keeps
-    /// nothing about it but that answer: no record and no tombstone
-    /// (task-d05).
+    /// Whether this replica executed `command` and retired it longer ago
+    /// than its last `capacity` retirements (task-d05).
     ///
     /// Such a command is history. Every voter that reports it has
     /// executed it, and a recovery report, a Sync and the payloads a
     /// replica serves leave it out; a voter that has not executed it by
     /// then is further behind than recovery carries anyone, and catches
-    /// up another way.
+    /// up another way. It may still be a key's latest command, kept as a
+    /// tombstone for the guards: that answers for it when a proposal
+    /// names it, and needs nothing of the report. An unbounded table
+    /// keeps every tombstone, and forgets only what it never held a
+    /// record of.
     pub fn forgotten(&self, command: &CommandId) -> bool {
-        self.history.contains(command) && !self.executed.contains(command)
+        self.history.contains(command)
+            && match self.capacity {
+                Some(_) => !self.recent_set.contains(command),
+                None => !self.executed.contains(command),
+            }
     }
 
     /// Start an exact closure traversal from an initialized command.
