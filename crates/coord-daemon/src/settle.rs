@@ -72,3 +72,52 @@ pub fn records_for<P: Persistence>(
         })
         .collect()
 }
+
+/// What one turn of settling from records sends, or the command that
+/// stopped it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settled<D> {
+    /// Every record was offered.
+    Offered {
+        /// The commands the collector accepted a record for.
+        settled: u64,
+        /// What goes out.
+        deliveries: Vec<D>,
+    },
+    /// The collector holds a release this node's own record of the
+    /// command contradicts (task-d06). This node executed the domain's
+    /// commands in another order than the leader, so nothing it read
+    /// from that record this turn goes out, and nothing after the
+    /// mismatch is offered.
+    Diverged(CommandId),
+}
+
+/// Offer each of `records` to `settle` in turn, and say what goes out.
+///
+/// `settle` is the collector's own decision
+/// ([`coord_collector::Dispatcher::settle_from_record`] in `coordd`).
+/// A refusal for want of corroboration, or of a command no longer
+/// pending, is ordinary and passed over. A mismatch is not: it ends the
+/// turn at once, and the deliveries already settled in it are dropped
+/// with it, since they come from the same execution record.
+pub fn offer<D>(
+    records: impl IntoIterator<Item = (CommandId, RetryRecordV1)>,
+    mut settle: impl FnMut(CommandId, &RetryRecordV1) -> Result<Option<D>, coord_collector::SettleError>,
+) -> Settled<D> {
+    let mut settled = 0;
+    let mut deliveries = Vec::new();
+    for (command, record) in records {
+        match settle(command, &record) {
+            Ok(delivery) => {
+                settled += 1;
+                deliveries.extend(delivery);
+            }
+            Err(coord_collector::SettleError::Mismatch) => return Settled::Diverged(command),
+            Err(_) => {}
+        }
+    }
+    Settled::Offered {
+        settled,
+        deliveries,
+    }
+}

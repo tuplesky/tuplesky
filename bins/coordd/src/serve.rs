@@ -2610,7 +2610,6 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         if half.is_empty() {
             return None;
         }
-        let mut deliveries = Vec::new();
         // Bounded per turn and rotated across turns: the bound is on
         // this turn's reads, and the rotation is what keeps it from
         // becoming a bound on which commands are ever read.
@@ -2618,40 +2617,38 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
         self.settle_cursor = cursor;
         let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
-        for (command, record) in records {
-            match self.frontend.frontend.dispatcher_mut().settle_from_record(
+        // The release this collector holds and what this node executed
+        // disagreeing is not an ordinary outcome: every replica executes
+        // the committed commands in one order, and this node's frontend
+        // answers from its own record of that order. So the node stops
+        // (task-d06) rather than go on answering from it, and nothing
+        // this pass read from the same record goes out.
+        let dispatcher = self.frontend.frontend.dispatcher_mut();
+        match coord_daemon::settle::offer(records, |command, record| {
+            dispatcher.settle_from_record(
                 command,
                 record.result_digest,
                 record.revision,
                 &record.response,
-            ) {
-                Ok(delivery) => {
-                    self.frontend.counts.settled_from_record += 1;
-                    deliveries.extend(delivery);
+            )
+        }) {
+            coord_daemon::settle::Settled::Offered {
+                settled,
+                deliveries,
+            } => {
+                self.frontend.counts.settled_from_record += settled;
+                for delivery in deliveries {
+                    self.answer(delivery);
                 }
-                // The release this collector holds and what this node
-                // executed disagree. Neither is believed, and it is not an
-                // ordinary outcome: every replica executes the committed
-                // commands in one order, and this node's frontend answers
-                // from its own record of that order. So the node stops
-                // (task-d06) rather than go on answering from it, and the
-                // deliveries this pass read from the same record do not
-                // go out either.
-                Err(coord_collector::SettleError::Mismatch) => {
-                    return Some(
-                        command.as_bytes()[..4]
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect(),
-                    );
-                }
-                Err(_) => {}
+                None
             }
+            coord_daemon::settle::Settled::Diverged(command) => Some(
+                command.as_bytes()[..4]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            ),
         }
-        for delivery in deliveries {
-            self.answer(delivery);
-        }
-        None
     }
 
     /// Which collector this voter owes a frame to, where it knows.

@@ -3841,6 +3841,30 @@ command initialized after a reclaim had no dependencies.
   next proposal on that key names. There is at most one per key, and each
   goes in its turn once a newer command has taken its key.
 
+**The same break at an election.** The review of #99 found the chain
+broken a second way. A key's latest command is written by `initialize`,
+which on a follower runs when a payload arrives, so a follower's latest
+is the last payload to reach it, in arrival order, not the leader's
+proposal order. `accept` and `adopt` never move it. A follower that wins
+re-proposes the recovered order through `repropose`, which only accepts,
+so its first fresh proposal named whatever payload had reached it last.
+That can be a command in the middle of the recovered order. A voter
+holding the tail committed but without its payload then found the fresh
+command ready and executed it first: the same fork as the reclaim, at a
+ballot change. `Leader::from_recovered` already computed the tail, to
+chain the re-proposed set after it, and did not store it. Now it
+anchors the tail as the conservative key's latest (`CommandTable::anchor`,
+the third place that writes it, beside `initialize` and `restore`), so
+the first fresh command of a ballot depends on it.
+
+`restore` rebuilds the latest as the record nothing else depends on, and
+picks the largest identity if there are several. The review suggested
+asserting there is exactly one. That does not hold for every table a
+restart can find. A follower's record starts with the dependencies of
+its own arrival order and takes the leader's when it accepts, so before
+every record has been accepted the two orders can give two tails, or
+none. So there is no assertion there.
+
 **Divergence stops the node.** A `release-record-mismatch` means the
 leader's release of a command and this node's own execution record of it
 disagree, so this node executed the committed commands in another order.
@@ -3851,8 +3875,10 @@ the same record. The serve loop then stops right there, with
 re-offers, re-dials or takes another event, so no retry is answered from
 that record after the mismatch is seen. A first version recorded the
 mismatch and stopped at the top of the next pass, which left the rest of
-the batch and one event in between (review of #99). This wiring has no
-test of its own: it is one match arm and one check after the call.
+the batch and one event in between (review of #99). The decision is
+`coord_daemon::settle::offer`. It stops at the first mismatch and returns
+the command, and returns nothing that pass had settled. `serve.rs` stops
+the node on that answer.
 
 **What the frontend trusts.** Two paths answer a caller from this node's
 own execution record rather than from the leader's release, and both are
@@ -3882,6 +3908,19 @@ disagrees. The votes-only case has nothing to compare against.
   after a reclaim. Without the fix, r2 executes 33 before 32. With it, r2
   waits, and once the payload arrives it executes both in the leader's
   order.
+- `activation.rs` `a_new_leaders_first_command_follows_the_recovered_tail`:
+  the review's election case. r2 receives C's payload before B's, while
+  the leader ordered B then C. r1 holds C committed, without its payload.
+  r2 wins. Without the anchor, D names B, and r1 executes B, D where r2
+  executes B, C. With it, D names C, r1 waits for C's payload, and every
+  voter executes B, C, D.
+- `settle.rs` `a_mismatch_ends_the_turn_and_sends_nothing` and
+  `a_turn_without_a_mismatch_sends_what_settled`: `offer`'s stop, and
+  what it sends when nothing disagrees. `repair.rs`
+  `a_record_the_release_contradicts_stops_the_turn` stages the mismatch
+  through a real collector holding the leader's release. The
+  contradicting record stops the turn and settles nothing, and the true
+  record settles the command.
 - `graph.rs`
   `a_hot_key_keeps_working_after_its_executed_predecessor_is_retired`
   pinned the old rule: after the key's latest was retired, the next
