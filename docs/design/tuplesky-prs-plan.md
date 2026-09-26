@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 102 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d07` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, and `task-d05` through `task-d07` from the Jepsen client's runs, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 105 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d10` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, and `task-d05` through `task-d10` from the Jepsen client's runs, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -32,7 +32,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-j01 through task-j10 | Shared journal, materialization, local checkpoint, runtime composition and multi-group qualification | task-j06 separately optional |
 | task-o01 through task-o06 | Finalized streams, regional observers/relays, Kine watch/read integration | Capability-specific gates |
 | task-m01 through task-m05 | Authoritative discovery, full-client Kine and integrated membership | Operational production requirement |
-| task-d01 through task-d07 | Daemon runtime wiring (election, leaf renewal, reconnection), one execution order on every replica, recovery bounded by execution, and multi-host test provisioning | Required before task-64/task-65 qualification and task-66 |
+| task-d01 through task-d10 | Daemon runtime wiring (election, leaf renewal, reconnection), one execution order on every replica, recovery bounded by execution, every proposal and decision reaching every voter, catch-up, and multi-host test provisioning | Required before task-64/task-65 qualification and task-66 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -125,7 +125,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-61](#task-61) | Complete bounded observability and operator diagnostics | task-31, task-43, task-53, task-57 |
 | [task-62](#task-62) | Build and run the matched native WAN benchmark matrix | task-29, task-32, task-43, task-53, task-61 |
 | [task-63](#task-63) | Measure Kine end-to-end overhead and regression budgets | task-48, task-61, task-62 |
-| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07 |
+| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10 |
 | [task-65](#task-65) | Package and qualify supported deployment targets | task-43, task-48, task-59, task-60, task-61, task-d02, task-d04 |
 | [task-66](#task-66) | Close security, supply-chain and production release gates | task-58, task-59, task-60, task-63, task-64, task-65, task-d02, task-q01 |
 | [task-s01](#task-s01) | Define the portable engine contract and logical collection registry | task-02, task-04 |
@@ -163,6 +163,9 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d05](#task-d05) | Bound recovery reports and Syncs by what the voters executed | task-26, task-53, task-d01, task-d06 |
 | [task-d06](#task-d06) | Keep one execution order on every replica when a table reclaims | task-21, task-24, task-c02 |
 | [task-d07](#task-d07) | Re-send a proposal until every voter has voted on it | task-23, task-25, task-d03, task-d06 |
+| [task-d08](#task-d08) | Bring a voter behind the leader's retention up from a peer's checkpoint | task-50, task-53, task-j04, task-d05 |
+| [task-d09](#task-d09) | Carry the leader's commit decision to every voter | task-24, task-d07 |
+| [task-d10](#task-d10) | Flow-control catch-up from each voter's own frontier | task-25, task-d09 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64 |
 
 ## Task specifications
@@ -1020,7 +1023,7 @@ The other two came out of chasing the WAN matrix's open finding with this task's
 <a id="task-64"></a>
 ### task-64: Run mixed-fault qualification and automatic minimization
 
-**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07.  
+**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10.  
 **Design:** Sections 12, 21, 23 G6.
 
 **Implement:** Minimize combined storage/network/clock/issuer/queue/format/lease/watch/handoff faults. Retain actual redb reference suite and reusable oracles; composed journal and observer integration is explicitly exercised by later qualification. Leader loss and re-election under every fault class is in the matrix, which is why task-d01 is a prerequisite: before it a leader-region outage is an outage of the domain, and the matrix would measure the absence of an election rather than its safety.
@@ -1514,6 +1517,42 @@ This is the top liveness priority. Without it a domain that has executed more th
 
 **Review boundary:** Protocol transfer only: what a leader re-sends, when, and in what batches. No change to what is proposed, voted, committed or executed.
 
+<a id="task-d08"></a>
+### task-d08: Bring a voter behind the leader's retention up from a peer's checkpoint
+
+**Prerequisites:** task-50, task-53, task-j04, task-d05.  
+**Design:** Sections 5.3, 6.5.
+
+**Implement:** A voter down longer than the leader keeps what it needs (a table's worth of history, a checkpoint's trimmed prefix) has no path back: every command it lacks is one no peer re-sends, and the Jepsen runs' voter down for 190 s came back holding a table of commands it could never commit. The design's catch-up is a peer's checkpoint: task-50's install code and task-53's floors exist, and `coordd` wires neither. Wire them: a voter whose missing prefix is below every reachable peer's retention fetches and installs a checkpoint, resumes from its floor, and follows the leader from there.
+
+**Acceptance:** A voter stopped past its peers' retention and restarted serves reads again without an election. The installed state is the checkpoint's, and nothing below its floor executes twice. A Jepsen run with a voter down for minutes under load shows that voter serving within a bounded time of its restart.
+
+**Review boundary:** Catch-up transport and installation in the daemon. No change to the checkpoint format, the floor rule or the commit rule.
+
+<a id="task-d09"></a>
+### task-d09: Carry the leader's commit decision to every voter
+
+**Prerequisites:** task-24, task-d07.  
+**Design:** Sections 4.3-4.5.
+
+**Implement:** A follower commits a command only from the acknowledgements it receives itself, each published once to every voter on a lane that drops frames by design. Nothing publishes a missed one again, and no message carries a decision from the leader to a follower outside an election's Sync. With five voters a follower needs two of its peers' acknowledgements besides the leader's proposal and its own; one that missed them sits at ACCEPT on that command, and with the chain total (task-d06) on everything after it. Within a table's worth it refuses new payloads as backpressure and the leader loses its vote: the Jepsen five-node runs' followers held a thousand adopted commands with payloads and could commit none past the first partition. The leader announces its commit frontier, the highest sequence number of its ballot whose whole prefix is committed with its batch durable, on the re-send timer. A follower commits every proposal it durably adopted from that leader in that ballot at or below the frontier, in sequence order. The leader's commit is a decision under the crash-fault model, and the proposal a follower adopted carries the leader's dependencies. A command whose turn has come and which the frontier covers is let into a full table, since a table full of later commands none of which can be adopted before it would otherwise hold it out for ever; a follower's bounded payload ask names those commands first.
+
+**Acceptance:** A follower that receives no peer's acknowledgements executes everything the leader commits. Two followers cut off from each other under a live leader both execute. A follower whose table filled while it could learn nothing catches up and executes in the leader's order. The frontier commits nothing a follower did not adopt, and a frontier from any voter but the ballot's leader is ignored. On the Jepsen five-node run, every voter's execution tracks the leader's, and service returns within seconds of the last heal, as it does on the etcd baseline; the time from the last heal to the first ok on every node is the number both runs report.
+
+**Review boundary:** Learning from the leader's word, and admission for the command whose turn has come. No change to what is proposed, to the fast or slow predicates, to what an acknowledgement means, or to recovery.
+
+<a id="task-d10"></a>
+### task-d10: Flow-control catch-up from each voter's own frontier
+
+**Prerequisites:** task-25, task-d09.  
+**Design:** Sections 4.2, 4.7, 4.8.
+
+**Implement:** task-d07's re-send is paced at 16 proposals per voter per 250 ms on the lane that carries new proposals, and payloads are asked 8 at a time from the leader alone, one ask outstanding; a burst of hundreds of refused frames is not repaired at that rate while new commands keep arriving. The leader also cannot tell that a follower restarted: the restarted follower's adoptions come back without the ballot's sequence numbers, so task-d09's frontier cannot commit them, and the leader, having counted them, never re-sends them. Drive catch-up from the voter's own frontier: the voter reports where it stands; the leader re-sends from there, filling the lane's free budget each turn and resuming when the lane can send again; payload transfer is pipelined and answerable by any voter holding the payload durably; a candidate's selection payloads go the same way, and a campaign that is making progress is not abandoned at its ceiling (task-d01's residual).
+
+**Acceptance:** A follower partitioned for 30 s at 20 operations a second serves within 10 s of healing. A follower restarted under a live leader commits and executes what it had adopted. A candidate whose reporters' windows are a full table binds its selection. Bounded memory and lane use per voter throughout.
+
+**Review boundary:** Transfer and pacing only. No change to what is proposed, committed or executed.
+
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report
 
@@ -1534,7 +1573,7 @@ task-s01, task-s02 feed the strict storage reference through task-07. Optional t
 
 G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacement/restore/upgrade through task-60 rather than merely all-voter task-51, and G6 task-66 including task-q01. Fixed-member observer previews may precede dynamic membership, but general production combines both. Code merged is not evidence that acceptance passed.
 
-**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption, and becomes a prerequisite of task-m03. The unenforced `max_request_bytes` bound is a follow-up on task-c01, in its own PR. A review of what a manual test on separate hosts would meet added two more: task-d03 re-dials peers and collector links on a timer, since both planes are dialled once at startup and every connection ends at the transport's age cap, so a mesh heals today only by restarting nodes; it is a prerequisite of task-d01 and task-64. task-d04 provisions a multi-host test domain from the harness and writes the runbook; it is a prerequisite of task-65. The Jepsen client's leader-kill run added one more: task-d05 bounds recovery reports and Syncs by what the voters executed, since both carry the whole history today and an election after enough of it cannot complete or leaves the new ballot refusing work; it is a prerequisite of task-64, and task-d04's real-hosts run waits on it. The same client's runs found two more. task-d06 keeps one execution order on every replica when a table reclaims: retiring a key's latest command broke the dependency chain, so a follower behind a full leader executed the committed commands in another order and answered from it; being safety, it goes ahead of task-d05. task-d07 re-sends a proposal until every voter has voted on it, since a proposal a voter never received (not linked yet, refused by a full lane, or ahead of its Sync) is never sent again and that voter holds everything after it until a Sync. Both are prerequisites of task-64. A later reading of the Jepsen runs found that no domain served past its first election: task-d05 is its first cause and becomes the top liveness priority, with the table capacity made configuration as its first commit, and task-d07 its second, broadened from a missed proposal to every proposal a voter did not receive. They follow task-d06 in that order. None of these changes the design: each is work the design already required and the plan had not named.
+**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption, and becomes a prerequisite of task-m03. The unenforced `max_request_bytes` bound is a follow-up on task-c01, in its own PR. A review of what a manual test on separate hosts would meet added two more: task-d03 re-dials peers and collector links on a timer, since both planes are dialled once at startup and every connection ends at the transport's age cap, so a mesh heals today only by restarting nodes; it is a prerequisite of task-d01 and task-64. task-d04 provisions a multi-host test domain from the harness and writes the runbook; it is a prerequisite of task-65. The Jepsen client's leader-kill run added one more: task-d05 bounds recovery reports and Syncs by what the voters executed, since both carry the whole history today and an election after enough of it cannot complete or leaves the new ballot refusing work; it is a prerequisite of task-64, and task-d04's real-hosts run waits on it. The same client's runs found two more. task-d06 keeps one execution order on every replica when a table reclaims: retiring a key's latest command broke the dependency chain, so a follower behind a full leader executed the committed commands in another order and answered from it; being safety, it goes ahead of task-d05. task-d07 re-sends a proposal until every voter has voted on it, since a proposal a voter never received (not linked yet, refused by a full lane, or ahead of its Sync) is never sent again and that voter holds everything after it until a Sync. Both are prerequisites of task-64. A later reading of the Jepsen runs found that no domain served past its first election: task-d05 is its first cause and becomes the top liveness priority, with the table capacity made configuration as its first commit, and task-d07 its second, broadened from a missed proposal to every proposal a voter did not receive. They follow task-d06 in that order. The five-node Jepsen runs found one root cause behind the stall that remained: a follower learns a decision only from its peers' acknowledgements, each sent once on a lane that drops, so one missed quorum stops it for good. task-d09 has the leader carry its commit frontier to every voter; it is the top liveness priority. task-d10 then makes catch-up flow-controlled and driven by each voter's own frontier, which also covers a follower restarted under a live leader, and task-d08 wires the design's checkpoint catch-up for a voter behind the leader's retention. All three are prerequisites of task-64. None of these changes the design: each is work the design already required and the plan had not named.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
