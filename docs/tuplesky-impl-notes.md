@@ -4399,12 +4399,41 @@ commands it needs. Two changes close it.
   capacity (`CommandTable::initialize_beyond_capacity`). It is adopted,
   committed and executed at once, so it makes room rather than taking
   it. Only the commands whose turn has come qualify, so the table
-  exceeds its bound by those and no more.
+  exceeds its bound by those and no more. This is the one place the
+  table's bound is crossed on purpose. How far is bounded by the
+  follower's backlog of held proposals, which is bounded by what the
+  leader still keeps: at most four tables' worth before
+  `forget_history` sweeps it.
 - **The ask.** A follower's bounded payload ask names first, and in the
   leader's order, the held proposals within the frontier whose payload
   it lacks: half the ask, so the rotation through the rest still moves.
   Before, the one command whose turn had come was reached once per
   rotation through a missing set of thousands.
+
+### A restarted follower asks for the proposals it adopted
+
+A follower killed with adoptions in flight comes back with them at
+ACCEPT, restored from the rows with no sequence number. The row names no
+ballot, and every ballot numbers its proposals from zero, so nothing
+durable says which of the leader's sequence numbers an adoption was, and
+the frontier cannot commit it. The leader counted its acknowledgements
+before the kill and never re-sends them. With the chain total, nothing
+the follower adopts afterwards commits either, until the next election.
+Jepsen's kill nemesis makes this routine.
+- **The ask.** Each time the leader's frontier arrives, a follower that
+  holds such adoptions asks the leader for their proposals:
+  `ProtocolMessage::ProposalRequest { ballot, commands }`. It names at
+  most `MAX_PROPOSAL_ASK` (16) and rotates through the rest, as the
+  payload ask does. So it is paced by the leader's re-send timer and
+  needs no timer of its own.
+- **The answer.** The leader sends each durable proposal of the ballot
+  that it names, byte for byte as a re-send would. A command it did not
+  propose in the ballot gets no answer and waits for the next Sync, as
+  before.
+- **Adopted again.** The follower takes the answer as any duplicate
+  proposal: an adoption with nothing kept and below COMMIT is adopted
+  again (task-d07), this time with its sequence number. The frontier
+  then commits it.
 
 ### What the tests show
 
@@ -4425,27 +4454,27 @@ needs its peers:
 - `the_frontier_commits_nothing_the_follower_did_not_adopt`: r3 receives
   payloads and no proposals; the frontier reaches it and nothing moves
   past PRE-ACCEPT, until the proposals do.
+- `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`:
+  r3 adopts six commands and commits none. It is killed and restarted
+  under the same leader, and three more follow; it executes all nine.
 - `a_frontier_from_another_voter_is_ignored`, and
   `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed`
   (three of five voters down: the frontier stays, then moves once they
   are back).
 
 Negative controls, each run and failing:
-- with a follower that ignores the frontier, six of the seven fail; the
-  leader's own frontier test is the one that passes;
+- with a follower that ignores the frontier, six of the first seven
+  fail; the leader's own frontier test is the one that passes;
+- without the proposal ask, the restart test executes nothing on r3;
 - without admission past capacity, the full-table test executes the
   first eight and stops;
 - without the ordered ask, the ask test leads with other commands.
 
 ### What is left
 
-- **A follower restarted under a live leader.** Its adoptions come back
-  from the rows without the ballot's sequence numbers, so the frontier
-  cannot commit them. The leader counted them before the restart and
-  does not re-send them, and it cannot tell the follower restarted: the
-  incarnation comes from the node's credential, not its boot. A new
-  ballot's Sync repairs it. task-d10's voter-reported frontier is what
-  closes it under the same leader.
+- **Restored adoptions from an earlier ballot.** An adoption the
+  current leader never proposed gets no answer to the ask, and waits for
+  the next Sync. The ask keeps naming it, within its bound.
 - **Rate.** Repair is still task-d07's 16 proposals per voter per 250 ms,
   and payloads 8 per ask from the leader alone. task-d10 makes both
   flow-controlled.

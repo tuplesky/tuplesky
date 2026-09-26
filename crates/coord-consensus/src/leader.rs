@@ -657,23 +657,13 @@ impl Leader {
                 .filter(|(_, c)| voted(c))
                 .map(|(s, _)| *s)
                 .max();
-            for (seqnum, command) in order
+            for (_, command) in order
                 .iter()
                 .filter(|(s, c)| through.is_none_or(|t| *s > t) && !voted(c))
                 .take(per_voter)
             {
                 let p = &self.proposals[command];
-                let frame = ProtocolMessage::Proposal(FastAck {
-                    replica: me,
-                    ballot,
-                    command: *command,
-                    deps: p.deps.clone(),
-                    paths: p.paths.clone(),
-                    path: p.path,
-                    admission: p.admission,
-                    seqnum: Some(*seqnum),
-                })
-                .encode();
+                let frame = self.proposal_frame(p);
                 sends.push(PendingSend {
                     context,
                     requires: alloc::vec![p.barrier],
@@ -685,6 +675,63 @@ impl Leader {
                 });
             }
         }
+        if sends.is_empty() {
+            return Vec::new();
+        }
+        let outbox = self.outbox.as_mut().expect("booted");
+        for send in sends {
+            outbox.publish(send);
+        }
+        self.release()
+    }
+
+    /// The proposal frame for `p`, as it was first published.
+    fn proposal_frame(&self, p: &Proposal) -> Vec<u8> {
+        ProtocolMessage::Proposal(FastAck {
+            replica: self.config.identity.replica,
+            ballot: self.config.quorum.ballot(),
+            command: p.command,
+            deps: p.deps.clone(),
+            paths: p.paths.clone(),
+            path: p.path,
+            admission: p.admission,
+            seqnum: Some(p.seqnum),
+        })
+        .encode()
+    }
+
+    /// Answer a follower's ask for proposals of this ballot (task-d09):
+    /// each durable one named is sent to it again, as a re-send would.
+    /// A command this leader did not propose in the ballot, or whose
+    /// batch is not durable yet, is not answered.
+    fn serve_proposals(
+        &mut self,
+        to: ReplicaId,
+        ballot: Ballot,
+        commands: &[CommandId],
+    ) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if !self.is_leading() || ballot != self.config.quorum.ballot() {
+            return Vec::new();
+        }
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let sends: Vec<PendingSend> = commands
+            .iter()
+            .filter_map(|c| self.proposals.get(c))
+            .filter(|p| p.durable)
+            .take(crate::messages::MAX_PROPOSAL_ASK)
+            .map(|p| PendingSend {
+                context,
+                requires: alloc::vec![p.barrier],
+                to: PeerId {
+                    replica: to,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: self.proposal_frame(p),
+            })
+            .collect();
         if sends.is_empty() {
             return Vec::new();
         }
@@ -1736,6 +1783,9 @@ impl Leader {
                         Vec::new()
                     }
                 }
+            }
+            ProtocolMessage::ProposalRequest { ballot, commands } => {
+                self.serve_proposals(from.replica, ballot, &commands)
             }
             ProtocolMessage::Sealed { .. }
             | ProtocolMessage::Committed { .. }
