@@ -3714,3 +3714,49 @@ executed long ago. Bounding recovery by an execution floor, a pruned
 ledger, or a durable "executed" answer is a protocol decision for
 `coord-consensus`, and this change does not make it. The plan now owns
 it as task-d05, a prerequisite of task-64.
+
+## A request bound that bounded nothing
+
+The task-c01 follow-up. `limits.max_request_bytes` sized the collector's
+undelivered-bytes budget and fed the writer-queue capability check. It
+was enforced nowhere. A request was bounded only by what the wire
+carries, so lowering the setting shrank a budget and still admitted
+requests up to the protocol's limit. Such a request then took a
+collector slot and bytes sized for smaller ones.
+
+The admission gate now enforces it. The measure is what the protocol
+already counts against its own request limit (`LogicalRequest::cost`,
+the bytes of the keys, values and range ends a request carries),
+compared with the setting and nothing added. At the default setting,
+which is the protocol's limit, no request that validates is refused for
+its size, so nothing changes. Below it, a larger request is refused as
+`AdmissionRefusal::RequestTooLarge`, after the checks that say whether
+the request is well formed and before a slot is reserved or a byte
+budgeted. A retry is refused the same way.
+
+The refusal needed a code of its own. None of the five fits: it is not
+malformed, not a matter of admission, and not backpressure, which the
+SDK retries. So `REQUEST_TOO_LARGE` (0x0006) is appended to the frozen
+codes, which are append-only. The SDK reports it as
+`RetryError::RequestTooLarge`, which is not retried. The Kine backend
+maps it to `InvalidArgument`, since the caller has to change the request
+and cannot just retry it. The refusal, like every admission refusal of a
+request that decodes, is answered under the invocation's own command
+identity: the SDK and the Kine client accept an answer only under the
+identity they derived. A first version compared the encoding with the
+setting plus the wire's 64 KiB allowance. That made a 1 KiB setting
+admit 65 KiB, and answered under an identity of the retry key alone,
+which no client could match.
+
+Admission comes before the lookup of a resolved result. So a retry of a
+request that was established under a larger setting, and is retried
+after the setting is lowered, is refused for its size rather than
+answered with its result.
+
+The tests are
+`a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot`
+(1024 admitted, 1025 refused) and
+`the_default_bound_refuses_nothing_the_protocol_admits` (collector), plus
+`a_request_above_the_configured_bound_is_refused_and_one_below_is_served`,
+which sets the bound to 1 KiB in a real daemon and asks through the SDK
+as well. With the check removed, the first and the last fail.

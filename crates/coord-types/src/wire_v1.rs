@@ -1068,4 +1068,8 @@ pub mod codes {
     pub const NOT_ADMITTED: u16 = 0x0004;
     /// The established result does not fit the response bound.
     pub const RESULT_TOO_LARGE: u16 = 0x0005;
+    /// The request is larger than this frontend admits (its
+    /// `max_request_bytes`); nothing was submitted, and the same request
+    /// will be refused again.
+    pub const REQUEST_TOO_LARGE: u16 = 0x0006;
 }

@@ -255,6 +255,10 @@ impl Frontend {
             membership.domain(),
             AdmissionLimits {
                 max_pending_per_session: config.limits.max_outstanding_per_session,
+                // Enforced here, at the door, and not only budgeted: the
+                // setting used to size the collector's undelivered bytes
+                // and bound nothing a caller sent.
+                max_request_bytes: config.limits.max_request_bytes,
             },
         );
         let dispatcher =

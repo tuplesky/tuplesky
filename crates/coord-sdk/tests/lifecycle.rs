@@ -243,6 +243,19 @@ fn a_payload_change_conflicts_locally_and_from_the_server() {
         c.take_completions()[0].outcome,
         Outcome::Failed(RetryError::Other { code: 0x7777 })
     );
+    // A request larger than the frontend admits fails, and is not
+    // re-queued: the same request would be refused again.
+    let id5 = c.submit(203, &put(b"e", b"1"), 0).unwrap();
+    let command5 = c.invocation(id5).unwrap().command_id;
+    let _ = c.take_actions();
+    c.on_frame(204, c1, &err_frame(command5, codes::REQUEST_TOO_LARGE))
+        .unwrap();
+    assert_eq!(
+        c.take_completions()[0].outcome,
+        Outcome::Failed(RetryError::RequestTooLarge)
+    );
+    c.tick(204 + ClientConfig::default().backoff);
+    assert!(sends(&c.take_actions()).is_empty(), "not sent again");
 }
 
 #[test]

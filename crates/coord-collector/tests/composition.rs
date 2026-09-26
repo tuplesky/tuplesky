@@ -1564,6 +1564,7 @@ fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
         DOMAIN,
         AdmissionLimits {
             max_pending_per_session: 1,
+            ..AdmissionLimits::default()
         },
     );
     let (_, first) = request(1, put(b"a", b"1"), 0);
@@ -1658,6 +1659,7 @@ fn a_conflicting_retry_never_frees_the_original_request_s_slot() {
         DOMAIN,
         AdmissionLimits {
             max_pending_per_session: 1,
+            ..AdmissionLimits::default()
         },
     );
     let (_, first) = request(1, put(b"a", b"1"), 0);
@@ -1693,4 +1695,60 @@ fn a_conflicting_retry_never_frees_the_original_request_s_slot() {
     gate.settled(&first.retry_key);
     assert_eq!(gate.pending(&SESSION), 0);
     gate.admit(0, &caller(), &other).expect("the slot is free");
+}
+
+#[test]
+fn a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot() {
+    // `max_request_bytes` used to size the collector's budget and bound
+    // nothing a caller sent: lowering it changed the budget and not what
+    // was admitted. It is enforced at the door now, with its own reason,
+    // before any slot is reserved.
+    let mut gate = Admission::new(
+        CLUSTER,
+        DOMAIN,
+        AdmissionLimits {
+            max_pending_per_session: 1,
+            max_request_bytes: 1024,
+        },
+    );
+    // The bound is what the protocol counts, the bytes of the key and
+    // the value, with no allowance on top: 1024 is admitted, 1025 is not.
+    let (_, large) = request(1, put(b"k", &vec![0x5a; 1024]), 0);
+    assert!(matches!(
+        gate.admit(0, &caller(), &large),
+        Err(AdmissionRefusal::RequestTooLarge {
+            bytes: 1025,
+            limit: 1024
+        })
+    ));
+    assert_eq!(gate.pending(&SESSION), 0, "the refusal took no slot");
+    // A retry is refused the same way, and a request inside the bound is
+    // admitted into the one slot the refusals left free.
+    assert!(matches!(
+        gate.admit(0, &caller(), &large),
+        Err(AdmissionRefusal::RequestTooLarge { .. })
+    ));
+    let (_, small) = request(2, put(b"k", &vec![0x5a; 1023]), 0);
+    gate.admit(0, &caller(), &small)
+        .expect("exactly at the bound");
+    assert_eq!(gate.pending(&SESSION), 1);
+}
+
+#[test]
+fn the_default_bound_refuses_nothing_the_protocol_admits() {
+    // At the default the bound is the protocol's own request limit, which
+    // every request that validates is already within -- a request past it
+    // cannot even be built -- so the check refuses nothing. The largest
+    // single write the protocol allows is admitted.
+    let limits = AdmissionLimits::default();
+    assert_eq!(
+        limits.max_request_bytes,
+        coord_types::logical_v1::limits::MAX_REQUEST_BYTES
+    );
+    let mut gate = Admission::new(CLUSTER, DOMAIN, limits);
+    let key = vec![0x6b; coord_types::logical_v1::limits::MAX_KEY_BYTES];
+    let value = vec![0x5a; coord_types::logical_v1::limits::MAX_VALUE_BYTES];
+    let (_, largest) = request(1, put(&key, &value), 0);
+    gate.admit(0, &caller(), &largest)
+        .expect("the protocol's largest write");
 }
