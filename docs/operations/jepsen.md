@@ -238,7 +238,7 @@ Where they stand on the stack at `afc0df6`:
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | In review in #101 (the leader re-sends unvoted proposals), carried here. Reproduced on `afc0df6`. |
 | No sessions after healing, under Jepsen | task-d05: in review in #100, carried here. Recovery carries the whole history (below). |
-| The domain stops serving at its first election | In review: #100 (the table capacity and bounded recovery) and #101 (re-sending lost proposals). With both, a first election is survived but a later one is not (below). It decides every Jepsen run's throughput. |
+| The domain stops serving at its first election | In review: #100 (the table capacity and bounded recovery) and #101 (re-sending lost proposals). With both (`6d248cc`), the three-voter stress runs pass through every election, but Jepsen's five nodes still stall after partitions and pauses, and two of them never serve (below). |
 
 The second and the last are the limit task-d01's notes now record as
 "recovery carries the whole history": dependency rows are never pruned,
@@ -552,7 +552,7 @@ recovery by what the voters executed. #101 has the leader re-send, every
   (`baseline` 4096 and 4097) and recovered more records (1617 to 1685)
   than the table holds. So a candidate's durable batch names a
   dependency the store does not know. The final read is not served (exit
-  2), and there was no anomaly.
+  2), and there was no anomaly. #100 fixed this in `751a71b` (below).
 * The `jepsen` workflow ([run 36231375038](https://github.com/tuplesky/tuplesky/actions/runs/36231375038))
   was `:valid? true`, with about 1940 `ok`. For the first time the domain
   served again after an election: it stopped at 40 s, when all five nodes
@@ -580,40 +580,42 @@ received the proposal, so the proposal it lacked was the one never sent
 again. #101 now counts only adoptions (`e7383da`), and with it the test
 passes every time; this change carries #101 again from `20d2a9d`.
 
-With #100's fix for the checkpoint trim (`f26cbee`) and #101's, both
-`shim-stress.py --fault leader` and `--fault majority` still end without
-the final read (exit 2, no anomaly). Voters stop on every restart with
-`Guard(DependencyUnknown)` on a candidate's or a follower's durable batch,
-after a checkpoint (`baseline` 4096 and 8192), and with #99 and #100 alone
-(`482fd9f`) the same happens. Recovery restores no executed identity
-from the executed rows (`history=0`) in any of these restarts, so the
-unknown dependency is not a trimmed command.
-The `jepsen` workflow on `20d2a9d`
-([run 36260245651](https://github.com/tuplesky/tuplesky/actions/runs/36260245651))
-was `:valid? true`, with 633 `ok`. It served again after its first
-election (80 s to 140 s), stopped when all five nodes were killed at
-160 s, and did not serve again, final reads included.
+With #100 (through `751a71b`) and #101 carried (`6d248cc`), the stress
+acceptance passes. `shim-stress.py --fault leader` and `--fault majority`
+each passed twice, 4 runs of 4: service resumed after every election,
+voters restarted after checkpoints (`baseline` up to 9404) and came back,
+the final read was served, and there was no anomaly.
 
-The cause was in the execution walk (#100, `751a71b`). A restart retires
-every executed record at once, about 2,000 here against a capacity of
-1024, and the walk over a command's closure stopped only at a retired
-command still in the tombstone window. A record still live after the
-restart could reach past the window: the guards answered EXECUTED for
-it, and the walk called it unknown. The walk now stops at any command
-the table has executed. With it (`6d248cc`), `--fault leader` and
-`--fault majority` each passed twice: service resumed after every
-election, voters restarted after checkpoints (`baseline` up to 9404)
-and came back, the final read was served, and there was no anomaly.
+| Run | `ok` | Voters restarted after a checkpoint |
+| --- | --- | --- |
+| `--fault leader` #1 | 898 of 1208 | voter 1 (`baseline=4096`) |
+| `--fault leader` #2 | 745 of 1145 | voter 1 (`baseline=4096`) |
+| `--fault majority` #1 | 1253 of 1680 | voters 1, 2, 3 (up to 8193) |
+| `--fault majority` #2 | 1398 of 1739 | voters 1, 2, 3 (up to 9404) |
+
+Two fixes on #100 got there. Recovery reads the executed answer from the
+executed rows (`f26cbee`), and the execution walk over a command's
+closure stops at any command the table executed (`751a71b`). Before the
+second, a restart retired about 2,000 executed records against a
+capacity of 1024, the walk stopped only at a retired command still in
+the tombstone window, and a record still live after the restart that
+reached past the window failed as `Guard(DependencyUnknown)` on every
+restart.
 
 The `jepsen` workflow on `6d248cc`
 ([run 36272474606](https://github.com/tuplesky/tuplesky/actions/runs/36272474606))
-was `:valid? true`, with 988 `ok`, but its five nodes still stall. It
-served until about 80 s, then nothing until about 200 s, through
-partitions, pauses and their healing. The final reads were served
-through `n1`, `n2` and `n5` but not `n3` or `n4`. Through `n4` no
-operation succeeded in the whole run, and through `n3` only 14, all in
-the first 20 s. The stress driver's three voters no longer show this;
-the five-node cluster, with partitions, still does.
+was `:valid? true`: 1281 operations, 988 `ok`, 291 `fail`, 2 `info`, no
+crash. Its five nodes still stall, though. Nothing was `ok` from about
+80 s to 200 s, through partitions, pauses and their healing. Of the five
+final reads, the three through `n1`, `n2` and `n5` were served. The two
+through `n3` (process 17) and `n4` (process 3) were answered `pending`
+until the shim's 10 s budget ran out. Their frontends were up and
+answering, but their replicas never showed the session. `n4` was never
+killed or paused, only partitioned, and no operation through it
+succeeded in the whole run. `n3` was killed at about 10 s and started
+again at about 200 s, and nothing through it succeeded after the first
+20 s. The workflow now prints each voter's log into the job log, so the
+next run shows what those voters were doing.
 
 ### Under Jepsen: a domain that no longer binds sessions
 

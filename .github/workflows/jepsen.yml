@@ -148,6 +148,19 @@ jobs:
             --nemesis "$NEMESIS" \
             --time-limit "$TIME_LIMIT" \
             --concurrency 2n
+      - name: Show each voter's log
+        if: always()
+        # Jepsen copies each voter's coordd.log into the test's store before
+        # tearing the cluster down. Printed here, without the periodic
+        # metrics lines, so a run can be read from its job log alone.
+        run: |
+          shopt -s nullglob
+          for log in jepsen/tuplesky/store/latest/n*/coordd.log; do
+            node=$(basename "$(dirname "$log")")
+            echo "::group::$node coordd.log (last 400 lines, without metrics)"
+            grep -v '^metrics ' "$log" | tail -n 400
+            echo "::endgroup::"
+          done
       - name: Pack the Jepsen store
         if: always()
         # Jepsen names each run's directory by its start time, and
