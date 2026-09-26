@@ -3844,11 +3844,15 @@ command initialized after a reclaim had no dependencies.
 **Divergence stops the node.** A `release-record-mismatch` means the
 leader's release of a command and this node's own execution record of it
 disagree, so this node executed the committed commands in another order.
-It used to be a recurring log line. Now `settle_from_records` records it,
-and the serve loop stops at the top of its next pass with
-`this node stopped: release-record-mismatch(<id>) ...`. This wiring has
-no test of its own: it is one match arm and one check at the top of the
-loop.
+It used to be a recurring log line. Now `settle_from_records` returns it
+at once, sending none of the deliveries it had settled in that pass from
+the same record. The serve loop then stops right there, with
+`this node stopped: release-record-mismatch(<id>) ...`, before it
+re-offers, re-dials or takes another event, so no retry is answered from
+that record after the mismatch is seen. A first version recorded the
+mismatch and stopped at the top of the next pass, which left the rest of
+the batch and one event in between (review of #99). This wiring has no
+test of its own: it is one match arm and one check after the call.
 
 **What the frontend trusts.** Two paths answer a caller from this node's
 own execution record rather than from the leader's release, and both are
