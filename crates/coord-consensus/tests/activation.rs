@@ -728,6 +728,68 @@ fn a_follower_behind_a_full_leader_executes_in_the_leaders_order() {
     }
 }
 
+/// A new leader orders its first command after the tail of the order it
+/// recovered, not after the payload that reached it last (task-d06).
+///
+/// A follower's latest command on a key is moved by `initialize`, which
+/// runs when a payload arrives, so it follows arrival order rather than
+/// the leader's order. Here r2 gets C's payload first and B's (fetched)
+/// second, while the leader ordered B before C. When r2 wins, it
+/// re-proposes B and C in the recovered order, which moved nothing, so its
+/// first fresh command D named B. r1 has C committed but no payload for
+/// it, so it found D ready and executed it before C: the fork this task
+/// closes for a reclaim, at an election instead. With D naming C, r1
+/// waits for C's payload, and every voter executes B, C, D.
+#[test]
+fn a_new_leaders_first_command_follows_the_recovered_tail() {
+    let mut cluster = Cluster::new(23);
+    // r1 never fetches: C stays committed there without its payload.
+    cluster.no_fetch = vec![1];
+    let b = cluster.admit_at(1, 1, &[0, 1]);
+    let c = cluster.admit_at(2, 2, &[0, 2]);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, vec![b, c]);
+    assert_eq!(cluster.nodes[2].executed, vec![b, c]);
+    assert_eq!(
+        cluster.nodes[2]
+            .follower()
+            .table()
+            .record(&c)
+            .map(|r| r.deps.clone()),
+        Some(vec![b]),
+        "the leader ordered B before C"
+    );
+    // r2 fetched B after C arrived: its latest on the key is B.
+    assert_eq!(cluster.nodes[1].executed, vec![b]);
+    cluster.crash(0);
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    let d = cluster.admit(3, 3);
+    cluster.settle();
+    let Some(Role::Leader(leader)) = &cluster.nodes[2].role else {
+        unreachable!()
+    };
+    assert_eq!(
+        leader.table().record(&d).map(|r| r.deps.clone()),
+        Some(vec![c]),
+        "the first fresh command follows the recovered tail"
+    );
+    // r1 holds C by identity only, so it cannot accept D after it: D
+    // waits for C's payload there, and commits once it arrives.
+    let behind = &cluster.nodes[1].executed;
+    assert_eq!(
+        behind[..],
+        cluster.nodes[2].executed[..behind.len()],
+        "r1 executed out of the new leader's order"
+    );
+    cluster.no_fetch.clear();
+    cluster.settle();
+    for i in [1usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, vec![b, c, d], "node {i}");
+    }
+}
+
 #[test]
 fn competing_campaigns_and_delayed_replies_cannot_establish_divergence() {
     let mut cluster = Cluster::new(7);
