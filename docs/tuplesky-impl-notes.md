@@ -4315,8 +4315,15 @@ file passed 10 of 10 runs, where it had failed on the first run before.
 - A voter that never votes (it is gone) is sent up to 16 proposals per
   interval, and they are dropped at its unlinked lane. It is bounded, not
   free.
-- The trailing proposal of a quiet domain, which a voter holds but never
-  acknowledges (it executed and retired it), is re-sent each interval
-  until a newer proposal draws a vote.
+- The one re-send that does not converge on its own: in a quiet domain,
+  a proposal for a command the voter has no ledger record of any more
+  (swept as history, or trimmed with a checkpoint's prefix) draws no
+  answer from `acknowledge_decided`. It is re-sent to that voter every
+  interval until the voter adopts a later proposal. That is one small
+  frame per 250 ms, within the 16 per voter.
 - `shim-stress.py --fault leader` and `--fault majority`, and the Jepsen
-  workflow, were not run on this branch; they are in the acceptance.
+  workflow, were run on #98 with this branch's code carried byte for
+  byte, not on this branch itself. The stress runs pass (4 of 4, exit 0).
+  The Jepsen run is `:valid? true`, but the five-node domain still stops
+  serving for minutes after partitions and pauses. That is open on #98,
+  and no cause has been traced to this task.
