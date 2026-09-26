@@ -253,7 +253,7 @@ fn credentials_of_cluster(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
-    collector_credential(dir, &ca, replica);
+    collector_credential(dir, &ca, cluster, replica);
     ca
 }
 
@@ -266,10 +266,10 @@ fn credentials_of_cluster(
 /// names the same node, so an operator can still see which process it
 /// is, and the genesis commits nothing about it -- what it proves is
 /// that this domain's issuer said this process may act as a collector.
-fn collector_credential(dir: &Path, ca: &Ca, replica: u8) {
+fn collector_credential(dir: &Path, ca: &Ca, cluster: [u8; 16], replica: u8) {
     let (certificate, key) = ca.issue(
         SERVER_NAME,
-        CLUSTER,
+        cluster,
         replica,
         coord_types::wire_v1::PeerRole::Frontend,
     );
@@ -745,6 +745,62 @@ fn a_node_that_is_not_a_committed_voter_does_not_vote() {
     .expect("write");
     let observer = run(&path, &["--check"]);
     assert_eq!(observer.code, Some(0), "{}{}", observer.out, observer.err);
+}
+
+/// The collector's leaf has to be this node's collector, checked at
+/// start like the node's own.
+///
+/// It was only read: a leaf for another replica, in any role, was
+/// accepted and presented as this node's collector, and renewal would
+/// have kept it so, because a renewed leaf is compared with the one it
+/// replaces and not with the node. Here the same domain issues this node
+/// a collector leaf naming replica 2, and then one naming this node as a
+/// voter; each is refused at `--check`, for what it is.
+#[test]
+fn a_collector_leaf_for_another_node_is_refused_at_start() {
+    let dir = workspace("foreign-collector");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis(&dir, Some(&ca.node_spki));
+    endpoints(&dir, &ca, 3, &[]);
+    let _ = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["--check"]).code, Some(0));
+
+    collector_credential(&dir, &ca, CLUSTER, 2);
+    let refused = run(&path, &["--check"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused
+            .err
+            .contains("is not this node's collector: it names another node"),
+        "the refusal did not say why: {}",
+        refused.err
+    );
+
+    let (certificate, key) = ca.issue(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+    );
+    std::fs::write(
+        dir.join("collector.pem"),
+        pem("CERTIFICATE", certificate.der()),
+    )
+    .expect("collector cert");
+    std::fs::write(
+        dir.join("collector.key"),
+        pem("PRIVATE KEY", &key.serialize_der()),
+    )
+    .expect("collector key");
+    let refused = run(&path, &["--check"]);
+    assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
+    assert!(
+        refused.err.contains("names the role voter"),
+        "the refusal did not say why: {}",
+        refused.err
+    );
+    assert!(!dir.join("state").exists(), "a refused node opened a store");
 }
 
 /// A certificate that says nothing about which replica it is, is not an
@@ -2214,7 +2270,7 @@ fn three_voters(dir: &Path) -> Cluster {
             std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod");
         }
-        collector_credential(&node, &ca, n);
+        collector_credential(&node, &ca, CLUSTER, n);
         std::fs::write(
             node.join("sts-jwks.json"),
             serde_json::to_vec_pretty(&ring.jwks()).expect("jwks"),
@@ -3347,19 +3403,7 @@ fn inspect_reports_the_credential_against_committed_membership_and_starts_nothin
     // A leaf at the next generation. The certificate is perfectly
     // valid; what is missing is the committed configuration that makes
     // this generation the voter.
-    let (next, key) = ca.issue_at(
-        SERVER_NAME,
-        CLUSTER,
-        1,
-        coord_types::wire_v1::PeerRole::Voter,
-        2,
-    );
-    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
-    std::fs::write(
-        dir.join("node.key"),
-        pem("PRIVATE KEY", &key.serialize_der()),
-    )
-    .expect("key");
+    replace_leaves(&dir, &ca, 2);
     let report = run(&path, &["inspect"]);
     assert_eq!(report.code, Some(0), "{}", report.err);
     assert!(
@@ -3370,9 +3414,15 @@ fn inspect_reports_the_credential_against_committed_membership_and_starts_nothin
         report.out
     );
     // And the daemon refuses to serve under it rather than starting as
-    // a voter nothing committed.
+    // a voter nothing committed -- for that, and not because its
+    // collector's leaf is at another generation.
     let refused = run(&path, &[]);
     assert_eq!(refused.code, Some(2), "{}", refused.out);
+    assert!(
+        !refused.err.contains("collector certificate"),
+        "refused for the collector's leaf, not the node's: {}",
+        refused.err
+    );
 
     // The other direction: the configuration moved on and this disk did
     // not. A clone restored from before a replacement is exactly this,
@@ -3390,6 +3440,11 @@ fn inspect_reports_the_credential_against_committed_membership_and_starts_nothin
     );
     let refused = run(&path, &[]);
     assert_eq!(refused.code, Some(2), "{}", refused.out);
+    assert!(
+        !refused.err.contains("collector certificate"),
+        "refused for the collector's leaf, not the node's: {}",
+        refused.err
+    );
 }
 
 /// A genesis committing voter one at `incarnation`.
@@ -3443,16 +3498,8 @@ async fn a_replacement_whose_first_start_fails_finishes_on_the_next_start() {
         response_of(&answer)
     };
 
-    let (next, key) = ca.issue_at(
-        SERVER_NAME,
-        CLUSTER,
-        1,
-        coord_types::wire_v1::PeerRole::Voter,
-        2,
-    );
-    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
-    write_key(&dir.join("node.key"), &key.serialize_der());
-    genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+    let next = replace_leaves(&dir, &ca, 2);
+    genesis_of_incarnation(&dir, &next, 2);
 
     // The replacement's first start stops partway: something that is not
     // a directory where its checkpoints are, which it finds after the
@@ -3525,16 +3572,8 @@ async fn an_authorized_replacement_keeps_the_state_and_a_left_behind_disk_does_n
     // configuration that commits it. Both are needed -- a certificate
     // nothing committed is refused, and a commitment to a key this node
     // does not hold is refused too.
-    let (next, key) = ca.issue_at(
-        SERVER_NAME,
-        CLUSTER,
-        1,
-        coord_types::wire_v1::PeerRole::Voter,
-        2,
-    );
-    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
-    write_key(&dir.join("node.key"), &key.serialize_der());
-    genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+    let next = replace_leaves(&dir, &ca, 2);
+    genesis_of_incarnation(&dir, &next, 2);
 
     // It comes back on its own state, and says so: the adoption is a
     // durable step and an operator replacing a node has to be able to
@@ -3617,16 +3656,10 @@ async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_ad
     let manifest = std::fs::read(dir.join("genesis.json")).expect("manifest");
     let retired = std::fs::read(dir.join("node.pem")).expect("cert");
     let retired_key = std::fs::read(dir.join("node.key")).expect("key");
-    let (next, key) = ca.issue_at(
-        SERVER_NAME,
-        CLUSTER,
-        1,
-        coord_types::wire_v1::PeerRole::Voter,
-        2,
-    );
-    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", next.der())).expect("cert");
-    write_key(&dir.join("node.key"), &key.serialize_der());
-    genesis_of_incarnation(&dir, &spki_of(next.der()), 2);
+    let retired_collector = std::fs::read(dir.join("collector.pem")).expect("collector cert");
+    let retired_collector_key = std::fs::read(dir.join("collector.key")).expect("collector key");
+    let next = replace_leaves(&dir, &ca, 2);
+    genesis_of_incarnation(&dir, &next, 2);
 
     let refused = run(&path, &[]);
     assert_eq!(refused.code, Some(2), "{}{}", refused.out, refused.err);
@@ -3645,6 +3678,8 @@ async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_ad
     std::fs::write(dir.join("node.pem"), &retired).expect("cert");
     // Already PEM, and the file keeps the permissions `write_key` gave it.
     std::fs::write(dir.join("node.key"), &retired_key).expect("key");
+    std::fs::write(dir.join("collector.pem"), &retired_collector).expect("collector cert");
+    std::fs::write(dir.join("collector.key"), &retired_collector_key).expect("collector key");
     let daemon = start(&path);
     let caller = Caller::bind(&daemon, &ca, &ring, [0x5a; 16]).await;
     let answer = ask(&caller.connection, &caller.put(1, b"k", b"v"))
@@ -3656,6 +3691,38 @@ async fn a_replacement_in_an_edited_genesis_is_quarantined_before_anything_is_ad
         again.outcome, first.outcome,
         "the refused replacement moved this node's state"
     );
+}
+
+/// Replace this node's leaves with ones at `incarnation`, each under a
+/// new key, as a committed replacement issues them; the new node leaf's
+/// SubjectPublicKeyInfo, for the genesis that commits it.
+///
+/// Both leaves, because both name the node: a collector leaf left at the
+/// old incarnation is refused at start as not this node's collector.
+fn replace_leaves(dir: &Path, ca: &Ca, incarnation: u64) -> Vec<u8> {
+    let (node, key) = ca.issue_at(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Voter,
+        incarnation,
+    );
+    std::fs::write(dir.join("node.pem"), pem("CERTIFICATE", node.der())).expect("cert");
+    write_key(&dir.join("node.key"), &key.serialize_der());
+    let (collector, key) = ca.issue_at(
+        SERVER_NAME,
+        CLUSTER,
+        1,
+        coord_types::wire_v1::PeerRole::Frontend,
+        incarnation,
+    );
+    std::fs::write(
+        dir.join("collector.pem"),
+        pem("CERTIFICATE", collector.der()),
+    )
+    .expect("collector cert");
+    write_key(&dir.join("collector.key"), &key.serialize_der());
+    spki_of(node.der())
 }
 
 /// Write a private key with the permissions the daemon insists on.
@@ -5163,11 +5230,23 @@ impl Ca {
     /// to, has to hold a leaf that ends while it watches. Returns the
     /// certificate and its `notAfter`.
     fn issue_short(&self, key: &rcgen::KeyPair, replica: u8, secs: u64) -> (Vec<u8>, u64) {
+        self.issue_short_as(key, replica, secs, coord_types::wire_v1::PeerRole::Voter)
+    }
+
+    /// The same, for `role`: a collector's leaf names the node as
+    /// `Frontend`.
+    fn issue_short_as(
+        &self,
+        key: &rcgen::KeyPair,
+        replica: u8,
+        secs: u64,
+        role: coord_types::wire_v1::PeerRole,
+    ) -> (Vec<u8>, u64) {
         let identity = coord_node_issuer::NodeIdentity {
             cluster: coord_types::ids::ClusterId(CLUSTER),
             node: coord_types::ids::ReplicaId([replica; 16]),
             incarnation: coord_types::ids::ReplicaIncarnation::new(1).expect("positive"),
-            role: coord_types::wire_v1::PeerRole::Voter,
+            role,
         };
         let now = unix_now();
         let not_after = now + secs - 1;
@@ -5215,7 +5294,12 @@ struct NodeIssuerFixture {
 
 impl NodeIssuerFixture {
     /// An issuer signing with `ca`, whose policy lets the workload
-    /// `voters/voter-<n>` enroll node `n` as a voter, for `nodes`.
+    /// `voters/voter-<n>` enroll node `n` as a voter, and as that node's
+    /// collector (`Frontend`), for `nodes`.
+    ///
+    /// The voter rule comes first, so a request that did not say which
+    /// role it asks for would be answered by it, and a collector's
+    /// renewal refused for coming back as a voter.
     fn new(ca: &Ca, nodes: &[u8]) -> Self {
         let now = unix_now();
         let idp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("idp key");
@@ -5250,7 +5334,14 @@ impl NodeIssuerFixture {
                 .expect("the domain's CA is a usable issuer CA");
         let rules = nodes
             .iter()
-            .map(|n| coord_node_issuer::RolePolicy {
+            .flat_map(|n| {
+                [
+                    coord_types::wire_v1::PeerRole::Voter,
+                    coord_types::wire_v1::PeerRole::Frontend,
+                ]
+                .map(|role| (n, role))
+            })
+            .map(|(n, role)| coord_node_issuer::RolePolicy {
                 issuer: "k8s".into(),
                 required: [
                     ("namespace".to_string(), "voters".to_string()),
@@ -5260,7 +5351,7 @@ impl NodeIssuerFixture {
                 .collect(),
                 cluster: coord_types::ids::ClusterId(CLUSTER),
                 nodes: vec![coord_types::ids::ReplicaId([*n; 16])],
-                role: coord_types::wire_v1::PeerRole::Voter,
+                role,
                 min_incarnation: 1,
                 max_lifetime_secs: 3600,
                 dns_names: vec![SERVER_NAME.into()],
@@ -5328,6 +5419,47 @@ fn renew_at(config: &Path, port: u16, assertion: &Path) {
         assertion.display()
     ));
     std::fs::write(config, text).expect("write config");
+}
+
+/// Replace the collector leaf in `dir` with one that ends `secs` from
+/// now, under the collector's own key; its `notAfter`.
+fn short_collector(dir: &Path, ca: &Ca, replica: u8, secs: u64) -> u64 {
+    use rustls_pki_types::pem::PemObject;
+    let key = rustls_pki_types::PrivateKeyDer::from_pem_file(dir.join("collector.key"))
+        .expect("the collector key");
+    let key = rcgen::KeyPair::try_from(&key).expect("a usable collector key");
+    let (leaf, not_after) = ca.issue_short_as(
+        &key,
+        replica,
+        secs,
+        coord_types::wire_v1::PeerRole::Frontend,
+    );
+    std::fs::write(dir.join("collector.pem"), pem("CERTIFICATE", &leaf)).expect("collector cert");
+    not_after
+}
+
+/// The role a leaf on disk names.
+fn role_on_disk(path: &Path) -> coord_types::wire_v1::PeerRole {
+    use rustls_pki_types::pem::PemObject;
+    let der = rustls_pki_types::CertificateDer::pem_file_iter(path)
+        .expect("readable")
+        .next()
+        .expect("a certificate")
+        .expect("pem");
+    let (_, x509) = x509_parser::parse_x509_certificate(&der).expect("x509");
+    x509.subject_alternative_name()
+        .expect("sans")
+        .expect("sans")
+        .value
+        .general_names
+        .iter()
+        .find_map(|name| match name {
+            x509_parser::extensions::GeneralName::URI(uri) => {
+                coord_node_issuer::parse_node_uri(uri).map(|id| id.role)
+            }
+            _ => None,
+        })
+        .expect("a node identity")
 }
 
 /// A single-voter node holding a leaf that ends `secs` from now, and the
@@ -5553,7 +5685,8 @@ async fn with_the_issuer_down_a_node_serves_to_its_deadline_and_stops_there() {
 async fn a_node_that_does_not_renew_stops_at_its_leafs_end_like_one_that_does() {
     let dir = workspace("no-renewal");
     let (ca, ring, path, not_after) = short_lived_voter(&dir, 12);
-    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let init = run(&path, &["init"]);
+    assert_eq!(init.code, Some(0), "{}{}", init.out, init.err);
 
     let mut daemon = start(&path);
     let report = daemon.out.lock().expect("not poisoned").clone();
@@ -5609,6 +5742,146 @@ async fn a_node_that_does_not_renew_stops_at_its_leafs_end_like_one_that_does() 
         ),
         other => panic!("the caller's connection ended for {other:?}"),
     }
+}
+
+/// A collector's leaf is renewed like the node's, under the same
+/// `[renewal]` section and its own key, and what it submits keeps going
+/// past the old leaf's end (task-d02).
+///
+/// Voter 1's collector holds a short leaf; its node leaf is long. The
+/// startup report and `inspect` name both leaves. The collector leaf is
+/// renewed as `Frontend` -- the issuer holds a voter rule for the same
+/// workload ahead of it, so the request has to say which it is -- and
+/// written where a restart reads it, the node's left as it was. At the old
+/// collector leaf's end, the links it was presented on close, and voter 1
+/// dials them again under the renewed one: `voters submittable=` falls
+/// and comes back to 2. Had the renewed leaf not been put into service,
+/// voter 1 would dial nothing under the expired one and it would not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_collectors_leaf_is_renewed_and_its_links_come_back_under_it() {
+    let dir = workspace("renew-collector");
+    let cluster = three_voters(&dir);
+    let n1 = dir.join("n1");
+    let old_not_after = short_collector(&n1, &cluster.ca, 1, 36);
+    let (node_spki, node_not_after) = leaf_on_disk(&n1.join("node.pem"));
+    let (collector_spki, _) = leaf_on_disk(&n1.join("collector.pem"));
+    let port = free_port();
+    let issuer = NodeIssuerFixture::new(&cluster.ca, &[1]);
+    issuer.assertion(&n1.join("assertion.jwt"), 1);
+    renew_at(&cluster.configs[0], port, &n1.join("assertion.jwt"));
+    issuer.serve(port).await;
+
+    let inspected = run(&cluster.configs[0], &["inspect"]);
+    assert_eq!(inspected.code, Some(0), "{}", inspected.err);
+    assert!(
+        inspected.out.contains("collector leaf issued_at=")
+            && inspected
+                .out
+                .contains(&format!("expires_at={old_not_after} "))
+            && inspected.out.contains("driver=configured"),
+        "inspect does not report the collector leaf:\n{}",
+        inspected.out
+    );
+    for config in &cluster.configs {
+        assert_eq!(run(config, &["init"]).code, Some(0));
+    }
+    let running: Vec<Running> = cluster.configs.iter().map(|c| start(c)).collect();
+    let report = running[0].out.lock().expect("not poisoned").clone();
+    assert!(
+        report
+            .lines()
+            .any(|l| l.starts_with("renewal configured issued_at="))
+            && report.contains("collector renewal configured issued_at=")
+            && report.contains(&format!("expires_at={old_not_after} ")),
+        "the startup report does not name both leaves:\n{report}"
+    );
+    assert!(
+        running[0].waits_until(40, |said| said
+            .contains("collector renewal renewed expires_at")),
+        "the collector leaf was not renewed:\n{}",
+        running[0].said()
+    );
+    // Written where a restart reads it: the collector's key, a later end,
+    // still the collector's role; the node's leaf untouched.
+    let (spki_after, new_not_after) = leaf_on_disk(&n1.join("collector.pem"));
+    assert_eq!(
+        spki_after, collector_spki,
+        "the renewal changed the collector key"
+    );
+    assert!(
+        new_not_after > old_not_after,
+        "{new_not_after} <= {old_not_after}"
+    );
+    assert_eq!(
+        role_on_disk(&n1.join("collector.pem")),
+        coord_types::wire_v1::PeerRole::Frontend
+    );
+    assert_eq!(
+        leaf_on_disk(&n1.join("node.pem")),
+        (node_spki, node_not_after),
+        "the collector's renewal touched the node's leaf"
+    );
+
+    // Past the old collector leaf's end, and then some: X.509 counts the
+    // `notAfter` second as valid, so a count read at the boundary proves
+    // nothing.
+    until_past(old_not_after + 2).await;
+    assert!(
+        running[0].waits_until(60, |said| healed(said, "voters submittable=", 2)),
+        "voter 1's collector links did not come back under the renewed leaf:\n{}",
+        running[0].said()
+    );
+    let said = running[0].said();
+    assert!(!said.contains("collector renewal expired"), "{said}");
+    assert!(!said.contains("reason=credential-expired"), "{said}");
+}
+
+/// A collector leaf that nothing renews ends the node at its `notAfter`,
+/// the same way the node's own leaf does (task-d02): a frontend whose
+/// collector can no longer reach another voter is half a node.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_collector_leaf_nothing_renews_ends_the_node_at_its_end() {
+    let dir = workspace("collector-expiry");
+    let (ca, _ring, path, node_not_after) = short_lived_voter(&dir, 3000);
+    let not_after = short_collector(&dir, &ca, 1, 12);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let mut daemon = start(&path);
+    let report = daemon.out.lock().expect("not poisoned").clone();
+    assert!(
+        report.contains("collector renewal not-configured")
+            && report.contains(&format!("expires_at={not_after}")),
+        "the startup report does not say when the collector leaf ends:\n{report}"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the node kept serving past its collector leaf's end:\n{}",
+            daemon.said()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        unix_now() >= not_after,
+        "the node stopped before the collector leaf's end"
+    );
+    assert!(unix_now() < node_not_after);
+    assert_eq!(status.code(), Some(2), "{}", daemon.said());
+    assert!(
+        daemon.waits_until(5, |said| said.contains("reason=credential-expired")),
+        "{}",
+        daemon.said()
+    );
+    assert!(
+        daemon.said().contains(&format!(
+            "collector renewal not-configured expires_at={not_after}: this node's collector leaf"
+        )),
+        "{}",
+        daemon.said()
+    );
 }
 
 /// The renewed leaf of one voter of three is admitted by its peers as a

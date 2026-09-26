@@ -169,6 +169,7 @@ impl Issuer {
             node: [node; 16],
             incarnation,
             lifetime_secs: 300,
+            role: None,
         };
         self.issuer
             .enroll(&request, &ClockHealth::healthy(NOW, 5))

@@ -2157,6 +2157,105 @@ async fn a_warm_connection_ends_with_the_credential_that_authenticated_it() {
     );
 }
 
+/// A separate collector credential is renewed on its own
+/// (`set_api_client`; task-d02): API-class dials present the new leaf
+/// from then on, a dialer taken before included, while what the endpoint
+/// serves as -- and dials peers as -- stays the node's own leaf. `c`
+/// admits only the renewed collector leaf, so it tells the two apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewed_collector_credential_is_presented_on_api_dials_only() {
+    let ca = TestCa::new();
+    let a_id = ca.issue("node-a", r(0), inc(1), PeerRole::Voter);
+    let b_id = ca.issue("node-b", r(1), inc(1), PeerRole::Voter);
+    let c_id = ca.issue("node-c", r(2), inc(1), PeerRole::Voter);
+    let old = ca.issue("node-b", r(1), inc(1), PeerRole::Frontend);
+    let renewed = ca.issue("node-b", r(1), inc(1), PeerRole::Frontend);
+    let mut everyone = TestBinder::new(CLUSTER, DOMAIN);
+    let mut only_renewed = TestBinder::new(CLUSTER, DOMAIN);
+    for id in [&a_id, &b_id, &c_id, &renewed] {
+        everyone.register(id);
+        only_renewed.register(id);
+    }
+    everyone.register(&old);
+    let everyone = Arc::new(everyone);
+    let bind_as = |local: coord_transport::LocalIdentity, binder: Arc<TestBinder>| {
+        Transport::bind("127.0.0.1:0".parse().unwrap(), local, binder, limits()).unwrap()
+    };
+    let mut b_local = b_id.local(&ca, CLUSTER, DOMAIN, vec![1, 2]);
+    b_local.api_client = Some(coord_transport::ClientIdentity {
+        chain: old.chain.clone(),
+        key: old.key.clone_key(),
+    });
+    let b = bind_as(b_local, everyone.clone());
+    let a = bind_as(
+        a_id.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
+        everyone.clone(),
+    );
+    let mut c = bind_as(
+        c_id.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
+        Arc::new(only_renewed),
+    );
+    let c_addr = c.local_addr().unwrap();
+    let dial_c = |from: &Transport| {
+        let from = from.dialer();
+        let expected = c_id.expected();
+        async move {
+            from.connect(
+                c_addr,
+                "node-c",
+                PeerRole::Frontend,
+                None,
+                Lane::Unary,
+                expected,
+            )
+            .await
+        }
+    };
+    let dialer = b.dialer();
+    assert!(
+        dial_c(&b).await.is_err(),
+        "`c` admitted the old collector leaf"
+    );
+
+    // An endpoint with no separate credential has none to replace.
+    assert!(
+        a.set_api_client(renewed.chain.clone(), renewed.key.clone_key())
+            .is_err()
+    );
+    b.set_api_client(renewed.chain.clone(), renewed.key.clone_key())
+        .expect("the renewed collector leaf is presentable");
+    dial_c(&b)
+        .await
+        .expect("the renewed collector leaf is what an API dial presents");
+    dialer
+        .connect(
+            c_addr,
+            "node-c",
+            PeerRole::Frontend,
+            None,
+            Lane::Unary,
+            c_id.expected(),
+        )
+        .await
+        .expect("a dialer taken before the swap presents the renewed leaf");
+    // The node's own leaf is untouched: `b` still dials a peer as itself.
+    connect_lane(&b, &c, &c_id, Lane::Control).await;
+    loop {
+        match event(&mut c).await {
+            TransportEvent::Connected {
+                identity,
+                lane: Lane::Control,
+                ..
+            } => {
+                assert_eq!(identity.replica, Some(r(1)));
+                break;
+            }
+            TransportEvent::Connected { .. } | TransportEvent::Closed { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
 /// A connection also ends with the leaf *this* end presented on it, and
 /// nothing is dialled or accepted under that leaf once it has ended
 /// (task-d02; design Sections 10.4, 20.4).

@@ -3272,15 +3272,117 @@ and the three-voter test fails when the peers do not take voter 1 back.
 
 ### What is left
 
-- **A separate collector credential is not renewed here.** A process
+- **The collector's credential is renewed by the follow-up.** A process
   that runs a voter and its domain's frontend submits to other voters as
-  the collector, with its own certificate (`collector_certificate`).
-  That certificate is another principal's, and `set_identity` leaves it
-  as it is. The transport bounds the collector's connections by that
-  certificate's end and dials nothing under it afterwards. Renewing it is
-  the follow-up on this task: the same enroller, as role `Frontend`,
-  under the same key.
+  the collector, with its own certificate (`collector_certificate`), and
+  `set_identity` leaves that certificate as it is. See the next section.
 - **The trust bundle is not reloaded.** A staged CA rotation that
   replaces the bundle still needs a restart. A leaf renewed under a new
   root that the running node does not yet trust is refused by the chain
   check, and the node stays on the leaf it has.
+
+## The collector's leaf is renewed like the node's
+
+The task-d02 follow-up. task-d02's acceptance says collector and
+observer roles renew the same way as a voter, and a process that runs a
+voter and its domain's frontend presents two leaves. One is the node's,
+which both planes serve as and a voter dials its peers as. The other is
+the collector's (`collector_certificate`), which names the same node as
+`Frontend` and is what the frontend presents when it submits to another
+voter. task-d02 renewed only the first, so the collector's leaf ran out
+on its own schedule, and from then on the frontend could reach no other
+voter.
+
+Each leaf is now a `Renewing` of its own, with its own schedule, attempt
+and deadline, told apart by `serve::Principal`. Both use the same
+`[renewal]` section and the same enroller, and each is signed with its
+own key. A collector's renewal keeps the collector's key, as a node's
+keeps the node's. Committed membership has nothing to say about a
+collector's key, so the collector's enroller skips that classification.
+Every other check still applies: same node, incarnation and role, same
+key, same names, a later end, and a chain to the trust bundle.
+
+- **The request names its role.** One workload presents one assertion
+  for both leaves, and the issuer answered with the first of that
+  workload's rules. A workload holding a voter rule and a frontend rule
+  for the same node would have both renewals answered by whichever came
+  first, and the other refused as a change of role. The enroll body now
+  carries `role`. `authorize` takes the first rule that matches the
+  workload and grants that role. That is a choice among the workload's
+  own rules, never a grant: a role it holds no rule for is refused as
+  `NoRule`. A request without `role` keeps the first-match rule.
+- **`Transport::set_api_client`** puts a renewed collector leaf into
+  service, beside `set_identity`. It replaces the api-class client
+  configuration and the collector's end, for dials that start after it.
+  A `Dialer` taken before is covered, and nothing open is touched. The
+  node's leaf, which every accepted handshake presents, is left alone. It
+  is refused on an endpoint built without a separate credential, because
+  a renewal does not add a second principal. Both planes are updated, and
+  the api plane is rolled back if the peer plane refuses, as for the node.
+- **Every leaf ends serving at its `notAfter`.** `main` races the
+  deadline of each leaf against the serving loop, so either one ends it
+  with status 2 and `reason=credential-expired`. A frontend whose
+  collector can no longer reach another voter is half a node, the same
+  half-serving the task-d02 decision rules out. Where nothing renews a
+  leaf, its deadline is fixed at startup, and the stop names it: `renewal
+  not-configured expires_at=N: this node's leaf ...` or `collector
+  renewal not-configured expires_at=N: this node's collector leaf ...`.
+- **The collector's leaf is tied to the node at start.** Before this,
+  it was only read: the chain and the key file's mode, no chain check
+  and no look at whom it names. So a collector leaf for another node or
+  incarnation was presented as this node's, and renewal kept it so,
+  because a renewed leaf is compared with the leaf it replaces and not
+  with the node. `enroll::collector_for` now makes the node leaf's
+  start-up check of it (`verify_chain`), and then requires it to name
+  this node's cluster, replica and incarnation, in `Frontend` or
+  `KineCollector`. A refusal stops the start, and `--check`, with status
+  2 and `the collector certificate at P is not this node's collector:
+  ...`. The gap predates this change (task-j08 introduced the
+  credential); renewal is what made it last.
+- **Both leaves are reported.** The startup report has a `renewal ...`
+  line and a `collector renewal ...` line, `configured` with the due point
+  or `not-configured`. `coordd inspect` adds `collector leaf issued_at=
+  expires_at= renewal= driver=`, and the stopping report has one line per
+  renewal.
+
+### What the tests show
+
+- `enroll::tests::a_collector_leaf_must_be_this_nodes`: leaves in
+  `Frontend` and `KineCollector` for this node pass. Each of these is
+  refused for what it is: another node, another cluster, another
+  incarnation, the voter role, a leaf from another authority, and a key
+  that is not the leaf's.
+- `cli::a_collector_leaf_for_another_node_is_refused_at_start`: the same
+  domain issues this node a collector leaf naming replica 2, then one
+  naming this node as a voter. `--check` refuses each with status 2 and
+  opens no store. With the check in `main` disabled, both pass `--check`
+  and the test fails.
+- `coord-node-issuer`'s
+  `a_request_that_names_its_role_is_answered_by_that_rule_of_the_workload`:
+  one workload holds a voter rule and then a frontend rule for the same
+  node. Without a role, the voter rule answers. With each role named, that
+  rule answers. Naming a role the workload has no rule for is refused as
+  `NoRule`.
+- `coord-transport`'s
+  `a_renewed_collector_credential_is_presented_on_api_dials_only`: a
+  server that admits only the renewed collector leaf refuses the old one,
+  and after `set_api_client` admits the dial and a dialer taken before
+  it. The endpoint still dials a peer as the node. An endpoint without a
+  separate credential refuses the call.
+- `a_collectors_leaf_is_renewed_and_its_links_come_back_under_it`: voter
+  1 of three holds a 36-second collector leaf and a long node leaf, and
+  the issuer lists the voter rule first. The startup report and `inspect`
+  name both leaves. The collector leaf is renewed and written with the
+  same key, a later end and role `Frontend`, and `node.pem` is
+  unchanged. Past the old collector leaf's end, voter 1's `voters
+  submittable=` falls and comes back to 2 under the renewed leaf, and the
+  node does not stop.
+- `a_collector_leaf_nothing_renews_ends_the_node_at_its_end`: with no
+  `[renewal]` and a 12-second collector leaf, the node exits with status
+  2 and `reason=credential-expired` at that leaf's end, long before its
+  node leaf's end.
+
+Negative controls, run by hand. With `role` left out of the request, the
+three-voter test fails: every attempt comes back as a voter and is refused
+as a change of role. With the renewed collector leaf never put into
+service, it fails because voter 1's collector links do not come back.
