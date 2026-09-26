@@ -1731,8 +1731,12 @@ impl Follower {
         }
         let command = proposal.command;
         if self.adopted.contains_key(&command) || self.held.contains_key(&command) {
-            // Duplicate proposal: converges without change.
-            return Vec::new();
+            // Duplicate proposal: converges without change -- except that
+            // the leader sends a proposal again only when it has no vote
+            // from this replica for it (task-d07). An acknowledgement that
+            // was lost on the way is published to the leader again, as it
+            // was published the first time.
+            return self.reacknowledge(command, from);
         }
         if self.table.record(&command).is_none()
             && self.table.phase_of(&command) == Some(Phase::Executed)
@@ -1795,6 +1799,42 @@ impl Follower {
         }
         self.held.insert(command, HeldProposal { proposal });
         self.advance_pending()
+    }
+
+    /// Publish to `leader` again what this replica acknowledged for
+    /// `command` in the current ballot.
+    ///
+    /// The same frames, under the context and barriers they were first
+    /// published with, so the outbox judges them exactly as it did then.
+    /// Nothing is recomputed or voted again. Bounded by the leader's
+    /// pacing: it re-sends a proposal only while a vote is missing.
+    fn reacknowledge(&mut self, command: CommandId, leader: ReplicaId) -> Vec<Effect> {
+        let ballot = self.config.quorum.ballot();
+        let sends: Vec<PendingSend> = self
+            .replay
+            .kept(&command)
+            .iter()
+            .filter(|e| e.ballot == ballot)
+            .map(|e| PendingSend {
+                context: e.context,
+                requires: e.requires.clone(),
+                to: PeerId {
+                    replica: leader,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: e.frame.clone(),
+            })
+            .collect();
+        if sends.is_empty() {
+            return Vec::new();
+        }
+        let Some(outbox) = self.outbox.as_mut() else {
+            return Vec::new();
+        };
+        for send in sends {
+            outbox.publish(send);
+        }
+        self.release()
     }
 
     /// Adopt every held proposal whose payload is initialized and whose
