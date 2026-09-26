@@ -188,7 +188,7 @@ Where they stand on the stack at `afc0df6`:
 
 | Finding | Status |
 | --- | --- |
-| A follower that acknowledges writes the domain does not keep | Fix in review: #99, carried here until the stack has it. Intermittent: 2 of 4 Jepsen runs without the fix (on `afc0df6` and `1f277c9`) and 1 of 4 local pause runs on `afc0df6`; none in the one run with it so far ([run 36209260989](https://github.com/tuplesky/tuplesky/actions/runs/36209260989), 339 transactions). Seen in ballot 0, with no recovery. |
+| A follower that acknowledges writes the domain does not keep | Fix in review: #99, carried here until the stack has it. Intermittent: 2 of 4 Jepsen runs without the fix (on `afc0df6` and `1f277c9`) and 1 of 4 local pause runs on `afc0df6`; none in the two runs with it so far ([run 36209260989](https://github.com/tuplesky/tuplesky/actions/runs/36209260989), 339 transactions; [run 36211748702](https://github.com/tuplesky/tuplesky/actions/runs/36211748702), 1177 transactions, 873 ok). Seen in ballot 0, with no recovery. |
 | A restarted follower whose table stays full | Open: task-d05. Recovery carries the whole history (below). |
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | Open: a plan task in #99. Reproduced on `afc0df6`. |
