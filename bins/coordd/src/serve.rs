@@ -937,6 +937,13 @@ pub struct Domain<P: Persistence> {
     /// stop is recorded here and the loop ends on its next pass, as it
     /// does for the same refusal on a turn.
     fenced_stop: Option<String>,
+    /// The command whose leader's release and this node's own execution
+    /// record disagreed, if one has (task-d06). That is replicas executing
+    /// the same committed commands in different orders, and this node's
+    /// frontend answers from its own execution record (a retry, and a
+    /// delivery whose release was lost), so the node stops rather than
+    /// answer again from a state the domain did not decide.
+    diverged: Option<String>,
 }
 
 /// The two planes a voter is dialled on.
@@ -1314,6 +1321,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             role_said: None,
             fenced_said: 0,
             fenced_stop: None,
+            diverged: None,
             peer_streak: 0,
             budgets,
             recorder,
@@ -1481,6 +1489,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // stops the voter here, as one met on a turn does below.
             if let Some(what) = self.fenced_stop.take() {
                 say_fenced_stop(&what);
+                return;
+            }
+            if let Some(command) = self.diverged.take() {
+                say_diverged(&command);
                 return;
             }
             let progressed = match self.turn(transport).await {
@@ -2615,19 +2627,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     deliveries.extend(delivery);
                 }
                 // The release this collector holds and what this node
-                // executed disagree. Neither is believed; said, because
-                // it is the one outcome here that is not ordinary.
+                // executed disagree. Neither is believed, and it is not an
+                // ordinary outcome: every replica executes the committed
+                // commands in one order, and this node's frontend answers
+                // from its own record of that order. So the node stops
+                // (task-d06) rather than go on answering from it.
                 Err(coord_collector::SettleError::Mismatch) => {
                     let head: String = command.as_bytes()[..4]
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect();
-                    let said = format!("release-record-mismatch({head})");
-                    if let Some(n) = self.recurring.seen(&said) {
-                        eprintln!(
-                            "this node's durable record and the leader's release disagree: {said} ({n} so far)"
-                        );
-                    }
+                    self.diverged.get_or_insert(head);
                 }
                 Err(_) => {}
             }
@@ -3295,6 +3305,16 @@ fn addressed(
         replica: to.replica,
         incarnation,
     })
+}
+
+/// Why a node stopped on a release its own execution contradicts.
+fn say_diverged(command: &str) {
+    eprintln!(
+        "this node stopped: release-record-mismatch({command}): the leader's release of that \
+         command and this node's own execution of it disagree, so this node executed the \
+         domain's commands in another order than the leader. Its store holds a history the \
+         domain did not decide, and this node does not answer from it"
+    );
 }
 
 /// Why a voter stopped on its own fence, and what heals it.
