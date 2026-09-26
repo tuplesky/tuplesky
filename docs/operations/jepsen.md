@@ -614,8 +614,38 @@ answering, but their replicas never showed the session. `n4` was never
 killed or paused, only partitioned, and no operation through it
 succeeded in the whole run. `n3` was killed at about 10 s and started
 again at about 200 s, and nothing through it succeeded after the first
-20 s. The workflow now prints each voter's log into the job log, so the
-next run shows what those voters were doing.
+20 s. The workflow now prints each voter's log into the job log.
+
+The first run with the voter logs, on `02804ac`
+([run 36275749815](https://github.com/tuplesky/tuplesky/actions/runs/36275749815),
+`:valid? true`, 618 `ok`), stalled the same way, and shows why. The voter log
+lines carry no time, so what follows is their order against the faults:
+
+1. From about 20 s into the run (a ring partition, and `n2` paused for
+   6 s), only `n1`, the ballot-0 leader, served. `n1` could not send to
+   `n2` and `n4` (`QueueFull { lane: Control }`, 749 and then 949
+   frames refused before it could send again), `n3` and `n5` logged full
+   control lanes too, and the followers refused submissions as
+   `Backpressure`. Reads through `n2` to `n5` stayed `Pending` from then
+   on.
+2. At about 40 s nothing succeeded anywhere, and it did not come back
+   when the partition healed 12 s later, before `n1`, `n3` and `n5` were
+   killed at about 104 s.
+3. No election completed after ballot 0. `n2` campaigned for ballots 1
+   to 18, every other voter followed `n2`'s ballot, and no voter logged
+   `leads ballot`. No voter stopped with an error.
+4. The followers were about 1,000 commands behind: restarted, `n3` and
+   `n5` recovered 1,192 records and had executed 168. `n1`, the old
+   leader, had executed 1,186 of 1,206, and followed `n2`'s ballots
+   rather than campaigning.
+5. The three final reads (through `n5`, `n1` and `n2`) were all
+   `pending`: there was no leader, and `n2`'s campaign for ballot 18
+   was still open.
+
+So the stall is followers falling about 1,000 commands behind under
+this load, and then a candidate that far behind never completing its
+campaign, while the one voter that had executed everything does not
+campaign. It is not a voter that stopped.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
