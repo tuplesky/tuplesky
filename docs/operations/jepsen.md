@@ -189,10 +189,10 @@ Where they stand on the stack at `afc0df6`:
 | Finding | Status |
 | --- | --- |
 | A follower that acknowledges writes the domain does not keep | Open. Intermittent: 1 of 2 Jepsen runs and 1 of 4 local pause runs on `afc0df6`. Seen in ballot 0, with no recovery. |
-| A restarted follower whose table stays full | Open. Recovery carries the whole history (below). |
-| A restarted voter that panics, then no election | Fixed on task-d01 (`fe09234`, `f2d4dfb`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
+| A restarted follower whose table stays full | Open: task-d05. Recovery carries the whole history (below). |
+| A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | Open. Reproduced on `afc0df6`. |
-| No sessions after healing, under Jepsen | Open. Recovery carries the whole history (below). |
+| No sessions after healing, under Jepsen | Open: task-d05. Recovery carries the whole history (below). |
 
 The second and the last are the limit task-d01's notes now record as
 "recovery carries the whole history": dependency rows are never pruned,
@@ -203,9 +203,10 @@ placeholders. Rerun on `afc0df6`, the leader-kill stress run shows it on
 its own: voter 1 was killed five times and led ballots 6 and 7 after
 coming back. But voters 2 and 3 refused every submission with
 `Backpressure` (past 16384), and no voter served the final read (exit 2;
-290 operations, no anomaly). Deciding what bounds it (an execution floor, a pruned
-ledger, or a durable "executed" answer) is a `coord-consensus` protocol
-decision, and it is in no task yet.
+290 operations, no anomaly). Bounding recovery reports and Syncs by what
+the voters executed is
+[task-d05](../design/tuplesky-prs-plan.md#task-d05), a prerequisite of
+task-64.
 
 ### A follower that acknowledges writes the domain does not keep
 
