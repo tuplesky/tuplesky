@@ -4570,14 +4570,19 @@ before it knows whether it can bind a selection, so a promise is not yet a
 leader, and one whose candidate stood down held every voter that promised
 it for as long as the link held.
 - **The rule.** A voter has a leader when it leads, or when the leader
-  its promised ballot names is linked *and* that ballot has synchronized
-  here: the ballot it votes in, the one whose Sync it adopted, is the one
-  it promised (`election::has_leader`).
-- **What it costs.** A live candidate's Sync follows the promise within a
-  round trip, and a follower counts as leaderless only for that long,
-  well inside the patience, so no campaign follows it. One whose Sync
-  does not come within the patience is campaigned over, with the usual
-  jitter and back-off.
+  its promised ballot names is linked and that ballot has synchronized
+  here -- the ballot it votes in, the one whose Sync it adopted, is the one
+  it promised -- or has had the ceiling (16 s) to do so, counted from when
+  this voter first saw the promise (`Election::led`).
+- **Why the ceiling and not the patience.** The first version gave a
+  promise only the patience (1 s). A Sync is not a round trip behind the
+  promise: the candidate collects a report from a majority, paged, and
+  binds its selection durably first, which under load takes longer. Voters
+  then campaigned over live candidates, and in five `--fault random` runs
+  the ballots duelled to between 10 and 46, against 2 to 8 without the
+  rule. The ceiling is what a candidate already gives its own campaign
+  before replacing it (`observe`'s `finishing`), so a promise now gets the
+  same.
 - **The candidate's side** is unchanged: its own campaign is its
   `campaigning` flag, and a stood-down candidate does not campaign again
   (task-d05).
@@ -4585,12 +4590,14 @@ it for as long as the link held.
 ### What the tests show
 
 `bins/coordd/src/election.rs`:
-- `a_promise_that_never_synchronizes_is_no_leader`: the rule's cases.
-  Promised ballot 3 while still voting in ballot 2, with the candidate
-  linked, is leaderless; synchronized and linked is led.
-- `a_voter_whose_promise_does_not_synchronize_campaigns_after_its_patience`:
-  stepped through the schedule, a voter stuck on such a promise campaigns
-  after its patience, and one whose Sync arrives after 20 ms never does.
+- `a_promise_that_never_synchronizes_is_a_leader_only_for_the_ceiling`:
+  the rule's cases. A promise of ballot 3 while still voting in ballot 2
+  is a leader until the ceiling and not after; a new promise starts its
+  own allowance; the link still matters.
+- `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling`:
+  stepped through the schedule, a voter held by a promise that never
+  synchronizes campaigns only after the ceiling, and one whose Sync comes
+  just inside it never does.
 
 ### What is left
 
