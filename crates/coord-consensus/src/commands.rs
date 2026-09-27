@@ -314,6 +314,31 @@ impl CommandTable {
         payload: Digest32,
         keys: Vec<Vec<u8>>,
     ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, true)
+    }
+
+    /// [`CommandTable::initialize`] past the table's capacity (task-d09).
+    ///
+    /// For a command whose turn has come and that is already decided
+    /// elsewhere: a full table of later commands, none of which can be
+    /// adopted before it, would otherwise hold it out for ever. The
+    /// caller vouches for that; the table cannot tell.
+    pub fn initialize_beyond_capacity(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<Initialized, InitError> {
+        self.initialize_bounded(command, payload, keys, false)
+    }
+
+    fn initialize_bounded(
+        &mut self,
+        command: CommandId,
+        payload: Digest32,
+        keys: Vec<Vec<u8>>,
+        bounded: bool,
+    ) -> Result<Initialized, InitError> {
         match self.records.get(&command) {
             Some(existing) if existing.payload.is_some() => {
                 return Err(if existing.payload == Some(payload) {
@@ -324,7 +349,7 @@ impl CommandTable {
             }
             Some(_) => {}
             None => {
-                if self.full_after_reclaim() {
+                if bounded && self.full_after_reclaim() {
                     return Err(InitError::Backpressure);
                 }
             }
@@ -362,6 +387,30 @@ impl CommandTable {
             path,
             payload,
         })
+    }
+
+    /// Bind `payload` in place of the admission a command was initialized
+    /// under, while nothing has been accepted over it (task-d09).
+    ///
+    /// For a follower that took its own submission under other attested
+    /// facts than the ones the leader proposed: every presentation of a
+    /// command mints its own admission receipt, so a submitter that
+    /// presents again after a lost link reaches the voters under facts the
+    /// leader never saw. At PRE-ACCEPT the record holds only this
+    /// replica's local order, which adoption replaces, and its fast
+    /// acknowledgement under the other facts is one no quorum counts:
+    /// every learning predicate needs the leader's proposal, and a vote
+    /// set counts nothing under other facts than the ones it bound.
+    /// Past PRE-ACCEPT the record's facts are what it acknowledged, and
+    /// nothing is rebound. Returns whether the record was rebound.
+    pub fn rebind(&mut self, command: &CommandId, payload: Digest32) -> bool {
+        match self.records.get_mut(command) {
+            Some(record) if record.payload.is_some() && record.phase == Phase::PreAccept => {
+                record.payload = Some(payload);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The path log of `key`, if any command touched it.

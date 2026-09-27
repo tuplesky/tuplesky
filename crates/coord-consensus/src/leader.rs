@@ -657,23 +657,13 @@ impl Leader {
                 .filter(|(_, c)| voted(c))
                 .map(|(s, _)| *s)
                 .max();
-            for (seqnum, command) in order
+            for (_, command) in order
                 .iter()
                 .filter(|(s, c)| through.is_none_or(|t| *s > t) && !voted(c))
                 .take(per_voter)
             {
                 let p = &self.proposals[command];
-                let frame = ProtocolMessage::Proposal(FastAck {
-                    replica: me,
-                    ballot,
-                    command: *command,
-                    deps: p.deps.clone(),
-                    paths: p.paths.clone(),
-                    path: p.path,
-                    admission: p.admission,
-                    seqnum: Some(*seqnum),
-                })
-                .encode();
+                let frame = self.proposal_frame(p);
                 sends.push(PendingSend {
                     context,
                     requires: alloc::vec![p.barrier],
@@ -691,6 +681,134 @@ impl Leader {
         let outbox = self.outbox.as_mut().expect("booted");
         for send in sends {
             outbox.publish(send);
+        }
+        self.release()
+    }
+
+    /// The proposal frame for `p`, as it was first published.
+    fn proposal_frame(&self, p: &Proposal) -> Vec<u8> {
+        ProtocolMessage::Proposal(FastAck {
+            replica: self.config.identity.replica,
+            ballot: self.config.quorum.ballot(),
+            command: p.command,
+            deps: p.deps.clone(),
+            paths: p.paths.clone(),
+            path: p.path,
+            admission: p.admission,
+            seqnum: Some(p.seqnum),
+        })
+        .encode()
+    }
+
+    /// Answer a follower's ask for proposals of this ballot (task-d09):
+    /// each durable one named is sent to it again, as a re-send would.
+    /// A command this leader did not propose in the ballot, or whose
+    /// batch is not durable yet, is not answered.
+    fn serve_proposals(
+        &mut self,
+        to: ReplicaId,
+        ballot: Ballot,
+        commands: &[CommandId],
+    ) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if !self.is_leading() || ballot != self.config.quorum.ballot() {
+            return Vec::new();
+        }
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let sends: Vec<PendingSend> = commands
+            .iter()
+            .filter_map(|c| self.proposals.get(c))
+            .filter(|p| p.durable)
+            .take(crate::messages::MAX_PROPOSAL_ASK)
+            .map(|p| PendingSend {
+                context,
+                requires: alloc::vec![p.barrier],
+                to: PeerId {
+                    replica: to,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: self.proposal_frame(p),
+            })
+            .collect();
+        if sends.is_empty() {
+            return Vec::new();
+        }
+        let outbox = self.outbox.as_mut().expect("booted");
+        for send in sends {
+            outbox.publish(send);
+        }
+        self.release()
+    }
+
+    /// The highest sequence number of this ballot whose whole prefix is
+    /// committed here with its batch durable, if any (task-d09).
+    ///
+    /// Every sequence number below `seqnum` went to a proposal of this
+    /// ballot. One that is no longer in `proposals` was forgotten, which
+    /// only happens to a command executed long ago. So the prefix ends
+    /// just before the lowest proposal that is either not durable or not
+    /// committed.
+    pub fn committed_through(&self) -> Option<u64> {
+        let open = self
+            .proposals
+            .values()
+            .filter(|p| {
+                !(p.durable
+                    && (p.executed || self.table.phase_of(&p.command) >= Some(Phase::Commit)))
+            })
+            .map(|p| p.seqnum)
+            .min();
+        match open {
+            Some(first) => first.checked_sub(1),
+            None => self.seqnum.checked_sub(1),
+        }
+    }
+
+    /// Tell every other voter this ballot's commit frontier (task-d09).
+    ///
+    /// Learning is otherwise all-to-all: a follower commits a command
+    /// from the acknowledgements it receives itself, each published once
+    /// on a lane that drops frames by design, and nothing publishes a
+    /// missed one again to it. The leader's commit is a decision under
+    /// the crash-fault model, and the proposal the follower adopted
+    /// carries the leader's dependencies, so a follower that adopted a
+    /// proposal at or below the frontier may commit it without the
+    /// acknowledgements it missed.
+    ///
+    /// Paced by the caller with the re-send. The frame is small and
+    /// carries the whole frontier, so one that is dropped is repaired by
+    /// the next. It needs no barrier: the frontier counts only proposals
+    /// whose batch is durable.
+    pub fn announce_committed(&mut self) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if !self.is_leading() {
+            return Vec::new();
+        }
+        let Some(through) = self.committed_through() else {
+            return Vec::new();
+        };
+        let me = self.config.identity.replica;
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let frame = ProtocolMessage::Committed { ballot, through }.encode();
+        let outbox = self.outbox.as_mut().expect("booted");
+        for voter in &self.config.identity.voters {
+            if *voter == me {
+                continue;
+            }
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: frame.clone(),
+            });
         }
         self.release()
     }
@@ -1666,7 +1784,11 @@ impl Leader {
                     }
                 }
             }
+            ProtocolMessage::ProposalRequest { ballot, commands } => {
+                self.serve_proposals(from.replica, ballot, &commands)
+            }
             ProtocolMessage::Sealed { .. }
+            | ProtocolMessage::Committed { .. }
             | ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. }

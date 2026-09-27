@@ -135,10 +135,15 @@ impl Machine {
     }
 
     /// Send the voters, again, the proposals they have not voted on
-    /// (task-d07). Only a leader has proposals to send.
+    /// (task-d07), and the commit frontier (task-d09). Only a leader has
+    /// proposals to send or a frontier to announce.
     pub fn resend_unvoted(&mut self, per_voter: usize) -> Vec<Effect> {
         match self {
-            Machine::Leader(m) => m.resend_unvoted(per_voter),
+            Machine::Leader(m) => {
+                let mut effects = m.resend_unvoted(per_voter);
+                effects.extend(m.announce_committed());
+                effects
+            }
             Machine::Follower(_) => Vec::new(),
         }
     }
@@ -534,7 +539,7 @@ impl<P: Persistence> Node<P> {
     }
 
     /// Send the voters, again, the proposals they have not voted on
-    /// (task-d07).
+    /// (task-d07), and the commit frontier (task-d09).
     pub fn resend_proposals(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let effects = self
             .machine_mut()

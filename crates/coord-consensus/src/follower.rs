@@ -38,7 +38,7 @@ use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, Replic
 use crate::campaign::Campaign;
 use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::{MAX_PAYLOAD_TRANSFER, ProtocolMessage};
+use crate::messages::{MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, ProtocolMessage};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryError, SyncDecision, SyncEntry};
@@ -127,7 +127,9 @@ pub enum FollowerRejection {
     Vote(VoteError),
     /// A leader proposal named this command under an admission this
     /// replica did not accept it under. The identity is shared; the
-    /// command is not.
+    /// command is not. Below ACCEPT the proposal is held and the leader's
+    /// payload asked for, and the record is rebound to it when it arrives
+    /// (task-d09); past it, the proposal is refused.
     AdmissionConflict {
         /// Command.
         command: CommandId,
@@ -309,6 +311,14 @@ pub struct Follower {
     /// that ballot for ever. Kept, it is installed the moment the promise
     /// is made, which is the order the protocol meant (task-d05).
     early_sync: Option<(ReplicaId, SyncDecision)>,
+    /// The commit frontier the leader of the current ballot announced:
+    /// every proposal of the ballot up to this sequence number is
+    /// committed there (task-d09). Reset with the ballot.
+    leader_committed: Option<u64>,
+    /// Where the next bounded proposal ask starts among the adoptions
+    /// with no sequence number of this ballot, as `payload_cursor` does
+    /// for payloads (task-d09).
+    proposal_cursor: usize,
     rejections: Vec<FollowerRejection>,
     /// What this replica published to the frontend for each command it
     /// still remembers, kept so an exact duplicate submission can offer
@@ -422,6 +432,8 @@ impl Follower {
             rejections: Vec::new(),
             resumed,
             early_sync: None,
+            leader_committed: None,
+            proposal_cursor: 0,
         }
         .resume_sync()
     }
@@ -542,6 +554,8 @@ impl Follower {
             rejections: Vec::new(),
             resumed: None,
             early_sync: None,
+            leader_committed: None,
+            proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
         }
     }
@@ -961,6 +975,7 @@ impl Follower {
         self.votes.clear();
         self.held.clear();
         self.adopted.clear();
+        self.leader_committed = None;
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
                 let _ = self.table.expect(*c);
@@ -1124,7 +1139,8 @@ impl Follower {
         report
     }
 
-    /// Commands known by identity (a held proposal) without a payload.
+    /// Commands known by identity (a held proposal) without a payload, or
+    /// with one under other attested facts than the proposal's.
     pub fn missing_payloads(&self) -> Vec<CommandId> {
         // Held by identity and not by content. A command this replica
         // has a record for may still have no payload: a proposal that
@@ -1138,6 +1154,7 @@ impl Follower {
             .chain(self.adopted.keys())
             .filter(|c| !self.payloads.contains_key(c))
             .copied()
+            .chain(self.held.keys().filter(|c| self.awaits_rebind(c)).copied())
             .chain(self.campaign_missing())
             .collect();
         out.sort();
@@ -1197,14 +1214,14 @@ impl Follower {
     /// on a shared, bounded lane; rotating because a bound that always
     /// took the same prefix would leave the rest of the set unasked for
     /// ever. See [`MAX_PAYLOAD_TRANSFER`].
-    fn payload_batch(&mut self, mut missing: Vec<CommandId>) -> Vec<CommandId> {
-        if missing.len() <= MAX_PAYLOAD_TRANSFER {
+    fn payload_batch(&mut self, mut missing: Vec<CommandId>, room: usize) -> Vec<CommandId> {
+        if missing.len() <= room {
             return missing;
         }
         let start = self.payload_cursor % missing.len();
-        self.payload_cursor = start.wrapping_add(MAX_PAYLOAD_TRANSFER);
+        self.payload_cursor = start.wrapping_add(room);
         missing.rotate_left(start);
-        missing.truncate(MAX_PAYLOAD_TRANSFER);
+        missing.truncate(room);
         missing
     }
 
@@ -1232,10 +1249,23 @@ impl Follower {
             _ => alloc::vec![from],
         };
         let commands = if campaign_missing.is_empty() {
-            let missing = self.missing_payloads();
-            self.payload_batch(missing)
+            // What the leader has committed comes first, in its order: a
+            // replica behind it executes nothing until the command whose
+            // turn it is arrives, and a rotation through thousands of
+            // missing payloads reaches that one once per pass (task-d09).
+            // Half the ask, so the rotation still moves.
+            let mut due = self.due_payloads();
+            due.truncate(MAX_PAYLOAD_TRANSFER / 2);
+            let missing: Vec<CommandId> = self
+                .missing_payloads()
+                .into_iter()
+                .filter(|c| !due.contains(c))
+                .collect();
+            let room = MAX_PAYLOAD_TRANSFER - due.len();
+            due.extend(self.payload_batch(missing, room));
+            due
         } else {
-            self.payload_batch(campaign_missing)
+            self.payload_batch(campaign_missing, MAX_PAYLOAD_TRANSFER)
         };
         if commands.is_empty() || sources.is_empty() {
             return Vec::new();
@@ -1329,7 +1359,200 @@ impl Follower {
     }
 
     fn learn(&mut self) {
-        self.learner.commit_learned(&mut self.table, &self.votes);
+        loop {
+            let learned = self.learner.commit_learned(&mut self.table, &self.votes);
+            if !self.commit_through_leader() && learned.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Commit what this replica adopted from the current ballot's leader
+    /// up to the frontier that leader announced (task-d09). Returns
+    /// whether anything was committed.
+    ///
+    /// Sound because the leader's commit is a decision under the
+    /// crash-fault model, and an adoption here took the dependencies of
+    /// that leader's proposal for that sequence number, which is the one
+    /// its commit was over. Only a durable adoption counts, as only a
+    /// durable adoption counts as this replica's vote. An adoption
+    /// restored from before a restart has no sequence number of this
+    /// ballot, so it waits for the re-sent proposal to be adopted again.
+    /// Sequence order, because a dependency needs to be committed first
+    /// and was proposed first.
+    fn commit_through_leader(&mut self) -> bool {
+        let Some(through) = self.leader_committed else {
+            return false;
+        };
+        let mut ready: Vec<(u64, CommandId)> = self
+            .adopted
+            .iter()
+            .filter(|(c, (seqnum, durable))| {
+                *durable && *seqnum <= through && self.table.phase_of(c) == Some(Phase::Accept)
+            })
+            .map(|(c, (seqnum, _))| (*seqnum, *c))
+            .collect();
+        ready.sort_unstable();
+        let mut progressed = false;
+        for (_, command) in ready {
+            progressed |= self.table.commit(command).is_ok();
+        }
+        progressed
+    }
+
+    /// Whether `command` is one this replica can adopt next: a held
+    /// proposal of this ballot, under the admission given, with every
+    /// dependency at least ACCEPT here (task-d09).
+    ///
+    /// Such a command is let into a full table. The table fills with
+    /// later commands while this replica is behind -- their payloads
+    /// arrive by submission and transfer in no particular order -- and
+    /// none of them can be adopted before the command whose turn it is.
+    /// Refused, that command held every one of them for ever. Admitted,
+    /// it is adopted at once, and its adoption is the vote the leader may
+    /// be waiting for.
+    ///
+    /// Not only once the leader has committed it. The first version
+    /// waited for the commit frontier, and with a majority of followers
+    /// full that frontier never moved: the leader could not commit the
+    /// command without their votes, and they would not adopt it until it
+    /// had. In the five-node Jepsen run the whole domain stopped with no
+    /// fault active, three followers refusing every proposal as
+    /// backpressure. Admitting what can be adopted is what breaks that.
+    ///
+    /// How far the table exceeds its bound: by the chain of held
+    /// proposals each of whose dependencies is adopted before it, and the
+    /// held proposals are bounded (`HELD_PROPOSAL_SLACK` tables' worth).
+    /// The commands it admits are the ones execution needs next, so
+    /// committing and executing them is what shrinks the table again.
+    ///
+    /// Only for the admission the proposal carries: a payload under other
+    /// attested facts could not be adopted anyway.
+    fn turn_has_come(
+        &self,
+        command: &CommandId,
+        admission: coord_types::identity::Digest32,
+    ) -> bool {
+        self.held.get(command).is_some_and(|h| {
+            h.proposal.admission == admission
+                && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d)).is_ok()
+        })
+    }
+
+    /// The held proposals whose payload this replica lacks and whose turn
+    /// has come -- every dependency adopted here, or within the leader's
+    /// commit frontier -- in the leader's order (task-d09).
+    fn due_payloads(&self) -> Vec<CommandId> {
+        let through = self.leader_committed;
+        let mut due: Vec<(u64, CommandId)> = self
+            .held
+            .iter()
+            .filter(|(c, _)| !self.payloads.contains_key(c) || self.awaits_rebind(c))
+            .filter(|(_, h)| {
+                through.is_some_and(|t| h.proposal.seqnum.is_some_and(|s| s <= t))
+                    || crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
+                        .is_ok()
+            })
+            .filter_map(|(c, h)| h.proposal.seqnum.map(|s| (s, *c)))
+            .collect();
+        due.sort_unstable();
+        due.into_iter().map(|(_, c)| c).collect()
+    }
+
+    /// Whether `command` is held under an admission other than the one
+    /// its record was initialized under, and can still be rebound to the
+    /// proposal's (task-d09).
+    ///
+    /// Every presentation of a command mints its own admission receipt,
+    /// so a submitter that presents again after a lost link reaches the
+    /// voters under facts the leader never saw, and a voter that took
+    /// that presentation first holds the leader's proposal under facts it
+    /// did not accept. Refused, that voter never adopted the command, and
+    /// with the chain total, nothing after it. The proposal is kept, the
+    /// leader's payload is asked for as missing, and `on_payload` rebinds
+    /// the record to it while nothing has been accepted over it.
+    fn awaits_rebind(&self, command: &CommandId) -> bool {
+        self.held.get(command).is_some_and(|h| {
+            self.table.record(command).is_some_and(|r| {
+                r.phase == Phase::PreAccept && r.payload.is_some_and(|p| p != h.proposal.admission)
+            })
+        })
+    }
+
+    /// The leader of the current ballot announced its commit frontier.
+    fn on_committed(&mut self, from: ReplicaId, ballot: Ballot, through: u64) -> Vec<Effect> {
+        if from != self.config.quorum.leader() || ballot != self.config.quorum.ballot() {
+            return Vec::new();
+        }
+        if self.leader_committed.is_none_or(|known| through > known) {
+            self.leader_committed = Some(through);
+            self.learn();
+        }
+        self.ask_for_proposals(from)
+    }
+
+    /// Adoptions at ACCEPT whose sequence number in this ballot this
+    /// replica does not know (task-d09).
+    ///
+    /// Restored from the rows after a restart: the row names no ballot,
+    /// and a ballot numbers its proposals from zero, so nothing durable
+    /// can say which of the leader's sequence numbers an adoption was.
+    /// The frontier cannot commit them, and with the chain total nothing
+    /// after them either.
+    fn unsequenced_adoptions(&self) -> Vec<CommandId> {
+        self.adopted
+            .iter()
+            .filter(|(c, (seqnum, _))| {
+                *seqnum == u64::MAX && self.table.phase_of(c) == Some(Phase::Accept)
+            })
+            .map(|(c, _)| *c)
+            .collect()
+    }
+
+    /// Ask `leader` for its proposals of the adoptions this replica holds
+    /// without a sequence number of the ballot (task-d09).
+    ///
+    /// Paced by the frontier it answers, which the leader sends on its
+    /// re-send timer, and bounded per ask, rotating through the set. The
+    /// answer is taken as any duplicate proposal is: an adoption with
+    /// nothing kept to acknowledge again is adopted again, this time with
+    /// the sequence number, and the frontier commits it. A command the
+    /// leader did not propose in this ballot gets no answer and waits for
+    /// the next Sync, as before.
+    fn ask_for_proposals(&mut self, leader: ReplicaId) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let mut unsequenced = self.unsequenced_adoptions();
+        if unsequenced.is_empty() {
+            return Vec::new();
+        }
+        if unsequenced.len() > MAX_PROPOSAL_ASK {
+            let start = self.proposal_cursor % unsequenced.len();
+            self.proposal_cursor = start.wrapping_add(MAX_PROPOSAL_ASK);
+            unsequenced.rotate_left(start);
+            unsequenced.truncate(MAX_PROPOSAL_ASK);
+        }
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let frame = ProtocolMessage::ProposalRequest {
+            ballot,
+            commands: unsequenced,
+        }
+        .encode();
+        let Some(outbox) = self.outbox.as_mut() else {
+            return Vec::new();
+        };
+        outbox.publish(PendingSend {
+            context,
+            requires: Vec::new(),
+            to: PeerId {
+                replica: leader,
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            frame,
+        });
+        self.release()
     }
 
     /// Choose the learning predicates (full, or the forced slow path for
@@ -1622,11 +1845,15 @@ impl Follower {
         // beside the identity is the admission: a second presentation of
         // this command under different attested facts conflicts here
         // instead of quietly replacing what this replica accepted.
-        let init = match self.table.initialize(
-            command,
-            payload.admission_digest(),
-            alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()],
-        ) {
+        let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
+        let initialized = if self.turn_has_come(&command, payload.admission_digest()) {
+            self.table
+                .initialize_beyond_capacity(command, payload.admission_digest(), keys)
+        } else {
+            self.table
+                .initialize(command, payload.admission_digest(), keys)
+        };
+        let init = match initialized {
             Ok(i) => i,
             Err(InitError::Backpressure) => {
                 // No room for this command -- and returning here would
@@ -1657,6 +1884,14 @@ impl Follower {
         };
         self.bindings.insert(retry_key, command);
         self.payloads.insert(command, payload.clone());
+        // The leader's proposal came first, under other attested facts:
+        // held, and waiting for the leader's payload (`awaits_rebind`).
+        if self.awaits_rebind(&command) {
+            self.rejections.push(FollowerRejection::AdmissionConflict {
+                command,
+                accepted: init.payload,
+            });
+        }
         let epoch = self.config.identity.epoch;
         let record = self
             .table
@@ -1767,20 +2002,31 @@ impl Follower {
             // for ever for an adoption that cannot happen (task-d05).
             return self.acknowledge_decided(&proposal, from);
         }
-        // A proposal asserts something about a command. Where this
-        // replica already holds that command's payload and accepted it
-        // under other attested facts, the leader is proposing a
-        // different command under a shared identity: adopting it would
-        // execute facts this replica never admitted. Nothing is held,
-        // nothing is counted, and the mismatch is reported rather than
-        // resolved -- whichever of the two is the real command, this
-        // replica cannot tell from the proposal.
+        // A proposal asserts something about a command, including the
+        // attested facts it was admitted under. Where this replica
+        // accepted the command under other facts, adopting the proposal
+        // would execute facts this replica never admitted. Reported,
+        // either way.
+        //
+        // Past PRE-ACCEPT the record's facts are the ones this replica
+        // acknowledged, so nothing is held or counted. Below it they are
+        // only a presentation this replica took first -- each
+        // presentation mints its own receipt, so a submitter's second one
+        // routinely differs from the one the leader proposed -- and the
+        // proposal is held while the leader's payload is fetched and
+        // bound in its place (`awaits_rebind`, task-d09). Dropped, the
+        // command sat at PRE-ACCEPT here for ever, and with the chain
+        // total, so did everything after it.
+        let mut rebinding = false;
         if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
             && accepted != proposal.admission
         {
             self.rejections
                 .push(FollowerRejection::AdmissionConflict { command, accepted });
-            return Vec::new();
+            if self.table.phase_of(&command) != Some(Phase::PreAccept) {
+                return Vec::new();
+            }
+            rebinding = true;
         }
         // The leader's order is recorded into the path logs as soon as it is
         // known (prototype `recordLeaderHash`); a missing payload only makes
@@ -1809,14 +2055,19 @@ impl Follower {
                 return self.advance_pending();
             }
         }
-        if let Some(set) = self.votes.get_mut(&command) {
-            if let Err(e) = set.add(Vote::Fast(proposal.clone())) {
-                self.rejections.push(FollowerRejection::Vote(e));
+        // Not counted yet when the record is to be rebound: the vote set
+        // may have bound the facts being replaced, and `rebind` starts it
+        // again from this proposal.
+        if !rebinding {
+            if let Some(set) = self.votes.get_mut(&command) {
+                if let Err(e) = set.add(Vote::Fast(proposal.clone())) {
+                    self.rejections.push(FollowerRejection::Vote(e));
+                }
+            } else {
+                let mut set = VoteSet::new(self.config.quorum.clone(), command);
+                let _ = set.add(Vote::Fast(proposal.clone()));
+                self.votes.insert(command, set);
             }
-        } else {
-            let mut set = VoteSet::new(self.config.quorum.clone(), command);
-            let _ = set.add(Vote::Fast(proposal.clone()));
-            self.votes.insert(command, set);
         }
         self.held.insert(command, HeldProposal { proposal });
         self.advance_pending()
@@ -1939,7 +2190,10 @@ impl Follower {
                     // nothing to accept an order *for* yet. It stays
                     // held until the payload arrives -- from the
                     // submission, or from the leader that proposed it.
+                    // Nor under other facts than the proposal's: that
+                    // one waits for the leader's payload to be bound.
                     self.table.is_initialized(c)
+                        && !self.awaits_rebind(c)
                         && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
                             .is_ok()
                 })
@@ -1951,6 +2205,21 @@ impl Follower {
             }
             for command in ready {
                 let held = self.held.remove(&command).expect("ready");
+                // The proposal asserts the admission it was ordered under.
+                // Adopted under other attested facts, this replica would
+                // execute a command the quorum never admitted as such --
+                // once committed, from the leader's frontier or from its
+                // peers' acknowledgements, which match the leader's
+                // (task-d09). Below ACCEPT such a proposal is not ready
+                // (`awaits_rebind`); this is a record past it, whose facts
+                // this replica acknowledged, and the proposal is refused.
+                if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
+                    && accepted != held.proposal.admission
+                {
+                    self.rejections
+                        .push(FollowerRejection::AdmissionConflict { command, accepted });
+                    continue;
+                }
                 // A command already learned or executed (installed from a
                 // Sync, or durable across a restart) keeps its phase: the
                 // re-proposal only supplies the new ballot's order.
@@ -2191,7 +2460,11 @@ impl Follower {
             }
             // A seal report is a coordinator's to count, never a
             // voter's to act on.
-            ProtocolMessage::Sealed { .. } => Vec::new(),
+            // Only a leader answers for proposals.
+            ProtocolMessage::Sealed { .. } | ProtocolMessage::ProposalRequest { .. } => Vec::new(),
+            ProtocolMessage::Committed { ballot, through } => {
+                self.on_committed(from.replica, ballot, through)
+            }
             ProtocolMessage::Promise {
                 ballot, replica, ..
             } => {
@@ -2232,7 +2505,7 @@ impl Follower {
                 let mut out = self.on_payload(command, payload);
                 // Counted only as an answer to the outstanding ask, and
                 // once: see `payloads_answered`.
-                if asked && self.payloads.contains_key(&command) {
+                if asked && self.payloads.contains_key(&command) && !self.awaits_rebind(&command) {
                     self.payloads_asked.remove(&command);
                     self.payloads_answered = self.payloads_answered.saturating_add(1);
                 }
@@ -2302,6 +2575,14 @@ impl Follower {
             return Vec::new();
         }
         if self.payloads.contains_key(&command) {
+            if self.awaits_rebind(&command)
+                && self
+                    .held
+                    .get(&command)
+                    .is_some_and(|h| h.proposal.admission == payload.admission_digest())
+            {
+                return self.rebind(command, payload);
+            }
             return Vec::new();
         }
         // The admission travels with the payload, so a replica that
@@ -2349,6 +2630,49 @@ impl Follower {
             base: None,
             updates: alloc::vec![payload_update(&command, &payload).expect("bounded")],
         })]
+    }
+
+    /// Bind the leader's payload in place of the one this replica took
+    /// first under other attested facts, then adopt (task-d09; see
+    /// `awaits_rebind`).
+    ///
+    /// Nothing was accepted over the record, so what is replaced is this
+    /// replica's local order and a fast acknowledgement no quorum counts:
+    /// every learning predicate needs the leader's proposal, whose facts
+    /// differ. The payload and dependency rows are written again under
+    /// the new facts in one batch, so a restart restores the record as
+    /// rebound. The old payload is no longer served; the new one is once
+    /// its batch is durable. The vote set is started again from the
+    /// proposal, as it may have bound the other facts from this replica's
+    /// own acknowledgement or a peer's.
+    fn rebind(&mut self, command: CommandId, payload: PayloadRecordV1) -> Vec<Effect> {
+        if self.boot.is_none() || !self.table.rebind(&command, payload.admission_digest()) {
+            return Vec::new();
+        }
+        self.bindings.insert(payload.retry_key, command);
+        self.payloads.insert(command, payload.clone());
+        self.served_payloads.remove(&command);
+        if let Some(held) = self.held.get(&command) {
+            let mut set = VoteSet::new(self.config.quorum.clone(), command);
+            let _ = set.add(Vote::Fast(held.proposal.clone()));
+            self.votes.insert(command, set);
+        }
+        let epoch = self.config.identity.epoch;
+        let record = self.table.record(&command).expect("rebound").clone();
+        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let mut effects = alloc::vec![Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates: alloc::vec![
+                payload_update(&command, &payload).expect("bounded"),
+                dependency_update(epoch, &command, &record).expect("bounded"),
+            ],
+        })];
+        self.pending.insert(barrier, Pending::Vote(command));
+        self.ledger.stage(barrier, command, record);
+        self.durable_payloads.insert(barrier, command);
+        effects.extend(self.advance_pending());
+        effects
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {

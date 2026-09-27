@@ -33,6 +33,14 @@ pub type PathAnchors = Vec<(Vec<u8>, Digest32)>;
 /// flood: a request for more than this is answered with this many.
 pub const MAX_PAYLOAD_TRANSFER: usize = 8;
 
+/// How many commands one [`ProtocolMessage::ProposalRequest`] names,
+/// and how many proposals the leader answers one with (task-d09).
+///
+/// Bounded for the reason [`MAX_PAYLOAD_TRANSFER`] is: the ask repeats
+/// with every commit frontier, and the answers share the lane with the
+/// proposals and acknowledgements the domain is waiting for.
+pub const MAX_PROPOSAL_ASK: usize = 16;
+
 /// Whether an encoded protocol message is payload transfer.
 ///
 /// Payload transfer is bulk. A replica catching up moves whole command
@@ -141,6 +149,41 @@ pub enum ProtocolMessage {
         /// Sealing replica.
         replica: ReplicaId,
     },
+    /// The leader's commit frontier (task-d09): every proposal of
+    /// `ballot` with a sequence number up to `through` is committed at
+    /// the leader, and its batch is durable there.
+    ///
+    /// A follower otherwise learns a command only from acknowledgements
+    /// it receives itself, each published once on a lane that drops
+    /// frames. One missed quorum left it at ACCEPT on that command, and
+    /// with the chain total on everything after it, for good. With this
+    /// it commits what it adopted from the leader of `ballot` up to the
+    /// frontier. The leader publishes it again on its re-send timer, so a
+    /// lost frame is repaired by the next one.
+    Committed {
+        /// The ballot the sequence numbers are in; its leader is the
+        /// sender.
+        ballot: Ballot,
+        /// Highest sequence number of the committed prefix.
+        through: u64,
+    },
+    /// A follower asks the leader of `ballot` for its proposals of
+    /// commands the follower adopted without knowing their sequence
+    /// number in that ballot (task-d09).
+    ///
+    /// An adoption restored from the rows after a restart carries no
+    /// sequence number (a ballot numbers from zero, and the row names no
+    /// ballot), so the commit frontier cannot commit it. The leader
+    /// counted its acknowledgement before the restart and never re-sends
+    /// it. Answered with the leader's durable proposals of the ballot,
+    /// which the follower adopts again with their sequence numbers; a
+    /// command the leader did not propose in the ballot is not answered.
+    ProposalRequest {
+        /// The ballot whose proposals are asked for.
+        ballot: Ballot,
+        /// Commands; at most [`MAX_PROPOSAL_ASK`] are answered.
+        commands: Vec<CommandId>,
+    },
 }
 
 impl ProtocolMessage {
@@ -169,6 +212,8 @@ impl ProtocolMessage {
             | ProtocolMessage::PayloadRequest { .. }
             | ProtocolMessage::SealRequest { .. }
             | ProtocolMessage::Sealed { .. }
+            | ProtocolMessage::Committed { .. }
+            | ProtocolMessage::ProposalRequest { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }

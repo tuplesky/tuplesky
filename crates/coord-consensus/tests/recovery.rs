@@ -794,14 +794,24 @@ fn a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask() {
     assert_eq!(current.len(), b.len());
 
     // A's answers arrive late. They are taken -- the payloads are no
-    // longer missing -- and they do not answer B.
+    // longer missing -- and they do not answer B, except for a command B
+    // asked for as well: the one whose turn has come leads every ask
+    // until its payload arrives (task-d09), and its late answer is an
+    // answer to B too.
+    let both = late
+        .iter()
+        .filter(|m| {
+            matches!(m, ProtocolMessage::PayloadResponse { command, .. } if b.contains(command))
+        })
+        .count() as u64;
+    assert!(both <= 1, "{both} commands in both asks");
     for m in &late {
         f.step(peer(0, m.clone()));
     }
     assert_eq!(f.missing_payloads().len(), wanted - bound);
     assert_eq!(
         f.payloads_answered(),
-        0,
+        both,
         "late answers to a superseded ask counted as answering the current one"
     );
 
