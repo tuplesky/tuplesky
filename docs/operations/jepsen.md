@@ -766,6 +766,18 @@ acceptance of an earlier ballot.
   `:valid? true`, with 2103 `ok` of 2760. Every node served its final
   read, and no voter logged a stop, a release mismatch,
   `IncompatibleAccepted`, `Behind` or a recovery error.
+* **Jepsen again on the same code** (`2bbf636`, docs only;
+  [run 36293271969](https://github.com/tuplesky/tuplesky/actions/runs/36293271969)):
+  **`:valid? false`**. Elle found G-single-item, G0-realtime and
+  incompatible orders on keys 35 and 37. `n2` was restarted at
+  04:10:40 with `executed=859`, far behind the other voters. From
+  04:11:03 to 04:11:08, requests through `n2` were answered from a
+  history of key 35 that started empty. Seven appends through `n2`
+  (147 to 187) were acknowledged as `ok`, and reads through `n2` showed
+  them. At 04:11:08.857 reads through `n2` showed the main history
+  again, and no later read on any node contains those appends: they
+  were acknowledged and lost. Key 37 shows the same. No voter logged a
+  stop or a release mismatch.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
