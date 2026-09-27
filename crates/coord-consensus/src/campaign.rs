@@ -130,15 +130,47 @@ impl Campaign {
     /// Run the selection once a majority of complete reports is present.
     /// `Ok(None)` means not yet; an error stops the campaign with the
     /// evidence.
+    ///
+    /// A report holding an acceptance whose payload no report has is set
+    /// aside while a majority remains without it (task-d12). Such a
+    /// reporter is typically far behind: it installed a Sync naming a
+    /// command the others executed and retired since, payload and all,
+    /// and which they therefore leave out of their reports. Nobody can
+    /// supply that payload any more, so every selection that included the
+    /// report failed as [`RecoveryError::HalfInitialized`], and so did
+    /// every campaign whose first majority included that voter. Any
+    /// majority of promises is a sound basis for the selection -- it is
+    /// the set the candidate would have had if that report had arrived
+    /// later -- so leaving one out needs no judgement about the reporter.
+    /// The candidate's own report is never set aside: its own state is
+    /// what it goes on to lead from. When no majority remains, the
+    /// campaign waits for the voters that have not reported, and fails
+    /// only once every voter has.
     pub fn try_select(&mut self) -> Result<Option<&SyncDecision>, RecoveryError> {
         if self.decision.is_some() {
             return Ok(self.decision.as_ref());
         }
-        let reports = self.reports();
+        let mut reports = self.reports();
         if reports.len() < self.config.slow_size() {
             return Ok(None);
         }
-        let decision = select(&self.config, &reports)?;
+        let everyone = reports.len() >= self.config.voters().len();
+        let decision = loop {
+            match select(&self.config, &reports) {
+                Ok(decision) => break decision,
+                Err(RecoveryError::HalfInitialized { replica, command }) => {
+                    if replica != self.config.leader() && reports.len() > self.config.slow_size() {
+                        reports.retain(|r| r.replica != replica);
+                        continue;
+                    }
+                    if everyone {
+                        return Err(RecoveryError::HalfInitialized { replica, command });
+                    }
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        };
         self.decision = Some(decision);
         Ok(self.decision.as_ref())
     }

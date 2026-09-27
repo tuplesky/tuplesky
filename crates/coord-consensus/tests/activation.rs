@@ -1962,6 +1962,75 @@ fn one_reporter_without_a_payload_does_not_stop_a_recoverable_campaign() {
     ));
 }
 
+#[test]
+fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
+    // Five voters. r4 fell far behind and installed a Sync naming x, whose
+    // payload never reached it; the others executed x and retired it, so
+    // their reports leave it out and nobody can supply the payload. Every
+    // campaign whose majority included r4's report failed as
+    // `HalfInitialized` (the five-node Jepsen stalls on #98). A majority
+    // without that report is as sound a basis as any other.
+    let voters: BTreeSet<ReplicaId> = (0..5).map(r).collect();
+    let config = BallotConfiguration::c2_default(epoch(), ballot(3, 0), voters).unwrap();
+    let x = CommandId(Digest32([0x78; 32]));
+    let dead = coord_consensus::ReportEntry {
+        command: x,
+        phase: Phase::Accept,
+        deps: vec![],
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        keys: Vec::new(),
+        payload_present: false,
+    };
+    let report = |replica, entries| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(2, 1),
+        entries,
+    };
+    let deliver = |c: &mut coord_consensus::Campaign, rep: &RecoveryReport| {
+        c.promise(rep.replica);
+        for page in coord_consensus::paginate(rep, 64) {
+            c.page(page).unwrap();
+        }
+    };
+
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(0), vec![]));
+    deliver(&mut c, &report(r(4), vec![dead.clone()]));
+    deliver(&mut c, &report(r(1), vec![]));
+    assert_eq!(
+        c.try_select(),
+        Ok(None),
+        "no majority without r4 yet: wait for the others rather than fail"
+    );
+    deliver(&mut c, &report(r(2), vec![]));
+    let decision = c
+        .try_select()
+        .expect("selected without r4's report")
+        .expect("a majority without r4");
+    assert!(
+        !decision.entries.contains_key(&x) && !decision.reproposed.contains(&x),
+        "nothing is selected that nobody can supply"
+    );
+
+    // The candidate's own report is never set aside: it waits while a
+    // voter has not reported, and fails once every voter has.
+    let mut own = coord_consensus::Campaign::new(config.clone());
+    own.own_report(report(r(0), vec![dead]));
+    for i in 1..4 {
+        deliver(&mut own, &report(r(i), vec![]));
+    }
+    assert_eq!(own.try_select(), Ok(None));
+    deliver(&mut own, &report(r(4), vec![]));
+    assert!(matches!(
+        own.try_select(),
+        Err(RecoveryError::HalfInitialized { replica, command })
+            if replica == r(0) && command == x
+    ));
+}
+
 /// A Sync leaves no acceptance of an earlier ballot that it does not carry
 /// (task-d11).
 ///

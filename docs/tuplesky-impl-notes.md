@@ -4961,6 +4961,42 @@ Without the adoption gate c2 reaches COMMIT. The payload gate alone is not
 separated by this test: with the adoption gate in place, c2's own fast
 vote did not complete a fast quorum here.
 
+### A report nobody can supply
+
+The five-node Jepsen runs stalled for good in 3 of 8 runs since this was
+carried (1 of 3 with the promise fence): every campaign, up to ballot 25,
+was refused by the candidate's own machine as `Campaign(HalfInitialized)`,
+naming a far-behind voter (one had last recovered at `executed=762`
+against 2360 on the others). `select` fails that way when a report holds
+a command at ACCEPT or beyond and no report has its payload. A voter far
+behind can hold exactly that for good: it installed a Sync naming a
+command whose payload had not reached it, and by the time it asked, every
+voter that had the command had executed and retired it, payload and all,
+and left it out of its reports. The command is decided and executed; the
+candidate just cannot tell, and every campaign whose majority included
+that report failed the same way.
+
+`Campaign::try_select` sets such a report aside while a majority of
+reports remains without it. Any majority of promises is a sound basis
+for the selection: it is the set the candidate would have had if that
+report had arrived later, so no judgement about the reporter is needed,
+and nothing is decided twice. The candidate's own report is never set
+aside, since its own state is what it goes on to lead from; with no
+majority left, the campaign waits for the voters that have not reported
+and fails only once every voter has. The voter set aside stays where it
+is, unable to execute the command; the domain serves around it, and
+catch-up (task-d08, task-d10) is what brings it back.
+
+`activation.rs`
+`a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has`:
+five voters, one reporting a payload-less acceptance nobody else holds.
+With three reports the campaign waits instead of failing, with four it
+selects without that report and without the command, and a candidate
+whose own report holds it waits and then fails once all five reported.
+Without the change, the first step fails as `HalfInitialized`. The store
+artifacts of the stalled runs were not reachable, so the cause is
+inferred from the logs and the code, not read from a store.
+
 ### What is left
 
 - No reporter holding the decision at all, every voter that had it having
@@ -4968,6 +5004,9 @@ vote did not complete a fast quorum here.
   candidate is behind by definition; task-d10's rule catches it (a report
   carries its executed position, and a candidate more than a window
   behind the source reporters steps aside). Recorded there, not built.
+- A voter set aside for an acceptance nobody can supply cannot execute
+  past it. The domain serves around it; catch-up (task-d08, task-d10)
+  brings it back.
 - A node stopped on a divergence serves again from its store after a
   restart. task-d13 keeps it stopped until an operator clears it or
   catch-up rebuilds it; planned behind task-d08.
