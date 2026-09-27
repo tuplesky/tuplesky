@@ -14,6 +14,9 @@ restart it), `random` (kill any voter, then restart it), `pause` (SIGSTOP
 a voter for eight seconds), all one voter at a time so a majority is
 always up; and `majority` (kill the leader and one other voter at once,
 restart both five seconds later), which takes the quorum away.
+`--faults 2,1` replaces the random choice with a fixed sequence of voters
+to kill and restart, one per interval, and then no more faults: a run
+that went wrong can be replayed on purpose.
 
 The checks are the ones a list-append history can be held to without a
 full Elle run:
@@ -56,10 +59,15 @@ def parse():
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--interval", type=float, default=20, help="seconds between faults")
     p.add_argument("--recovery", type=float, default=45, help="seconds to wait before the final read")
+    p.add_argument("--faults", type=lambda v: [int(x) for x in v.split(",")],
+                   help="kill and restart these voters in order (e.g. 2,1), then stop faulting; "
+                        "only with --fault random")
     return p.parse_args()
 
 
 A = parse()
+if A.faults is not None and (A.fault != "random" or not all(1 <= n <= 3 for n in A.faults)):
+    sys.exit("--faults takes voters 1 to 3, with --fault random")
 RUN = os.path.abspath(A.run)
 COORDD = os.path.join(A.bin, "coordd")
 SHIM = os.path.join(A.bin, "coord-jepsen")
@@ -190,7 +198,12 @@ def nemesis():
             log(f"restarted voters {pair}")
             stop.wait(A.interval)
             continue
-        n = leader() if A.fault == "leader" else random.randint(1, 3)
+        if A.faults is not None:
+            if not A.faults:
+                break
+            n = A.faults.pop(0)
+        else:
+            n = leader() if A.fault == "leader" else random.randint(1, 3)
         if daemons[n].poll() is not None:
             log(f"voter {n} is not running (exit {daemons[n].returncode}); restarting it")
             start(n)
