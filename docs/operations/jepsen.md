@@ -695,6 +695,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `d7827de` (with #104's election commits and `f7af332`) | 6 | none | none |
 | `b3ea1f6` (#105 at `076d218`) | 6 | none | none |
 | `4ef1113` (#106 at `2c8efea`) | 6 | 1 (three voters) | none |
+| `82e222b` (#106 at `0d31e75`) | 6 | 2 | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -822,6 +823,24 @@ already given stops the node.
   `f4244a00`: a report held it at ACCEPT or beyond without its payload.
   It had not appeared in any earlier Jepsen run. It showed 5 times in
   one of the six stress runs, and twice in one `7f62f17` run.
+
+`82e222b` carries #106 at `0d31e75`: a commit below the source ballot is
+a decision.
+* **Jepsen**
+  ([run 36303299737](https://github.com/tuplesky/tuplesky/actions/runs/36303299737)):
+  `:valid? true`, with 1235 `ok` of 1619. Every node served its final
+  read, and no voter logged a stop, `HalfInitialized`,
+  `IncompatibleAccepted` or `Behind`.
+* **Stress:** six random-kill runs, no anomaly. Two runs stopped voters
+  on `release-record-mismatch`, and one logged `IncompatibleAccepted`
+  twice, after a leader's restart.
+* **A replay.** `--faults 2,1` kills and restarts voter 2, then kills
+  voter 1, the ballot-0 leader, 20 s later. In 4 of 6 runs, voter 3
+  stopped on `release-record-mismatch` while following ballot 1.
+  * Voter 2 led ballot 1 every time. It had restarted with 325 to 380
+    commands executed, while voter 1 was at 658 to 751.
+  * Voter 3 had not restarted before its stop.
+  * No run had a history anomaly.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
