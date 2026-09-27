@@ -693,6 +693,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `8ad8e4f` (#103 through `334b098`) | 6 | none | none |
 | `7f62f17` (with #103's rebind, #100's recovery read, `b3f56e3`) | 6 | 1 | none |
 | `d7827de` (with #104's election commits and `f7af332`) | 6 | none | none |
+| `b3ea1f6` (#105 at `076d218`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -778,6 +779,24 @@ acceptance of an earlier ballot.
   again, and no later read on any node contains those appends: they
   were acknowledged and lost. Key 37 shows the same. No voter logged a
   stop or a release mismatch.
+
+`b3ea1f6` carries #105's head, `076d218`: a demoted record is no
+fast-path evidence.
+* **Stress:** six random-kill runs had no stop and no anomaly, and
+  reached ballots 1 to 16.
+* **`IncompatibleAccepted` still fires,** which #105 should end.
+  It fired on one voter in each of two runs, 4 and 8 times. It also
+  fired 8 times in one `d7827de` run.
+  * In all three cases the voter had just restarted.
+  * Each campaign after that failed on the same command, whose two
+    acceptances named different single dependencies.
+  * Two of the three voters had just refused an older ballot's Sync
+    (`SyncRejected`).
+* **Jepsen**
+  ([run 36295508306](https://github.com/tuplesky/tuplesky/actions/runs/36295508306)):
+  `:valid? true`, with 1418 `ok` of 1873. Every node served its final
+  read, and no voter logged a stop, a release mismatch,
+  `IncompatibleAccepted`, `Behind` or a recovery error.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
