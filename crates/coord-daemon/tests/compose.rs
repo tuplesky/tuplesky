@@ -996,6 +996,7 @@ fn the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame() {
                     path: Digest32([0xff; 32]),
                     paths: vec![(b"*".to_vec(), Digest32([0xff; 32]))],
                     seqnum: u64::MAX,
+                    admission: None,
                 },
             )
         })

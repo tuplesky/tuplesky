@@ -63,6 +63,11 @@ pub struct ReportEntry {
     pub keys: Vec<Vec<u8>>,
     /// Whether the payload is durably known (a placeholder is not).
     pub payload_present: bool,
+    /// The admission digest the reporter holds the command under: its
+    /// record's, or, for a selected entry whose payload has not arrived,
+    /// the one its Sync named (task-d14). `None` only for a Sync entry
+    /// that named none.
+    pub admission: Option<Digest32>,
 }
 
 /// A replica's report for a new ballot (`MNewLeaderAckN`).
@@ -97,6 +102,17 @@ pub struct SyncEntry {
     pub paths: Vec<(Vec<u8>, Digest32)>,
     /// Leader sequence number the per-key digests were synchronized at.
     pub seqnum: u64,
+    /// The admission digest the command was accepted under (task-d14).
+    ///
+    /// One command is one set of attested facts: a vote under another
+    /// digest than the ones counted is refused, so a decision has one.
+    /// Each presentation of a request mints its own receipt, though, and
+    /// a voter may hold the command under a presentation other than the
+    /// one a quorum accepted. The selection names the accepted one, so
+    /// the candidate re-proposes under it and every voter installs and
+    /// executes under it. `None` when no reporter named any, which only
+    /// a Sync entry without a digest can cause.
+    pub admission: Option<Digest32>,
 }
 
 /// The selected recovery result (`MSync`).
@@ -159,6 +175,17 @@ pub enum RecoveryError {
         /// The other's.
         second: Vec<CommandId>,
     },
+    /// Two eligible accepted (or committed) candidates name different
+    /// admission facts for one command: a second decision, never merged
+    /// (task-d14).
+    IncompatibleAdmission {
+        /// Command.
+        command: CommandId,
+        /// One candidate's admission digest.
+        first: Digest32,
+        /// The other's.
+        second: Digest32,
+    },
 }
 
 /// Select the Sync result from `reports` for the ballot of `config`.
@@ -166,7 +193,7 @@ pub fn select(
     config: &BallotConfiguration,
     reports: &[RecoveryReport],
 ) -> Result<SyncDecision, RecoveryError> {
-    select_with(config, reports, |_| false)
+    select_with(config, reports, |_, _| false)
 }
 
 /// [`select`], where `supplied` names the commands the candidate can
@@ -177,10 +204,14 @@ pub fn select(
 /// candidate that executed it knows it was decided; the selection carries
 /// it, and the candidate marks it committed before binding
 /// ([`crate::Campaign::commit_executed`]).
+///
+/// `supplied` is asked with the admission digest the reporters name for
+/// the command, if any: a payload held under other facts supplies nothing
+/// the selection can install (task-d14).
 pub fn select_with(
     config: &BallotConfiguration,
     reports: &[RecoveryReport],
-    supplied: impl Fn(&CommandId) -> bool,
+    supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
 ) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
@@ -207,14 +238,46 @@ pub fn select_with(
     // omitting the entry would lose the selected command.
     let mut accepted_somewhere: BTreeSet<CommandId> = BTreeSet::new();
     let mut with_payload: BTreeSet<CommandId> = BTreeSet::new();
-    for r in reports {
+    // The facts the selection will name for a command come from the
+    // copies it selects from: an acceptance at the source ballot, or a
+    // commit at any. An acceptance below the source is re-proposed and
+    // names nothing (task-d14).
+    let source = reports
+        .iter()
+        .map(|r| r.committed_ballot)
+        .max_by(|a, b| a.compare_same_epoch(b).expect("same epoch"));
+    let mut named: BTreeMap<CommandId, Digest32> = BTreeMap::new();
+    let mut by_replica: Vec<&RecoveryReport> = reports.iter().collect();
+    by_replica.sort_by_key(|r| r.replica);
+    for r in &by_replica {
         for e in &r.entries {
             if e.phase >= Phase::Accept {
                 accepted_somewhere.insert(e.command);
-                if e.payload_present || supplied(&e.command) {
-                    with_payload.insert(e.command);
+                let eligible = e.phase >= Phase::Commit || Some(r.committed_ballot) == source;
+                if eligible && let Some(d) = e.admission {
+                    named.entry(e.command).or_insert(d);
                 }
             }
+        }
+    }
+    // A payload supplies the command only under the facts the reporters
+    // name for it: one under other facts is another presentation, and
+    // fetching it would not let the candidate bind (task-d14).
+    for r in &by_replica {
+        for e in &r.entries {
+            if e.phase >= Phase::Accept
+                && e.payload_present
+                && named
+                    .get(&e.command)
+                    .is_none_or(|d| e.admission == Some(*d))
+            {
+                with_payload.insert(e.command);
+            }
+        }
+    }
+    for c in &accepted_somewhere {
+        if !with_payload.contains(c) && supplied(c, named.get(c).copied()) {
+            with_payload.insert(*c);
         }
     }
     if let Some(command) = accepted_somewhere.difference(&with_payload).next() {
@@ -283,6 +346,7 @@ pub fn select_with(
                             path: e.path,
                             paths: e.paths.clone(),
                             seqnum: e.seqnum,
+                            admission: e.admission,
                         },
                     );
                 }
@@ -293,6 +357,17 @@ pub fn select_with(
                             first: existing.deps.clone(),
                             second: e.deps.clone(),
                         });
+                    }
+                    match (existing.admission, e.admission) {
+                        (Some(first), Some(second)) if first != second => {
+                            return Err(RecoveryError::IncompatibleAdmission {
+                                command: e.command,
+                                first,
+                                second,
+                            });
+                        }
+                        (None, Some(named)) => existing.admission = Some(named),
+                        _ => {}
                     }
                     if phase > existing.phase {
                         existing.phase = phase;
@@ -397,8 +472,14 @@ fn possible_fast_decisions(
             continue;
         }
         let agreed = fast_reporters.iter().all(|r| {
+            // A fast decision counted one digest (task-d14): members
+            // holding the command under different facts never decided it
+            // together.
             record(r, &e.command).is_some_and(|o| {
-                o.phase == Phase::PreAccept && o.path == e.path && o.payload_present
+                o.phase == Phase::PreAccept
+                    && o.path == e.path
+                    && o.payload_present
+                    && o.admission == e.admission
             })
         });
         if agreed {
@@ -453,6 +534,7 @@ fn possible_fast_decisions(
                 path: e.path,
                 paths: e.paths,
                 seqnum: e.seqnum,
+                admission: e.admission,
             },
         );
     }
