@@ -419,11 +419,15 @@ impl CommandTable {
     /// acknowledgement under the other facts is one no quorum counts:
     /// every learning predicate needs the leader's proposal, and a vote
     /// set counts nothing under other facts than the ones it bound.
-    /// Past PRE-ACCEPT the record's facts are what it acknowledged, and
-    /// nothing is rebound. Returns whether the record was rebound.
+    /// At ACCEPT the record's facts are what it acknowledged, but an
+    /// acknowledgement is not a decision: a selection that names other
+    /// facts for the command rebinds it too, since a decision has one
+    /// digest and the selection names it (task-d14). A committed or
+    /// executed record is never rebound. Returns whether the record was
+    /// rebound.
     pub fn rebind(&mut self, command: &CommandId, payload: Digest32) -> bool {
         match self.records.get_mut(command) {
-            Some(record) if record.payload.is_some() && record.phase == Phase::PreAccept => {
+            Some(record) if record.payload.is_some() && record.phase <= Phase::Accept => {
                 record.payload = Some(payload);
                 true
             }

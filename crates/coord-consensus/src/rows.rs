@@ -366,33 +366,11 @@ pub fn sync_key(epoch: ConfigurationEpoch, ballot: &Ballot) -> Vec<u8> {
 }
 
 /// Schema version of the Sync row. Version 1 carried no path evidence in
-/// its entries; version 2 (task-28) carries the combined digest, the
+/// its entries; version 2 (task-28) added the combined digest, the
 /// per-key digests and the leader sequence number they were synchronized
-/// at, so the layout changed and the version had to change with it.
-pub const SYNC_SCHEMA_VERSION: u16 = 2;
-
-/// A version 1 Sync entry: dependencies only, no path evidence.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncEntryV1 {
-    command: CommandId,
-    phase: crate::phase::Phase,
-    deps: Vec<CommandId>,
-}
-
-/// A version 1 Sync decision.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncDecisionV1 {
-    ballot: Ballot,
-    source_ballot: Ballot,
-    entries: alloc::collections::BTreeMap<CommandId, SyncEntryV1>,
-    reproposed: alloc::collections::BTreeSet<CommandId>,
-}
-
-/// A version 1 Sync row.
-#[derive(Clone, Debug, Deserialize)]
-struct SyncRecordV1Legacy {
-    decision: SyncDecisionV1,
-}
+/// at; version 3 (task-d14) adds the admission digest each entry was
+/// accepted under.
+pub const SYNC_SCHEMA_VERSION: u16 = 3;
 
 /// The durable seal of one replica on one configuration (design
 /// Section 10.3.2).
@@ -451,43 +429,22 @@ pub fn encode_sync(record: &SyncRecordV1) -> Result<Vec<u8>, EngineError> {
     envelope_at(SYNC_KIND, SYNC_SCHEMA_VERSION, record, "sync encode")
 }
 
-/// Decode a Sync row, including one written by a revision that stored the
-/// version 1 layout. A version 1 selection is read back with empty path
-/// evidence, which is what that revision knew: the dependencies it bound
-/// are preserved exactly, and the replica realigns nothing it has no
-/// evidence for. Any other version is refused rather than misread.
+/// Decode a Sync row.
+///
+/// Only the current layout is read. A row of an earlier version names no
+/// admission facts, and reading it as a selection without them would let
+/// the replica install and execute its entries under whichever facts it
+/// happens to hold, which is the divergence version 3 exists to prevent
+/// (task-d14). It is refused as corrupt, loudly, and the store has to be
+/// started fresh.
 pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
     let (version, payload) = open(SYNC_KIND, bytes, "sync record")?;
     match version {
         SYNC_SCHEMA_VERSION => decode_exact(&payload, "sync record"),
-        1 => {
-            let legacy: SyncRecordV1Legacy = decode_exact(&payload, "sync record")?;
-            Ok(SyncRecordV1 {
-                decision: SyncDecision {
-                    ballot: legacy.decision.ballot,
-                    source_ballot: legacy.decision.source_ballot,
-                    entries: legacy
-                        .decision
-                        .entries
-                        .into_iter()
-                        .map(|(c, e)| {
-                            (
-                                c,
-                                crate::recovery::SyncEntry {
-                                    command: e.command,
-                                    phase: e.phase,
-                                    deps: e.deps,
-                                    path: crate::graph::empty_path(),
-                                    paths: Vec::new(),
-                                    seqnum: 0,
-                                },
-                            )
-                        })
-                        .collect(),
-                    reproposed: legacy.decision.reproposed,
-                },
-            })
-        }
+        1 | 2 => Err(EngineError::new(
+            ErrorClass::Corrupt,
+            "sync record of a layout without admission facts (before task-d14)",
+        )),
         _ => Err(EngineError::new(
             ErrorClass::Corrupt,
             "sync record of an unsupported schema version",

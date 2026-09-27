@@ -30,6 +30,7 @@ use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch};
 use coord_core::event::{Event, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
+use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ExecutionPosition, LocalJournalSeq, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{MessageV1, decode_stream};
 use coord_types::{CommandId, RetryKey};
@@ -193,6 +194,18 @@ pub enum FollowerRejection {
         /// The position it has to reach first.
         needed: ExecutionPosition,
     },
+    /// A Sync names other admission facts for a command this replica
+    /// committed or executed: two decisions of one command (task-d14).
+    /// The entry is not installed, and this replica stops voting and
+    /// executing, as a selection stops on `IncompatibleAccepted`.
+    IncompatibleAdmission {
+        /// Command.
+        command: CommandId,
+        /// The digest this replica holds it under.
+        held: Digest32,
+        /// The digest the Sync named.
+        selected: Digest32,
+    },
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -311,6 +324,14 @@ pub struct Follower {
     behind_voters: Option<ExecutionPosition>,
     report_due: Option<ReportDue>,
     sync_pending: BTreeMap<CommandId, SyncEntry>,
+    /// The admission digest the synchronized selection named for each of
+    /// its entries (task-d14). Kept past installation: a payload that
+    /// arrives for an entry installed over a placeholder has to be the
+    /// one under these facts. Replaced with each Sync.
+    named_facts: BTreeMap<CommandId, Digest32>,
+    /// A command a Sync named other facts for than this replica committed
+    /// or executed it under (task-d14): it votes and executes nothing more.
+    halted: Option<CommandId>,
     /// The Sync whose synchronized-ballot row is in flight: the new ballot
     /// is activated only when that row is durable.
     sync_barrier: Option<(BarrierId, SyncDecision)>,
@@ -454,6 +475,8 @@ impl Follower {
             behind_voters: None,
             report_due: None,
             sync_pending: BTreeMap::new(),
+            named_facts: BTreeMap::new(),
+            halted: None,
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
@@ -472,6 +495,7 @@ impl Follower {
         let Some(decision) = self.resumed.take() else {
             return self;
         };
+        self.named_facts = named_facts(&decision);
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
                 let _ = self.table.expect(*c);
@@ -576,6 +600,8 @@ impl Follower {
             // would stall a candidate that needs this replica's majority.
             report_due: state.report_due,
             sync_pending: BTreeMap::new(),
+            named_facts: BTreeMap::new(),
+            halted: None,
             sync_barrier: None,
             sync_demoted: Vec::new(),
             won: None,
@@ -785,7 +811,17 @@ impl Follower {
         };
         if campaign.decision().is_none() {
             let table = &self.table;
-            match campaign.try_select(|c| table.phase_of(c).is_some()) {
+            // A payload under other facts than the ones the reporters
+            // name supplies nothing the selection can bind: it is fetched
+            // like a missing one (task-d14).
+            let supplied = |c: &CommandId, named: Option<Digest32>| match named {
+                Some(d) => {
+                    table.phase_of(c) == Some(Phase::Executed)
+                        || table.record(c).and_then(|r| r.payload) == Some(d)
+                }
+                None => table.phase_of(c).is_some(),
+            };
+            match campaign.try_select(supplied) {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
@@ -806,6 +842,19 @@ impl Follower {
             if let Some(missing) = Self::selection_gap(&self.table, &decision) {
                 self.rejections.push(FollowerRejection::Behind { missing });
                 self.behind = Some(missing);
+                self.campaign = None;
+                return Vec::new();
+            }
+            if let Some((command, held, selected)) =
+                Self::admission_conflict(&self.table, &self.payloads, &decision)
+            {
+                self.rejections.push(FollowerRejection::Campaign(
+                    RecoveryError::IncompatibleAdmission {
+                        command,
+                        first: selected,
+                        second: held,
+                    },
+                ));
                 self.campaign = None;
                 return Vec::new();
             }
@@ -1055,6 +1104,7 @@ impl Follower {
         self.held.clear();
         self.adopted.clear();
         self.leader_committed = None;
+        self.named_facts = named_facts(&decision);
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
                 let _ = self.table.expect(*c);
@@ -1076,6 +1126,7 @@ impl Follower {
                 .iter()
                 .filter(|(c, e)| {
                     self.table.phase_of(c).is_some()
+                        && !self.awaits_selected_facts(c)
                         && crate::phase::guard_accept(&e.deps, |d| self.table.phase_of(d)).is_ok()
                 })
                 .map(|(c, _)| *c)
@@ -1097,6 +1148,43 @@ impl Follower {
                     // executed, was killed and came back as a follower
                     // receives exactly these entries in the next leader's
                     // Sync, and installing them was a panic.
+                    //
+                    // Its payload row, where it is still kept, is what it
+                    // was executed under: other facts in the selection are
+                    // a second decision, as for a record (task-d14).
+                    if let (Some(selected), Some(held)) = (
+                        entry.admission,
+                        self.payloads
+                            .get(&command)
+                            .map(PayloadRecordV1::admission_digest),
+                    ) && held != selected
+                    {
+                        self.rejections
+                            .push(FollowerRejection::IncompatibleAdmission {
+                                command,
+                                held,
+                                selected,
+                            });
+                        self.halted = Some(command);
+                    }
+                    continue;
+                }
+                // Committed or executed here under other facts than the
+                // selection names: a second decision of one command, which
+                // no rebinding may paper over (task-d14). Only a record
+                // below COMMIT is rebound (`awaits_selected_facts`).
+                if let (Some(selected), Some(held)) = (
+                    entry.admission,
+                    self.table.record(&command).and_then(|r| r.payload),
+                ) && held != selected
+                {
+                    self.rejections
+                        .push(FollowerRejection::IncompatibleAdmission {
+                            command,
+                            held,
+                            selected,
+                        });
+                    self.halted = Some(command);
                     continue;
                 }
                 // Installing the selection means installing its whole
@@ -1146,6 +1234,9 @@ impl Follower {
 
     /// The next command to execute through the materializer, if any.
     pub fn next_executable(&self) -> Option<CommandId> {
+        if self.halted.is_some() {
+            return None;
+        }
         self.learner
             .next_executable(&self.table, |c| self.adopted.get(c).map(|(s, _)| *s))
     }
@@ -1205,6 +1296,9 @@ impl Follower {
                 // entry can rely on.
                 keys: entry.paths.iter().map(|(k, _)| k.clone()).collect(),
                 payload_present: false,
+                // The facts the selection named: the payload that arrives
+                // has to be the one under them (task-d14).
+                admission: entry.admission,
             });
         }
         // History is left out: a command this replica executed and keeps
@@ -1234,6 +1328,12 @@ impl Follower {
             .filter(|c| !self.payloads.contains_key(c))
             .copied()
             .chain(self.held.keys().filter(|c| self.awaits_rebind(c)).copied())
+            .chain(
+                self.sync_pending
+                    .keys()
+                    .filter(|c| self.awaits_selected_facts(c))
+                    .copied(),
+            )
             .chain(self.campaign_missing())
             .collect();
         out.sort();
@@ -1250,7 +1350,42 @@ impl Follower {
             .chain(decision.reproposed.iter())
             .filter(|c| table.phase_of(c).is_none())
             .copied()
+            // Held below COMMIT under other facts than the selection
+            // names: the payload under the named ones is fetched and the
+            // record rebound before binding, so the re-proposal carries
+            // the facts a quorum accepted (task-d14).
+            .chain(decision.entries.values().filter_map(|e| {
+                let selected = e.admission?;
+                let r = table.record(&e.command)?;
+                (r.phase < Phase::Commit && r.payload.is_some_and(|p| p != selected))
+                    .then_some(e.command)
+            }))
             .collect()
+    }
+
+    /// A selected entry this replica committed or executed under other
+    /// facts than the selection names (task-d14): two decisions of one
+    /// command, as `(command, held, selected)`.
+    ///
+    /// A command executed and retired here has no record left; its
+    /// payload row, where it is still kept, is what it was executed under.
+    fn admission_conflict(
+        table: &CommandTable,
+        payloads: &BTreeMap<CommandId, PayloadRecordV1>,
+        decision: &SyncDecision,
+    ) -> Option<(CommandId, Digest32, Digest32)> {
+        decision.entries.values().find_map(|e| {
+            let selected = e.admission?;
+            let held = match table.record(&e.command) {
+                Some(r) if r.phase >= Phase::Commit => r.payload?,
+                Some(_) => return None,
+                None if table.phase_of(&e.command) == Some(Phase::Executed) => {
+                    payloads.get(&e.command)?.admission_digest()
+                }
+                None => return None,
+            };
+            (held != selected).then_some((e.command, held, selected))
+        })
     }
 
     /// A dependency of a selected entry that the selection does not carry
@@ -1553,9 +1688,35 @@ impl Follower {
     fn awaits_rebind(&self, command: &CommandId) -> bool {
         self.held.get(command).is_some_and(|h| {
             self.table.record(command).is_some_and(|r| {
-                r.phase == Phase::PreAccept && r.payload.is_some_and(|p| p != h.proposal.admission)
+                r.phase < Phase::Commit && r.payload.is_some_and(|p| p != h.proposal.admission)
             })
         })
+    }
+
+    /// The admission digest a selection names for `command` (task-d14):
+    /// this replica's own before it binds it, or the synchronized one.
+    fn selected_admission(&self, command: &CommandId) -> Option<Digest32> {
+        self.campaign
+            .as_ref()
+            .filter(|c| c.binding().is_none() && !c.is_durable())
+            .and_then(Campaign::decision)
+            .and_then(|d| d.entries.get(command))
+            .and_then(|e| e.admission)
+            .or_else(|| self.named_facts.get(command).copied())
+    }
+
+    /// Whether this replica holds `command` below COMMIT under other facts
+    /// than a selection names (task-d14). It fetches the payload under the
+    /// named facts and rebinds before installing or binding the entry:
+    /// what it accepted under its own facts was not decided, since a
+    /// decision has one digest and the selection names it.
+    fn awaits_selected_facts(&self, command: &CommandId) -> bool {
+        let Some(selected) = self.selected_admission(command) else {
+            return false;
+        };
+        self.table
+            .record(command)
+            .is_some_and(|r| r.phase < Phase::Commit && r.payload.is_some_and(|p| p != selected))
     }
 
     /// The leader of the current ballot announced its commit frontier.
@@ -1694,7 +1855,8 @@ impl Follower {
     /// A seal is the same cut for every ballot of the configuration, so a
     /// durable seal, or a seal row in flight, ends voting too (task-55).
     fn may_vote(&self) -> bool {
-        !self.ballots.is_fenced()
+        self.halted.is_none()
+            && !self.ballots.is_fenced()
             && self.config.identity.role == ReplicaRole::Voter
             && self.ballots.promised() == self.config.quorum.ballot()
             && self.ballots.in_flight().is_none()
@@ -2108,7 +2270,12 @@ impl Follower {
         {
             self.rejections
                 .push(FollowerRejection::AdmissionConflict { command, accepted });
-            if self.table.phase_of(&command) != Some(Phase::PreAccept) {
+            // At ACCEPT the record's facts were accepted, but not decided,
+            // when the Sync names the proposal's: the payload is fetched
+            // and rebound as below (task-d14).
+            let named = self.table.phase_of(&command) == Some(Phase::Accept)
+                && self.selected_admission(&command) == Some(proposal.admission);
+            if self.table.phase_of(&command) != Some(Phase::PreAccept) && !named {
                 return Vec::new();
             }
             rebinding = true;
@@ -2669,7 +2836,11 @@ impl Follower {
                 let mut out = self.on_payload(command, payload);
                 // Counted only as an answer to the outstanding ask, and
                 // once: see `payloads_answered`.
-                if asked && self.payloads.contains_key(&command) && !self.awaits_rebind(&command) {
+                if asked
+                    && self.payloads.contains_key(&command)
+                    && !self.awaits_rebind(&command)
+                    && !self.awaits_selected_facts(&command)
+                {
                     self.payloads_asked.remove(&command);
                     self.payloads_answered = self.payloads_answered.saturating_add(1);
                 }
@@ -2738,14 +2909,28 @@ impl Follower {
                 .push(FollowerRejection::PayloadIdentityMismatch(command));
             return Vec::new();
         }
+        // A selection names the facts the command was accepted under; a
+        // payload under others is not the command a quorum decided, and
+        // taking it would install or execute a presentation nobody
+        // accepted (task-d14).
+        if self
+            .selected_admission(&command)
+            .is_some_and(|d| d != payload.admission_digest())
+        {
+            return Vec::new();
+        }
         if self.payloads.contains_key(&command) {
-            if self.awaits_rebind(&command)
+            let for_proposal = self.awaits_rebind(&command)
                 && self
                     .held
                     .get(&command)
-                    .is_some_and(|h| h.proposal.admission == payload.admission_digest())
-            {
-                return self.rebind(command, payload);
+                    .is_some_and(|h| h.proposal.admission == payload.admission_digest());
+            if for_proposal || self.awaits_selected_facts(&command) {
+                // A Sync entry waiting on the same rebind installs now too,
+                // whichever of the two asked for the payload (task-d14).
+                let mut effects = self.rebind(command, payload);
+                effects.extend(self.advance_sync());
+                return effects;
             }
             return Vec::new();
         }
@@ -2856,6 +3041,15 @@ impl Follower {
         self.learn();
         Vec::new()
     }
+}
+
+/// The admission digest a selection names for each of its entries.
+fn named_facts(decision: &SyncDecision) -> BTreeMap<CommandId, Digest32> {
+    decision
+        .entries
+        .iter()
+        .filter_map(|(c, e)| e.admission.map(|d| (*c, d)))
+        .collect()
 }
 
 impl DeterministicMachine for Follower {

@@ -445,6 +445,7 @@ fn entry(c: CommandId, phase: Phase, deps: &[CommandId]) -> ReportEntry {
         seqnum: 0,
         keys: vec![b"*".to_vec()],
         payload_present: true,
+        admission: None,
     }
 }
 
@@ -644,6 +645,7 @@ fn recovery_selection_is_source_defined_and_order_independent() {
             seqnum: 0,
             keys: vec![b"*".to_vec()],
             payload_present: false,
+            admission: None,
         }],
     });
     let half = explore_recovery("half-initialized-entry", &cfg, &half);
