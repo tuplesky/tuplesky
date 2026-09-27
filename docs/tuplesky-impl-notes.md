@@ -4379,6 +4379,15 @@ itself:
   counts as this replica's vote. The frontier commits nothing the
   follower did not adopt: a command it holds initialized without the
   proposal stays where it is.
+- **An adoption carries the proposal's admission.** A proposal that
+  arrived before the payload was held, and adopted once a payload was
+  bound, even one under other attested facts. `on_proposal` compared the
+  admissions only when the payload came first. Adopted, the command
+  committed from the frontier, or from the leader's proposal and two
+  peers' acknowledgements, and executed under facts the quorum never
+  admitted (Codex, on #103). A held proposal whose admission differs from
+  the bound payload's is now refused as `AdmissionConflict`, and so is
+  its admission past a full table's capacity.
 
 ### A full table admits the command whose turn has come
 
@@ -4457,6 +4466,10 @@ needs its peers:
 - `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`:
   r3 adopts six commands and commits none. It is killed and restarted
   under the same leader, and three more follow; it executes all nine.
+- `a_proposal_held_before_a_conflicting_payload_is_not_adopted`: the
+  proposal reaches r3 before r3's own submission, which carries another
+  admission receipt. r3 adopts nothing, executes nothing and reports the
+  conflict.
 - `a_frontier_from_another_voter_is_ignored`, and
   `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed`
   (three of five voters down: the frontier stays, then moves once they
@@ -4466,6 +4479,8 @@ Negative controls, each run and failing:
 - with a follower that ignores the frontier, six of the first seven
   fail; the leader's own frontier test is the one that passes;
 - without the proposal ask, the restart test executes nothing on r3;
+- without the admission check at adoption, r3 executes the conflicting
+  facts;
 - without admission past capacity, the full-table test executes the
   first eight and stops;
 - without the ordered ask, the ask test leads with other commands.

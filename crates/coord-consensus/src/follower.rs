@@ -1409,12 +1409,20 @@ impl Follower {
     /// this ballot within the frontier qualifies, with every dependency
     /// at least ACCEPT, so the table exceeds its bound by the commands
     /// whose turn has come and no more.
-    fn decided_and_due(&self, command: &CommandId) -> bool {
+    ///
+    /// Only for the admission the proposal carries: a payload under other
+    /// attested facts could not be adopted anyway.
+    fn decided_and_due(
+        &self,
+        command: &CommandId,
+        admission: coord_types::identity::Digest32,
+    ) -> bool {
         let Some(through) = self.leader_committed else {
             return false;
         };
         self.held.get(command).is_some_and(|h| {
-            h.proposal.seqnum.is_some_and(|s| s <= through)
+            h.proposal.admission == admission
+                && h.proposal.seqnum.is_some_and(|s| s <= through)
                 && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d)).is_ok()
         })
     }
@@ -1803,7 +1811,7 @@ impl Follower {
         // this command under different attested facts conflicts here
         // instead of quietly replacing what this replica accepted.
         let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
-        let initialized = if self.decided_and_due(&command) {
+        let initialized = if self.decided_and_due(&command, payload.admission_digest()) {
             self.table
                 .initialize_beyond_capacity(command, payload.admission_digest(), keys)
         } else {
@@ -2135,6 +2143,22 @@ impl Follower {
             }
             for command in ready {
                 let held = self.held.remove(&command).expect("ready");
+                // The proposal asserts the admission it was ordered under.
+                // `on_proposal` compares it with this replica's when the
+                // payload is already here; when the proposal came first,
+                // the payload bound since is compared now. Adopted under
+                // other attested facts, this replica would execute a
+                // command the quorum never admitted as such -- once
+                // committed, from the leader's frontier or from its peers'
+                // acknowledgements, which match the leader's (task-d09).
+                // Reported rather than resolved, as there.
+                if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
+                    && accepted != held.proposal.admission
+                {
+                    self.rejections
+                        .push(FollowerRejection::AdmissionConflict { command, accepted });
+                    continue;
+                }
                 // A command already learned or executed (installed from a
                 // Sync, or durable across a restart) keeps its phase: the
                 // re-proposal only supplies the new ballot's order.

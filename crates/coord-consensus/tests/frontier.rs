@@ -421,6 +421,14 @@ impl Cluster {
     }
 
     fn admit(&mut self, seq: u64) -> CommandId {
+        let all: Vec<usize> = (0..self.nodes.len()).collect();
+        self.admit_to(seq, &all, 9)
+    }
+
+    /// Submit request `seq` to the voters `at` only, under the admission
+    /// receipt `receipt`: the same command identity, and other attested
+    /// facts when `receipt` differs.
+    fn admit_to(&mut self, seq: u64, at: &[usize], receipt: u8) -> CommandId {
         let key = (seq % 250) as u8;
         let request = LogicalRequest::new(
             NamespaceId([5; 16]),
@@ -442,7 +450,7 @@ impl Cluster {
         let frame = MessageV1::Request(RequestV1::new(rk, &request, 0, 0).unwrap())
             .encode()
             .unwrap();
-        for i in 0..self.nodes.len() {
+        for &i in at {
             if self.down.contains(&(i as u8)) {
                 continue;
             }
@@ -454,7 +462,7 @@ impl Cluster {
                     session: SessionId([3; 16]),
                     rule_generation: 1,
                     scope_ceiling: u32::MAX,
-                    receipt_id: Digest32([9; 32]),
+                    receipt_id: Digest32([receipt; 32]),
                     admitted_at_ticks: 0,
                 },
             );
@@ -645,6 +653,39 @@ fn a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commit
     let all: Vec<CommandId> = first.iter().chain(late.iter()).copied().collect();
     assert_eq!(cluster.nodes[0].executed, all);
     assert_eq!(cluster.nodes[3].executed, all);
+}
+
+/// A follower that received the proposal before a payload under other
+/// attested facts adopts nothing, and the frontier executes nothing.
+///
+/// The proposal reaches r3 first and is held. r3's own submission of the
+/// same command then arrives under another admission receipt. Adopted,
+/// the frontier committed it and r3 executed a command under facts the
+/// quorum never admitted; the adoption is refused instead, and reported.
+#[test]
+fn a_proposal_held_before_a_conflicting_payload_is_not_adopted() {
+    let mut cluster = Cluster::new(29, 64);
+    cluster.deaf = vec![3];
+    let c = cluster.admit_to(1, &[0, 1, 2, 4], 9);
+    let pending: Vec<(ReplicaId, Vec<u8>)> = cluster.nodes[3].inbox.drain(..).collect();
+    for (from, frame) in pending {
+        cluster.deliver(3, from, frame);
+    }
+    assert_eq!(cluster.admit_to(1, &[3], 8), c);
+    cluster.settle_ticking(2);
+    assert_eq!(cluster.nodes[0].executed, vec![c]);
+    assert!(
+        cluster.nodes[3].executed.is_empty(),
+        "r3 executed other facts"
+    );
+    assert!(cluster.nodes[3].phase_of(&c) < Some(Phase::Accept));
+    let rejections = cluster.nodes[3].follower_mut().take_rejections();
+    assert!(
+        rejections.iter().any(
+            |r| matches!(r, FollowerRejection::AdmissionConflict { command, .. } if *command == c)
+        ),
+        "the conflict was not reported"
+    );
 }
 
 /// The frontier commits only what the follower adopted from the leader.
