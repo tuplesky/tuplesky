@@ -1015,7 +1015,7 @@ COMMIT. Wire and durable formats change, so every domain starts fresh.
     Control lane (600 and more at a time), and `n2`'s to `n1` as
     `NotConnected` (1336 frames, after a TLS alert 120 on the redial).
   * In raf-2 and repaf-4 no command's admission digest differs between
-    any two voters either, so neither stall is task-d14's.
+    any two voters either, so #108 does not explain either stall.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
