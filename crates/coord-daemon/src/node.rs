@@ -157,6 +157,23 @@ impl Machine {
         }
     }
 
+    /// What this replica executed through.
+    pub const fn executed_through(&self) -> coord_types::ids::ExecutionPosition {
+        match self {
+            Machine::Leader(m) => m.executed_through(),
+            Machine::Follower(m) => m.executed_through(),
+        }
+    }
+
+    /// The highest ballot this replica refused to a candidate as behind
+    /// (task-d10), which its own next campaign has to go above.
+    pub fn outranked(&self) -> Option<Ballot> {
+        match self {
+            Machine::Leader(m) => m.ballots().outranked(),
+            Machine::Follower(m) => m.ballots().outranked(),
+        }
+    }
+
     /// The highest ballot this replica has promised, counting a promise
     /// whose row is not durable yet (task-d01).
     ///
@@ -490,6 +507,29 @@ impl<P: Persistence> Node<P> {
         };
         self.machine = Some(machine);
         self.carry_out(effects, at).map(Some)
+    }
+
+    /// Give up the lead without having been deposed, so that this replica
+    /// can campaign above a ballot it refused as behind (task-d10).
+    ///
+    /// The conversion is the one a deposed leader makes in
+    /// [`Node::change_role`]: the same replica at the same ballot, as a
+    /// follower, with its promises, table and outbox carried over. What
+    /// the leader had proposed and not decided is recovered by the
+    /// campaign that follows, as after any change of leader. A follower
+    /// is left as it is.
+    pub fn step_down(&mut self, at: &Ballot) -> Result<Outbound, DriveError> {
+        if !matches!(self.machine(), Machine::Leader(_)) {
+            return Ok(Outbound::default());
+        }
+        let Some(Machine::Leader(l)) = self.machine.take() else {
+            unreachable!("checked above")
+        };
+        let quorum = l.config_quorum();
+        let follower = Follower::from_recovered(l.into_recovered(), quorum);
+        self.won = None;
+        self.machine = Some(Machine::Follower(Box::new(follower)));
+        self.carry_out(Vec::new(), at)
     }
 
     /// The selection this replica won the ballot it leads with; `None`

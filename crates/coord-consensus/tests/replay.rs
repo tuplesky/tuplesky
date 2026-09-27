@@ -474,6 +474,7 @@ fn a_fenced_replica_replays_nothing() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     f.take_rejections();
@@ -503,6 +504,7 @@ fn a_fenced_replica_replays_nothing() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     l.take_rejections();

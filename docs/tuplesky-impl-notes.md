@@ -5044,3 +5044,118 @@ and catch-up (task-d08, task-d10) is what brings it back.
   catch-up rebuilds it; planned behind task-d08.
 - The random-kill stress runs and the five-node Jepsen run with this
   carried are the acceptance.
+
+## A candidate a table behind is refused
+
+Local run rep-d-4 (#106's replay), the reviewer's run 2 on `82e222b` and
+the five-node Jepsen `n2` share one shape: a voter restarts far behind,
+its election timer fires first, it wins, and it cannot serve. In rep-d-4,
+n2 restarted at `executed=339` while n1 was at 679, led ballot 1, and
+executed 64 more commands in the rest of the run while its followers
+reached 1427. A leader asks nobody for payloads (`request_payloads` is
+follower to leader), and what it lacked had been executed and retired by
+the voters that could have sent it. It was stuck, not slow.
+
+The replica cannot tell this from its own state: its rows say ACCEPT for
+commands that were committed in memory, so a restarted table understates
+what is decided. The voters it asks can tell.
+
+### The rule
+
+- `NewLeader` carries the candidate's executed position.
+- A voter whose own executed position is more than its table capacity
+  past the candidate's refuses to promise
+  (`BallotState::refuses_behind`, after every other check a promise
+  makes) and replies `PromiseRefused` naming its own position. A leader
+  applies the same rule.
+- The candidate abandons its campaign on the first refusal, unless its
+  selection is already being bound, and does not campaign again until
+  it has executed as far as the refuser (`FollowerRejection::
+  CampaignRefused`, then `BehindVoters` while it is still short).
+- A voter that refused never promised, so for it the ballot is
+  leaderless and it campaigns after its patience. Nobody waits out the
+  campaign ceiling, and nothing is withdrawn.
+- The refused ballot is remembered (`BallotState::outranked`). The
+  refuser's next campaign goes above it (`Voter::campaign`), and it
+  promises no other candidate's ballot at or below it
+  (`check_candidate`, as `NotHigher`). The refused candidate promised
+  itself that ballot and hears nothing below it, and following the next
+  leader is how it catches up; a lower ballot another voter campaigned
+  for without seeing the refusal must not win (from review).
+- Only a configured voter's refusal is honoured: an observer or learner
+  on the peer plane has no promise to withhold (from review).
+- A leader that refuses a higher ballot as behind steps down and
+  campaigns above it at once (`Voter::follow_machine`, `Node::step_down`,
+  then `Voter::campaign`). A restarted voter's timer can fire before it
+  hears the leader, and rgb-2 and rgb-6 on #98 were that: refused by
+  everyone, it would sit promised above the live ballot, deaf, until an
+  election came along. The cost is an election per refused campaign
+  against a live leader, bounded because the refused voter does not
+  campaign again until it has caught up. Watch for election churn in the
+  runs (from review).
+- The window is `limits.command_table_capacity`, per voter. It is set
+  alike across a domain so that voters judge alike; nothing enforces it,
+  and a voter with a larger table only refuses later.
+
+The most advanced live voter is refused by nobody, so someone can always
+lead. A candidate whose `NewLeader` reaches only voters as far behind as
+itself still leads; that is catch-up's case.
+
+### What the tests show
+
+- `activation.rs`
+  `a_candidate_a_table_behind_is_refused_and_follows_the_voter_that_refused`:
+  a table of 32; r2 stops at 40 while the others go on to 80; r0 dies and
+  r2 campaigns first. r1 refuses with `CandidateBehind { candidate: 40,
+  own: 80 }`, has not promised, and records the ballot as outranked. r2
+  gets `CampaignRefused { by: r1, executed: 80 }`, then `BehindVoters`
+  when asked to campaign again. r1 leads above the refused ballot, r2
+  promises it and follows, and with r0 back the domain serves. With the
+  refusal switched off the test fails: the cluster does not settle.
+- `a_refused_replica_campaigns_again_once_it_executed_as_far_as_the_refuser`:
+  an injected refusal at a position five commands ahead, which r2
+  reaches by following; it campaigns again, and leads, once it has.
+- `a_candidate_behind_every_reporters_window_does_not_win` (task-d05) now
+  sees `CampaignRefused` from r1 rather than its own `Behind`: the
+  refusal comes before the selection. The candidate-side check stays as
+  the backstop for a gap the refusal does not see.
+- `ballot.rs` `a_ballot_refused_as_behind_fences_the_ballots_below_it`:
+  after refusing ballot 5 as behind, another voter's ballot 1 is refused
+  as `NotHigher` naming 5, and ballot 6 is promised. Without the floor,
+  ballot 1 is promised.
+- The second `activation.rs` test also sends the refusal from a replica
+  that is not a voter, naming `ExecutionPosition::MAX`; the campaign
+  goes on. Without the voter check it is abandoned.
+- `voter.rs`
+  `a_live_leader_that_refuses_a_behind_candidate_leads_again_above_it`:
+  three voters, the leader and one follower at 100 and the third at the
+  bootstrap position, which campaigns first. The leader refuses it,
+  steps down, campaigns above the refused ballot and leads again; both
+  followers promise that ballot. Without the step-down the leader stays
+  at ballot 0, below the refused ballot 1, and the refused voter stays
+  deaf.
+- `voter.rs`
+  `a_voter_that_refused_a_behind_candidate_campaigns_above_its_ballot`:
+  the refusal goes out naming the voter's position, no promise does, and
+  its next campaign is above the refused ballot. Without the floor it
+  campaigns at ballot 1, below the refused 5.
+
+### What is left
+
+- A voter more than a table behind still cannot catch up by payload:
+  what it lacks was retired past every peer's table. A checkpoint brings
+  it up (task-d08). Until then it follows and votes, but executes
+  nothing past the gap.
+- When only followers receive the behind voter's `NewLeader` (the
+  leader is partitioned from it), they refuse and fence, and nobody
+  campaigns above the refused ballot: the voter stays deaf, promised
+  above the live leader's ballot, until the next election. It does not
+  disrupt the domain; it is one voter short until then.
+- A cleaner design, for later and not now, removes the whole problem: a
+  candidate promises itself only once the first promise from another
+  voter arrives, so a campaign refused by everyone leaves no promise
+  behind, and nothing needs fencing or leading above.
+- `outranked` and the candidate's refusal position are not durable. A
+  restarted refuser can campaign at or below the refused ballot, which
+  the refused candidate does not promise; the other voters still can. A
+  restarted candidate campaigns again and is refused again.

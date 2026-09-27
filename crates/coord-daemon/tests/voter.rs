@@ -651,6 +651,11 @@ impl coord_storage::Persistence for Stamped {
 /// A booted voter over a [`Stamped`] store: replica `me`, the leader of
 /// the genesis ballot when `me` is 0 and a follower otherwise.
 fn stamped(me: u8) -> Voter<Stamped> {
+    stamped_at(me, None)
+}
+
+/// [`stamped`], started as having executed through `at`.
+fn stamped_at(me: u8, at: Option<coord_types::ids::ExecutionPosition>) -> Voter<Stamped> {
     let boot = BootId([7; 16]);
     let mut worker =
         StoreWorker::open(ModelEngine::new(), boot, inc(), GroupLimits::default()).unwrap();
@@ -691,7 +696,7 @@ fn stamped(me: u8) -> Voter<Stamped> {
                 capacity: 64,
             },
             None,
-            bootstrapped,
+            at.unwrap_or(bootstrapped),
         );
         leader.set_learning(LearningMode::Full);
         Machine::Leader(Box::new(leader))
@@ -703,7 +708,7 @@ fn stamped(me: u8) -> Voter<Stamped> {
             frontend: FRONTEND,
             capacity: 64,
         })
-        .restore_execution(bootstrapped, []);
+        .restore_execution(at.unwrap_or(bootstrapped), []);
         follower.set_learning(LearningMode::Full);
         Machine::Follower(Box::new(follower))
     };
@@ -725,7 +730,11 @@ fn new_leader(voter: &mut Voter<Stamped>, from: u8, ballot: Ballot) -> coord_dae
     voter
         .on_peer(
             PeerProvenance::from_local_voter(r(from), inc()),
-            coord_consensus::ProtocolMessage::NewLeader { ballot }.encode(),
+            coord_consensus::ProtocolMessage::NewLeader {
+                ballot,
+                executed: coord_types::ids::ExecutionPosition::ZERO,
+            }
+            .encode(),
         )
         .expect("stepped")
 }
@@ -765,7 +774,7 @@ fn a_campaign_records_its_promise_under_the_ballot_it_campaigns_for() {
     assert_eq!(store.fences, vec![campaigned]);
     let asked: Vec<ReplicaId> = messages(&out)
         .into_iter()
-        .filter(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::NewLeader { ballot } if *ballot == campaigned))
+        .filter(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::NewLeader { ballot, .. } if *ballot == campaigned))
         .map(|(to, _)| to)
         .collect();
     assert_eq!(asked, vec![r(0), r(2)]);
@@ -816,6 +825,105 @@ fn a_new_leader_the_machine_refuses_moves_nothing() {
     assert!(out.peer.is_empty());
 }
 
+/// A voter refuses a candidate more than a table behind it, naming its
+/// position, and its own next campaign goes above the refused ballot
+/// (task-d10): that candidate promised itself the ballot and hears
+/// nothing below it, and it can only catch up by following.
+#[test]
+fn a_voter_that_refused_a_behind_candidate_campaigns_above_its_ballot() {
+    let at = coord_types::ids::ExecutionPosition::new(100).unwrap();
+    let mut voter = stamped_at(2, Some(at));
+    let refused = Ballot {
+        epoch: epoch(),
+        number: 5,
+        leader: r(1),
+    };
+    let out = new_leader(&mut voter, 1, refused);
+    let sent = messages(&out);
+    assert!(
+        sent.iter().any(|(to, m)| *to == r(1)
+            && matches!(
+                m,
+                coord_consensus::ProtocolMessage::PromiseRefused { ballot, executed, .. }
+                    if *ballot == refused && *executed == at
+            )),
+        "{sent:?}"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|(_, m)| matches!(m, coord_consensus::ProtocolMessage::Promise { .. })),
+        "{sent:?}"
+    );
+    assert_eq!(voter.node().machine().promised(), ballot());
+    let (campaigned, _) = voter.campaign().expect("stepped").expect("campaigns");
+    assert_eq!(
+        campaigned.compare_same_epoch(&refused),
+        Some(core::cmp::Ordering::Greater),
+        "{campaigned:?}"
+    );
+}
+
+/// Deliver every peer frame among `voters` (indexed by replica byte)
+/// until none is left, starting from `out` sent by voter `from`.
+fn route(voters: &mut [Voter<Stamped>], from: u8, out: coord_daemon::Outbound) {
+    let mut queue: std::collections::VecDeque<(u8, u8, Vec<u8>)> = out
+        .peer
+        .into_iter()
+        .map(|(to, frame)| (from, to.replica.0[0], frame))
+        .collect();
+    let mut steps = 0;
+    while let Some((from, to, frame)) = queue.pop_front() {
+        steps += 1;
+        assert!(steps < 10_000, "the voters did not settle");
+        let Some(voter) = voters.get_mut(to as usize) else {
+            continue;
+        };
+        let out = voter
+            .on_peer(PeerProvenance::from_local_voter(r(from), inc()), frame)
+            .expect("stepped");
+        queue.extend(
+            out.peer
+                .into_iter()
+                .map(|(next, frame)| (to, next.replica.0[0], frame)),
+        );
+    }
+}
+
+/// A live leader that refuses a behind candidate leads again above the
+/// refused ballot, and the behind voter follows it (task-d10).
+///
+/// A restarted voter's timer can fire before it hears the leader (rgb-2
+/// and rgb-6 on #98). Refused by everyone, it would stay promised to its
+/// own ballot, above the live one, and deaf until the next election. The
+/// leader steps down and campaigns above that ballot instead.
+#[test]
+fn a_live_leader_that_refuses_a_behind_candidate_leads_again_above_it() {
+    let ahead = coord_types::ids::ExecutionPosition::new(100).unwrap();
+    let mut voters = vec![
+        stamped_at(0, Some(ahead)),
+        stamped(1),
+        stamped_at(2, Some(ahead)),
+    ];
+    assert!(voters[0].leads());
+    let (refused, out) = voters[1].campaign().expect("stepped").expect("campaigns");
+    route(&mut voters, 1, out);
+
+    assert!(voters[0].leads(), "the leader leads again");
+    let led = voters[0].ballot();
+    assert_eq!(
+        led.compare_same_epoch(&refused),
+        Some(core::cmp::Ordering::Greater),
+        "{led:?} is above the refused {refused:?}"
+    );
+    for i in [1usize, 2] {
+        assert_eq!(voters[i].ballot(), led, "voter {i} follows it");
+        assert_eq!(voters[i].node().machine().promised(), led, "voter {i}");
+    }
+    assert!(!voters[1].leads());
+    assert!(!voters[1].node().machine().campaigning());
+}
+
 /// A transition the store refuses as fenced fails its barrier and the
 /// voter goes on serving (task-d01).
 ///
@@ -838,7 +946,11 @@ fn a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on() {
     let out = voter
         .on_peer(
             PeerProvenance::from_local_voter(r(1), inc()),
-            coord_consensus::ProtocolMessage::NewLeader { ballot: candidate }.encode(),
+            coord_consensus::ProtocolMessage::NewLeader {
+                ballot: candidate,
+                executed: coord_types::ids::ExecutionPosition::ZERO,
+            }
+            .encode(),
         )
         .expect("a refusal the voter expects does not end its turn");
     assert_eq!(voter.node().fenced, 1);
