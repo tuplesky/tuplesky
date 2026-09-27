@@ -691,7 +691,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `add543c` | 4 | none | none |
 | `65b33ba` | 5 | 2 | 1 |
 | `8ad8e4f` (#103 through `334b098`) | 6 | none | none |
-| `7f62f17` (with the rebind, task-d05's recovery read, task-d10) | 6 | 1 | none |
+| `7f62f17` (with #103's rebind, #100's recovery read, `b3f56e3`) | 6 | 1 | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -726,8 +726,9 @@ workflow on `8ad8e4f`
 was `:valid? true`, with 1442 `ok` of 1866, and no voter stopped.
 
 The stack's next commits did not keep it that way. `7f62f17` carries
-task-d09's rebind (`107384e`), task-d05's paged recovery read (`6b86883`)
-and task-d10's first commit (`b3f56e3`). In one of six random-kill runs
+#103's rebind (`107384e`), #100's paged recovery read (`6b86883`), and
+`b3f56e3`, under which a promised ballot that has not synchronized is
+no leader. In one of six random-kill runs
 on it, voter 1 stopped on `release-record-mismatch(11579793)`.
 * Voters 1 and 2 had taken turns leading: voter 1 led ballots 21 and
   23, and voter 2 led 20, 22, 24 and 26. Voter 1 was deposed each time
