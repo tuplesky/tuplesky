@@ -728,6 +728,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `a793a81` (#106 at `b64acc1`) | 6 | none | none |
 | `af06c39` (#107 at `5dfda8b`) | 6 | none | none |
 | `b9059d9` (#107 at `54c6560`) | 6 | none | none |
+| `6a1391e` (#108 at `19744c7`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -995,6 +996,26 @@ can follow it.
   (1036 of 1594). The last served nothing from about 120 s to 330 s,
   because the nemesis killed all five nodes at 91 s and started them
   again only at 281 s.
+
+`6a1391e` carries #108 at `19744c7`: report pages and the Sync name each
+entry's admission digest, and a voter rebinds to the named facts below
+COMMIT. Wire and durable formats change, so every domain starts fresh.
+* **Local runs:** 6 random-kill runs and 6 replays. No stop, anomaly,
+  `IncompatibleAccepted`, `HalfInitialized`, `AdmissionConflict` or
+  `IncompatibleAdmission`. One replay did not serve its final read, the
+  shape of repaf-4 on `af06c39`:
+  * `n2` restarted at 355 and led ballot 1 while `n1` was down. It
+    proposed 1077 commands in that ballot, and `n1` and `n3` executed
+    all of them (through 1432).
+  * `n2` executed only its first 53 (seqnums 0 to 52, through 408). Its
+    own record of seqnum 53, `45e480af`, stayed at ACCEPT, with the same
+    dependency and admission digest `n1` and `n3` executed it under. It
+    republished its lease command until `Backpressure`.
+  * Around then `n1`'s frames to `n2` were dropped as `QueueFull` on the
+    Control lane (600 and more at a time), and `n2`'s to `n1` as
+    `NotConnected` (1336 frames, after a TLS alert 120 on the redial).
+  * In raf-2 and repaf-4 no command's admission digest differs between
+    any two voters either, so neither stall is task-d14's.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
