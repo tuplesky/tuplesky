@@ -155,6 +155,10 @@ pub struct CommandTable {
     /// The same commands, for lookup.
     recent_set: BTreeSet<CommandId>,
     capacity: Option<usize>,
+    /// The command this replica executed last. With every command on one
+    /// key, it is the tail of the order everything executed so far
+    /// follows, which a new leader chains its first proposals after.
+    last_executed: Option<CommandId>,
 }
 
 impl CommandTable {
@@ -169,6 +173,7 @@ impl CommandTable {
             recent: VecDeque::new(),
             recent_set: BTreeSet::new(),
             capacity: None,
+            last_executed: None,
         }
     }
 
@@ -183,6 +188,7 @@ impl CommandTable {
             recent: VecDeque::new(),
             recent_set: BTreeSet::new(),
             capacity: Some(capacity),
+            last_executed: None,
         }
     }
 
@@ -204,6 +210,7 @@ impl CommandTable {
             recent: VecDeque::new(),
             recent_set: BTreeSet::new(),
             capacity,
+            last_executed: None,
         };
         for (c, r) in records {
             table.records.insert(c, r);
@@ -598,7 +605,40 @@ impl CommandTable {
         let deps = record.deps.clone();
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
+        self.last_executed = Some(command);
         Ok(())
+    }
+
+    /// The command this replica executed last, if it remembers one.
+    pub const fn last_executed(&self) -> Option<CommandId> {
+        self.last_executed
+    }
+
+    /// The last command on `key` this replica has committed and not yet
+    /// executed: the committed record no other committed record of the
+    /// key depends on (task-d12).
+    ///
+    /// Execution follows the dependencies, so every such command comes
+    /// after [`CommandTable::last_executed`] in the key's order, and a
+    /// command that must follow everything this replica holds decided
+    /// follows this one. Where the replica lacks a command between two
+    /// committed ones, both look last; the larger identity is taken, as
+    /// [`CommandTable::restore`] does.
+    pub fn committed_tail(&self, key: &[u8]) -> Option<CommandId> {
+        let committed: Vec<(&CommandId, &CommandRecord)> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.phase == Phase::Commit && r.keys.iter().any(|k| k == key))
+            .collect();
+        let depended: BTreeSet<CommandId> = committed
+            .iter()
+            .flat_map(|(_, r)| r.deps.iter().copied())
+            .collect();
+        committed
+            .into_iter()
+            .map(|(c, _)| *c)
+            .filter(|c| !depended.contains(c))
+            .max()
     }
 
     /// Mark a command executed from durable evidence (its executed identity
@@ -609,6 +649,7 @@ impl CommandTable {
     /// prefix): it is remembered as executed, which is all there is left
     /// to say about it.
     pub fn restore_executed(&mut self, command: &CommandId) {
+        self.last_executed = Some(*command);
         match self.records.get_mut(command) {
             Some(r) if r.payload.is_some() => r.phase = Phase::Executed,
             Some(_) => {}

@@ -425,7 +425,20 @@ impl Leader {
         // command identifier says nothing about execution order, and
         // chaining re-proposals after an arbitrary entry lets a
         // re-proposed command become executable before an earlier one.
-        let mut last = order.last().copied();
+        //
+        // Nor an entry this leader has executed: every voter that could
+        // report it may have retired it, so it can sit far behind what
+        // this leader executed since. The tail is the last entry this
+        // leader has not executed; else the last command it committed
+        // and has not executed yet, which comes after everything it
+        // executed; else the last command it executed.
+        let mut last = order
+            .iter()
+            .rev()
+            .find(|c| leader.table.phase_of(c) < Some(Phase::Executed))
+            .copied()
+            .or_else(|| leader.table.committed_tail(CONSERVATIVE_KEY))
+            .or_else(|| leader.table.last_executed());
         // Published in a first batch; the rest go out through the re-send,
         // oldest first, as votes come back. A new leader after a long
         // history used to put its whole selection on each follower's
@@ -451,6 +464,16 @@ impl Leader {
         }
         for c in &decision.reproposed {
             if leader.table.phase_of(c).is_none() {
+                continue;
+            }
+            // A command this leader committed was decided in an earlier
+            // ballot, with the dependencies it has here. A reporter behind
+            // the source ballot put it in `reproposed` because the voters
+            // that executed it retired it. Chaining it after the tail
+            // would give it other dependencies than the ones it was
+            // decided with, and anchoring the next proposal after it
+            // would fork the order at a command executed long ago.
+            if leader.table.phase_of(c) >= Some(Phase::Commit) {
                 continue;
             }
             let deps = last.map_or_else(Vec::new, |l| alloc::vec![l]);

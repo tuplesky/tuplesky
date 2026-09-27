@@ -1562,8 +1562,14 @@ fn reproposals_follow_the_recovered_order_not_identity_order() {
     // command must depend on the tail of the recovered order, never on
     // whichever identity happens to sort highest.
     let mut c = Cluster::new(3);
-    let (mut a, mut b, mut extra) = (c.admit(1, 1), c.admit(2, 2), c.admit(3, 3));
+    // The new leader holds both selected commands and has executed
+    // neither, so the recovered order is what it follows; the command to
+    // re-propose reached only it, so it is undecided there. (A command it
+    // had executed would not be re-proposed at all.)
+    c.no_execute = vec![2];
+    let (mut a, mut b) = (c.admit(1, 1), c.admit(2, 2));
     c.settle();
+    let mut extra = c.admit_at(3, 3, &[2]);
     // Name them so that the dependency tail is not the largest identity.
     if a < b {
         core::mem::swap(&mut a, &mut b);
@@ -1597,7 +1603,7 @@ fn reproposals_follow_the_recovered_order_not_identity_order() {
         ),
     ]);
     if extra == a || extra == b {
-        extra = c.admit(4, 4);
+        extra = c.admit_at(4, 4, &[2]);
     }
     let decision = SyncDecision {
         ballot: new,
@@ -2115,4 +2121,217 @@ fn a_sync_demotes_no_acceptance_of_its_own_ballot() {
     let report = cluster.nodes[1].follower().report(ballot(2, 0));
     let entry = report.entries.iter().find(|e| e.command == x).unwrap();
     assert_eq!((entry.phase, entry.deps.clone()), (Phase::Accept, vec![a]));
+}
+
+/// A new leader anchors fresh proposals at the key's tail, never at an
+/// executed command a behind reporter put in `reproposed`.
+#[test]
+fn a_fresh_proposal_follows_the_tail_not_an_executed_reproposal() {
+    let mut c = Cluster::new(59);
+    let cmds: Vec<CommandId> = (1..=6).map(|s| c.admit(s, 1)).collect();
+    c.settle();
+    let tail = *cmds.last().unwrap();
+    let old = cmds[1];
+    for i in 0..3 {
+        assert!(
+            c.nodes[i].executed.contains(&tail),
+            "node {i} executed the tail"
+        );
+    }
+    // Every voter executed all six, so a selection has no entry for
+    // them; a reporter behind the source ballot still holds `old`'s row,
+    // so the selection re-proposes it.
+    let new = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: core::iter::once(old).collect(),
+    };
+    // Promised, as a winning candidate is.
+    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    c.handle(2, effects);
+    let (leader, effects) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    c.nodes[2].role = Some(Role::Leader(leader));
+    c.handle(2, effects);
+    let fresh = c.admit_at(7, 1, &[2]);
+    let Some(Role::Leader(leader)) = c.nodes[2].role.as_mut() else {
+        unreachable!()
+    };
+    let refused = leader.take_rejections();
+    let Some(proposal) = leader.proposal(&fresh) else {
+        panic!("not proposed: {refused:?}")
+    };
+    assert_eq!(
+        proposal.deps,
+        vec![tail],
+        "a fresh command forks off the chain at the executed {old:?}"
+    );
+}
+
+/// With no entry to follow, a re-proposed command still follows what the
+/// new leader executed.
+#[test]
+fn a_reproposal_with_no_entry_to_follow_follows_the_executed_tail() {
+    let mut c = Cluster::new(61);
+    let cmds: Vec<CommandId> = (1..=6).map(|s| c.admit(s, 1)).collect();
+    c.settle();
+    let tail = *cmds.last().unwrap();
+    // Reaches only r2, and ballot 0's leader never proposes it.
+    let undecided = c.admit_at(7, 1, &[2]);
+    let new = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: core::iter::once(undecided).collect(),
+    };
+    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    c.handle(2, effects);
+    let (leader, _) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    let proposal = leader.proposal(&undecided).expect("re-proposed");
+    assert_eq!(
+        proposal.deps,
+        vec![tail],
+        "the re-proposal does not follow the six commands every voter executed"
+    );
+}
+
+/// A candidate restarted before it wins still chains after the last
+/// command it executed: a restart replays the executed identities in the
+/// order they executed, and the last one replayed is the anchor.
+#[test]
+fn a_restarted_candidate_with_no_entries_chains_after_what_it_executed() {
+    let mut c = Cluster::new(67);
+    let cmds: Vec<CommandId> = (1..=6).map(|s| c.admit(s, 1)).collect();
+    c.settle();
+    let tail = *cmds.last().unwrap();
+    // Restarted after a trim took every executed command's dependency
+    // row: only the executed identities come back, in the order they
+    // executed, as `coordd` replays them. Nothing in the table says which
+    // command is the key's latest.
+    c.crash(2);
+    let executed = c.nodes[2].executed.clone();
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(2),
+            genesis: ballot(0, 0),
+            quorum: quorum(ballot(0, 0)),
+            frontend: FRONTEND,
+            capacity: c.capacity,
+        },
+        promise_row(&c.nodes[2].storage),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    )
+    .restore_execution(
+        ExecutionPosition::new(executed.len() as u64).unwrap(),
+        executed.iter().copied(),
+    );
+    c.nodes[2].boot += 1;
+    f.step(boot_event(c.nodes[2].boot));
+    c.nodes[2].role = Some(Role::Follower(f));
+    c.nodes[2].alive = true;
+    // Every voter executed all six; a reporter behind the source ballot
+    // still holds one of them.
+    let new = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: core::iter::once(cmds[1]).collect(),
+    };
+    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    c.handle(2, effects);
+    let (leader, effects) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    c.nodes[2].role = Some(Role::Leader(leader));
+    c.handle(2, effects);
+    let fresh = c.admit_at(7, 1, &[2]);
+    let Some(Role::Leader(leader)) = c.nodes[2].role.as_mut() else {
+        unreachable!()
+    };
+    let refused = leader.take_rejections();
+    let Some(proposal) = leader.proposal(&fresh) else {
+        panic!("not proposed: {refused:?}")
+    };
+    assert_eq!(
+        proposal.deps,
+        vec![tail],
+        "the restarted leader forks the chain"
+    );
+    assert!(
+        leader.proposal(&cmds[1]).is_none(),
+        "a command it executed is not proposed again"
+    );
+}
+
+/// A new leader that committed commands it has not executed yet chains
+/// after them, not after the last command it executed: every other voter
+/// executed them, and a fresh command that followed only the executed
+/// tail would run before them here and after them there. The same with
+/// one of them re-proposed by a behind reporter, and with nothing
+/// re-proposed.
+#[test]
+fn a_new_leader_chains_after_what_it_committed_and_has_not_executed() {
+    for reproposed in [BTreeSet::new(), BTreeSet::from([4usize])] {
+        let mut c = Cluster::new(71);
+        let mut cmds: Vec<CommandId> = (1..=3).map(|s| c.admit(s, 1)).collect();
+        c.settle();
+        // r2 commits the next three and executes none of them.
+        c.no_execute = vec![2];
+        cmds.extend((4..=6).map(|s| c.admit(s, 1)));
+        c.settle();
+        let tail = *cmds.last().unwrap();
+        assert!(c.nodes[0].executed.contains(&tail));
+        assert!(c.nodes[1].executed.contains(&tail));
+        assert_eq!(
+            c.nodes[2].executed,
+            cmds[..3],
+            "r2 executed only the first three"
+        );
+        let new = ballot(1, 2);
+        let decision = SyncDecision {
+            ballot: new,
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::new(),
+            reproposed: reproposed.iter().map(|&i| cmds[i]).collect(),
+        };
+        let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+        c.handle(2, effects);
+        let (leader, effects) = Leader::from_recovered(
+            c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+            quorum(new),
+            &decision,
+        );
+        c.nodes[2].role = Some(Role::Leader(leader));
+        c.handle(2, effects);
+        let fresh = c.admit_at(7, 1, &[2]);
+        let Some(Role::Leader(leader)) = c.nodes[2].role.as_mut() else {
+            unreachable!()
+        };
+        let refused = leader.take_rejections();
+        let Some(proposal) = leader.proposal(&fresh) else {
+            panic!("not proposed: {refused:?}")
+        };
+        assert_eq!(
+            proposal.deps,
+            vec![tail],
+            "re-proposed {reproposed:?}: a fresh command forks off the committed commands"
+        );
+    }
 }

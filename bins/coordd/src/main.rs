@@ -1493,6 +1493,8 @@ fn voter(
         // The executed identities whose dependency rows a trim removed
         // first: they are older than every surviving one, and they are
         // the executed answer for what a live record may still name.
+        // Both in execution order, so the last one replayed is the last
+        // command this replica executed (task-d12).
         .restore_execution(
             executed_through,
             recovered
