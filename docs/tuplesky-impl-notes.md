@@ -4923,6 +4923,44 @@ that one at COMMIT, and r2's first fresh proposal still depends on the
 command it executed last. With the chain starting at the last unexecuted
 entry alone, it depends on the stale command only.
 
+### No acceptance after the promise
+
+With both changes above carried, random-kill runs still stopped a voter
+on `release-record-mismatch` (d12c-1, -7, -9) or failed a campaign as
+`IncompatibleAccepted` (d12c-11), and the reviewer's replay (`--faults
+2,1`: voter 2 restarted, then the ballot-0 leader killed) stopped voter 3
+in 4 of 6 runs. Every one of the four dumps has the same shape:
+
+- The old leader proposed P and then X, which depends on P, and was
+  killed. A voter restarted far behind won the next ballot with its own
+  report and the third voter's.
+- The Sync's entries end exactly at P's position (794, 1415, 780, 1432),
+  and X is in neither its entries nor its re-proposals.
+- The third voter executed X right after P anyway, and the new leader
+  chained its first command after P as well: a fork at P + 1.
+
+The third voter had held X's proposal at the promise, its payload or P's
+acceptance not there yet, so its report was taken without X. During the
+campaign `advance_pending` adopted X once it became ready: it checked the
+seal's fence and not the promise. This replica's own acceptance and the
+old leader's proposal then made a quorum here, and it committed and
+executed X. A command no majority accepted before the promise was
+executed, and no selection could see it.
+
+`advance_pending` adopts nothing while the replica may not vote, and
+activation drops what is held, as it did. A payload that arrives after
+the promise (fetched for a held proposal or a selection) is recorded and
+not acknowledged; admission was fenced already. The outbox already
+dropped the stale-ballot acknowledgement, so what that second gate stops
+is the replica's own vote counting towards the old ballot here.
+
+`follower.rs` `a_proposal_held_across_a_higher_promise_is_not_accepted_after_it`:
+c1 accepted, c2's proposal held for its payload, a promise to ballot 1,
+then c2's payload. c2 stays below ACCEPT and nothing acknowledges it.
+Without the adoption gate c2 reaches COMMIT. The payload gate alone is not
+separated by this test: with the adoption gate in place, c2's own fast
+vote did not complete a fast quorum here.
+
 ### What is left
 
 - No reporter holding the decision at all, every voter that had it having
