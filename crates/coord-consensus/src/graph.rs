@@ -32,6 +32,18 @@ pub fn empty_path() -> Digest32 {
     HashDomain::DependencyPath.digest(&[])
 }
 
+/// The path evidence of a record a Sync demoted (task-d11): no path at
+/// all. A demoted record was pre-accepted in an earlier ballot, and the
+/// path it had then is no evidence about the synchronized one, whose label
+/// its report carries. Recovery counts no record with this path as a
+/// fast-path candidate. No acknowledgement carries it: a follower's fast
+/// acknowledgement carries the path it computed at initialization, a
+/// combination of at least one key, and a single-part digest is none of
+/// those (every part is length-prefixed).
+pub fn demoted_path() -> Digest32 {
+    HashDomain::DependencyPath.digest(&[b"demoted"])
+}
+
 /// One key's conflict log (prototype `HashLog`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathLog {

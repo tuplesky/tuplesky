@@ -975,7 +975,7 @@ impl Follower {
                 })
                 .map(|(c, r)| {
                     let mut r = r.clone();
-                    r.phase = Phase::PreAccept;
+                    r.demote();
                     (*c, r)
                 })
                 .collect();
@@ -2277,6 +2277,12 @@ impl Follower {
                 {
                     continue;
                 }
+                // An acceptance of the new ballot, taken while the Sync's
+                // marker was still in flight (a duplicate Sync activates
+                // early): it is not the earlier ballot's acceptance the
+                // marker's batch demotes, and its own row follows that
+                // batch, so the table must not be demoted under it.
+                self.sync_demoted.retain(|c| *c != command);
                 self.adopted
                     .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
                 let epoch = self.config.identity.epoch;

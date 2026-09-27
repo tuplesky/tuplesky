@@ -69,6 +69,15 @@ pub struct CommandRecord {
     pub path: Digest32,
 }
 
+impl CommandRecord {
+    /// This record, demoted by a Sync that does not carry it
+    /// ([`CommandTable::demote`]): PRE-ACCEPT, with no path evidence.
+    pub(crate) fn demote(&mut self) {
+        self.phase = Phase::PreAccept;
+        self.path = crate::graph::demoted_path();
+    }
+}
+
 /// Why initialization did not happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitError {
@@ -418,10 +427,15 @@ impl CommandTable {
     /// dependencies, which at PRE-ACCEPT decide nothing and which adoption
     /// replaces (task-d11). Only an ACCEPT is demoted; a commit is a
     /// decision and stays. Returns whether the record was demoted.
+    ///
+    /// The path goes too ([`crate::graph::demoted_path`]): it was evidence
+    /// about the earlier ballot, and a report labels the record with the
+    /// synchronized one, so kept it would let the next selection's
+    /// fast-path analysis take the old order as the new ballot's.
     pub fn demote(&mut self, command: &CommandId) -> bool {
         match self.records.get_mut(command) {
             Some(record) if record.payload.is_some() && record.phase == Phase::Accept => {
-                record.phase = Phase::PreAccept;
+                record.demote();
                 true
             }
             _ => false,

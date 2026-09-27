@@ -348,7 +348,13 @@ fn possible_fast_decisions(
     // same path evidence, and not already adopted.
     let mut candidates: BTreeMap<CommandId, ReportEntry> = BTreeMap::new();
     for e in &first.entries {
-        if e.phase != Phase::PreAccept || !e.payload_present || entries.contains_key(&e.command) {
+        // A record a Sync demoted was pre-accepted in an earlier ballot:
+        // no evidence of a fast decision in this one (task-d11).
+        if e.phase != Phase::PreAccept
+            || !e.payload_present
+            || e.path == crate::graph::demoted_path()
+            || entries.contains_key(&e.command)
+        {
             continue;
         }
         let agreed = fast_reporters.iter().all(|r| {

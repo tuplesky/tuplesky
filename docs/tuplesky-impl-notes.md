@@ -4638,6 +4638,23 @@ ballot it last synchronized. So:
 - **Kept:** the payload and the dependencies, which at PRE-ACCEPT decide
   nothing and which adoption under the new ballot replaces. A record the
   voter has committed is a decision and stays.
+- **Not kept: the path.** A report carries PRE-ACCEPT entries into the
+  next selection's fast-path analysis (`possible_fast_decisions`), under
+  the synchronized ballot's label. With that ballot's leader absent and
+  the demoted voter its only fast-set reporter, the path x had under
+  ballot 0 would read as evidence that ballot 1 decided x fast, and the
+  selection would promote ballot 0's dependencies (Codex, #105). A
+  demoted record's path is `demoted_path()`, a single-part digest that no
+  initialization computes, and the analysis counts no record with it. A
+  fast set's member that did not pre-accept a command in the ballot rules
+  out a fast decision of it there, so the analysis loses nothing it
+  needed.
+- **Not an acceptance of the new ballot.** A duplicate Sync that arrives
+  while the first one's marker is becoming durable activates the new
+  ballot early, and a proposal of that ballot can be adopted before the
+  marker is durable. That adoption takes the command out of the pending
+  demotions, since its own row follows the marker's batch; otherwise the
+  table would drop to PRE-ACCEPT under a durable ACCEPT row (Codex, #105).
 - **Why only at the first installation.** An acceptance written after the
   Sync is the new ballot's own. After a restart the marker's batch has
   already demoted what it had to, and demoting again would take back a
@@ -4659,17 +4676,27 @@ r1 adopts x after a under ballot 0 and is restarted, then installs a
 ballot-1 Sync that re-proposes x. Its report for ballot 2 has x at
 PRE-ACCEPT under ballot 1, and a selection over it and a ballot-1
 acceptance of x with other dependencies completes with those. The same
-holds after another restart. Negative control: without the demotion, the
-report says ballot 0's acceptance is ballot 1's, and the selection fails
-as `IncompatibleAccepted`.
+holds after another restart. Ballot 1 is r0's, so r1 is in its fast set,
+and a selection by r2 over r1's report and a report of ballot 0 does not
+select x as a fast decision of ballot 1. Negative controls: without the
+demotion, the report says ballot 0's acceptance is ballot 1's, and the
+selection fails as `IncompatibleAccepted`; with the demotion keeping the
+path, or with the analysis counting `demoted_path()`, the second
+selection takes x with ballot 0's dependencies.
+
+`a_sync_demotes_no_acceptance_of_its_own_ballot`: r1's marker batch is
+held back while a proposal of ballot 1 and a duplicate Sync arrive; r1
+adopts x under ballot 1, then the marker and the adoption become durable
+in that order, and x stays at ACCEPT with ballot 1's dependencies.
+Negative control: without the adoption leaving the pending demotions, the
+marker demotes it.
 
 ### What is left
 
-- A demoted record keeps the path evidence of the ballot it was adopted
-  under, and a report carries PRE-ACCEPT entries into the next selection's
-  fast-path analysis (`possible_fast_decisions`). Such a record can be a
-  fast-path candidate there, subject to that analysis's ordering checks;
-  before this change it was installed as an accepted entry with no check.
-  A report that names the ballot of each record would close this, and
-  changes the row format.
+- A winning leader whose own acceptance of a command was demoted
+  re-proposes it with `demoted_path()` as its path, so no fast
+  acknowledgement matches it and the command is learned on the slow
+  path. Before, it carried the leader's path from the
+  earlier ballot, which no follower's acknowledgement in the new ballot
+  was computed against either.
 - The stress runs with this carried are the acceptance.
