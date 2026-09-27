@@ -63,8 +63,8 @@ pub struct RecoveredProtocol {
     /// this is what still has rows, not the whole executed history.
     pub executed: Vec<(CommandId, ExecutionPosition)>,
     /// Every other executed identity: commands whose `executed_v1` row
-    /// survives and whose dependency row does not, in key order
-    /// (task-d05).
+    /// survives and whose dependency row does not, in execution order
+    /// (task-d05; the order since task-d12).
     ///
     /// A checkpoint trim removes the dependency rows of an executed
     /// prefix and keeps its executed rows. Read only through the
@@ -260,7 +260,14 @@ pub fn read_protocol<V: OrderedRead>(
 }
 
 /// Every executed identity without a dependency row among `records`,
-/// read from `executed_v1` itself (task-d05).
+/// read from `executed_v1` itself (task-d05), in execution order.
+///
+/// In the order they executed, not their key order (task-d12). A restart
+/// replays them into the machine's table, and the last one replayed is
+/// the command a new leader chains its first proposals after when its
+/// selection gives it nothing to follow. In key order that was whichever
+/// identity sorts highest, which says nothing about the order, and the
+/// chain forked there.
 ///
 /// Paged within `budget` per page, like the protocol rows: the answer is one identity per command executed, which
 /// the machine keeps in memory for the life of the process anyway (its
@@ -273,7 +280,7 @@ fn read_history<V: OrderedRead>(
     budget: ViewBudget,
 ) -> Result<Vec<CommandId>, EngineError> {
     let known: std::collections::BTreeSet<CommandId> = records.iter().map(|(c, _)| *c).collect();
-    let mut history = Vec::new();
+    let mut history: Vec<(ExecutionPosition, CommandId)> = Vec::new();
     let mut resume: Option<Vec<u8>> = None;
     loop {
         let page = view.scan_page(
@@ -295,7 +302,8 @@ fn read_history<V: OrderedRead>(
                 .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
             let command = CommandId(Digest32(id));
             if !known.contains(&command) {
-                history.push(command);
+                let ExecutedRecordV1 { position, .. } = codecs::decode_executed(&row.value)?;
+                history.push((position, command));
             }
         }
         match page.rows.last() {
@@ -303,5 +311,6 @@ fn read_history<V: OrderedRead>(
             _ => break,
         }
     }
-    Ok(history)
+    history.sort_unstable();
+    Ok(history.into_iter().map(|(_, c)| c).collect())
 }
