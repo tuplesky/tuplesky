@@ -1947,3 +1947,172 @@ fn one_reporter_without_a_payload_does_not_stop_a_recoverable_campaign() {
         Err(coord_consensus::RecoveryError::HalfInitialized { .. })
     ));
 }
+
+/// A Sync leaves no acceptance of an earlier ballot that it does not carry
+/// (task-d11).
+///
+/// r1 adopts x under ballot 0 and is restarted, so its table holds x at
+/// ACCEPT from its rows. Ballot 1 is selected without r1's report and
+/// re-proposes x; its leader and another voter would adopt x again, with
+/// the dependencies ballot 1's leader orders it after. r1 then installs
+/// ballot 1's Sync, which does not carry x as an entry. A report is
+/// labelled with the synchronized ballot, so r1 used to report ballot 0's
+/// acceptance of x as ballot 1's: beside a ballot-1 report of x under
+/// other dependencies, every later selection failed as
+/// `IncompatibleAccepted` (the three-voter stress stalls), and without
+/// one, a selection installed dependencies no ballot-1 quorum agreed on.
+/// The acceptance is demoted to PRE-ACCEPT, durably with the marker, so a
+/// restart cannot bring it back.
+#[test]
+fn a_sync_leaves_no_acceptance_of_an_earlier_ballot() {
+    let mut cluster = Cluster::new(47);
+    let a = cluster.admit(1, 1);
+    let x = cluster.admit(2, 1);
+    cluster.no_execute = vec![1];
+    cluster.settle();
+    // Restarted: the in-memory commit is gone, the ACCEPT row is not.
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let before = cluster.nodes[1].follower().report(ballot(1, 0));
+    let entry = before.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!((entry.phase, entry.deps.clone()), (Phase::Accept, vec![a]));
+
+    // Ballot 1 is r0's again, so r1 is in its fast set ({r0, r1}).
+    let b1 = ballot(1, 0);
+    let effects =
+        cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::NewLeader { ballot: b1 }));
+    cluster.handle(1, effects);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: [x].into_iter().collect(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
+
+    // What ballot 1's leader and another voter adopted for x: the order
+    // ballot 1's leader gave it, here none.
+    let q = quorum(ballot(2, 0));
+    let check = |cluster: &Cluster| {
+        let ours = cluster.nodes[1].follower().report(ballot(2, 0));
+        assert_eq!(ours.committed_ballot, b1);
+        let mut theirs = ours.clone();
+        theirs.replica = r(2);
+        for e in &mut theirs.entries {
+            if e.command == x {
+                e.phase = Phase::Accept;
+                e.deps = Vec::new();
+            }
+        }
+        let selected = coord_consensus::recovery::select(&q, &[ours.clone(), theirs])
+            .expect("the selection completes");
+        assert_eq!(selected.entries[&x].deps, Vec::<CommandId>::new());
+        let entry = ours.entries.iter().find(|e| e.command == x).unwrap();
+        assert_eq!(
+            entry.phase,
+            Phase::PreAccept,
+            "ballot 0's acceptance of x is reported as ballot 1's"
+        );
+        // Nor as a fast decision of ballot 1. With ballot 1's leader r0
+        // down, r2 behind, and r1 the only reporter of ballot 1 and a
+        // member of its fast set, the fast-path analysis used to take the
+        // path x had under ballot 0 as evidence that ballot 1 decided x
+        // fast, and selected it with ballot 0's dependencies.
+        let q2 = quorum(ballot(2, 2));
+        let ours = cluster.nodes[1].follower().report(ballot(2, 2));
+        let mut older = ours.clone();
+        older.replica = r(2);
+        older.committed_ballot = ballot(0, 0);
+        older.entries.retain(|e| e.command != x);
+        let alone = coord_consensus::recovery::select(&q2, &[ours, older])
+            .expect("the selection completes");
+        assert!(
+            !alone.entries.contains_key(&x),
+            "a demoted acceptance was selected as a fast decision: {:?}",
+            alone.entries.get(&x)
+        );
+    };
+    check(&cluster);
+    // Durable with the marker: a restart before the next report reports
+    // the same.
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    check(&cluster);
+}
+
+/// A Sync demotes no acceptance of its own ballot (task-d11).
+///
+/// A duplicate Sync that arrives while the first one's marker is still
+/// becoming durable activates the new ballot early, and a proposal of that
+/// ballot queued before it is adopted. The marker's batch demotes x's
+/// acceptance of ballot 0; when it becomes durable it must not demote the
+/// acceptance of ballot 1 taken since, whose own row follows it.
+#[test]
+fn a_sync_demotes_no_acceptance_of_its_own_ballot() {
+    let mut cluster = Cluster::new(53);
+    let a = cluster.admit(1, 1);
+    let x = cluster.admit(2, 1);
+    cluster.no_execute = vec![1];
+    cluster.settle();
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let phase = |cluster: &Cluster| {
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&x)
+            .unwrap()
+            .phase
+    };
+    assert_eq!(phase(&cluster), Phase::Accept);
+
+    let b1 = ballot(1, 2);
+    let effects =
+        cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: b1 }));
+    cluster.handle(1, effects);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: [x].into_iter().collect(),
+    };
+    // The marker's batch, not yet durable.
+    let marker = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Sync(decision.clone())));
+    // Ballot 1's proposal of x, after a, then the duplicate Sync.
+    let admission = cluster.nodes[1]
+        .follower()
+        .table()
+        .record(&x)
+        .unwrap()
+        .payload
+        .unwrap();
+    let proposal = coord_consensus::FastAck {
+        replica: r(2),
+        ballot: b1,
+        command: x,
+        deps: vec![a],
+        paths: Vec::new(),
+        path: Digest32([7; 32]),
+        admission,
+        seqnum: Some(0),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Proposal(proposal)));
+    cluster.handle(1, effects);
+    let adoption = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
+    assert_eq!(phase(&cluster), Phase::Accept, "adopted under ballot 1");
+
+    // The marker, then the adoption, become durable in that order.
+    cluster.handle(1, marker);
+    cluster.handle(1, adoption);
+    assert_eq!(
+        phase(&cluster),
+        Phase::Accept,
+        "the marker demoted ballot 1's own acceptance"
+    );
+    let report = cluster.nodes[1].follower().report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!((entry.phase, entry.deps.clone()), (Phase::Accept, vec![a]));
+}
