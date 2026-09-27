@@ -694,6 +694,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `7f62f17` (with #103's rebind, #100's recovery read, `b3f56e3`) | 6 | 1 | none |
 | `d7827de` (with #104's election commits and `f7af332`) | 6 | none | none |
 | `b3ea1f6` (#105 at `076d218`) | 6 | none | none |
+| `4ef1113` (#106 at `2c8efea`) | 6 | 1 (three voters) | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -797,6 +798,30 @@ fast-path evidence.
   `:valid? true`, with 1418 `ok` of 1873. Every node served its final
   read, and no voter logged a stop, a release mismatch,
   `IncompatibleAccepted`, `Behind` or a recovery error.
+
+`4ef1113` carries #106 at `2c8efea`. Under it, a new leader chains
+after what it executed, and a late release that contradicts an answer
+already given stops the node.
+* **Stress:** six random-kill runs. No anomaly, and no
+  `IncompatibleAccepted`. But in run 5 all three voters stopped on
+  `release-record-mismatch`:
+  1. Voter 2 was restarted with 356 commands executed, then led
+     ballot 1 once voter 1 was killed.
+  2. Voter 3, following it, stopped on `d8cc9e34`.
+  3. The driver restarted voter 3. After a second restart it led
+     ballot 7 from its own store.
+  4. Voters 1 and 2 then stopped on that leader's releases.
+  So a divergence under a behind new leader survives #106, and a
+  diverged voter that restarts can lead the others into stopping.
+* **Jepsen**
+  ([run 36299708830](https://github.com/tuplesky/tuplesky/actions/runs/36299708830)):
+  `:valid? true`, with 1252 `ok` of 1696. But nothing was `ok` after
+  06:23:29, about 100 s into the test, through every later heal and the
+  final reads. `n4` led ballot 2. Every later campaign, from ballot 3
+  to 24, was refused as `Campaign(HalfInitialized)` on command
+  `f4244a00`: a report held it at ACCEPT or beyond without its payload.
+  It had not appeared in any earlier Jepsen run. It showed 5 times in
+  one of the six stress runs, and twice in one `7f62f17` run.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
