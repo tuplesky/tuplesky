@@ -4700,3 +4700,125 @@ marker demotes it.
   earlier ballot, which no follower's acknowledgement in the new ballot
   was computed against either.
 - The stress runs with this carried are the acceptance.
+
+## A new leader chains after what it executed
+
+task-d12, from a three-voter stress run's `release-record-mismatch` and a
+five-node Jepsen run's lost appends on #98. Both were one fork, made by a
+new leader.
+
+task-d06 made a new leader anchor the conservative key at the recovered
+order's tail before it proposes anything new. `Leader::from_recovered`
+then chained `decision.reproposed` after the entries, in identity order,
+and moved the anchor to every command it knew, whether or not it proposed
+it. `phase_of` answers `Executed` for a command in history with no record,
+and `select` puts every row of a report behind the source ballot in
+`reproposed`. So a selection over a behind reporter's rows anchored the key
+at the largest identity among old commands the leader had executed and
+retired, and the first fresh proposal depended on that command alone.
+Every voter holds the same dependencies for it, and a voter that ran it
+beside the commands after the old anchor had no edge to order them by.
+
+- **The stress run.** The stopped node executed a ballot-3 proposal whose
+  only dependency had executed at position 12; it ran it at position 1179
+  and the other two at 2149, and 161 digests differed after that. The
+  same run's ballot 8 forked on the same old command.
+- **The Jepsen run.** Two ballot-1 leaders left two voters about a
+  thousand rows behind the ballot the next leader recovered from. That
+  leader's fresh proposals forked, and a behind voter executed them before
+  its backlog, against a key that was still empty there. The appends are
+  guarded, so its guard held and it answered `ok`; on the main line the
+  same commands ran against a key with a hundred elements, the guard
+  failed and they had no effect.
+- **Two more hazards in the same loop.** A command the leader had at
+  Commit or beyond was re-proposed chained after the anchor rather than
+  with its decided dependencies. With no entries, the anchor started
+  empty and the first re-proposal depended on nothing.
+
+### The fix
+
+- A re-proposed command the new leader has at Commit or beyond is neither
+  chained nor re-proposed: it was decided in an earlier ballot, with the
+  dependencies it has here. Re-proposing decided commands with their
+  decided dependencies would let a behind voter adopt them again, but a
+  proposal of a decided command is a new mechanism; catch-up is
+  task-d08's.
+- The chain starts at the recovered order's last command the leader has
+  not executed. Else it starts at the last command the leader committed
+  and has not executed yet (`CommandTable::committed_tail`, the committed
+  record no other committed record depends on): execution follows the
+  dependencies, so that command comes after everything the leader
+  executed, and every other voter may have executed it already. Else at
+  the last command it executed (`CommandTable::last_executed`, kept by
+  `execute` and `restore_executed`).
+- On a restart, that last command is the last one replayed. coordd
+  replays history, then the executed commands with rows. Both were read
+  back in identity order; `read_history` now sorts by each row's execution
+  position, as the executed rows already were, so what comes back last is
+  what executed last.
+- **The collector compares a late release with its answer.** A collector
+  that answered from this node's record, with the votes counted and the
+  release not yet in, took the release when it came as settled without
+  looking at it. That is why the Jepsen run's forked voter answered seven
+  times and never stopped. The collector now keeps the result digest with
+  each answer, and a release for a command it already answered must agree
+  with the response and the digest. A difference is `AnsweredOtherwise`,
+  and coordd stops on it as it does on `release-record-mismatch`. That
+  does not prevent the first wrong answer; it stops the node from going
+  on.
+
+**Liveness.** A voter that holds a decided command the Sync omits is at
+PRE-ACCEPT after task-d11 and learns the decision only by catch-up
+(task-d08). Before task-d11 it sat at ACCEPT with no commit coming, so
+nothing regresses.
+
+### What the tests show
+
+`activation.rs`:
+- `a_fresh_proposal_follows_the_tail_not_an_executed_reproposal`: six
+  executed commands on one key, and a selection with no entries that
+  re-proposes the second. The new leader's first fresh proposal depends on
+  the sixth, and the second is not proposed again.
+- `a_reproposal_with_no_entry_to_follow_follows_the_executed_tail`: an
+  undecided command only the new leader holds is re-proposed after the
+  executed tail, not with no dependencies.
+- `a_new_leader_chains_after_what_it_committed_and_has_not_executed`:
+  r2 commits three commands and executes none of them while the others
+  execute all six. As the new leader, with nothing re-proposed and with
+  one of the three re-proposed, its fresh proposal follows the sixth.
+- `a_restarted_candidate_with_no_entries_chains_after_what_it_executed`:
+  the candidate is restarted from its executed commands alone, with no
+  rows to rebuild the tail from, wins and chains after its tail.
+- `reproposals_follow_the_recovered_order_not_identity_order` (task-d06)
+  had re-proposed a command the new leader had executed, which is this
+  bug. It now holds the entries unexecuted and the re-proposed command
+  undecided, and still checks the recovered order.
+
+`trim.rs` `a_trimmed_history_comes_back_in_the_order_it_executed`: the
+trimmed prefix's positions are rewritten so identity order is the reverse
+of position order, and the history reads back by position; a table
+restored from it names the last executed command.
+
+`repair.rs` `a_late_release_that_contradicts_the_answer_is_refused`: the
+release is lost, the collector settles from the votes and the record,
+and the release arrives afterwards. It settles when the record agreed,
+and is refused as `AnsweredOtherwise` when the record had another
+response, or the same response under another digest.
+
+Negative controls: without the Commit skip, the first test fails; with
+the chain starting only at the entries' tail, the second; with the
+chain skipping the committed tail, the committed-not-executed test (at
+`076d218` its case with nothing re-proposed passed, and an anchor at the
+last executed command alone breaks it); with
+`restore_executed` not keeping the last command, the restart test; with
+the history in identity order, the trim test; with
+`check_release` as it was, the response fork is accepted, and without the
+digest comparison, the digest fork is.
+
+### What is left
+
+- A node stopped on a divergence serves again from its store after a
+  restart. task-d13 keeps it stopped until an operator clears it or
+  catch-up rebuilds it; planned behind task-d08.
+- The random-kill stress runs and the five-node Jepsen run with this
+  carried are the acceptance.
