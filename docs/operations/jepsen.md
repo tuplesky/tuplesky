@@ -707,6 +707,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `eaaa540` (#106 at `848be52`) | 6 | none | none |
 | `a793a81` (#106 at `b64acc1`) | 6 | none | none |
 | `af06c39` (#107 at `5dfda8b`) | 6 | none | none |
+| `b9059d9` (#107 at `54c6560`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -939,6 +940,24 @@ refuses it (`CandidateBehind`).
   followed. With the default fast set (the leader and the next voters
   by identity), both are in `n3`'s fast set. In the local random run
   above, the refused `n3` was likewise in the leader `n2`'s fast set.
+* **A third run on the same code**
+  ([run 36345511072](https://github.com/tuplesky/tuplesky/actions/runs/36345511072))
+  was clean: `:valid? true`, with 2083 `ok` of 2651, and every node
+  served its final read.
+
+`b9059d9` carries #107 at `54c6560`: a leader whose refused ballot
+outranks its own steps down and campaigns above it, so the refused voter
+can follow it.
+* **Local runs:** 6 random-kill runs and 6 replays. Every final read was
+  served, with no stop, anomaly, `IncompatibleAccepted` or
+  `HalfInitialized`. In one random run, `n3` restarted at 824 against
+  2703 and campaigned for ballot 2; `n2` refused it, `n1` led ballot 3,
+  and `n3` followed ballot 3.
+* **Jepsen**
+  ([run 36346941229](https://github.com/tuplesky/tuplesky/actions/runs/36346941229)):
+  `:valid? true`, with 3278 `ok` of 4154. Every node served its final
+  reads. Two campaigns were refused as behind, and no voter logged a
+  stop, `HalfInitialized` or `IncompatibleAccepted`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
