@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use coord_consensus::{
-    ClosureProgress, CommandTable, GuardViolation, InitError, Phase, RetireError, chain,
-    decode_dependency, dependency_key, dependency_update, empty_path,
+    ClosureProgress, CommandRecord, CommandTable, GuardViolation, InitError, Phase, RetireError,
+    chain, decode_dependency, dependency_key, dependency_update, empty_path,
 };
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
@@ -720,4 +720,56 @@ fn a_closure_stops_at_history_older_than_the_tombstones() {
         panic!("an unbounded step completes");
     };
     assert_eq!(closure.members, BTreeSet::from([cmd(1)]));
+}
+
+/// A table restored with a commit missing between two committed commands
+/// has two committed tails, and nothing in it says which one is last. The
+/// next command anchored at them depends on both, so it follows the real
+/// tail whichever it is (task-d12).
+///
+/// A live table cannot get there -- a commit waits for its dependencies'
+/// -- but a restart can: a command installed from a Sync comes back at
+/// COMMIT from its row, while one committed from votes left its row at
+/// ACCEPT.
+#[test]
+fn a_command_anchored_at_every_committed_tail_follows_the_last_one() {
+    // The earlier of the two committed commands takes the larger
+    // identity, so a choice by identity picks the wrong one.
+    let (one, two) = (cmd(1), cmd(2));
+    let (early, late) = (one.max(two), one.min(two));
+    let between = cmd(3);
+    let mut live = CommandTable::new();
+    for (i, c) in [early, between, late].into_iter().enumerate() {
+        live.initialize(c, payload(i as u8), k("key")).unwrap();
+    }
+    live.accept(early, vec![]).unwrap();
+    live.accept(between, vec![early]).unwrap();
+    live.accept(late, vec![between]).unwrap();
+    // As the rows say after the restart: `between` at ACCEPT.
+    let rows: Vec<(CommandId, CommandRecord)> = [
+        (early, Phase::Commit),
+        (between, Phase::Accept),
+        (late, Phase::Commit),
+    ]
+    .into_iter()
+    .map(|(c, phase)| {
+        let mut record = live.record(&c).unwrap().clone();
+        record.phase = phase;
+        (c, record)
+    })
+    .collect();
+    let mut table = CommandTable::restore(Some(32), rows);
+    let tails = table.committed_tails(b"key");
+    assert_eq!(tails.len(), 2, "{tails:?}");
+    assert!(tails.contains(&early) && tails.contains(&late));
+    table.anchor_all(b"key", &tails);
+    let next = table.initialize(cmd(4), payload(4), k("key")).unwrap();
+    assert!(
+        next.deps.contains(&late),
+        "the next command does not follow the last committed command: {:?}",
+        next.deps
+    );
+    // Once, not for ever: the command after it follows it alone.
+    let after = table.initialize(cmd(5), payload(5), k("key")).unwrap();
+    assert_eq!(after.deps, vec![cmd(4)]);
 }

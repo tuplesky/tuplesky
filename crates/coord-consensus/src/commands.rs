@@ -118,6 +118,9 @@ pub struct Initialized {
 #[derive(Clone, Debug, Default)]
 struct KeyState {
     last: Option<CommandId>,
+    /// Other commands the next command on the key depends on besides
+    /// `last`: the other tails a new leader anchored (task-d12).
+    also: Vec<CommandId>,
     log: PathLog,
 }
 
@@ -374,11 +377,10 @@ impl CommandTable {
         let mut paths = Vec::with_capacity(keys.len());
         for key in &keys {
             let state = self.keys.entry(key.clone()).or_default();
-            if let Some(last) = state.last
-                && last != command
-                && !deps.contains(&last)
-            {
-                deps.push(last);
+            for tail in state.last.into_iter().chain(state.also.drain(..)) {
+                if tail != command && !deps.contains(&tail) {
+                    deps.push(tail);
+                }
             }
             state.last = Some(command);
             let digest = state.log.append(command);
@@ -512,10 +514,13 @@ impl CommandTable {
     pub fn conflicts(&self, keys: &[Vec<u8>]) -> Vec<CommandId> {
         let mut out = Vec::new();
         for key in keys {
-            if let Some(last) = self.keys.get(key).and_then(|k| k.last)
-                && !out.contains(&last)
-            {
-                out.push(last);
+            let Some(state) = self.keys.get(key) else {
+                continue;
+            };
+            for tail in state.last.iter().chain(&state.also) {
+                if !out.contains(tail) {
+                    out.push(*tail);
+                }
             }
         }
         out
@@ -559,7 +564,17 @@ impl CommandTable {
     /// appends, and the leader's paths reach the followers in its
     /// proposals, not through this.
     pub fn anchor(&mut self, key: &[u8], command: CommandId) {
-        self.keys.entry(key.to_vec()).or_default().last = Some(command);
+        self.anchor_all(key, &[command]);
+    }
+
+    /// [`CommandTable::anchor`] at several commands: the next command
+    /// initialized on the key depends on all of them (task-d12). For a new
+    /// leader that cannot tell which of its committed tails is the last:
+    /// depending on every one of them follows whichever it is.
+    pub fn anchor_all(&mut self, key: &[u8], tails: &[CommandId]) {
+        let state = self.keys.entry(key.to_vec()).or_default();
+        state.last = tails.first().copied();
+        state.also = tails.iter().skip(1).copied().collect();
     }
 
     /// Adopt the leader's order and path evidence for a command
@@ -614,17 +629,18 @@ impl CommandTable {
         self.last_executed
     }
 
-    /// The last command on `key` this replica has committed and not yet
-    /// executed: the committed record no other committed record of the
+    /// The last commands on `key` this replica has committed and not yet
+    /// executed: the committed records no other committed record of the
     /// key depends on (task-d12).
     ///
     /// Execution follows the dependencies, so every such command comes
     /// after [`CommandTable::last_executed`] in the key's order, and a
     /// command that must follow everything this replica holds decided
-    /// follows this one. Where the replica lacks a command between two
-    /// committed ones, both look last; the larger identity is taken, as
-    /// [`CommandTable::restore`] does.
-    pub fn committed_tail(&self, key: &[u8]) -> Option<CommandId> {
+    /// follows these. There is one unless the replica lacks a command
+    /// between two committed ones: then both look last, and nothing here
+    /// says which one is, so a command that follows every one of them is
+    /// the only safe successor.
+    pub fn committed_tails(&self, key: &[u8]) -> Vec<CommandId> {
         let committed: Vec<(&CommandId, &CommandRecord)> = self
             .records
             .iter()
@@ -638,7 +654,7 @@ impl CommandTable {
             .into_iter()
             .map(|(c, _)| *c)
             .filter(|c| !depended.contains(c))
-            .max()
+            .collect()
     }
 
     /// Mark a command executed from durable evidence (its executed identity
@@ -733,7 +749,11 @@ impl CommandTable {
                 let Some(oldest) = self.retired.pop_front() else {
                     break;
                 };
-                if self.keys.values().any(|k| k.last == Some(oldest)) {
+                if self
+                    .keys
+                    .values()
+                    .any(|k| k.last == Some(oldest) || k.also.contains(&oldest))
+                {
                     latest.push(oldest);
                 } else {
                     self.executed.remove(&oldest);

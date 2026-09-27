@@ -2679,6 +2679,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             dispatcher.settle_from_record(
                 command,
                 record.result_digest,
+                record.position,
                 record.revision,
                 &record.response,
             )
@@ -2787,6 +2788,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Answer the caller a delivery belongs to, gated against a fresh
     /// barrier.
     fn answer(&mut self, delivery: coord_collector::Delivery) {
+        // A late release has contradicted an answer this node gave from
+        // its own record (task-d12), and the pass ends in the stop. Until
+        // it does, nothing more goes out: not the rest of the voter's
+        // batch, and not what the parked frames or the records settle.
+        if self.answered_otherwise.is_some() {
+            return;
+        }
         let policy = StorePolicySource {
             store: self.backing.applier().store(),
             budget: ViewBudget::default(),
