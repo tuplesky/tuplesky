@@ -4554,3 +4554,53 @@ Negative controls, each run and failing:
   checkpoint: task-d08.
 - **Acceptance on Jepsen.** The five-node Jepsen run is task-d09's
   acceptance and has not run with this change; it needs #98 to carry it.
+
+## A promise is not a leader
+
+task-d10's first commit, from the five-node Jepsen run on #98. After all
+five voters were killed, the one furthest behind campaigned for ballots 2
+to 6 and was promised each one. Its machine then found itself behind
+every reporter and stood down without a Sync (task-d05), so it never led.
+The two voters that promised it followed those ballots and did not
+campaign. The domain served nothing from then on.
+
+`coordd` counted a voter as led when the ballot it promised named another
+voter it held a link to (task-d01). A candidate collects its promises
+before it knows whether it can bind a selection, so a promise is not yet a
+leader, and one whose candidate stood down held every voter that promised
+it for as long as the link held.
+- **The rule.** A voter has a leader when it leads, or when the leader
+  its promised ballot names is linked and that ballot has synchronized
+  here -- the ballot it votes in, the one whose Sync it adopted, is the one
+  it promised -- or has had the ceiling (16 s) to do so, counted from when
+  this voter first saw the promise (`Election::led`).
+- **Why the ceiling and not the patience.** The first version gave a
+  promise only the patience (1 s). A Sync is not a round trip behind the
+  promise: the candidate collects a report from a majority, paged, and
+  binds its selection durably first, which under load takes longer. Voters
+  then campaigned over live candidates, and in five `--fault random` runs
+  the ballots duelled to between 10 and 46, against 2 to 8 without the
+  rule. The ceiling is what a candidate already gives its own campaign
+  before replacing it (`observe`'s `finishing`), so a promise now gets the
+  same.
+- **The candidate's side** is unchanged: its own campaign is its
+  `campaigning` flag, and a stood-down candidate does not campaign again
+  (task-d05).
+
+### What the tests show
+
+`bins/coordd/src/election.rs`:
+- `a_promise_that_never_synchronizes_is_a_leader_only_for_the_ceiling`:
+  the rule's cases. A promise of ballot 3 while still voting in ballot 2
+  is a leader until the ceiling and not after; a new promise starts its
+  own allowance; the link still matters.
+- `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling`:
+  stepped through the schedule, a voter held by a promise that never
+  synchronizes campaigns only after the ceiling, and one whose Sync comes
+  just inside it never does.
+
+### What is left
+
+- The five-node Jepsen run is the acceptance, and has not run with this.
+- The rest of task-d10: flow-controlled catch-up and a campaign that is
+  making progress kept past its ceiling.
