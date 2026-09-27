@@ -218,7 +218,13 @@ pub fn select(
         });
     }
     // Source rule: only the reports at the highest synchronized ballot
-    // supply state (prototype `handleNewLeaderAckNs`: `U`, `maxCbal`).
+    // supply state (prototype `handleNewLeaderAckNs`: `U`, `maxCbal`) --
+    // except their commits. A commit is a quorum's acceptance of one
+    // dependency set, final whatever ballot it was reached in; the source
+    // rule chooses among acceptances and never discards a decision
+    // (task-d12). A report below the source ballot supplies its entries at
+    // COMMIT, executed-as-committed ones included; the rest of it is
+    // re-proposed.
     let source_ballot = reports
         .iter()
         .map(|r| r.committed_ballot)
@@ -231,10 +237,14 @@ pub fn select(
     // an agreement check, not by last writer.
     let mut sorted: Vec<&RecoveryReport> = reports.iter().collect();
     sorted.sort_by_key(|r| r.replica);
+    // Entries whose path evidence so far is a below-source report's: an
+    // at-source copy's replaces it, since sequence numbers and paths are a
+    // ballot's own and only the source ballot's are the leader's order.
+    let mut from_below: BTreeSet<CommandId> = BTreeSet::new();
     for r in sorted {
         let at_source = r.committed_ballot == source_ballot;
         for e in &r.entries {
-            if !at_source || e.phase < Phase::Accept {
+            if e.phase < Phase::Accept || (!at_source && e.phase < Phase::Commit) {
                 reproposed.insert(e.command);
                 continue;
             }
@@ -245,6 +255,9 @@ pub fn select(
             };
             match entries.get_mut(&e.command) {
                 None => {
+                    if !at_source {
+                        from_below.insert(e.command);
+                    }
                     entries.insert(
                         e.command,
                         SyncEntry {
@@ -272,7 +285,17 @@ pub fn select(
                     // leader order, so their per-key digests agree; take
                     // the most recently synchronized copy, which is a
                     // maximum and therefore independent of report order.
-                    if e.seqnum > existing.seqnum {
+                    // An at-source copy outranks a below-source one.
+                    let existing_below = from_below.contains(&e.command);
+                    let replaces = match (at_source, existing_below) {
+                        (true, true) => true,
+                        (false, false) => false,
+                        _ => e.seqnum > existing.seqnum,
+                    };
+                    if at_source {
+                        from_below.remove(&e.command);
+                    }
+                    if replaces {
                         existing.seqnum = e.seqnum;
                         existing.paths = e.paths.clone();
                     }

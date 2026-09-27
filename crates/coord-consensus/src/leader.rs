@@ -428,17 +428,35 @@ impl Leader {
         //
         // Nor an entry this leader has executed: every voter that could
         // report it may have retired it, so it can sit far behind what
-        // this leader executed since. The tail is the last entry this
-        // leader has not executed; else the last command it committed
-        // and has not executed yet, which comes after everything it
-        // executed; else the last command it executed.
-        let mut last = order
+        // this leader executed since.
+        //
+        // Nor any one candidate alone. The last entry this leader has not
+        // executed, the last commands it committed and has not executed
+        // yet, and the last command it executed are each the tail when
+        // the table is right, and each has been wrong: a command that
+        // executed with no executed row came back unexecuted after a
+        // restart, and a chain after it forked from everything executed
+        // since (task-d12, stress run d12-11). Depending on a command that
+        // is already behind the tail orders nothing wrongly, so the chain
+        // starts after all of them.
+        let mut last: Vec<CommandId> = Vec::new();
+        if let Some(tail) = order
             .iter()
             .rev()
             .find(|c| leader.table.phase_of(c) < Some(Phase::Executed))
-            .copied()
-            .or_else(|| leader.table.committed_tail(CONSERVATIVE_KEY))
-            .or_else(|| leader.table.last_executed());
+        {
+            last.push(*tail);
+        }
+        for c in leader
+            .table
+            .committed_tails(CONSERVATIVE_KEY)
+            .into_iter()
+            .chain(leader.table.last_executed())
+        {
+            if !last.contains(&c) {
+                last.push(c);
+            }
+        }
         // Published in a first batch; the rest go out through the re-send,
         // oldest first, as votes come back. A new leader after a long
         // history used to put its whole selection on each follower's
@@ -476,11 +494,10 @@ impl Leader {
             if leader.table.phase_of(c) >= Some(Phase::Commit) {
                 continue;
             }
-            let deps = last.map_or_else(Vec::new, |l| alloc::vec![l]);
+            let deps = core::mem::replace(&mut last, alloc::vec![*c]);
             let publish = published < REPROPOSE_BATCH;
             published += 1;
             effects.extend(leader.repropose(*c, deps, publish));
-            last = Some(*c);
         }
         // The first fresh proposal of this ballot follows the recovered
         // order's tail. Re-proposing moved nothing in the table, so its
@@ -488,8 +505,8 @@ impl Leader {
         // last, which can sit in the middle of that order: a command
         // proposed after it would not wait for the tail on a replica
         // still behind it, and would execute first there (task-d06).
-        if let Some(tail) = last {
-            leader.table.anchor(CONSERVATIVE_KEY, tail);
+        if !last.is_empty() {
+            leader.table.anchor_all(CONSERVATIVE_KEY, &last);
         }
         effects.extend(leader.release());
         (leader, effects)

@@ -25,7 +25,7 @@ use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest};
 use coord_types::{CommandId, RetryKey};
 
-use crate::materialize::{ApplyOutcome, apply_plan};
+use crate::materialize::{ApplyOutcome, apply_plan, apply_refused_plan};
 use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
 use crate::view::ViewError;
@@ -227,9 +227,11 @@ impl<P: Persistence> Applier<P> {
             // An establishing admission with any other operation, and
             // the establishing operation under anything else: neither
             // authorizes the other.
-            (CanonicalOperation::ConsumeAdmission, _) => {
-                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
-            }
+            (CanonicalOperation::ConsumeAdmission, _) => self.apply_refusal(
+                command,
+                request.namespace,
+                RejectionReason::AdmissionMismatch,
+            ),
             // A service operation, accepted with no admission because
             // no verifier admitted one: this is a voter's own proposal,
             // and it is the only kind of command that arrives without a
@@ -240,18 +242,26 @@ impl<P: Persistence> Applier<P> {
                 let internal = coord_state::service_command(&request).expect("a service operation");
                 self.apply_internal(request.namespace, &internal, &binding)
             }
-            (operation, Some(_)) if Self::is_service_operation(operation) => {
-                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
-            }
-            (_, Some(facts)) if facts.purpose() == AdmissionPurpose::Establish => {
-                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
-            }
+            (operation, Some(_)) if Self::is_service_operation(operation) => self.apply_refusal(
+                command,
+                request.namespace,
+                RejectionReason::AdmissionMismatch,
+            ),
+            (_, Some(facts)) if facts.purpose() == AdmissionPurpose::Establish => self
+                .apply_refusal(
+                    command,
+                    request.namespace,
+                    RejectionReason::AdmissionMismatch,
+                ),
             // An ordinary submission. The receipt attests that the caller
             // is bound to the session the retry key names; a receipt
             // naming another session admits nothing under this one.
-            (_, Some(facts)) if facts.attested.session != payload.retry_key.session_id => {
-                self.apply_refusal(request.namespace, RejectionReason::AdmissionMismatch)
-            }
+            (_, Some(facts)) if facts.attested.session != payload.retry_key.session_id => self
+                .apply_refusal(
+                    command,
+                    request.namespace,
+                    RejectionReason::AdmissionMismatch,
+                ),
             _ => self.apply_bound(&request, &binding, payload.ack_through),
         }
     }
@@ -294,10 +304,18 @@ impl<P: Persistence> Applier<P> {
         // session, or the command would establish one identity while
         // recording its outcome under another.
         let Some(receipt) = AdmissionReceiptV1::of(facts) else {
-            return self.apply_refusal(namespace, RejectionReason::AdmissionMismatch);
+            return self.apply_refusal(
+                binding.command_id,
+                namespace,
+                RejectionReason::AdmissionMismatch,
+            );
         };
         if receipt.session != binding.retry_key.session_id {
-            return self.apply_refusal(namespace, RejectionReason::AdmissionMismatch);
+            return self.apply_refusal(
+                binding.command_id,
+                namespace,
+                RejectionReason::AdmissionMismatch,
+            );
         }
         let internal = InternalCommand::ConsumeAdmission {
             namespace,
@@ -344,7 +362,11 @@ impl<P: Persistence> Applier<P> {
                 }
                 Some(_) => {
                     drop(gated);
-                    return self.apply_refusal(namespace, RejectionReason::RetryConflict);
+                    return self.apply_refusal(
+                        binding.command_id,
+                        namespace,
+                        RejectionReason::RetryConflict,
+                    );
                 }
                 None => {}
             }
@@ -391,10 +413,11 @@ impl<P: Persistence> Applier<P> {
     }
 
     /// Execute `reason` as this command's whole result: it takes the
-    /// position that is already its own, records nothing under the retry
-    /// key, and changes nothing else.
+    /// position that is already its own, records that `command` executed,
+    /// records nothing under the retry key, and changes nothing else.
     fn apply_refusal(
         &mut self,
+        command: CommandId,
         namespace: NamespaceId,
         reason: RejectionReason,
     ) -> Result<AppliedOutcome, ApplyError> {
@@ -408,7 +431,7 @@ impl<P: Persistence> Applier<P> {
             .map_err(ApplyError::Plan)?;
             drop(gated);
             let barrier = self.alloc.allocate();
-            match apply_plan(&mut self.store, barrier, namespace, &planned, None)? {
+            match apply_refused_plan(&mut self.store, barrier, namespace, &planned, &command)? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -499,9 +522,9 @@ impl<P: Persistence> Applier<P> {
                 // command unexecuted: the position is already its own,
                 // every successor conflicts with it, and retrying can
                 // only refuse it again. The refusal takes the position
-                // and records nothing under the retry key, so the
-                // original binding stands and a retired request is not
-                // resurrected.
+                // and records that the command executed, and records
+                // nothing under the retry key, so the original binding
+                // stands and a retired request is not resurrected.
                 other => {
                     let reason = Self::admission_rejection_of(&other);
                     let planned = rejection_plan_at(
@@ -512,7 +535,13 @@ impl<P: Persistence> Applier<P> {
                     .map_err(ApplyError::Plan)?;
                     drop(gated);
                     let barrier = self.alloc.allocate();
-                    match apply_plan(&mut self.store, barrier, namespace, &planned, None)? {
+                    match apply_refused_plan(
+                        &mut self.store,
+                        barrier,
+                        namespace,
+                        &planned,
+                        &binding.command_id,
+                    )? {
                         ApplyOutcome::Applied(_) => {
                             let response = postcard::to_allocvec(&planned.response)
                                 .map_err(|_| ApplyError::MalformedPayload)?;

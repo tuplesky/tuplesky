@@ -58,8 +58,9 @@ use coord_storage::{Applier, GroupLimits, StoreWorker};
 use coord_store_testkit::model::ModelEngine;
 use coord_types::identity::Digest32;
 use coord_types::ids::{
-    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, NamespaceId, PolicyRuleId,
-    PrincipalId, ReplicaId, ReplicaIncarnation, RequestSequence, SessionId,
+    Ballot, ClientInstanceId, ClusterId, ConfigurationEpoch, DomainId, ExecutionPosition,
+    KvRevision, NamespaceId, PolicyRuleId, PrincipalId, ReplicaId, ReplicaIncarnation,
+    RequestSequence, SessionId,
 };
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
 use coord_types::wire_v1::{Frame, MessageV1, PeerRole, RequestV1};
@@ -804,6 +805,7 @@ fn a_refused_repair_falls_back_to_the_durable_record() {
         .settle_from_record(
             command,
             record.result_digest,
+            record.position,
             record.revision,
             &record.response,
         )
@@ -825,6 +827,7 @@ fn a_refused_repair_falls_back_to_the_durable_record() {
         w.collector.settle_from_record(
             command,
             record.result_digest,
+            record.position,
             record.revision,
             &record.response
         ),
@@ -866,6 +869,7 @@ fn a_lost_release_is_settled_from_the_durable_record() {
         .settle_from_record(
             command,
             record.result_digest,
+            record.position,
             record.revision,
             &record.response,
         )
@@ -899,8 +903,13 @@ fn the_record_alone_settles_nothing() {
     // No settle: the followers never answer, the leader never executes.
     assert!(w.collector.half_established().is_empty());
     assert_eq!(
-        w.collector
-            .settle_from_record(command, Digest32([0; 32]), None, b""),
+        w.collector.settle_from_record(
+            command,
+            Digest32([0; 32]),
+            ExecutionPosition::ZERO,
+            None,
+            b""
+        ),
         Err(SettleError::Uncorroborated)
     );
     assert!(w.collector.is_pending(&command));
@@ -927,7 +936,7 @@ fn a_record_the_release_contradicts_stops_the_turn() {
     let turn = offer([(command, forked.clone()), (command, forked)], |c, r| {
         offered += 1;
         w.collector
-            .settle_from_record(c, r.result_digest, r.revision, &r.response)
+            .settle_from_record(c, r.result_digest, r.position, r.revision, &r.response)
             .map(Some)
     });
     assert_eq!(turn, Settled::Diverged(command));
@@ -935,7 +944,7 @@ fn a_record_the_release_contradicts_stops_the_turn() {
     assert!(w.collector.is_pending(&command), "nothing was settled");
     let turn = offer(records, |c, r| {
         w.collector
-            .settle_from_record(c, r.result_digest, r.revision, &r.response)
+            .settle_from_record(c, r.result_digest, r.position, r.revision, &r.response)
             .map(Some)
     });
     let Settled::Offered {
@@ -956,9 +965,10 @@ fn a_record_the_release_contradicts_stops_the_turn() {
 /// the caller from this node's own record. When this node executed the
 /// command where the leader did, the late release agrees and settles
 /// nothing further. When it did not -- here, a record with another response,
-/// and then one with the same response under another result digest --
-/// the caller was told something the domain did not decide, and the
-/// release is refused with the command named so the node can stop on it.
+/// then one with the same response under another result digest, at
+/// another position, or with another revision -- the caller was told
+/// something the domain did not decide, and the release is refused with
+/// the command named so the node can stop on it.
 #[test]
 fn a_late_release_that_contradicts_the_answer_is_refused() {
     let digest_of = |w: &Cluster| {
@@ -968,7 +978,7 @@ fn a_late_release_that_contradicts_the_answer_is_refused() {
             .established()
             .result_digest()
     };
-    for fork in [0, 1, 2] {
+    for fork in [0, 1, 2, 3, 4] {
         let mut w = Cluster::new(256);
         w.lose = Lose::Releases;
         let submit = w.submit(1);
@@ -989,6 +999,11 @@ fn a_late_release_that_contradicts_the_answer_is_refused() {
         match fork {
             1 => record.response.push(0xff),
             2 => record.result_digest.0[0] ^= 1,
+            3 => record.position = ExecutionPosition::new(record.position.get() + 1).unwrap(),
+            4 => {
+                record.revision =
+                    Some(KvRevision::new(record.revision.map_or(1, |r| r.get() + 1)).unwrap());
+            }
             _ => {}
         }
         let progress = w
@@ -996,6 +1011,7 @@ fn a_late_release_that_contradicts_the_answer_is_refused() {
             .settle_from_record(
                 command,
                 record.result_digest,
+                record.position,
                 record.revision,
                 &record.response,
             )

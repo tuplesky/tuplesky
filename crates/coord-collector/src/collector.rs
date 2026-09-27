@@ -46,7 +46,7 @@ use coord_consensus::{
 use coord_core::capability::{ReleasedResult, admission_digest};
 use coord_core::event::{AdmittedRequest, PeerProvenance};
 use coord_types::identity::Digest32;
-use coord_types::ids::{KvRevision, ReplicaId, SessionId};
+use coord_types::ids::{ExecutionPosition, KvRevision, ReplicaId, SessionId};
 use coord_types::wire_v1::{
     BoundedBytes, MessageV1, OutcomeV1, ResolveRequestV1, ResponseV1, decode_stream,
 };
@@ -458,16 +458,40 @@ struct Pending {
     dissemination: Dissemination,
 }
 
+/// The execution an answer was given from (task-d12): where the command
+/// executed and what it produced there.
+///
+/// The response alone does not say it. Two executions at different
+/// positions can answer with the same bytes, and an answer over the
+/// deliverable bound is the same `RESULT_TOO_LARGE` whatever it replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Executed {
+    digest: Digest32,
+    position: ExecutionPosition,
+    revision: Option<KvRevision>,
+}
+
+impl Executed {
+    fn released(released: &ReleasedResult) -> Self {
+        let established = released.established();
+        Executed {
+            digest: established.result_digest(),
+            position: established.position(),
+            revision: established.revision(),
+        }
+    }
+}
+
 /// The collector of one domain.
 #[derive(Debug)]
 pub struct Collector {
     config: CollectorConfig,
     pending: BTreeMap<CommandId, Pending>,
     bindings: BTreeMap<RetryKey, CommandId>,
-    /// Answers given, for retries and resolution, with the result digest
-    /// they were given under: a late release is compared with both
+    /// Answers given, for retries and resolution, with the execution
+    /// they were given from: a late release is compared with both
     /// (task-d12).
-    resolved: BTreeMap<RetryKey, (CommandId, ResponseV1, Digest32)>,
+    resolved: BTreeMap<RetryKey, (CommandId, ResponseV1, Executed)>,
     resolved_order: VecDeque<RetryKey>,
     trace: Vec<CollectorEvent>,
     /// Envelope bytes reserved by commands that still owe a
@@ -976,12 +1000,12 @@ impl Collector {
                 .resolved
                 .values()
                 .find(|(c, _, _)| *c == command)
-                .map(|(_, response, digest)| (response.clone(), *digest));
+                .map(|(_, response, executed)| (response.clone(), *executed));
             return match answered {
-                Some((answered, digest)) => {
+                Some((answered, executed)) => {
                     let response =
                         self.answer_of(command, established.revision(), released.response());
-                    if response == answered && established.result_digest() == digest {
+                    if response == answered && executed == Executed::released(released) {
                         Ok(true)
                     } else {
                         Err(EvidenceError::AnsweredOtherwise { command })
@@ -1051,11 +1075,11 @@ impl Collector {
         let fast = matches!(learned, Learned::Fast { .. });
         let established = released.established();
         let response = self.answer_of(command, established.revision(), released.response());
-        let digest = established.result_digest();
+        let executed = Executed::released(&released);
         self.finish(
             command,
             entry,
-            (response, digest),
+            (response, executed),
             released.speculative(),
             fast,
         )
@@ -1089,7 +1113,7 @@ impl Collector {
         &mut self,
         command: CommandId,
         entry: Pending,
-        (response, digest): (ResponseV1, Digest32),
+        (response, executed): (ResponseV1, Executed),
         speculative: bool,
         fast: bool,
     ) -> Progress {
@@ -1098,7 +1122,7 @@ impl Collector {
             OutcomeV1::Ok { revision, .. } => revision.map(|r| r.get()),
             _ => None,
         };
-        self.retain(entry.retry_key, command, response.clone(), digest);
+        self.retain(entry.retry_key, command, response.clone(), executed);
         self.trace.push(CollectorEvent::Released {
             command: command_hex(&command),
             speculative,
@@ -1141,8 +1165,8 @@ impl Collector {
     /// node's own committed state -- the same thing that answers a
     /// caller's retry before anything is submitted -- and it is trusted
     /// here only to complete what the collector already half holds. When
-    /// the release is held, the record must agree with it on the digest
-    /// and the bytes, and then it confirms what the missing votes would
+    /// the release is held, the record must agree with it on the digest,
+    /// the bytes, the position and the revision, and then it confirms what the missing votes would
     /// have: the command executed. When the learning predicate holds, the
     /// record supplies the response the missing release would have
     /// carried. With neither, the record is not used, deliberately: a
@@ -1156,9 +1180,15 @@ impl Collector {
         &mut self,
         command: CommandId,
         result_digest: Digest32,
+        position: ExecutionPosition,
         revision: Option<KvRevision>,
         response: &[u8],
     ) -> Result<Progress, SettleError> {
+        let executed = Executed {
+            digest: result_digest,
+            position,
+            revision,
+        };
         let Some(entry) = self.pending.get(&command) else {
             return if self.is_resolved(&command) {
                 Ok(Progress::Settled)
@@ -1170,9 +1200,7 @@ impl Collector {
         let fast = matches!(learned, Some(Learned::Fast { .. }));
         let corroborated = match (&entry.released, learned.is_some()) {
             (Some(released), _) => {
-                if released.established().result_digest() != result_digest
-                    || released.response() != response
-                {
+                if Executed::released(released) != executed || released.response() != response {
                     return Err(SettleError::Mismatch);
                 }
                 "release"
@@ -1186,7 +1214,7 @@ impl Collector {
             corroborated: corroborated.into(),
         });
         let response = self.answer_of(command, revision, response);
-        Ok(self.finish(command, entry, (response, result_digest), false, fast))
+        Ok(self.finish(command, entry, (response, executed), false, fast))
     }
 
     fn retain(
@@ -1194,9 +1222,9 @@ impl Collector {
         key: RetryKey,
         command: CommandId,
         response: ResponseV1,
-        digest: Digest32,
+        executed: Executed,
     ) {
-        self.resolved.insert(key, (command, response, digest));
+        self.resolved.insert(key, (command, response, executed));
         self.resolved_order.push_back(key);
         while self.resolved_order.len() > self.config.max_resolved {
             let old = self.resolved_order.pop_front().expect("non-empty");
