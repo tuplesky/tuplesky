@@ -181,6 +181,26 @@ which doesn't cancel runs in progress. One etcd run on this PR logged
 nothing for 84 minutes after its time limit ran out
 ([run 36323935964](https://github.com/tuplesky/tuplesky/actions/runs/36323935964)).
 
+Each job's summary digests its run, since the job log runs to thousands
+of lines. `scripts/ci/jepsen_summary.py` reads the test's store
+(`jepsen.log`, `results.edn` and each node's log) and writes:
+
+* the verdict, with Elle's anomaly types when there are any;
+* the operation counts, `ok` per 30 s, the last `ok` and the last fault
+  operation (the final heal);
+* each node's final reads after the heal, and why the others failed,
+  which says whether the domain served again;
+* the commonest reasons an operation was not `ok`, and the faults in
+  order;
+* for the TupleSky job, one row per voter from its `coordd.log`: boots,
+  the position it last recovered at, its last role, its highest ballot,
+  and its stops, panics, `HalfInitialized`, `IncompatibleAccepted`,
+  `CandidateBehind`, `BehindVoters`, `Backpressure`,
+  `ProposalRepublished` and TLS alert 120. A refusal the daemon logs as
+  "(N so far)" counts the highest N in each boot.
+
+The last 400 lines of each voter's log follow in the TupleSky job's log.
+
 The first paired run, on `65336cf`
 ([run 36273802438](https://github.com/tuplesky/tuplesky/actions/runs/36273802438)),
 was `:valid? true` for both, with etcd 3.7.2. Each test draws its own

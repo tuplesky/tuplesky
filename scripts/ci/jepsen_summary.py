@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""Digest a Jepsen store into a Markdown job summary (docs/operations/jepsen.md).
+
+A Jepsen job's log runs to thousands of lines. This reads the test's store
+directory (`store/latest`) and writes what a reader looks for first:
+
+* the verdict, with Elle's anomaly types when there are any;
+* the operation counts, `ok` per 30 s, the last `ok` and the final heal;
+* each node's final reads, which say whether the domain served again;
+* the commonest failure reasons;
+* the faults, in order;
+* for a TupleSky run, one row per voter from its `coordd.log`: boots,
+  where it last recovered, its last role and the refusals and stops that
+  mark the failures seen so far.
+
+    scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
+
+The Markdown goes to `$GITHUB_STEP_SUMMARY` when it is set, and to standard
+output otherwise. It reads only `jepsen.log`, `results.edn` and
+`n*/coordd.log`; a missing file leaves its section out. Exit status 0
+unless the store directory does not exist.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+
+# `jepsen.log` in the store: "%d{ISO8601}{GMT}\t%p\t[%t] %c: %m".
+FILE_LINE = re.compile(
+    r"^(?P<ts>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d[,.]\d+)(?:\{GMT\})?\s+\w+\s+"
+    r"\[(?P<thread>[^\]]+)\] (?P<logger>[\w.$-]+): (?P<msg>.*)$"
+)
+# The console's layout, "%p [%d] %t - %c %m", for a log copied from a job.
+CONSOLE_LINE = re.compile(
+    r"^\w+ \[(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d[,.]\d+)\] "
+    r"(?P<thread>.+?) - (?P<logger>[\w.$-]+) (?P<msg>.*)$"
+)
+OP_LOGGERS = ("jepsen.print", "jepsen.util")
+WORKER = re.compile(r"^jepsen worker (\d+)$")
+BUCKET_S = 30
+# What a voter's log says, in the words the daemon uses. A counted refusal
+# is logged at powers of two as "(N so far)", so the count is the highest
+# N in each boot, summed over boots; a line without one counts once.
+MARKERS = (
+    ("stopped", "this node stopped"),
+    ("panicked", "panicked at"),
+    ("HalfInitialized", "HalfInitialized"),
+    ("IncompatibleAccepted", "IncompatibleAccepted"),
+    ("CandidateBehind", "CandidateBehind"),
+    ("BehindVoters", "BehindVoters"),
+    ("Backpressure", "Backpressure"),
+    ("ProposalRepublished", "ProposalRepublished"),
+    ("alert 120", "error 120"),
+)
+SO_FAR = re.compile(r"\((\d+) so far\)")
+ROLE = re.compile(
+    r"this voter (leads ballot \d+|follows ballot \d+ led by \w+|is a candidate for ballot \d+)"
+)
+BALLOT = re.compile(r"ballot (\d+)")
+# `[:no-client "throw+: {:type :ns/kind, ... :error \"why\"}"]`
+SLINGSHOT = re.compile(r':type :[\w.-]+/([\w-]+).*?:error \\?"([^"\\]*)')
+RECOVERED = re.compile(r"^recovered .*\bexecuted=(\d+)")
+
+
+@dataclass
+class Op:
+    at: datetime.datetime
+    thread: str
+    process: str
+    type: str
+    f: str
+    value: str
+    error: str
+
+
+@dataclass
+class Voter:
+    boots: int = 0
+    executed: str = "-"
+    role: str = "-"
+    ballot: int | None = None
+    counts: dict = field(default_factory=dict)
+
+
+def parse_time(ts: str) -> datetime.datetime:
+    return datetime.datetime.strptime(ts.replace("T", " ").replace(".", ","), "%Y-%m-%d %H:%M:%S,%f")
+
+
+def parse_ops(lines) -> list[Op]:
+    """The operations Jepsen logged, in log order."""
+    ops = []
+    for line in lines:
+        line = line.rstrip("\n")
+        m = FILE_LINE.match(line) or CONSOLE_LINE.match(line)
+        if not m or m["logger"] not in OP_LOGGERS:
+            continue
+        parts = m["msg"].split("\t")
+        if len(parts) < 4 or not parts[1].startswith(":"):
+            continue
+        ops.append(
+            Op(
+                at=parse_time(m["ts"]),
+                thread=m["thread"],
+                process=parts[0],
+                type=parts[1][1:],
+                f=parts[2],
+                value=parts[3],
+                error="\t".join(parts[4:]),
+            )
+        )
+    return ops
+
+
+def parse_results(text: str) -> tuple[str, list[str]]:
+    """The top-level `:valid?` of results.edn and Elle's anomaly types."""
+    valid = "missing"
+    for m in re.finditer(r"^ :valid\? (\S+?)\}*$", text, re.M):
+        valid = m[1]
+    anomalies = []
+    for m in re.finditer(r":anomaly-types\s*[\[(]([^\])]*)[\])]", text):
+        anomalies += [a for a in m[1].replace(",", " ").split() if a not in anomalies]
+    return valid, anomalies
+
+
+def parse_voter(lines) -> Voter:
+    v = Voter()
+    boot: dict = {}
+    for line in lines:
+        if line.startswith("metrics "):
+            continue
+        if line.startswith("coordd domain="):
+            v.boots += 1
+            for k, n in boot.items():
+                v.counts[k] = v.counts.get(k, 0) + n
+            boot = {}
+            continue
+        m = RECOVERED.match(line)
+        if m:
+            v.executed = m[1]
+        m = ROLE.search(line)
+        if m:
+            v.role = m[1]
+        if "this voter" in line and "ballot" in line:
+            for b in BALLOT.findall(line):
+                v.ballot = max(v.ballot or 0, int(b))
+        for key, needle in MARKERS:
+            if needle in line:
+                so_far = SO_FAR.search(line)
+                n = int(so_far[1]) if so_far else boot.get(key, 0) + 1
+                boot[key] = max(boot.get(key, 0), n)
+    for k, n in boot.items():
+        v.counts[k] = v.counts.get(k, 0) + n
+    return v
+
+
+def node_of(op: Op, nodes: list[str]) -> str:
+    """Jepsen binds worker thread N to node N mod the node count."""
+    m = WORKER.match(op.thread)
+    if not m or not nodes:
+        return "?"
+    return nodes[int(m[1]) % len(nodes)]
+
+
+def reason(op: Op) -> str:
+    """Why an operation was not ok, short: a client that could not start
+    reads as its exception type and message rather than the whole map."""
+    m = SLINGSHOT.search(op.error)
+    if m:
+        return clip(f"{m[1]}: {m[2]}", 70)
+    return clip(op.error, 70)
+
+
+def clip(s: str, n: int = 90) -> str:
+    s = s.replace("|", "\\|").replace("\n", " ")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def summarize(store: str, nodes: list[str], title: str) -> str:
+    out = [f"## {title}", ""]
+    log_path = os.path.join(store, "jepsen.log")
+    ops = []
+    if os.path.exists(log_path):
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            ops = parse_ops(f)
+    results_path = os.path.join(store, "results.edn")
+    if os.path.exists(results_path):
+        with open(results_path, encoding="utf-8", errors="replace") as f:
+            valid, anomalies = parse_results(f.read())
+    else:
+        valid, anomalies = "no results.edn (the test did not finish)", []
+    out.append(f"**Verdict:** `:valid? {valid}`" if not valid.startswith("no ") else f"**Verdict:** {valid}")
+    if anomalies:
+        out.append("")
+        out.append("**Anomalies:** " + ", ".join(f"`{a}`" for a in anomalies))
+    out.append("")
+
+    client = [o for o in ops if not o.process.startswith(":")]
+    nemesis = [o for o in ops if o.process == ":nemesis" and o.type == "info"]
+    done = [o for o in client if o.type != "invoke"]
+    if client:
+        start = client[0].at
+        kinds = collections.Counter(o.type for o in done)
+        oks = [o for o in done if o.type == "ok"]
+        heal = nemesis[-1].at if nemesis else None
+        out.append("| Operations | `ok` | `fail` | `info` | Last `ok` | Last fault op |")
+        out.append("| --- | --- | --- | --- | --- | --- |")
+        last_ok = f"{oks[-1].at:%H:%M:%S} (+{(oks[-1].at - start).seconds} s)" if oks else "none"
+        last_fault = f"{heal:%H:%M:%S} (+{(heal - start).seconds} s)" if heal else "none"
+        out.append(
+            f"| {len(done)} | {kinds['ok']} | {kinds['fail']} | {kinds['info']} | {last_ok} | {last_fault} |"
+        )
+        out.append("")
+        buckets = collections.Counter((o.at - start).seconds // BUCKET_S for o in oks)
+        end = (done[-1].at - start).seconds // BUCKET_S if done else 0
+        row = " · ".join(f"{b * BUCKET_S}s:{buckets.get(b, 0)}" for b in range(end + 1))
+        out.append(f"`ok` per {BUCKET_S} s: {row}")
+        out.append("")
+
+        # The final reads: each worker's operations invoked after the last
+        # fault operation (the final heal), with what answered them. A
+        # worker's operations are sequential, so an invocation's answer is
+        # that worker's next completion.
+        if heal is not None:
+            per = collections.defaultdict(lambda: [0, 0, collections.Counter()])
+            waiting = {}
+            for o in client:
+                if o.type == "invoke":
+                    if o.at > heal:
+                        waiting[o.thread] = o
+                    continue
+                if waiting.pop(o.thread, None) is None:
+                    continue
+                row_ = per[node_of(o, nodes)]
+                if o.type == "ok":
+                    row_[0] += 1
+                else:
+                    row_[1] += 1
+                    row_[2][reason(o) or o.type] += 1
+            for o in waiting.values():
+                row_ = per[node_of(o, nodes)]
+                row_[1] += 1
+                row_[2]["no answer"] += 1
+            if per:
+                served = sum(1 for r in per.values() if r[0])
+                out.append(f"**After the final heal:** {served} of {len(per)} nodes served a final read.")
+                out.append("")
+                out.append("| Node | Reads `ok` | Reads not `ok` | Why not |")
+                out.append("| --- | --- | --- | --- |")
+                for node in sorted(per):
+                    ok, bad, why = per[node]
+                    reasons = "; ".join(f"`{r}` ×{n}" for r, n in why.most_common(3))
+                    out.append(f"| {node} | {ok} | {bad} | {reasons} |")
+                out.append("")
+
+        fails = collections.Counter(reason(o) for o in done if o.type != "ok" and o.error)
+        if fails:
+            out.append("<details><summary>Commonest reasons an operation was not ok</summary>")
+            out.append("")
+            out.append("| Count | Reason |")
+            out.append("| --- | --- |")
+            for why, n in fails.most_common(8):
+                out.append(f"| {n} | `{why}` |")
+            out.append("")
+            out.append("</details>")
+            out.append("")
+    elif ops or os.path.exists(log_path):
+        out.append("No client operations in `jepsen.log`.")
+        out.append("")
+    else:
+        out.append("No `jepsen.log` in the store.")
+        out.append("")
+
+    if nemesis:
+        start = client[0].at if client else nemesis[0].at
+        out.append(f"<details><summary>Faults ({len(nemesis)} operations)</summary>")
+        out.append("")
+        out.append("| Time | + s | Fault | Result |")
+        out.append("| --- | --- | --- | --- |")
+        for o in nemesis:
+            out.append(f"| {o.at:%H:%M:%S} | {(o.at - start).seconds} | `{o.f}` | {clip(o.value, 80)} |")
+        out.append("")
+        out.append("</details>")
+        out.append("")
+
+    voters = {}
+    for node in sorted(os.listdir(store)) if os.path.isdir(store) else []:
+        path = os.path.join(store, node, "coordd.log")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                voters[node] = parse_voter(f)
+    if voters:
+        keys = [k for k, _ in MARKERS]
+        out.append("**Voters** (from each `coordd.log`; a refusal counts the highest \"so far\" in each boot)")
+        out.append("")
+        out.append("| Node | Boots | Executed at last boot | Last role | Highest ballot | " + " | ".join(keys) + " |")
+        out.append("| --- " * (5 + len(keys)) + "|")
+        for node, v in voters.items():
+            counts = " | ".join(str(v.counts.get(k, 0)) for k in keys)
+            ballot = "-" if v.ballot is None else str(v.ballot)
+            out.append(f"| {node} | {v.boots} | {v.executed} | {v.role} | {ballot} | {counts} |")
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("store", help="the test's store directory, e.g. store/latest")
+    p.add_argument("--nodes-file", help="one node per line, in Jepsen's order")
+    p.add_argument("--title", default="Jepsen")
+    a = p.parse_args()
+    if not os.path.isdir(a.store):
+        print(f"no store directory at {a.store}", file=sys.stderr)
+        return 1
+    nodes = []
+    if a.nodes_file and os.path.exists(a.nodes_file):
+        with open(a.nodes_file, encoding="utf-8") as f:
+            nodes = [line.strip() for line in f if line.strip()]
+    if not nodes:
+        # Without the nodes file: the directories Jepsen copied node logs
+        # into, which is every node the test ran on.
+        nodes = sorted(
+            d
+            for d in os.listdir(a.store)
+            if os.path.isdir(os.path.join(a.store, d))
+            and any(n.endswith(".log") for n in os.listdir(os.path.join(a.store, d)))
+        )
+    text = summarize(a.store, nodes, a.title)
+    target = os.environ.get("GITHUB_STEP_SUMMARY")
+    if target:
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(text)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

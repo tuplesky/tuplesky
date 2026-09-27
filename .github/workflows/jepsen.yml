@@ -43,6 +43,7 @@ on:
     paths:
       - .github/workflows/jepsen.yml
       - crates/coord-jepsen/**
+      - scripts/ci/jepsen_summary.py
   schedule:
     # Weekly, after the Kubernetes certification.
     - cron: "17 6 * * 1"
@@ -152,6 +153,17 @@ jobs:
             --nemesis "$NEMESIS" \
             --time-limit "$TIME_LIMIT" \
             --concurrency 2n
+      - name: Summarize the run
+        if: always()
+        # The verdict, counts, final reads per node, faults and one row per
+        # voter, in the job summary; each voter's last 400 lines follow here.
+        run: |
+          if [ -d jepsen/tuplesky/store/latest ]; then
+            python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "TupleSky: $WORKLOAD, $NEMESIS"
+          else
+            echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Show each voter's log
         if: always()
         # Jepsen copies each voter's coordd.log into the test's store before
@@ -195,6 +207,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: tuplesky
+          persist-credentials: false
+          sparse-checkout: scripts/ci
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: tuplesky/jepsen
@@ -265,6 +282,15 @@ jobs:
             --rate 20 \
             --time-limit "$TIME_LIMIT" \
             --concurrency 2n
+      - name: Summarize the run
+        if: always()
+        run: |
+          if [ -d etcd-test/store/latest ]; then
+            python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS"
+          else
+            echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Pack the Jepsen store
         if: always()
         run: |
