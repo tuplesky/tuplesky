@@ -717,7 +717,14 @@ impl Cluster {
             .promise
             .as_ref()
             .map_or(ballot(0, 0), |p| p.synced);
-        let executed: Vec<CommandId> = recovered.executed.iter().map(|(c, _)| *c).collect();
+        // As `coordd` restores it: identities a trim left without a
+        // dependency row first, then the ones that still have rows.
+        let executed: Vec<CommandId> = recovered
+            .history
+            .iter()
+            .copied()
+            .chain(recovered.executed.iter().map(|(c, _)| *c))
+            .collect();
         let resume = recovered.resumable_sync(&r(i as u8)).cloned();
         let mut f = Follower::recover(
             FollowerConfig {
@@ -1838,9 +1845,11 @@ fn recovery_refuses_a_payload_row_under_the_wrong_command_key() {
 }
 
 #[test]
-fn recovery_charges_every_row_against_one_byte_budget() {
-    // The budget bounds the whole recovery: many rows that each fit a page
-    // must still be refused once their total exceeds it.
+fn recovery_reads_every_row_however_many_pages_it_takes() {
+    // The budget bounds a page, not the recovery (task-d05): a voter's
+    // protocol rows are what it owes the domain, and a recovery refused
+    // for their total left a healthy voter unable ever to start again.
+    // Many rows that each fit a page are all read, a page at a time.
     let (backend, _shared) = FaultBackend::new(Vec::new(), FaultPlan::default());
     let engine = RedbEngine::create_on_backend(backend, CACHE).unwrap();
     let boot = boot_id(0, 1);
@@ -1885,12 +1894,13 @@ fn recovery_charges_every_row_against_one_byte_budget() {
         max_rows: 10_000,
         max_bytes: 1024,
     };
-    let err = read_protocol(gated.view(), epoch(), budget)
-        .expect_err("the cumulative bytes exceed the budget");
-    assert_eq!(err.class, coord_store_api::engine::ErrorClass::Limit);
-    // The same rows load under a budget that admits them.
+    let paged = read_protocol(gated.view(), epoch(), budget)
+        .expect("the total is not bounded by one page's bytes");
+    // The same rows as under a budget whose one page holds them all.
     let recovered = read_protocol(gated.view(), epoch(), ViewBudget::default()).unwrap();
     assert_eq!(recovered.records.len(), 32);
+    assert_eq!(paged.records, recovered.records);
+    assert_eq!(paged.payloads, recovered.payloads);
 }
 
 /// A canonical request whose identity is derived from sequence `seq`.

@@ -909,3 +909,108 @@ fn a_renewal_issuer_is_https_or_an_allowed_loopback_address() {
         Err(ConfigError::Parse(_))
     ));
 }
+
+/// The command table's capacity is configuration, within bounds
+/// (task-d05).
+///
+/// Nothing sets it and a voter gets the raised default; a value inside
+/// the bounds is taken as written; one outside them is refused and the
+/// setting is named, rather than a voter starting with a table that
+/// cannot reclaim or cannot be allocated.
+#[test]
+fn the_command_table_capacity_is_configuration_within_bounds() {
+    use coord_daemon::config::{
+        DEFAULT_COMMAND_TABLE_CAPACITY, MAX_COMMAND_TABLE_CAPACITY, MIN_COMMAND_TABLE_CAPACITY,
+    };
+    let unset = Config::parse(&base_config("")).unwrap();
+    assert_eq!(
+        unset.limits.command_table_capacity,
+        DEFAULT_COMMAND_TABLE_CAPACITY
+    );
+    let limits = |capacity: usize| {
+        base_config(&format!(
+            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
+             command_table_capacity = {capacity}\n"
+        ))
+    };
+    for capacity in [MIN_COMMAND_TABLE_CAPACITY, 1000, MAX_COMMAND_TABLE_CAPACITY] {
+        let config = Config::parse(&limits(capacity)).unwrap();
+        assert_eq!(config.limits.command_table_capacity, capacity);
+    }
+    for capacity in [
+        0,
+        MIN_COMMAND_TABLE_CAPACITY - 1,
+        MAX_COMMAND_TABLE_CAPACITY + 1,
+    ] {
+        assert_eq!(
+            Config::parse(&limits(capacity)),
+            Err(ConfigError::OutOfRange {
+                field: "limits.command_table_capacity",
+                min: MIN_COMMAND_TABLE_CAPACITY as u64,
+                max: MAX_COMMAND_TABLE_CAPACITY as u64,
+            }),
+            "{capacity}"
+        );
+    }
+}
+
+/// The largest configured table still gives a Sync that can be written
+/// as one row and sent as one frame (task-d05).
+///
+/// A report names what its voter has not executed and what it executed
+/// recently -- at most its live records and its tombstones, about twice
+/// the capacity -- and a Sync is selected from a majority of reports. A
+/// capacity whose worst case did not fit would fail at the moment an
+/// election binds its selection, which is the worst moment to find out.
+#[test]
+fn the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame() {
+    use coord_consensus::rows::{SyncRecordV1, sync_update};
+    use coord_consensus::{Phase, ProtocolMessage, SyncDecision, SyncEntry};
+    use coord_daemon::config::MAX_COMMAND_TABLE_CAPACITY;
+    use coord_types::CommandId;
+    use coord_types::identity::Digest32;
+    use coord_types::ids::{Ballot, ConfigurationEpoch, ReplicaId};
+    use coord_types::wire_v1::KindRange;
+
+    // Five voters: a majority of three reports, disjoint in the worst case.
+    let worst = 3 * (2 * MAX_COMMAND_TABLE_CAPACITY + 1);
+    let id = |n: usize| {
+        let mut d = [0xffu8; 32];
+        d[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let ballot = Ballot {
+        epoch: ConfigurationEpoch::new(u64::MAX).unwrap(),
+        number: u64::MAX,
+        leader: ReplicaId([0xff; 16]),
+    };
+    let entries = (0..worst)
+        .map(|n| {
+            (
+                id(n),
+                SyncEntry {
+                    command: id(n),
+                    phase: Phase::Commit,
+                    deps: vec![id(n + worst)],
+                    path: Digest32([0xff; 32]),
+                    paths: vec![(b"*".to_vec(), Digest32([0xff; 32]))],
+                    seqnum: u64::MAX,
+                },
+            )
+        })
+        .collect();
+    let decision = SyncDecision {
+        ballot,
+        source_ballot: ballot,
+        entries,
+        reproposed: Default::default(),
+    };
+    let frame = ProtocolMessage::Sync(decision.clone()).encode();
+    assert!(
+        frame.len() <= KindRange::ProtocolEvidence.max_frame_length() as usize,
+        "a worst-case Sync is {} bytes",
+        frame.len()
+    );
+    sync_update(ballot.epoch, &SyncRecordV1 { decision }).expect("a worst-case Sync fits one row");
+}

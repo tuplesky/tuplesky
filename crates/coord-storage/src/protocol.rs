@@ -62,6 +62,17 @@ pub struct RecoveredProtocol {
     /// Trimming may remove the dependency rows of executed commands, so
     /// this is what still has rows, not the whole executed history.
     pub executed: Vec<(CommandId, ExecutionPosition)>,
+    /// Every other executed identity: commands whose `executed_v1` row
+    /// survives and whose dependency row does not, in key order
+    /// (task-d05).
+    ///
+    /// A checkpoint trim removes the dependency rows of an executed
+    /// prefix and keeps its executed rows. Read only through the
+    /// dependency rows, those commands came back unknown, and a live
+    /// record naming one -- the first proposal after a reclaim names the
+    /// retired latest -- failed the execution guard on every restart.
+    /// This is the executed answer for them.
+    pub history: Vec<CommandId>,
     /// The durable execution frontier: how far this store has actually
     /// executed, whatever protocol rows survive.
     pub frontier: ExecutionPosition,
@@ -76,6 +87,7 @@ impl Default for RecoveredProtocol {
             syncs: Vec::new(),
             payloads: Vec::new(),
             executed: Vec::new(),
+            history: Vec::new(),
             frontier: ExecutionPosition::ZERO,
         }
     }
@@ -139,9 +151,18 @@ fn corrupt(what: &'static str) -> EngineError {
     EngineError::new(ErrorClass::Corrupt, what)
 }
 
-/// Read the epoch's protocol state from a durable view, within `budget`
-/// rows per collection scan (a budget overrun is a limit error, never a
-/// silently truncated recovery).
+/// Read the epoch's protocol state from a durable view, paged within
+/// `budget` rows and bytes per page.
+///
+/// Every row the store holds is read, however many pages that takes
+/// (task-d05). The budget bounds each page, not the recovery: a voter's
+/// protocol rows are what it owes the domain, and their number is bounded
+/// by the checkpoint trim, not by the schema's view budget. That budget
+/// exists for the execution path, where overrunning it is a replicated
+/// result; applied to the whole recovery, it made a healthy voter whose
+/// history outgrew it unable ever to start again. What recovery keeps in
+/// memory is what the machine keeps for the life of the process anyway,
+/// as with [`read_history`].
 pub fn read_protocol<V: OrderedRead>(
     view: &V,
     epoch: ConfigurationEpoch,
@@ -159,25 +180,6 @@ pub fn read_protocol<V: OrderedRead>(
     let mut records = Vec::new();
     let mut syncs = Vec::new();
     let mut resume: Option<Vec<u8>> = None;
-    let mut seen = 0u32;
-    // The budget bounds the whole recovery, not one page: every row of
-    // every page, and every payload and executed row read below, is
-    // charged against it, so a projection of many individually small rows
-    // cannot make recovery allocate without limit.
-    let mut bytes_left = budget.max_bytes;
-    let charge = |taken: usize, left: &mut u32| -> Result<(), EngineError> {
-        let taken = u32::try_from(taken).unwrap_or(u32::MAX);
-        match left.checked_sub(taken) {
-            Some(rest) => {
-                *left = rest;
-                Ok(())
-            }
-            None => Err(EngineError::new(
-                ErrorClass::Limit,
-                "protocol rows exceed the recovery byte budget",
-            )),
-        }
-    };
     loop {
         let page = view.scan_page(
             Collection::ProtocolV1.id(),
@@ -187,18 +189,10 @@ pub fn read_protocol<V: OrderedRead>(
                 direction: Direction::Forward,
                 resume_after: resume.clone(),
                 max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
-                max_bytes: bytes_left.max(1).try_into().expect("non-zero"),
+                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
             },
         )?;
         for row in &page.rows {
-            seen += 1;
-            if seen > budget.max_rows {
-                return Err(EngineError::new(
-                    ErrorClass::Limit,
-                    "protocol rows exceed the recovery budget",
-                ));
-            }
-            charge(row.key.len() + row.value.len(), &mut bytes_left)?;
             match row.key.get(8) {
                 Some(&DEPENDENCY_TAG) if row.key.len() == 41 => {
                     let mut id = [0u8; 32];
@@ -223,7 +217,6 @@ pub fn read_protocol<V: OrderedRead>(
         if record.payload.is_some() {
             match view.get(Collection::PayloadV1.id(), &payload_key(command))? {
                 Some(bytes) => {
-                    charge(bytes.len(), &mut bytes_left)?;
                     let payload = decode_payload(&bytes)?;
                     // The row is only this command's payload if it rehashes
                     // to this identity. A well-formed payload under the
@@ -245,12 +238,12 @@ pub fn read_protocol<V: OrderedRead>(
         if let Some(bytes) =
             view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))?
         {
-            charge(bytes.len(), &mut bytes_left)?;
             let ExecutedRecordV1 { position, .. } = codecs::decode_executed(&bytes)?;
             executed.push((*command, position));
         }
     }
     executed.sort_by_key(|(_, p)| *p);
+    let history = read_history(view, &records, budget)?;
     let frontier = crate::lowering::DurableMeta::read(view)?
         .frontier
         .execution_position;
@@ -261,6 +254,54 @@ pub fn read_protocol<V: OrderedRead>(
         syncs,
         payloads,
         executed,
+        history,
         frontier,
     })
+}
+
+/// Every executed identity without a dependency row among `records`,
+/// read from `executed_v1` itself (task-d05).
+///
+/// Paged within `budget` per page, like the protocol rows: the answer is one identity per command executed, which
+/// the machine keeps in memory for the life of the process anyway (its
+/// executed answer). It grows with the history until a floor lets
+/// `executed_v1` forget a prefix every voter executed, which is the same
+/// bound that set is waiting for.
+fn read_history<V: OrderedRead>(
+    view: &V,
+    records: &[(CommandId, CommandRecord)],
+    budget: ViewBudget,
+) -> Result<Vec<CommandId>, EngineError> {
+    let known: std::collections::BTreeSet<CommandId> = records.iter().map(|(c, _)| *c).collect();
+    let mut history = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            Collection::ExecutedV1.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.clone(),
+                max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
+                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+            },
+        )?;
+        for row in &page.rows {
+            let id: [u8; 32] = row
+                .key
+                .as_slice()
+                .try_into()
+                .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
+            let command = CommandId(Digest32(id));
+            if !known.contains(&command) {
+                history.push(command);
+            }
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    Ok(history)
 }
