@@ -4386,8 +4386,44 @@ itself:
   committed from the frontier, or from the leader's proposal and two
   peers' acknowledgements, and executed under facts the quorum never
   admitted (Codex, on #103). A held proposal whose admission differs from
-  the bound payload's is now refused as `AdmissionConflict`, and so is
-  its admission past a full table's capacity.
+  the bound payload's is not adopted, and not admitted past a full
+  table's capacity either.
+
+### A follower that took other facts rebinds to the leader's
+
+Refusing such a proposal left the voter stalled on that command, and
+with the chain total, on everything after it. The conflict is routine,
+not an attack:
+- Every presentation of a command mints its own admission receipt. The
+  receipt id mixes the collector's clock and a counter, and the
+  admission digest binds the receipt id and the admission time.
+- A submitter that presents again after a lost link therefore reaches
+  the voters under facts the leader never saw. A voter that missed the
+  first presentation takes the second, and then meets the leader's
+  proposal under the first.
+
+So a follower now fetches the leader's facts and binds them in place of
+its own, while nothing has been accepted over them:
+- **Held, not dropped.** A proposal under other facts than a record at
+  PRE-ACCEPT is held and reported as `AdmissionConflict`, whichever
+  arrived first. It is not counted in the vote set, which may have bound
+  the other facts. Past PRE-ACCEPT the record's facts are the ones this
+  replica acknowledged adopting, and the proposal is refused as before.
+- **Asked for as missing.** The command counts as a missing payload, and
+  as a due one once the leader's frontier covers it, so the paced ask
+  names it.
+- **Rebound.** A transferred payload under the held proposal's facts
+  rebinds the record (`CommandTable::rebind`, only at PRE-ACCEPT). The
+  payload and dependency rows are written again under the new facts in
+  one batch, so a restart restores the record as rebound. The old
+  payload is no longer served, and the new one is once durable. The vote
+  set starts again from the proposal. Then the proposal is adopted, and
+  the frontier commits it.
+- **What is replaced** is this replica's local order, which adoption
+  replaces anyway, and its fast acknowledgement under the other facts.
+  No quorum counts that acknowledgement: every learning predicate needs
+  the leader's proposal, and a vote set counts nothing under facts other
+  than the ones it bound.
 
 ### A full table admits the command whose turn has come
 
@@ -4466,10 +4502,14 @@ needs its peers:
 - `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`:
   r3 adopts six commands and commits none. It is killed and restarted
   under the same leader, and three more follow; it executes all nine.
-- `a_proposal_held_before_a_conflicting_payload_is_not_adopted`: the
-  proposal reaches r3 before r3's own submission, which carries another
-  admission receipt. r3 adopts nothing, executes nothing and reports the
-  conflict.
+- `a_follower_that_took_a_command_under_other_facts_after_its_proposal_rebinds`:
+  the proposal reaches r3 before r3's own submission, which carries
+  another admission receipt. r3 reports the conflict, rebinds to the
+  leader's facts and executes the command and three more under them.
+  The durable row names the leader's facts, and a restart restores its
+  payload.
+- `a_follower_that_took_a_command_under_other_facts_before_its_proposal_rebinds`:
+  the same with r3's submission first.
 - `a_frontier_from_another_voter_is_ignored`, and
   `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed`
   (three of five voters down: the frontier stays, then moves once they
@@ -4480,7 +4520,8 @@ Negative controls, each run and failing:
   fail; the leader's own frontier test is the one that passes;
 - without the proposal ask, the restart test executes nothing on r3;
 - without the admission check at adoption, r3 executes the conflicting
-  facts;
+  facts in both rebind tests;
+- without the rebind, r3 executes nothing in either;
 - without admission past capacity, the full-table test executes the
   first eight and stops;
 - without the ordered ask, the ask test leads with other commands.

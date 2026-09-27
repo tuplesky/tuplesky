@@ -389,6 +389,30 @@ impl CommandTable {
         })
     }
 
+    /// Bind `payload` in place of the admission a command was initialized
+    /// under, while nothing has been accepted over it (task-d09).
+    ///
+    /// For a follower that took its own submission under other attested
+    /// facts than the ones the leader proposed: every presentation of a
+    /// command mints its own admission receipt, so a submitter that
+    /// presents again after a lost link reaches the voters under facts the
+    /// leader never saw. At PRE-ACCEPT the record holds only this
+    /// replica's local order, which adoption replaces, and its fast
+    /// acknowledgement under the other facts is one no quorum counts:
+    /// every learning predicate needs the leader's proposal, and a vote
+    /// set counts nothing under other facts than the ones it bound.
+    /// Past PRE-ACCEPT the record's facts are what it acknowledged, and
+    /// nothing is rebound. Returns whether the record was rebound.
+    pub fn rebind(&mut self, command: &CommandId, payload: Digest32) -> bool {
+        match self.records.get_mut(command) {
+            Some(record) if record.payload.is_some() && record.phase == Phase::PreAccept => {
+                record.payload = Some(payload);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The path log of `key`, if any command touched it.
     pub fn log(&self, key: &[u8]) -> Option<&PathLog> {
         self.keys.get(key).map(|k| &k.log)

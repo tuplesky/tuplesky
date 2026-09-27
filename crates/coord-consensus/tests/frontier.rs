@@ -655,15 +655,55 @@ fn a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commit
     assert_eq!(cluster.nodes[3].executed, all);
 }
 
-/// A follower that received the proposal before a payload under other
-/// attested facts adopts nothing, and the frontier executes nothing.
+/// The attested facts r3 bound `command` under, and the ones r1 did.
+fn admissions(cluster: &Cluster, command: &CommandId) -> (Option<Digest32>, Option<Digest32>) {
+    let bound = |i: usize| {
+        let Role::Follower(f) = &cluster.nodes[i].role else {
+            unreachable!()
+        };
+        f.payload(command).map(|p| p.admission_digest())
+    };
+    (bound(3), bound(1))
+}
+
+/// Everything after `first`, submitted to every voter.
+fn and_then(cluster: &mut Cluster, first: CommandId) -> Vec<CommandId> {
+    let mut all = vec![first];
+    all.extend((2..=4).map(|n| cluster.admit(n)));
+    all
+}
+
+/// r3 took a command under other attested facts than the leader proposed
+/// it under, and executes it under the leader's, with everything after it.
+fn assert_rebound(cluster: &mut Cluster, all: &[CommandId]) {
+    cluster.settle_ticking(3);
+    assert_eq!(cluster.nodes[0].executed, all);
+    assert_eq!(cluster.nodes[3].executed, all, "r3 stalled");
+    let (r3, r1) = admissions(cluster, &all[0]);
+    assert_eq!(r3, r1, "r3 executed other facts");
+    let rejections = cluster.nodes[3].follower_mut().take_rejections();
+    assert!(
+        rejections.iter().any(
+            |r| matches!(r, FollowerRejection::AdmissionConflict { command, .. } if *command == all[0])
+        ),
+        "the conflict was not reported"
+    );
+}
+
+/// A follower that received the proposal before its own submission under
+/// other attested facts rebinds to the leader's, and executes.
 ///
-/// The proposal reaches r3 first and is held. r3's own submission of the
-/// same command then arrives under another admission receipt. Adopted,
-/// the frontier committed it and r3 executed a command under facts the
-/// quorum never admitted; the adoption is refused instead, and reported.
+/// Every presentation of a command mints its own admission receipt, so a
+/// submitter that presents again after a lost link reaches the voters
+/// under facts the leader never saw. The proposal reaches r3 first and is
+/// held; r3's own submission of the same command then arrives under
+/// another receipt. Adopted, the frontier committed it and r3 executed a
+/// command under facts the quorum never admitted. Refused, r3 never
+/// adopted it, and with the chain total, nothing after it either. It asks
+/// the leader for its payload instead, binds it in place of its own while
+/// nothing has been accepted over it, and adopts.
 #[test]
-fn a_proposal_held_before_a_conflicting_payload_is_not_adopted() {
+fn a_follower_that_took_a_command_under_other_facts_after_its_proposal_rebinds() {
     let mut cluster = Cluster::new(29, 64);
     cluster.deaf = vec![3];
     let c = cluster.admit_to(1, &[0, 1, 2, 4], 9);
@@ -672,20 +712,44 @@ fn a_proposal_held_before_a_conflicting_payload_is_not_adopted() {
         cluster.deliver(3, from, frame);
     }
     assert_eq!(cluster.admit_to(1, &[3], 8), c);
-    cluster.settle_ticking(2);
-    assert_eq!(cluster.nodes[0].executed, vec![c]);
-    assert!(
-        cluster.nodes[3].executed.is_empty(),
-        "r3 executed other facts"
+    let (r3, r1) = admissions(&cluster, &c);
+    assert_ne!(r3, r1, "r3 took the same facts");
+    let all = and_then(&mut cluster, c);
+    assert_rebound(&mut cluster, &all);
+    // Written as rebound: the durable dependency row names the leader's
+    // facts, and a restart restores the leader's payload.
+    let (_, r1) = admissions(&cluster, &c);
+    let row = cluster.nodes[3]
+        .storage
+        .durable_rows()
+        .into_iter()
+        .find(|(col, k, _)| {
+            *col == Collection::ProtocolV1.id().0
+                && k.len() == 41
+                && k[8] == 0x01
+                && k[9..] == c.0.0
+        })
+        .map(|(_, _, v)| coord_consensus::decode_dependency(&v).unwrap())
+        .expect("a dependency row");
+    assert_eq!(row.payload, r1, "the row names other facts");
+    cluster.restart(3);
+    assert_eq!(
+        admissions(&cluster, &c).0,
+        r1,
+        "the restart restored other facts"
     );
-    assert!(cluster.nodes[3].phase_of(&c) < Some(Phase::Accept));
-    let rejections = cluster.nodes[3].follower_mut().take_rejections();
-    assert!(
-        rejections.iter().any(
-            |r| matches!(r, FollowerRejection::AdmissionConflict { command, .. } if *command == c)
-        ),
-        "the conflict was not reported"
-    );
+}
+
+/// The same, with r3's own submission first: the order in which a voter
+/// that missed the first presentation meets the second.
+#[test]
+fn a_follower_that_took_a_command_under_other_facts_before_its_proposal_rebinds() {
+    let mut cluster = Cluster::new(31, 64);
+    cluster.deaf = vec![3];
+    let c = cluster.admit_to(1, &[3], 8);
+    assert_eq!(cluster.admit_to(1, &[0, 1, 2, 4], 9), c);
+    let all = and_then(&mut cluster, c);
+    assert_rebound(&mut cluster, &all);
 }
 
 /// The frontier commits only what the follower adopted from the leader.

@@ -394,6 +394,11 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
         Err(InitError::PayloadConflict)
     );
     assert_eq!(table.record(&c1).unwrap().deps, vec![c2]);
+    // Rebinding the facts is only for a record nothing was accepted over
+    // (task-d09): at PRE-ACCEPT it replaces them, past it nothing changes.
+    assert!(table.rebind(&c1, Digest32([8; 32])));
+    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([8; 32])));
+    assert!(table.rebind(&c1, Digest32([1; 32])));
     // Dependency-phase prerequisites: c1 cannot be accepted with dep c2
     // until c2 is accepted; nor committed until c2 is committed.
     assert_eq!(
@@ -402,6 +407,8 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     );
     table.accept(c2, vec![]).unwrap();
     table.accept(c1, vec![c2]).unwrap();
+    assert!(!table.rebind(&c1, Digest32([8; 32])));
+    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([1; 32])));
     assert_eq!(
         table.commit(c1),
         Err(GuardViolation::DependencyNotCommitted { dep: c2 })
