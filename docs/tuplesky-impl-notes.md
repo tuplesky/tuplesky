@@ -4968,6 +4968,1745 @@ carried (1 of 3 with the promise fence): every campaign, up to ballot 25,
 was refused by the candidate's own machine as `Campaign(HalfInitialized)`,
 naming a far-behind voter (one had last recovered at `executed=762`
 against 2360 on the others). `select` fails that way when a report holds
+a command at ACCEPT or beyond and no report has its payload.
+
+Local stress run d12-15 (three voters) had the same loop, and its stores
+show the shape. n3, at 401 executed against 3092 on n1 and n2, held
+`028f7aae` as an entry of ballot 3's Sync with no record and no payload.
+n1 and n2 had executed it at position 1185 and still held it, but a
+report leaves out what its replica executed long ago (task-d05), so
+neither report named it. n2 could reach only n3, and n3's own report
+held the command, so every campaign from ballot 4 to 16 failed naming n3.
+On the Jepsen runs a voter that retired the command may also have lost
+its payload; the stores there were not reachable.
+
+Two things let the campaign through now:
+
+- `select_with` takes the commands the candidate can supply itself: a
+  command it holds a payload for or executed (`phase_of` answers) is not
+  a dead end. It is selected, and `commit_executed` commits it before
+  binding when the candidate executed it. This is d12-15's n2.
+- `Campaign::try_select` sets a report aside while a majority of reports
+  remains without it. Any majority of promises is a sound basis for the
+  selection: it is the set the candidate would have had if that report
+  had arrived later, so no judgement about the reporter is needed, and
+  nothing is decided twice. The candidate's own report is never set
+  aside, since its own state is what it goes on to lead from.
+
+With neither, the campaign waits for the voters that have not reported
+and fails only once every voter has. A behind voter still cannot execute
+past a command whose payload it never gets; the domain serves around it,
+and catch-up (task-d08, task-d10) is what brings it back.
+
+`activation.rs`:
+
+- `a_campaign_supplies_what_its_candidate_executed`, d12-15's shape:
+  three voters, the candidate and the behind voter only. Nothing supplied,
+  the campaign waits; with the candidate supplying the command, it is
+  selected with the reported dependencies and committed.
+- `a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has`:
+  five voters, one reporting a payload-less acceptance nobody else holds.
+  With three reports the campaign waits instead of failing, with four it
+  selects without that report and without the command, and a candidate
+  whose own report holds it waits and then fails once all five reported.
+  Without the change, the first step fails as `HalfInitialized`.
+
+### What is left
+
+- **The collector's credential is renewed by the follow-up.** A process
+  that runs a voter and its domain's frontend submits to other voters as
+  the collector, with its own certificate (`collector_certificate`), and
+  `set_identity` leaves that certificate as it is. See the next section.
+- **The trust bundle is not reloaded.** A staged CA rotation that
+  replaces the bundle still needs a restart. A leaf renewed under a new
+  root that the running node does not yet trust is refused by the chain
+  check, and the node stays on the leaf it has.
+
+## The collector's leaf is renewed like the node's
+
+The task-d02 follow-up. task-d02's acceptance says collector and
+observer roles renew the same way as a voter, and a process that runs a
+voter and its domain's frontend presents two leaves. One is the node's,
+which both planes serve as and a voter dials its peers as. The other is
+the collector's (`collector_certificate`), which names the same node as
+`Frontend` and is what the frontend presents when it submits to another
+voter. task-d02 renewed only the first, so the collector's leaf ran out
+on its own schedule, and from then on the frontend could reach no other
+voter.
+
+Each leaf is now a `Renewing` of its own, with its own schedule, attempt
+and deadline, told apart by `serve::Principal`. Both use the same
+`[renewal]` section and the same enroller, and each is signed with its
+own key. A collector's renewal keeps the collector's key, as a node's
+keeps the node's. Committed membership has nothing to say about a
+collector's key, so the collector's enroller skips that classification.
+Every other check still applies: same node, incarnation and role, same
+key, same names, a later end, and a chain to the trust bundle.
+
+- **The request names its role.** One workload presents one assertion
+  for both leaves, and the issuer answered with the first of that
+  workload's rules. A workload holding a voter rule and a frontend rule
+  for the same node would have both renewals answered by whichever came
+  first, and the other refused as a change of role. The enroll body now
+  carries `role`. `authorize` takes the first rule that matches the
+  workload and grants that role. That is a choice among the workload's
+  own rules, never a grant: a role it holds no rule for is refused as
+  `NoRule`. A request without `role` keeps the first-match rule.
+- **`Transport::set_api_client`** puts a renewed collector leaf into
+  service, beside `set_identity`. It replaces the api-class client
+  configuration and the collector's end, for dials that start after it.
+  A `Dialer` taken before is covered, and nothing open is touched. The
+  node's leaf, which every accepted handshake presents, is left alone. It
+  is refused on an endpoint built without a separate credential, because
+  a renewal does not add a second principal. Both planes are updated, and
+  the api plane is rolled back if the peer plane refuses, as for the node.
+- **Every leaf ends serving at its `notAfter`.** `main` races the
+  deadline of each leaf against the serving loop, so either one ends it
+  with status 2 and `reason=credential-expired`. A frontend whose
+  collector can no longer reach another voter is half a node, the same
+  half-serving the task-d02 decision rules out. Where nothing renews a
+  leaf, its deadline is fixed at startup, and the stop names it: `renewal
+  not-configured expires_at=N: this node's leaf ...` or `collector
+  renewal not-configured expires_at=N: this node's collector leaf ...`.
+- **The collector's leaf is tied to the node at start.** Before this,
+  it was only read: the chain and the key file's mode, no chain check
+  and no look at whom it names. So a collector leaf for another node or
+  incarnation was presented as this node's, and renewal kept it so,
+  because a renewed leaf is compared with the leaf it replaces and not
+  with the node. `enroll::collector_for` now makes the node leaf's
+  start-up check of it (`verify_chain`), and then requires it to name
+  this node's cluster, replica and incarnation, in `Frontend` or
+  `KineCollector`. A refusal stops the start, and `--check`, with status
+  2 and `the collector certificate at P is not this node's collector:
+  ...`. The gap predates this change (task-j08 introduced the
+  credential); renewal is what made it last.
+- **Both leaves are reported.** The startup report has a `renewal ...`
+  line and a `collector renewal ...` line, `configured` with the due point
+  or `not-configured`. `coordd inspect` adds `collector leaf issued_at=
+  expires_at= renewal= driver=`, and the stopping report has one line per
+  renewal.
+
+### What the tests show
+
+- `enroll::tests::a_collector_leaf_must_be_this_nodes`: leaves in
+  `Frontend` and `KineCollector` for this node pass. Each of these is
+  refused for what it is: another node, another cluster, another
+  incarnation, the voter role, a leaf from another authority, and a key
+  that is not the leaf's.
+- `cli::a_collector_leaf_for_another_node_is_refused_at_start`: the same
+  domain issues this node a collector leaf naming replica 2, then one
+  naming this node as a voter. `--check` refuses each with status 2 and
+  opens no store. With the check in `main` disabled, both pass `--check`
+  and the test fails.
+- `coord-node-issuer`'s
+  `a_request_that_names_its_role_is_answered_by_that_rule_of_the_workload`:
+  one workload holds a voter rule and then a frontend rule for the same
+  node. Without a role, the voter rule answers. With each role named, that
+  rule answers. Naming a role the workload has no rule for is refused as
+  `NoRule`.
+- `coord-transport`'s
+  `a_renewed_collector_credential_is_presented_on_api_dials_only`: a
+  server that admits only the renewed collector leaf refuses the old one,
+  and after `set_api_client` admits the dial and a dialer taken before
+  it. The endpoint still dials a peer as the node. An endpoint without a
+  separate credential refuses the call.
+- `a_collectors_leaf_is_renewed_and_its_links_come_back_under_it`: voter
+  1 of three holds a 36-second collector leaf and a long node leaf, and
+  the issuer lists the voter rule first. The startup report and `inspect`
+  name both leaves. The collector leaf is renewed and written with the
+  same key, a later end and role `Frontend`, and `node.pem` is
+  unchanged. Past the old collector leaf's end, voter 1's `voters
+  submittable=` falls and comes back to 2 under the renewed leaf, and the
+  node does not stop.
+- `a_collector_leaf_nothing_renews_ends_the_node_at_its_end`: with no
+  `[renewal]` and a 12-second collector leaf, the node exits with status
+  2 and `reason=credential-expired` at that leaf's end, long before its
+  node leaf's end.
+
+Negative controls, run by hand. With `role` left out of the request, the
+three-voter test fails: every attempt comes back as a voter and is refused
+as a change of role. With the renewed collector leaf never put into
+service, it fails because voter 1's collector links do not come back.
+
+## A domain whose leader stops has no leader
+
+task-d01. The protocol machines could campaign, win, and step down, but
+nothing in `coordd` ever asked them to. The genesis ballot's leader was
+the only leader a domain had, and stopping that one process stopped
+every write.
+
+**When to campaign** is `bins/coordd/src/election.rs`, a schedule handed
+time so it is tested without a clock. A voter is without a leader when
+it does not lead and holds no control link to the voter its ballot
+names, or when its ballot names itself and it does not lead (a restarted
+leader, or a campaign of its own not yet won). No heartbeat was added:
+the transport keeps a link to every voter, re-dials it (task-d03), and
+closes one whose peer stopped answering at its idle timeout. A voter
+without a leader waits a jittered patience (1 s, scaled into 0.75 to
+1.25), campaigns only while it can reach a majority of voters counting
+itself, and doubles its wait after each campaign that produced no leader,
+up to 16 s. An operator asks a voter to campaign with `SIGUSR1`. The
+request goes on the next pass that can reach a majority, whether or not
+the voter has a leader. Patience and ceiling are constants, not
+settings. The configuration schema is unchanged.
+
+**How a campaign goes** is `Voter::campaign`. The ballot moves first, to
+the successor of the highest ballot the voter holds or has promised, so
+the promise it makes itself is recorded under the ballot it promises.
+The follower machine then campaigns. The store is fenced at the new
+ballot last, which refuses what was still queued under the old one. A
+candidate's `NewLeader` is adopted the same way in `Voter::on_peer`. If
+it is above the voter's ballot, the voter moves to it before the machine
+steps, fences if the machine promised, and moves back if it did not.
+`Voter::follow_machine` runs after every peer frame and on every turn.
+It adopts any higher ballot the machine promised by another path and
+changes role when the machine says so. A follower that won converts with
+`Leader::from_recovered`. A deposed leader converts with
+`Follower::from_recovered` and replays the Sync it received while it
+still led. The conversion happens in place inside `Node`. The store, the
+outbox and every connection carry on.
+
+**A voter that missed the election** would never hear it. A campaign
+asks every voter once. One that was down or cut off comes back still
+leading, or still following, a ballot the domain has left. So a leader
+that won a ballot keeps the selection it won with (`Node::won`). When a
+voter's control link returns, the leader sends it `NewLeader` for its
+ballot and the Sync it won with (`Voter::welcome`). Both are needed. A
+voter that had promised the ballot but not received its Sync before it
+stopped refuses a `NewLeader` for a ballot it has already promised, so
+it would send no promise and never be sent the Sync on one. A voter
+that has not promised refuses the Sync, harmlessly, and promises on the
+`NewLeader`, and its promise is answered with the Sync again. A second
+copy of the active ballot's Sync changes nothing.
+
+**A restart comes back at the ballot it had, and never leading it.**
+`main.rs` used to start every replica at the genesis ballot, as its
+leader or as a follower. It now starts at the ballot the recovered
+promise row holds and votes in the configuration of the ballot it was
+synchronized to. It comes back as a follower of that ballot. The one
+exception is the genesis leader on a store that has taken part in
+nothing: no promise, no records, no payloads, nothing executed, no Sync,
+and a zero frontier. A leader's command table, its proposals and its
+sequence numbers live in memory. A leader that restarted and went on
+leading its ballot would propose again from sequence zero with no memory
+of what it had proposed. Its followers would accept, since they check
+the ballot and the leader and not that sequences only go up, and a new
+command could take an order that contradicts one the domain had already
+committed. Replicas would diverge with nothing to detect it. The
+survivors cannot prevent this, because a leader killed and restarted
+before its links idle out was never missed. A restarted leader is
+instead a follower of a ballot that names itself and that it does not
+lead, which the election counts as leaderless. It campaigns for the next
+ballot, and that ballot's recovery rebuilds from a majority what the
+leader lost. A campaign whose Sync was bound before a stop is not taken
+up either, since taking it up would make the replica that ballot's
+proposer again. Nobody publishes that selection. Task-26 forbids
+publishing a different one, not publishing none, and the next campaign's
+recovery reads what the voters that received it kept. Every restart of
+a single-voter domain is therefore a campaign of one, a patience after
+start.
+
+**The collector follows its voter.** Evidence is counted under a ballot's
+configuration. The co-located collector is reconfigured when the ballot
+its voter votes in has changed: after every peer frame, before that
+frame's output reaches it, and on every turn. Waiting for the turn would
+have the evidence produced by the step that activated a ballot refused
+as the old ballot's, and recovered only by a re-offer. That voids what it counted
+under the old ballot, and its pending commands collect afresh. A
+frontend-only process has no voter to follow. It keeps counting under
+the genesis ballot and establishes nothing after an election. That gap
+stays open until the collector learns the ballot from the evidence it
+is sent.
+
+**Seen on stderr:**
+
+- `this voter leads ballot N`, `this voter follows ballot N led by X`,
+  or `this voter is a candidate for ballot N`, whenever the role or
+  ballot changes.
+- `this voter campaigns for ballot N (no leader)` or `(asked to)`.
+- A count of transitions the fence refused, as definitely not committed.
+
+The acceptance tests are these:
+
+- `the_survivors_of_a_stopped_leader_elect_another_and_it_follows_when_it_returns`
+  runs three daemons and kills the genesis leader. The survivors elect
+  one of themselves once the leader's links end at the idle timeout. A
+  read returns the value written under the old leader, and a write is
+  established. The old leader, restarted, follows ballot 1 and the
+  domain keeps serving. Without the campaign the survivors never elect.
+  Without the welcome the old leader comes back leading ballot 0.
+- `a_leader_restarted_before_it_is_missed_campaigns_rather_than_resuming_its_ballot`
+  kills the genesis leader and starts it again at once, while the
+  survivors still hold its old links. It does not lead ballot 0. It
+  leads ballot 1, the survivors follow it, and every voter reads the
+  value written before and then the value written after. With the old
+  restart rule it comes back leading ballot 0.
+- `an_operator_moves_leadership_and_the_old_leader_steps_down` sends
+  `SIGUSR1` to voter 3 while voter 1 leads. Voter 1 converts in place and
+  the domain serves under ballot 1.
+- In process, `a_follower_that_campaigns_leads_and_the_domain_serves_under_its_ballot`,
+  `two_candidates_at_once_end_with_one_leader` and
+  `a_leader_that_missed_the_election_authorizes_nothing` show the three
+  cases. A campaign is won by a majority. Two simultaneous candidates end
+  with the higher ballot's leader and one execution per command. A leader
+  cut off from the election gets nothing established and nothing
+  executed on its word. Without the role change the first fails.
+- The voter tests check the ordering. A campaign's promise and a
+  candidate's promise are each submitted under the ballot promised and
+  fenced there. A `NewLeader` the machine refuses moves nothing.
+
+**A promise that does not become durable** moves the voter back. The
+machine counts a promise in flight as promised, so the voter fences at
+it. If the row then fails, the machine is back at the ballot it had, and
+`follow_machine` brings the voter's ballot back to it, so what the
+machine does is stamped with the ballot it does it under. The store's
+fence does not move back. Work stamped below it is refused and counted
+until the voter promises that ballot or a higher one again. A voter that
+does not vote is always safe.
+
+What refused means matters, because the refusal lands in the serve loop.
+Work already queued is refused by the fence itself, and its barriers fail.
+Work the machine asks for afterwards is refused at submit, where the
+journaled store answers `ObsoleteBallot`. That used to surface as
+`DriveError::Submit`. On the turn path, a `DriveError` ends the serve
+loop. On the peer path and the connection-submission path, it is logged
+and serving continues. In that case the `?` in `Voter::on_peer` also
+skips the revert, leaving a stamp at the candidate's ballot with a
+promise that never resolves. The store wrapper now reports the refusal as
+`Refused::Fenced`. What happens next depends on the role:
+
+- **A follower serves on.** `Node::one_round` turns the refusal into what
+  the fence reports for queued work: the barrier failed,
+  `DefinitelyNotCommitted`, fed back to the machine. The send that waited
+  on it is never released. This also closes the peer-path case above for
+  `Fenced`. Every other refusal at submit still ends the loop on the turn
+  path. `a_transition_refused_as_fenced_fails_its_barrier_and_the_voter_serves_on`
+  has the store refuse a candidate's promise row as fenced. The voter
+  sends no promise, follows the machine back to its ballot, and counts
+  the refusal.
+- **A leader stops**, with `DriveError::Fenced`. A leader whose promise
+  to a candidate failed still leads its old ballot, because
+  `Leader::deposed` reads the durable promise. Every batch it makes is
+  then stamped below the fence and refused. If it served on, it would run
+  out of proposal retries and stop proposing while still `Machine::Leader`.
+  Neither it nor the voters holding its links would campaign, and the
+  domain would stall. Stopped, it restarts as a follower of its ballot and
+  campaigns (the restart rule above). This holds on every path. On the
+  peer path and the collector-submission path a `DriveError` is otherwise
+  only logged. A `Fenced` one is recorded instead (`Domain::fenced_stop`),
+  and the loop ends on its next pass with the same message as a turn.
+  `a_leader_whose_work_is_refused_by_its_own_fence_stops` fences the
+  promise, fails its row as a group failure would, and then submits: the
+  step ends `Fenced`. Without the leader arm, it serves on.
+- **A follower's own campaign goes above the fence.** `Voter` keeps the
+  highest ballot it fenced at, and `campaign` takes the successor of the
+  highest of its ballot, its promise and that fence. After a candidate's
+  promise fails, the successor of the first two alone is the old number
+  plus one under the voter's own id. Where the candidate's id is higher,
+  that ballot is below the fence, and the voter's own store would refuse
+  the campaign every time. `a_follower_below_its_own_fence_campaigns_above_it`
+  shows the campaign accepted above the fence. Without the fence in the
+  successor, it is refused.
+- **A fenced apply stops, and says why.** An application transition
+  stamped below the fence is refused by the same check. It is a committed
+  command being applied, and the batch carries the voter's current stamp,
+  not the ballot the command was committed under. Failing its barrier and
+  forgetting it is not an answer, because a committed command has to be
+  applied at its position. `materialize::submit` reports it as
+  `FENCED_APPLY`, and `Node::execute` turns that into `DriveError::Fenced`.
+  The serve loop then says the voter stopped because its store's fence is
+  above its ballot, and that a restart resumes at the promised ballot, as
+  a follower that campaigns. The fence is held in memory only (it is not
+  written, or restored at open or replay), and a promise row that
+  definitely failed leaves no trace, so a restart heals every variant of
+  this state. `composed.rs::a_transition_stamped_below_the_fence_is_refused_as_fenced`
+  shows both kinds reaching the driver as fenced through `JournaledDomain`.
+
+Re-promising is not done here. A driver-initiated re-promise would be a
+second path to a promise. A machine-side one needs the machine to keep the
+candidate, which `PromiseOutcome::Failed` drops; that is a
+`coord-consensus` change, and promise rules belong to task-26. Releasing
+the fence on a failed promise would be safe only if keyed to
+`DefinitelyNotCommitted`, and `PromiseOutcome::Failed` is not keyed to the
+failure class. The eventual fix is the machine-level re-promise. Until
+then, a leader stops where serving on would stall, and so does an apply.
+One harmless leftover: after a fenced promise, a follower's `report_due`
+still requires the failed barrier until the next promise or campaign
+replaces it.
+
+**A campaign still under way is left to finish.** A campaign collects a
+report from a majority, and a report carries what its voter holds, so on
+a busy domain the collection can outlast the doubled patience. Replacing
+it would discard it and raise the ballot every voter must promise again.
+While a campaign of the voter's own is live, a leaderless voter waits for
+it up to the schedule's ceiling (16 s) after it started. An operator's
+request is not held back.
+
+Recorded, not changed:
+
+- A leader that becomes a follower drops its proposals, its votes, its
+  early votes and the task-c02 replay store (`Follower::from_recovered`
+  keeps the table and the records). Retries are then served from the
+  table and the record path only.
+- A stale leader that reconnects to a follower of the higher ballot, but
+  not to that ballot's leader, keeps leading its own until the new
+  leader's welcome reaches it. That affects liveness only, because a
+  majority has promised the higher ballot and nothing is established on
+  its word.
+- A follower whose control link to the leader closes, while it still
+  holds another voter, campaigns after about a second. That churn is
+  bounded by the idle timeout: a link closes on a real departure or
+  after 30 s of silence, not on a short blip.
+- `SIGUSR1` exists only on Unix. Elsewhere leadership moves by election
+  alone, and the operator-request arm never fires.
+- A CLI election test waits for the transport's idle timeout plus
+  patience, 45 to 70 s, because a killed process closes nothing.
+
+**Surfacing the ballot before the promise is recorded** matters only
+where a promise row can still be queued when the fence arrives. In
+`coordd` it cannot: `Node` drives storage until nothing is queued within
+the round that produced the row, so the row is durable before the fence
+is set. With the pre-adoption removed, the daemon tests still pass while
+the voter test fails. The stamp is still what the plan requires. A
+promise recorded under the ballot the voter was leaving is a record that
+says the wrong thing, and a store that queued across rounds would refuse
+it.
+
+### Repeated leader kills
+
+The Jepsen shim's stress run (#98, `--fault leader`) kills whichever
+voter leads every 25 s. On this chain it found three faults, all reached
+only after a voter has served for a while, and the domain never elected
+again:
+
+- the restarted voter stopped with "batch refused: the queue is full";
+- on its next restarts it panicked at `expect("installed")` in
+  `Follower::advance_sync`;
+- the survivors campaigned ballot after ballot and none of them won.
+
+Each has a deterministic test that fails without its fix.
+
+**A candidate asks again until it has every payload.** A candidate asked
+each promised voter once for every payload its selection lacked. A peer
+answers at most `MAX_PAYLOAD_TRANSFER` (8), so a candidate behind by more
+than that got one batch and then waited for ever. The runtime's paced
+asks went to the leader of the ballot it followed, which is the voter
+whose loss started the campaign. Now:
+
+- the campaign's missing set counts as missing, so those paced asks
+  cover it;
+- `request_payloads` asks the promised voters, not that leader, for a
+  bounded batch of it;
+- the campaign asks for the next batch as soon as the last was answered
+  in full, or when a voter promises that was not asked yet.
+
+Test: `a_candidate_missing_more_payloads_than_one_answer_carries_still_wins`.
+
+**A retired command installs as executed.** A Sync names what every
+reporter's durable ledger holds, which includes commands a voter already
+executed and retired. `phase_of` answers EXECUTED from the tombstone, so
+the installation took such an entry as ready and then found no record.
+That was the follower's panic, and `Leader::repropose` had the same one.
+Both now skip a command with no record.
+
+A leader without the record cannot re-propose the command, so a voter
+holding it at ACCEPT would wait for a vote that never comes. To close
+that, the candidate marks as committed every selected entry it executed
+itself. It does so only when the executed dependencies agree with the
+entry, or when the record is gone.
+
+`commit_executed` visits the selected entries only, not `reproposed`. A command the candidate executed cannot be re-proposed only: it was committed, so a majority accepted it at a ballot no lower than the one it committed under. The promised majority intersects that majority, and accepting requires the ballot to be synced, so the source ballot's reports carry the command at ACCEPT or above, and the selection puts it in `entries`.
+
+Test: `a_sync_naming_commands_this_voter_retired_installs_without_them`.
+
+**A step that asks for more than the queue holds lowers first.**
+Installing a Sync writes one row per selected command, and a new leader
+re-proposes each one. `Node::one_round` submitted them all before
+lowering any, the journaled store's queue (256 batches) refused the rest,
+and the voter stopped. When it came back, it met the same selection. Now:
+
+- `Persistence::has_room` answers the queue's own bounds;
+- before each submit, `one_round` lowers what is queued until there is
+  room, and feeds what became durable to the outbox and the machine;
+- a lowering that moves nothing leaves the refusal to `submit`.
+
+Test: `a_step_that_asks_for_more_than_the_queue_holds_is_carried_out`.
+
+**What the stress run shows now.** With these fixes, five leader kills
+in 120 s produce no exit and no panic, and every election completes. The
+final read is still not served. The cause is the limit below, not
+anything in this list.
+
+**What is left: recovery carries the whole history.** Dependency rows
+are never deleted, and `DurableLedger` reports every one. So a report,
+and the Sync selected from reports, names every command the domain ever
+ran. A voter remembers the commands it retired only for its last
+`capacity` retirements. It cannot tell an older command it executed
+from one it never heard of: `phase_of` answers `None` for both.
+
+- The candidate treats such a command as missing its payload.
+- A follower installs it as a placeholder.
+- Either way the table fills, and new work is refused as
+  `Backpressure`.
+
+In the deterministic cluster, with capacity 32, 200 commands before a
+leader loss leave the candidate waiting on 160 payloads for commands it
+executed long ago. Bounding recovery by an execution floor, a pruned
+ledger, or a durable "executed" answer is a protocol decision for
+`coord-consensus`, and this change does not make it. The plan now owns
+it as task-d05, a prerequisite of task-64.
+
+**A limit of this change: a campaign that is making progress is still
+abandoned.** The election timer gives a campaign until its ceiling
+(16 s). A candidate still gathering payloads when that passes is
+replaced by the next ballot, which starts from scratch, even if it had
+most of what it needed. With the whole history to fetch at eight
+payloads an answer, that is how a restarted voter campaigned for ever
+in the Jepsen runs. With task-d05 a campaign fetches only the live
+window, so it is short and this rarely matters. It is recorded here
+because task-d05 removes it in practice, not by design.
+
+## A request bound that bounded nothing
+
+The task-c01 follow-up. `limits.max_request_bytes` sized the collector's
+undelivered-bytes budget and fed the writer-queue capability check. It
+was enforced nowhere. A request was bounded only by what the wire
+carries, so lowering the setting shrank a budget and still admitted
+requests up to the protocol's limit. Such a request then took a
+collector slot and bytes sized for smaller ones.
+
+The admission gate now enforces it. The measure is what the protocol
+already counts against its own request limit (`LogicalRequest::cost`,
+the bytes of the keys, values and range ends a request carries),
+compared with the setting and nothing added. At the default setting,
+which is the protocol's limit, no request that validates is refused for
+its size, so nothing changes. Below it, a larger request is refused as
+`AdmissionRefusal::RequestTooLarge`, after the checks that say whether
+the request is well formed and before a slot is reserved or a byte
+budgeted. A retry is refused the same way.
+
+The refusal needed a code of its own. None of the five fits: it is not
+malformed, not a matter of admission, and not backpressure, which the
+SDK retries. So `REQUEST_TOO_LARGE` (0x0006) is appended to the frozen
+codes, which are append-only. The SDK reports it as
+`RetryError::RequestTooLarge`, which is not retried. The Kine backend
+maps it to `InvalidArgument`, since the caller has to change the request
+and cannot just retry it. The refusal, like every admission refusal of a
+request that decodes, is answered under the invocation's own command
+identity: the SDK and the Kine client accept an answer only under the
+identity they derived. A first version compared the encoding with the
+setting plus the wire's 64 KiB allowance. That made a 1 KiB setting
+admit 65 KiB, and answered under an identity of the retry key alone,
+which no client could match.
+
+Admission comes before the lookup of a resolved result. So a retry of a
+request that was established under a larger setting, and is retried
+after the setting is lowered, is refused for its size rather than
+answered with its result.
+
+The tests are
+`a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot`
+(1024 admitted, 1025 refused) and
+`the_default_bound_refuses_nothing_the_protocol_admits` (collector), plus
+`a_request_above_the_configured_bound_is_refused_and_one_below_is_served`,
+which sets the bound to 1 KiB in a real daemon and asks through the SDK
+as well. With the check removed, the first and the last fail.
+
+## A pinned genesis nobody had signed
+
+task-43, from the v1.5 review, as a follow-up branch at the top of the
+stack rather than on the task-43 branch itself: every branch after
+task-43 writes genesis and configuration fixtures of its own, and the
+change is one to all of them at once. `coordd` read the genesis manifest as
+plain JSON, and `verify_genesis` had no caller. So `init` pinned
+whatever file it was handed. Task-42's "signed/pinned genesis" held for
+the pin and not for the signature. The pin made the manifest immutable
+after `init`, but the manifest `init` pinned was an unauthenticated
+per-node file.
+
+The manifest file is now the token the admin signed. The configuration
+names the admin's public key in `genesis_admin_key`, a PEM P-256
+`PUBLIC KEY`, which is required and may not be empty. The only reader
+is `membership::read_manifest`: it verifies the token against that key
+before anything in it is used. `init` runs it before placement, so a
+manifest that does not verify pins nothing and leaves no store. Every
+start runs it before the pinned digest is compared. A file with the
+same content as plain JSON, or signed by another key, is refused as a
+genesis quarantine.
+
+`coord-membership` gained three pieces: `admin_key_from_pem`, which
+accepts only id-ecPublicKey on prime256v1 and refuses anything else as a
+key rather than failing every signature later; `sign_genesis_pem` for
+provisioning tools that hold a PKCS#8 key; and `PROTOCOL_VERSION`.
+
+The tests:
+
+- `a_manifest_the_admin_did_not_sign_is_refused_at_init_and_at_start`
+  covers four cases. `init` refuses the fixture as plain JSON and as
+  signed by a stranger, and leaves nothing behind. The signed fixture
+  initializes and starts. The same manifest unsigned is then refused at
+  the next start. With coordd falling back to plain JSON, it fails.
+- The pin test now swaps a voter in a manifest the same admin signed,
+  so what refuses it is the pin and not the signature.
+- A `coord-membership` test covers the PEM round trip, a wrong key, and
+  a key on another curve.
+
+## A retired command stays its key's latest
+
+task-d06, from finding 1 of the Jepsen client (#98). The client's run
+was `:valid? false`: G1a, a lost update, incompatible orders on about
+twenty keys, and a PL-1 cycle, all through one follower. The pause stress
+driver reproduced it without Jepsen, in ballot 0 with no election. A
+follower acknowledged about thirty appends as `ok` and served reads
+showing them, while the other voters read a different continuation from
+the same point; its log then showed `release-record-mismatch` for one
+command, past two thousand times.
+
+**Cause.** Every command is initialized on the conservative key, and
+depends on that key's latest command. That is what makes the chain total.
+`CommandTable::retire` cleared the key's latest when it retired it.
+`initialize` reclaims -- retiring every executed record -- exactly when
+the table is full, and before it computes the dependencies. So the first
+command a full leader proposed named no dependency at all.
+
+- On the leader nothing looked wrong: everything it retired had executed
+  there.
+- A follower still behind the command that should have been named (a
+  payload missing, its own table full, a proposal dropped) found the new
+  command committed and ready, with nothing ordering it after the
+  backlog, and executed it first.
+- Same committed set, two execution orders: a fork right after the common
+  prefix.
+
+The review proposed a ten-line test that decides it. Before the fix, the
+command initialized after a reclaim had no dependencies.
+
+**Fix.** `retire` keeps the key's latest.
+- A replica that already executed it reads the tombstone as EXECUTED.
+- A lagging replica waits until it has executed it, which is the order
+  every replica must keep.
+- The tombstone of a command that is still some key's latest is never
+  evicted by the recency bound, so the guards always answer for what the
+  next proposal on that key names. There is at most one per key, and each
+  goes in its turn once a newer command has taken its key.
+
+**The same break at an election.** The review of #99 found the chain
+broken a second way. A key's latest command is written by `initialize`,
+which on a follower runs when a payload arrives, so a follower's latest
+is the last payload to reach it, in arrival order, not the leader's
+proposal order. `accept` and `adopt` never move it. A follower that wins
+re-proposes the recovered order through `repropose`, which only accepts,
+so its first fresh proposal named whatever payload had reached it last.
+That can be a command in the middle of the recovered order. A voter
+holding the tail committed but without its payload then found the fresh
+command ready and executed it first: the same fork as the reclaim, at a
+ballot change. `Leader::from_recovered` already computed the tail, to
+chain the re-proposed set after it, and did not store it. Now it
+anchors the tail as the conservative key's latest (`CommandTable::anchor`,
+the third place that writes it, beside `initialize` and `restore`), so
+the first fresh command of a ballot depends on it.
+
+`restore` rebuilds the latest as the record nothing else depends on, and
+picks the largest identity if there are several. The review suggested
+asserting there is exactly one. That does not hold for every table a
+restart can find. A follower's record starts with the dependencies of
+its own arrival order and takes the leader's when it accepts, so before
+every record has been accepted the two orders can give two tails, or
+none. So there is no assertion there.
+
+**Divergence stops the node.** A `release-record-mismatch` means the
+leader's release of a command and this node's own execution record of it
+disagree, so this node executed the committed commands in another order.
+It used to be a recurring log line. Now `settle_from_records` returns it
+at once, sending none of the deliveries it had settled in that pass from
+the same record. The serve loop then stops right there, with
+`this node stopped: release-record-mismatch(<id>) ...`, before it
+re-offers, re-dials or takes another event, so no retry is answered from
+that record after the mismatch is seen. A first version recorded the
+mismatch and stopped at the top of the next pass, which left the rest of
+the batch and one event in between (review of #99). The decision is
+`coord_daemon::settle::offer`. It stops at the first mismatch and returns
+the command, and returns nothing that pass had settled. `serve.rs` stops
+the node on that answer.
+
+**What the frontend trusts.** Two paths answer a caller from this node's
+own execution record rather than from the leader's release, and both are
+sound only if every replica executes the committed commands in one
+order. This task is what makes that hold when a table reclaims.
+- `settle_from_records`: when the collector holds a command's votes but
+  not its release, it answers with the local response, and nothing
+  cross-checks it.
+- `retained_answer`: it answers a retry from the local record before
+  admission.
+
+The mismatch stop covers only the case where a release is held and
+disagrees. The votes-only case has nothing to compare against.
+
+### What the tests show
+
+- `graph.rs` `the_command_after_a_reclaim_still_depends_on_the_last_one`:
+  the review's test. A table at capacity, every record executed, one more
+  initialize: its dependency is the last command, which is retired and
+  answered for by its tombstone.
+- `graph.rs` `a_keys_latest_tombstone_outlives_the_bound`: a quiet key's
+  latest keeps its tombstone through many retirements on a busy key, and
+  the next command on it passes the guard. Once superseded, it goes in
+  its turn.
+- `activation.rs` `a_follower_behind_a_full_leader_executes_in_the_leaders_order`:
+  r2 never gets command 32's payload, and the full leader proposes 33
+  after a reclaim. Without the fix, r2 executes 33 before 32. With it, r2
+  waits, and once the payload arrives it executes both in the leader's
+  order.
+- `activation.rs` `a_new_leaders_first_command_follows_the_recovered_tail`:
+  the review's election case. r2 receives C's payload before B's, while
+  the leader ordered B then C. r1 holds C committed, without its payload.
+  r2 wins. Without the anchor, D names B, and r1 executes B, D where r2
+  executes B, C. With it, D names C, r1 waits for C's payload, and every
+  voter executes B, C, D.
+- `settle.rs` `a_mismatch_ends_the_turn_and_sends_nothing` and
+  `a_turn_without_a_mismatch_sends_what_settled`: `offer`'s stop, and
+  what it sends when nothing disagrees. `repair.rs`
+  `a_record_the_release_contradicts_stops_the_turn` stages the mismatch
+  through a real collector holding the leader's release. The
+  contradicting record stops the turn and settles nothing, and the true
+  record settles the command.
+- `graph.rs`
+  `a_hot_key_keeps_working_after_its_executed_predecessor_is_retired`
+  pinned the old rule: after the key's latest was retired, the next
+  command depended on nothing. It now requires the dependency on the
+  retired latest.
+
+### What is left
+
+- A follower that missed a proposal never learns the command, and holds
+  everything after it until a Sync. That is finding 3, now task-d07.
+- Recovery carries the whole history (task-d05). Past the tombstone
+  window, a lagging replica meets that limit as a stall, not as a fork.
+- A replica that already forked is not repaired by this change. The
+  divergence stop keeps it from answering from its record.
+
+## Recovery bounded by what the voters executed
+
+task-d05, from the Jepsen client's runs on #98. No run served past its
+first election. Every node served about 80 transactions per 20 s until
+the first fault that cost the leader or the quorum. From then on the
+domain served nothing, through healing and restarts. The `ok` counts
+measured how long the random fault schedule took to reach an election,
+not anything about the fixes.
+
+### The table capacity is configuration
+
+`coordd` gave both voter configurations a command table of 64, with
+nothing to change it. Recovery names the whole history, and a candidate
+must hold the whole selection. So past about twice that many executed
+commands, a voter cannot tell retired history from unknown commands. It
+asks for payloads it executed long ago, eight to an answer, and cannot
+hold them anyway. With 387 commands executed, a restarted voter's
+campaign counted 330 missing payloads and never bound.
+
+`limits.command_table_capacity` now sets it.
+- The default is 1024.
+- The accepted range is 32 to 1536. A value outside it is refused at
+  start, naming the setting.
+- The maximum comes from the Sync, not from memory. A report names up to
+  about twice the table: its live records and its tombstones. A Sync is
+  selected from a majority of reports, and it is written as one row
+  (about 2 MiB) and sent as one frame (4 MiB). At 1536 a worst-case Sync
+  for five voters is about 1.6 MiB. `compose.rs`
+  `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame` builds
+  that worst case and writes it.
+- The default is near the ceiling on purpose. A worst-case Sync at 1024
+  is already about two thirds of a row, and the default is what the
+  fault runs exercise, so it is set as high as leaves room for a
+  majority's reports to vary.
+- It is a local setting, and voters of one domain may differ. No
+  replicated result depends on it, so it is not one of the security
+  gate's switches (design 20.5).
+
+### Recovery is bounded by what the voters executed
+
+The design choice among the plan's three candidates is the third: a
+durable "executed" answer, plus a report that leaves out history.
+
+**The executed answer.** `CommandTable` keeps the identity of every
+command it executed and retired, however long ago. The tombstones stay a
+recency window (what the replica still keeps *about* a command); the new
+set only answers "did this replica execute it". `phase_of` answers
+EXECUTED from it. `restore_executed` fills it from the executed-identity
+rows, including rows whose dependency record is gone. It costs one
+identity per executed command, and is the one thing here that still
+grows with the history.
+
+**Recovery reads that answer from `executed_v1` itself.** It used to
+find executed identities only through the dependency rows, and a
+checkpoint trim removes those for an executed prefix while keeping its
+executed rows. A restarted voter then answered "unknown" for every
+trimmed command. A record written after the trim that names one -- the
+first proposal after a reclaim names the retired latest -- failed the
+execution guard as `DependencyUnknown`, on every restart, since the
+state is durable. That is how two voters of the #98 stress run stopped
+for good. `read_protocol` now pages through `executed_v1` and returns
+the identities without a dependency row as `history`, and `coordd`
+restores them first. The scan is paged, and grows with the history just
+as the set does, until the same floor lets `executed_v1` forget a
+prefix.
+
+**The closure stops at that answer too.** Executing a command walks its
+closure, and the walk stopped only at a retired command still in the
+tombstone window. A restart retires everything it executed at once --
+about 2,000 commands in the `--fault leader` runs, against a capacity of
+1024 -- and the window then holds the last `capacity` of them. A record
+still live after the restart can reach further back than that: the
+guards answered EXECUTED for the command it reached, and the walk called
+it unknown. Executing that record failed as `DependencyUnknown` on every
+restart, which is the `--fault leader` stop that remained after the fix
+above; it needs no checkpoint. The walk now stops at any command this
+replica executed.
+
+Checked with #98's `shim-stress.py`, on #98's head with and without this
+change:
+- **Without it**, `--fault leader`: voter 1 stopped on every restart with
+  `DependencyUnknown`, and the final read was not served (exit 2).
+- **With it**:
+  - `--fault leader`, three runs: exit 0 every time, no voter stopped,
+    and no anomaly;
+  - `--fault majority`, one run: exit 0 as well.
+
+**History is left out of reports.** A command is *forgotten* when this
+replica executed it and retired it longer ago than its last `capacity`
+retirements. That window is kept apart from the tombstones: those also
+keep every key's latest command for the guards, however old, so with
+commands on ever new keys they grow with the keys, and a report bounded
+by them would too. (The domain uses one conservative key today.) A report
+leaves forgotten commands out, so it names what the voter has not
+executed, and what it executed recently. A Sync, selected from a
+majority of reports, is bounded the same way. A voter that has not
+executed a command every majority reporter forgot is further behind than
+recovery carries anyone; it catches up by the checkpoint path.
+
+**Executed means committed.** A commit is not written as a row, so a
+durable record says ACCEPT for a command long executed. Reports now say
+COMMIT for every command the reporter executed, and the selection
+installs it as committed wherever it goes. Before, it went out as
+ACCEPT: the new leader proposed it again and waited for votes from
+voters that had executed and retired it, which had no record to vote
+from. A follower that receives a proposal for a command it executed and
+retired now drops it rather than holding it for ever.
+
+**A new leader proposes nothing it executed.** A selected command
+installed as committed that the leader already executed has nothing left
+to decide. Re-proposing it only spent the lanes: the Jepsen run's leader
+re-proposed about 350 commands in one pass, and the lanes refused the
+ones that mattered along with them.
+
+**Memory follows the window.** When a voter's durable ledger outgrows
+four times its table, it drops the durable records, payloads, served
+payloads, proposals, votes and adoption orders of forgotten commands. A
+restarted voter retires everything it executed, in execution order, and
+sweeps at once: every dependency row comes back as a record, and it
+used to report all of them to the first candidate that asked, which
+after a kill is straight away.
+
+**A candidate that far behind does not lead.** The selection names what
+it lacks only as a dependency of the oldest command it carries, since
+every reporter left that command out. Before binding, a candidate checks
+every dependency of a selected entry: one that the selection does not
+carry and the candidate has not committed means it is behind every
+reporter's window. Bound and won, the ballot would have a leader that can
+never execute again. Its execution was guarded, so this was never a
+wrong result, but it was a domain without a working leader. The
+candidate abandons the campaign, records `Behind`, and does not campaign
+again this boot; a voter that is not behind leads instead.
+
+**Restarts stay swept.** A restarted voter sweeps what it forgot as it
+restores its execution frontier, and `coordd` then restores the payload
+rows. Those used to come back in full, a payload per command ever
+executed until the next sweep. Forgotten commands' payloads now stay out.
+
+### Liveness gaps found on the way
+
+- **A new leader served only its own proposals' payloads.** A recovered
+  command it had no reason to propose again (one it executed) was never
+  served, and a voter lacking it asked for ever. The leader now keeps the
+  payloads it recovered as servable.
+- **A Sync ahead of the promise was refused.** The Sync is published once.
+  A voter whose promise for that ballot was still to come refused it, and
+  was then promised to a ballot it could never synchronize to. A leader
+  receiving it before its own deposing promise dropped it the same way.
+  Both now keep the highest such Sync, and only from its ballot's leader,
+  and install it once the promise is durable. Kept by arrival instead, a
+  lower Sync arriving second replaced the higher one, which was then
+  lost. This had been hidden: the new leader's re-proposals used to
+  bring such a voter back as a side effect.
+- **A voter with a long history could not start again.** Recovery charged
+  every protocol row, payload and executed row to one `ViewBudget`, and
+  `coordd` passes the schema's (10,000 rows, 16 MiB) and treats a
+  recovery error as fatal. In the five-node Jepsen run the ballot-1
+  leader ended every restart on `protocol rows exceed the recovery
+  budget` (#98). Nothing in `coordd` trims protocol rows yet: its
+  housekeeping publishes local checkpoints (task-j04), which retire
+  journal prefixes, and the quorum floor that lets a trim remove the
+  dependency rows of an executed prefix (task-53) is not wired in. So a
+  voter holds one dependency row per command it saw, and any long run
+  crosses 10,000. That budget exists for the execution path, where an
+  overrun is a replicated result; recovery is not one. `read_protocol`
+  now reads every row the store holds, a page at a time within the
+  budget, as the executed identities already were. What it keeps is what
+  the machine keeps for the life of the process anyway.
+
+### What the tests show
+
+- `graph.rs` `an_executed_command_is_answered_for_long_after_its_tombstone_went`:
+  forty commands through a table of two. The tombstones stay bounded, and
+  every command still reads as EXECUTED.
+- `activation.rs`
+  `an_election_after_more_history_than_the_table_holds_asks_for_nothing_executed`:
+  400 commands at capacity 32, then a follower restart and a leader loss.
+  - A follower's report stays at about twice the table, restarted or not.
+  - The candidate wins in one campaign and asks for no payload of a
+    command every voter executed.
+  - The Sync names at most four times the table.
+  - The new ballot serves.
+  - Negative controls: without the executed answer the cluster never
+    settles; without the report window a follower reports 112 commands
+    where the bound is 65.
+- `activation.rs` `a_sync_ahead_of_the_promise_is_installed_once_the_promise_is_made`:
+  r1's promise request is held back until r2 has won and published its
+  Sync. r1 then synchronizes and serves. Without the fix it stays
+  unsynchronized.
+- `graph.rs` `history_on_distinct_keys_is_forgotten_past_the_window`:
+  forty commands, each on its own key, through a table of four. Every one
+  keeps its tombstone as its key's latest, and only the last four are
+  still reported. Negative control: bounded by the tombstones, all forty
+  are.
+- `activation.rs` `a_candidate_behind_every_reporters_window_does_not_win`:
+  r2 misses 200 commands, the leader goes, and r2 campaigns first. It
+  does not win and does not campaign again; r1 leads, and the next
+  command executes. Negative control: without the check, r2 wins and the
+  cluster never settles.
+- `activation.rs` `a_leader_keeps_the_highest_sync_ahead_of_it`: Syncs of
+  ballots 2 and then 1, and one of ballot 3 relayed by a voter that does
+  not lead it, leave ballot 2's kept. Negative control: kept by arrival,
+  the relayed one is kept.
+- `graph.rs` `a_closure_stops_at_history_older_than_the_tombstones`: six
+  commands executed and retired through a table of two, and a committed
+  seventh that depends on the first. Its closure completes. Negative
+  control: stopping only at tombstones, it fails as `DependencyUnknown`.
+- `trim.rs` `a_record_that_names_a_trimmed_command_executes_after_a_restart`:
+  a trim removes commands 7 and 8's dependency rows, and command 9,
+  written after it, names 8. Recovery returns 7 and 8 as executed, and a
+  table restored as `coordd` restores one executes 9. Negative control:
+  read through the dependency rows alone, 7 and 8 are unknown.
+- `trim.rs` `a_voter_with_more_protocol_rows_than_the_schema_budget_recovers`:
+  11,000 dependency rows recover under the schema budget, and pages of
+  seven rows read the same records. Negative control: the old read fails
+  it with the Jepsen run's error. `recovery.rs`
+  `recovery_reads_every_row_however_many_pages_it_takes` (was
+  `recovery_charges_every_row_against_one_byte_budget`, which pinned the
+  cap): 32 rows under a 1 KiB page read the same records and payloads as
+  one page.
+- The election test above also restores payloads the way `coordd` does,
+  and a restarted follower holds no more payloads than records. Negative
+  control: restoring every payload row fails it.
+- The deterministic cluster's `settle` is now bounded, so a cluster that
+  cannot converge fails with a message instead of hanging the test run.
+
+### What is left
+
+- The executed-identity set, and the `executed_v1` scan that restores
+  it, grow by one identity per command. So do the protocol rows, and
+  recovery's memory and time with them. A floor that lets them forget a
+  prefix every voter executed needs task-53's checkpoint path wired into
+  `coordd`, which it is not.
+- History is swept from `applied`, so a leader that stops executing keeps
+  a ledger above the sweep bound until its next execution. It is
+  harmless: nothing is added to it meanwhile.
+- A voter further behind than every majority reporter's window is not
+  brought up by recovery, and nothing else brings it up yet. The
+  checkpoint path is what should.
+- Bringing a candidate that far behind up before it leads, rather than
+  standing it down (above), is future work with the rest of the
+  checkpoint path.
+- Proposals a voter never received (task-d07).
+
+## A proposal is sent until every voter has voted on it
+
+task-d07, cause 2 of "no domain serves past its first election" (#98), and
+the Jepsen client's finding 3. The protocol assumes a proposal reaches
+every voter. The transport drops a frame by design when a lane is full
+or the peer is not linked yet, and nothing sent a proposal again. A voter
+that missed one held everything after it, since every later proposal
+depends on it through the conservative key, and executed nothing more
+until a Sync realigned it. Writes still succeeded where the leader
+answered them; reads through that voter waited for ever.
+
+Three triggers were known:
+- a voter not linked yet when the proposal went out: the last voters
+  started, in the Jepsen runs;
+- a frame a full lane refused: a new leader re-proposed its whole
+  selection in one pass, and a 64-frame control lane refused dozens;
+- a re-proposal that reached a follower before its Sync, refused as
+  `FencedByPromise`.
+
+### The re-send
+
+- **`Leader::resend_unvoted(per_voter)`** sends each voter, again, the
+  durable proposals of the ballot it has not adopted. They go oldest
+  first, at most `RESEND_PER_VOTER` (16) per voter per call, as the same
+  proposal: the same sequence number, dependencies, paths and admission.
+  The admission is now kept in `Proposal`, so a re-send is the same
+  proposal even after the leader's record was retired.
+- **What a voter lacks is read from its adoption acknowledgements.**
+  Only those say it received a proposal. A fast acknowledgement goes
+  out when the payload arrives, with no sequence number, proposal or
+  not. Counted as a vote, it credited a fast-set voter with a proposal
+  it never received and with every one before it. The chain is total,
+  so a voter that adopted a proposal holds every earlier one, and only
+  proposals after the latest it adopted are sent. One it never
+  acknowledges -- a command it executed and keeps no record of -- stops
+  being sent once it adopts a later one.
+- **A duplicate proposal is re-acknowledged.** A follower that receives
+  a proposal it already adopted or holds publishes to the leader, again,
+  what it acknowledged for that command in this ballot. It is the same
+  frames, under the context and barriers they were first published
+  with. A lost acknowledgement used to be as final as a lost proposal:
+  with one voter down, the command never committed.
+- **Across a restart too.** What a follower published is kept for its
+  boot, so a restarted one had nothing to publish again. When nothing is
+  kept, a duplicate proposal of an adoption restored from the rows is
+  adopted again: the same row is written, and acknowledged once it is
+  durable. A proposal for a command the follower has decided --
+  committed or executed, retired or not -- is answered with an adoption
+  acknowledgement to the leader alone, and only when it carries the
+  dependencies and admission of the follower's durable record. Decided,
+  the command's dependencies are those; a command it keeps no durable
+  record of any more is left alone. Nothing is written for it, and no
+  frontend is sent evidence of it.
+- **A new leader publishes its re-proposals in batches.**
+  `from_recovered` makes every re-proposal durable, but publishes only
+  the first `REPROPOSE_BATCH` (32). The re-send delivers the rest,
+  oldest first, as votes come back.
+- **`coordd` drives it.** A leader calls it every `RESEND_INTERVAL`
+  (250 ms), from the serve loop, and wakes for it on a quiet domain,
+  since the voter it re-sends to is the one not sending.
+- **The numbers.** 250 ms is tuned for a release build. A debug build's
+  adoption can take longer, so there a re-send often races the first
+  vote; the duplicate is answered from what was kept, which costs a
+  frame. `REPROPOSE_BATCH` (32) and `RESEND_PER_VOTER` (16) together
+  stay under the 64-frame control lane to a voter, with room left for
+  the leader's other traffic on it.
+
+### The regression the shim test found
+
+With the first version of this change carried on #98,
+`jepsen_shim::each_operation_does_what_its_line_says` failed every time:
+the first read through voter 2 stayed pending. Traced with temporary
+logging:
+- The domain's first proposal goes out before the followers are linked,
+  and neither receives it. Before this change the collector's re-offer
+  made the leader republish it to every voter until it was learned.
+- The re-send sent it to voter 3 only. Voter 2 is in the fast set and had
+  fast-acknowledged the command when its payload arrived, and that
+  counted as having voted on it.
+- Voter 3 adopted it, the leader learned the command from that, and
+  republishing stopped. Voter 2 never got the proposal, held everything
+  after it, and never executed the session that the read waits for.
+
+Counting only adoption acknowledgements closes it: the whole shim test
+file passed 10 of 10 runs, where it had failed on the first run before.
+
+### What the tests show
+
+- `activation.rs`:
+  - `a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend`:
+    r2 misses c1's proposal. Before the re-send, it has executed nothing;
+    after it, every voter executes c1, c2.
+  - `a_fast_acknowledgement_does_not_stand_for_the_proposal`: r1, in
+    the fast set, receives c1's payload but not its proposal. Negative
+    control: counting its fast acknowledgement as a vote, r1 never
+    executes c1.
+  - `a_lost_acknowledgement_is_published_again_on_a_resend`: with r1
+    down, r2's acknowledgement is dropped. The command commits only once
+    the re-send draws the re-acknowledgement. Negative control: without
+    the re-acknowledgement it never commits.
+  - `a_lost_acknowledgement_is_published_again_after_the_voter_restarts`:
+    the same, with r2 restarted after executing c2 and before the re-send.
+    Negative control: without the acknowledgement for an executed
+    command, c2 never commits on r0.
+  - `a_restored_adoption_is_acknowledged_again_on_a_resend`: the same,
+    with r2 restarted before it executed c2. Negative control: without
+    adopting again, c2 never commits on r0.
+  - `a_proposal_refused_ahead_of_the_promise_is_sent_again`: the new
+    ballot's first command reaches r1 before r1 promised. After its Sync,
+    r1 lacks it until the re-send.
+  - `a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive`:
+    69 commands to propose again, and the first pass to a follower is 32.
+    All 69 arrive through the re-send. Negative control: publishing all
+    at once sends 69.
+- `multi_host.rs` `a_voter_started_after_the_first_write_serves_reads`:
+  the decisive case, with real daemons. Voters 1 and 2 serve a write,
+  voter 3 starts afterwards, and a read through voter 3 is served.
+  Negative control: with the serve loop's re-send removed, the read is
+  not served.
+
+### What is left
+
+- A voter that never votes (it is gone) is sent up to 16 proposals per
+  interval, and they are dropped at its unlinked lane. It is bounded, not
+  free.
+- The one re-send that does not converge on its own: in a quiet domain,
+  a proposal for a command the voter has no ledger record of any more
+  (swept as history, or trimmed with a checkpoint's prefix) draws no
+  answer from `acknowledge_decided`. It is re-sent to that voter every
+  interval until the voter adopts a later proposal. That is one small
+  frame per 250 ms, within the 16 per voter.
+- `shim-stress.py --fault leader` and `--fault majority`, and the Jepsen
+  workflow, were run on #98 with this branch's code carried byte for
+  byte, not on this branch itself. The stress runs pass (4 of 4, exit 0).
+  The Jepsen run is `:valid? true`, but the five-node domain still stops
+  serving for minutes after partitions and pauses. That is open on #98,
+  and no cause has been traced to this task.
+
+## The leader carries the decision to every voter
+
+task-d09, the root cause of the five-node Jepsen stall that remained with
+task-d05 through task-d07 carried (#98). A follower commits a command
+only from the acknowledgements it receives itself: its `VoteSet` needs
+the leader's proposal and a majority's adoptions, or the fast set's
+evidence. Every acknowledgement is published once, to every voter, on a
+lane that refuses a frame when its queue is full, and nothing publishes a
+missed one to that follower again. No message carried a decision from
+the leader to a follower outside an election's Sync.
+
+With three voters that never showed: the leader's proposal and the
+follower's own adoption are already a majority, which is why the
+three-voter stress runs passed. With five, a follower needs two of its
+peers' acknowledgements as well. In the Jepsen runs a ring partition left
+two followers seeing the leader and one peer that was paused or cut off
+itself:
+- they adopted every command and could commit none of them;
+- the chain is total (task-d06), so nothing after the first missed
+  quorum could commit either;
+- within a table's worth they refused every payload as backpressure;
+- the leader lost both votes, and the domain served nothing to the end
+  of the run, through the heal.
+
+### The frontier
+
+- **`Leader::committed_through`** is the highest sequence number of the
+  ballot whose whole prefix is committed at the leader with its batch
+  durable. Every sequence number below the next went to a proposal of
+  the ballot, and one no longer in `proposals` was forgotten, which only
+  happens to a command executed long ago.
+- **`Leader::announce_committed`** sends it to every other voter as
+  `ProtocolMessage::Committed { ballot, through }`. `Machine::
+  resend_unvoted` calls it after the re-send, so `coordd` sends it every
+  `RESEND_INTERVAL` (250 ms). The frame is a few bytes and carries the
+  whole frontier, so a dropped one is repaired by the next; it needs no
+  barrier, since the frontier counts only durable batches. It is the
+  last variant, so the payload-transfer discriminants stay where
+  `is_payload_transfer` expects them.
+- **A follower commits what it adopted up to it.** Only a frontier from
+  the leader of the follower's current ballot is taken, and it is reset
+  with the ballot. Every durable adoption of that ballot at or below it
+  is committed, in sequence order. `learn` alternates this with the
+  acknowledgement rule until neither commits anything more.
+- **Why it is sound.** The leader's commit is a decision under the
+  crash-fault model. An adoption here took the dependencies of that
+  leader's proposal with that sequence number, which is what its commit
+  was over. Only a durable adoption counts, as only a durable adoption
+  counts as this replica's vote. The frontier commits nothing the
+  follower did not adopt: a command it holds initialized without the
+  proposal stays where it is.
+- **An adoption carries the proposal's admission.** A proposal that
+  arrived before the payload was held, and adopted once a payload was
+  bound, even one under other attested facts. `on_proposal` compared the
+  admissions only when the payload came first. Adopted, the command
+  committed from the frontier, or from the leader's proposal and two
+  peers' acknowledgements, and executed under facts the quorum never
+  admitted (Codex, on #103). A held proposal whose admission differs from
+  the bound payload's is not adopted, and not admitted past a full
+  table's capacity either.
+
+### A follower that took other facts rebinds to the leader's
+
+Refusing such a proposal left the voter stalled on that command, and
+with the chain total, on everything after it. The conflict is routine,
+not an attack:
+- Every presentation of a command mints its own admission receipt. The
+  receipt id mixes the collector's clock and a counter, and the
+  admission digest binds the receipt id and the admission time.
+- A submitter that presents again after a lost link therefore reaches
+  the voters under facts the leader never saw. A voter that missed the
+  first presentation takes the second, and then meets the leader's
+  proposal under the first.
+
+So a follower now fetches the leader's facts and binds them in place of
+its own, while nothing has been accepted over them:
+- **Held, not dropped.** A proposal under other facts than a record at
+  PRE-ACCEPT is held and reported as `AdmissionConflict`, whichever
+  arrived first. It is not counted in the vote set, which may have bound
+  the other facts. Past PRE-ACCEPT the record's facts are the ones this
+  replica acknowledged adopting, and the proposal is refused as before.
+- **Asked for as missing.** The command counts as a missing payload, and
+  as a due one once the leader's frontier covers it, so the paced ask
+  names it.
+- **Rebound.** A transferred payload under the held proposal's facts
+  rebinds the record (`CommandTable::rebind`, only at PRE-ACCEPT). The
+  payload and dependency rows are written again under the new facts in
+  one batch, so a restart restores the record as rebound. The old
+  payload is no longer served, and the new one is once durable. The vote
+  set starts again from the proposal. Then the proposal is adopted, and
+  the frontier commits it.
+- **What is replaced** is this replica's local order, which adoption
+  replaces anyway, and its fast acknowledgement under the other facts.
+  No quorum counts that acknowledgement: every learning predicate needs
+  the leader's proposal, and a vote set counts nothing under facts other
+  than the ones it bound.
+
+### A full table admits the command whose turn has come
+
+The first version of the tests found a second stall behind the first.
+- The frontier committed the eight commands the follower had adopted,
+  and they executed.
+- The payloads it then asked for arrived in no particular order, and
+  the table filled again with later commands.
+- None of those can be adopted before the next command in the chain,
+  and that one was refused as backpressure. So were its later
+  retries, for ever.
+
+In the Jepsen runs the same happens with submissions: new commands'
+payloads reach a follower that is behind and fill its table ahead of the
+commands it needs. Two changes close it.
+- **Admission.** A payload whose held proposal has every dependency at
+  least ACCEPT here initializes past the table's capacity
+  (`CommandTable::initialize_beyond_capacity`, `turn_has_come`). It is
+  adopted at once, and its adoption is the vote the leader may be
+  waiting for. This is the one place the table's bound is crossed on
+  purpose. How far is bounded by the chain of held proposals each of
+  whose dependencies is adopted before it, and the held proposals are
+  bounded: at most `HELD_PROPOSAL_SLACK` (four) tables' worth. The
+  commands admitted are the ones execution needs next, so committing
+  and executing them is what shrinks the table again.
+- **Not only once the leader has committed it.** The first version
+  admitted such a command only within the leader's commit frontier.
+  With a majority of followers full, that frontier never moved: the
+  leader could not commit the command without their votes, and they
+  would not adopt it until it had. The five-node Jepsen run on
+  `7f62f17` stopped at 265 s with no fault active and three followers
+  refusing proposals as backpressure in the thousands, which is this;
+  `a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it`
+  reproduces it deterministically.
+- **The ask.** A follower's bounded payload ask names first, and in the
+  leader's order, the held proposals whose payload it lacks and whose
+  turn has come or which the frontier covers: half the ask, so the
+  rotation through the rest still moves. Before, the one command whose
+  turn had come was reached once per rotation through a missing set of
+  thousands.
+
+### A restarted follower asks for the proposals it adopted
+
+A follower killed with adoptions in flight comes back with them at
+ACCEPT, restored from the rows with no sequence number. The row names no
+ballot, and every ballot numbers its proposals from zero, so nothing
+durable says which of the leader's sequence numbers an adoption was, and
+the frontier cannot commit it. The leader counted its acknowledgements
+before the kill and never re-sends them. With the chain total, nothing
+the follower adopts afterwards commits either, until the next election.
+Jepsen's kill nemesis makes this routine.
+- **The ask.** Each time the leader's frontier arrives, a follower that
+  holds such adoptions asks the leader for their proposals:
+  `ProtocolMessage::ProposalRequest { ballot, commands }`. It names at
+  most `MAX_PROPOSAL_ASK` (16) and rotates through the rest, as the
+  payload ask does. So it is paced by the leader's re-send timer and
+  needs no timer of its own.
+- **The answer.** The leader sends each durable proposal of the ballot
+  that it names, byte for byte as a re-send would. A command it did not
+  propose in the ballot gets no answer and waits for the next Sync, as
+  before.
+- **Adopted again.** The follower takes the answer as any duplicate
+  proposal: an adoption with nothing kept and below COMMIT is adopted
+  again (task-d07), this time with its sequence number. The frontier
+  then commits it.
+
+### What the tests show
+
+`crates/coord-consensus/tests/frontier.rs` runs five voters, so a follower
+needs its peers:
+- `a_follower_that_hears_only_the_leader_executes_what_it_commits`: r3
+  receives every proposal and no peer's acknowledgement. The re-send
+  alone leaves it at ACCEPT on all ten commands; the frontier executes
+  them.
+- `two_followers_cut_from_their_peers_both_execute`: the ring partition,
+  with r3 and r4.
+- `a_follower_whose_table_filled_while_it_could_not_learn_catches_up`:
+  a table of eight, 32 commands, backpressure on r3; it executes all 32
+  in the leader's order.
+- `a_follower_asks_first_for_what_the_leader_committed_in_its_order`:
+  r3 holds 32 proposals without their payloads; its first ask leads with
+  the one whose turn has come.
+- `a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it`:
+  three of four followers' tables of eight fill with later commands
+  before the one they all depend on, which reaches only the leader and
+  r1. Every voter executes all nine.
+- `the_frontier_commits_nothing_the_follower_did_not_adopt`: r3 receives
+  payloads and no proposals; the frontier reaches it and nothing moves
+  past PRE-ACCEPT, until the proposals do.
+- `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`:
+  r3 adopts six commands and commits none. It is killed and restarted
+  under the same leader, and three more follow; it executes all nine.
+- `a_follower_that_took_a_command_under_other_facts_after_its_proposal_rebinds`:
+  the proposal reaches r3 before r3's own submission, which carries
+  another admission receipt. r3 reports the conflict, rebinds to the
+  leader's facts and executes the command and three more under them.
+  The durable row names the leader's facts, and a restart restores its
+  payload.
+- `a_follower_that_took_a_command_under_other_facts_before_its_proposal_rebinds`:
+  the same with r3's submission first.
+- `a_frontier_from_another_voter_is_ignored`, and
+  `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed`
+  (three of five voters down: the frontier stays, then moves once they
+  are back).
+
+Negative controls, each run and failing:
+- with a follower that ignores the frontier, six of the first seven
+  fail; the leader's own frontier test is the one that passes;
+- without the proposal ask, the restart test executes nothing on r3;
+- without the admission check at adoption, r3 executes the conflicting
+  facts in both rebind tests;
+- without the rebind, r3 executes nothing in either;
+- without admission past capacity, the full-table test executes the
+  first eight and stops;
+- with admission past capacity only within the frontier, no voter
+  executes anything in the three-full-followers test;
+- without the ordered ask, the ask test leads with other commands.
+
+### What is left
+
+- **Restored adoptions from an earlier ballot.** An adoption the
+  current leader never proposed gets no answer to the ask, and waits for
+  the next Sync. The ask keeps naming it, within its bound.
+- **Rate.** Repair is still task-d07's 16 proposals per voter per 250 ms,
+  and payloads 8 per ask from the leader alone. task-d10 makes both
+  flow-controlled.
+- **A voter behind the leader's retention** has no path back without a
+  checkpoint: task-d08.
+- **Acceptance on Jepsen.** The five-node Jepsen run is task-d09's
+  acceptance and has not run with this change; it needs #98 to carry it.
+
+## A promise is not a leader
+
+task-d10's first commit, from the five-node Jepsen run on #98. After all
+five voters were killed, the one furthest behind campaigned for ballots 2
+to 6 and was promised each one. Its machine then found itself behind
+every reporter and stood down without a Sync (task-d05), so it never led.
+The two voters that promised it followed those ballots and did not
+campaign. The domain served nothing from then on.
+
+`coordd` counted a voter as led when the ballot it promised named another
+voter it held a link to (task-d01). A candidate collects its promises
+before it knows whether it can bind a selection, so a promise is not yet a
+leader, and one whose candidate stood down held every voter that promised
+it for as long as the link held.
+- **The rule.** A voter has a leader when it leads, or when the leader
+  its promised ballot names is linked and that ballot has synchronized
+  here -- the ballot it votes in, the one whose Sync it adopted, is the one
+  it promised -- or has had the ceiling (16 s) to do so, counted from when
+  this voter first saw the promise (`Election::led`).
+- **Why the ceiling and not the patience.** The first version gave a
+  promise only the patience (1 s). A Sync is not a round trip behind the
+  promise: the candidate collects a report from a majority, paged, and
+  binds its selection durably first, which under load takes longer. Voters
+  then campaigned over live candidates, and in five `--fault random` runs
+  the ballots duelled to between 10 and 46, against 2 to 8 without the
+  rule. The ceiling is what a candidate already gives its own campaign
+  before replacing it (`observe`'s `finishing`), so a promise now gets the
+  same.
+- **The candidate's side** is unchanged: its own campaign is its
+  `campaigning` flag, and a stood-down candidate does not campaign again
+  (task-d05).
+
+### What the tests show
+
+`bins/coordd/src/election.rs`:
+- `a_promise_that_never_synchronizes_is_a_leader_only_for_the_ceiling`:
+  the rule's cases. A promise of ballot 3 while still voting in ballot 2
+  is a leader until the ceiling and not after; a new promise starts its
+  own allowance; the link still matters.
+- `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling`:
+  stepped through the schedule, a voter held by a promise that never
+  synchronizes campaigns only after the ceiling, and one whose Sync comes
+  just inside it never does.
+
+### What is left
+
+- The five-node Jepsen run is the acceptance, and has not run with this.
+- The rest of task-d10: flow-controlled catch-up and a campaign that is
+  making progress kept past its ceiling.
+
+## A Sync leaves no acceptance of an earlier ballot
+
+task-d11, from the three-voter stress runs on #98. With #100, #103 and
+#104 carried, the one unserved final read left was a domain whose every
+campaign failed as `IncompatibleAccepted`: two reports held one command at
+ACCEPT under the same synchronized ballot with different dependencies.
+The same stall ended a run on the build before any of those changes.
+
+A ballot's leader proposes a command once, so one of the two acceptances
+was not that ballot's. A voter installs a Sync's entries and nothing
+else (`Follower::activate`), and its report labels every record with the
+ballot it last synchronized. So:
+1. A voter adopts x under ballot 0 and is restarted; its table holds x at
+   ACCEPT from its rows.
+2. Ballot 1 is selected without its report and re-proposes x, and the new
+   leader and another voter adopt x under the order ballot 1 gives it.
+3. The voter installs ballot 1's Sync, which does not carry x as an entry.
+   x stays at ACCEPT with ballot 0's dependencies.
+4. Its report for ballot 2 says x was accepted under ballot 1. Beside the
+   other voter's report, `select` raises `IncompatibleAccepted` on every
+   campaign. Without it, `select` installs ballot 0's dependencies as
+   ballot 1's decision.
+
+- **The fix.** At the first installation of a Sync (`on_sync`, not the
+  idempotent re-activation after a restart), every record at ACCEPT that
+  the decision does not carry as an entry is demoted to PRE-ACCEPT. The
+  demoted rows go into the batch of the synchronized-ballot row and the
+  promise, and the ledger stages each of them under that barrier, so a
+  restart cannot bring an acceptance back beside the new marker. The
+  table follows once the batch is durable (`CommandTable::demote`).
+- **Kept:** the payload and the dependencies, which at PRE-ACCEPT decide
+  nothing and which adoption under the new ballot replaces. A record the
+  voter has committed is a decision and stays.
+- **Not kept: the path.** A report carries PRE-ACCEPT entries into the
+  next selection's fast-path analysis (`possible_fast_decisions`), under
+  the synchronized ballot's label. With that ballot's leader absent and
+  the demoted voter its only fast-set reporter, the path x had under
+  ballot 0 would read as evidence that ballot 1 decided x fast, and the
+  selection would promote ballot 0's dependencies (Codex, #105). A
+  demoted record's path is `demoted_path()`, a single-part digest that no
+  initialization computes, and the analysis counts no record with it. A
+  fast set's member that did not pre-accept a command in the ballot rules
+  out a fast decision of it there, so the analysis loses nothing it
+  needed.
+- **Not an acceptance of the new ballot.** A duplicate Sync that arrives
+  while the first one's marker is becoming durable activates the new
+  ballot early, and a proposal of that ballot can be adopted before the
+  marker is durable. That adoption takes the command out of the pending
+  demotions, since its own row follows the marker's batch; otherwise the
+  table would drop to PRE-ACCEPT under a durable ACCEPT row (Codex, #105).
+- **Why only at the first installation.** An acceptance written after the
+  Sync is the new ballot's own. After a restart the marker's batch has
+  already demoted what it had to, and demoting again would take back a
+  vote that counted.
+- **A candidate** installs its own Sync through the same `on_sync` once
+  its selection is durable, so a winning leader's table is demoted the
+  same way.
+- **Not the other way.** Committing such a record because a selected
+  entry depends on it would be wrong: an omission says a majority
+  executed the command, not under which dependencies, and a voter that
+  missed a whole ballot can hold an acceptance of a command the next
+  ballot re-proposed and decided differently. That voter is behind every
+  window, which is task-d08's.
+
+### What the tests show
+
+`activation.rs` `a_sync_leaves_no_acceptance_of_an_earlier_ballot`:
+r1 adopts x after a under ballot 0 and is restarted, then installs a
+ballot-1 Sync that re-proposes x. Its report for ballot 2 has x at
+PRE-ACCEPT under ballot 1, and a selection over it and a ballot-1
+acceptance of x with other dependencies completes with those. The same
+holds after another restart. Ballot 1 is r0's, so r1 is in its fast set,
+and a selection by r2 over r1's report and a report of ballot 0 does not
+select x as a fast decision of ballot 1. Negative controls: without the
+demotion, the report says ballot 0's acceptance is ballot 1's, and the
+selection fails as `IncompatibleAccepted`; with the demotion keeping the
+path, or with the analysis counting `demoted_path()`, the second
+selection takes x with ballot 0's dependencies.
+
+`a_sync_demotes_no_acceptance_of_its_own_ballot`: r1's marker batch is
+held back while a proposal of ballot 1 and a duplicate Sync arrive; r1
+adopts x under ballot 1, then the marker and the adoption become durable
+in that order, and x stays at ACCEPT with ballot 1's dependencies.
+Negative control: without the adoption leaving the pending demotions, the
+marker demotes it.
+
+### What is left
+
+- A winning leader whose own acceptance of a command was demoted
+  re-proposes it with `demoted_path()` as its path, so no fast
+  acknowledgement matches it and the command is learned on the slow
+  path. Before, it carried the leader's path from the
+  earlier ballot, which no follower's acknowledgement in the new ballot
+  was computed against either.
+- The stress runs with this carried are the acceptance.
+
+## A new leader chains after what it executed
+
+task-d12, from a three-voter stress run's `release-record-mismatch` and a
+five-node Jepsen run's lost appends on #98. Both were one fork, made by a
+new leader.
+
+task-d06 made a new leader anchor the conservative key at the recovered
+order's tail before it proposes anything new. `Leader::from_recovered`
+then chained `decision.reproposed` after the entries, in identity order,
+and moved the anchor to every command it knew, whether or not it proposed
+it. `phase_of` answers `Executed` for a command in history with no record,
+and `select` puts every row of a report behind the source ballot in
+`reproposed`. So a selection over a behind reporter's rows anchored the key
+at the largest identity among old commands the leader had executed and
+retired, and the first fresh proposal depended on that command alone.
+Every voter holds the same dependencies for it, and a voter that ran it
+beside the commands after the old anchor had no edge to order them by.
+
+- **The stress run.** The stopped node executed a ballot-3 proposal whose
+  only dependency had executed at position 12; it ran it at position 1179
+  and the other two at 2149, and 161 digests differed after that. The
+  same run's ballot 8 forked on the same old command.
+- **The Jepsen run.** Two ballot-1 leaders left two voters about a
+  thousand rows behind the ballot the next leader recovered from. That
+  leader's fresh proposals forked, and a behind voter executed them before
+  its backlog, against a key that was still empty there. The appends are
+  guarded, so its guard held and it answered `ok`; on the main line the
+  same commands ran against a key with a hundred elements, the guard
+  failed and they had no effect.
+- **Two more hazards in the same loop.** A command the leader had at
+  Commit or beyond was re-proposed chained after the anchor rather than
+  with its decided dependencies. With no entries, the anchor started
+  empty and the first re-proposal depended on nothing.
+
+### The fix
+
+- A re-proposed command the new leader has at Commit or beyond is neither
+  chained nor re-proposed: it was decided in an earlier ballot, with the
+  dependencies it has here. Re-proposing decided commands with their
+  decided dependencies would let a behind voter adopt them again, but a
+  proposal of a decided command is a new mechanism; catch-up is
+  task-d08's.
+- The chain starts at the recovered order's last command the leader has
+  not executed. Else it starts at the last command the leader committed
+  and has not executed yet (`CommandTable::committed_tail`, the committed
+  record no other committed record depends on): execution follows the
+  dependencies, so that command comes after everything the leader
+  executed, and every other voter may have executed it already. Else at
+  the last command it executed (`CommandTable::last_executed`, kept by
+  `execute` and `restore_executed`).
+- On a restart, that last command is the last one replayed. coordd
+  replays history, then the executed commands with rows. Both were read
+  back in identity order; `read_history` now sorts by each row's execution
+  position, as the executed rows already were, so what comes back last is
+  what executed last.
+- **The collector compares a late release with its answer.** A collector
+  that answered from this node's record, with the votes counted and the
+  release not yet in, took the release when it came as settled without
+  looking at it. That is why the Jepsen run's forked voter answered seven
+  times and never stopped. The collector now keeps the result digest with
+  each answer, and a release for a command it already answered must agree
+  with the response and the digest. A difference is `AnsweredOtherwise`,
+  and coordd stops on it as it does on `release-record-mismatch`. That
+  does not prevent the first wrong answer; it stops the node from going
+  on.
+
+**Liveness.** A voter that holds a decided command the Sync omits is at
+PRE-ACCEPT after task-d11 and learns the decision only by catch-up
+(task-d08). Before task-d11 it sat at ACCEPT with no commit coming, so
+nothing regresses.
+
+### What the tests show
+
+`activation.rs`:
+- `a_fresh_proposal_follows_the_tail_not_an_executed_reproposal`: six
+  executed commands on one key, and a selection with no entries that
+  re-proposes the second. The new leader's first fresh proposal depends on
+  the sixth, and the second is not proposed again.
+- `a_reproposal_with_no_entry_to_follow_follows_the_executed_tail`: an
+  undecided command only the new leader holds is re-proposed after the
+  executed tail, not with no dependencies.
+- `a_new_leader_chains_after_what_it_committed_and_has_not_executed`:
+  r2 commits three commands and executes none of them while the others
+  execute all six. As the new leader, with nothing re-proposed and with
+  one of the three re-proposed, its fresh proposal follows the sixth.
+- `a_restarted_candidate_with_no_entries_chains_after_what_it_executed`:
+  the candidate is restarted from its executed commands alone, with no
+  rows to rebuild the tail from, wins and chains after its tail.
+- `reproposals_follow_the_recovered_order_not_identity_order` (task-d06)
+  had re-proposed a command the new leader had executed, which is this
+  bug. It now holds the entries unexecuted and the re-proposed command
+  undecided, and still checks the recovered order.
+
+`trim.rs` `a_trimmed_history_comes_back_in_the_order_it_executed`: the
+trimmed prefix's positions are rewritten so identity order is the reverse
+of position order, and the history reads back by position; a table
+restored from it names the last executed command.
+
+`repair.rs` `a_late_release_that_contradicts_the_answer_is_refused`: the
+release is lost, the collector settles from the votes and the record,
+and the release arrives afterwards. It settles when the record agreed,
+and is refused as `AnsweredOtherwise` when the record had another
+response, or the same response under another digest.
+
+Negative controls: without the Commit skip, the first test fails; with
+the chain starting only at the entries' tail, the second; with the
+chain skipping the committed tail, the committed-not-executed test (at
+`076d218` its case with nothing re-proposed passed, and an anchor at the
+last executed command alone breaks it); with
+`restore_executed` not keeping the last command, the restart test; with
+the history in identity order, the trim test; with
+`check_release` as it was, the response fork is accepted, and without the
+digest comparison, the digest fork is.
+
+### From review
+
+- **Every committed tail.** A live table commits only after a command's
+  dependencies, but a restarted one takes each record's phase from its
+  row: a command installed from a Sync comes back at COMMIT, while one
+  committed from votes left its row at ACCEPT. Two committed records then
+  look last, and nothing says which is. `committed_tails` returns them
+  all and `anchor_all` makes the next command on the key depend on every
+  one of them, once (Codex, #106).
+- **The whole execution.** A late release is compared with the execution
+  the answer came from: digest, position and revision besides the
+  response. Two executions at different positions can answer with the
+  same bytes, and an answer over the deliverable bound is the same
+  `RESULT_TOO_LARGE` whatever it replaced (Codex, #106).
+- **Nothing after the contradiction.** Once a late release contradicts
+  an answer, `Domain::answer` sends nothing until the pass ends in the
+  stop: not the rest of the voter's batch, the parked frames or what the
+  records settle in the same turn (Codex, #106).
+
+### A commit below the source ballot is a decision
+
+The case the chain rule leaves: a new leader that holds a decided command
+only at ACCEPT, having missed the commit, while every reporter that holds
+the decision is behind the source ballot. The source rule sent all of
+those reporters' rows to `reproposed`, so the leader re-proposed the
+command after its tail and decided it a second time; a voter adopting
+that order then reported it beside a commit under one label, which is
+the `IncompatibleAccepted` the stress runs showed.
+
+`select` now takes an entry at COMMIT from any report, executed-as-
+committed ones included, into the selection with its dependencies and
+paths; PRE-ACCEPT and ACCEPT below the source are still re-proposed. A
+commit is a quorum's acceptance of one dependency set, final whatever
+ballot reached it, and the source rule chooses among acceptances. The
+agreement check applies as to any entry, so a below-source commit
+meeting an at-source acceptance under other dependencies is
+`IncompatibleAccepted`: the alarm it should be, where the old rule
+called it stale and kept the acceptance. An at-source copy's sequence
+number and paths outrank a below-source one's, since those are a
+ballot's own.
+
+- The new leader re-proposes such an entry with the decided dependencies
+  where it has not executed it, which is the existing entry path.
+- A behind voter installing the Sync commits those commands without a
+  vote, a partial heal of the task-d11 liveness note.
+- The Sync grows by the behind reporters' commits, bounded by the reports
+  it already reads.
+- The model's `legitimate-phase-differences` scenario had a lower
+  ballot's COMMIT of c2 under other dependencies as stale state; it now
+  holds only stale acceptances (c3 at ACCEPT where the source
+  pre-accepted it, the highest-phase-wins counterexample), and a fourth
+  frozen scenario, `below-source-commit-disagrees`, records the alarm.
+
+`activation.rs` `a_commit_below_the_source_ballot_is_selected_with_its_dependencies`:
+r1 executed x after a; r2 adopted both and, restarted before executing
+them, holds them at ACCEPT; the source report holds neither. x is
+selected at COMMIT with `[a]` and r2, winning, proposes it with `[a]`.
+Against the old rule x is not selected.
+`a_below_source_commit_against_an_acceptance_of_other_dependencies_is_incompatible`:
+the alarm. Against the old rule the selection succeeds.
+
+### A refusal is an execution
+
+A local random-kill stress run with this PR's first three commits carried
+(d12-11) stopped n1 on `release-record-mismatch`. The store dumps give the
+cause:
+
+- A command refused at execution (an admission mismatch, a retry conflict,
+  a window refusal) took its position and wrote no `executed_v1` row; only
+  a bound outcome wrote one. Every voter's executed rows have gaps between
+  positions 691 and 708, n3's again between 2629 and 2651 and n1's at 1338
+  and 1347.
+- After a restart the table held those commands at COMMIT from their
+  dependency rows, not executed. The voter executed them a second time, at
+  new positions, and every position after them moved on that voter only.
+- n3, restarted and then elected, had one of them (`f7b90790`, with no
+  executed row on any voter) as the last recovered entry it had not
+  executed, so its chain started there alone. It re-proposed `3e056e8a`
+  after it; n1, which had not run the commands executed since, executed
+  `3e056e8a` at 1339, where n3 executed it at 2643. n1's collector then held
+  a release for `0d2091fa` that contradicted its record, and stopped.
+
+Two changes:
+
+- **A refusal writes its executed row**, with its position and result
+  digest and no revision, and still nothing under the retry key, so the
+  binding it refused stands. `Applier::apply_refusal` and the admission
+  refusal in `apply_bound` go through `materialize::apply_refused_plan`,
+  which adds that row to the refusal's batch. Checkpoint trims and exports
+  already read `executed_v1` as "this command executed", and now see the
+  refusals as well.
+- **The chain starts after every candidate tail**: the recovered order's
+  last command the leader has not executed, the committed tails and the
+  last command executed. Each is the tail when the table is right, and a
+  dependency on one already behind the tail orders nothing wrongly; any
+  one alone has now been wrong.
+
+`coord-storage/tests/apply.rs` `a_refused_command_is_recorded_as_executed`:
+two refusals, a window refusal and an admission mismatch, each leave an
+executed row with the outcome's position and digest and no retry record,
+and `read_protocol` gives the history back with them in execution order.
+Without `apply_refused_plan` the row is missing.
+`activation.rs` `a_command_that_comes_back_unexecuted_does_not_restart_the_chain`:
+r2 restarts with every executed identity but one, the selection carries
+that one at COMMIT, and r2's first fresh proposal still depends on the
+command it executed last. With the chain starting at the last unexecuted
+entry alone, it depends on the stale command only.
+
+### No acceptance after the promise
+
+With both changes above carried, random-kill runs still stopped a voter
+on `release-record-mismatch` (d12c-1, -7, -9) or failed a campaign as
+`IncompatibleAccepted` (d12c-11), and the reviewer's replay (`--faults
+2,1`: voter 2 restarted, then the ballot-0 leader killed) stopped voter 3
+in 4 of 6 runs. Every one of the four dumps has the same shape:
+
+- The old leader proposed P and then X, which depends on P, and was
+  killed. A voter restarted far behind won the next ballot with its own
+  report and the third voter's.
+- The Sync's entries end exactly at P's position (794, 1415, 780, 1432),
+  and X is in neither its entries nor its re-proposals.
+- The third voter executed X right after P anyway, and the new leader
+  chained its first command after P as well: a fork at P + 1.
+
+The third voter had held X's proposal at the promise, its payload or P's
+acceptance not there yet, so its report was taken without X. During the
+campaign `advance_pending` adopted X once it became ready: it checked the
+seal's fence and not the promise. This replica's own acceptance and the
+old leader's proposal then made a quorum here, and it committed and
+executed X. A command no majority accepted before the promise was
+executed, and no selection could see it.
+
+`advance_pending` adopts nothing while the replica may not vote, and
+activation drops what is held, as it did. A payload that arrives after
+the promise (fetched for a held proposal or a selection) is recorded and
+not acknowledged; admission was fenced already. The outbox already
+dropped the stale-ballot acknowledgement, so what that second gate stops
+is the replica's own vote counting towards the old ballot here.
+
+`follower.rs` `a_proposal_held_across_a_higher_promise_is_not_accepted_after_it`:
+c1 accepted, c2's proposal held for its payload, a promise to ballot 1,
+then c2's payload. c2 stays below ACCEPT and nothing acknowledges it.
+Without the adoption gate c2 reaches COMMIT. The payload gate alone is not
+separated by this test: with the adoption gate in place, c2's own fast
+vote did not complete a fast quorum here.
+
+### A report nobody can supply
+
+The five-node Jepsen runs stalled for good in 3 of 8 runs since this was
+carried (1 of 3 with the promise fence): every campaign, up to ballot 25,
+was refused by the candidate's own machine as `Campaign(HalfInitialized)`,
+naming a far-behind voter (one had last recovered at `executed=762`
+against 2360 on the others). `select` fails that way when a report holds
 a command at ACCEPT or beyond and no report has its payload. A voter far
 behind can hold exactly that for good: it installed a Sync naming a
 command whose payload had not reached it, and by the time it asked, every

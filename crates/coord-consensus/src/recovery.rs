@@ -166,6 +166,22 @@ pub fn select(
     config: &BallotConfiguration,
     reports: &[RecoveryReport],
 ) -> Result<SyncDecision, RecoveryError> {
+    select_with(config, reports, |_| false)
+}
+
+/// [`select`], where `supplied` names the commands the candidate can
+/// supply itself beyond what its report says: it holds their payloads, or
+/// executed them (task-d12). A report leaves out what its replica executed
+/// long ago, the candidate's own included, so a behind voter's acceptance
+/// of such a command otherwise reads as one nobody can supply. The
+/// candidate that executed it knows it was decided; the selection carries
+/// it, and the candidate marks it committed before binding
+/// ([`crate::Campaign::commit_executed`]).
+pub fn select_with(
+    config: &BallotConfiguration,
+    reports: &[RecoveryReport],
+    supplied: impl Fn(&CommandId) -> bool,
+) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
         if !config.is_voter(&r.replica) {
@@ -195,7 +211,7 @@ pub fn select(
         for e in &r.entries {
             if e.phase >= Phase::Accept {
                 accepted_somewhere.insert(e.command);
-                if e.payload_present {
+                if e.payload_present || supplied(&e.command) {
                     with_payload.insert(e.command);
                 }
             }

@@ -17,7 +17,7 @@ use coord_types::ids::{Ballot, ReplicaId};
 
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
-use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select};
+use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select_with};
 use crate::summary::{PageError, ReportAssembler, ReportPage};
 
 /// The campaign for one ballot.
@@ -129,24 +129,32 @@ impl Campaign {
 
     /// Run the selection once a majority of complete reports is present.
     /// `Ok(None)` means not yet; an error stops the campaign with the
-    /// evidence.
+    /// evidence. `supplied` names the commands this candidate holds a
+    /// payload for or executed ([`crate::recovery::select_with`]).
     ///
-    /// A report holding an acceptance whose payload no report has is set
-    /// aside while a majority remains without it (task-d12). Such a
-    /// reporter is typically far behind: it installed a Sync naming a
-    /// command the others executed and retired since, payload and all,
-    /// and which they therefore leave out of their reports. Nobody can
-    /// supply that payload any more, so every selection that included the
-    /// report failed as [`RecoveryError::HalfInitialized`], and so did
-    /// every campaign whose first majority included that voter. Any
-    /// majority of promises is a sound basis for the selection -- it is
-    /// the set the candidate would have had if that report had arrived
-    /// later -- so leaving one out needs no judgement about the reporter.
-    /// The candidate's own report is never set aside: its own state is
-    /// what it goes on to lead from. When no majority remains, the
-    /// campaign waits for the voters that have not reported, and fails
-    /// only once every voter has.
-    pub fn try_select(&mut self) -> Result<Option<&SyncDecision>, RecoveryError> {
+    /// A far-behind voter can report an acceptance, from a Sync it
+    /// installed, of a command whose payload never reached it and which
+    /// the others executed long ago. They leave such a command out of
+    /// their reports (task-d05), and one that retired it may no longer
+    /// hold its payload, so every selection that included the behind
+    /// report failed as [`RecoveryError::HalfInitialized`] (task-d12).
+    /// Two things let the campaign through:
+    ///
+    /// - A command the candidate itself holds or executed is supplied: it
+    ///   is selected, and committed before binding if executed.
+    /// - Otherwise the report is set aside while a majority remains
+    ///   without it. Any majority of promises is a sound basis for the
+    ///   selection -- it is the set the candidate would have had if that
+    ///   report had arrived later -- so leaving one out needs no
+    ///   judgement about the reporter. The candidate's own report is
+    ///   never set aside: its own state is what it goes on to lead from.
+    ///
+    /// When neither applies, the campaign waits for the voters that have
+    /// not reported, and fails only once every voter has.
+    pub fn try_select(
+        &mut self,
+        supplied: impl Fn(&CommandId) -> bool,
+    ) -> Result<Option<&SyncDecision>, RecoveryError> {
         if self.decision.is_some() {
             return Ok(self.decision.as_ref());
         }
@@ -156,7 +164,7 @@ impl Campaign {
         }
         let everyone = reports.len() >= self.config.voters().len();
         let decision = loop {
-            match select(&self.config, &reports) {
+            match select_with(&self.config, &reports, &supplied) {
                 Ok(decision) => break decision,
                 Err(RecoveryError::HalfInitialized { replica, command }) => {
                     if replica != self.config.leader() && reports.len() > self.config.slow_size() {

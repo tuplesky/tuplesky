@@ -2001,13 +2001,13 @@ fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
     deliver(&mut c, &report(r(4), vec![dead.clone()]));
     deliver(&mut c, &report(r(1), vec![]));
     assert_eq!(
-        c.try_select(),
+        c.try_select(|_| false),
         Ok(None),
         "no majority without r4 yet: wait for the others rather than fail"
     );
     deliver(&mut c, &report(r(2), vec![]));
     let decision = c
-        .try_select()
+        .try_select(|_| false)
         .expect("selected without r4's report")
         .expect("a majority without r4");
     assert!(
@@ -2022,13 +2022,68 @@ fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
     for i in 1..4 {
         deliver(&mut own, &report(r(i), vec![]));
     }
-    assert_eq!(own.try_select(), Ok(None));
+    assert_eq!(own.try_select(|_| false), Ok(None));
     deliver(&mut own, &report(r(4), vec![]));
     assert!(matches!(
-        own.try_select(),
+        own.try_select(|_| false),
         Err(RecoveryError::HalfInitialized { replica, command })
             if replica == r(0) && command == x
     ));
+}
+
+#[test]
+fn a_campaign_supplies_what_its_candidate_executed() {
+    // Stress run d12-15, three voters: r2 far behind (401 executed against
+    // 3092) held x at ACCEPT from ballot 3's Sync without its payload. r1
+    // executed x at 1185 and still held it, but a report leaves out what
+    // its replica executed long ago, so r1's own report did not name it.
+    // r1 reached only r2, and every campaign failed as `HalfInitialized`
+    // naming r2. The candidate knows x was decided: it selects x and
+    // commits it before binding.
+    let config = quorum(ballot(4, 1));
+    let x = CommandId(Digest32([0x79; 32]));
+    let d = CommandId(Digest32([0x7a; 32]));
+    let report = |replica, entries| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(3, 0),
+        entries,
+    };
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(1), vec![]));
+    let behind = report(
+        r(2),
+        vec![coord_consensus::ReportEntry {
+            command: x,
+            phase: Phase::Accept,
+            deps: vec![d],
+            path: coord_consensus::empty_path(),
+            paths: Vec::new(),
+            seqnum: 1184,
+            keys: Vec::new(),
+            payload_present: false,
+        }],
+    );
+    c.promise(r(2));
+    for page in coord_consensus::paginate(&behind, 64) {
+        c.page(page).unwrap();
+    }
+    assert_eq!(
+        c.try_select(|_| false),
+        Ok(None),
+        "nobody supplies x and no majority remains without r2: wait"
+    );
+    let decision = c
+        .try_select(|command| *command == x)
+        .expect("the candidate supplies x")
+        .expect("selected");
+    assert_eq!(decision.entries[&x].deps, vec![d]);
+    c.commit_executed(|command| (*command == x).then_some(Some(vec![d])));
+    assert_eq!(
+        c.decision().unwrap().entries[&x].phase,
+        Phase::Commit,
+        "executed by the candidate: committed before binding"
+    );
 }
 
 /// A Sync leaves no acceptance of an earlier ballot that it does not carry
