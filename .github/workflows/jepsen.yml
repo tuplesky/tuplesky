@@ -90,14 +90,14 @@ jobs:
       - name: Install the exact Rust toolchain from rust-toolchain.toml
         working-directory: tuplesky
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: tuplesky
           key: jepsen
       - name: Build the daemon, the harness and the Jepsen client
         working-directory: tuplesky
         run: cargo build --locked --release -p coordd -p coord-harness -p coord-jepsen
-      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.m2/repository
@@ -191,7 +191,7 @@ jobs:
           fi
       - name: Upload the Jepsen store
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: jepsen-store-${{ env.WORKLOAD }}
           path: ${{ runner.temp }}/jepsen-store.tgz
@@ -224,7 +224,7 @@ jobs:
           ref: ${{ env.ETCD_TEST_REF }}
           path: etcd-test
           persist-credentials: false
-      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.m2/repository
@@ -299,7 +299,7 @@ jobs:
           fi
       - name: Upload the Jepsen store
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: jepsen-store-etcd-${{ env.WORKLOAD }}
           path: ${{ runner.temp }}/jepsen-store.tgz

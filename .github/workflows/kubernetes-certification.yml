@@ -42,13 +42,13 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: adapters/kine/go.mod
           cache-dependency-path: adapters/kine/go.sum
       - name: Install the exact Rust toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: certification
       - name: Build the daemon, the harness and the Kine build
@@ -106,7 +106,7 @@ jobs:
       - name: Collect what everything said
         if: always()
         run: scripts/e2e/stop.sh "$RUNNER_TEMP/run" || true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: edge-certification-logs
@@ -124,13 +124,13 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: adapters/kine/go.mod
           cache-dependency-path: adapters/kine/go.sum
       - name: Install the exact Rust toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: certification
       - name: Build the daemon, the harness and the Kine build
@@ -154,7 +154,7 @@ jobs:
           sudo chmod -R a+r "$RUNNER_TEMP/run" || true
           scripts/e2e/stop.sh "$RUNNER_TEMP/run" || true
           sudo /usr/local/bin/k3s-uninstall.sh || true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: k3s-certification-logs
@@ -176,13 +176,13 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: adapters/kine/go.mod
           cache-dependency-path: adapters/kine/go.sum
       - name: Install the exact Rust toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: certification
       - name: Build the daemon, the harness and the Kine build
@@ -191,7 +191,7 @@ jobs:
           (cd adapters/kine && go build -o ../../target/release/kine-coord ./cmd/kine-coord)
       - name: Provision for three hosts, serve through Kine, kill and restart a voter
         run: scripts/e2e/multi-host-local.sh "$RUNNER_TEMP/multi-host"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: multi-host-logs
