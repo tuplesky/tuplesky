@@ -138,8 +138,12 @@ jobs:
             --bin-dir "$GITHUB_WORKSPACE/tuplesky/target/release"
       - name: Run the Jepsen test
         working-directory: jepsen/tuplesky
+        # Bounded at the time limit plus 20 minutes for setup, healing,
+        # the final reads and the checkers: a test whose final phase hangs
+        # fails here instead of holding the job, and every later run of
+        # this concurrency group, until the job's own timeout.
         run: |
-          lein run test \
+          timeout -k 60 $((TIME_LIMIT + 1200)) lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
             --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
             --username root \
@@ -246,9 +250,11 @@ jobs:
       - name: Run the etcd test
         working-directory: etcd-test
         # The tuplesky test's rate (20/s) and fault interval (30 s) rather
-        # than the etcd test's defaults (200/s, 5 s).
+        # than the etcd test's defaults (200/s, 5 s). Bounded as the
+        # tuplesky test is: one etcd run hung for 84 minutes after its
+        # time limit.
         run: |
-          lein run test \
+          timeout -k 60 $((TIME_LIMIT + 1200)) lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
             --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
             --username root \

@@ -173,6 +173,14 @@ and its behaviour under faults have something to be compared with:
 
 Its store is the `jepsen-store-etcd-append` artifact.
 
+Each test runs under `timeout`, bounded at the time limit plus 20
+minutes. A test whose final phase hangs then fails in that time, instead
+of holding its job until the job's own timeout (90 or 120 minutes). The
+job would also hold every later run of the workflow's concurrency group,
+which doesn't cancel runs in progress. One etcd run on this PR logged
+nothing for 84 minutes after its time limit ran out
+([run 36323935964](https://github.com/tuplesky/tuplesky/actions/runs/36323935964)).
+
 The first paired run, on `65336cf`
 ([run 36273802438](https://github.com/tuplesky/tuplesky/actions/runs/36273802438)),
 was `:valid? true` for both, with etcd 3.7.2. Each test draws its own
