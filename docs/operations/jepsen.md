@@ -696,6 +696,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `b3ea1f6` (#105 at `076d218`) | 6 | none | none |
 | `4ef1113` (#106 at `2c8efea`) | 6 | 1 (three voters) | none |
 | `82e222b` (#106 at `0d31e75`) | 6 | 2 | none |
+| `eaaa540` (#106 at `848be52`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -841,6 +842,23 @@ a decision.
     commands executed, while voter 1 was at 658 to 751.
   * Voter 3 had not restarted before its stop.
   * No run had a history anomaly.
+
+The cause, found from those stores: while voter 2 campaigned, voter 3
+adopted a proposal it had been holding from voter 1. It checked the
+seal's fence, not its own promise. Voter 3 then counted its own
+acceptance with voter 1's proposal as a quorum, and executed a command
+that ballot 1's selection never saw. `eaaa540` carries #106 at
+`848be52`, where nothing is accepted in a ballot that was promised
+away.
+* **Replay:** `--faults 2,1` 12 times, with no stop.
+* **Stress:** six random-kill runs.
+* **Across all 18:** no anomaly, no stop, no `IncompatibleAccepted`,
+  no `HalfInitialized`, and every final read was served.
+* **Jepsen**
+  ([run 36323935964](https://github.com/tuplesky/tuplesky/actions/runs/36323935964)):
+  `:valid? true`, with 2903 `ok` of 3754. Every node served its final
+  read, and no voter logged a stop, `HalfInitialized`,
+  `IncompatibleAccepted` or `Behind`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
