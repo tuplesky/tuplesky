@@ -2567,7 +2567,10 @@ impl Follower {
                 replica,
                 executed,
             } => {
-                if replica != from.replica {
+                // Only a voter of this configuration can refuse: an
+                // observer or learner on the peer plane has no promise to
+                // withhold, and honouring it would let it stop a campaign.
+                if replica != from.replica || !self.config.identity.voters.contains(&replica) {
                     return Vec::new();
                 }
                 let abandon = self.campaign.as_ref().is_some_and(|c| {

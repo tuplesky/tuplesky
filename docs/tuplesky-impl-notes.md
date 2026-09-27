@@ -5075,10 +5075,15 @@ what is decided. The voters it asks can tell.
 - A voter that refused never promised, so for it the ballot is
   leaderless and it campaigns after its patience. Nobody waits out the
   campaign ceiling, and nothing is withdrawn.
-- The refused ballot is remembered (`BallotState::outranked`), and the
-  refuser's next campaign goes above it (`Voter::campaign`). The
-  candidate promised itself that ballot and hears nothing below it, and
-  following the next leader is how it catches up.
+- The refused ballot is remembered (`BallotState::outranked`). The
+  refuser's next campaign goes above it (`Voter::campaign`), and it
+  promises no other candidate's ballot at or below it
+  (`check_candidate`, as `NotHigher`). The refused candidate promised
+  itself that ballot and hears nothing below it, and following the next
+  leader is how it catches up; a lower ballot another voter campaigned
+  for without seeing the refusal must not win (from review).
+- Only a configured voter's refusal is honoured: an observer or learner
+  on the peer plane has no promise to withhold (from review).
 
 The most advanced live voter is refused by nobody, so someone can always
 lead. A candidate whose `NewLeader` reaches only voters as far behind as
@@ -5102,6 +5107,13 @@ itself still leads; that is catch-up's case.
   sees `CampaignRefused` from r1 rather than its own `Behind`: the
   refusal comes before the selection. The candidate-side check stays as
   the backstop for a gap the refusal does not see.
+- `ballot.rs` `a_ballot_refused_as_behind_fences_the_ballots_below_it`:
+  after refusing ballot 5 as behind, another voter's ballot 1 is refused
+  as `NotHigher` naming 5, and ballot 6 is promised. Without the floor,
+  ballot 1 is promised.
+- The second `activation.rs` test also sends the refusal from a replica
+  that is not a voter, naming `ExecutionPosition::MAX`; the campaign
+  goes on. Without the voter check it is abandoned.
 - `voter.rs`
   `a_voter_that_refused_a_behind_candidate_campaigns_above_its_ballot`:
   the refusal goes out naming the voter's position, no promise does, and

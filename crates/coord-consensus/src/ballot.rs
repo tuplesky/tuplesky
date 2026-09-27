@@ -463,7 +463,14 @@ impl BallotState {
     /// The checks every `NewLeader` must pass before this replica
     /// promises or refuses anything: no seal, this epoch, a voter naming
     /// itself as the ballot's leader, this replica a voter, and a ballot
-    /// above everything promised or in flight.
+    /// above everything promised or in flight and above the highest ballot
+    /// refused as behind.
+    ///
+    /// The last is what makes a refusal stick (task-d10). The refused
+    /// candidate promised itself that ballot and hears nothing below it;
+    /// a lower ballot promised here could win without it, and then it
+    /// could never follow the leader it has to catch up from. Refusing
+    /// those as `NotHigher` makes the next winning ballot go above it.
     fn check_candidate(&self, from: ReplicaId, ballot: Ballot) -> Result<(), PromiseRejection> {
         // The seal comes first. A higher ballot is not an exception to
         // a fence; it is the thing a fence exists to stop. A seal row in
@@ -492,7 +499,12 @@ impl BallotState {
                 role: self.identity.role,
             });
         }
-        let bound = self.bound();
+        let mut bound = self.bound();
+        if let Some(refused) = self.outranked
+            && refused.compare_same_epoch(&bound) == Some(core::cmp::Ordering::Greater)
+        {
+            bound = refused;
+        }
         if ballot.compare_same_epoch(&bound) != Some(core::cmp::Ordering::Greater) {
             return Err(PromiseRejection::NotHigher { promised: bound });
         }

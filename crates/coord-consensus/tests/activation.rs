@@ -1152,6 +1152,19 @@ fn a_refused_replica_campaigns_again_once_it_executed_as_far_as_the_refuser() {
         replica: r(1),
         executed: at,
     };
+    // Only a voter of the configuration can refuse: the same refusal from
+    // a replica that is not one is ignored.
+    let forged = ProtocolMessage::PromiseRefused {
+        ballot: mine,
+        replica: r(9),
+        executed: ExecutionPosition::MAX,
+    };
+    let effects = cluster.nodes[2].step(peer_event(r(9), forged));
+    cluster.handle(2, effects);
+    assert!(
+        cluster.nodes[2].follower().campaign_state().is_some(),
+        "a non-voter's refusal stopped the campaign"
+    );
     let effects = cluster.nodes[2].step(peer_event(r(1), refusal));
     cluster.handle(2, effects);
     assert!(
