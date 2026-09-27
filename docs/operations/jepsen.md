@@ -691,6 +691,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `add543c` | 4 | none | none |
 | `65b33ba` | 5 | 2 | 1 |
 | `8ad8e4f` (#103 through `334b098`) | 6 | none | none |
+| `7f62f17` (with the rebind, task-d05's recovery read, task-d10) | 6 | 1 | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -723,6 +724,33 @@ two stops in five make the fix likely, not certain. The `jepsen`
 workflow on `8ad8e4f`
 ([run 36284503854](https://github.com/tuplesky/tuplesky/actions/runs/36284503854))
 was `:valid? true`, with 1442 `ok` of 1866, and no voter stopped.
+
+The stack's next commits did not keep it that way. `7f62f17` carries
+task-d09's rebind (`107384e`), task-d05's paged recovery read (`6b86883`)
+and task-d10's first commit (`b3f56e3`). In one of six random-kill runs
+on it, voter 1 stopped on `release-record-mismatch(11579793)`.
+* Voters 1 and 2 had taken turns leading: voter 1 led ballots 21 and
+  23, and voter 2 led 20, 22, 24 and 26. Voter 1 was deposed each time
+  without being killed. It stopped while following ballot 26, as the
+  second stop on `65b33ba` did.
+* No `AdmissionConflict` or `RequestFactsConflict` was logged in any of
+  the six runs, nor in the two `8ad8e4f` runs whose logs were kept. So
+  the logs do not show the case `334b098` fixes happening at all.
+* Elections churn more on `7f62f17`: its runs reached ballots 10 to
+  59, against 11 and 15 in the two kept `8ad8e4f` runs.
+
+The release mismatch is open. The six clean runs on `8ad8e4f` were
+chance, or the cause is elsewhere.
+
+The `jepsen` workflow on `7f62f17`
+([run 36288925909](https://github.com/tuplesky/tuplesky/actions/runs/36288925909))
+was `:valid? true`, with 901 `ok` of 1227. No voter stopped or
+panicked, and no recovery-budget error was logged. But the domain
+stopped serving at 265 s with no fault active: the last fault had
+healed at 249 s, and the next began at 273 s. Nothing was `ok` after
+that, through the final heal and the final reads. At the end, `n2`,
+`n3` and `n5` were refusing proposals as `Backpressure` (logged at 8192
+to 16384), and `n4` led ballot 3.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
