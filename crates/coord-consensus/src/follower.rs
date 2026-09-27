@@ -127,7 +127,9 @@ pub enum FollowerRejection {
     Vote(VoteError),
     /// A leader proposal named this command under an admission this
     /// replica did not accept it under. The identity is shared; the
-    /// command is not.
+    /// command is not. Below ACCEPT the proposal is held and the leader's
+    /// payload asked for, and the record is rebound to it when it arrives
+    /// (task-d09); past it, the proposal is refused.
     AdmissionConflict {
         /// Command.
         command: CommandId,
@@ -1137,7 +1139,8 @@ impl Follower {
         report
     }
 
-    /// Commands known by identity (a held proposal) without a payload.
+    /// Commands known by identity (a held proposal) without a payload, or
+    /// with one under other attested facts than the proposal's.
     pub fn missing_payloads(&self) -> Vec<CommandId> {
         // Held by identity and not by content. A command this replica
         // has a record for may still have no payload: a proposal that
@@ -1151,6 +1154,7 @@ impl Follower {
             .chain(self.adopted.keys())
             .filter(|c| !self.payloads.contains_key(c))
             .copied()
+            .chain(self.held.keys().filter(|c| self.awaits_rebind(c)).copied())
             .chain(self.campaign_missing())
             .collect();
         out.sort();
@@ -1436,12 +1440,32 @@ impl Follower {
         let mut due: Vec<(u64, CommandId)> = self
             .held
             .iter()
-            .filter(|(c, _)| !self.payloads.contains_key(c))
+            .filter(|(c, _)| !self.payloads.contains_key(c) || self.awaits_rebind(c))
             .filter_map(|(c, h)| h.proposal.seqnum.map(|s| (s, *c)))
             .filter(|(s, _)| *s <= through)
             .collect();
         due.sort_unstable();
         due.into_iter().map(|(_, c)| c).collect()
+    }
+
+    /// Whether `command` is held under an admission other than the one
+    /// its record was initialized under, and can still be rebound to the
+    /// proposal's (task-d09).
+    ///
+    /// Every presentation of a command mints its own admission receipt,
+    /// so a submitter that presents again after a lost link reaches the
+    /// voters under facts the leader never saw, and a voter that took
+    /// that presentation first holds the leader's proposal under facts it
+    /// did not accept. Refused, that voter never adopted the command, and
+    /// with the chain total, nothing after it. The proposal is kept, the
+    /// leader's payload is asked for as missing, and `on_payload` rebinds
+    /// the record to it while nothing has been accepted over it.
+    fn awaits_rebind(&self, command: &CommandId) -> bool {
+        self.held.get(command).is_some_and(|h| {
+            self.table.record(command).is_some_and(|r| {
+                r.phase == Phase::PreAccept && r.payload.is_some_and(|p| p != h.proposal.admission)
+            })
+        })
     }
 
     /// The leader of the current ballot announced its commit frontier.
@@ -1849,6 +1873,14 @@ impl Follower {
         };
         self.bindings.insert(retry_key, command);
         self.payloads.insert(command, payload.clone());
+        // The leader's proposal came first, under other attested facts:
+        // held, and waiting for the leader's payload (`awaits_rebind`).
+        if self.awaits_rebind(&command) {
+            self.rejections.push(FollowerRejection::AdmissionConflict {
+                command,
+                accepted: init.payload,
+            });
+        }
         let epoch = self.config.identity.epoch;
         let record = self
             .table
@@ -1959,20 +1991,31 @@ impl Follower {
             // for ever for an adoption that cannot happen (task-d05).
             return self.acknowledge_decided(&proposal, from);
         }
-        // A proposal asserts something about a command. Where this
-        // replica already holds that command's payload and accepted it
-        // under other attested facts, the leader is proposing a
-        // different command under a shared identity: adopting it would
-        // execute facts this replica never admitted. Nothing is held,
-        // nothing is counted, and the mismatch is reported rather than
-        // resolved -- whichever of the two is the real command, this
-        // replica cannot tell from the proposal.
+        // A proposal asserts something about a command, including the
+        // attested facts it was admitted under. Where this replica
+        // accepted the command under other facts, adopting the proposal
+        // would execute facts this replica never admitted. Reported,
+        // either way.
+        //
+        // Past PRE-ACCEPT the record's facts are the ones this replica
+        // acknowledged, so nothing is held or counted. Below it they are
+        // only a presentation this replica took first -- each
+        // presentation mints its own receipt, so a submitter's second one
+        // routinely differs from the one the leader proposed -- and the
+        // proposal is held while the leader's payload is fetched and
+        // bound in its place (`awaits_rebind`, task-d09). Dropped, the
+        // command sat at PRE-ACCEPT here for ever, and with the chain
+        // total, so did everything after it.
+        let mut rebinding = false;
         if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
             && accepted != proposal.admission
         {
             self.rejections
                 .push(FollowerRejection::AdmissionConflict { command, accepted });
-            return Vec::new();
+            if self.table.phase_of(&command) != Some(Phase::PreAccept) {
+                return Vec::new();
+            }
+            rebinding = true;
         }
         // The leader's order is recorded into the path logs as soon as it is
         // known (prototype `recordLeaderHash`); a missing payload only makes
@@ -2001,14 +2044,19 @@ impl Follower {
                 return self.advance_pending();
             }
         }
-        if let Some(set) = self.votes.get_mut(&command) {
-            if let Err(e) = set.add(Vote::Fast(proposal.clone())) {
-                self.rejections.push(FollowerRejection::Vote(e));
+        // Not counted yet when the record is to be rebound: the vote set
+        // may have bound the facts being replaced, and `rebind` starts it
+        // again from this proposal.
+        if !rebinding {
+            if let Some(set) = self.votes.get_mut(&command) {
+                if let Err(e) = set.add(Vote::Fast(proposal.clone())) {
+                    self.rejections.push(FollowerRejection::Vote(e));
+                }
+            } else {
+                let mut set = VoteSet::new(self.config.quorum.clone(), command);
+                let _ = set.add(Vote::Fast(proposal.clone()));
+                self.votes.insert(command, set);
             }
-        } else {
-            let mut set = VoteSet::new(self.config.quorum.clone(), command);
-            let _ = set.add(Vote::Fast(proposal.clone()));
-            self.votes.insert(command, set);
         }
         self.held.insert(command, HeldProposal { proposal });
         self.advance_pending()
@@ -2131,7 +2179,10 @@ impl Follower {
                     // nothing to accept an order *for* yet. It stays
                     // held until the payload arrives -- from the
                     // submission, or from the leader that proposed it.
+                    // Nor under other facts than the proposal's: that
+                    // one waits for the leader's payload to be bound.
                     self.table.is_initialized(c)
+                        && !self.awaits_rebind(c)
                         && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
                             .is_ok()
                 })
@@ -2144,14 +2195,13 @@ impl Follower {
             for command in ready {
                 let held = self.held.remove(&command).expect("ready");
                 // The proposal asserts the admission it was ordered under.
-                // `on_proposal` compares it with this replica's when the
-                // payload is already here; when the proposal came first,
-                // the payload bound since is compared now. Adopted under
-                // other attested facts, this replica would execute a
-                // command the quorum never admitted as such -- once
-                // committed, from the leader's frontier or from its peers'
-                // acknowledgements, which match the leader's (task-d09).
-                // Reported rather than resolved, as there.
+                // Adopted under other attested facts, this replica would
+                // execute a command the quorum never admitted as such --
+                // once committed, from the leader's frontier or from its
+                // peers' acknowledgements, which match the leader's
+                // (task-d09). Below ACCEPT such a proposal is not ready
+                // (`awaits_rebind`); this is a record past it, whose facts
+                // this replica acknowledged, and the proposal is refused.
                 if let Some(accepted) = self.table.record(&command).and_then(|r| r.payload)
                     && accepted != held.proposal.admission
                 {
@@ -2444,7 +2494,7 @@ impl Follower {
                 let mut out = self.on_payload(command, payload);
                 // Counted only as an answer to the outstanding ask, and
                 // once: see `payloads_answered`.
-                if asked && self.payloads.contains_key(&command) {
+                if asked && self.payloads.contains_key(&command) && !self.awaits_rebind(&command) {
                     self.payloads_asked.remove(&command);
                     self.payloads_answered = self.payloads_answered.saturating_add(1);
                 }
@@ -2514,6 +2564,14 @@ impl Follower {
             return Vec::new();
         }
         if self.payloads.contains_key(&command) {
+            if self.awaits_rebind(&command)
+                && self
+                    .held
+                    .get(&command)
+                    .is_some_and(|h| h.proposal.admission == payload.admission_digest())
+            {
+                return self.rebind(command, payload);
+            }
             return Vec::new();
         }
         // The admission travels with the payload, so a replica that
@@ -2561,6 +2619,49 @@ impl Follower {
             base: None,
             updates: alloc::vec![payload_update(&command, &payload).expect("bounded")],
         })]
+    }
+
+    /// Bind the leader's payload in place of the one this replica took
+    /// first under other attested facts, then adopt (task-d09; see
+    /// `awaits_rebind`).
+    ///
+    /// Nothing was accepted over the record, so what is replaced is this
+    /// replica's local order and a fast acknowledgement no quorum counts:
+    /// every learning predicate needs the leader's proposal, whose facts
+    /// differ. The payload and dependency rows are written again under
+    /// the new facts in one batch, so a restart restores the record as
+    /// rebound. The old payload is no longer served; the new one is once
+    /// its batch is durable. The vote set is started again from the
+    /// proposal, as it may have bound the other facts from this replica's
+    /// own acknowledgement or a peer's.
+    fn rebind(&mut self, command: CommandId, payload: PayloadRecordV1) -> Vec<Effect> {
+        if self.boot.is_none() || !self.table.rebind(&command, payload.admission_digest()) {
+            return Vec::new();
+        }
+        self.bindings.insert(payload.retry_key, command);
+        self.payloads.insert(command, payload.clone());
+        self.served_payloads.remove(&command);
+        if let Some(held) = self.held.get(&command) {
+            let mut set = VoteSet::new(self.config.quorum.clone(), command);
+            let _ = set.add(Vote::Fast(held.proposal.clone()));
+            self.votes.insert(command, set);
+        }
+        let epoch = self.config.identity.epoch;
+        let record = self.table.record(&command).expect("rebound").clone();
+        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let mut effects = alloc::vec![Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates: alloc::vec![
+                payload_update(&command, &payload).expect("bounded"),
+                dependency_update(epoch, &command, &record).expect("bounded"),
+            ],
+        })];
+        self.pending.insert(barrier, Pending::Vote(command));
+        self.ledger.stage(barrier, command, record);
+        self.durable_payloads.insert(barrier, command);
+        effects.extend(self.advance_pending());
+        effects
     }
 
     fn collect(&mut self, from: ReplicaId, vote: Vote) -> Vec<Effect> {

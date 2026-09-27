@@ -2085,19 +2085,25 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // leader for its patience, or an operator asked, and follow
         // whatever ballot the machine has moved to by any path.
         if let Some(election) = self.election.as_mut() {
-            let ballot = voter.ballot();
             let me = voter.provenance().from();
             let (held, voters) = self
                 .plane
                 .as_ref()
                 .map_or((0, 1), |p| (p.reachable(), p.peers.len() + 1));
-            let led = voter.leads()
-                || (ballot.leader != me
-                    && self.plane.as_ref().is_some_and(|p| {
+            let machine = voter.node().machine();
+            let led = crate::election::has_leader(
+                voter.leads(),
+                me,
+                machine.promised(),
+                machine.active(),
+                |leader| {
+                    self.plane.as_ref().is_some_and(|p| {
                         p.peers
                             .iter()
-                            .any(|peer| peer.replica == ballot.leader && p.holds(peer))
-                    }));
+                            .any(|peer| peer.replica == leader && p.holds(peer))
+                    })
+                },
+            );
             let majority = (held + 1) * 2 > voters;
             let campaigning = voter.node().machine().campaigning();
             if let Some(why) =

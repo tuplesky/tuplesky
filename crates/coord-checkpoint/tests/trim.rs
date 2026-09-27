@@ -1193,6 +1193,49 @@ fn recovery_after_a_trim_knows_how_far_the_store_executed() {
 }
 
 #[test]
+fn a_voter_with_more_protocol_rows_than_the_schema_budget_recovers() {
+    // Recovery charged every protocol row to the schema's view budget
+    // (10,000 rows), and `coordd` treats a recovery error as fatal: a
+    // healthy voter whose history outgrew the budget could never start
+    // again (task-d05; the five-node Jepsen run's ballot-1 leader). The
+    // budget bounds a page; recovery reads every row the store holds.
+    let e = epoch(EPOCH);
+    let owed = ViewBudget::SCHEMA.max_rows as usize + 1_000;
+    let placeholder = CommandRecord {
+        payload: None,
+        ..record(Phase::PreAccept, &[])
+    };
+    let encoded = encode_dependency(&placeholder).unwrap();
+    let mut rows: Vec<Row> = common_rows().into_iter().chain(identity_rows()).collect();
+    for i in 0..owed {
+        let mut id = [0xa5; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        rows.push((
+            Collection::ProtocolV1,
+            dependency_key(e, &CommandId(Digest32(id))),
+            encoded.clone(),
+        ));
+    }
+    let mut engine = ModelEngine::new();
+    seed(&mut engine, rows);
+    let view = engine.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, e, ViewBudget::SCHEMA)
+        .expect("recovery is not bounded by the schema's view budget");
+    assert_eq!(recovered.records.len(), owed, "every row is read");
+    // Pages of any size read the same rows.
+    let paged = read_protocol(
+        &view,
+        e,
+        ViewBudget {
+            max_rows: 7,
+            max_bytes: 4096,
+        },
+    )
+    .unwrap();
+    assert_eq!(paged.records, recovered.records);
+}
+
+#[test]
 fn a_record_that_names_a_trimmed_command_executes_after_a_restart() {
     // A trim removes the dependency rows of an executed prefix and keeps
     // its executed rows. Recovery read executed identities only through
