@@ -867,6 +867,15 @@ away.
   `:valid? true`, with 2903 `ok` of 3754. Every node served its final
   read, and no voter logged a stop, `HalfInitialized`,
   `IncompatibleAccepted` or `Behind`.
+* **Two more Jepsen runs on the same code:**
+  * [Run 36329480703](https://github.com/tuplesky/tuplesky/actions/runs/36329480703)
+    was clean, with 2422 `ok` and every final read served.
+  * [Run 36326352609](https://github.com/tuplesky/tuplesky/actions/runs/36326352609)
+    was `:valid? true`, with 1100 `ok`, but stalled for good at
+    15:30:43. Campaigns up to ballot 25 were refused as
+    `Campaign(HalfInitialized)`, naming `n5` (`executed=762` against
+    2360 on the others, at `Backpressure` 16384) or `n2` (at
+    `Backpressure` 4096). The promise fence does not touch that stall.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
