@@ -238,7 +238,7 @@ Where they stand on the stack at `afc0df6`:
 | A restarted voter that panics, then no election | Fixed on task-d01 (`e6f4846`, `834e7c6`). Rerun on `afc0df6`: no panic, and elections complete. But the domain still stops serving, with finding 2's full tables. |
 | A follower that started late never completes a read | In review in #101 (the leader re-sends unvoted proposals), carried here. Reproduced on `afc0df6`. |
 | No sessions after healing, under Jepsen | task-d05: in review in #100, carried here. Recovery carries the whole history (below). |
-| The domain stops serving at its first election | In review: #100 (the table capacity and bounded recovery) and #101 (re-sending lost proposals). With both (`6d248cc`), the three-voter stress runs pass through every election, but Jepsen's five nodes still stall after partitions and pauses, and two of them never serve (below). |
+| The domain stops serving at its first election | In review: #100 (the table capacity and bounded recovery) and #101 (re-sending lost proposals). With both (`6d248cc`), the three-voter stress runs pass through every election, but Jepsen's five nodes still stall after partitions and pauses, and two of them never serve (below). With the leader's commit frontier carried (`65b33ba`) the five nodes serve again within a second of each heal, until all five are killed. But the three-voter random-kill runs stopped a voter on a release mismatch in 2 of 5 (below). |
 
 The second and the last are the limit task-d01's notes now record as
 "recovery carries the whole history": dependency rows are never pruned,
@@ -646,6 +646,67 @@ So the stall is followers falling about 1,000 commands behind under
 this load, and then a candidate that far behind never completing its
 campaign, while the one voter that had executed everything does not
 campaign. It is not a voter that stopped.
+
+#### With the leader's commit frontier
+
+`b82906f`, on the branch after #101 and carried in `65b33ba`, has the
+leader announce its commit frontier every 250 ms, and a follower commit
+its adoptions of that ballot up to it.
+
+The `jepsen` workflow on `65b33ba`
+([run 36280782237](https://github.com/tuplesky/tuplesky/actions/runs/36280782237))
+was `:valid? true`, with 2893 `ok` of 3814, against 618 on `02804ac`.
+Service came back after the partitions healed:
+
+| Heal | First `ok` after it |
+| --- | --- |
+| 59 s (a ring partition, `n5` killed at 7 s) | `n2` to `n4` within 0.7 s, `n1` 9 s, `n5` 74 s |
+| 222 s (`n1` isolated) | `n2` to `n4` within 0.4 s (`n1` and `n5` behind, below) |
+
+It stopped for good when all five nodes were killed at 234 s. It served
+nothing after that, through restarts, a second kill of all five and the
+final reads. The voter logs show why:
+
+* The ballot-1 leader `n2` no longer starts. Every restart ends with
+  `this replica cannot read what it owes: EngineError { class: Limit,
+  diagnostic: "protocol rows exceed the recovery budget" }`
+  (`journaled_through` 19677).
+* `n1` (executed 273) and `n5` (executed 1716) were far behind `n3` and
+  `n4` (6451). `n1` had been restarted under the live leader, the case
+  the frontier leaves to later work. `n5` campaigned for ballots 2 to 6 and
+  was promised each, but its machine refused with `Behind { missing }`
+  and it never led. `n3` and `n4` followed `n5`'s ballots, and `n3`
+  campaigned only once, for ballot 3.
+
+The etcd baseline in the same run served on every node within 0.8 s of
+each heal, and within about 10 s of restarting after its own kill of all
+five nodes.
+
+Locally, on the three-voter stress driver, the frontier adds a divergence.
+`shim-stress.py --fault random` was run on `65b33ba` five times and on
+`add543c` (without the frontier) four times, alternating:
+
+| Build | Runs | A voter stopped on `release-record-mismatch` | Anomaly |
+| --- | --- | --- | --- |
+| `add543c` | 4 | none | none |
+| `65b33ba` | 5 | 2 | 1 |
+
+Both stops came when a voter took up a new leader's release after an
+election:
+
+* In the first run, voter 1 was restarted under ballot 1 and executed
+  nothing more (705) until it was killed again. It followed ballot 6 and
+  stopped on command `a246bb44`.
+* In the second run, voter 1 had led ballot 2 and was deposed without
+  being killed. It followed ballot 4 and stopped on command `34b1be7a`.
+
+The stop does not outlast a restart. The driver restarts a voter that
+exited before the final read, and in the first run voter 1 came back at
+ballot 6 (`executed=726`) with no stop logged. The final read (the
+driver tries voter 1 first) then returned key 1 as it was at about 11 s,
+without any of the appends acknowledged from 71 s to 80 s. The checker
+reported it as reads that began after longer ones ended and are
+shorter.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
