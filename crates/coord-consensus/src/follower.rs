@@ -1400,49 +1400,60 @@ impl Follower {
         progressed
     }
 
-    /// Whether `command` is the next this replica can adopt, and the
-    /// leader has already committed it (task-d09).
+    /// Whether `command` is one this replica can adopt next: a held
+    /// proposal of this ballot, under the admission given, with every
+    /// dependency at least ACCEPT here (task-d09).
     ///
     /// Such a command is let into a full table. The table fills with
     /// later commands while this replica is behind -- their payloads
     /// arrive by submission and transfer in no particular order -- and
     /// none of them can be adopted before the command whose turn it is.
     /// Refused, that command held every one of them for ever. Admitted,
-    /// it is adopted, committed from the frontier and executed at once,
-    /// so it makes room rather than taking it. Only a held proposal of
-    /// this ballot within the frontier qualifies, with every dependency
-    /// at least ACCEPT, so the table exceeds its bound by the commands
-    /// whose turn has come and no more.
+    /// it is adopted at once, and its adoption is the vote the leader may
+    /// be waiting for.
+    ///
+    /// Not only once the leader has committed it. The first version
+    /// waited for the commit frontier, and with a majority of followers
+    /// full that frontier never moved: the leader could not commit the
+    /// command without their votes, and they would not adopt it until it
+    /// had. In the five-node Jepsen run the whole domain stopped with no
+    /// fault active, three followers refusing every proposal as
+    /// backpressure. Admitting what can be adopted is what breaks that.
+    ///
+    /// How far the table exceeds its bound: by the chain of held
+    /// proposals each of whose dependencies is adopted before it, and the
+    /// held proposals are bounded (`HELD_PROPOSAL_SLACK` tables' worth).
+    /// The commands it admits are the ones execution needs next, so
+    /// committing and executing them is what shrinks the table again.
     ///
     /// Only for the admission the proposal carries: a payload under other
     /// attested facts could not be adopted anyway.
-    fn decided_and_due(
+    fn turn_has_come(
         &self,
         command: &CommandId,
         admission: coord_types::identity::Digest32,
     ) -> bool {
-        let Some(through) = self.leader_committed else {
-            return false;
-        };
         self.held.get(command).is_some_and(|h| {
             h.proposal.admission == admission
-                && h.proposal.seqnum.is_some_and(|s| s <= through)
                 && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d)).is_ok()
         })
     }
 
-    /// The held proposals within the leader's frontier whose payload this
-    /// replica lacks, in the leader's order (task-d09).
+    /// The held proposals whose payload this replica lacks and whose turn
+    /// has come -- every dependency adopted here, or within the leader's
+    /// commit frontier -- in the leader's order (task-d09).
     fn due_payloads(&self) -> Vec<CommandId> {
-        let Some(through) = self.leader_committed else {
-            return Vec::new();
-        };
+        let through = self.leader_committed;
         let mut due: Vec<(u64, CommandId)> = self
             .held
             .iter()
             .filter(|(c, _)| !self.payloads.contains_key(c) || self.awaits_rebind(c))
+            .filter(|(_, h)| {
+                through.is_some_and(|t| h.proposal.seqnum.is_some_and(|s| s <= t))
+                    || crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
+                        .is_ok()
+            })
             .filter_map(|(c, h)| h.proposal.seqnum.map(|s| (s, *c)))
-            .filter(|(s, _)| *s <= through)
             .collect();
         due.sort_unstable();
         due.into_iter().map(|(_, c)| c).collect()
@@ -1835,7 +1846,7 @@ impl Follower {
         // this command under different attested facts conflicts here
         // instead of quietly replacing what this replica accepted.
         let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
-        let initialized = if self.decided_and_due(&command, payload.admission_digest()) {
+        let initialized = if self.turn_has_come(&command, payload.admission_digest()) {
             self.table
                 .initialize_beyond_capacity(command, payload.admission_digest(), keys)
         } else {

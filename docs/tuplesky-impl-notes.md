@@ -4439,21 +4439,31 @@ The first version of the tests found a second stall behind the first.
 In the Jepsen runs the same happens with submissions: new commands'
 payloads reach a follower that is behind and fill its table ahead of the
 commands it needs. Two changes close it.
-- **Admission.** A payload whose held proposal is within the frontier,
-  with every dependency at least ACCEPT, initializes past the table's
-  capacity (`CommandTable::initialize_beyond_capacity`). It is adopted,
-  committed and executed at once, so it makes room rather than taking
-  it. Only the commands whose turn has come qualify, so the table
-  exceeds its bound by those and no more. This is the one place the
-  table's bound is crossed on purpose. How far is bounded by the
-  follower's backlog of held proposals, which is bounded by what the
-  leader still keeps: at most four tables' worth before
-  `forget_history` sweeps it.
+- **Admission.** A payload whose held proposal has every dependency at
+  least ACCEPT here initializes past the table's capacity
+  (`CommandTable::initialize_beyond_capacity`, `turn_has_come`). It is
+  adopted at once, and its adoption is the vote the leader may be
+  waiting for. This is the one place the table's bound is crossed on
+  purpose. How far is bounded by the chain of held proposals each of
+  whose dependencies is adopted before it, and the held proposals are
+  bounded: at most `HELD_PROPOSAL_SLACK` (four) tables' worth. The
+  commands admitted are the ones execution needs next, so committing
+  and executing them is what shrinks the table again.
+- **Not only once the leader has committed it.** The first version
+  admitted such a command only within the leader's commit frontier.
+  With a majority of followers full, that frontier never moved: the
+  leader could not commit the command without their votes, and they
+  would not adopt it until it had. The five-node Jepsen run on
+  `7f62f17` stopped at 265 s with no fault active and three followers
+  refusing proposals as backpressure in the thousands, which is this;
+  `a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it`
+  reproduces it deterministically.
 - **The ask.** A follower's bounded payload ask names first, and in the
-  leader's order, the held proposals within the frontier whose payload
-  it lacks: half the ask, so the rotation through the rest still moves.
-  Before, the one command whose turn had come was reached once per
-  rotation through a missing set of thousands.
+  leader's order, the held proposals whose payload it lacks and whose
+  turn has come or which the frontier covers: half the ask, so the
+  rotation through the rest still moves. Before, the one command whose
+  turn had come was reached once per rotation through a missing set of
+  thousands.
 
 ### A restarted follower asks for the proposals it adopted
 
@@ -4494,8 +4504,12 @@ needs its peers:
   a table of eight, 32 commands, backpressure on r3; it executes all 32
   in the leader's order.
 - `a_follower_asks_first_for_what_the_leader_committed_in_its_order`:
-  the first ask after the frontier arrives leads with the four lowest
-  sequence numbers it lacks.
+  r3 holds 32 proposals without their payloads; its first ask leads with
+  the one whose turn has come.
+- `a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it`:
+  three of four followers' tables of eight fill with later commands
+  before the one they all depend on, which reaches only the leader and
+  r1. Every voter executes all nine.
 - `the_frontier_commits_nothing_the_follower_did_not_adopt`: r3 receives
   payloads and no proposals; the frontier reaches it and nothing moves
   past PRE-ACCEPT, until the proposals do.
@@ -4524,6 +4538,8 @@ Negative controls, each run and failing:
 - without the rebind, r3 executes nothing in either;
 - without admission past capacity, the full-table test executes the
   first eight and stops;
+- with admission past capacity only within the frontier, no voter
+  executes anything in the three-full-followers test;
 - without the ordered ask, the ask test leads with other commands.
 
 ### What is left
