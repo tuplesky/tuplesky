@@ -929,6 +929,16 @@ refuses it (`CandidateBehind`).
   were refused as candidates and did not serve; bringing them up is
   catch-up's. No voter logged a stop, `HalfInitialized` or
   `IncompatibleAccepted`.
+* **A second Jepsen run on the same code**
+  ([run 36344549177](https://github.com/tuplesky/tuplesky/actions/runs/36344549177)):
+  `:valid? true`, with 3076 `ok` of 3829, but the last `ok` was at
+  19:37:55 and every final read failed (`bind: Timeout`). `n3` led
+  ballot 5 and republished its lease-authority command (`1b4888ac`,
+  epoch 4) until the end. `n4` and `n5` were at 1752 against about 6572.
+  `n5` was refused as behind and stayed on its own ballot 5, which `n4`
+  followed. With the default fast set (the leader and the next voters
+  by identity), both are in `n3`'s fast set. In the local random run
+  above, the refused `n3` was likewise in the leader `n2`'s fast set.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
