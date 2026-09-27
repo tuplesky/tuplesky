@@ -4700,3 +4700,347 @@ marker demotes it.
   earlier ballot, which no follower's acknowledgement in the new ballot
   was computed against either.
 - The stress runs with this carried are the acceptance.
+
+## A new leader chains after what it executed
+
+task-d12, from a three-voter stress run's `release-record-mismatch` and a
+five-node Jepsen run's lost appends on #98. Both were one fork, made by a
+new leader.
+
+task-d06 made a new leader anchor the conservative key at the recovered
+order's tail before it proposes anything new. `Leader::from_recovered`
+then chained `decision.reproposed` after the entries, in identity order,
+and moved the anchor to every command it knew, whether or not it proposed
+it. `phase_of` answers `Executed` for a command in history with no record,
+and `select` puts every row of a report behind the source ballot in
+`reproposed`. So a selection over a behind reporter's rows anchored the key
+at the largest identity among old commands the leader had executed and
+retired, and the first fresh proposal depended on that command alone.
+Every voter holds the same dependencies for it, and a voter that ran it
+beside the commands after the old anchor had no edge to order them by.
+
+- **The stress run.** The stopped node executed a ballot-3 proposal whose
+  only dependency had executed at position 12; it ran it at position 1179
+  and the other two at 2149, and 161 digests differed after that. The
+  same run's ballot 8 forked on the same old command.
+- **The Jepsen run.** Two ballot-1 leaders left two voters about a
+  thousand rows behind the ballot the next leader recovered from. That
+  leader's fresh proposals forked, and a behind voter executed them before
+  its backlog, against a key that was still empty there. The appends are
+  guarded, so its guard held and it answered `ok`; on the main line the
+  same commands ran against a key with a hundred elements, the guard
+  failed and they had no effect.
+- **Two more hazards in the same loop.** A command the leader had at
+  Commit or beyond was re-proposed chained after the anchor rather than
+  with its decided dependencies. With no entries, the anchor started
+  empty and the first re-proposal depended on nothing.
+
+### The fix
+
+- A re-proposed command the new leader has at Commit or beyond is neither
+  chained nor re-proposed: it was decided in an earlier ballot, with the
+  dependencies it has here. Re-proposing decided commands with their
+  decided dependencies would let a behind voter adopt them again, but a
+  proposal of a decided command is a new mechanism; catch-up is
+  task-d08's.
+- The chain starts at the recovered order's last command the leader has
+  not executed. Else it starts at the last command the leader committed
+  and has not executed yet (`CommandTable::committed_tail`, the committed
+  record no other committed record depends on): execution follows the
+  dependencies, so that command comes after everything the leader
+  executed, and every other voter may have executed it already. Else at
+  the last command it executed (`CommandTable::last_executed`, kept by
+  `execute` and `restore_executed`).
+- On a restart, that last command is the last one replayed. coordd
+  replays history, then the executed commands with rows. Both were read
+  back in identity order; `read_history` now sorts by each row's execution
+  position, as the executed rows already were, so what comes back last is
+  what executed last.
+- **The collector compares a late release with its answer.** A collector
+  that answered from this node's record, with the votes counted and the
+  release not yet in, took the release when it came as settled without
+  looking at it. That is why the Jepsen run's forked voter answered seven
+  times and never stopped. The collector now keeps the result digest with
+  each answer, and a release for a command it already answered must agree
+  with the response and the digest. A difference is `AnsweredOtherwise`,
+  and coordd stops on it as it does on `release-record-mismatch`. That
+  does not prevent the first wrong answer; it stops the node from going
+  on.
+
+**Liveness.** A voter that holds a decided command the Sync omits is at
+PRE-ACCEPT after task-d11 and learns the decision only by catch-up
+(task-d08). Before task-d11 it sat at ACCEPT with no commit coming, so
+nothing regresses.
+
+### What the tests show
+
+`activation.rs`:
+- `a_fresh_proposal_follows_the_tail_not_an_executed_reproposal`: six
+  executed commands on one key, and a selection with no entries that
+  re-proposes the second. The new leader's first fresh proposal depends on
+  the sixth, and the second is not proposed again.
+- `a_reproposal_with_no_entry_to_follow_follows_the_executed_tail`: an
+  undecided command only the new leader holds is re-proposed after the
+  executed tail, not with no dependencies.
+- `a_new_leader_chains_after_what_it_committed_and_has_not_executed`:
+  r2 commits three commands and executes none of them while the others
+  execute all six. As the new leader, with nothing re-proposed and with
+  one of the three re-proposed, its fresh proposal follows the sixth.
+- `a_restarted_candidate_with_no_entries_chains_after_what_it_executed`:
+  the candidate is restarted from its executed commands alone, with no
+  rows to rebuild the tail from, wins and chains after its tail.
+- `reproposals_follow_the_recovered_order_not_identity_order` (task-d06)
+  had re-proposed a command the new leader had executed, which is this
+  bug. It now holds the entries unexecuted and the re-proposed command
+  undecided, and still checks the recovered order.
+
+`trim.rs` `a_trimmed_history_comes_back_in_the_order_it_executed`: the
+trimmed prefix's positions are rewritten so identity order is the reverse
+of position order, and the history reads back by position; a table
+restored from it names the last executed command.
+
+`repair.rs` `a_late_release_that_contradicts_the_answer_is_refused`: the
+release is lost, the collector settles from the votes and the record,
+and the release arrives afterwards. It settles when the record agreed,
+and is refused as `AnsweredOtherwise` when the record had another
+response, or the same response under another digest.
+
+Negative controls: without the Commit skip, the first test fails; with
+the chain starting only at the entries' tail, the second; with the
+chain skipping the committed tail, the committed-not-executed test (at
+`076d218` its case with nothing re-proposed passed, and an anchor at the
+last executed command alone breaks it); with
+`restore_executed` not keeping the last command, the restart test; with
+the history in identity order, the trim test; with
+`check_release` as it was, the response fork is accepted, and without the
+digest comparison, the digest fork is.
+
+### From review
+
+- **Every committed tail.** A live table commits only after a command's
+  dependencies, but a restarted one takes each record's phase from its
+  row: a command installed from a Sync comes back at COMMIT, while one
+  committed from votes left its row at ACCEPT. Two committed records then
+  look last, and nothing says which is. `committed_tails` returns them
+  all and `anchor_all` makes the next command on the key depend on every
+  one of them, once (Codex, #106).
+- **The whole execution.** A late release is compared with the execution
+  the answer came from: digest, position and revision besides the
+  response. Two executions at different positions can answer with the
+  same bytes, and an answer over the deliverable bound is the same
+  `RESULT_TOO_LARGE` whatever it replaced (Codex, #106).
+- **Nothing after the contradiction.** Once a late release contradicts
+  an answer, `Domain::answer` sends nothing until the pass ends in the
+  stop: not the rest of the voter's batch, the parked frames or what the
+  records settle in the same turn (Codex, #106).
+
+### A commit below the source ballot is a decision
+
+The case the chain rule leaves: a new leader that holds a decided command
+only at ACCEPT, having missed the commit, while every reporter that holds
+the decision is behind the source ballot. The source rule sent all of
+those reporters' rows to `reproposed`, so the leader re-proposed the
+command after its tail and decided it a second time; a voter adopting
+that order then reported it beside a commit under one label, which is
+the `IncompatibleAccepted` the stress runs showed.
+
+`select` now takes an entry at COMMIT from any report, executed-as-
+committed ones included, into the selection with its dependencies and
+paths; PRE-ACCEPT and ACCEPT below the source are still re-proposed. A
+commit is a quorum's acceptance of one dependency set, final whatever
+ballot reached it, and the source rule chooses among acceptances. The
+agreement check applies as to any entry, so a below-source commit
+meeting an at-source acceptance under other dependencies is
+`IncompatibleAccepted`: the alarm it should be, where the old rule
+called it stale and kept the acceptance. An at-source copy's sequence
+number and paths outrank a below-source one's, since those are a
+ballot's own.
+
+- The new leader re-proposes such an entry with the decided dependencies
+  where it has not executed it, which is the existing entry path.
+- A behind voter installing the Sync commits those commands without a
+  vote, a partial heal of the task-d11 liveness note.
+- The Sync grows by the behind reporters' commits, bounded by the reports
+  it already reads.
+- The model's `legitimate-phase-differences` scenario had a lower
+  ballot's COMMIT of c2 under other dependencies as stale state; it now
+  holds only stale acceptances (c3 at ACCEPT where the source
+  pre-accepted it, the highest-phase-wins counterexample), and a fourth
+  frozen scenario, `below-source-commit-disagrees`, records the alarm.
+
+`activation.rs` `a_commit_below_the_source_ballot_is_selected_with_its_dependencies`:
+r1 executed x after a; r2 adopted both and, restarted before executing
+them, holds them at ACCEPT; the source report holds neither. x is
+selected at COMMIT with `[a]` and r2, winning, proposes it with `[a]`.
+Against the old rule x is not selected.
+`a_below_source_commit_against_an_acceptance_of_other_dependencies_is_incompatible`:
+the alarm. Against the old rule the selection succeeds.
+
+### A refusal is an execution
+
+A local random-kill stress run with this PR's first three commits carried
+(d12-11) stopped n1 on `release-record-mismatch`. The store dumps give the
+cause:
+
+- A command refused at execution (an admission mismatch, a retry conflict,
+  a window refusal) took its position and wrote no `executed_v1` row; only
+  a bound outcome wrote one. Every voter's executed rows have gaps between
+  positions 691 and 708, n3's again between 2629 and 2651 and n1's at 1338
+  and 1347.
+- After a restart the table held those commands at COMMIT from their
+  dependency rows, not executed. The voter executed them a second time, at
+  new positions, and every position after them moved on that voter only.
+- n3, restarted and then elected, had one of them (`f7b90790`, with no
+  executed row on any voter) as the last recovered entry it had not
+  executed, so its chain started there alone. It re-proposed `3e056e8a`
+  after it; n1, which had not run the commands executed since, executed
+  `3e056e8a` at 1339, where n3 executed it at 2643. n1's collector then held
+  a release for `0d2091fa` that contradicted its record, and stopped.
+
+Two changes:
+
+- **A refusal writes its executed row**, with its position and result
+  digest and no revision, and still nothing under the retry key, so the
+  binding it refused stands. `Applier::apply_refusal` and the admission
+  refusal in `apply_bound` go through `materialize::apply_refused_plan`,
+  which adds that row to the refusal's batch. Checkpoint trims and exports
+  already read `executed_v1` as "this command executed", and now see the
+  refusals as well.
+- **The chain starts after every candidate tail**: the recovered order's
+  last command the leader has not executed, the committed tails and the
+  last command executed. Each is the tail when the table is right, and a
+  dependency on one already behind the tail orders nothing wrongly; any
+  one alone has now been wrong.
+
+`coord-storage/tests/apply.rs` `a_refused_command_is_recorded_as_executed`:
+two refusals, a window refusal and an admission mismatch, each leave an
+executed row with the outcome's position and digest and no retry record,
+and `read_protocol` gives the history back with them in execution order.
+Without `apply_refused_plan` the row is missing.
+`activation.rs` `a_command_that_comes_back_unexecuted_does_not_restart_the_chain`:
+r2 restarts with every executed identity but one, the selection carries
+that one at COMMIT, and r2's first fresh proposal still depends on the
+command it executed last. With the chain starting at the last unexecuted
+entry alone, it depends on the stale command only.
+
+### No acceptance after the promise
+
+With both changes above carried, random-kill runs still stopped a voter
+on `release-record-mismatch` (d12c-1, -7, -9) or failed a campaign as
+`IncompatibleAccepted` (d12c-11), and the reviewer's replay (`--faults
+2,1`: voter 2 restarted, then the ballot-0 leader killed) stopped voter 3
+in 4 of 6 runs. Every one of the four dumps has the same shape:
+
+- The old leader proposed P and then X, which depends on P, and was
+  killed. A voter restarted far behind won the next ballot with its own
+  report and the third voter's.
+- The Sync's entries end exactly at P's position (794, 1415, 780, 1432),
+  and X is in neither its entries nor its re-proposals.
+- The third voter executed X right after P anyway, and the new leader
+  chained its first command after P as well: a fork at P + 1.
+
+The third voter had held X's proposal at the promise, its payload or P's
+acceptance not there yet, so its report was taken without X. During the
+campaign `advance_pending` adopted X once it became ready: it checked the
+seal's fence and not the promise. This replica's own acceptance and the
+old leader's proposal then made a quorum here, and it committed and
+executed X. A command no majority accepted before the promise was
+executed, and no selection could see it.
+
+`advance_pending` adopts nothing while the replica may not vote, and
+activation drops what is held, as it did. A payload that arrives after
+the promise (fetched for a held proposal or a selection) is recorded and
+not acknowledged; admission was fenced already. The outbox already
+dropped the stale-ballot acknowledgement, so what that second gate stops
+is the replica's own vote counting towards the old ballot here.
+
+`follower.rs` `a_proposal_held_across_a_higher_promise_is_not_accepted_after_it`:
+c1 accepted, c2's proposal held for its payload, a promise to ballot 1,
+then c2's payload. c2 stays below ACCEPT and nothing acknowledges it.
+Without the adoption gate c2 reaches COMMIT. The payload gate alone is not
+separated by this test: with the adoption gate in place, c2's own fast
+vote did not complete a fast quorum here.
+
+### A report nobody can supply
+
+The five-node Jepsen runs stalled for good in 3 of 8 runs since this was
+carried (1 of 3 with the promise fence): every campaign, up to ballot 25,
+was refused by the candidate's own machine as `Campaign(HalfInitialized)`,
+naming a far-behind voter (one had last recovered at `executed=762`
+against 2360 on the others). `select` fails that way when a report holds
+a command at ACCEPT or beyond and no report has its payload.
+
+Local stress run d12-15 (three voters) had the same loop, and its stores
+show the shape. n3, at 401 executed against 3092 on n1 and n2, held
+`028f7aae` as an entry of ballot 3's Sync with no record and no payload.
+n1 and n2 had executed it at position 1185 and still held it, but a
+report leaves out what its replica executed long ago (task-d05), so
+neither report named it. n2 could reach only n3, and n3's own report
+held the command, so every campaign from ballot 4 to 16 failed naming n3.
+On the Jepsen runs a voter that retired the command may also have lost
+its payload; the stores there were not reachable.
+
+Two things let the campaign through now:
+
+- `select_with` takes the commands the candidate can supply itself: a
+  command it holds a payload for or executed (`phase_of` answers) is not
+  a dead end. It is selected, and `commit_executed` commits it before
+  binding when the candidate executed it. This is d12-15's n2.
+- `Campaign::try_select` sets a report aside while a majority of reports
+  remains without it. Any majority of promises is a sound basis for the
+  selection: it is the set the candidate would have had if that report
+  had arrived later, so no judgement about the reporter is needed, and
+  nothing is decided twice. The candidate's own report is never set
+  aside, since its own state is what it goes on to lead from.
+
+Both are safe because no acceptance is ever voted without its payload.
+`activate` puts a Sync entry whose payload is missing in `sync_pending`,
+`advance_sync` installs it only once the payload is known,
+`advance_pending` adopts a proposal only with its payload, and there is
+no Sync acknowledgement message at all. So an acceptance that no
+reporter has a payload for was either never decided, or was decided by
+voters that have since executed it and left it out of their reports; by
+quorum intersection, leaving it out of the selection loses nothing.
+
+With neither, the campaign waits for the voters that have not reported
+and fails only once every voter has. A behind voter still cannot execute
+past a command whose payload it never gets; the domain serves around it,
+and catch-up (task-d08, task-d10) is what brings it back.
+
+`activation.rs`:
+
+- `a_campaign_supplies_what_its_candidate_executed`, d12-15's shape:
+  three voters, the candidate and the behind voter only. Nothing supplied,
+  the campaign waits; with the candidate supplying the command, it is
+  selected with the reported dependencies and committed.
+- `a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has`:
+  five voters, one reporting a payload-less acceptance nobody else holds.
+  With three reports the campaign waits instead of failing, with four it
+  selects without that report and without the command, and a candidate
+  whose own report holds it waits and then fails once all five reported.
+  Without the change, the first step fails as `HalfInitialized`.
+
+### What is left
+
+- No reporter holding the decision at all, every voter that had it having
+  retired it, while the candidate holds the command undecided. That
+  candidate is behind by definition; task-d10's rule catches it (a report
+  carries its executed position, and a candidate more than a window
+  behind the source reporters steps aside). Recorded there, not built.
+- A voter set aside for an acceptance nobody can supply cannot execute
+  past it. The domain serves around it; catch-up (task-d08, task-d10)
+  brings it back.
+- A restarted voter's peer dials are refused by the peer's handshake
+  (`aborted by peer: ... error 120: peer doesn't support any known
+  protocol`, TLS `no_application_protocol`), on both lanes. It appears
+  after restarts in all 52 local stress runs; the re-dial usually gets
+  through later. In d12-15 it did not: n2's dials to n1 failed after each
+  of its restarts, to the end of the run, which is why d12-15 needed the
+  candidate to supply the command rather than a report being set aside.
+  A link-layer defect, recorded for task-d03 to root-cause with those
+  logs.
+- A node stopped on a divergence serves again from its store after a
+  restart. task-d13 keeps it stopped until an operator clears it or
+  catch-up rebuilds it; planned behind task-d08.
+- The random-kill stress runs and the five-node Jepsen run with this
+  carried are the acceptance.

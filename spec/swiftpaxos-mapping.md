@@ -54,7 +54,7 @@ must be re-checked against the paper text at the task-19 review.
 | Source handler / rule | Rule | Rust item | Test |
 |---|---|---|---|
 | `handleNewLeader`: `r.ballot >= msg.Ballot -> return`; status `RECOVERING`, stop descriptors, `fillNewLeaderAckN` | A report is produced only for a higher ballot, at a cut where no old-ballot transition is admitted | `RecoveryReport{ballot, committed_ballot, entries}`; the cut discipline is Section 4.8 `[EXT]`, actor in task-20/task-23 | recovery test |
-| `MNewLeaderAckN.Cballot` and `handleNewLeaderAckNs`: `U` = reports at `maxCbal`; only their `ACCEPT`/`COMMIT` entries are adopted | Source of state is the highest synchronized ballot among a majority of reports; lower-ballot state is never merged | `select` -> `SyncDecision::source_ballot`, entries only from source-ballot reports | `tests/model.rs::recovery_selection_is_source_defined_and_order_independent` |
+| `MNewLeaderAckN.Cballot` and `handleNewLeaderAckNs`: `U` = reports at `maxCbal`; only their `ACCEPT`/`COMMIT` entries are adopted | Source of state is the highest synchronized ballot among a majority of reports; lower-ballot acceptances are never merged, but a lower-ballot commit is (task-d12: a commit is final whatever ballot reached it) | `select` -> `SyncDecision::source_ballot`, entries from source-ballot reports and the commits of lower ones | `tests/model.rs::recovery_selection_is_source_defined_and_order_independent` |
 | `handleNewLeaderAckNs`: `phases[cmdId] = phase` (map overwrite in arrival order) | `[EXT: replaced]` selection is a function of the report set; equal candidates merge by phase class, differing accepted candidates stop recovery | `RecoveryError::IncompatibleAccepted`, order-independence asserted over all permutations | same (`incompatible-accepted-candidates`) |
 | `reinitNewLeaderAckNs`: `Majority` | A majority of reports from voters, one per replica | `RecoveryError::{InsufficientReports, DuplicateReport, NotAVoter, WrongBallot}` | same |
 | `fillNewLeaderAckN`: proposes without a descriptor reported as `ACCEPT` with `NOOP` and empty deps | `[EXT: rejected]` a half-initialized command is never reported as accepted; an accepted entry without a durable payload fails recovery | `ReportEntry::payload_present`, `RecoveryError::HalfInitialized` | same (`half-initialized-entry`) |
@@ -423,8 +423,10 @@ with the guard enforced and deliberately removed. Frozen results live in
   and the missing-leader case;
 * `recovery_scenarios.json`: legitimate phase differences, the
   highest-phase-wins result that is *not* chosen (recorded as the
-  counterexample), incompatible accepted candidates and a half-initialized
-  entry;
+  counterexample), incompatible accepted candidates, a half-initialized
+  entry, and a commit below the source ballot that disagrees with the
+  source's acceptance (task-d12: a commit is selected whatever ballot
+  reported it, so the disagreement is `IncompatibleAccepted`);
 * `possible_fast_scenarios.json` (task-28): a possible fast decision
   adopted from the fast-set member's order, the source leader present, a
   member order that differs from the leader's, and disagreeing members;

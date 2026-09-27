@@ -545,12 +545,16 @@ fn recovery_selection_is_source_defined_and_order_independent() {
                 entry(c3, Phase::PreAccept, &[]),
             ],
         ),
-        // A lower synchronized ballot: its COMMIT of c2 with different
-        // dependencies is stale state, never a candidate.
+        // A lower synchronized ballot: its acceptances are stale state,
+        // never candidates -- c3, which only the source pre-accepted, and
+        // c4, which the source does not hold.
         report(
             3,
             0,
-            vec![entry(c2, Phase::Commit, &[]), entry(c4, Phase::Accept, &[])],
+            vec![
+                entry(c3, Phase::Accept, &[c4]),
+                entry(c4, Phase::Accept, &[]),
+            ],
         ),
     ];
     let scenario = explore_recovery("legitimate-phase-differences", &cfg, &reports);
@@ -569,12 +573,29 @@ fn recovery_selection_is_source_defined_and_order_independent() {
     );
     assert_eq!(decision.reproposed, BTreeSet::from([c3, c4]));
     assert_eq!(scenario.outcome.as_ref().unwrap(), &summarize(&decision));
-    // The wrong rule would have committed c2 with the stale dependencies.
+    // The wrong rule would have adopted c3 with the stale dependencies.
     assert_eq!(
-        scenario.highest_phase_wins[&format!("{c2:?}")],
-        (Phase::Commit, vec![]),
+        scenario.highest_phase_wins[&format!("{c3:?}")],
+        (Phase::Accept, vec![c4]),
         "the recorded counterexample of highest-phase-wins"
     );
+
+    // A commit is final whatever ballot it was reached in (task-d12): a
+    // lower synchronized ballot's COMMIT is selected, and one under other
+    // dependencies than the source's acceptance is the alarm it should be.
+    let mut committed_below = reports.clone();
+    committed_below[2]
+        .entries
+        .push(entry(c1, Phase::Commit, &[]));
+    let decision_below = select(&cfg, &committed_below).unwrap();
+    assert_eq!(decision_below.entries[&c1].phase, Phase::Commit);
+    let mut disagreeing = reports.clone();
+    disagreeing[2].entries.push(entry(c2, Phase::Commit, &[]));
+    let below = explore_recovery("below-source-commit-disagrees", &cfg, &disagreeing);
+    assert!(matches!(
+        below.outcome,
+        Err(RecoveryError::IncompatibleAccepted { command, .. }) if command == c2
+    ));
 
     // Incompatible accepted candidates at the source ballot stop recovery
     // with the evidence whenever the conflicting report is among the
@@ -655,7 +676,7 @@ fn recovery_selection_is_source_defined_and_order_independent() {
         Err(RecoveryError::WrongBallot { replica: r(1) })
     );
 
-    fixture("recovery_scenarios.json", &vec![scenario, bad, half]);
+    fixture("recovery_scenarios.json", &vec![scenario, bad, half, below]);
 }
 
 #[test]

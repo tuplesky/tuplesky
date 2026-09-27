@@ -2225,3 +2225,69 @@ fn trimming_never_removes_a_seal_row() {
         );
     }
 }
+
+#[test]
+fn a_trimmed_history_comes_back_in_the_order_it_executed() {
+    // A restart replays the executed identities into the table, and the
+    // last one replayed is what a new leader chains its first proposals
+    // after when its selection gives it nothing to follow. Read in key
+    // order, the trimmed history ended at whichever identity sorts
+    // highest, and on a replica with nothing but history the chain forked
+    // there (task-d12).
+    let mut engine = trimmable_store();
+    trim_to_completion(&mut engine, &TrimLimits::default());
+    let e = epoch(EPOCH);
+    let view = engine.reader().snapshot().unwrap();
+    let before = read_protocol(&view, e, ViewBudget::default()).unwrap();
+    assert!(before.history.len() > 1, "the fixture trims a prefix");
+    // The trimmed commands' positions, reversed against their key order
+    // and kept within the prefix they occupy.
+    let mut positions: Vec<ExecutionPosition> = before
+        .history
+        .iter()
+        .map(|c| {
+            let bytes = view
+                .get(Collection::ExecutedV1.id(), &codecs::executed_key(c))
+                .unwrap()
+                .expect("an executed row");
+            codecs::decode_executed(&bytes).unwrap().position
+        })
+        .collect();
+    positions.sort_unstable();
+    let mut by_key = before.history.clone();
+    by_key.sort_unstable();
+    let rewrites: Vec<StoreUpdate> = by_key
+        .iter()
+        .zip(positions.iter().rev())
+        .map(|(c, at)| StoreUpdate {
+            collection: Collection::ExecutedV1.id(),
+            key: codecs::executed_key(c),
+            value: Some(
+                codecs::encode_executed(&ExecutedRecordV1 {
+                    position: *at,
+                    revision: None,
+                    result_digest: Digest32([0; 32]),
+                })
+                .unwrap(),
+            ),
+        })
+        .collect();
+    apply(&mut engine, &rewrites);
+    let view = engine.reader().snapshot().unwrap();
+    let recovered = read_protocol(&view, e, ViewBudget::default()).unwrap();
+    let executed_last = *by_key.first().unwrap();
+    assert_eq!(
+        recovered.history.last(),
+        Some(&executed_last),
+        "history in execution order, not key order: {:?}",
+        recovered.history
+    );
+    // A replica whose every executed row lost its dependency row replays
+    // history alone; its last executed command is the one that executed
+    // last.
+    let mut table = coord_consensus::CommandTable::restore(Some(32), Vec::new());
+    for c in &recovered.history {
+        table.restore_executed(c);
+    }
+    assert_eq!(table.last_executed(), Some(executed_last));
+}

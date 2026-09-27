@@ -889,6 +889,10 @@ pub struct Domain<P: Persistence> {
     /// left off, so a command that cannot settle here does not keep the
     /// ones behind it from being looked at.
     settle_cursor: usize,
+    /// A command whose late release contradicted the answer this node
+    /// already gave from its own record (task-d12). The serve loop stops
+    /// on it as it stops on a record contradicting a held release.
+    answered_otherwise: Option<CommandId>,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -1313,6 +1317,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             resent: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
+            answered_otherwise: None,
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
@@ -1514,6 +1519,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // from that execution (task-d06).
             if let Some(command) = self.settle_from_records() {
                 say_diverged(&command);
+                return;
+            }
+            // The same, found the other way round: a release that came
+            // after this node had already answered from its record, and
+            // says something else (task-d12). The caller was already told
+            // the wrong thing; nothing more is.
+            if let Some(command) = self.answered_otherwise.take() {
+                say_diverged(&short_hex(&command));
                 return;
             }
             // A submission a destination could not take is offered
@@ -2666,6 +2679,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             dispatcher.settle_from_record(
                 command,
                 record.result_digest,
+                record.position,
                 record.revision,
                 &record.response,
             )
@@ -2680,12 +2694,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
                 None
             }
-            coord_daemon::settle::Settled::Diverged(command) => Some(
-                command.as_bytes()[..4]
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect(),
-            ),
+            coord_daemon::settle::Settled::Diverged(command) => Some(short_hex(&command)),
         }
     }
 
@@ -2720,12 +2729,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .flatten()
             }),
             KIND_RELEASE => decode_release(frame).ok().and_then(|released| {
-                self.frontend
+                match self
+                    .frontend
                     .frontend
                     .dispatcher_mut()
                     .on_release(provenance, released)
-                    .ok()
-                    .flatten()
+                {
+                    Ok(delivery) => delivery,
+                    Err(coord_collector::collector::EvidenceError::AnsweredOtherwise {
+                        command,
+                    }) => {
+                        self.answered_otherwise = Some(command);
+                        None
+                    }
+                    Err(_) => None,
+                }
             }),
             _ => {
                 self.frontend.counts.unserved += 1;
@@ -2770,6 +2788,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Answer the caller a delivery belongs to, gated against a fresh
     /// barrier.
     fn answer(&mut self, delivery: coord_collector::Delivery) {
+        // A late release has contradicted an answer this node gave from
+        // its own record (task-d12), and the pass ends in the stop. Until
+        // it does, nothing more goes out: not the rest of the voter's
+        // batch, and not what the parked frames or the records settle.
+        if self.answered_otherwise.is_some() {
+            return;
+        }
         let policy = StorePolicySource {
             store: self.backing.applier().store(),
             budget: ViewBudget::default(),
@@ -3347,6 +3372,14 @@ fn addressed(
         replica: to.replica,
         incarnation,
     })
+}
+
+/// The first four bytes of a command identity, as the stop names it.
+fn short_hex(command: &CommandId) -> String {
+    command.as_bytes()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Why a node stopped on a release its own execution contradicts.

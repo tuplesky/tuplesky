@@ -424,3 +424,32 @@ pub fn apply_plan<P: Persistence>(
         Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
     }
 }
+
+/// Apply `plan` as `command`'s refusal: its position and whatever the plan
+/// carries, with `command`'s executed identity and nothing under a retry
+/// key.
+///
+/// A refused command executed like any other. Without its executed row a
+/// restart would find it unexecuted and execute it again, at a position
+/// after everything this voter executed since, which is not where the
+/// other voters executed it (task-d12).
+pub fn apply_refused_plan<P: Persistence>(
+    store: &mut P,
+    barrier: BarrierId,
+    namespace: NamespaceId,
+    plan: &ApplyPlan,
+    command: &coord_types::CommandId,
+) -> Result<ApplyOutcome, EngineError> {
+    let (mut batch, kind, pending) = prepare(barrier, namespace, plan, None)?;
+    batch.updates.push(crate::retry::executed_update(
+        command,
+        plan.position,
+        plan.revision,
+        pending.result_digest,
+    )?);
+    match submit(store, batch, kind)? {
+        Submitted::Accepted => complete(store, &pending),
+        Submitted::Replan => Ok(ApplyOutcome::Replan),
+        Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
+    }
+}

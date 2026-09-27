@@ -747,7 +747,8 @@ impl Follower {
             return Vec::new();
         };
         if campaign.decision().is_none() {
-            match campaign.try_select() {
+            let table = &self.table;
+            match campaign.try_select(|c| table.phase_of(c).is_some()) {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
@@ -1957,7 +1958,13 @@ impl Follower {
         self.votes
             .entry(command)
             .or_insert_with(|| VoteSet::new(self.config.quorum.clone(), command));
-        if self.in_fast_set() {
+        // A payload can still arrive after a higher promise: fetched for a
+        // held proposal or for a campaign's selection. It is recorded, so
+        // the command can be installed or executed later, and it is not
+        // acknowledged: an acknowledgement in the ballot this replica
+        // promised away is an acceptance the candidate's selection cannot
+        // see (task-d12). Admission itself is fenced in `on_admitted`.
+        if self.in_fast_set() && self.may_vote() {
             let ack = FastAck {
                 replica: self.config.identity.replica,
                 ballot: self.config.quorum.ballot(),
@@ -2217,6 +2224,18 @@ impl Follower {
         // stays held: adopting it now would acknowledge after the cut the
         // seal report was built over.
         if self.ballots.is_fenced() {
+            self.learn();
+            return effects;
+        }
+        // Nor after a higher promise. A held proposal is the old leader's
+        // offer in the ballot this replica has promised away, and the
+        // report it sent the candidate was taken without it. Adopted now,
+        // this replica's own acceptance joined the old leader's proposal
+        // as a quorum here and it executed the command -- while the
+        // candidate, which never heard of it, chained its first command
+        // after the same predecessor (task-d12, stress runs d12c-1, -7,
+        // -9 and -11). Activating the new ballot drops what is held.
+        if !self.may_vote() {
             self.learn();
             return effects;
         }

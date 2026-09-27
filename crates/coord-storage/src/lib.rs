@@ -124,7 +124,8 @@ pub use journaled::{
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{
-    ApplyOutcome, Pending, Submitted, apply_plan, complete, plan_to_batch, prepare, submit,
+    ApplyOutcome, Pending, Submitted, apply_plan, apply_refused_plan, complete, plan_to_batch,
+    prepare, submit,
 };
 pub use persistence::{JournaledDomain, Lowered, Persistence, Refused};
 pub use retry::{Admission, Resolution, RetryBinding};

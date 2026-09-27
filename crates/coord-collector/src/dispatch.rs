@@ -508,12 +508,17 @@ impl Dispatcher {
         &mut self,
         command: CommandId,
         result_digest: coord_types::identity::Digest32,
+        position: coord_types::ids::ExecutionPosition,
         revision: Option<coord_types::ids::KvRevision>,
         response: &[u8],
     ) -> Result<Option<Delivery>, crate::collector::SettleError> {
-        let progress =
-            self.collector
-                .settle_from_record(command, result_digest, revision, response)?;
+        let progress = self.collector.settle_from_record(
+            command,
+            result_digest,
+            position,
+            revision,
+            response,
+        )?;
         Ok(self.deliver(progress))
     }
 
