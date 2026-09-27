@@ -654,7 +654,7 @@ fn stamped(me: u8) -> Voter<Stamped> {
     stamped_at(me, None)
 }
 
-/// [`stamped`], a follower started as having executed through `at`.
+/// [`stamped`], started as having executed through `at`.
 fn stamped_at(me: u8, at: Option<coord_types::ids::ExecutionPosition>) -> Voter<Stamped> {
     let boot = BootId([7; 16]);
     let mut worker =
@@ -696,7 +696,7 @@ fn stamped_at(me: u8, at: Option<coord_types::ids::ExecutionPosition>) -> Voter<
                 capacity: 64,
             },
             None,
-            bootstrapped,
+            at.unwrap_or(bootstrapped),
         );
         leader.set_learning(LearningMode::Full);
         Machine::Leader(Box::new(leader))
@@ -862,6 +862,66 @@ fn a_voter_that_refused_a_behind_candidate_campaigns_above_its_ballot() {
         Some(core::cmp::Ordering::Greater),
         "{campaigned:?}"
     );
+}
+
+/// Deliver every peer frame among `voters` (indexed by replica byte)
+/// until none is left, starting from `out` sent by voter `from`.
+fn route(voters: &mut [Voter<Stamped>], from: u8, out: coord_daemon::Outbound) {
+    let mut queue: std::collections::VecDeque<(u8, u8, Vec<u8>)> = out
+        .peer
+        .into_iter()
+        .map(|(to, frame)| (from, to.replica.0[0], frame))
+        .collect();
+    let mut steps = 0;
+    while let Some((from, to, frame)) = queue.pop_front() {
+        steps += 1;
+        assert!(steps < 10_000, "the voters did not settle");
+        let Some(voter) = voters.get_mut(to as usize) else {
+            continue;
+        };
+        let out = voter
+            .on_peer(PeerProvenance::from_local_voter(r(from), inc()), frame)
+            .expect("stepped");
+        queue.extend(
+            out.peer
+                .into_iter()
+                .map(|(next, frame)| (to, next.replica.0[0], frame)),
+        );
+    }
+}
+
+/// A live leader that refuses a behind candidate leads again above the
+/// refused ballot, and the behind voter follows it (task-d10).
+///
+/// A restarted voter's timer can fire before it hears the leader (rgb-2
+/// and rgb-6 on #98). Refused by everyone, it would stay promised to its
+/// own ballot, above the live one, and deaf until the next election. The
+/// leader steps down and campaigns above that ballot instead.
+#[test]
+fn a_live_leader_that_refuses_a_behind_candidate_leads_again_above_it() {
+    let ahead = coord_types::ids::ExecutionPosition::new(100).unwrap();
+    let mut voters = vec![
+        stamped_at(0, Some(ahead)),
+        stamped(1),
+        stamped_at(2, Some(ahead)),
+    ];
+    assert!(voters[0].leads());
+    let (refused, out) = voters[1].campaign().expect("stepped").expect("campaigns");
+    route(&mut voters, 1, out);
+
+    assert!(voters[0].leads(), "the leader leads again");
+    let led = voters[0].ballot();
+    assert_eq!(
+        led.compare_same_epoch(&refused),
+        Some(core::cmp::Ordering::Greater),
+        "{led:?} is above the refused {refused:?}"
+    );
+    for i in [1usize, 2] {
+        assert_eq!(voters[i].ballot(), led, "voter {i} follows it");
+        assert_eq!(voters[i].node().machine().promised(), led, "voter {i}");
+    }
+    assert!(!voters[1].leads());
+    assert!(!voters[1].node().machine().campaigning());
 }
 
 /// A transition the store refuses as fenced fails its barrier and the

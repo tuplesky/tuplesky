@@ -5084,6 +5084,18 @@ what is decided. The voters it asks can tell.
   for without seeing the refusal must not win (from review).
 - Only a configured voter's refusal is honoured: an observer or learner
   on the peer plane has no promise to withhold (from review).
+- A leader that refuses a higher ballot as behind steps down and
+  campaigns above it at once (`Voter::follow_machine`, `Node::step_down`,
+  then `Voter::campaign`). A restarted voter's timer can fire before it
+  hears the leader, and rgb-2 and rgb-6 on #98 were that: refused by
+  everyone, it would sit promised above the live ballot, deaf, until an
+  election came along. The cost is an election per refused campaign
+  against a live leader, bounded because the refused voter does not
+  campaign again until it has caught up. Watch for election churn in the
+  runs (from review).
+- The window is `limits.command_table_capacity`, per voter. It is set
+  alike across a domain so that voters judge alike; nothing enforces it,
+  and a voter with a larger table only refuses later.
 
 The most advanced live voter is refused by nobody, so someone can always
 lead. A candidate whose `NewLeader` reaches only voters as far behind as
@@ -5115,6 +5127,14 @@ itself still leads; that is catch-up's case.
   that is not a voter, naming `ExecutionPosition::MAX`; the campaign
   goes on. Without the voter check it is abandoned.
 - `voter.rs`
+  `a_live_leader_that_refuses_a_behind_candidate_leads_again_above_it`:
+  three voters, the leader and one follower at 100 and the third at the
+  bootstrap position, which campaigns first. The leader refuses it,
+  steps down, campaigns above the refused ballot and leads again; both
+  followers promise that ballot. Without the step-down the leader stays
+  at ballot 0, below the refused ballot 1, and the refused voter stays
+  deaf.
+- `voter.rs`
   `a_voter_that_refused_a_behind_candidate_campaigns_above_its_ballot`:
   the refusal goes out naming the voter's position, no promise does, and
   its next campaign is above the refused ballot. Without the floor it
@@ -5126,14 +5146,15 @@ itself still leads; that is catch-up's case.
   what it lacks was retired past every peer's table. A checkpoint brings
   it up (task-d08). Until then it follows and votes, but executes
   nothing past the gap.
-- If the leader is alive when a behind voter campaigns, the leader and
-  the other voters refuse it, and it is left promised to a ballot above
-  the live leader's. It hears nothing from that leader until an election
-  goes above the refused ballot. The leader records the ballot as
-  outranked, but a leader does not campaign, so nothing moves until the
-  next election. The voter's campaigns stay blocked meanwhile, so it
-  does not disrupt the domain; it is one voter short of the quorum until
-  then.
+- When only followers receive the behind voter's `NewLeader` (the
+  leader is partitioned from it), they refuse and fence, and nobody
+  campaigns above the refused ballot: the voter stays deaf, promised
+  above the live leader's ballot, until the next election. It does not
+  disrupt the domain; it is one voter short until then.
+- A cleaner design, for later and not now, removes the whole problem: a
+  candidate promises itself only once the first promise from another
+  voter arrives, so a campaign refused by everyone leaves no promise
+  behind, and nothing needs fencing or leading above.
 - `outranked` and the candidate's refusal position are not durable. A
   restarted refuser can campaign at or below the refused ballot, which
   the refused candidate does not promise; the other voters still can. A

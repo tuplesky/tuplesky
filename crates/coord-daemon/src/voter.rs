@@ -348,6 +348,28 @@ impl<P: Persistence> Voter<P> {
         if let Some(changed) = self.node.change_role(&self.ballot)? {
             out.absorb(changed);
         }
+        // A leader that refused a higher ballot as behind leads again above
+        // it, at once (task-d10). The refused voter promised itself that
+        // ballot and hears nothing below it, so under this leader's ballot
+        // it would sit deaf, one voter short, until an election came
+        // along -- and a restarted voter's timer firing before it hears
+        // the leader is exactly how the refused campaign starts. Stepping
+        // down and campaigning through [`Voter::campaign`] goes above the
+        // refused ballot; the refused voter promises and follows. It costs
+        // an election per refused campaign, bounded because the refused
+        // voter does not campaign again until it has caught up.
+        if self.leads()
+            && self
+                .node
+                .machine()
+                .outranked()
+                .is_some_and(|refused| higher(&refused, &self.ballot))
+        {
+            out.absorb(self.node.step_down(&self.ballot)?);
+            if let Some((_, campaigned)) = self.campaign()? {
+                out.absorb(campaigned);
+            }
+        }
         Ok(out)
     }
 
