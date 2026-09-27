@@ -4815,8 +4815,74 @@ the history in identity order, the trim test; with
 `check_release` as it was, the response fork is accepted, and without the
 digest comparison, the digest fork is.
 
+### From review
+
+- **Every committed tail.** A live table commits only after a command's
+  dependencies, but a restarted one takes each record's phase from its
+  row: a command installed from a Sync comes back at COMMIT, while one
+  committed from votes left its row at ACCEPT. Two committed records then
+  look last, and nothing says which is. `committed_tails` returns them
+  all and `anchor_all` makes the next command on the key depend on every
+  one of them, once (Codex, #106).
+- **The whole execution.** A late release is compared with the execution
+  the answer came from: digest, position and revision besides the
+  response. Two executions at different positions can answer with the
+  same bytes, and an answer over the deliverable bound is the same
+  `RESULT_TOO_LARGE` whatever it replaced (Codex, #106).
+- **Nothing after the contradiction.** Once a late release contradicts
+  an answer, `Domain::answer` sends nothing until the pass ends in the
+  stop: not the rest of the voter's batch, the parked frames or what the
+  records settle in the same turn (Codex, #106).
+
+### A commit below the source ballot is a decision
+
+The case the chain rule leaves: a new leader that holds a decided command
+only at ACCEPT, having missed the commit, while every reporter that holds
+the decision is behind the source ballot. The source rule sent all of
+those reporters' rows to `reproposed`, so the leader re-proposed the
+command after its tail and decided it a second time; a voter adopting
+that order then reported it beside a commit under one label, which is
+the `IncompatibleAccepted` the stress runs showed.
+
+`select` now takes an entry at COMMIT from any report, executed-as-
+committed ones included, into the selection with its dependencies and
+paths; PRE-ACCEPT and ACCEPT below the source are still re-proposed. A
+commit is a quorum's acceptance of one dependency set, final whatever
+ballot reached it, and the source rule chooses among acceptances. The
+agreement check applies as to any entry, so a below-source commit
+meeting an at-source acceptance under other dependencies is
+`IncompatibleAccepted`: the alarm it should be, where the old rule
+called it stale and kept the acceptance. An at-source copy's sequence
+number and paths outrank a below-source one's, since those are a
+ballot's own.
+
+- The new leader re-proposes such an entry with the decided dependencies
+  where it has not executed it, which is the existing entry path.
+- A behind voter installing the Sync commits those commands without a
+  vote, a partial heal of the task-d11 liveness note.
+- The Sync grows by the behind reporters' commits, bounded by the reports
+  it already reads.
+- The model's `legitimate-phase-differences` scenario had a lower
+  ballot's COMMIT of c2 under other dependencies as stale state; it now
+  holds only stale acceptances (c3 at ACCEPT where the source
+  pre-accepted it, the highest-phase-wins counterexample), and a fourth
+  frozen scenario, `below-source-commit-disagrees`, records the alarm.
+
+`activation.rs` `a_commit_below_the_source_ballot_is_selected_with_its_dependencies`:
+r1 executed x after a; r2 adopted both and, restarted before executing
+them, holds them at ACCEPT; the source report holds neither. x is
+selected at COMMIT with `[a]` and r2, winning, proposes it with `[a]`.
+Against the old rule x is not selected.
+`a_below_source_commit_against_an_acceptance_of_other_dependencies_is_incompatible`:
+the alarm. Against the old rule the selection succeeds.
+
 ### What is left
 
+- No reporter holding the decision at all, every voter that had it having
+  retired it, while the candidate holds the command undecided. That
+  candidate is behind by definition; task-d10's rule catches it (a report
+  carries its executed position, and a candidate more than a window
+  behind the source reporters steps aside). Recorded there, not built.
 - A node stopped on a divergence serves again from its store after a
   restart. task-d13 keeps it stopped until an operator clears it or
   catch-up rebuilds it; planned behind task-d08.

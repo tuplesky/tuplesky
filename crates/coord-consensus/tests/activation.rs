@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use coord_consensus::{
     AppliedOutcome, BallotConfiguration, CommandRecord, ConfigurationIdentity, Follower,
     FollowerConfig, FollowerRejection, Leader, LeaderConfig, PageError, Phase, ProtocolMessage,
-    ReplicaRole, SyncDecision, decode_dependency, decode_promise, decode_sync,
+    RecoveryError, RecoveryReport, ReplicaRole, SyncDecision, decode_dependency, decode_promise,
+    decode_sync, select,
 };
 use coord_core::capability::{
     AdmissionReceipt, AttestedAdmission, EstablishedResult, VerifierToken,
@@ -2346,4 +2347,101 @@ fn a_new_leader_chains_after_what_it_committed_and_has_not_executed() {
             "re-proposed {reproposed:?}: a fresh command forks off the committed commands"
         );
     }
+}
+
+/// A commit in a report below the source ballot is a decision, and the
+/// selection carries it (task-d12).
+///
+/// r1 executed x after a; r2 adopted both and, restarted before it
+/// executed them, holds them at ACCEPT (a commit is not written as a
+/// row). Both report below the source ballot, which only a report without x
+/// holds. The selection carries x at COMMIT with r1's dependencies, and
+/// r2, winning, proposes it with them: with x re-proposed instead, r2
+/// would chain it after whatever it held last, and decide a second time
+/// a command the domain had decided.
+#[test]
+fn a_commit_below_the_source_ballot_is_selected_with_its_dependencies() {
+    let mut c = Cluster::new(79);
+    c.no_execute = vec![2];
+    let a = c.admit(1, 1);
+    let x = c.admit(2, 1);
+    c.settle();
+    assert_eq!(c.nodes[1].executed, vec![a, x]);
+    c.crash(2);
+    c.revive(2, quorum(ballot(0, 0)));
+    assert_eq!(
+        c.nodes[2].follower().table().phase_of(&x),
+        Some(Phase::Accept)
+    );
+    let decided = c.nodes[1]
+        .follower()
+        .table()
+        .record(&x)
+        .unwrap()
+        .deps
+        .clone();
+    assert_eq!(decided, vec![a]);
+    let new = ballot(2, 2);
+    let reports = |c: &Cluster| {
+        let mut reports: Vec<RecoveryReport> =
+            (1..3).map(|i| c.nodes[i].follower().report(new)).collect();
+        // The source: a voter synchronized to a later ballot that holds
+        // neither command.
+        reports.push(RecoveryReport {
+            replica: r(0),
+            ballot: new,
+            committed_ballot: ballot(1, 0),
+            entries: Vec::new(),
+        });
+        reports
+    };
+    let decision = select(&quorum(new), &reports(&c)).unwrap();
+    let entry = decision.entries.get(&x).expect("x is selected");
+    assert_eq!(
+        (entry.phase, entry.deps.clone()),
+        (Phase::Commit, decided.clone())
+    );
+    assert!(!decision.reproposed.contains(&x));
+    // r2 wins with that selection and proposes x with its decided
+    // dependencies.
+    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    c.handle(2, effects);
+    let (leader, _) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    let proposal = leader.proposal(&x).expect("x is proposed");
+    assert_eq!(proposal.deps, decided);
+}
+
+/// A below-source commit that meets an at-source acceptance of the same
+/// command under other dependencies is the alarm it should be (task-d12).
+#[test]
+fn a_below_source_commit_against_an_acceptance_of_other_dependencies_is_incompatible() {
+    let mut c = Cluster::new(83);
+    let a = c.admit(1, 1);
+    let x = c.admit(2, 1);
+    c.settle();
+    assert_eq!(c.nodes[1].executed, vec![a, x]);
+    let new = ballot(2, 2);
+    let below = c.nodes[1].follower().report(new);
+    let committed = below.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(
+        (committed.phase, committed.deps.clone()),
+        (Phase::Commit, vec![a])
+    );
+    let mut other = committed.clone();
+    other.phase = Phase::Accept;
+    other.deps = Vec::new();
+    let at_source = RecoveryReport {
+        replica: r(0),
+        ballot: new,
+        committed_ballot: ballot(1, 0),
+        entries: vec![other],
+    };
+    assert!(matches!(
+        select(&quorum(new), &[below, at_source]),
+        Err(RecoveryError::IncompatibleAccepted { command, .. }) if command == x
+    ));
 }

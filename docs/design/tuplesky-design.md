@@ -337,7 +337,7 @@ Previously authorized old evidence can arrive late; never relabel it or combine 
 <a id="s4-9"></a>
 ### 4.9 Recovery selection and stable publication
 
-One leader selects the recovery Sync result and followers adopt it. Different local progress phases are not themselves divergent committed dependencies. Follow source ballot selection and possible-fast-decision recovery, not a generic highest-phase-wins merge. Validate command/dependency equivalence where eligible accepted candidates must agree. Unexpected incompatible accepted candidates stop recovery with diagnostic evidence; normal preaccept disagreement remains valid input. [S1, X2, X3]
+One leader selects the recovery Sync result and followers adopt it. Different local progress phases are not themselves divergent committed dependencies. Follow source ballot selection and possible-fast-decision recovery, not a generic highest-phase-wins merge; reports below the source ballot supply their commits. Validate command/dependency equivalence where eligible accepted candidates must agree. Unexpected incompatible accepted candidates stop recovery with diagnostic evidence; normal preaccept disagreement remains valid input. [S1, X2, X3]
 
 Canonical deterministic choice aids reproducibility wherever the protocol allows choice, but does not prove it safe. Durably bind the selected result to epoch/ballot before publishing Sync. After crash, reuse it or enter a valid new ballot; do not publish incompatible results under one identity.
 
