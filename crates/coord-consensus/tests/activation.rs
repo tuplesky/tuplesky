@@ -3102,6 +3102,25 @@ fn copies_of_one_command_under_two_sets_of_facts_are_incompatible() {
             second: b,
         })
     );
+    // The same when the copy naming A has no payload: the conflict is
+    // two decisions, not a half-initialized report to set aside and
+    // leave the other to be bound.
+    let mut without_payload = entry(Phase::Accept, a);
+    without_payload.payload_present = false;
+    assert_eq!(
+        select(
+            &config,
+            &[
+                report(r(1), ballot(0, 0), without_payload),
+                report(r(2), ballot(0, 0), entry(Phase::Accept, b)),
+            ],
+        ),
+        Err(RecoveryError::IncompatibleAdmission {
+            command: x,
+            first: a,
+            second: b,
+        })
+    );
     // An ACCEPT under A below the source ballot beside the source's
     // ACCEPT under B: the source's copy is selected, under B.
     let selected = select(
@@ -3287,4 +3306,178 @@ fn a_voter_accepting_under_other_facts_rebinds_to_the_selected_ones() {
         Some(second.admission_digest())
     );
     assert!(cluster.nodes[1].follower().missing_payloads().is_empty());
+}
+
+/// The same for a command the voter executed and retired: its record is
+/// gone, and its payload row, where it is still kept, is what it was
+/// executed under (task-d14).
+#[test]
+fn a_voter_handed_other_facts_for_a_command_it_retired_stops() {
+    let mut cluster = Cluster::with_capacity(41, 4);
+    let x = cluster.admit(1, 1);
+    for s in 2..12u64 {
+        cluster.admit(s, s as u8);
+        cluster.settle();
+    }
+    let f = cluster.nodes[1].follower();
+    assert!(f.table().record(&x).is_none(), "X is retired");
+    assert_eq!(f.table().phase_of(&x), Some(Phase::Executed));
+    let held = facts_of(&cluster.nodes[1], &x).expect("its payload row is kept");
+    cluster.no_execute = vec![1];
+    let z = cluster.admit(20, 20);
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].next_executable(), Some(z));
+    let z_facts = facts_of(&cluster.nodes[1], &z).unwrap();
+    let z_deps = cluster.nodes[1]
+        .follower()
+        .table()
+        .record(&z)
+        .unwrap()
+        .deps
+        .clone();
+    let new = ballot(1, 2);
+    let own = cluster.nodes[1].executed_through();
+    let promised = cluster.nodes[1].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: own,
+        },
+    ));
+    cluster.handle(1, promised);
+    let other = Digest32([0xee; 32]);
+    let entry = |command, deps, admission| coord_consensus::SyncEntry {
+        command,
+        phase: Phase::Commit,
+        deps,
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: Some(admission),
+    };
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, entry(x, vec![], other)), (z, entry(z, z_deps, z_facts))]),
+        reproposed: Default::default(),
+    };
+    let synced = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, synced);
+    let rejections = cluster.nodes[1].follower_mut().take_rejections();
+    assert!(
+        rejections.contains(&FollowerRejection::IncompatibleAdmission {
+            command: x,
+            held,
+            selected: other,
+        }),
+        "{rejections:?}"
+    );
+    assert_eq!(cluster.nodes[1].next_executable(), None);
+}
+
+/// A re-proposal under the selected facts that arrives before their
+/// payload is held, and the payload then serves both it and the Sync
+/// entry waiting on the same rebind: the entry installs at once rather
+/// than waiting for some unrelated event (task-d14).
+#[test]
+fn a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting() {
+    let mut cluster = Cluster::new(41);
+    cluster.cut = (0..3u8)
+        .flat_map(|a| (0..3u8).map(move |b| (a, b)))
+        .filter(|(a, b)| a != b)
+        .collect();
+    let x = cluster.admit_presented(1, 1, &[1], 9);
+    cluster.admit_presented(1, 1, &[2], 10);
+    cluster.settle();
+    let first = facts_of(&cluster.nodes[1], &x).unwrap();
+    let second = cluster.nodes[2].follower().payload(&x).unwrap().clone();
+    let own = cluster.nodes[1].executed_through();
+    // The later selection's own evidence for X: installing its entry
+    // realigns the key's log to it, which adopting the proposal alone does
+    // not.
+    let key = coord_consensus::CONSERVATIVE_KEY.to_vec();
+    let chosen = Digest32([42; 32]);
+    let sync = |b: Ballot, source: Ballot, seqnum: u64, admission: Digest32| SyncDecision {
+        ballot: b,
+        source_ballot: source,
+        entries: BTreeMap::from([(
+            x,
+            coord_consensus::SyncEntry {
+                command: x,
+                phase: Phase::Accept,
+                deps: vec![],
+                path: chosen,
+                paths: vec![(key.clone(), chosen)],
+                seqnum,
+                admission: Some(admission),
+            },
+        )]),
+        reproposed: Default::default(),
+    };
+    let steps = [
+        (
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(1, 2),
+                executed: own,
+            },
+        ),
+        (
+            r(2),
+            ProtocolMessage::Sync(sync(ballot(1, 2), ballot(0, 0), 0, first)),
+        ),
+        (
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(2, 0),
+                executed: own,
+            },
+        ),
+        (
+            r(0),
+            ProtocolMessage::Sync(sync(
+                ballot(2, 0),
+                ballot(1, 2),
+                7,
+                second.admission_digest(),
+            )),
+        ),
+        // The new leader's re-proposal under the selected facts, ahead of
+        // their payload.
+        (
+            r(0),
+            ProtocolMessage::Proposal(coord_consensus::FastAck {
+                replica: r(0),
+                ballot: ballot(2, 0),
+                command: x,
+                deps: vec![],
+                paths: Vec::new(),
+                path: coord_consensus::empty_path(),
+                admission: second.admission_digest(),
+                seqnum: Some(0),
+            }),
+        ),
+        (
+            r(0),
+            ProtocolMessage::PayloadResponse {
+                command: x,
+                payload: second.clone(),
+            },
+        ),
+    ];
+    for (from, message) in steps {
+        let effects = cluster.nodes[1].step(peer_event(from, message));
+        cluster.handle(1, effects);
+    }
+    let f = cluster.nodes[1].follower();
+    assert_eq!(
+        f.table().record(&x).and_then(|r| r.payload),
+        Some(second.admission_digest())
+    );
+    let record = f.table().record(&x).unwrap();
+    assert_eq!(
+        (record.synced_seq, record.paths.clone()),
+        (Some(7), vec![(key, chosen)]),
+        "the Sync entry installed with the rebind"
+    );
 }

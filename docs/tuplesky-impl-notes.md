@@ -5191,7 +5191,9 @@ command that writes another receipt identity into replicated state
   reports the digest its Sync named.
 - Copies at ACCEPT or beyond of one command under different digests are
   `IncompatibleAdmission` in the selection: a second decision, never a
-  merge. An acceptance below the source ballot decides nothing and is
+  merge. It is checked before the payload check, so a copy without its
+  payload cannot be set aside as half-initialized and leave the other
+  copy to be bound. An acceptance below the source ballot decides nothing and is
   re-proposed as before, whatever its facts.
 - The named digest comes from the copies the selection takes: an
   acceptance at the source ballot or a commit at any. A reporter's
@@ -5209,9 +5211,12 @@ command that writes another receipt identity into replicated state
 - At COMMIT or beyond, a different digest is two decisions of one
   command. The voter does not install the entry, reports
   `IncompatibleAdmission`, and stops voting and executing.
-- A retired command has nothing to compare. After this change a voter
-  can only have executed a command under other facts than its decision
-  through the path it removes, so `ExecutedRecordV1` is unchanged.
+- A command executed and retired has no record; it is compared against
+  its payload row where one is kept, by the candidate and by a voter
+  installing a Sync. With none it has nothing to compare. After this
+  change a voter can only have executed a command under other facts than
+  its decision through the path it removes, so `ExecutedRecordV1` is
+  unchanged.
 - The report pages and the Sync carry the digest on the wire; the bound
   Sync row carries it at schema version 3. A row of version 1 or 2 is
   refused as corrupt, not read as a selection without facts, so stores
@@ -5246,13 +5251,23 @@ In `crates/coord-consensus/tests/activation.rs`:
   that executed X under A and is handed a Sync naming B for it reports
   `IncompatibleAdmission` and does not execute the committed command
   waiting after it.
+- `a_voter_handed_other_facts_for_a_command_it_retired_stops`: the same
+  for a command executed and retired, compared against its payload row.
+- `a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting`:
+  the new leader's re-proposal under the selected facts arrives before
+  their payload; the payload rebinds the record for both, and the Sync
+  entry installs at once with its own evidence.
 - `a_sync_row_without_admission_facts_is_refused`: rows of versions 1 and
   2 are refused; the current row round-trips with its facts.
+- The incompatibility test also covers a copy without its payload.
 
 Each has a negative control. With the selection naming no facts, the
 first four fail. With the alarm and the stop switched off, the
 incompatibility test and the stop test fail. With the rebind at
-PRE-ACCEPT only, the ACCEPT rebind test fails.
+PRE-ACCEPT only, the ACCEPT rebind test fails. With the conflict found
+only in the merge, the case without a payload is `HalfInitialized`; with
+the retired command skipped, the voter executes on; and without resuming
+the Sync after a proposal's rebind, the entry stays uninstalled.
 
 ### What is left
 

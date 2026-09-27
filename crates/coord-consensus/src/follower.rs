@@ -846,7 +846,7 @@ impl Follower {
                 return Vec::new();
             }
             if let Some((command, held, selected)) =
-                Self::admission_conflict(&self.table, &decision)
+                Self::admission_conflict(&self.table, &self.payloads, &decision)
             {
                 self.rejections.push(FollowerRejection::Campaign(
                     RecoveryError::IncompatibleAdmission {
@@ -1148,6 +1148,25 @@ impl Follower {
                     // executed, was killed and came back as a follower
                     // receives exactly these entries in the next leader's
                     // Sync, and installing them was a panic.
+                    //
+                    // Its payload row, where it is still kept, is what it
+                    // was executed under: other facts in the selection are
+                    // a second decision, as for a record (task-d14).
+                    if let (Some(selected), Some(held)) = (
+                        entry.admission,
+                        self.payloads
+                            .get(&command)
+                            .map(PayloadRecordV1::admission_digest),
+                    ) && held != selected
+                    {
+                        self.rejections
+                            .push(FollowerRejection::IncompatibleAdmission {
+                                command,
+                                held,
+                                selected,
+                            });
+                        self.halted = Some(command);
+                    }
                     continue;
                 }
                 // Committed or executed here under other facts than the
@@ -1347,15 +1366,25 @@ impl Follower {
     /// A selected entry this replica committed or executed under other
     /// facts than the selection names (task-d14): two decisions of one
     /// command, as `(command, held, selected)`.
+    ///
+    /// A command executed and retired here has no record left; its
+    /// payload row, where it is still kept, is what it was executed under.
     fn admission_conflict(
         table: &CommandTable,
+        payloads: &BTreeMap<CommandId, PayloadRecordV1>,
         decision: &SyncDecision,
     ) -> Option<(CommandId, Digest32, Digest32)> {
         decision.entries.values().find_map(|e| {
             let selected = e.admission?;
-            let r = table.record(&e.command)?;
-            let held = r.payload?;
-            (r.phase >= Phase::Commit && held != selected).then_some((e.command, held, selected))
+            let held = match table.record(&e.command) {
+                Some(r) if r.phase >= Phase::Commit => r.payload?,
+                Some(_) => return None,
+                None if table.phase_of(&e.command) == Some(Phase::Executed) => {
+                    payloads.get(&e.command)?.admission_digest()
+                }
+                None => return None,
+            };
+            (held != selected).then_some((e.command, held, selected))
         })
     }
 
@@ -2891,15 +2920,14 @@ impl Follower {
             return Vec::new();
         }
         if self.payloads.contains_key(&command) {
-            if self.awaits_rebind(&command)
+            let for_proposal = self.awaits_rebind(&command)
                 && self
                     .held
                     .get(&command)
-                    .is_some_and(|h| h.proposal.admission == payload.admission_digest())
-            {
-                return self.rebind(command, payload);
-            }
-            if self.awaits_selected_facts(&command) {
+                    .is_some_and(|h| h.proposal.admission == payload.admission_digest());
+            if for_proposal || self.awaits_selected_facts(&command) {
+                // A Sync entry waiting on the same rebind installs now too,
+                // whichever of the two asked for the payload (task-d14).
                 let mut effects = self.rebind(command, payload);
                 effects.extend(self.advance_sync());
                 return effects;

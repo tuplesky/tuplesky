@@ -255,7 +255,24 @@ pub fn select_with(
                 accepted_somewhere.insert(e.command);
                 let eligible = e.phase >= Phase::Commit || Some(r.committed_ballot) == source;
                 if eligible && let Some(d) = e.admission {
-                    named.entry(e.command).or_insert(d);
+                    // Two eligible copies under different facts are two
+                    // decisions, whichever of them has a payload: stopped
+                    // here, before the payload check could set one of the
+                    // reports aside as half-initialized and leave the
+                    // other to be bound.
+                    match named.get(&e.command) {
+                        Some(first) if *first != d => {
+                            return Err(RecoveryError::IncompatibleAdmission {
+                                command: e.command,
+                                first: *first,
+                                second: d,
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            named.insert(e.command, d);
+                        }
+                    }
                 }
             }
         }
