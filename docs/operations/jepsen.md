@@ -692,6 +692,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `65b33ba` | 5 | 2 | 1 |
 | `8ad8e4f` (#103 through `334b098`) | 6 | none | none |
 | `7f62f17` (with #103's rebind, #100's recovery read, `b3f56e3`) | 6 | 1 | none |
+| `d7827de` (with #104's election commits and `f7af332`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -752,6 +753,19 @@ healed at 249 s, and the next began at 273 s. Nothing was `ok` after
 that, through the final heal and the final reads. At the end, `n2`,
 `n3` and `n5` were refusing proposals as `Backpressure` (logged at 8192
 to 16384), and `n4` led ballot 3.
+
+`d7827de` adds #103's early admission (`e83d7ba`), #104's second
+election commit (`176ec81`), and `f7af332`: a Sync leaves no
+acceptance of an earlier ballot.
+* **Stress:** six random-kill runs had no stop and no anomaly. They
+  reached ballots 1 to 14, against 10 to 59 on `7f62f17`. One voter
+  logged a single `RequestFactsConflict`. Three runs did not serve the
+  final read.
+* **Jepsen**
+  ([run 36292234135](https://github.com/tuplesky/tuplesky/actions/runs/36292234135)):
+  `:valid? true`, with 2103 `ok` of 2760. Every node served its final
+  read, and no voter logged a stop, a release mismatch,
+  `IncompatibleAccepted`, `Behind` or a recovery error.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
