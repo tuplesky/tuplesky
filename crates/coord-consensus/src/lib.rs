@@ -164,7 +164,9 @@ pub use leader::{
     REPROPOSE_BATCH, RESEND_PER_VOTER, Rejection,
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-pub use messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, is_payload_transfer};
+pub use messages::{
+    MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, is_payload_transfer,
+};
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};

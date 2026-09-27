@@ -27,6 +27,7 @@ use coord_core::event::{
 };
 use coord_core::machine::DeterministicMachine;
 use coord_sim::storage::StorageModel;
+use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest, PutOp};
@@ -84,6 +85,7 @@ struct Node {
     storage: StorageModel,
     inbox: VecDeque<(ReplicaId, Vec<u8>)>,
     executed: Vec<CommandId>,
+    boot: u8,
 }
 
 impl Node {
@@ -130,6 +132,8 @@ struct Cluster {
     announced: Vec<(u8, u64)>,
     /// Every payload ask sent: (from, commands).
     asks: Vec<(u8, Vec<CommandId>)>,
+    /// The voters' table capacity.
+    capacity: usize,
 }
 
 const SETTLE_STEPS: u32 = 200_000;
@@ -164,6 +168,7 @@ impl Cluster {
                 storage: StorageModel::default(),
                 inbox: VecDeque::new(),
                 executed: Vec::new(),
+                boot: 1,
             };
             node.step(Event::Boot {
                 boot_id: BootId([1; 16]),
@@ -179,6 +184,7 @@ impl Cluster {
             down: Vec::new(),
             announced: Vec::new(),
             asks: Vec::new(),
+            capacity,
         }
     }
 
@@ -340,6 +346,72 @@ impl Cluster {
         self.handle(0, effects);
     }
 
+    /// Kill node `i` and bring it back at once from its durable rows, as
+    /// `coordd` restores a voter: its volatile state is gone, and its
+    /// adoptions come back without the ballot's sequence numbers.
+    fn restart(&mut self, i: usize) {
+        let capacity = self.capacity;
+        let node = &mut self.nodes[i];
+        node.inbox.clear();
+        node.storage.crash();
+        let rows: Vec<_> = node
+            .storage
+            .durable_rows()
+            .into_iter()
+            .filter(|(c, k, _)| {
+                *c == Collection::ProtocolV1.id().0 && k.len() == 41 && k[8] == 0x01
+            })
+            .map(|(_, k, v)| {
+                (
+                    CommandId(Digest32(k[9..].try_into().unwrap())),
+                    coord_consensus::decode_dependency(&v).unwrap(),
+                )
+            })
+            .collect();
+        let promise = node
+            .storage
+            .durable_rows()
+            .into_iter()
+            .find(|(c, k, _)| *c == Collection::ProtocolV1.id().0 && k.len() == 9)
+            .map(|(_, _, v)| coord_consensus::decode_promise(&v).unwrap());
+        let payloads: Vec<_> = node
+            .storage
+            .durable_rows()
+            .into_iter()
+            .filter(|(c, _, _)| *c == Collection::PayloadV1.id().0)
+            .map(|(_, k, v)| {
+                (
+                    CommandId(Digest32(k[..].try_into().unwrap())),
+                    coord_consensus::decode_payload(&v).unwrap(),
+                )
+            })
+            .collect();
+        let mut f = Follower::recover(
+            FollowerConfig {
+                identity: identity(i as u8),
+                quorum: quorum(),
+                genesis: ballot0(),
+                frontend: FRONTEND,
+                capacity,
+            },
+            promise,
+            rows,
+            payloads.clone(),
+            ExecutionPosition::ZERO,
+        )
+        .restore_execution(
+            ExecutionPosition::new(node.executed.len() as u64).unwrap(),
+            node.executed.iter().copied(),
+        )
+        .restore_payloads(payloads);
+        node.boot += 1;
+        f.step(Event::Boot {
+            boot_id: BootId([node.boot; 16]),
+            incarnation: ReplicaIncarnation::new(1).unwrap(),
+        });
+        node.role = Role::Follower(f);
+    }
+
     fn settle_ticking(&mut self, rounds: usize) {
         self.settle();
         for _ in 0..rounds {
@@ -349,6 +421,14 @@ impl Cluster {
     }
 
     fn admit(&mut self, seq: u64) -> CommandId {
+        let all: Vec<usize> = (0..self.nodes.len()).collect();
+        self.admit_to(seq, &all, 9)
+    }
+
+    /// Submit request `seq` to the voters `at` only, under the admission
+    /// receipt `receipt`: the same command identity, and other attested
+    /// facts when `receipt` differs.
+    fn admit_to(&mut self, seq: u64, at: &[usize], receipt: u8) -> CommandId {
         let key = (seq % 250) as u8;
         let request = LogicalRequest::new(
             NamespaceId([5; 16]),
@@ -370,7 +450,7 @@ impl Cluster {
         let frame = MessageV1::Request(RequestV1::new(rk, &request, 0, 0).unwrap())
             .encode()
             .unwrap();
-        for i in 0..self.nodes.len() {
+        for &i in at {
             if self.down.contains(&(i as u8)) {
                 continue;
             }
@@ -382,7 +462,7 @@ impl Cluster {
                     session: SessionId([3; 16]),
                     rule_generation: 1,
                     scope_ceiling: u32::MAX,
-                    receipt_id: Digest32([9; 32]),
+                    receipt_id: Digest32([receipt; 32]),
                     admitted_at_ticks: 0,
                 },
             );
@@ -539,6 +619,73 @@ fn a_follower_asks_first_for_what_the_leader_committed_in_its_order() {
     assert_eq!(ask[..4], due[..4], "the ask led with other commands");
     cluster.settle_ticking(commands.len());
     assert_eq!(cluster.nodes[3].executed, commands);
+}
+
+/// A follower restarted under a live leader, with adoptions it could not
+/// commit, executes everything the leader commits.
+///
+/// r3 hears no peer, so it adopts the first six commands and commits
+/// none. Killed and restarted, it gets its adoptions back from the rows
+/// without the ballot's sequence numbers, so the frontier cannot commit
+/// them. The leader counted its acknowledgements and never re-sends
+/// them, and with the chain total, nothing r3 adopts afterwards can
+/// commit either. It asks the leader for those proposals, adopts them
+/// again with their sequence numbers, and the frontier commits them.
+#[test]
+fn a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits() {
+    let mut cluster = Cluster::new(23, 64);
+    cluster.deaf = vec![3];
+    let first: Vec<CommandId> = (1..=6).map(|n| cluster.admit(n)).collect();
+    cluster.settle();
+    assert!(
+        first
+            .iter()
+            .all(|c| cluster.nodes[3].phase_of(c) == Some(Phase::Accept)),
+        "r3 adopted every command"
+    );
+    cluster.restart(3);
+    let late: Vec<CommandId> = (7..=9).map(|n| cluster.admit(n)).collect();
+    cluster.settle();
+    cluster.resend_only();
+    cluster.settle();
+    assert!(cluster.nodes[3].executed.is_empty());
+    cluster.settle_ticking(3);
+    let all: Vec<CommandId> = first.iter().chain(late.iter()).copied().collect();
+    assert_eq!(cluster.nodes[0].executed, all);
+    assert_eq!(cluster.nodes[3].executed, all);
+}
+
+/// A follower that received the proposal before a payload under other
+/// attested facts adopts nothing, and the frontier executes nothing.
+///
+/// The proposal reaches r3 first and is held. r3's own submission of the
+/// same command then arrives under another admission receipt. Adopted,
+/// the frontier committed it and r3 executed a command under facts the
+/// quorum never admitted; the adoption is refused instead, and reported.
+#[test]
+fn a_proposal_held_before_a_conflicting_payload_is_not_adopted() {
+    let mut cluster = Cluster::new(29, 64);
+    cluster.deaf = vec![3];
+    let c = cluster.admit_to(1, &[0, 1, 2, 4], 9);
+    let pending: Vec<(ReplicaId, Vec<u8>)> = cluster.nodes[3].inbox.drain(..).collect();
+    for (from, frame) in pending {
+        cluster.deliver(3, from, frame);
+    }
+    assert_eq!(cluster.admit_to(1, &[3], 8), c);
+    cluster.settle_ticking(2);
+    assert_eq!(cluster.nodes[0].executed, vec![c]);
+    assert!(
+        cluster.nodes[3].executed.is_empty(),
+        "r3 executed other facts"
+    );
+    assert!(cluster.nodes[3].phase_of(&c) < Some(Phase::Accept));
+    let rejections = cluster.nodes[3].follower_mut().take_rejections();
+    assert!(
+        rejections.iter().any(
+            |r| matches!(r, FollowerRejection::AdmissionConflict { command, .. } if *command == c)
+        ),
+        "the conflict was not reported"
+    );
 }
 
 /// The frontier commits only what the follower adopted from the leader.
