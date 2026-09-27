@@ -1740,11 +1740,29 @@ impl Leader {
             return Vec::new();
         };
         match message {
-            ProtocolMessage::NewLeader { ballot } => {
+            ProtocolMessage::NewLeader { ballot, executed } => {
                 let outstanding = self.cut();
                 let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
                     return Vec::new();
                 };
+                // A candidate more than a table behind this leader would
+                // win and then not serve (task-d10); refused, it is told
+                // how far this leader executed.
+                let own = self.learner.executed_through();
+                if let Some(refused) = self.ballots.refuses_behind(
+                    from.replica,
+                    ballot,
+                    executed,
+                    own,
+                    self.config.capacity as u64,
+                ) {
+                    self.rejections.push(Rejection::Promise(refused));
+                    let reply = self.ballots.refusal(from, ballot, boot, own);
+                    if let Some(outbox) = self.outbox.as_mut() {
+                        outbox.publish(reply);
+                    }
+                    return self.release();
+                }
                 match self
                     .ballots
                     .on_new_leader(from, ballot, boot, alloc, &outstanding)
@@ -1833,6 +1851,7 @@ impl Leader {
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::ReportPage(_)
+            | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::PayloadResponse { .. } => Vec::new(),
         }
     }

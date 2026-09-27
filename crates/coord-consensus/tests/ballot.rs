@@ -286,6 +286,46 @@ fn wrong_configuration_identity_never_votes() {
     }
 }
 
+/// A ballot refused as behind fences every ballot at or below it here
+/// (task-d10). The refused candidate promised itself that ballot and hears
+/// nothing below it; a lower ballot promised here could win without it,
+/// and it could then never follow the leader it has to catch up from.
+#[test]
+fn a_ballot_refused_as_behind_fences_the_ballots_below_it() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let refused = ballot(1, 5, 0);
+    let behind = ExecutionPosition::new(10).unwrap();
+    let own = ExecutionPosition::new(100).unwrap();
+    assert_eq!(
+        state.refuses_behind(r(0), refused, behind, own, 64),
+        Some(PromiseRejection::CandidateBehind {
+            candidate: behind,
+            own
+        })
+    );
+    assert_eq!(state.outranked(), Some(refused));
+    assert_eq!(state.in_flight(), None, "nothing was promised");
+    // Within a table, nobody is refused.
+    assert_eq!(
+        state.refuses_behind(r(2), ballot(1, 6, 2), own, own, 64),
+        None
+    );
+    // Another voter's lower ballot, which it campaigned for without
+    // seeing the refused one, is not promised.
+    assert_eq!(
+        state.on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[]),
+        Err(PromiseRejection::NotHigher { promised: refused })
+    );
+    // One above it is.
+    assert!(
+        state
+            .on_new_leader(peer(2), ballot(1, 6, 2), b, &mut a, &[])
+            .is_ok()
+    );
+}
+
 #[test]
 fn a_same_boot_election_fences_obsolete_vote_callbacks() {
     let b = boot(1);

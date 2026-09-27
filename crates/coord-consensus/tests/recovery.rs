@@ -475,6 +475,7 @@ fn old_ballot_work_is_held_across_recovery_and_required_state_survives_a_crash()
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     let Effect::Persist(pb) = promise[0].clone() else {
@@ -545,7 +546,8 @@ fn old_ballot_work_is_held_across_recovery_and_required_state_survives_a_crash()
             .step(peer(
                 0,
                 ProtocolMessage::NewLeader {
-                    ballot: ballot(0, 0)
+                    ballot: ballot(0, 0),
+                    executed: coord_types::ids::ExecutionPosition::ZERO,
                 }
             ))
             .is_empty()
@@ -864,6 +866,7 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
     let not_transfer = [
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 0),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
         ProtocolMessage::Promise {
             ballot: ballot(1, 0),

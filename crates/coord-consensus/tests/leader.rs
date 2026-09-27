@@ -584,6 +584,7 @@ fn a_higher_promise_stops_proposing_and_fences_unreleased_proposals() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     assert_eq!(effects.len(), 1);

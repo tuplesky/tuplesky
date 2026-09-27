@@ -236,6 +236,14 @@ impl<P: Persistence> Voter<P> {
         // under that fence (a candidate with a higher replica id at the
         // same number), which its own store refuses every time.
         let held = highest(self.ballot, self.node.machine().promised());
+        // Above any ballot this voter refused as behind (task-d10): that
+        // candidate promised itself the ballot and hears nothing below
+        // it, and it has to follow this campaign's leader to catch up.
+        let held = self
+            .node
+            .machine()
+            .outranked()
+            .map_or(held, |refused| highest(held, refused));
         let highest = self.fenced_at.map_or(held, |fence| highest(held, fence));
         let Ok(ballot) = highest.successor(self.ingress.replica()) else {
             return Ok(None);
@@ -296,6 +304,7 @@ impl<P: Persistence> Voter<P> {
                 to,
                 coord_consensus::ProtocolMessage::NewLeader {
                     ballot: self.ballot,
+                    executed: self.node.machine().executed_through(),
                 }
                 .encode(),
             ));
@@ -406,7 +415,7 @@ impl<P: Persistence> Voter<P> {
     ) -> Result<Outbound, DriveError> {
         let before = self.ballot;
         let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
-        if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot }) = &message
+        if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
             self.set_ballot(*ballot);

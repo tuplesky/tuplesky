@@ -149,6 +149,15 @@ impl Campaign {
     ///   judgement about the reporter. The candidate's own report is
     ///   never set aside: its own state is what it goes on to lead from.
     ///
+    /// Both are safe because no acceptance is ever voted without its
+    /// payload: a Sync entry whose payload is missing waits in
+    /// `sync_pending` until it arrives, a proposal is adopted only with
+    /// its payload, and no message acknowledges a Sync. An acceptance that
+    /// no reporter has a payload for was therefore either never decided,
+    /// or decided by voters that have since executed it and leave it out
+    /// of their reports; by quorum intersection, leaving it out of the
+    /// selection loses nothing.
+    ///
     /// When neither applies, the campaign waits for the voters that have
     /// not reported, and fails only once every voter has.
     pub fn try_select(

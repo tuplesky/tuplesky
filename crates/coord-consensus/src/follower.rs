@@ -175,6 +175,24 @@ pub enum FollowerRejection {
         /// The dependency the selection leaves this replica without.
         missing: CommandId,
     },
+    /// A voter refused to promise this replica's campaign: it executed
+    /// through `executed`, more than a table ahead of this replica. The
+    /// campaign was abandoned (task-d10).
+    CampaignRefused {
+        /// The refusing voter.
+        by: ReplicaId,
+        /// What it executed through.
+        executed: ExecutionPosition,
+    },
+    /// A campaign was requested while this replica is still behind the
+    /// position a voter refused it at: it executed through `executed`,
+    /// and does not campaign again until it reaches `needed` (task-d10).
+    BehindVoters {
+        /// What this replica executed through.
+        executed: ExecutionPosition,
+        /// The position it has to reach first.
+        needed: ExecutionPosition,
+    },
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -287,6 +305,10 @@ pub struct Follower {
     /// Set when a selection showed this replica further behind than
     /// recovery carries anyone; it does not campaign again this boot.
     behind: Option<CommandId>,
+    /// The highest position a voter refused this replica's campaign at
+    /// (task-d10): it does not campaign again until it has executed that
+    /// far. Not durable; a restart campaigns and is refused again.
+    behind_voters: Option<ExecutionPosition>,
     report_due: Option<ReportDue>,
     sync_pending: BTreeMap<CommandId, SyncEntry>,
     /// The Sync whose synchronized-ballot row is in flight: the new ballot
@@ -429,6 +451,7 @@ impl Follower {
             learner: Learner::new(executed_through),
             campaign: None,
             behind: None,
+            behind_voters: None,
             report_due: None,
             sync_pending: BTreeMap::new(),
             won: None,
@@ -547,6 +570,7 @@ impl Follower {
             deferred: BTreeMap::new(),
             campaign: None,
             behind: None,
+            behind_voters: None,
             // A report owed to a candidate is an obligation of the replica,
             // not of the role it held when the request arrived: dropping it
             // would stall a candidate that needs this replica's majority.
@@ -616,6 +640,15 @@ impl Follower {
             self.rejections.push(FollowerRejection::Behind { missing });
             return Vec::new();
         }
+        if let Some(needed) = self.behind_voters {
+            let executed = self.executed_through();
+            if executed.get() < needed.get() {
+                self.rejections
+                    .push(FollowerRejection::BehindVoters { executed, needed });
+                return Vec::new();
+            }
+            self.behind_voters = None;
+        }
         let Ok(config) = BallotConfiguration::c2_default(
             self.config.identity.epoch,
             ballot,
@@ -666,7 +699,11 @@ impl Follower {
                     replica: *voter,
                     incarnation: ReplicaIncarnation::ZERO,
                 },
-                frame: ProtocolMessage::NewLeader { ballot }.encode(),
+                frame: ProtocolMessage::NewLeader {
+                    ballot,
+                    executed: self.learner.executed_through(),
+                }
+                .encode(),
             });
         }
         self.campaign = Some(Campaign::new(config));
@@ -2470,10 +2507,25 @@ impl Follower {
             return Vec::new();
         };
         match message {
-            ProtocolMessage::NewLeader { ballot } => {
+            ProtocolMessage::NewLeader { ballot, executed } => {
                 let (Some(boot), Some(alloc)) = (self.boot, self.alloc.as_mut()) else {
                     return Vec::new();
                 };
+                let own = self.learner.executed_through();
+                if let Some(refused) = self.ballots.refuses_behind(
+                    from.replica,
+                    ballot,
+                    executed,
+                    own,
+                    self.config.capacity as u64,
+                ) {
+                    self.rejections.push(FollowerRejection::Promise(refused));
+                    let reply = self.ballots.refusal(from, ballot, boot, own);
+                    if let Some(outbox) = self.outbox.as_mut() {
+                        outbox.publish(reply);
+                    }
+                    return self.release();
+                }
                 let outstanding: Vec<BarrierId> = self
                     .pending
                     .keys()
@@ -2503,6 +2555,43 @@ impl Follower {
                         Vec::new()
                     }
                 }
+            }
+            // A voter more than a table ahead refused this replica's
+            // campaign (task-d10). Abandoned at once unless the selection
+            // is already being bound: a promise refused is a promise the
+            // campaign will not get, and a leader that far behind could
+            // not serve. It campaigns again only once it has executed as
+            // far as the refuser.
+            ProtocolMessage::PromiseRefused {
+                ballot,
+                replica,
+                executed,
+            } => {
+                // Only a voter of this configuration can refuse: an
+                // observer or learner on the peer plane has no promise to
+                // withhold, and honouring it would let it stop a campaign.
+                if replica != from.replica || !self.config.identity.voters.contains(&replica) {
+                    return Vec::new();
+                }
+                let abandon = self.campaign.as_ref().is_some_and(|c| {
+                    c.ballot() == ballot && c.binding().is_none() && !c.is_durable()
+                });
+                if abandon {
+                    self.campaign = None;
+                    let needed = self.behind_voters.map_or(executed, |p| {
+                        if p.get() > executed.get() {
+                            p
+                        } else {
+                            executed
+                        }
+                    });
+                    self.behind_voters = Some(needed);
+                    self.rejections.push(FollowerRejection::CampaignRefused {
+                        by: replica,
+                        executed,
+                    });
+                }
+                Vec::new()
             }
             // Sealing the old configuration (task-55). The row and the
             // report follow the promise's rule exactly: the report is
