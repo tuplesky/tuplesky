@@ -958,6 +958,13 @@ can follow it.
   `:valid? true`, with 3278 `ok` of 4154. Every node served its final
   reads. Two campaigns were refused as behind, and no voter logged a
   stop, `HalfInitialized` or `IncompatibleAccepted`.
+* **A second Jepsen run on the same code**
+  ([run 36348734213](https://github.com/tuplesky/tuplesky/actions/runs/36348734213)):
+  `:valid? true`, with 1622 `ok` of 2386, after a kill of all five
+  nodes. Every node served a final read. One of `n1`'s two final reads
+  failed with `bind: Timeout`, while `n1` was refusing proposals as
+  `Backpressure`. No campaign was refused, and no voter logged a stop
+  or `HalfInitialized`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
