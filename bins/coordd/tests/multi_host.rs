@@ -144,6 +144,107 @@ fn put(provisioned: &Provisioned, key: &[u8]) -> coord_types::logical_v1::Logica
     logical
 }
 
+fn get(provisioned: &Provisioned, key: &[u8]) -> coord_types::logical_v1::LogicalRequest {
+    let put = put(provisioned, key);
+    let mut logical = coord_types::logical_v1::LogicalRequest::new(
+        put.namespace,
+        coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
+            range: coord_types::logical_v1::KeyRange::exact(key.to_vec()),
+            revision: None,
+            limit: 0,
+            keys_only: false,
+            count_only: false,
+        }),
+    );
+    logical.canonicalize();
+    logical
+}
+
+/// A voter started after the domain served its first write serves reads
+/// (task-d07).
+///
+/// The decisive case from the Jepsen client. Voters 1 and 2 serve a write
+/// before voter 3 exists; its proposal went out to a peer that was not
+/// linked, and was dropped. Nothing sent it again, and every later
+/// proposal depends on it through the conservative key, so voter 3 held
+/// everything and executed nothing: a read through it waited for ever,
+/// while writes still succeeded because the leader answers them. The
+/// leader now sends a proposal again until every voter has voted on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_started_after_the_first_write_serves_reads() {
+    if HOSTS.iter().any(|h| UdpSocket::bind((*h, 0)).is_err()) {
+        eprintln!("skipped: {HOSTS:?} are not all assigned on this machine");
+        return;
+    }
+    let dir = workspace("late");
+    let api = free_everywhere(&[]);
+    let peer = free_everywhere(&[api]);
+    let spec = HOSTS
+        .iter()
+        .enumerate()
+        .map(|(i, host)| format!("n{}={host}:{api}:{peer}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let run = dir.join("run");
+    let provisioned = provision(&Plan {
+        hosts: parse_hosts(&spec).expect("a host list"),
+        ..Plan::loopback(run.clone(), 3, 0)
+    })
+    .expect("provisioned");
+    let mut voters: Vec<Voter> = (1..=3)
+        .map(|n| Voter {
+            bundle: run.join(format!("n{n}")),
+            daemon: None,
+        })
+        .collect();
+    for (i, voter) in voters.iter_mut().enumerate().take(2) {
+        voter.start(i + 1);
+    }
+    for (i, voter) in voters.iter().enumerate().take(2) {
+        assert!(
+            voter.waits_until(60, 0, |said| reported(said, "voters submittable=").last()
+                == Some(&1)),
+            "voter {} did not reach the other started voter:\n{}",
+            i + 1,
+            voter.said()
+        );
+    }
+    let minter = coord_harness::issuer::Minter::of(&provisioned).expect("the minter");
+    let mut first = Caller::connect(&run, &provisioned, &minter, 0, 0)
+        .await
+        .expect("a caller bound at voter 1");
+    assert_eq!(
+        first
+            .ask(&put(&provisioned, b"early"), Duration::from_secs(30))
+            .await,
+        Answer::Established,
+        "two voters of three did not establish a write"
+    );
+
+    voters[2].start(3);
+    for (i, voter) in voters.iter().enumerate() {
+        assert!(
+            voter.waits_until(60, 0, meshed),
+            "voter {} did not reach every other voter:\n{}",
+            i + 1,
+            voter.said()
+        );
+    }
+    let mut late = Caller::connect(&run, &provisioned, &minter, 2, 1)
+        .await
+        .expect("a caller bound at the late voter");
+    assert_eq!(
+        late.ask(&get(&provisioned, b"early"), Duration::from_secs(30))
+            .await,
+        Answer::Established,
+        "a read through the voter started late was not served:\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
+        voters[0].said(),
+        voters[1].said(),
+        voters[2].said()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Three voters placed on three addresses come up, serve a request,
 /// and take back a voter that was killed and restarted (task-d04, with
 /// the re-dial of task-d03).

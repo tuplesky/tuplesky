@@ -134,6 +134,15 @@ impl Machine {
         }
     }
 
+    /// Send the voters, again, the proposals they have not voted on
+    /// (task-d07). Only a leader has proposals to send.
+    pub fn resend_unvoted(&mut self, per_voter: usize) -> Vec<Effect> {
+        match self {
+            Machine::Leader(m) => m.resend_unvoted(per_voter),
+            Machine::Follower(_) => Vec::new(),
+        }
+    }
+
     /// Ask `from` for the payloads this replica lacks. Only a follower
     /// lacks one: a leader holds every payload it proposed.
     pub fn request_payloads(&mut self, from: coord_types::ids::ReplicaId) -> Vec<Effect> {
@@ -522,6 +531,15 @@ impl<P: Persistence> Node<P> {
     /// with.
     pub fn payloads_answered(&self) -> u64 {
         self.machine().payloads_answered()
+    }
+
+    /// Send the voters, again, the proposals they have not voted on
+    /// (task-d07).
+    pub fn resend_proposals(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self
+            .machine_mut()
+            .resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+        self.carry_out(effects, ballot)
     }
 
     /// Ask `from` for the payloads this replica lacks.

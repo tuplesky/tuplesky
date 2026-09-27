@@ -160,7 +160,8 @@ pub use handoff::{
     TerminalReport, TerminalReportError, Transition, cancel, resume, seal, select_terminal,
 };
 pub use leader::{
-    CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal, Rejection,
+    CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal,
+    REPROPOSE_BATCH, RESEND_PER_VOTER, Rejection,
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, is_payload_transfer};
