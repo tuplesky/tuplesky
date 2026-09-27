@@ -690,6 +690,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | --- | --- | --- | --- |
 | `add543c` | 4 | none | none |
 | `65b33ba` | 5 | 2 | 1 |
+| `8ad8e4f` (#103 through `334b098`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -707,6 +708,21 @@ driver tries voter 1 first) then returned key 1 as it was at about 11 s,
 without any of the appends acknowledged from 71 s to 80 s. The checker
 reported it as reads that began after longer ones ended and are
 shorter.
+
+#103 then added two commits, carried in `8ad8e4f`. A restarted follower asks the
+leader for the proposals it adopted (`ca14523`). A proposal that reached a
+follower before its payload is adopted only under the admission it
+carries (`334b098`). Before that commit, such a proposal was adopted
+under whatever payload was bound since, even one under other attested
+facts. Then the frontier, or two peers' acknowledgements, committed it,
+and the follower executed facts the quorum never admitted. That is a
+likely cause of the two release mismatches. Six random-kill runs on
+`8ad8e4f` had no stop and no anomaly; two did not serve the final read
+(exit 2), as in one run on each earlier build. Six clean runs against
+two stops in five make the fix likely, not certain. The `jepsen`
+workflow on `8ad8e4f`
+([run 36284503854](https://github.com/tuplesky/tuplesky/actions/runs/36284503854))
+was `:valid? true`, with 1442 `ok` of 1866, and no voter stopped.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
