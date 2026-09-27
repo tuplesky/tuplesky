@@ -112,7 +112,9 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn("`timeout` ×", self.text)
 
     def test_faults_and_voters(self):
-        self.assertIn('| 10:00:05 | 4 | `:kill` | {"n1" "", "n2" ""} |', self.text)
+        self.assertIn("<summary>Faults (2)</summary>", self.text)
+        self.assertIn('| 10:00:04 | 3 | `:kill` | :all | {"n1" "", "n2" ""} |', self.text)
+        self.assertIn("| 10:00:40 | 39 | `:start` | :all | - |", self.text)
         self.assertIn("| n1 | 2 | 9 | follows ballot 3 led by 02020202 | 3 |", self.text)
 
     def test_missing_files_leave_sections_out(self):

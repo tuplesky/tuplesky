@@ -276,13 +276,19 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         out.append("")
 
     if nemesis:
+        # The nemesis runs one fault at a time and logs each twice, as
+        # invoked (what it targets) and as completed (what it did).
         start = client[0].at if client else nemesis[0].at
-        out.append(f"<details><summary>Faults ({len(nemesis)} operations)</summary>")
+        pairs = [(nemesis[i], nemesis[i + 1] if i + 1 < len(nemesis) else None) for i in range(0, len(nemesis), 2)]
+        out.append(f"<details><summary>Faults ({len(pairs)})</summary>")
         out.append("")
-        out.append("| Time | + s | Fault | Result |")
-        out.append("| --- | --- | --- | --- |")
-        for o in nemesis:
-            out.append(f"| {o.at:%H:%M:%S} | {(o.at - start).seconds} | `{o.f}` | {clip(o.value, 80)} |")
+        out.append("| Time | + s | Fault | Target | Result |")
+        out.append("| --- | --- | --- | --- | --- |")
+        for inv, res in pairs:
+            result = clip(res.value, 80) if res is not None and res.f == inv.f else "-"
+            out.append(
+                f"| {inv.at:%H:%M:%S} | {(inv.at - start).seconds} | `{inv.f}` | {clip(inv.value, 30)} | {result} |"
+            )
         out.append("")
         out.append("</details>")
         out.append("")
