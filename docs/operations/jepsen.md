@@ -706,6 +706,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `82e222b` (#106 at `0d31e75`) | 6 | 2 | none |
 | `eaaa540` (#106 at `848be52`) | 6 | none | none |
 | `a793a81` (#106 at `b64acc1`) | 6 | none | none |
+| `af06c39` (#107 at `5dfda8b`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -884,12 +885,50 @@ report nobody can supply, and supplies what its own candidate executed.
   `IncompatibleAccepted` or `HalfInitialized`. Two random runs did not
   serve the final read: in each, a restarted `n3` far behind the others
   (403 against 1305, and 924 against 2567) won the ballot and could not
-  serve. That is the behind leader #104's next rule is to refuse.
+  serve. That is the behind leader #107 refuses.
 * **Jepsen**
   ([run 36337898807](https://github.com/tuplesky/tuplesky/actions/runs/36337898807)):
   `:valid? true`, with 1285 `ok` of 1683. `n2` to `n5` served their
   final reads. `n1`, a follower still at `Backpressure`, did not. No
   voter logged `HalfInitialized`.
+* **A second Jepsen run**
+  ([run 36340499356](https://github.com/tuplesky/tuplesky/actions/runs/36340499356)):
+  `:valid? true`, with 91 `ok` of 322. That low count isn't a stall. The
+  nemesis killed all five nodes at 18:27:03 and did not pick `:start`
+  again until the final heal at 18:31:02, so no voter ran for four
+  minutes. After the restart, `n1` led ballot 1 and the final read was
+  served.
+
+`af06c39` carries #107 at `5dfda8b`: `NewLeader` carries the
+candidate's executed position, and a voter more than a table ahead
+refuses it (`CandidateBehind`).
+* **The rule refuses behind candidates.** In one local random run,
+  `n1` and `n2` refused `n3` (360 against 1576 and 2021). In the Jepsen
+  run below, `n1`, `n4` and `n5` refused `n2` and `n3` (212 and 213
+  against 1416 to 2045).
+* **Local runs:** 6 random-kill runs and 6 replays. No stop, anomaly,
+  `IncompatibleAccepted` or `HalfInitialized`. One run of each kind did
+  not serve its final read. In both, the new leader republished its
+  first lease-authority command (`26fff3ac`, epoch 2) until the end, and
+  never learned it:
+  * **The replay:** `n2` restarted at 358 and led ballot 1 while `n1`
+    was down. It was less than a table behind, so the rule let it
+    through. Its followers executed through 1431, `26fff3ac` included
+    (at 685). `n2` got no further than 407, and ended refusing with
+    `Backpressure`. That is a behind leader the table rule doesn't
+    cover.
+  * **The random run:** `n2` restarted level with `n1` (2021), could not
+    reach `n1` (TLS alert 120), campaigned up to ballot 4 and led it with
+    `n1` following. Both stopped executing at 2053, and neither executed
+    `26fff3ac`. `n3`, refused as behind, stayed promised to its own
+    ballot 4.
+* **Jepsen**
+  ([run 36342552156](https://github.com/tuplesky/tuplesky/actions/runs/36342552156)):
+  `:valid? true`, with 1623 `ok` of 2137. `n1`, `n4` and `n5` served
+  their final reads. `n2` and `n3`, restarted far behind (212 and 213),
+  were refused as candidates and did not serve; bringing them up is
+  catch-up's. No voter logged a stop, `HalfInitialized` or
+  `IncompatibleAccepted`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
