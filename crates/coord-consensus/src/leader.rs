@@ -428,26 +428,35 @@ impl Leader {
         //
         // Nor an entry this leader has executed: every voter that could
         // report it may have retired it, so it can sit far behind what
-        // this leader executed since. The tail is the last entry this
-        // leader has not executed; else the last commands it committed
-        // and has not executed yet, which come after everything it
-        // executed (all of them, where it cannot tell which is last);
-        // else the last command it executed.
-        let mut last: Vec<CommandId> = match order
+        // this leader executed since.
+        //
+        // Nor any one candidate alone. The last entry this leader has not
+        // executed, the last commands it committed and has not executed
+        // yet, and the last command it executed are each the tail when
+        // the table is right, and each has been wrong: a command that
+        // executed with no executed row came back unexecuted after a
+        // restart, and a chain after it forked from everything executed
+        // since (task-d12, stress run d12-11). Depending on a command that
+        // is already behind the tail orders nothing wrongly, so the chain
+        // starts after all of them.
+        let mut last: Vec<CommandId> = Vec::new();
+        if let Some(tail) = order
             .iter()
             .rev()
             .find(|c| leader.table.phase_of(c) < Some(Phase::Executed))
         {
-            Some(tail) => alloc::vec![*tail],
-            None => {
-                let committed = leader.table.committed_tails(CONSERVATIVE_KEY);
-                if committed.is_empty() {
-                    leader.table.last_executed().into_iter().collect()
-                } else {
-                    committed
-                }
+            last.push(*tail);
+        }
+        for c in leader
+            .table
+            .committed_tails(CONSERVATIVE_KEY)
+            .into_iter()
+            .chain(leader.table.last_executed())
+        {
+            if !last.contains(&c) {
+                last.push(c);
             }
-        };
+        }
         // Published in a first batch; the rest go out through the re-send,
         // oldest first, as votes come back. A new leader after a long
         // history used to put its whole selection on each follower's

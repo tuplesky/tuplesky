@@ -4876,6 +4876,53 @@ Against the old rule x is not selected.
 `a_below_source_commit_against_an_acceptance_of_other_dependencies_is_incompatible`:
 the alarm. Against the old rule the selection succeeds.
 
+### A refusal is an execution
+
+A local random-kill stress run with this PR's first three commits carried
+(d12-11) stopped n1 on `release-record-mismatch`. The store dumps give the
+cause:
+
+- A command refused at execution (an admission mismatch, a retry conflict,
+  a window refusal) took its position and wrote no `executed_v1` row; only
+  a bound outcome wrote one. Every voter's executed rows have gaps between
+  positions 691 and 708, n3's again between 2629 and 2651 and n1's at 1338
+  and 1347.
+- After a restart the table held those commands at COMMIT from their
+  dependency rows, not executed. The voter executed them a second time, at
+  new positions, and every position after them moved on that voter only.
+- n3, restarted and then elected, had one of them (`f7b90790`, with no
+  executed row on any voter) as the last recovered entry it had not
+  executed, so its chain started there alone. It re-proposed `3e056e8a`
+  after it; n1, which had not run the commands executed since, executed
+  `3e056e8a` at 1339, where n3 executed it at 2643. n1's collector then held
+  a release for `0d2091fa` that contradicted its record, and stopped.
+
+Two changes:
+
+- **A refusal writes its executed row**, with its position and result
+  digest and no revision, and still nothing under the retry key, so the
+  binding it refused stands. `Applier::apply_refusal` and the admission
+  refusal in `apply_bound` go through `materialize::apply_refused_plan`,
+  which adds that row to the refusal's batch. Checkpoint trims and exports
+  already read `executed_v1` as "this command executed", and now see the
+  refusals as well.
+- **The chain starts after every candidate tail**: the recovered order's
+  last command the leader has not executed, the committed tails and the
+  last command executed. Each is the tail when the table is right, and a
+  dependency on one already behind the tail orders nothing wrongly; any
+  one alone has now been wrong.
+
+`coord-storage/tests/apply.rs` `a_refused_command_is_recorded_as_executed`:
+two refusals, a window refusal and an admission mismatch, each leave an
+executed row with the outcome's position and digest and no retry record,
+and `read_protocol` gives the history back with them in execution order.
+Without `apply_refused_plan` the row is missing.
+`activation.rs` `a_command_that_comes_back_unexecuted_does_not_restart_the_chain`:
+r2 restarts with every executed identity but one, the selection carries
+that one at COMMIT, and r2's first fresh proposal still depends on the
+command it executed last. With the chain starting at the last unexecuted
+entry alone, it depends on the stale command only.
+
 ### What is left
 
 - No reporter holding the decision at all, every voter that had it having
