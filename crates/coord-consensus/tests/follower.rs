@@ -692,6 +692,7 @@ fn a_higher_promise_in_flight_fences_the_configured_ballot() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     assert!(matches!(effects.as_slice(), [Effect::Persist(_), ..]));
@@ -1138,6 +1139,7 @@ fn a_proposal_held_across_a_higher_promise_is_not_accepted_after_it() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     for event in durable_of(&promised, 3) {

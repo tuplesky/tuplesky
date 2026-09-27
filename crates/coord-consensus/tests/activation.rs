@@ -997,11 +997,15 @@ fn a_candidate_behind_every_reporters_window_does_not_win() {
         !matches!(cluster.nodes[2].role, Some(Role::Leader(_))),
         "a candidate {history} commands behind won"
     );
+    // Refused by r1 before it could select (task-d10): r1 executed a
+    // whole history more than a table ahead of it. Before task-d10 it got
+    // r1's promise and found itself `Behind` in its own selection.
     let rejections = cluster.nodes[2].follower_mut().take_rejections();
     assert!(
-        rejections
-            .iter()
-            .any(|r| matches!(r, FollowerRejection::Behind { .. })),
+        rejections.iter().any(|x| matches!(
+            x,
+            FollowerRejection::CampaignRefused { by, .. } if *by == r(1)
+        )),
         "{rejections:?}"
     );
     // It does not campaign again this boot.
@@ -1023,6 +1027,171 @@ fn a_candidate_behind_every_reporters_window_does_not_win() {
     for i in [0usize, 1] {
         assert_eq!(cluster.nodes[i].executed.last(), Some(&next), "node {i}");
     }
+}
+
+/// A candidate more than a table behind the voters it asks is refused,
+/// and one of them leads instead (task-d10).
+///
+/// rep-d-4, the reviewer's run 2 and the five-node Jepsen `n2` are one
+/// shape: a voter restarts far behind, its timer fires first, it wins, and
+/// it cannot serve -- a leader asks nobody for the payloads it lacks.
+/// Here r2 stops at 40 while r0 and r1 go on to 80 with a table of 32,
+/// then r0 dies and r2 campaigns first. r1 refuses and names its position;
+/// r2 abandons, and does not campaign again until it has executed that
+/// far. r1 leads above the refused ballot, which r2 promised itself, so r2
+/// follows it, catches up, and may campaign again.
+#[test]
+fn a_candidate_a_table_behind_is_refused_and_follows_the_voter_that_refused() {
+    let mut cluster = Cluster::new(47);
+    for n in 0..40u64 {
+        cluster.admit(n + 1, 1);
+        cluster.settle();
+    }
+    cluster.crash(2);
+    for n in 40..80u64 {
+        cluster.admit(n + 1, 1);
+        cluster.settle();
+    }
+    assert_eq!(cluster.nodes[1].executed.len(), 80);
+    cluster.revive(2, quorum(ballot(0, 0)));
+    assert_eq!(cluster.nodes[2].executed.len(), 40);
+    cluster.crash(0);
+
+    let refused = ballot(1, 2);
+    cluster.campaign(2, refused);
+    cluster.settle();
+    assert!(!matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    let at = ExecutionPosition::new(80).unwrap();
+    let r2 = cluster.nodes[2].follower_mut().take_rejections();
+    assert!(
+        r2.contains(&FollowerRejection::CampaignRefused {
+            by: r(1),
+            executed: at,
+        }),
+        "r2 is told r1's position: {r2:?}"
+    );
+    let r1 = cluster.nodes[1].follower_mut().take_rejections();
+    assert!(
+        r1.contains(&FollowerRejection::Promise(
+            coord_consensus::PromiseRejection::CandidateBehind {
+                candidate: ExecutionPosition::new(40).unwrap(),
+                own: at,
+            }
+        )),
+        "{r1:?}"
+    );
+    assert_eq!(
+        cluster.nodes[1].follower().ballots().promised(),
+        ballot(0, 0),
+        "r1 never promised the refused ballot"
+    );
+    assert_eq!(
+        cluster.nodes[1].follower().ballots().outranked(),
+        Some(refused)
+    );
+
+    // r2 does not campaign again while it is behind r1's position.
+    cluster.campaign(2, ballot(2, 2));
+    assert_eq!(cluster.nodes[2].follower().ballots().promised(), refused);
+    let r2 = cluster.nodes[2].follower_mut().take_rejections();
+    assert!(
+        r2.iter().any(|r| matches!(
+            r,
+            FollowerRejection::BehindVoters { needed, .. } if *needed == at
+        )),
+        "{r2:?}"
+    );
+
+    // r1 leads above the refused ballot, which r2 promised itself, so r2
+    // promises it and follows. What r2 lacks was retired by the voters
+    // that could send it, so a checkpoint brings it up (task-d08), not a
+    // payload; its asks are left out of the harness, and r0 comes back
+    // for a quorum that can accept what r1 proposes next.
+    cluster.no_fetch.push(2);
+    cluster.revive(0, quorum(ballot(0, 0)));
+    cluster.campaign(1, ballot(2, 1));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(2, 1),
+        "r2 follows the voter that refused it"
+    );
+    let next = cluster.admit(1000, 1);
+    cluster.settle();
+    for i in [0usize, 1] {
+        assert_eq!(cluster.nodes[i].executed.last(), Some(&next), "node {i}");
+    }
+}
+
+/// A replica refused at a position campaigns again once it has executed
+/// that far, and not before (task-d10).
+///
+/// A refusal is injected here, naming a position five commands ahead of
+/// r2 that r2 can reach by following, which a refusal by the table rule
+/// never names (what that voter lacks is past every peer's table).
+#[test]
+fn a_refused_replica_campaigns_again_once_it_executed_as_far_as_the_refuser() {
+    let mut cluster = Cluster::new(53);
+    for n in 0..10u64 {
+        cluster.admit(n + 1, 1);
+        cluster.settle();
+    }
+    // r2 misses five commands, then campaigns, and r1 refuses it at 15.
+    cluster.crash(2);
+    for n in 10..15u64 {
+        cluster.admit(n + 1, 1);
+        cluster.settle();
+    }
+    cluster.revive(2, quorum(ballot(0, 0)));
+    let mine = ballot(1, 2);
+    cluster.campaign(2, mine);
+    let at = ExecutionPosition::new(15).unwrap();
+    let refusal = ProtocolMessage::PromiseRefused {
+        ballot: mine,
+        replica: r(1),
+        executed: at,
+    };
+    let effects = cluster.nodes[2].step(peer_event(r(1), refusal));
+    cluster.handle(2, effects);
+    assert!(
+        cluster.nodes[2].follower().campaign_state().is_none(),
+        "abandoned on the refusal"
+    );
+    let r2 = cluster.nodes[2].follower_mut().take_rejections();
+    assert!(
+        r2.contains(&FollowerRejection::CampaignRefused {
+            by: r(1),
+            executed: at,
+        }),
+        "{r2:?}"
+    );
+    // The promises r0 and r1 send now reach no campaign.
+    cluster.settle();
+    assert!(!matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    // Behind 15, it does not campaign.
+    cluster.campaign(2, ballot(2, 2));
+    assert_eq!(cluster.nodes[2].follower().ballots().promised(), mine);
+    let r2 = cluster.nodes[2].follower_mut().take_rejections();
+    assert!(
+        r2.iter().any(|x| matches!(
+            x,
+            FollowerRejection::BehindVoters { needed, .. } if *needed == at
+        )),
+        "{r2:?}"
+    );
+    // r1 leads above r2's ballot; r2 follows and catches up past 15.
+    cluster.campaign(1, ballot(3, 1));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    let next = cluster.admit(1000, 1);
+    cluster.settle();
+    assert_eq!(cluster.nodes[2].executed.last(), Some(&next));
+    assert!(cluster.nodes[2].executed.len() > 15);
+    // Now it campaigns, and wins.
+    cluster.campaign(2, ballot(4, 2));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
 }
 
 /// A leader keeps the highest of the Syncs ahead of it, and only from
@@ -1509,7 +1678,13 @@ fn a_synchronized_ballot_is_durable_before_anything_of_the_new_one() {
     });
     f.step(boot_event(2));
     // Promise the new ballot and make that row durable.
-    let promise = f.step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     for event in durable_events(&promise) {
         f.step(event);
     }
@@ -1654,7 +1829,13 @@ fn a_receiving_follower_that_crashes_on_the_marker_still_holds_the_selection() {
     let c1 = c.admit(1, 1);
     let new = ballot(1, 2);
     let f = c.nodes[1].follower_mut();
-    let promise = f.step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     for event in durable_events(&promise) {
         f.step(event);
     }
@@ -1724,7 +1905,13 @@ fn a_sync_installs_the_selected_per_key_evidence_not_only_the_combined_digest() 
     );
     let new = ballot(1, 2);
     let f = c.nodes[1].follower_mut();
-    let promise = f.step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     for event in durable_events(&promise) {
         f.step(event);
     }
@@ -1867,7 +2054,13 @@ fn a_report_after_a_sync_never_omits_a_selected_command_it_still_owes() {
     let mut c = Cluster::new(3);
     let new = ballot(1, 2);
     let f = c.nodes[1].follower_mut();
-    let promise = f.step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     for event in durable_events(&promise) {
         f.step(event);
     }
@@ -1903,7 +2096,10 @@ fn a_report_after_a_sync_never_omits_a_selected_command_it_still_owes() {
     let later = ballot(2, 0);
     let _ = f.step(peer_event(
         r(0),
-        ProtocolMessage::NewLeader { ballot: later },
+        ProtocolMessage::NewLeader {
+            ballot: later,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
     ));
     let report = f.report(later);
     assert_eq!(
@@ -2117,8 +2313,13 @@ fn a_sync_leaves_no_acceptance_of_an_earlier_ballot() {
 
     // Ballot 1 is r0's again, so r1 is in its fast set ({r0, r1}).
     let b1 = ballot(1, 0);
-    let effects =
-        cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::NewLeader { ballot: b1 }));
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     cluster.handle(1, effects);
     let decision = SyncDecision {
         ballot: b1,
@@ -2207,8 +2408,13 @@ fn a_sync_demotes_no_acceptance_of_its_own_ballot() {
     assert_eq!(phase(&cluster), Phase::Accept);
 
     let b1 = ballot(1, 2);
-    let effects =
-        cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: b1 }));
+    let effects = cluster.nodes[1].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     cluster.handle(1, effects);
     let decision = SyncDecision {
         ballot: b1,
@@ -2281,7 +2487,13 @@ fn a_fresh_proposal_follows_the_tail_not_an_executed_reproposal() {
         reproposed: core::iter::once(old).collect(),
     };
     // Promised, as a winning candidate is.
-    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let effects = c.nodes[2].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     c.handle(2, effects);
     let (leader, effects) = Leader::from_recovered(
         c.nodes[2].role.take().map(role_into_recovered).unwrap(),
@@ -2322,7 +2534,13 @@ fn a_reproposal_with_no_entry_to_follow_follows_the_executed_tail() {
         entries: BTreeMap::new(),
         reproposed: core::iter::once(undecided).collect(),
     };
-    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let effects = c.nodes[2].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     c.handle(2, effects);
     let (leader, _) = Leader::from_recovered(
         c.nodes[2].role.take().map(role_into_recovered).unwrap(),
@@ -2384,7 +2602,13 @@ fn a_restarted_candidate_with_no_entries_chains_after_what_it_executed() {
         entries: BTreeMap::new(),
         reproposed: core::iter::once(cmds[1]).collect(),
     };
-    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let effects = c.nodes[2].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     c.handle(2, effects);
     let (leader, effects) = Leader::from_recovered(
         c.nodes[2].role.take().map(role_into_recovered).unwrap(),
@@ -2443,7 +2667,13 @@ fn a_new_leader_chains_after_what_it_committed_and_has_not_executed() {
             entries: BTreeMap::new(),
             reproposed: reproposed.iter().map(|&i| cmds[i]).collect(),
         };
-        let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+        let effects = c.nodes[2].step(peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: new,
+                executed: coord_types::ids::ExecutionPosition::ZERO,
+            },
+        ));
         c.handle(2, effects);
         let (leader, effects) = Leader::from_recovered(
             c.nodes[2].role.take().map(role_into_recovered).unwrap(),
@@ -2526,7 +2756,13 @@ fn a_command_that_comes_back_unexecuted_does_not_restart_the_chain() {
         )]),
         reproposed: BTreeSet::new(),
     };
-    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let effects = c.nodes[2].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     c.handle(2, effects);
     let (leader, effects) = Leader::from_recovered(
         c.nodes[2].role.take().map(role_into_recovered).unwrap(),
@@ -2605,7 +2841,13 @@ fn a_commit_below_the_source_ballot_is_selected_with_its_dependencies() {
     assert!(!decision.reproposed.contains(&x));
     // r2 wins with that selection and proposes x with its decided
     // dependencies.
-    let effects = c.nodes[2].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: new }));
+    let effects = c.nodes[2].step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
     c.handle(2, effects);
     let (leader, _) = Leader::from_recovered(
         c.nodes[2].role.take().map(role_into_recovered).unwrap(),

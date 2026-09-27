@@ -157,6 +157,23 @@ impl Machine {
         }
     }
 
+    /// What this replica executed through.
+    pub const fn executed_through(&self) -> coord_types::ids::ExecutionPosition {
+        match self {
+            Machine::Leader(m) => m.executed_through(),
+            Machine::Follower(m) => m.executed_through(),
+        }
+    }
+
+    /// The highest ballot this replica refused to a candidate as behind
+    /// (task-d10), which its own next campaign has to go above.
+    pub fn outranked(&self) -> Option<Ballot> {
+        match self {
+            Machine::Leader(m) => m.ballots().outranked(),
+            Machine::Follower(m) => m.ballots().outranked(),
+        }
+    }
+
     /// The highest ballot this replica has promised, counting a promise
     /// whose row is not durable yet (task-d01).
     ///

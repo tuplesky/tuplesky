@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use coord_types::CommandId;
 use coord_types::error::DecodeError;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ReplicaId};
+use coord_types::ids::{Ballot, ExecutionPosition, ReplicaId};
 use serde::{Deserialize, Serialize};
 
 use crate::recovery::SyncDecision;
@@ -78,6 +78,9 @@ pub enum ProtocolMessage {
     NewLeader {
         /// Ballot; its leader is the sender.
         ballot: Ballot,
+        /// What the candidate executed through (task-d10): a voter more
+        /// than a table ahead of it refuses to promise.
+        executed: ExecutionPosition,
     },
     /// A voter's promise (`MNewLeaderAckN` header): it will vote in no
     /// ballot below `ballot`, and its state is that of `synced`. The
@@ -184,6 +187,19 @@ pub enum ProtocolMessage {
         /// Commands; at most [`MAX_PROPOSAL_ASK`] are answered.
         commands: Vec<CommandId>,
     },
+    /// A voter's refusal to promise `ballot` to a candidate more than a
+    /// table behind it (task-d10). The candidate abandons the campaign
+    /// and does not campaign again until it has executed past
+    /// `executed`; the refuser never promised, so for it the ballot is
+    /// leaderless.
+    PromiseRefused {
+        /// The refused ballot.
+        ballot: Ballot,
+        /// The refusing replica.
+        replica: ReplicaId,
+        /// What the refusing replica executed through.
+        executed: ExecutionPosition,
+    },
 }
 
 impl ProtocolMessage {
@@ -214,6 +230,7 @@ impl ProtocolMessage {
             | ProtocolMessage::Sealed { .. }
             | ProtocolMessage::Committed { .. }
             | ProtocolMessage::ProposalRequest { .. }
+            | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }
