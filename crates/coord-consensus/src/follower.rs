@@ -747,7 +747,8 @@ impl Follower {
             return Vec::new();
         };
         if campaign.decision().is_none() {
-            match campaign.try_select() {
+            let table = &self.table;
+            match campaign.try_select(|c| table.phase_of(c).is_some()) {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
