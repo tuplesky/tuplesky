@@ -985,6 +985,16 @@ can follow it.
   failed with `bind: Timeout`, while `n1` was refusing proposals as
   `Backpressure`. No campaign was refused, and no voter logged a stop
   or `HalfInitialized`.
+* **Three more runs on the same code**, all `:valid? true` with every
+  node serving its final reads, and no stop or `HalfInitialized`:
+  [run 36351274409](https://github.com/tuplesky/tuplesky/actions/runs/36351274409)
+  (2659 `ok` of 3415),
+  [run 36352117264](https://github.com/tuplesky/tuplesky/actions/runs/36352117264)
+  (1205 of 1520) and
+  [run 36352747743](https://github.com/tuplesky/tuplesky/actions/runs/36352747743)
+  (1036 of 1594). The last served nothing from about 120 s to 330 s,
+  because the nemesis killed all five nodes at 91 s and started them
+  again only at 281 s.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
