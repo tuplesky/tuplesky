@@ -332,6 +332,9 @@ struct Cluster {
     progress: Vec<(u8, Progress)>,
     rejected: Vec<(u8, EvidenceError)>,
     releases: Vec<Release>,
+    /// Releases lost on the way, from which voter, in the order the
+    /// voters published them: a test may deliver them late.
+    lost: Vec<(usize, Frame)>,
     /// Frames that reached the collector, per voter, by kind.
     counted: Vec<(u8, u16)>,
     /// How many frames each voter parked since the count was last
@@ -359,6 +362,7 @@ impl Cluster {
             progress: Vec::new(),
             rejected: Vec::new(),
             releases: Vec::new(),
+            lost: Vec::new(),
             counted: Vec::new(),
             published: vec![0; 3],
             down: None,
@@ -441,6 +445,7 @@ impl Cluster {
                 .on_evidence(prov, decode_evidence(f).expect("evidence")),
             KIND_RELEASE => {
                 if self.lose == Lose::Releases {
+                    self.lost.push((from, f.clone()));
                     return;
                 }
                 self.collector
@@ -942,6 +947,84 @@ fn a_record_the_release_contradicts_stops_the_turn() {
     };
     assert!(matches!(deliveries[..], [Progress::Released(_)]));
     assert!(!w.collector.is_pending(&command));
+}
+
+/// A release that arrives after the command was answered from this node's
+/// record, and says something else, is refused by name (task-d12).
+///
+/// The votes arrived and the release did not, so the collector answered
+/// the caller from this node's own record. When this node executed the
+/// command where the leader did, the late release agrees and settles
+/// nothing further. When it did not -- here, a record with another response,
+/// and then one with the same response under another result digest --
+/// the caller was told something the domain did not decide, and the
+/// release is refused with the command named so the node can stop on it.
+#[test]
+fn a_late_release_that_contradicts_the_answer_is_refused() {
+    let digest_of = |w: &Cluster| {
+        let (_, f) = w.lost.last().expect("the release was lost");
+        decode_release(f)
+            .expect("release")
+            .established()
+            .result_digest()
+    };
+    for fork in [0, 1, 2] {
+        let mut w = Cluster::new(256);
+        w.lose = Lose::Releases;
+        let submit = w.submit(1);
+        let command = w.command(1);
+        for i in 0..3 {
+            w.deliver_submission(i, &submit);
+        }
+        w.settle();
+        assert_eq!(w.executed(), [1, 1, 1]);
+        assert!(!w.lost.is_empty(), "the leader released and it was lost");
+        let half = w.collector.half_established();
+        assert_eq!(half, vec![(command, retry_key(1))]);
+        let mut record = records_for(w.voters[0].node().applier(), half)
+            .pop()
+            .expect("a record")
+            .1;
+        assert_eq!(record.result_digest, digest_of(&w));
+        match fork {
+            1 => record.response.push(0xff),
+            2 => record.result_digest.0[0] ^= 1,
+            _ => {}
+        }
+        let progress = w
+            .collector
+            .settle_from_record(
+                command,
+                record.result_digest,
+                record.revision,
+                &record.response,
+            )
+            .expect("settled from the votes and the record");
+        assert!(matches!(progress, Progress::Released(_)), "{progress:?}");
+
+        w.lose = Lose::Nothing;
+        let late: Vec<(usize, Frame)> = std::mem::take(&mut w.lost);
+        let answers: Vec<_> = late
+            .iter()
+            .map(|(from, f)| {
+                let prov = w.voters[*from].provenance();
+                w.collector
+                    .on_release(prov, decode_release(f).expect("release"))
+            })
+            .collect();
+        match fork {
+            0 => assert!(
+                answers.iter().all(|a| *a == Ok(Progress::Settled)),
+                "{answers:?}"
+            ),
+            _ => assert!(
+                answers
+                    .iter()
+                    .all(|a| *a == Err(EvidenceError::AnsweredOtherwise { command })),
+                "fork {fork}: {answers:?}"
+            ),
+        }
+    }
 }
 
 /// A follower that campaigns while the leader is away leads the next
