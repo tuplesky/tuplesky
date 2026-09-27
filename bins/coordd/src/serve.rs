@@ -2091,18 +2091,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 .as_ref()
                 .map_or((0, 1), |p| (p.reachable(), p.peers.len() + 1));
             let machine = voter.node().machine();
-            let led = crate::election::has_leader(
+            let promised = machine.promised();
+            let linked = self.plane.as_ref().is_some_and(|p| {
+                p.peers
+                    .iter()
+                    .any(|peer| peer.replica == promised.leader && p.holds(peer))
+            });
+            let led = election.led(
                 voter.leads(),
                 me,
-                machine.promised(),
+                promised,
                 machine.active(),
-                |leader| {
-                    self.plane.as_ref().is_some_and(|p| {
-                        p.peers
-                            .iter()
-                            .any(|peer| peer.replica == leader && p.holds(peer))
-                    })
-                },
+                linked,
+                std::time::Instant::now(),
             );
             let majority = (held + 1) * 2 > voters;
             let campaigning = voter.node().machine().campaigning();

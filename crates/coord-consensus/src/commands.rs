@@ -413,6 +413,21 @@ impl CommandTable {
         }
     }
 
+    /// Take back an acceptance of an earlier ballot that a Sync did not
+    /// carry: the record returns to PRE-ACCEPT, keeping its payload and
+    /// dependencies, which at PRE-ACCEPT decide nothing and which adoption
+    /// replaces (task-d11). Only an ACCEPT is demoted; a commit is a
+    /// decision and stays. Returns whether the record was demoted.
+    pub fn demote(&mut self, command: &CommandId) -> bool {
+        match self.records.get_mut(command) {
+            Some(record) if record.payload.is_some() && record.phase == Phase::Accept => {
+                record.phase = Phase::PreAccept;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The path log of `key`, if any command touched it.
     pub fn log(&self, key: &[u8]) -> Option<&PathLog> {
         self.keys.get(key).map(|k| &k.log)

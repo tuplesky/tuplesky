@@ -573,8 +573,7 @@ fn stalled(seed: u64) -> (Cluster, Vec<CommandId>) {
 /// before the next one in the chain; that one was refused, and held every
 /// later one for ever. This is the five-node Jepsen stall, where
 /// backpressure refusals on the followers reached the thousands. The
-/// command whose turn has come, and which the leader committed, is now
-/// let into the full table.
+/// command whose turn has come is now let into the full table.
 #[test]
 fn a_follower_whose_table_filled_while_it_could_not_learn_catches_up() {
     let (mut cluster, commands) = stalled(7);
@@ -582,42 +581,53 @@ fn a_follower_whose_table_filled_while_it_could_not_learn_catches_up() {
     assert_eq!(cluster.nodes[3].executed, commands);
 }
 
-/// A follower behind the frontier asks first for the payloads of the
-/// commands the leader committed, in the leader's order.
+/// A follower that lacks many payloads asks first for the one whose turn
+/// has come.
 ///
-/// Its missing set is every later command, and the ask is bounded and
-/// rotates through it. The one whose turn has come was reached once per
-/// rotation, and nothing executes before it.
+/// r3 receives the leader's proposals of 32 commands and none of their
+/// payloads. Its missing set is every command, four times what one ask
+/// carries, and the ask is bounded and rotates through it in identity
+/// order, so the one whose turn it is was reached once per rotation, and
+/// nothing executes before it. The ask leads with
+/// the held proposals whose turn has come (or that the leader's frontier
+/// covers), lowest sequence number first.
 #[test]
 fn a_follower_asks_first_for_what_the_leader_committed_in_its_order() {
-    let (mut cluster, commands) = stalled(19);
-    // One round for the frontier to reach r3, so that its next ask knows
-    // what the leader committed.
-    cluster.tick();
-    cluster.settle();
-    let due: Vec<CommandId> = {
-        let Role::Follower(f) = &cluster.nodes[3].role else {
-            unreachable!()
-        };
-        let missing = f.missing_payloads();
-        commands
-            .iter()
-            .filter(|c| missing.contains(c) && f.held().contains_key(c))
-            .copied()
-            .collect()
-    };
-    assert!(due.len() > 8, "only {} missing", due.len());
-    cluster.asks.clear();
-    cluster.tick();
-    cluster.settle();
-    let (_, ask) = cluster
-        .asks
+    let capacity = 32;
+    let mut cluster = Cluster::new(19, capacity);
+    let commands: Vec<CommandId> = (1..=capacity as u64)
+        .map(|n| cluster.admit_to(n, &[0, 1, 2, 4], 9))
+        .collect();
+    // Only the leader's proposals reach r3, and nothing is settled, so it
+    // has asked for nothing yet.
+    let frames: Vec<(ReplicaId, Vec<u8>)> = cluster.nodes[3].inbox.drain(..).collect();
+    for (from, frame) in frames {
+        if from == r(0)
+            && matches!(
+                ProtocolMessage::decode(&frame),
+                Ok(ProtocolMessage::Proposal(_))
+            )
+        {
+            cluster.deliver(3, from, frame);
+        }
+    }
+    let f = cluster.nodes[3].follower_mut();
+    assert_eq!(f.missing_payloads().len(), commands.len());
+    let effects = f.request_payloads(r(0));
+    let ask = effects
         .iter()
-        .find(|(from, _)| *from == 3)
-        .cloned()
+        .find_map(|e| match e {
+            Effect::SendWhenDurable { frame, .. } => match ProtocolMessage::decode(frame) {
+                Ok(ProtocolMessage::PayloadRequest { commands }) => Some(commands),
+                _ => None,
+            },
+            _ => None,
+        })
         .expect("r3 asked");
-    assert_eq!(ask[..4], due[..4], "the ask led with other commands");
+    assert_eq!(ask[0], commands[0], "the ask led with other commands");
+    cluster.handle(3, effects);
     cluster.settle_ticking(commands.len());
+    assert_eq!(cluster.nodes[0].executed, commands);
     assert_eq!(cluster.nodes[3].executed, commands);
 }
 
@@ -750,6 +760,39 @@ fn a_follower_that_took_a_command_under_other_facts_before_its_proposal_rebinds(
     assert_eq!(cluster.admit_to(1, &[0, 1, 2, 4], 9), c);
     let all = and_then(&mut cluster, c);
     assert_rebound(&mut cluster, &all);
+}
+
+/// A domain whose followers' tables filled with later commands still
+/// executes: a command whose turn has come is admitted without waiting
+/// for the leader's frontier.
+///
+/// Three of the four followers receive the submissions of eight later
+/// commands before the command they all depend on, and their tables of
+/// eight fill. The first command reaches only the leader and r1. Its
+/// proposal cannot be placed in the three full tables, and its payload
+/// was admitted past capacity only once the leader had committed it --
+/// which it cannot do without their votes. Nothing ever executed, on any
+/// voter, with no fault active: the five-node Jepsen run's stop at 265 s.
+#[test]
+fn a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it() {
+    let capacity = 8;
+    let mut cluster = Cluster::new(53, capacity);
+    let later: Vec<CommandId> = (2..=(capacity as u64 + 1))
+        .map(|n| cluster.admit_to(n, &[2, 3, 4], 9))
+        .collect();
+    cluster.settle();
+    let head = cluster.admit_to(1, &[0, 1], 9);
+    cluster.settle_ticking(3);
+    // The collector re-offers the later commands to the rest.
+    for n in 2..=(capacity as u64 + 1) {
+        cluster.admit_to(n, &[0, 1], 9);
+    }
+    cluster.settle_ticking(capacity * 2);
+    let mut all = vec![head];
+    all.extend(later);
+    for i in 0..VOTERS as usize {
+        assert_eq!(cluster.nodes[i].executed, all, "node {i}");
+    }
 }
 
 /// The frontier commits only what the follower adopted from the leader.
