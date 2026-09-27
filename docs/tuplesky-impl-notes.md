@@ -4099,6 +4099,21 @@ executed until the next sweep. Forgotten commands' payloads now stay out.
   lower Sync arriving second replaced the higher one, which was then
   lost. This had been hidden: the new leader's re-proposals used to
   bring such a voter back as a side effect.
+- **A voter with a long history could not start again.** Recovery charged
+  every protocol row, payload and executed row to one `ViewBudget`, and
+  `coordd` passes the schema's (10,000 rows, 16 MiB) and treats a
+  recovery error as fatal. In the five-node Jepsen run the ballot-1
+  leader ended every restart on `protocol rows exceed the recovery
+  budget` (#98). Nothing in `coordd` trims protocol rows yet: its
+  housekeeping publishes local checkpoints (task-j04), which retire
+  journal prefixes, and the quorum floor that lets a trim remove the
+  dependency rows of an executed prefix (task-53) is not wired in. So a
+  voter holds one dependency row per command it saw, and any long run
+  crosses 10,000. That budget exists for the execution path, where an
+  overrun is a replicated result; recovery is not one. `read_protocol`
+  now reads every row the store holds, a page at a time within the
+  budget, as the executed identities already were. What it keeps is what
+  the machine keeps for the life of the process anyway.
 
 ### What the tests show
 
@@ -4143,6 +4158,14 @@ executed until the next sweep. Forgotten commands' payloads now stay out.
   written after it, names 8. Recovery returns 7 and 8 as executed, and a
   table restored as `coordd` restores one executes 9. Negative control:
   read through the dependency rows alone, 7 and 8 are unknown.
+- `trim.rs` `a_voter_with_more_protocol_rows_than_the_schema_budget_recovers`:
+  11,000 dependency rows recover under the schema budget, and pages of
+  seven rows read the same records. Negative control: the old read fails
+  it with the Jepsen run's error. `recovery.rs`
+  `recovery_reads_every_row_however_many_pages_it_takes` (was
+  `recovery_charges_every_row_against_one_byte_budget`, which pinned the
+  cap): 32 rows under a 1 KiB page read the same records and payloads as
+  one page.
 - The election test above also restores payloads the way `coordd` does,
   and a restarted follower holds no more payloads than records. Negative
   control: restoring every payload row fails it.
@@ -4152,7 +4175,8 @@ executed until the next sweep. Forgotten commands' payloads now stay out.
 ### What is left
 
 - The executed-identity set, and the `executed_v1` scan that restores
-  it, grow by one identity per command. A floor that lets them forget a
+  it, grow by one identity per command. So do the protocol rows, and
+  recovery's memory and time with them. A floor that lets them forget a
   prefix every voter executed needs task-53's checkpoint path wired into
   `coordd`, which it is not.
 - History is swept from `applied`, so a leader that stops executing keeps
