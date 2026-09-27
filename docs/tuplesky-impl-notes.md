@@ -4554,3 +4554,46 @@ Negative controls, each run and failing:
   checkpoint: task-d08.
 - **Acceptance on Jepsen.** The five-node Jepsen run is task-d09's
   acceptance and has not run with this change; it needs #98 to carry it.
+
+## A promise is not a leader
+
+task-d10's first commit, from the five-node Jepsen run on #98. After all
+five voters were killed, the one furthest behind campaigned for ballots 2
+to 6 and was promised each one. Its machine then found itself behind
+every reporter and stood down without a Sync (task-d05), so it never led.
+The two voters that promised it followed those ballots and did not
+campaign. The domain served nothing from then on.
+
+`coordd` counted a voter as led when the ballot it promised named another
+voter it held a link to (task-d01). A candidate collects its promises
+before it knows whether it can bind a selection, so a promise is not yet a
+leader, and one whose candidate stood down held every voter that promised
+it for as long as the link held.
+- **The rule.** A voter has a leader when it leads, or when the leader
+  its promised ballot names is linked *and* that ballot has synchronized
+  here: the ballot it votes in, the one whose Sync it adopted, is the one
+  it promised (`election::has_leader`).
+- **What it costs.** A live candidate's Sync follows the promise within a
+  round trip, and a follower counts as leaderless only for that long,
+  well inside the patience, so no campaign follows it. One whose Sync
+  does not come within the patience is campaigned over, with the usual
+  jitter and back-off.
+- **The candidate's side** is unchanged: its own campaign is its
+  `campaigning` flag, and a stood-down candidate does not campaign again
+  (task-d05).
+
+### What the tests show
+
+`bins/coordd/src/election.rs`:
+- `a_promise_that_never_synchronizes_is_no_leader`: the rule's cases.
+  Promised ballot 3 while still voting in ballot 2, with the candidate
+  linked, is leaderless; synchronized and linked is led.
+- `a_voter_whose_promise_does_not_synchronize_campaigns_after_its_patience`:
+  stepped through the schedule, a voter stuck on such a promise campaigns
+  after its patience, and one whose Sync arrives after 20 ms never does.
+
+### What is left
+
+- The five-node Jepsen run is the acceptance, and has not run with this.
+- The rest of task-d10: flow-controlled catch-up and a campaign that is
+  making progress kept past its ceiling.
