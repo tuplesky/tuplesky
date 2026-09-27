@@ -16,7 +16,7 @@ directory (`store/latest`) and writes what a reader looks for first:
     scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
 
 The Markdown goes to `$GITHUB_STEP_SUMMARY` when it is set, and to standard
-output otherwise. It reads only `jepsen.log`, `results.edn` and
+output either way (in a folded group on a runner). It reads only `jepsen.log`, `results.edn` and
 `n*/coordd.log`; a missing file leaves its section out. Exit status 0
 unless the store directory does not exist.
 """
@@ -334,6 +334,9 @@ def main() -> int:
     if target:
         with open(target, "a", encoding="utf-8") as f:
             f.write(text)
+        # The same digest in the job's log, folded, for whoever reads the
+        # log (or fetches it through the API) rather than the summary page.
+        sys.stdout.write(f"::group::{a.title}: summary\n{text}::endgroup::\n")
     else:
         sys.stdout.write(text)
     return 0
