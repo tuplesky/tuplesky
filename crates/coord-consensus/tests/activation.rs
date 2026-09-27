@@ -2318,6 +2318,18 @@ fn a_new_leader_chains_after_what_it_committed_and_has_not_executed() {
             quorum(new),
             &decision,
         );
+        // A committed command is not proposed again: with chained
+        // dependencies it would be decided twice, and a voter that adopted
+        // the second order would report it beside this leader's commit
+        // under one synchronized ballot, which fails every later selection
+        // as `IncompatibleAccepted`.
+        for &i in &reproposed {
+            assert!(
+                leader.proposal(&cmds[i]).is_none(),
+                "the committed {:?} was proposed again",
+                cmds[i]
+            );
+        }
         c.nodes[2].role = Some(Role::Leader(leader));
         c.handle(2, effects);
         let fresh = c.admit_at(7, 1, &[2]);
