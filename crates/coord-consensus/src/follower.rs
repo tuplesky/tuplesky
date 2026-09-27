@@ -292,6 +292,9 @@ pub struct Follower {
     /// The Sync whose synchronized-ballot row is in flight: the new ballot
     /// is activated only when that row is durable.
     sync_barrier: Option<(BarrierId, SyncDecision)>,
+    /// The acceptances of earlier ballots the in-flight Sync demotes, in
+    /// the batch of its synchronized-ballot row (task-d11).
+    sync_demoted: Vec<CommandId>,
     won: Option<SyncDecision>,
     /// Voting messages of the promised ballot that arrived before its Sync
     /// (delivery is not ordered across peers); replayed once synchronized.
@@ -398,6 +401,7 @@ impl Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             config,
             sync_barrier: None,
+            sync_demoted: Vec::new(),
             boot: None,
             alloc: None,
             outbox: None,
@@ -549,6 +553,7 @@ impl Follower {
             report_due: state.report_due,
             sync_pending: BTreeMap::new(),
             sync_barrier: None,
+            sync_demoted: Vec::new(),
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
@@ -933,7 +938,7 @@ impl Follower {
             // highest synchronized ballot as the authoritative source of
             // accepted state. Either both rows are durable or neither is,
             // and a restart resumes the installation from the row.
-            let updates = alloc::vec![
+            let mut updates = alloc::vec![
                 sync_update(
                     self.config.identity.epoch,
                     &SyncRecordV1 {
@@ -943,6 +948,42 @@ impl Follower {
                 .expect("bounded"),
                 promise_update(self.config.identity.epoch, &record).expect("bounded"),
             ];
+            // An acceptance of an earlier ballot that the selection does
+            // not carry is not this ballot's, and it goes down with the
+            // marker too (task-d11). A report is labelled with the
+            // synchronized ballot, so kept at ACCEPT it would read as the
+            // new ballot's acceptance: beside a voter that adopted the
+            // command again under the new ballot, with other dependencies,
+            // every later selection fails as `IncompatibleAccepted`, and
+            // without one, a selection installs dependencies no quorum of
+            // the new ballot agreed on. The selection re-proposes such a
+            // command, or omits it because a majority executed it; either
+            // way this replica's acceptance decides nothing more. Demoted
+            // to PRE-ACCEPT, it keeps its payload and dependencies, and
+            // adoption under the new ballot replaces them. In the same
+            // batch, so a restart cannot bring the acceptance back beside
+            // the new marker; only here, at the first installation, since
+            // an acceptance written after it is the new ballot's own.
+            let epoch = self.config.identity.epoch;
+            let demoted: Vec<(CommandId, CommandRecord)> = self
+                .table
+                .records()
+                .filter(|(c, r)| {
+                    r.payload.is_some()
+                        && r.phase == Phase::Accept
+                        && !decision.entries.contains_key(c)
+                })
+                .map(|(c, r)| {
+                    let mut r = r.clone();
+                    r.phase = Phase::PreAccept;
+                    (*c, r)
+                })
+                .collect();
+            for (command, demoted) in &demoted {
+                updates.push(dependency_update(epoch, command, demoted).expect("bounded"));
+                self.ledger.stage(barrier, *command, demoted.clone());
+            }
+            self.sync_demoted = demoted.into_iter().map(|(c, _)| c).collect();
             self.sync_barrier = Some((barrier, decision));
             return alloc::vec![Effect::Persist(PersistBatch {
                 barrier,
@@ -2305,7 +2346,14 @@ impl Follower {
         {
             let (_, decision) = self.sync_barrier.take().expect("checked");
             let mut out = match event {
-                StorageEvent::JournalDurable { .. } => {
+                StorageEvent::JournalDurable { journal_seq, .. } => {
+                    // The demotions are durable with the marker, whether or
+                    // not this ballot is still the one to activate: the
+                    // table follows its rows.
+                    self.ledger.durable(barrier, *journal_seq);
+                    for command in core::mem::take(&mut self.sync_demoted) {
+                        self.table.demote(&command);
+                    }
                     // Unless a higher ballot was promised while the row was
                     // becoming durable: that cut supersedes this one and its
                     // leader recovers from the rows.
@@ -2318,6 +2366,8 @@ impl Follower {
                     }
                 }
                 StorageEvent::Failed { .. } => {
+                    self.ledger.failed(barrier);
+                    self.sync_demoted.clear();
                     self.rejections
                         .push(FollowerRejection::SyncNotDurable(decision.ballot));
                     Vec::new()

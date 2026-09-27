@@ -34,7 +34,9 @@ pub struct DurableLedger {
     records: BTreeMap<CommandId, CommandRecord>,
     /// Journal sequence each durable record was written at.
     sequences: BTreeMap<CommandId, LocalJournalSeq>,
-    staged: BTreeMap<BarrierId, (CommandId, CommandRecord)>,
+    /// Records a batch in flight writes, by its barrier: usually one, and
+    /// several for a Sync that demotes what it leaves out (task-d11).
+    staged: BTreeMap<BarrierId, Vec<(CommandId, CommandRecord)>>,
 }
 
 impl DurableLedger {
@@ -57,8 +59,12 @@ impl DurableLedger {
     }
 
     /// A batch writing `record` for `command` was submitted under `barrier`.
+    /// A batch that writes several records stages each.
     pub fn stage(&mut self, barrier: BarrierId, command: CommandId, record: CommandRecord) {
-        self.staged.insert(barrier, (command, record));
+        self.staged
+            .entry(barrier)
+            .or_default()
+            .push((command, record));
     }
 
     /// The batch under `barrier` is durable at `journal_seq`: its record is
@@ -70,22 +76,27 @@ impl DurableLedger {
         barrier: BarrierId,
         journal_seq: LocalJournalSeq,
     ) -> Option<CommandId> {
-        let (command, record) = self.staged.remove(&barrier)?;
-        match self.sequences.get(&command) {
-            // Strictly older completions are ignored; distinct batches
-            // never share a journal sequence.
-            Some(seen) if *seen > journal_seq => {}
-            _ => {
-                self.sequences.insert(command, journal_seq);
-                self.records.insert(command, record);
+        let staged = self.staged.remove(&barrier)?;
+        let first = staged.first().map(|(c, _)| *c);
+        for (command, record) in staged {
+            match self.sequences.get(&command) {
+                // Strictly older completions are ignored; distinct batches
+                // never share a journal sequence.
+                Some(seen) if *seen > journal_seq => {}
+                _ => {
+                    self.sequences.insert(command, journal_seq);
+                    self.records.insert(command, record);
+                }
             }
         }
-        Some(command)
+        first
     }
 
     /// The batch under `barrier` failed: nothing became durable.
     pub fn failed(&mut self, barrier: BarrierId) -> Option<CommandId> {
-        self.staged.remove(&barrier).map(|(c, _)| c)
+        self.staged
+            .remove(&barrier)
+            .and_then(|s| s.first().map(|(c, _)| *c))
     }
 
     /// Durable record of a command.

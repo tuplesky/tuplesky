@@ -1947,3 +1947,78 @@ fn one_reporter_without_a_payload_does_not_stop_a_recoverable_campaign() {
         Err(coord_consensus::RecoveryError::HalfInitialized { .. })
     ));
 }
+
+/// A Sync leaves no acceptance of an earlier ballot that it does not carry
+/// (task-d11).
+///
+/// r1 adopts x under ballot 0 and is restarted, so its table holds x at
+/// ACCEPT from its rows. Ballot 1 is selected without r1's report and
+/// re-proposes x; its leader and another voter would adopt x again, with
+/// the dependencies ballot 1's leader orders it after. r1 then installs
+/// ballot 1's Sync, which does not carry x as an entry. A report is
+/// labelled with the synchronized ballot, so r1 used to report ballot 0's
+/// acceptance of x as ballot 1's: beside a ballot-1 report of x under
+/// other dependencies, every later selection failed as
+/// `IncompatibleAccepted` (the three-voter stress stalls), and without
+/// one, a selection installed dependencies no ballot-1 quorum agreed on.
+/// The acceptance is demoted to PRE-ACCEPT, durably with the marker, so a
+/// restart cannot bring it back.
+#[test]
+fn a_sync_leaves_no_acceptance_of_an_earlier_ballot() {
+    let mut cluster = Cluster::new(47);
+    let a = cluster.admit(1, 1);
+    let x = cluster.admit(2, 1);
+    cluster.no_execute = vec![1];
+    cluster.settle();
+    // Restarted: the in-memory commit is gone, the ACCEPT row is not.
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let before = cluster.nodes[1].follower().report(ballot(1, 2));
+    let entry = before.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!((entry.phase, entry.deps.clone()), (Phase::Accept, vec![a]));
+
+    let b1 = ballot(1, 2);
+    let effects =
+        cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::NewLeader { ballot: b1 }));
+    cluster.handle(1, effects);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::new(),
+        reproposed: [x].into_iter().collect(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
+
+    // What ballot 1's leader and another voter adopted for x: the order
+    // ballot 1's leader gave it, here none.
+    let q = quorum(ballot(2, 0));
+    let check = |cluster: &Cluster| {
+        let ours = cluster.nodes[1].follower().report(ballot(2, 0));
+        assert_eq!(ours.committed_ballot, b1);
+        let mut theirs = ours.clone();
+        theirs.replica = r(2);
+        for e in &mut theirs.entries {
+            if e.command == x {
+                e.phase = Phase::Accept;
+                e.deps = Vec::new();
+            }
+        }
+        let selected = coord_consensus::recovery::select(&q, &[ours.clone(), theirs])
+            .expect("the selection completes");
+        assert_eq!(selected.entries[&x].deps, Vec::<CommandId>::new());
+        let entry = ours.entries.iter().find(|e| e.command == x).unwrap();
+        assert_eq!(
+            entry.phase,
+            Phase::PreAccept,
+            "ballot 0's acceptance of x is reported as ballot 1's"
+        );
+    };
+    check(&cluster);
+    // Durable with the marker: a restart before the next report reports
+    // the same.
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    check(&cluster);
+}
