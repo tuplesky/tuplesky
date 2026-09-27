@@ -705,6 +705,7 @@ Locally, on the three-voter stress driver, the frontier adds a divergence.
 | `4ef1113` (#106 at `2c8efea`) | 6 | 1 (three voters) | none |
 | `82e222b` (#106 at `0d31e75`) | 6 | 2 | none |
 | `eaaa540` (#106 at `848be52`) | 6 | none | none |
+| `a793a81` (#106 at `b64acc1`) | 6 | none | none |
 
 Both stops came when a voter took up a new leader's release after an
 election:
@@ -876,6 +877,19 @@ away.
     `Campaign(HalfInitialized)`, naming `n5` (`executed=762` against
     2360 on the others, at `Backpressure` 16384) or `n2` (at
     `Backpressure` 4096). The promise fence does not touch that stall.
+
+`a793a81` carries #106 at `b64acc1`. With it, a campaign sets aside a
+report nobody can supply, and supplies what its own candidate executed.
+* **Local runs:** 12 replays and 6 random-kill runs. No stop, anomaly,
+  `IncompatibleAccepted` or `HalfInitialized`. Two random runs did not
+  serve the final read: in each, a restarted `n3` far behind the others
+  (403 against 1305, and 924 against 2567) won the ballot and could not
+  serve. That is the behind leader #104's next rule is to refuse.
+* **Jepsen**
+  ([run 36337898807](https://github.com/tuplesky/tuplesky/actions/runs/36337898807)):
+  `:valid? true`, with 1285 `ok` of 1683. `n2` to `n5` served their
+  final reads. `n1`, a follower still at `Backpressure`, did not. No
+  voter logged `HalfInitialized`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
