@@ -4676,3 +4676,189 @@ fn interrupted_campaigns_leave_the_candidates_memory_flat() {
     );
     assert_eq!(c.pages_held(), 0);
 }
+
+fn standalone(id: u8, capacity: usize) -> Follower {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(id),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity,
+    });
+    f.step(boot_event(id));
+    f
+}
+
+fn step_durably(f: &mut Follower, event: Event) {
+    let effects = f.step(event);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+}
+
+/// task-d24: a voter whose table is full for new admission installs a
+/// Sync whose entries it lacks, and executes them. A placeholder refused
+/// under backpressure dropped the entry silently, and its payload was
+/// refused the same way, so only catch-up could bring it in.
+#[test]
+fn a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut donor = standalone(2, capacity);
+    let xs: Vec<CommandId> = (0..3u64)
+        .map(|i| {
+            let (c, e) = admission(900 + i, 9);
+            step_durably(&mut donor, e);
+            c
+        })
+        .collect();
+    let mut f = standalone(1, capacity);
+    let filled: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_durably(&mut f, e);
+            c
+        })
+        .collect();
+    let (_, over) = admission(999, 1);
+    f.step(over);
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new admission stops short of the reserved share"
+    );
+    assert_eq!(f.table().len(), full);
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let entries = xs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut e = selected(*c, if i == 0 { &[] } else { &xs[i - 1..i] });
+            e.phase = Phase::Commit;
+            e.admission = donor.payload(c).map(|p| p.admission_digest());
+            (*c, e)
+        })
+        .collect();
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            // What this voter holds is re-proposed, so none of it is
+            // released and the table stays full while the entries come in.
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries,
+                reproposed: filled.iter().copied().collect(),
+            }),
+        ),
+    );
+    for x in &xs {
+        step_durably(
+            &mut f,
+            peer_event(
+                r(2),
+                ProtocolMessage::PayloadResponse {
+                    command: *x,
+                    payload: donor.payload(x).unwrap().clone(),
+                },
+            ),
+        );
+    }
+    let mut executed = Vec::new();
+    while let Some(c) = f.next_executable() {
+        let position = f.executed_through().checked_next().unwrap();
+        let outcome = AppliedOutcome {
+            position,
+            revision: None,
+            result_digest: Digest32(c.0.0),
+            response: c.0.0.to_vec(),
+        };
+        f.applied(c, &outcome).unwrap();
+        executed.push(c);
+    }
+    assert_eq!(executed, xs);
+    for c in &filled {
+        assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+    }
+}
+
+/// task-d24: the records a Sync neither selected nor re-proposed, that
+/// this voter's report for the ballot named, are released with the Sync's
+/// install batch, payloads included; a selected one and a re-proposed one
+/// stay; new work is admitted again. (A record the new leader proposes
+/// after its Sync, reaching this voter first, is
+/// `a_proposal_refused_ahead_of_the_promise_is_sent_again`.)
+#[test]
+fn records_decided_nowhere_are_released_by_the_next_sync() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut f = standalone(1, capacity);
+    let held: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_durably(&mut f, e);
+            c
+        })
+        .collect();
+    let (_, over) = admission(999, 1);
+    f.step(over);
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure)
+    );
+    // The promise, and the report it owes, naming every record held.
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let (sel, rep) = (held[3], held[7]);
+    let mut entry = selected(sel, &[]);
+    entry.admission = f.table().record(&sel).and_then(|r| r.payload);
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::from([(sel, entry)]),
+                reproposed: BTreeSet::from([rep]),
+            }),
+        ),
+    );
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        if *c == sel || *c == rep {
+            assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+        } else {
+            assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+            assert!(f.payload(c).is_none(), "{c:?}'s payload was kept");
+        }
+    }
+    assert!(f.ledger().record(&held[0]).is_none());
+    let (_, again) = admission(1000, 1);
+    step_durably(&mut f, again);
+    assert!(
+        !f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new work is admitted after the release"
+    );
+}

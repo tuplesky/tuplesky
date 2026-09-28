@@ -6256,3 +6256,88 @@ The report format is unchanged.
 - The protocol simulator's rows pass at the default seeds with the new
   timer.
 
+## Table room for recovery work
+
+task-d24, from the checklist review (item R4), taking up task-d08's
+residual on records decided nowhere (its requirement 7). Work that
+finishes or recovers admitted commands could be refused by a full table.
+- A Sync entry's placeholder was dropped silently under backpressure, and
+  the payload that followed went through the bounded path, so only
+  catch-up could bring the entry in.
+- A record no Sync selected and no history named kept its slot until the
+  command was decided somewhere. With one voter gone for good, that could
+  be never.
+
+### What changed
+
+- **A reserved share.** A bounded table admits new work only up to its
+  capacity less one part in `RECOVERY_RESERVE_PARTS` (8). Sync entries
+  and pulled commands enter a full table: a Sync's placeholders through
+  `expect_beyond_capacity`, and its payloads as a command whose turn has
+  come does.
+- **Release of records decided nowhere.** In the Sync's own install
+  batch, as task-d11 puts its demotions there, some undecided records are
+  released:
+  - which: those this voter's report for the ballot named, that the
+    Sync neither selected nor re-proposed, and that no selected entry
+    depends on;
+  - their dependency rows and payload rows are deleted;
+  - the table releases them and repairs the key index once the batch is
+    durable. A key whose latest command was released takes that
+    command's own dependencies (`CommandTable::release`);
+  - the ledger removes them only when the batch is durable
+    (`DurableLedger::stage_removal`), so a report never loses a durable
+    record early.
+- **The argument.** The Sync is selected from a majority's reports, and
+  selection keeps every command a quorum of an earlier ballot could have
+  decided (at five voters only with task-d19). So a command it leaves out
+  was not decided below its ballot. A later decision reaches this voter
+  as any command does, through the leader or catch-up, and no voter
+  outside the majority is waited for. This rests on selection being
+  complete: the open task-d19 review item, the leader's own acceptance
+  row, is a gap in that premise and has to close with it.
+
+### Two departures from the task text, and why
+
+- **Only what the report named.** The task releases every record present
+  at installation. The protocol simulator's neighbour test
+  `a_proposal_refused_ahead_of_the_promise_is_sent_again` shows why not:
+  1. The new leader proposes c2 after binding its Sync.
+  2. c2's payload reaches a voter before that voter has even promised,
+     so c2 is in its table and in its late report.
+  3. The selection, bound without that report, does not name c2.
+
+  Admission is fenced once a voter promises, so the records its report
+  named for the ballot are the ones the selection could have spoken for.
+  That is the rule used.
+- **The payload goes too.** Kept beside no record, a later proposal of
+  the command found the payload present, never asked for it and never
+  bound it again, so the voter stalled on it. With the row deleted, the
+  voter is as if it never held the command, and the proposal fetches the
+  payload as any missing one, before and after a restart.
+
+### Evidence
+
+- `a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them`
+  (`activation`):
+  - New admission stops at `capacity - capacity / 8` with `Backpressure`.
+  - A Sync re-proposes everything held and selects three commands the
+    voter lacks, at COMMIT.
+  - Their payloads arrive, the entries are installed in the full table,
+    and all three execute.
+  - It fails without the beyond-capacity placeholder and payload path.
+- `records_decided_nowhere_are_released_by_the_next_sync` (`activation`):
+  - A table full of records admitted nowhere else, then promised and
+    reported.
+  - The Sync selects one record and re-proposes another. The rest leave
+    the table and the ledger, payloads included, and the two stay.
+  - New work is admitted again without `Backpressure`.
+  - It fails without the release.
+- `releasing_the_latest_command_hands_the_key_back_to_its_predecessor`
+  (`graph`): the next command on the key depends on the released one's
+  predecessor, and a committed record is not released.
+- Existing tests that filled a table to its capacity by admission fill it
+  to the admission limit instead (`follower.rs`, `frontier.rs`), and
+  the two payload-transfer tests of `recovery.rs` use a 32-slot table
+  so that twice the transfer bound still fits under it.
+

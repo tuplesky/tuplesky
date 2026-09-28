@@ -124,6 +124,12 @@ struct KeyState {
     log: PathLog,
 }
 
+/// A bounded table admits new work up to its capacity less one part in
+/// this many (task-d24). The rest is kept for the work that finishes or
+/// recovers admitted commands: a Sync's entries and the commands catch-up
+/// pulls, which enter a full table.
+pub const RECOVERY_RESERVE_PARTS: usize = 8;
+
 /// The command table of one replica in one domain.
 #[derive(Clone, Debug, Default)]
 pub struct CommandTable {
@@ -258,8 +264,75 @@ impl CommandTable {
         self.records.iter().filter(|(_, r)| r.payload.is_some())
     }
 
+    /// Whether new admission has no room left: a bounded table admits new
+    /// work only up to its capacity less the share reserved for recovery
+    /// and catch-up ([`RECOVERY_RESERVE_PARTS`], task-d24).
     fn full(&self) -> bool {
-        self.capacity.is_some_and(|c| self.records.len() >= c)
+        self.capacity
+            .is_some_and(|c| self.records.len() >= c - c / RECOVERY_RESERVE_PARTS)
+    }
+
+    /// A placeholder for a command a Sync selected, let into a full table
+    /// as a pulled command is (task-d24): recovery work is what makes room
+    /// again, and a placeholder refused under backpressure dropped the
+    /// entry silently, so only catch-up could bring it in.
+    pub fn expect_beyond_capacity(&mut self, command: CommandId) {
+        self.records
+            .entry(command)
+            .or_insert_with(|| CommandRecord {
+                phase: Phase::Start,
+                deps: Vec::new(),
+                keys: Vec::new(),
+                payload: None,
+                paths: Vec::new(),
+                synced_seq: None,
+                path: crate::graph::empty_path(),
+            });
+    }
+
+    /// The commands this table holds undecided: in START, PRE-ACCEPT or
+    /// ACCEPT, placeholders included.
+    pub fn undecided(&self) -> impl Iterator<Item = &CommandId> {
+        self.records
+            .iter()
+            .filter(|(_, r)| r.phase < Phase::Commit)
+            .map(|(c, _)| c)
+    }
+
+    /// Release an undecided record from the table (task-d24), repairing
+    /// the conflict index: a key whose latest command it was takes the
+    /// released command's own dependencies in its place, those still
+    /// known here, so the next command on the key still follows what the
+    /// released one followed. A decided record is never released.
+    pub fn release(&mut self, command: &CommandId) -> bool {
+        match self.records.get(command) {
+            Some(r) if r.phase < Phase::Commit => {}
+            _ => return false,
+        }
+        let record = self.records.remove(command).expect("checked");
+        for key in &record.keys {
+            let Some(state) = self.keys.get_mut(key) else {
+                continue;
+            };
+            let tails: Vec<CommandId> =
+                state.last.into_iter().chain(state.also.drain(..)).collect();
+            let mut repaired: Vec<CommandId> = Vec::new();
+            for tail in tails {
+                if tail == *command {
+                    for dep in &record.deps {
+                        let known = self.records.contains_key(dep) || self.history.contains(dep);
+                        if known && !repaired.contains(dep) {
+                            repaired.push(*dep);
+                        }
+                    }
+                } else if !repaired.contains(&tail) {
+                    repaired.push(tail);
+                }
+            }
+            state.last = repaired.first().copied();
+            state.also = repaired.into_iter().skip(1).collect();
+        }
+        true
     }
 
     /// Retire every executed record, and say how many went.

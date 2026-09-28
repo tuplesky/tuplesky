@@ -988,7 +988,10 @@ fn a_seal_stops_the_follower_voting_live_and_after_a_restart() {
 /// asked for refused as unauthorized for the rest of the run.
 #[test]
 fn a_full_table_still_adopts_and_still_keeps_the_order_it_was_sent() {
+    // Full for new admission: the capacity less the share kept for
+    // recovery and catch-up (task-d24).
     let capacity = config(1).capacity;
+    let capacity = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
     let mut f = booted(1);
 
     // The leader's view, so the proposals carry real path evidence.

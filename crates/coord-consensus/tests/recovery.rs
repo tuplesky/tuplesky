@@ -78,25 +78,33 @@ fn boot_event() -> Event {
 }
 
 fn follower(me: u8) -> Follower {
+    follower_with(me, 16)
+}
+
+fn follower_with(me: u8, capacity: usize) -> Follower {
     let mut f = Follower::new(FollowerConfig {
         identity: identity(me),
         quorum: quorum(),
         genesis: ballot(0, 0),
         frontend: FRONTEND,
-        capacity: 16,
+        capacity,
     });
     f.step(boot_event());
     f
 }
 
 fn leader() -> Leader {
+    leader_with(16)
+}
+
+fn leader_with(capacity: usize) -> Leader {
     let mut l = Leader::new(
         LeaderConfig {
             identity: identity(0),
             quorum: quorum(),
             genesis: ballot(0, 0),
             frontend: FRONTEND,
-            capacity: 16,
+            capacity,
         },
         None,
         ExecutionPosition::ZERO,
@@ -668,8 +676,10 @@ fn payload_rows(storage: &StorageModel) -> Vec<(CommandId, coord_consensus::Payl
 #[test]
 fn payload_transfer_is_bounded_in_both_directions_and_still_covers_everything() {
     let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
-    let mut l = leader();
-    let mut f = follower(2);
+    // Room for twice the bound within new admission, which stops short
+    // of the capacity by the recovery reserve (task-d24).
+    let mut l = leader_with(32);
+    let mut f = follower_with(2, 32);
     // More than the bound and inside the leader's own table capacity, so
     // every one of them really is proposed.
     let wanted = bound * 2;
@@ -755,8 +765,10 @@ fn payload_transfer_is_bounded_in_both_directions_and_still_covers_everything() 
 #[test]
 fn a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask() {
     let bound = coord_consensus::MAX_PAYLOAD_TRANSFER;
-    let mut l = leader();
-    let mut f = follower(2);
+    // Room for twice the bound within new admission, which stops short
+    // of the capacity by the recovery reserve (task-d24).
+    let mut l = leader_with(32);
+    let mut f = follower_with(2, 32);
     let wanted = bound * 2;
     for seq in 1..=wanted as u64 {
         let (event, _) = admitted(seq, 1);

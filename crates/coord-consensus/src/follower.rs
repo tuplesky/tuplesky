@@ -362,6 +362,9 @@ pub struct Follower {
     /// The pages of the last report sent a candidate, which a lost page
     /// is answered from (task-d28).
     served_report: Option<crate::summary::ServedReport>,
+    /// The ballot this replica last reported for and the commands its
+    /// report named (task-d24).
+    report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
     sync_pending: BTreeMap<CommandId, SyncEntry>,
     /// The admission digest the synchronized selection named for each of
     /// its entries (task-d14). Kept past installation: a payload that
@@ -382,6 +385,9 @@ pub struct Follower {
     /// The acceptances of earlier ballots the in-flight Sync demotes, in
     /// the batch of its synchronized-ballot row (task-d11).
     sync_demoted: Vec<CommandId>,
+    /// The undecided records the marker in flight releases (task-d24):
+    /// released from the table once that batch is durable.
+    sync_released: Vec<CommandId>,
     won: Option<SyncDecision>,
     /// Voting messages of the promised ballot that arrived before its Sync
     /// (delivery is not ordered across peers); replayed once synchronized.
@@ -513,6 +519,7 @@ impl Follower {
             config,
             sync_barrier: None,
             sync_demoted: Vec::new(),
+            sync_released: Vec::new(),
             boot: None,
             alloc: None,
             outbox: None,
@@ -543,6 +550,7 @@ impl Follower {
             behind_voters: None,
             report_due: None,
             served_report: None,
+            report_cut: None,
             sync_pending: BTreeMap::new(),
             named_facts: BTreeMap::new(),
             halted: None,
@@ -577,7 +585,7 @@ impl Follower {
         self.named_facts = named_facts(&decision);
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
-                let _ = self.table.expect(*c);
+                self.table.expect_beyond_capacity(*c);
             }
             if self.table.phase_of(c) < Some(Phase::Commit) {
                 self.sync_pending.insert(*c, e.clone());
@@ -679,12 +687,14 @@ impl Follower {
             // would stall a candidate that needs this replica's majority.
             report_due: state.report_due,
             served_report: state.served_report,
+            report_cut: state.report_cut,
             sync_pending: BTreeMap::new(),
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
             sync_barrier: None,
             sync_demoted: Vec::new(),
+            sync_released: Vec::new(),
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
@@ -717,6 +727,7 @@ impl Follower {
             outbox: self.outbox,
             report_due: self.report_due,
             served_report: self.served_report,
+            report_cut: self.report_cut,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
         }
@@ -929,6 +940,10 @@ impl Follower {
         }
         self.report_due = None;
         let report = self.report(due.ballot);
+        self.report_cut = Some((
+            due.ballot,
+            report.entries.iter().map(|e| e.command).collect(),
+        ));
         if due.to.replica == self.config.identity.replica {
             if let Some(c) = self.campaign.as_mut()
                 && c.ballot() == due.ballot
@@ -1261,11 +1276,59 @@ impl Follower {
             // the new marker; only here, at the first installation, since
             // an acceptance written after it is the new ballot's own.
             let epoch = self.config.identity.epoch;
+            // A record the selection neither selected nor re-proposed,
+            // and no selected entry depends on, was decided nowhere
+            // (task-d24): the selection is taken from a majority's
+            // reports and keeps every command a quorum of an earlier
+            // ballot could have decided, so a command it leaves out was
+            // not decided below this ballot. Kept, it held its slot until
+            // the command was decided somewhere, which may be never; with
+            // one voter gone for good the table filled with them. It is
+            // released in this batch, as the demotions are. A restart
+            // resumes the installation from the Sync row, so nothing
+            // proposed after it is released this way. A later
+            // decision of the command reaches this voter as any command
+            // does, through the leader or catch-up. Its payload goes too:
+            // kept beside no record, a later proposal of the command would
+            // find the payload present and never bind it again.
+            let named: BTreeSet<CommandId> = decision
+                .entries
+                .values()
+                .flat_map(|e| e.deps.iter().copied())
+                .chain(decision.entries.keys().copied())
+                .chain(decision.reproposed.iter().copied())
+                .collect();
+            // Only what this replica's own report for the ballot named:
+            // a command the new leader proposes after its Sync can reach
+            // this voter, as a payload, before the Sync does, and it is
+            // no record the selection could speak for.
+            let cut = self
+                .report_cut
+                .take()
+                .filter(|(b, _)| *b == decision.ballot)
+                .map(|(_, cut)| cut)
+                .unwrap_or_default();
+            let released: Vec<CommandId> = self
+                .table
+                .undecided()
+                .filter(|c| cut.contains(c) && !named.contains(c))
+                .copied()
+                .collect();
+            for command in &released {
+                if self.ledger.record(command).is_some() {
+                    updates.push(dependency_delete(epoch, command));
+                    self.ledger.stage_removal(barrier, *command);
+                }
+                if self.payloads.contains_key(command) {
+                    updates.push(crate::rows::payload_delete(command));
+                }
+            }
             let demoted: Vec<(CommandId, CommandRecord)> = self
                 .table
                 .records()
                 .filter(|(c, r)| {
                     r.payload.is_some()
+                        && !released.contains(c)
                         && r.phase == Phase::Accept
                         && decision
                             .entries
@@ -1283,6 +1346,7 @@ impl Follower {
                 self.ledger.stage(barrier, *command, demoted.clone());
             }
             self.sync_demoted = demoted.into_iter().map(|(c, _)| c).collect();
+            self.sync_released = released;
             self.sync_barrier = Some((barrier, decision));
             return alloc::vec![Effect::Persist(PersistBatch {
                 barrier,
@@ -1323,6 +1387,22 @@ impl Follower {
         effects
     }
 
+    /// Drop what this replica holds of an undecided command a durable Sync
+    /// released (task-d24): its table slot, its payload and binding, and
+    /// ballot-scoped state, as if it had never held it.
+    fn release_undecided(&mut self, command: &CommandId) {
+        if !self.table.release(command) {
+            return;
+        }
+        if let Some(payload) = self.payloads.remove(command) {
+            self.bindings.remove(&payload.retry_key);
+        }
+        self.served_payloads.remove(command);
+        self.votes.remove(command);
+        self.adopted.remove(command);
+        self.held.remove(command);
+    }
+
     /// Hold `decision`'s entries for installation, in place of whatever an
     /// earlier Sync left pending (task-d20).
     ///
@@ -1339,7 +1419,7 @@ impl Follower {
         self.sync_pending.clear();
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
-                let _ = self.table.expect(*c);
+                self.table.expect_beyond_capacity(*c);
             }
             self.sync_pending.insert(*c, e.clone());
         }
@@ -2708,7 +2788,11 @@ impl Follower {
         // this command under different attested facts conflicts here
         // instead of quietly replacing what this replica accepted.
         let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
-        let initialized = if self.turn_has_come(&command, payload.admission_digest()) {
+        // A command a Sync selected enters a full table as a pulled one
+        // does (task-d24): it finishes admitted work.
+        let recovering = self.sync_pending.contains_key(&command);
+        let initialized = if recovering || self.turn_has_come(&command, payload.admission_digest())
+        {
             self.table
                 .initialize_beyond_capacity(command, payload.admission_digest(), keys)
         } else {
@@ -3243,6 +3327,9 @@ impl Follower {
                     for command in core::mem::take(&mut self.sync_demoted) {
                         self.table.demote(&command);
                     }
+                    for command in core::mem::take(&mut self.sync_released) {
+                        self.release_undecided(&command);
+                    }
                     // Unless a higher ballot was promised while the row was
                     // becoming durable: that cut supersedes this one and its
                     // leader recovers from the rows.
@@ -3266,6 +3353,7 @@ impl Follower {
                 StorageEvent::Failed { .. } => {
                     self.ledger.failed(barrier);
                     self.sync_demoted.clear();
+                    self.sync_released.clear();
                     self.rejections
                         .push(FollowerRejection::SyncNotDurable(decision.ballot));
                     Vec::new()

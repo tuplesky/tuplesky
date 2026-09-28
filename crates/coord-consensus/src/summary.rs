@@ -90,6 +90,8 @@ pub struct DurableLedger {
     /// Records a batch in flight writes, by its barrier: usually one, and
     /// several for a Sync that demotes what it leaves out (task-d11).
     staged: BTreeMap<BarrierId, Vec<(CommandId, CommandRecord)>>,
+    /// Records a batch in flight deletes, by its barrier (task-d24).
+    removals: BTreeMap<BarrierId, Vec<CommandId>>,
 }
 
 impl DurableLedger {
@@ -99,6 +101,7 @@ impl DurableLedger {
             records: BTreeMap::new(),
             sequences: BTreeMap::new(),
             staged: BTreeMap::new(),
+            removals: BTreeMap::new(),
         }
     }
 
@@ -108,6 +111,7 @@ impl DurableLedger {
             records: rows.into_iter().collect(),
             sequences: BTreeMap::new(),
             staged: BTreeMap::new(),
+            removals: BTreeMap::new(),
         }
     }
 
@@ -129,6 +133,15 @@ impl DurableLedger {
         barrier: BarrierId,
         journal_seq: LocalJournalSeq,
     ) -> Option<CommandId> {
+        for command in self.removals.remove(&barrier).unwrap_or_default() {
+            match self.sequences.get(&command) {
+                Some(seen) if *seen > journal_seq => {}
+                _ => {
+                    self.sequences.insert(command, journal_seq);
+                    self.records.remove(&command);
+                }
+            }
+        }
         let staged = self.staged.remove(&barrier)?;
         let first = staged.first().map(|(c, _)| *c);
         for (command, record) in staged {
@@ -147,6 +160,7 @@ impl DurableLedger {
 
     /// The batch under `barrier` failed: nothing became durable.
     pub fn failed(&mut self, barrier: BarrierId) -> Option<CommandId> {
+        self.removals.remove(&barrier);
         self.staged
             .remove(&barrier)
             .and_then(|s| s.first().map(|(c, _)| *c))
@@ -180,9 +194,22 @@ impl DurableLedger {
         self.sequences.retain(|c, _| keep(c));
     }
 
+    /// Stage the deletion of `command`'s record under `barrier`: it leaves
+    /// the ledger when that batch is durable, and stays if it fails
+    /// (task-d24).
+    pub fn stage_removal(&mut self, barrier: BarrierId, command: CommandId) {
+        self.removals.entry(barrier).or_default().push(command);
+    }
+
     /// Barriers still outstanding (the cut must wait for them).
     pub fn outstanding(&self) -> Vec<BarrierId> {
-        self.staged.keys().copied().collect()
+        let mut out: Vec<BarrierId> = self.staged.keys().copied().collect();
+        for b in self.removals.keys() {
+            if !out.contains(b) {
+                out.push(*b);
+            }
+        }
+        out
     }
 
     /// The report for `ballot` from durable state only.

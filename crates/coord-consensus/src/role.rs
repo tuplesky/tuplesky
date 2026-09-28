@@ -60,6 +60,10 @@ pub struct RecoveredState {
     /// The pages of the last report this replica sent a candidate, which
     /// it answers a lost page from (task-d28).
     pub served_report: Option<ServedReport>,
+    /// The ballot this replica last reported for and the commands its
+    /// report named: the only records a Sync of that ballot may release
+    /// (task-d24).
+    pub report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
     /// Frontend.
     pub frontend: PeerId,
     /// Command table capacity.

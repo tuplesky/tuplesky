@@ -243,6 +243,9 @@ pub struct Leader {
     /// The pages of the last report sent a candidate, which a lost page
     /// is answered from (task-d28).
     served_report: Option<crate::summary::ServedReport>,
+    /// The ballot this replica last reported for and the commands its
+    /// report named (task-d24).
+    report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
     pending_sync: Option<(ReplicaId, SyncDecision)>,
     speculation: Speculation,
     rejections: Vec<Rejection>,
@@ -311,6 +314,7 @@ impl Leader {
             seqnum: 0,
             report_due: None,
             served_report: None,
+            report_cut: None,
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
@@ -342,6 +346,7 @@ impl Leader {
         RecoveredState {
             report_due: self.report_due,
             served_report: self.served_report,
+            report_cut: self.report_cut,
             identity: self.config.identity,
             ballots: self.ballots,
             table: self.table,
@@ -399,6 +404,7 @@ impl Leader {
             seqnum: 0,
             report_due: state.report_due,
             served_report: state.served_report,
+            report_cut: state.report_cut,
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
@@ -913,6 +919,10 @@ impl Leader {
             return Vec::new();
         };
         let report = self.report(due.ballot);
+        self.report_cut = Some((
+            due.ballot,
+            report.entries.iter().map(|e| e.command).collect(),
+        ));
         let context = self
             .ballots
             .context(boot, due.ballot, LocalJournalSeq::ZERO);

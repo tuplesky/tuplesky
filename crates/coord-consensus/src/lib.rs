@@ -145,7 +145,9 @@ pub use ballot::{
 };
 pub use campaign::Campaign;
 pub use catch_up::{CatchUpDivergence, DonorExecution, OwnExecution};
-pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
+pub use commands::{
+    CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RetireError,
+};
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
     FloorInstall, FloorLedger, Readiness, ReadinessError, ReadinessLedger, activate, discover,
@@ -185,8 +187,8 @@ pub use rows::{
     SealRecordV1, SyncRecordV1, bounded_sync_update, decode_dependency, decode_payload,
     decode_promise, decode_proposal, decode_seal, decode_sync, dependency_delete, dependency_key,
     dependency_update, encode_dependency, encode_payload, encode_promise, encode_proposal,
-    encode_seal, encode_sync, payload_key, payload_update, promise_key, promise_update,
-    proposal_key, proposal_update, seal_key, seal_update, sync_key, sync_update,
+    encode_seal, encode_sync, payload_delete, payload_key, payload_update, promise_key,
+    promise_update, proposal_key, proposal_update, seal_key, seal_update, sync_key, sync_update,
 };
 pub use speculation::{
     DEFAULT_SPECULATION_BOUND, ReleaseGate, Speculation, SpeculationMismatch, SpeculationRequest,
