@@ -434,8 +434,9 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
         Err(InitError::PayloadConflict)
     );
     assert_eq!(table.record(&c1).unwrap().deps, vec![c2]);
-    // Rebinding the facts is only for a record nothing was accepted over
-    // (task-d09): at PRE-ACCEPT it replaces them, past it nothing changes.
+    // Rebinding the facts is for a record nothing was decided over: at
+    // PRE-ACCEPT (task-d09) and at ACCEPT (task-d14) it replaces them, and
+    // at COMMIT or beyond nothing changes.
     assert!(table.rebind(&c1, Digest32([8; 32])));
     assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([8; 32])));
     assert!(table.rebind(&c1, Digest32([1; 32])));
@@ -447,14 +448,17 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     );
     table.accept(c2, vec![]).unwrap();
     table.accept(c1, vec![c2]).unwrap();
-    assert!(!table.rebind(&c1, Digest32([8; 32])));
-    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([1; 32])));
+    assert!(table.rebind(&c1, Digest32([8; 32])));
+    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([8; 32])));
+    assert!(table.rebind(&c1, Digest32([1; 32])));
     assert_eq!(
         table.commit(c1),
         Err(GuardViolation::DependencyNotCommitted { dep: c2 })
     );
     table.commit(c2).unwrap();
     table.commit(c1).unwrap();
+    assert!(!table.rebind(&c1, Digest32([8; 32])));
+    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([1; 32])));
     assert_eq!(
         table.execute(c1),
         Err(GuardViolation::DependencyNotExecuted { dep: c2 })

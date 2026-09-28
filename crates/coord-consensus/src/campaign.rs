@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 
 use coord_core::effect::BarrierId;
 use coord_types::CommandId;
+use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ReplicaId};
 
 use crate::phase::Phase;
@@ -130,7 +131,8 @@ impl Campaign {
     /// Run the selection once a majority of complete reports is present.
     /// `Ok(None)` means not yet; an error stops the campaign with the
     /// evidence. `supplied` names the commands this candidate holds a
-    /// payload for or executed ([`crate::recovery::select_with`]).
+    /// payload for, under the admission digest the reporters name when
+    /// they name one, or executed ([`crate::recovery::select_with`]).
     ///
     /// A far-behind voter can report an acceptance, from a Sync it
     /// installed, of a command whose payload never reached it and which
@@ -162,7 +164,7 @@ impl Campaign {
     /// not reported, and fails only once every voter has.
     pub fn try_select(
         &mut self,
-        supplied: impl Fn(&CommandId) -> bool,
+        supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     ) -> Result<Option<&SyncDecision>, RecoveryError> {
         if self.decision.is_some() {
             return Ok(self.decision.as_ref());

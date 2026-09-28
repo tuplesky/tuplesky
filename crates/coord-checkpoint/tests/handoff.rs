@@ -101,6 +101,7 @@ fn selection(commands: &[u8]) -> SyncDecision {
                         path: coord_consensus::graph::empty_path(),
                         paths: Vec::new(),
                         seqnum: u64::from(*i),
+                        admission: None,
                     },
                 )
             })

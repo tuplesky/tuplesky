@@ -5159,3 +5159,128 @@ itself still leads; that is catch-up's case.
   restarted refuser can campaign at or below the refused ballot, which
   the refused candidate does not promise; the other voters still can. A
   restarted candidate campaigns again and is refused again.
+
+## A decision names its admission facts
+
+A new leader can hold a command under a presentation other than the
+one its voters accepted: it took a second presentation after its
+restart, and each presentation mints its own admission receipt. Neither
+a report entry nor a Sync entry carried facts, so the leader re-proposed
+the selected entry under its own. The one live follower held the command at ACCEPT
+under the old leader's facts, answered `AdmissionConflict` and never
+voted, since task-d09's rebind covers PRE-ACCEPT only. With the third
+voter out, the entry never reached a majority, and everything chained
+after it waited until the table filled and the leader refused as
+`Backpressure`. With the third voter back the entry commits, but the
+follower holding the other facts stays at ACCEPT on the command for
+good.
+
+This was first taken for the cause of the stress runs raf-2 and repaf-4,
+where a leader republished its lease command until the end. It is not:
+their stores hold every command under one digest on every voter. Those
+runs are a leader that never learned a proposal whose acknowledgement it
+lost, a separate stall.
+
+The same gap let a Sync COMMIT entry make a new leader execute a command,
+without a vote, under facts no quorum accepted. For a session-establishing
+command that writes another receipt identity into replicated state
+(`ConsumeAdmission` in `coord-state`'s planner).
+
+### The rule
+
+- A vote set counts one admission digest, so a decision has one. The
+  selection names it: `ReportEntry` and `SyncEntry` carry the digest the
+  reporter's record holds, and a Sync entry whose payload has not arrived
+  reports the digest its Sync named.
+- Copies at ACCEPT or beyond of one command under different digests are
+  `IncompatibleAdmission` in the selection: a second decision, never a
+  merge. It is checked before the payload check, so a copy without its
+  payload cannot be set aside as half-initialized and leave the other
+  copy to be bound. An acceptance below the source ballot decides nothing and is
+  re-proposed as before, whatever its facts.
+- The named digest comes from the copies the selection takes: an
+  acceptance at the source ballot or a commit at any. A reporter's
+  payload counts as available only under it, and a command counts as
+  supplied to a candidate only when it holds the payload under it, or
+  executed the command. Otherwise the payload
+  is fetched like a missing one and the candidate's record is rebound
+  before binding, so its re-proposals carry the selected facts. A
+  candidate that committed or executed a selected command under other
+  facts stops its campaign as `IncompatibleAdmission`.
+- A voter installing an entry whose digest differs from its record
+  rebinds at PRE-ACCEPT and ACCEPT, fetching the payload under the named
+  facts first, and holds a re-proposal under those facts until it has.
+  A payload under other facts than a selection names is not taken.
+- At COMMIT or beyond, a different digest is two decisions of one
+  command. The voter does not install the entry, reports
+  `IncompatibleAdmission`, and stops voting and executing; a candidate
+  that finds one in its own selection stops the same way. `coordd` then
+  stops the process, as on `release-record-mismatch`, saying
+  `incompatible-admission` and the command.
+- A command executed and retired has no record; it is compared against
+  its payload row where one is kept, by the candidate and by a voter
+  installing a Sync. With none it has nothing to compare. After this
+  change a voter can only have executed a command under other facts than
+  its decision through the path it removes, so `ExecutedRecordV1` is
+  unchanged.
+- The report pages and the Sync carry the digest on the wire; the bound
+  Sync row carries it at schema version 3. A row of version 1 or 2 is
+  refused as corrupt, not read as a selection without facts, so stores
+  are started fresh.
+
+### What the tests show
+
+In `crates/coord-consensus/tests/activation.rs`:
+
+- `a_new_leader_re_proposes_under_the_facts_its_reporters_accepted`: r0
+  proposes X under one presentation's facts and nobody hears it; r1
+  takes a second presentation. With r2 out, r1 campaigns, fetches X under
+  r0's facts, rebinds and re-proposes under them. Both voters execute X
+  and a later Y, and r0 refuses nothing as `AdmissionConflict`. Before,
+  X and Y stayed at ACCEPT on both.
+- `every_voter_executes_a_recovered_command_under_one_set_of_facts`: the
+  same with every voter up. All three execute X under r0's facts; before,
+  r0 stayed at ACCEPT on X for good.
+- `a_command_decided_under_one_set_of_facts_executes_under_them_everywhere`:
+  X is decided and executed by r0 and r1; r2 holds a second presentation,
+  leads after r0 goes down, and executes X under the decided facts.
+  Before, it executed X under its own.
+- `copies_of_one_command_under_two_sets_of_facts_are_incompatible`: a
+  COMMIT under A beside an ACCEPT under B is `IncompatibleAdmission`; an
+  ACCEPT under A below the source beside the source's ACCEPT under B
+  selects B.
+- `a_voter_accepting_under_other_facts_rebinds_to_the_selected_ones`: a
+  voter at ACCEPT under one presentation installs a later Sync naming the
+  other, asks for the payload under the named facts, rebinds and
+  installs.
+- `a_voter_handed_other_facts_for_a_command_it_committed_stops`: a voter
+  that executed X under A and is handed a Sync naming B for it reports
+  `IncompatibleAdmission` and does not execute the committed command
+  waiting after it.
+- `a_voter_handed_other_facts_for_a_command_it_retired_stops`: the same
+  for a command executed and retired, compared against its payload row.
+- `a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting`:
+  the new leader's re-proposal under the selected facts arrives before
+  their payload; the payload rebinds the record for both, and the Sync
+  entry installs at once with its own evidence.
+- `a_sync_row_without_admission_facts_is_refused`: rows of versions 1 and
+  2 are refused; the current row round-trips with its facts.
+- The incompatibility test also covers a copy without its payload.
+
+Each has a negative control. With the selection naming no facts, the
+first four fail. With the alarm and the stop switched off, the
+incompatibility test and the stop test fail. With the rebind at
+PRE-ACCEPT only, the ACCEPT rebind test fails. With the conflict found
+only in the merge, the case without a payload is `HalfInitialized`; with
+the retired command skipped, the voter executes on; and without resuming
+the Sync after a proposal's rebind, the entry stays uninstalled.
+
+### What is left
+
+- The stop on a committed mismatch is not durable. A restarted voter
+  does not stop again, since a resumed Sync re-queues only entries below
+  COMMIT; that half is task-d13's durable marker, as for the other
+  stops.
+- A Sync entry that names no facts (no reporter held a payload, and the
+  candidate supplies it by having executed it) is installed under
+  whatever facts a voter holds, as before.

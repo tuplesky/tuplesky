@@ -1204,6 +1204,7 @@ fn a_step_that_asks_for_more_than_the_queue_holds_is_carried_out() {
                         path: coord_consensus::empty_path(),
                         paths: Vec::new(),
                         seqnum: 0,
+                        admission: None,
                     },
                 )
             })
