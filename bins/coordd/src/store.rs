@@ -756,6 +756,7 @@ mod tests {
             r#"config_version = 2
 role = "voter-frontend-observer"
 cluster_manifest = "{root}/genesis.json"
+genesis_admin_key = "{root}/genesis-admin.pem"
 cluster_endpoints = "{root}/endpoints.bin"
 domain = "control-plane-test"
 state_directory = "{root}"

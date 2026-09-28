@@ -19,6 +19,7 @@ fn base_config(extra: &str) -> String {
         r#"config_version = {CONFIG_VERSION}
 role = "voter-frontend-observer"
 cluster_manifest = "/etc/coord/genesis.json"
+genesis_admin_key = "/etc/coord/genesis-admin.pem"
 domain = "control-plane-a"
 state_directory = "/var/lib/coord/a"
 {extra}
@@ -103,6 +104,7 @@ fn strict_configuration_is_validated() {
     let auth_only = r#"config_version = 2
 role = "auth"
 cluster_manifest = "/g.json"
+genesis_admin_key = "/g.pem"
 domain = "d"
 state_directory = "/s"
 
@@ -584,6 +586,11 @@ fn a_configuration_that_could_not_find_its_own_state_is_refused() {
             "cluster_manifest",
         ),
         (
+            "genesis_admin_key = \"/etc/coord/genesis-admin.pem\"",
+            "genesis_admin_key = \"\"",
+            "genesis_admin_key",
+        ),
+        (
             "trust_bundle = \"/etc/coord/roots.pem\"",
             "trust_bundle = \"\"",
             "identity.trust_bundle",
@@ -746,6 +753,7 @@ fn a_process_that_serves_clients_is_configured_to_verify_them() {
     let broker = r#"config_version = 2
 role = "auth"
 cluster_manifest = "/g.json"
+genesis_admin_key = "/g.pem"
 domain = "d"
 state_directory = "/s"
 

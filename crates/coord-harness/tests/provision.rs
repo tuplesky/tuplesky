@@ -61,8 +61,11 @@ fn genesis_commits_the_key_every_node_presents() {
     use x509_parser::prelude::FromDer;
 
     let (_dir, out) = provisioned(3);
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&out.manifest).expect("manifest")).expect("json");
+    // Read the way a node reads it: through the admin's signature.
+    let manifest = serde_json::to_value(
+        coord_harness::domain::verified_genesis(&out.manifest).expect("a signed manifest"),
+    )
+    .expect("json");
     let voters = manifest["voters"].as_array().expect("voters");
     assert_eq!(voters.len(), 3);
     for (index, node) in out.voters.iter().enumerate() {
@@ -168,13 +171,16 @@ fn the_issuer_is_loopback_only() {
 }
 
 /// The configuration `coord-harness provision` wrote before a host list
-/// existed, verbatim. `{root}`, `{node}`, `{api}` and `{peer}` are the
-/// run directory, the node's directory and its two loopback ports.
+/// existed, verbatim, with the one line task-43 added when a node began
+/// to read the genesis only through the admin's key. `{root}`, `{node}`,
+/// `{api}` and `{peer}` are the run directory, the node's directory and
+/// its two loopback ports.
 const LOOPBACK_CONFIG: &str = r#"# Written by `coord-harness provision`. A strict configuration: the
 # daemon that reads it runs the same startup checks it runs anywhere.
 config_version = 2
 role = "voter-frontend-observer"
 cluster_manifest = "{root}/genesis.json"
+genesis_admin_key = "{root}/genesis-admin.pem"
 cluster_endpoints = "{root}/endpoints.bin"
 domain = "tuplesky-harness"
 state_directory = "{node}"
@@ -231,6 +237,7 @@ const LOOPBACK_FILES: &[&str] = &[
     "edge-unauthorized.key",
     "edge-unauthorized.pem",
     "endpoints.bin",
+    "genesis-admin.pem",
     "genesis.json",
     "harness.json",
     "issuer-ca.pem",
@@ -458,7 +465,10 @@ fn every_placed_node_is_a_bundle_that_runs_wherever_it_is_copied() {
     .expect("provisioned");
 
     let manifest = std::fs::read(&out.manifest).expect("genesis");
-    let committed: serde_json::Value = serde_json::from_slice(&manifest).expect("json");
+    let committed = serde_json::to_value(
+        coord_harness::domain::verified_genesis(&out.manifest).expect("a signed manifest"),
+    )
+    .expect("json");
     for (index, node) in out.voters.iter().enumerate() {
         // Somewhere else entirely, as another host would have it.
         let bundle = dir.path().join(format!("elsewhere-{index}"));
@@ -492,6 +502,12 @@ fn every_placed_node_is_a_bundle_that_runs_wherever_it_is_copied() {
         assert_eq!(
             std::fs::read(bundle.join("genesis.json")).expect("genesis"),
             manifest
+        );
+        // The key it is verified against travels with it.
+        assert_eq!(
+            coord_harness::domain::verified_genesis(&bundle.join("genesis.json"))
+                .expect("the bundle's own copy verifies"),
+            coord_harness::domain::verified_genesis(&out.manifest).expect("verifies")
         );
         assert_eq!(
             std::fs::read(bundle.join("endpoints.bin")).expect("catalog"),

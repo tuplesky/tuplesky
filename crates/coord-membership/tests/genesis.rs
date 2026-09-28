@@ -708,3 +708,146 @@ fn the_binder_reports_when_the_credential_it_admitted_ends() {
     // chain, and the connection is then bounded by the age cap alone.
     assert_eq!(binder.expires_at(&[]), None);
 }
+
+/// PEM-encoded admin keys, as provisioning tools and `coordd` hold them:
+/// a manifest signed from the private key verifies against the public
+/// one, and against no other; a key that is not P-256 is refused as a
+/// key, not accepted and then failing every signature.
+#[test]
+fn a_manifest_signed_from_a_pem_key_verifies_against_its_public_pem() {
+    use rcgen::PublicKeyData;
+    fn pem(label: &str, der: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut body = String::new();
+        for chunk in der.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    body.push(A[((n >> (18 - 6 * i)) & 0x3f) as usize] as char);
+                } else {
+                    body.push('=');
+                }
+            }
+        }
+        let mut out = format!("-----BEGIN {label}-----\n");
+        for line in body.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(line).unwrap());
+            out.push('\n');
+        }
+        out.push_str(&format!("-----END {label}-----\n"));
+        out
+    }
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+
+    let key = ecdsa();
+    let private = pem("PRIVATE KEY", &key.serialize_der());
+    let public = pem("PUBLIC KEY", &key.subject_public_key_info());
+    let signed = coord_membership::sign_genesis_pem(&manifest, private.as_bytes()).unwrap();
+    let verifying = coord_membership::admin_key_from_pem(public.as_bytes()).unwrap();
+    assert_eq!(
+        verify_genesis(&signed, &verifying, coord_membership::PROTOCOL_VERSION).unwrap(),
+        manifest
+    );
+
+    let other = ecdsa();
+    let other_public = pem("PUBLIC KEY", &other.subject_public_key_info());
+    assert_eq!(
+        verify_genesis(
+            &signed,
+            &coord_membership::admin_key_from_pem(other_public.as_bytes()).unwrap(),
+            coord_membership::PROTOCOL_VERSION
+        ),
+        Err(GenesisError::Signature)
+    );
+
+    let ed25519 = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let wrong_curve = pem("PUBLIC KEY", &ed25519.subject_public_key_info());
+    assert!(matches!(
+        coord_membership::admin_key_from_pem(wrong_curve.as_bytes()),
+        Err(GenesisError::AdminKey)
+    ));
+    assert!(matches!(
+        coord_membership::admin_key_from_pem(b"not a key"),
+        Err(GenesisError::AdminKey)
+    ));
+    assert!(matches!(
+        coord_membership::sign_genesis_pem(&manifest, public.as_bytes()),
+        Err(GenesisError::AdminKey)
+    ));
+
+    // Other keys ES256 does not verify with: RSA, and EC on P-384.
+    const RSA: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjR5/SjSl4f7dyRVwk9e+\n4hyTYckxcibzZxyejYXxfuUtppi2+DCoA0KjipiEZ1JUIOFSaiNQ+ePG+447BVAX\ncziUz5WBPdVEcf+C9VJ5ISIhC19LvgcswL0JcuOlIVU7fbTq/5qDGmbyaSj7s7BZ\nJOWJ9fVUoA8spaGAPFAoShrqssuwoMp2ljrG8WIqJkE/ZF9ja91f+6ZIMTY76n1s\n0rLAT++rTTa4+eN/sy4cOmXUyn02y/ts7qbXEAPrKE9wwdmDF2EcvEveq0ePmefn\nqHzRyB8ldGYQ6aF0wZS5G3yVSMnqdsagQXaxp/Qo0Zqh/TWniG2fLeWROg/X3Egk\nhQIDAQAB\n-----END PUBLIC KEY-----\n";
+    const P384: &str = "-----BEGIN PUBLIC KEY-----\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEsVFwR2nFr4OPbU58s5uzVMXpC3T6TI8L\n90kxo1BFFkxMVoM2VQtjm9PV0uhuO6zIb65YZaaZVmdd+Hdr8iSu763p9/6dsvmx\n71WrEybFIE+O4zQZqbtGLC7gAsbzZfnm\n-----END PUBLIC KEY-----\n";
+    for (what, key) in [("RSA", RSA), ("P-384", P384)] {
+        assert!(
+            matches!(
+                coord_membership::admin_key_from_pem(key.as_bytes()),
+                Err(GenesisError::AdminKey)
+            ),
+            "{what} was accepted"
+        );
+    }
+    // One section, and nothing else: not two keys, and not the private
+    // key beside the public one, whichever comes first.
+    for (what, file) in [
+        ("two keys", format!("{public}{other_public}")),
+        ("a private key after", format!("{public}{private}")),
+        ("a private key before", format!("{private}{public}")),
+    ] {
+        assert!(
+            matches!(
+                coord_membership::admin_key_from_pem(file.as_bytes()),
+                Err(GenesisError::AdminKey)
+            ),
+            "{what} was accepted"
+        );
+    }
+    // Bytes after the key's own encoding.
+    let mut padded = key.subject_public_key_info();
+    padded.extend_from_slice(&[0, 0]);
+    assert!(matches!(
+        coord_membership::admin_key_from_pem(pem("PUBLIC KEY", &padded).as_bytes()),
+        Err(GenesisError::AdminKey)
+    ));
+}
+
+/// A token that names no algorithm, or tells the verifier where to find
+/// a key, is refused before any key is tried -- the pinned admin key is
+/// the only key a manifest is ever verified with.
+#[test]
+fn a_manifest_that_picks_its_own_algorithm_or_key_is_refused() {
+    let admin = admin_key();
+    let mut issuer = build_issuer();
+    let (manifest, _) = manifest_with_voters(&mut issuer, &admin);
+    let claims = b64url(&serde_json::to_vec(&manifest).unwrap());
+
+    let none = coord_membership::SignedGenesis(format!(
+        "{}.{claims}.",
+        b64url(br#"{"alg":"none","typ":"JWT"}"#)
+    ));
+    assert!(matches!(
+        verify_genesis(&none, &pinned(&admin), coord_membership::PROTOCOL_VERSION),
+        Err(GenesisError::Algorithm | GenesisError::Malformed)
+    ));
+
+    let mut header = jsonwebtoken::Header::new(Algorithm::ES256);
+    header.jku = Some("https://keys.example/jwks".into());
+    let pointed = coord_membership::SignedGenesis(
+        jsonwebtoken::encode(&header, &manifest, &admin.enc).unwrap(),
+    );
+    assert_eq!(
+        verify_genesis(
+            &pointed,
+            &pinned(&admin),
+            coord_membership::PROTOCOL_VERSION
+        ),
+        Err(GenesisError::Algorithm)
+    );
+}

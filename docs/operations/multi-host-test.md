@@ -80,12 +80,19 @@ What `--hosts` changes, and nothing else does:
   certificate against it; without the host in the certificate every
   handshake fails.
 * **Each `nN/` directory is a self-contained bundle.** It holds its own copy
-  of `genesis.json` and `endpoints.bin` beside its credentials, and its
+  of `genesis.json` (the manifest as the admin signed it), the admin's public
+  key `genesis-admin.pem` a node verifies it against at `init` and at every
+  start, and `endpoints.bin` beside its credentials, and its
   `coordd.toml` names every file relative to the bundle, with
   `state_directory = "."`. `coordd` opens a relative path against its
   *working directory*, not against the configuration file -- this task did
   not change that -- so a bundle is run from inside itself. Copy it anywhere;
   the examples use `/opt/tuplesky/nN`.
+* **The admin's private key is never written.** Provisioning generates it,
+  signs the manifest once, and drops it. Only its public half ships. So a
+  provisioned domain's genesis cannot be re-signed by the harness or by
+  anyone else, which is what the pin admits anyway: no change. A domain that
+  needs another genesis is provisioned again, and every bundle is replaced.
 * **The credential endpoint** (`--issuer-listen`) gets a certificate for its
   host and a URL naming it, so a Kine build on another host can exchange its
   assertion there. Without the flag it stays on loopback. `localhost` (and any
