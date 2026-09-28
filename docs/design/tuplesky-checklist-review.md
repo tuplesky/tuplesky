@@ -1,6 +1,6 @@
 # SwiftPaxos correctness checklist review
 
-**Status:** Review record, 2026-09-28. Not a specification: the tasks it gives rise to are specified in [the plan](tuplesky-prs-plan.md), as [task-d18](tuplesky-prs-plan.md#task-d18) through [task-d31](tuplesky-prs-plan.md#task-d31).
+**Status:** Review record, 2026-09-28. Not a specification: the tasks it gives rise to are specified in [the plan](tuplesky-prs-plan.md), as [task-d18](tuplesky-prs-plan.md#task-d18) through [task-d32](tuplesky-prs-plan.md#task-d32).
 
 **What was reviewed:** the implementation stack at `d4bd28c` (task-d08 at its head) and the Jepsen client, its stress driver and their findings at `377d0a0`. The checklist is "TupleSky SwiftPaxos implementation correctness checklist" (GPT-6, 2026-09-28): 56 items in nine sections (A contract, P protocol, E evidence, D durability, B bounds, R repair, G reclamation, S application semantics, M membership) and a 15-row failure-test matrix, under one central gate: every state reachable under admission limits stays recoverable within configured limits once a valid quorum and stable communication return, without the original client, an excluded replica, deleted evidence or a manual increase in limits.
 
@@ -109,11 +109,11 @@ The central gate is not met.
 | R5 End-to-end escalation | Gap | — | No escalation for an entry holding neither half | task-d22 |
 | R6 Equivalent ingress | Partial | `a_local_submission_and_a_wire_submission_produce_the_same_round` | Remote evidence dies with its connection; frontends without a voter do not follow ballots | task-d22, task-m02 |
 | G1 Retirement justification | Partial | `CommandTable::retire` retires executed commands only | Tombstones and the forgetting window go by recency | task-d29 |
-| G2 Recovery versus catch-up | Covered in libraries | `a_local_image_is_this_nodes_whole_storage` | Learner install unwired | task-d27 |
+| G2 Recovery versus catch-up | Covered in libraries | `a_local_image_is_this_nodes_whole_storage` | Learner install unwired | task-d32 |
 | G3 Safe frontier | Partial | `a_trim_keeps_every_dependency_a_retained_command_can_reach` (library) | A forgotten dependency stops catch-up | task-d27 |
 | G4 Bounded retirement metadata | Gap | `a_stale_retirement_never_lowers_the_floor` | No row is reclaimed | task-d27 |
-| G5 Offline participants | Partial | task-d08 catch-up | No path behind a future floor; harness re-creates a wiped voter | task-d27, task-d29 |
-| G6 Snapshot fencing | Partial | `a_root_whose_selected_generation_holds_obligations_is_never_staged_over` | Learner installs unwired | task-d27, task-m03 |
+| G5 Offline participants | Partial | task-d08 catch-up | No path behind a future floor; harness re-creates a wiped voter | task-d32, task-d29 |
+| G6 Snapshot fencing | Partial | `a_root_whose_selected_generation_holds_obligations_is_never_staged_over` | Learner installs unwired | task-d32, task-m03 |
 | S1 Conflict oracle | Covered | Conservative key | Finer predicates out of scope | — |
 | S2 Determinism | Covered | `authority_epochs_fence_former_leaders_and_only_advance` | Session expiry checked at admission only | — |
 | S3 Global observables | Partial | `watch_events_follow_irrevocable_application` | Fast-path rate under the total chain unmeasured | task-64 |
@@ -145,7 +145,7 @@ The deterministic clusters run three voters at table capacity 32 and five voters
 | 8 | Crash during checkpoint, truncation, install | Component | `a_crash_between_the_certificate_and_the_floor_deletes_nothing` | task-j05 |
 | 9 | Repeated interrupted elections | Partial | `competing_campaigns_and_delayed_replies_cannot_establish_divergence`; flat budgets unshown | task-d28, task-d30 |
 | 10 | Delayed old-ballot messages | Partial | `old_ballot_work_is_held_across_recovery`; the promise bug is a gap here | task-d18, task-d30 |
-| 11 | Replica offline through many checkpoints | Partial | task-d08 catch-up and the follower-out driver; no floor to test | task-d27 |
+| 11 | Replica offline through many checkpoints | Partial | task-d08 catch-up and the follower-out driver; no floor to test | task-d27, task-d32 |
 | 12 | Loss beyond the repair-cache window | Partial | `a_refused_repair_falls_back_to_the_durable_record`; neither half stalls | task-d22, task-d30 |
 | 13 | Disk full, fsync failure, slow materializer | Partial | `enospc_fails_the_commit` (engine only) | task-j05 |
 | 14 | Lost response, same-ID and new-payload retries | Partial | `lost_response_with_the_same_identity_returns_the_same_result`; not under faults at three or five voters | task-d23, task-d30 |
@@ -153,8 +153,8 @@ The deterministic clusters run three voters at table capacity 32 and five voters
 
 ## Order
 
-- **Safety first.** task-d18 through task-d21 are prerequisites of task-64 and go ahead of further Jepsen conclusions.
+- **Safety first.** task-d18 through task-d21 go ahead of further Jepsen conclusions. Every task here is a prerequisite of task-64.
 - **Then ownership:** task-d22 through task-d25.
-- **Then bounds:** task-d26 through task-d28.
+- **Then bounds:** task-d26 through task-d28, and task-d32 after task-d27.
 - **Then the contract and simulation:** task-d29 through task-d31.
 - **task-d25 waits on a decision:** leaving catch-up as it is, or windowed installation.
