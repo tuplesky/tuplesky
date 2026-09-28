@@ -882,6 +882,9 @@ pub struct Domain<P: Persistence> {
     /// When this leader last sent its voters the proposals they had not
     /// voted on (task-d07).
     resent: Option<std::time::Instant>,
+    /// When this voter's campaign last asked for the report pages it
+    /// lacks (task-d28).
+    pages_asked: Option<std::time::Instant>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
@@ -1329,6 +1332,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             expiry: None,
             asked: None,
             resent: None,
+            pages_asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
             answered_otherwise: None,
@@ -2242,6 +2246,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         } else {
             self.resent = None;
+        }
+        // A report page is published once, on a lane that drops when
+        // full: a campaign asks the voters that promised it for the pages
+        // that have not arrived, paced like the re-send (task-d28).
+        if voter.node().machine().campaigning() {
+            let now = std::time::Instant::now();
+            if self
+                .pages_asked
+                .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
+            {
+                self.pages_asked = Some(now);
+                out.absorb(voter.request_report_pages()?);
+            }
+        } else {
+            self.pages_asked = None;
         }
         // A voter that holds work it does not execute, and has not moved
         // for a while, asks a peer for the commands it executed after

@@ -114,6 +114,46 @@ impl Campaign {
         self.assembler.accept(page)
     }
 
+    /// Hold no report larger than `report_limit` entries, and a page more
+    /// (task-d28; [`ReportAssembler::bound_entries`]).
+    #[must_use]
+    pub fn bounded(mut self, report_limit: usize) -> Self {
+        self.assembler.bound_entries(report_limit);
+        self
+    }
+
+    /// The report pages to ask each promising voter for again (task-d28):
+    /// those still missing from a report some page of which arrived, or
+    /// an empty list -- the first pages -- for one of which none did. The
+    /// candidate's own report is never asked for, and nothing is once
+    /// the selection is made.
+    pub fn missing_pages(&self) -> Vec<(ReplicaId, Vec<u32>)> {
+        if self.decision.is_some() {
+            return Vec::new();
+        }
+        let me = self.config.leader();
+        self.promised
+            .iter()
+            .filter(|r| **r != me)
+            .filter_map(|r| match self.assembler.missing(r) {
+                None => Some((*r, Vec::new())),
+                Some(missing) if missing.is_empty() => None,
+                Some(missing) => Some((
+                    *r,
+                    missing
+                        .into_iter()
+                        .take(crate::summary::MAX_PAGE_ASK)
+                        .collect(),
+                )),
+            })
+            .collect()
+    }
+
+    /// Report pages held (task-d28).
+    pub fn pages_held(&self) -> usize {
+        self.assembler.pages_held()
+    }
+
     /// Complete reports from promising voters, own included.
     pub fn reports(&self) -> Vec<RecoveryReport> {
         let mut out: Vec<RecoveryReport> = self

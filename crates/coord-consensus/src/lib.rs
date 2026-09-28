@@ -193,8 +193,8 @@ pub use speculation::{
     TentativeOutcome,
 };
 pub use summary::{
-    DurableLedger, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler, ReportPage,
-    paginate,
+    DurableLedger, MAX_PAGE_ASK, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler,
+    ReportPage, ServedReport, paginate,
 };
 pub use vote::{FastAck, Learned, SlowAck, Vote, VoteError, VoteSet};
 

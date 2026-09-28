@@ -6203,3 +6203,56 @@ Nothing changes in what is selected, or in the Sync format.
   (`activation`): a 16,000-entry Sync is refused, named, with nothing
   written and the synchronized ballot unchanged. Before this change the
   write panicked.
+
+## A lost report page is asked for again
+
+task-d28, from the checklist review (item R3). A voter published each
+page of its recovery report once, on a lane that drops when full, and
+nothing asked for a missing page. The candidate counts a report only
+when every page arrived, so one lost page cost that voter's report for
+the whole ballot, and with a majority short the ballot itself. A voter
+that regenerated its report for the same ballot would not help either:
+a new report is another snapshot, and the assembler refuses pages of two
+snapshots from one replica as inconsistent.
+
+### What changed
+
+- **Pages kept.** A voter keeps the pages of the report it last sent a
+  candidate (`ServedReport`), one report at a time. The pages go across
+  its role changes with the report it owes, since a leader promising a
+  higher ballot is deposed before the candidate asks.
+- **Asked for again.** `ReportPageRequest { ballot, pages }` is a new
+  protocol message. The candidate sends it on an interval while its
+  campaign selects (`request_report_pages`, driven by `coordd` at the
+  re-send interval and by the protocol simulator's timers).
+  - It goes to each voter that promised and whose report is incomplete.
+  - It names the missing pages, at most `MAX_PAGE_ASK` (16), or none
+    when no page has arrived, which asks for the first pages.
+  - The voter answers only the candidate its report went to, for that
+    ballot, from the same version.
+- **Bounded assembler.** A campaign refuses a report announcing more
+  pages than `max_report_entries(capacity)` entries take, plus one. The
+  extra page lets a report one entry past the bound still assemble, so
+  task-d20 names it. The pages held are one campaign's, since a new
+  campaign replaces the old one, plus the one report the voter serves.
+
+The report format is unchanged.
+
+### Evidence
+
+- `a_campaign_completes_in_its_ballot_with_a_page_of_each_report_lost`
+  (`coord-consensus`, `activation`):
+  - Three voters, with r2 campaigning. The report pages from r0, the
+    leader until then, and from r1 are each dropped once.
+  - The campaign does not complete on its own.
+  - After one `request_report_pages`, both voters answer and r2 leads
+    the ballot it campaigned for. r0 answers after its change of role.
+- `interrupted_campaigns_leave_the_candidates_memory_flat`
+  (`activation`):
+  - Fifty campaigns, each interrupted with one voter's report half
+    delivered, leave one page held every time.
+  - A report announcing more pages than the bound is refused and holds
+    nothing.
+- The protocol simulator's rows pass at the default seeds with the new
+  timer.
+

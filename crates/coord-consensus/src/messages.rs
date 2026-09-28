@@ -290,6 +290,17 @@ pub enum ProtocolMessage {
         /// The commands.
         entries: Vec<CatchUpEntry>,
     },
+    /// A candidate asks a voter that promised `ballot` for pages of its
+    /// report that never arrived (task-d28). The voter answers from the
+    /// report it sent, never a regenerated one: an empty list asks for
+    /// the first [`crate::summary::MAX_PAGE_ASK`] pages, and at most that
+    /// many are answered.
+    ReportPageRequest {
+        /// The ballot promised.
+        ballot: Ballot,
+        /// The pages wanted, by number.
+        pages: Vec<u32>,
+    },
 }
 
 impl ProtocolMessage {
@@ -315,6 +326,7 @@ impl ProtocolMessage {
             ProtocolMessage::NewLeader { .. }
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::ReportPage(_)
+            | ProtocolMessage::ReportPageRequest { .. }
             | ProtocolMessage::PayloadRequest { .. }
             | ProtocolMessage::SealRequest { .. }
             | ProtocolMessage::Sealed { .. }

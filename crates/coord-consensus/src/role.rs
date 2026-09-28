@@ -13,7 +13,7 @@ use crate::ballot::{BallotState, ConfigurationIdentity};
 use crate::commands::CommandTable;
 use crate::learner::Learner;
 use crate::rows::PayloadRecordV1;
-use crate::summary::DurableLedger;
+use crate::summary::{DurableLedger, ServedReport};
 
 /// A recovery report owed to a candidate; the replica's state
 /// independent of its role carries it across a role change.
@@ -57,6 +57,9 @@ pub struct RecoveredState {
     /// obligation survives a role change, since the candidate may need
     /// this replica for its majority.
     pub report_due: Option<PendingReport>,
+    /// The pages of the last report this replica sent a candidate, which
+    /// it answers a lost page from (task-d28).
+    pub served_report: Option<ServedReport>,
     /// Frontend.
     pub frontend: PeerId,
     /// Command table capacity.
