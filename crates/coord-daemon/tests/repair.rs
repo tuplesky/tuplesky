@@ -33,9 +33,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use coord_collector::{
-    Collector, CollectorConfig, CollectorEvent, EvidenceError, HoldReason, KIND_EVIDENCE,
-    KIND_RELEASE, MonotonicMillis, Progress, Release, SettleError, Submitted, decode_evidence,
-    decode_release,
+    Collector, CollectorConfig, CollectorEvent, Differs, EvidenceError, HoldReason, KIND_EVIDENCE,
+    KIND_RELEASE, MismatchCheck, MonotonicMillis, Progress, Release, SettleError, Submitted,
+    decode_evidence, decode_release,
 };
 use coord_consensus::{
     BallotConfiguration, ConfigurationIdentity, Follower, FollowerConfig, Leader, LeaderConfig,
@@ -48,7 +48,7 @@ use coord_core::outbox::BarrierAllocator;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node, Outbound};
 use coord_daemon::parked::Parked;
-use coord_daemon::settle::{Settled, offer, records_for};
+use coord_daemon::settle::{NEAR_POSITIONS, Settled, executed_near, offer, records_for};
 use coord_daemon::voter::{Origin, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
@@ -920,8 +920,8 @@ fn the_record_alone_settles_nothing() {
 /// The collector holds the leader's release, and this node's own record
 /// of the command says something else: the node executed the domain's
 /// commands in another order than the leader. The turn ends there with
-/// the command named, and nothing is settled from the record. The same
-/// record, read correctly, settles the command, so it is the
+/// what was compared (task-d17), and nothing is settled from the record.
+/// The same record, read correctly, settles the command, so it is the
 /// contradiction and not the path that stops it.
 #[test]
 fn a_record_the_release_contradicts_stops_the_turn() {
@@ -933,13 +933,52 @@ fn a_record_the_release_contradicts_stops_the_turn() {
     let mut forked = records[0].1.clone();
     forked.response.push(0xff);
     let mut offered = 0;
-    let turn = offer([(command, forked.clone()), (command, forked)], |c, r| {
-        offered += 1;
-        w.collector
-            .settle_from_record(c, r.result_digest, r.position, r.revision, &r.response)
-            .map(Some)
-    });
-    assert_eq!(turn, Settled::Diverged(command));
+    let turn = offer(
+        [(command, forked.clone()), (command, forked.clone())],
+        |c, r| {
+            offered += 1;
+            w.collector
+                .settle_from_record(c, r.result_digest, r.position, r.revision, &r.response)
+                .map(Some)
+        },
+    );
+    let Settled::Diverged(mismatch) = turn else {
+        panic!("the turn did not stop: {turn:?}");
+    };
+    assert_eq!(mismatch.command, command);
+    assert_eq!(mismatch.check, MismatchCheck::HeldReleaseAgainstRecord);
+    // This node's side is its record, which nobody released; the other
+    // is the leader's release, under the ballot this collector counts.
+    assert_eq!(mismatch.own.release, None);
+    assert_eq!(mismatch.own.position, forked.position);
+    assert_eq!(mismatch.own.result_digest, forked.result_digest);
+    assert_eq!(mismatch.own.response_len, forked.response.len());
+    let origin = mismatch.release.release.expect("the release's origin");
+    assert_eq!(origin.sender, w.voters[0].provenance().from());
+    assert_eq!(origin.ballot, w.collector.quorum().ballot());
+    assert_eq!(mismatch.release.position, records[0].1.position);
+    assert_eq!(mismatch.release.response_len, records[0].1.response.len());
+    assert_eq!(
+        mismatch.differs,
+        Differs {
+            response: true,
+            ..Differs::default()
+        },
+        "only the bytes were forked"
+    );
+    // What the stop shows of this node's own execution around the two
+    // positions: here, the command itself where this node executed it.
+    let rows = executed_near(w.voters[0].node().applier(), &mismatch);
+    assert!(
+        rows.iter()
+            .any(|(c, r)| *c == command && r.position == forked.position),
+        "{rows:?}"
+    );
+    assert!(rows.iter().all(|(_, r)| {
+        [mismatch.own.position, mismatch.release.position]
+            .iter()
+            .any(|p| p.get().abs_diff(r.position.get()) <= NEAR_POSITIONS)
+    }));
     assert_eq!(offered, 1, "nothing is offered after the mismatch");
     assert!(w.collector.is_pending(&command), "nothing was settled");
     let turn = offer(records, |c, r| {
@@ -968,7 +1007,8 @@ fn a_record_the_release_contradicts_stops_the_turn() {
 /// then one with the same response under another result digest, at
 /// another position, or with another revision -- the caller was told
 /// something the domain did not decide, and the release is refused with
-/// the command named so the node can stop on it.
+/// what was compared so the node can stop on it and say so (task-d17):
+/// both sides, and exactly the fields the fork changed.
 #[test]
 fn a_late_release_that_contradicts_the_answer_is_refused() {
     let digest_of = |w: &Cluster| {
@@ -1028,17 +1068,59 @@ fn a_late_release_that_contradicts_the_answer_is_refused() {
                     .on_release(prov, decode_release(f).expect("release"))
             })
             .collect();
-        match fork {
-            0 => assert!(
-                answers.iter().all(|a| *a == Ok(Progress::Settled)),
-                "{answers:?}"
-            ),
-            _ => assert!(
-                answers
-                    .iter()
-                    .all(|a| *a == Err(EvidenceError::AnsweredOtherwise { command })),
-                "fork {fork}: {answers:?}"
-            ),
+        // The revision is part of the answer a caller is handed, so a
+        // fork of the revision is a fork of the response too.
+        let differs = match fork {
+            0 => {
+                assert!(
+                    answers.iter().all(|a| *a == Ok(Progress::Settled)),
+                    "{answers:?}"
+                );
+                continue;
+            }
+            1 => Differs {
+                response: true,
+                ..Differs::default()
+            },
+            2 => Differs {
+                result_digest: true,
+                ..Differs::default()
+            },
+            3 => Differs {
+                position: true,
+                ..Differs::default()
+            },
+            _ => Differs {
+                revision: true,
+                response: true,
+                ..Differs::default()
+            },
+        };
+        assert!(!answers.is_empty());
+        for (answer, (from, frame)) in answers.iter().zip(&late) {
+            let Err(EvidenceError::AnsweredOtherwise(mismatch)) = answer else {
+                panic!("fork {fork}: {answer:?}");
+            };
+            assert_eq!(mismatch.command, command);
+            assert_eq!(mismatch.check, MismatchCheck::LateReleaseAgainstAnswer);
+            assert_eq!(mismatch.differs, differs, "fork {fork}");
+            // The answer was given from the record, which nobody released.
+            assert_eq!(mismatch.own.release, None);
+            assert_eq!(mismatch.own.position, record.position);
+            assert_eq!(mismatch.own.revision, record.revision);
+            assert_eq!(mismatch.own.result_digest, record.result_digest);
+            assert_eq!(mismatch.own.response_len, record.response.len());
+            let origin = mismatch.release.release.expect("the release's origin");
+            assert_eq!(origin.sender, w.voters[*from].provenance().from());
+            assert_eq!(origin.ballot, w.collector.quorum().ballot());
+            let released = decode_release(frame).expect("release");
+            assert_eq!(
+                mismatch.release.result_digest,
+                released.established().result_digest()
+            );
+            assert_eq!(mismatch.release.position, released.established().position());
+            assert_eq!(mismatch.release.response_len, released.response().len());
+            assert_eq!(origin.speculative, released.speculative());
         }
     }
 }
