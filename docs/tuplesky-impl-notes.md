@@ -5162,21 +5162,24 @@ itself still leads; that is catch-up's case.
 
 ## A decision names its admission facts
 
-The stress runs raf-2 and repaf-4 ended with a leader republishing its
-lease-authority command until the end. It never committed: an earlier
-command in its chain never did. The new leader had taken a second
-presentation of that command after its restart, and each presentation
-mints its own admission receipt, so it held the command under other
-facts than the voters that accepted the first. Neither a report entry
-nor a Sync entry carried facts, so the leader re-proposed the selected
-entry under its own. The one live follower held the command at ACCEPT
+A new leader can hold a command under a presentation other than the
+one its voters accepted: it took a second presentation after its
+restart, and each presentation mints its own admission receipt. Neither
+a report entry nor a Sync entry carried facts, so the leader re-proposed
+the selected entry under its own. The one live follower held the command at ACCEPT
 under the old leader's facts, answered `AdmissionConflict` and never
 voted, since task-d09's rebind covers PRE-ACCEPT only. With the third
 voter out, the entry never reached a majority, and everything chained
 after it waited until the table filled and the leader refused as
-`Backpressure`. task-d10's step-down hid the case by bringing the third
-voter back, but the follower holding the other facts stayed at ACCEPT on
-the command for good.
+`Backpressure`. With the third voter back the entry commits, but the
+follower holding the other facts stays at ACCEPT on the command for
+good.
+
+This was first taken for the cause of the stress runs raf-2 and repaf-4,
+where a leader republished its lease command until the end. It is not:
+their stores hold every command under one digest on every voter. Those
+runs are a leader that never learned a proposal whose acknowledgement it
+lost, a separate stall.
 
 The same gap let a Sync COMMIT entry make a new leader execute a command,
 without a vote, under facts no quorum accepted. For a session-establishing

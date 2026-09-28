@@ -2981,8 +2981,7 @@ fn two_presentations(cluster: &mut Cluster) -> (CommandId, CommandId, Digest32, 
 /// follower held the command at ACCEPT under the old leader's, answered
 /// `AdmissionConflict` and never voted, so with the third voter out the
 /// command never reached a majority and everything chained after it
-/// waited: the shape of raf-2 and repaf-4, a leader republishing its
-/// lease command until the end.
+/// waited, the leader's own lease command included.
 #[test]
 fn a_new_leader_re_proposes_under_the_facts_its_reporters_accepted() {
     let mut cluster = Cluster::new(41);
