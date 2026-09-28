@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 112 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d17` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, and `task-d05` through `task-d17` from the Jepsen client's runs, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 128 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d33` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, and `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -32,7 +32,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-j01 through task-j10 | Shared journal, materialization, local checkpoint, runtime composition and multi-group qualification | task-j06 separately optional |
 | task-o01 through task-o06 | Finalized streams, regional observers/relays, Kine watch/read integration | Capability-specific gates |
 | task-m01 through task-m05 | Authoritative discovery, full-client Kine and integrated membership | Operational production requirement |
-| task-d01 through task-d17 | Daemon runtime wiring (election, leaf renewal, reconnection and why a dial failed), one execution order on every replica, recovery bounded by execution, a Sync that leaves no stale acceptance, a new leader that chains after what it executed, a diverged node that stays stopped and says what it compared, a decision that names its admission facts, every proposal and decision reaching every voter, every vote reaching the leader, catch-up, and multi-host test provisioning | Required before task-64/task-65 qualification and task-66 |
+| task-d01 through task-d33 | Daemon runtime wiring (election, leaf renewal, reconnection and why a dial failed), one execution order on every replica, recovery bounded by execution, a Sync that leaves no stale acceptance, a new leader that chains after what it executed, a diverged node that stays stopped and says what it compared, a decision that names its admission facts, every proposal and decision reaching every voter, every vote reaching the leader, catch-up, multi-host test provisioning, and the correctness-checklist remediation (a promise a Sync cannot lower, slow decisions recovery keeps, a Sync that fits its row, collector obligations that end, client outcomes, table room for recovery, a resource contract, forgetting wired into `coordd` and a learner reinstall behind its floor, the failure and obligation contract, and the real machines under simulation) | Required before task-64/task-65 qualification and task-66 |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -125,7 +125,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-61](#task-61) | Complete bounded observability and operator diagnostics | task-31, task-43, task-53, task-57 |
 | [task-62](#task-62) | Build and run the matched native WAN benchmark matrix | task-29, task-32, task-43, task-53, task-61 |
 | [task-63](#task-63) | Measure Kine end-to-end overhead and regression budgets | task-48, task-61, task-62 |
-| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15 |
+| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15, task-d18, task-d19, task-d20, task-d21, task-d22, task-d23, task-d24, task-d25, task-d26, task-d27, task-d28, task-d29, task-d30, task-d31, task-d32, task-d33 |
 | [task-65](#task-65) | Package and qualify supported deployment targets | task-43, task-48, task-59, task-60, task-61, task-d02, task-d04 |
 | [task-66](#task-66) | Close security, supply-chain and production release gates | task-58, task-59, task-60, task-63, task-64, task-65, task-d02, task-q01 |
 | [task-s01](#task-s01) | Define the portable engine contract and logical collection registry | task-02, task-04 |
@@ -173,6 +173,22 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d15](#task-d15) | Ask again for every vote the leader still needs | task-d07 |
 | [task-d16](#task-d16) | Say why each address of a dial failed | task-d03 |
 | [task-d17](#task-d17) | Say what a divergence stop compared | task-d12 |
+| [task-d18](#task-d18) | Never let a Sync lower a durable promise | task-20, task-26, task-d11 |
+| [task-d19](#task-d19) | Count only adoptions toward the slow majority | task-24, task-26, task-28 |
+| [task-d20](#task-d20) | Prove the largest Sync fits its row, or refuse the campaign | task-d05, task-d14 |
+| [task-d21](#task-d21) | Settle whether a recovery cycle is reachable, and never stall on one | task-26, task-d12 |
+| [task-d22](#task-d22) | End every collector entry the voters refuse | task-c01, task-c02, task-d14 |
+| [task-d23](#task-d23) | Tell a client what is known of its outcome | task-34, task-c02, task-d22 |
+| [task-d24](#task-d24) | Keep table room for recovery work | task-d08, task-d19, task-d20 |
+| [task-d25](#task-d25) | Make catch-up outpace the domain | task-d08, task-d18, task-d19 |
+| [task-d26](#task-d26) | State the resource contract and test its accounting | task-d20, task-d24, task-d25 |
+| [task-d27](#task-d27) | Wire quorum-safe forgetting into coordd | task-53, task-j04, task-d08, task-d26 |
+| [task-d28](#task-d28) | Let a recovery report survive a lost page | task-25, task-d05 |
+| [task-d29](#task-d29) | Write the failure and obligation contract | task-d18, task-d19, task-d22 |
+| [task-d30](#task-d30) | Run the real replica machines in the deterministic simulator | task-05, task-d18, task-d19 |
+| [task-d31](#task-d31) | Refuse epochs other than three or five voters and read the source fast set from its ballot | task-26, task-m01 |
+| [task-d32](#task-d32) | Reinstall a voter behind the forgetting floor as a learner | task-50, task-d27 |
+| [task-d33](#task-d33) | Hold the simulated domain to its budgets and to progress after healing | task-d22, task-d24, task-d26, task-d28, task-d30 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64 |
 
 ## Task specifications
@@ -1030,7 +1046,7 @@ The other two came out of chasing the WAN matrix's open finding with this task's
 <a id="task-64"></a>
 ### task-64: Run mixed-fault qualification and automatic minimization
 
-**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15.  
+**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15, task-d18, task-d19, task-d20, task-d21, task-d22, task-d23, task-d24, task-d25, task-d26, task-d27, task-d28, task-d29, task-d30, task-d31, task-d32, task-d33.  
 **Design:** Sections 12, 21, 23 G6.
 
 **Implement:** Minimize combined storage/network/clock/issuer/queue/format/lease/watch/handoff faults. Retain actual redb reference suite and reusable oracles; composed journal and observer integration is explicitly exercised by later qualification. Leader loss and re-election under every fault class is in the matrix, which is why task-d01 is a prerequisite: before it a leader-region outage is an outage of the domain, and the matrix would measure the absence of an election rather than its safety.
@@ -1646,6 +1662,200 @@ This is the top liveness priority. Without it a domain that has executed more th
 
 **Review boundary:** What a divergence stop says and what the collector's mismatch errors carry. No change to what is compared, to when a node stops, or to what it answers.
 
+<a id="task-d18"></a>
+### task-d18: Never let a Sync lower a durable promise
+
+**Prerequisites:** task-20, task-26, task-d11.  
+**Design:** Sections 4.8, 5.1.
+
+**Implement:** A voter that has promised ballot P1 durably and then accepts a `NewLeader` for P3 queues the promise row `{P3}` and publishes `Promise(P3)` once that row is durable. If P1's Sync arrives in between, `Follower::on_sync` accepts it: the Sync's ballot equals the durable promise, and unlike `may_vote` it never looks at a promise in flight. `BallotState::mark_synced` then builds `{promised: P1, synced: P1}` and queues it after the P3 row. The journal applies rows in order, so the durable promise ends at P1 after the voter told P3's candidate it would vote in nothing below P3, and a crash brings the voter back willing to vote in P1. A Sync of a ballot below a promise in flight is held, as a Sync ahead of the promise already is, and is installed only if that promise fails. Every write of the promise row, from a promise, a Sync or a seal, carries the highest promise already queued for disk, so no row that lands later can lower one that landed earlier.
+
+**Acceptance:** `a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise` (checklist review, D1/D4), which fails today, passes. A model test drives every order of `NewLeader` for two ballots, the lower ballot's Sync and the storage completions of their rows: in none is the durable promise below a ballot for which `Promise` was published, and the voter installs the lower Sync only when the higher promise's row failed.
+
+**Review boundary:** Sync admission against promises in flight and the content of promise-row writes. No change to the commit rule, the Sync's selection or any row format.
+
+<a id="task-d19"></a>
+### task-d19: Count only adoptions toward the slow majority
+
+**Prerequisites:** task-24, task-26, task-28.  
+**Design:** Sections 4.1, 4.9.
+
+**Implement:** `VoteSet::learned` and `learned_slow` count a fast-set member's fast acknowledgement toward the slow majority when its dependencies equal the leader's (the mapping cites the prototype's `acceptFastAndSlowAck`, `Dep == nil || leaderDep.Equals(dep)`). Recovery keeps a PRE-ACCEPT only through the possible-fast rule, which needs every reporting fast-set member to hold the command with the same path. With five voters and fast set {r0, r1, r2}, a command learned from r0's proposal, r1's fast acknowledgement and r3's adoption is re-proposed with new dependencies when r2 recovers from r1, r2 and r4, although the collector may have released its result. With three voters the fast set is a majority and the possible-fast rule covers it.
+
+Count only adoption acknowledgements toward the slow majority, leaving the fast predicate unchanged. Recovery cannot be made to keep the pre-accept instead: at five voters a recovering majority {r1, r2, r4} can hold two fast-set pre-accepts of one command, r1's with D and r2's with D′, and with neither the leader nor an ACCEPT copy among the reports, a slow decision through {r0, r1, r3} with D is indistinguishable from one through {r0, r2, r3} with D′. With adoptions only, a slow decision is the leader and `slow_size − 1` durable ACCEPT copies at its ballot, any majority of reports holds one, and selection already keeps ACCEPT at the source. The cost is latency only: every non-leader already adopts and sends its adoption acknowledgement, and `adopted_by` and the re-send already count adoptions only. The change reaches every learner that uses `VoteSet`: the leader's, the followers' `commit_learned` and the collector's release. The mapping's `acceptFastAndSlowAck` row becomes `[EXT: stricter]`, with this counterexample, and records that the paper's recovery appendix was not consulted and why the rule stands without it.
+
+**Acceptance:** `a_slow_decision_counting_a_fast_ack_survives_recovery` (checklist review, P5/P6), which fails today, passes. A bounded model for three and five voters joins learning with selection: for every vote set that learns a command and every majority of reports consistent with it, `select` keeps the command with the learned dependencies. A collector-level test shows the collector does not release a result on a fast acknowledgement counted as an adoption. The five-node Jepsen stop `release-record-mismatch(c96f0e70)` is read again against the fix and its conclusion recorded.
+
+**Review boundary:** The slow-learning predicate in `VoteSet`, every learner that uses it, and the mapping row. No change to the fast-learning predicate, the quorum policy, recovery selection or any row format.
+
+<a id="task-d20"></a>
+### task-d20: Prove the largest Sync fits its row, or refuse the campaign
+
+**Prerequisites:** task-d05, task-d14.  
+**Design:** Sections 4.9, 5.3.
+
+**Implement:** `MAX_COMMAND_TABLE_CAPACITY` (1536) rests on one test that sizes a Sync from three disjoint reports whose entries carry no admission digest. A campaign selects over every complete report it holds, up to five; entries carry a digest since task-d14; adoptions past capacity and every pending Sync entry go into a report; and `sync_pending` is never cleared between Syncs, so a voter behind across failed ballots reports more each time. The candidate binds with `sync_update(..).expect("bounded")` and every installer writes the same way, so a Sync over the row limit ends the process in the middle of an election. Bound what a report may carry and clear pending Sync entries a later Sync supersedes. Derive the capacity limit from a measured worst case with real entries and five reports, or cap what a selection may carry. A Sync that would still not fit refuses the campaign with a named error.
+
+**Acceptance:** At the largest capacity, five disjoint reports of the most a report may carry, every entry with its digest, give a Sync that encodes within the row and the frame; the same test at one entry more is refused with the named error and does not panic. A voter behind through three failed ballots reports no more than one ballot's worth.
+
+**Review boundary:** Report and Sync size bounds, `sync_pending` retention, the capacity limit and the campaign's refusal. No change to the selection rule or the Sync format.
+
+<a id="task-d21"></a>
+### task-d21: Settle whether a recovery cycle is reachable, and never stall on one
+
+**Prerequisites:** task-26, task-d12.  
+**Design:** Sections 4.7, 4.9.
+
+**Implement:** When the commands a new leader re-proposes depend on each other in a cycle, the ordering loop in `Leader::from_recovered` stops without an error and leaves the rest unproposed, so the ballot waits on commands no one will propose. A named error alone would only turn the silent stall loud, since every later campaign sees the same reports. First argue whether a cycle is reachable. The loop's comment covers ACCEPT copies from the source ballot only, which one leader's order cannot make cyclic; selection also merges commits from lower ballots (task-d12) and possible-fast candidates carrying their reporters' own dependencies, and whether `guard_accept` rules out every mixed case is to be argued, not assumed. If a cycle is reachable, resolve it deterministically in a way that keeps every decided command's dependencies. If it is not, a cycle is an invariant violation: the node stops as on a divergence, naming the commands, and the selection is not retried as an ordinary failure.
+
+**Acceptance:** The reachability argument is recorded in the notes and the mapping. If reachable, a selection with such a cycle completes and the domain serves, with every decided command's dependencies unchanged. If unreachable, a constructed cycle stops the node with the commands named, and nothing more is proposed.
+
+**Review boundary:** The re-proposal ordering and what it does on a cycle. No change to what is selected.
+
+<a id="task-d22"></a>
+### task-d22: End every collector entry the voters refuse
+
+**Prerequisites:** task-c01, task-c02, task-d14.  
+**Design:** Sections 4.3, 6.5.
+
+**Implement:** A voter answers three refusals with no effect at all: a request under another admission's facts (`RequestFactsConflict`), another payload under a bound identity, and a duplicate whose payload it has forgotten. The collector removes an entry only when it settles, so such an entry stays pending for good and holds one of the domain's pending slots; once a key's binding leaves the resolved window, a new payload under that key is new work again. A ballot change voids the evidence the collector counted and nothing asks for it again, so a command that executed under the old ballot never settles; evidence addressed to a closed remote connection is dropped. Every refusal is answered with an explicit reply the collector settles on. A pending entry that holds neither half is solicited again after a bounded time and then resolved from the durable record. A ballot change solicits evidence again for every pending entry.
+
+**Acceptance:** A session sends 256 retries that the voters refuse, one per pending slot, and the domain still serves new work. A command executed under a ballot that changed before its evidence reached the collector settles under the new one. Each refusal kind has a test showing the reply and the settled entry.
+
+**Review boundary:** Voter replies to refused submissions, the collector's escalation of a pending entry and its re-solicitation on a ballot change. No change to what a voter accepts or to the evidence rules.
+
+<a id="task-d23"></a>
+### task-d23: Tell a client what is known of its outcome
+
+**Prerequisites:** task-34, task-c02, task-d22.  
+**Design:** Sections 6.5.
+
+**Implement:** The output gate answers `NOT_ADMITTED` when it withholds the result of a command that executed, and the SDK maps `NOT_ADMITTED` to a definite failure. `ResolveRequest` is answered from the collector's memory alone, so an outcome evicted from the resolved window, or asked of another frontend, is `Unknown` even when the node holds the executed record, and the SDK treats `Unknown` as final; `retry()` after it replays the stored outcome and sends nothing. A withheld result gets its own status, distinct from not admitted. `ResolveRequest` consults the durable record. The SDK gains a "retired, result unavailable" outcome, and `retry()` after `Unknown` submits again under the same identity.
+
+**Acceptance:** A command that executed and whose output is withheld is never reported as not admitted. A resolve through a frontend that never saw the request returns the executed result from the record. A resolve past the retained window says retired rather than unknown. A retry after `Unknown` reaches the voters and returns the retained result.
+
+**Review boundary:** Outcome statuses on the wire and in the SDK, and the resolve path's durable lookup. No change to authorization of output.
+
+<a id="task-d24"></a>
+### task-d24: Keep table room for recovery work
+
+**Prerequisites:** task-d08, task-d19, task-d20.  
+**Design:** Sections 5.3, 13.
+
+**Implement:** Work that finishes or recovers admitted commands can be refused by a full table. Installing a Sync entry drops its placeholder silently under backpressure, and the payload that follows goes through the bounded path, so only catch-up gets such an entry in. A record no Sync selected and no history names keeps its slot until the command is decided somewhere (task-d08's recorded residual). Sync entries enter a full table as pulled commands do. A share of the table is reserved for recovery and catch-up work. In the Sync's own install batch, as task-d11 puts its demotions there, the records present when the Sync is installed that it neither selected nor re-proposed are released from the table and the key index is repaired. No ballot has to be tracked per record: a record the new leader proposes after the Sync does not exist yet at installation, and a restart resumes the installation from the Sync row, so nothing proposed after it is released this way. The Sync is selected from a majority's reports, and selection keeps every command a quorum of an earlier ballot could have decided (at five voters only once task-d19 is in), so a command it leaves out cannot have been decided below its ballot. A later decision then reaches this voter as any other command does, through the leader or catch-up. The argument is recorded with the change, and no voter outside the majority is waited for. This takes up task-d08's residual on records decided nowhere (its requirement 7).
+
+**Acceptance:** A voter with a full table installs a Sync whose entries it lacks and executes them. A table filled with records decided nowhere drains after the next Sync, with one voter permanently absent, and new work is admitted without `Backpressure`. A record the Sync selected or re-proposed, or one proposed after it, is never released. New admission never takes the reserved share.
+
+**Review boundary:** Table admission of recovery work, the reservation and the release of undecided records. No change to the selection or commit rules.
+
+<a id="task-d25"></a>
+### task-d25: Make catch-up outpace the domain
+
+**Prerequisites:** task-d08, task-d18, task-d19.  
+**Design:** Sections 5.4, 13.
+
+**Implement:** Catch-up installs one pulled command, waits for its batch to be durable, executes it and only then installs the next, so a voter pulls about 100 commands a second on the test host and never closes its gap under a load above that. Install a window of up to a page (64 commands and 1 MiB) in one batch ahead of execution. The dependency chain is total (task-d06), so a window of decided commits with dependency rows executes in the donor's positions through the ordinary learner, and a command whose donor kept no dependency row is a window of its own. After a restart the first ask starts at the `executed_through` read at boot, so every row executed since then is compared with the donor's and no comparison is lost. Catch-up can outpace only a domain that leaves execution headroom; task-d26's contract bounds the admitted rate below what a catching-up voter executes, and says so.
+
+**Acceptance:** The unthrottled `follower-out` run (about 113 appends a second, a follower 3400 behind at its restart) catches up and serves, with catch-up's rate reported beside the domain's. A crash at every point of a window resumes without executing anything twice, and every row executed after the boot frontier is compared with the donor's.
+
+**Review boundary:** Windowed installation and its restart path, as its own PR on task-d08. No change to the page format or the donor's rules.
+
+<a id="task-d26"></a>
+### task-d26: State the resource contract and test its accounting
+
+**Prerequisites:** task-d20, task-d24, task-d25.  
+**Design:** Sections 5.3, 13.
+
+**Implement:** The configuration names limits for a request, a response, a session's outstanding requests, the table and checkpoints, and nothing more. Write a resource contract in the design with separate limits for memory, durable protocol data, application data, a single message, each queue and temporary files. Bound the admitted rate below the rate at which a catching-up voter executes (task-d25), so a returning voter's recovery time is bounded. Account for peaks, not the steady state: the candidate's report pages and their clones, the Sync's encoding, receive-side reassembly of partly arrived frames, and the executor's working set. Bound the per-boot bindings and the executed-history set, and make `advance_sync` stop rescanning every pending entry each round.
+
+**Acceptance:** Each limit has a test that drives it and fails when it is exceeded. A long run shows memory flat in history once admission stops.
+
+**Review boundary:** The contract text, the accounting and the bounds it adds. No change to protocol messages or rows.
+
+<a id="task-d27"></a>
+### task-d27: Wire quorum-safe forgetting into coordd
+
+**Prerequisites:** task-53, task-j04, task-d08, task-d26.  
+**Design:** Sections 5.3, 5.4.
+
+**Implement:** Quorum-safe floors and trim exist as libraries (task-51 to task-53), and `coordd` wires none of them: the payload, executed, dependency and proposal rows, session rows and retry records are never reclaimed, so disk grows with history and recovery reads grow with it. Wire the floor into `coordd`; trim every row below it that no voting, recovery, dependency resolution, execution or deduplication path still needs; reclaim abandoned sessions' rows and retry records; check disk headroom before publishing a checkpoint. A voter behind the floor, which catch-up can no longer serve, stops with a named reason and waits for task-d32.
+
+**Acceptance:** A long run keeps disk bounded by the floor's distance. A voter held down past the floor stops, naming the floor and its own frontier, and serves nothing. A crash at every step of a trim leaves either the old or the new floor, never less.
+
+**Review boundary:** Floor wiring, trim and reclamation. No change to the floor's certificate format.
+
+<a id="task-d28"></a>
+### task-d28: Let a recovery report survive a lost page
+
+**Prerequisites:** task-25, task-d05.  
+**Design:** Sections 4.9.
+
+**Implement:** A voter publishes each recovery report page once, on a lane that drops when full, and nothing asks for a missing page, so one lost page costs the whole ballot. A regenerated report for the same ballot is refused as inconsistent. The candidate asks for the pages it lacks, a voter answers from the same report version, and the candidate's assembler is bounded across ballots.
+
+**Acceptance:** With one page of each report dropped, the campaign completes in its ballot. Repeated interrupted campaigns leave the candidate's memory flat.
+
+**Review boundary:** Page retransmission and assembler bounds. No change to the report format.
+
+<a id="task-d29"></a>
+### task-d29: Write the failure and obligation contract
+
+**Prerequisites:** task-d18, task-d19, task-d22.  
+**Design:** Sections 1.2, 4.8, 5.1.
+
+**Implement:** The failure model, the transitions and the obligations they create are spread across the design, the collector specification and the notes. Write one section: tolerated failures, restart semantics, storage and corruption handling, and what restores progress; the eight transitions (receipt, admission, durable protocol state, evidence publication, decision, application, response, retirement) and which create obligations; an owner, a trigger and an escalation for each obligation; and the conditional argument that, once faults stop and admission pauses, the finite outstanding work completes. Have the harness refuse to initialize over a voter whose state is gone, as design Section 5.4 requires.
+
+**Acceptance:** Every obligation named in the section has a test showing its owner acting after the fault it covers. The harness refuses a wiped voter. The document checks pass.
+
+**Review boundary:** Design text and the harness refusal. No protocol change.
+
+<a id="task-d30"></a>
+### task-d30: Run the real replica machines in the deterministic simulator
+
+**Prerequisites:** task-05, task-d18, task-d19.  
+**Design:** Sections 12.1, 12.3.
+
+**Implement:** `coord-sim` runs only reference actors, and the multi-node tests that run `Leader` and `Follower` drop messages by hand for a few seeds. Drive the real machines in the simulator under loss, duplication, reordering, crashes and restarts at table capacity 32, for three and five voters, with a protocol oracle: one order of committed commands on every replica, promises never lowered, and every learned decision recovered with its dependencies. Failing seeds are saved as fixtures. This is what finds the next bug of task-d18's or task-d19's kind before Jepsen does; the budget and progress oracles are task-d33.
+
+**Acceptance:** The checklist's failure-test matrix rows 1 to 4 and 10 run at both sizes under the protocol oracle and pass. The oracle finds the bugs task-d18 and task-d19 fix when their fixes are reverted.
+
+**Review boundary:** Simulator wiring and the protocol oracle. No production code change beyond the hooks the simulator needs.
+
+<a id="task-d31"></a>
+### task-d31: Refuse epochs other than three or five voters and read the source fast set from its ballot
+
+**Prerequisites:** task-26, task-m01.  
+**Design:** Sections 1.4, 4.2.
+
+**Implement:** The configuration validator accepts one, two and four voters, while the design allows three or five and no four-voter epoch. Recovery computes the source ballot's fast set with `c2_default`, while `verify_ballot` accepts C1 or any valid C2 set, so a ballot with another fast set would be recovered against the wrong one. Every production path builds `c2_default` today (`serve.rs`, `main.rs`, `follower.rs`), so the mismatch cannot happen yet. Refuse two and four voters. Single-voter domains are used by many `coordd` tests (`bins/coordd/tests/cli.rs`) and supported in `peers.rs` and `config.rs`, so before refusing one voter, list the tests and harness paths that start one and either keep one voter as an explicit test-only profile or move them to three. Have recovery read the fast set from the source ballot's configuration.
+
+**Acceptance:** Two- and four-voter manifests are refused at validation, and one voter is either refused or allowed only under the named test profile, with every existing single-voter test accounted for. A recovery whose source ballot has a non-default fast set applies the possible-fast rule to that set.
+
+**Review boundary:** Configuration validation and recovery's fast-set source. No change to the quorum policy.
+
+<a id="task-d32"></a>
+### task-d32: Reinstall a voter behind the forgetting floor as a learner
+
+**Prerequisites:** task-50, task-d27.  
+**Design:** Sections 5.4, 17.6.
+
+**Implement:** Once task-d27 trims below the floor, a voter whose frontier is below it cannot be served by catch-up, which pulls executed history the peers no longer hold. Such a voter is reinstalled as a learner with a new generation through task-50's install, from a peer's shared checkpoint at or above the floor, keeping nothing of its old obligations, and rejoins voting only through the path design Section 5.4 names.
+
+**Acceptance:** A voter held down past the floor is reinstalled, catches up from the checkpoint and the suffix above it, and its executed rows above the checkpoint equal the leader's. A crash at every step of the reinstall leaves either the old stopped voter or the installed learner. Its old promises and acceptances are never reported.
+
+**Review boundary:** The reinstall trigger and its wiring to task-50's install. No change to the checkpoint format or to how a learner becomes a voter.
+
+<a id="task-d33"></a>
+### task-d33: Hold the simulated domain to its budgets and to progress after healing
+
+**Prerequisites:** task-d22, task-d24, task-d26, task-d28, task-d30.  
+**Design:** Sections 12.3, 13.
+
+**Implement:** Add to task-d30's simulator a budget oracle, which checks every limit of task-d26's resource contract at its peak, and a progress oracle, which checks that once faults stop and admission pauses every admitted command settles and every voter executes as far as the leader.
+
+**Acceptance:** The checklist's failure-test matrix rows 5, 9, 12 and 14 run at three and five voters and pass, along with task-d30's rows under the new oracles. The oracles find the bugs task-d22 and task-d28 fix when their fixes are reverted, and a budget violation when task-d24's reservation or task-d26's bounds are removed.
+
+**Review boundary:** The two oracles and the scenarios they add. No production code change beyond the hooks the simulator needs.
+
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report
 
@@ -1666,7 +1876,7 @@ task-s01, task-s02 feed the strict storage reference through task-07. Optional t
 
 G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacement/restore/upgrade through task-60 rather than merely all-voter task-51, and G6 task-66 including task-q01. Fixed-member observer previews may precede dynamic membership, but general production combines both. Code merged is not evidence that acceptance passed.
 
-**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption, and becomes a prerequisite of task-m03. The unenforced `max_request_bytes` bound is a follow-up on task-c01, in its own PR. A review of what a manual test on separate hosts would meet added two more: task-d03 re-dials peers and collector links on a timer, since both planes are dialled once at startup and every connection ends at the transport's age cap, so a mesh heals today only by restarting nodes; it is a prerequisite of task-d01 and task-64. task-d04 provisions a multi-host test domain from the harness and writes the runbook; it is a prerequisite of task-65. The Jepsen client's leader-kill run added one more: task-d05 bounds recovery reports and Syncs by what the voters executed, since both carry the whole history today and an election after enough of it cannot complete or leaves the new ballot refusing work; it is a prerequisite of task-64, and task-d04's real-hosts run waits on it. The same client's runs found two more. task-d06 keeps one execution order on every replica when a table reclaims: retiring a key's latest command broke the dependency chain, so a follower behind a full leader executed the committed commands in another order and answered from it; being safety, it goes ahead of task-d05. task-d07 re-sends a proposal until every voter has voted on it, since a proposal a voter never received (not linked yet, refused by a full lane, or ahead of its Sync) is never sent again and that voter holds everything after it until a Sync. Both are prerequisites of task-64. A later reading of the Jepsen runs found that no domain served past its first election: task-d05 is its first cause and becomes the top liveness priority, with the table capacity made configuration as its first commit, and task-d07 its second, broadened from a missed proposal to every proposal a voter did not receive. They follow task-d06 in that order. The five-node Jepsen runs found one root cause behind the stall that remained: a follower learns a decision only from its peers' acknowledgements, each sent once on a lane that drops, so one missed quorum stops it for good. task-d09 has the leader carry its commit frontier to every voter; it is the top liveness priority. task-d10 then makes catch-up flow-controlled and driven by each voter's own frontier, and task-d08 wires the design's checkpoint catch-up for a voter behind the leader's retention. All three are prerequisites of task-64. The stress runs with those carried found a recovery gap: a Sync installs only its entries, so an acceptance of an earlier ballot survives it and is reported as the new ballot's. task-d11 demotes such an acceptance at installation; it is a prerequisite of task-64, ahead of the next five-node run. The next stress and Jepsen runs found both safety failures that remained to be one fork: a new leader chained its first fresh proposal after an old command it had executed long before, not after its tail. task-d12 anchors the new leader's chain at what it executed and has the collector compare a late release with the answer it gave; it is a prerequisite of task-64. The node that stops on a divergence serves again after a restart; task-d13 keeps it stopped until catch-up rebuilds it, and is planned behind task-d08. The stress runs with task-d10's refusal carried found a stall that the refusal only hid: a new leader re-proposed a recovered command under the facts of its own presentation, and a follower that had accepted another presentation never voted on it. task-d14 has recovery name the facts a command was accepted under; it is a prerequisite of task-64. The stress run rep108-3 then showed what repaf-4, and most likely raf-2, had been: a leader that never learned a proposal whose acknowledgement it lost behind a counted one, since task-d07's re-send stopped asking for it; task-d15 has the leader ask again for every vote it still needs, amending task-d07's rule, and is a prerequisite of task-64. Every failed peer dial in those runs said TLS alert 120, which is the other plane's listener refusing a dial by design; a dial logged only the last address's error, so why the right address failed was never seen. task-d16 has a dial say why each address failed. A five-node Jepsen run stopped a node on `release-record-mismatch` and kept no store to read it from, and the stop said only the command's first bytes; task-d17 has the stop say what it compared, both sides and this node's executed rows around them. A checkpoint cannot be installed into a live voter and nothing trims the rows a peer would serve, so task-d08 brings a lagging voter up from a peer's executed history instead, taking in task-d10's catch-up, and task-d13 leaves a diverged node to replacement. None of these changes the design: each is work the design already required and the plan had not named.
+**v1.5 amendment, from review of the open implementation PRs.** Three runtime gaps the task PRs recorded as unowned now have owners. task-d01 wires leader election and ballot adoption into `coordd` (recorded on task-j08); it is a prerequisite of task-64 and task-m05, and the open regional-failover row of task-48 waits on it. task-d02 drives leaf renewal inside the serving daemon (recorded on task-58); it is a prerequisite of task-65 and task-66. task-43 verifies the genesis signature at `init` and at start (recorded on task-58). Committed voting-key/incarnation replacement moves from task-58 to task-m03, where a committed membership is first installed into a running daemon, with its interrupted cases under task-m05; task-58 keeps classification, fencing and the durable adoption, and becomes a prerequisite of task-m03. The unenforced `max_request_bytes` bound is a follow-up on task-c01, in its own PR. A review of what a manual test on separate hosts would meet added two more: task-d03 re-dials peers and collector links on a timer, since both planes are dialled once at startup and every connection ends at the transport's age cap, so a mesh heals today only by restarting nodes; it is a prerequisite of task-d01 and task-64. task-d04 provisions a multi-host test domain from the harness and writes the runbook; it is a prerequisite of task-65. The Jepsen client's leader-kill run added one more: task-d05 bounds recovery reports and Syncs by what the voters executed, since both carry the whole history today and an election after enough of it cannot complete or leaves the new ballot refusing work; it is a prerequisite of task-64, and task-d04's real-hosts run waits on it. The same client's runs found two more. task-d06 keeps one execution order on every replica when a table reclaims: retiring a key's latest command broke the dependency chain, so a follower behind a full leader executed the committed commands in another order and answered from it; being safety, it goes ahead of task-d05. task-d07 re-sends a proposal until every voter has voted on it, since a proposal a voter never received (not linked yet, refused by a full lane, or ahead of its Sync) is never sent again and that voter holds everything after it until a Sync. Both are prerequisites of task-64. A later reading of the Jepsen runs found that no domain served past its first election: task-d05 is its first cause and becomes the top liveness priority, with the table capacity made configuration as its first commit, and task-d07 its second, broadened from a missed proposal to every proposal a voter did not receive. They follow task-d06 in that order. The five-node Jepsen runs found one root cause behind the stall that remained: a follower learns a decision only from its peers' acknowledgements, each sent once on a lane that drops, so one missed quorum stops it for good. task-d09 has the leader carry its commit frontier to every voter; it is the top liveness priority. task-d10 then makes catch-up flow-controlled and driven by each voter's own frontier, and task-d08 wires the design's checkpoint catch-up for a voter behind the leader's retention. All three are prerequisites of task-64. The stress runs with those carried found a recovery gap: a Sync installs only its entries, so an acceptance of an earlier ballot survives it and is reported as the new ballot's. task-d11 demotes such an acceptance at installation; it is a prerequisite of task-64, ahead of the next five-node run. The next stress and Jepsen runs found both safety failures that remained to be one fork: a new leader chained its first fresh proposal after an old command it had executed long before, not after its tail. task-d12 anchors the new leader's chain at what it executed and has the collector compare a late release with the answer it gave; it is a prerequisite of task-64. The node that stops on a divergence serves again after a restart; task-d13 keeps it stopped until it is replaced (Section 5.4); catch-up adds to a history and cannot undo one. The stress runs with task-d10's refusal carried found a stall that the refusal only hid: a new leader re-proposed a recovered command under the facts of its own presentation, and a follower that had accepted another presentation never voted on it. task-d14 has recovery name the facts a command was accepted under; it is a prerequisite of task-64. The stress run rep108-3 then showed what repaf-4, and most likely raf-2, had been: a leader that never learned a proposal whose acknowledgement it lost behind a counted one, since task-d07's re-send stopped asking for it; task-d15 has the leader ask again for every vote it still needs, amending task-d07's rule, and is a prerequisite of task-64. Every failed peer dial in those runs said TLS alert 120, which is the other plane's listener refusing a dial by design; a dial logged only the last address's error, so why the right address failed was never seen. task-d16 has a dial say why each address failed. A five-node Jepsen run stopped a node on `release-record-mismatch` and kept no store to read it from, and the stop said only the command's first bytes; task-d17 has the stop say what it compared, both sides and this node's executed rows around them. A checkpoint cannot be installed into a live voter and nothing trims the rows a peer would serve, so task-d08 brings a lagging voter up from a peer's executed history instead, taking in task-d10's catch-up, and task-d13 no longer waits on it. A review of the stack against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)) found two safety bugs, each shown by a failing test, and gaps in bounds and ownership; it adds task-d18 through task-d33, all prerequisites of task-64, in this order. Safety first: task-d18 keeps a Sync from lowering a durable promise, task-d19 counts only adoptions toward a slow decision so that recovery keeps every one at five voters, task-d21 settles whether a recovery cycle is reachable and never stalls on one, and task-d30 runs the real replica machines in the simulator under a protocol oracle. Then bounded recovery time: task-d20 proves the largest Sync fits its row or refuses the campaign, task-d28 lets a report survive a lost page, task-d24 keeps table room for recovery work and releases records decided nowhere, task-d25 makes catch-up outpace the domain with windowed installation, and task-d22 ends every collector entry the voters refuse. Then bounded storage: task-d26 states the resource contract, task-d27 wires quorum-safe forgetting into `coordd`, and task-d32 reinstalls a voter behind its floor as a learner. Then the contract: task-d23 tells a client what is known of its outcome, task-d29 writes the failure and obligation contract, task-d31 refuses voter counts other than three or five and reads the source fast set from its ballot, and task-d33 holds the simulated domain to its budgets and to progress after healing. None of these changes the design: each is work the design already required and the plan had not named.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
