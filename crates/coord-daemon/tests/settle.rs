@@ -6,7 +6,12 @@
 //! never settle here does not keep the ones behind it from being looked
 //! at, however many turns it stays pending.
 
-use coord_daemon::settle::window;
+use coord_collector::SettleError;
+use coord_daemon::settle::{Settled, offer, window};
+use coord_storage::codecs::RetryRecordV1;
+use coord_types::CommandId;
+use coord_types::identity::Digest32;
+use coord_types::ids::ExecutionPosition;
 
 #[test]
 fn a_turn_takes_at_most_its_bound_and_the_next_turn_continues() {
@@ -62,4 +67,53 @@ fn a_list_shorter_than_the_bound_is_taken_whole_and_once() {
 fn nothing_half_held_or_no_budget_is_nothing() {
     assert_eq!(window(Vec::<u32>::new(), 9, 16), (Vec::new(), 0));
     assert_eq!(window(vec![1u32, 2], 0, 0), (Vec::new(), 0));
+}
+
+fn record(n: u8) -> (CommandId, RetryRecordV1) {
+    let command = CommandId(Digest32([n; 32]));
+    (
+        command,
+        RetryRecordV1 {
+            command_id: command,
+            position: ExecutionPosition::new(u64::from(n)).unwrap(),
+            revision: None,
+            response: vec![n],
+            result_digest: Digest32([n; 32]),
+        },
+    )
+}
+
+/// What the collector passes over is passed over; what it settles goes
+/// out, and is counted whether or not it has a delivery.
+#[test]
+fn a_turn_without_a_mismatch_sends_what_settled() {
+    let turn = offer((1..=4).map(record), |c, _| match c.as_bytes()[0] {
+        1 => Ok(Some(1)),
+        2 => Err(SettleError::Uncorroborated),
+        3 => Ok(None),
+        _ => Err(SettleError::NotPending),
+    });
+    assert_eq!(
+        turn,
+        Settled::Offered {
+            settled: 2,
+            deliveries: vec![1],
+        }
+    );
+}
+
+/// A mismatch ends the turn: what was settled before it does not go out,
+/// and nothing after it is offered (task-d06).
+#[test]
+fn a_mismatch_ends_the_turn_and_sends_nothing() {
+    let mut offered = Vec::new();
+    let turn = offer((1..=3).map(record), |c, _| {
+        offered.push(c.as_bytes()[0]);
+        match c.as_bytes()[0] {
+            2 => Err(SettleError::Mismatch),
+            n => Ok(Some(n)),
+        }
+    });
+    assert_eq!(turn, Settled::Diverged(record(2).0));
+    assert_eq!(offered, vec![1, 2]);
 }

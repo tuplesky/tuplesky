@@ -48,7 +48,7 @@ use coord_core::outbox::BarrierAllocator;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node, Outbound};
 use coord_daemon::parked::Parked;
-use coord_daemon::settle::records_for;
+use coord_daemon::settle::{Settled, offer, records_for};
 use coord_daemon::voter::{Origin, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
@@ -899,6 +899,49 @@ fn the_record_alone_settles_nothing() {
         Err(SettleError::Uncorroborated)
     );
     assert!(w.collector.is_pending(&command));
+}
+
+/// A record the leader's release contradicts stops the turn (task-d06).
+///
+/// The collector holds the leader's release, and this node's own record
+/// of the command says something else: the node executed the domain's
+/// commands in another order than the leader. The turn ends there with
+/// the command named, and nothing is settled from the record. The same
+/// record, read correctly, settles the command, so it is the
+/// contradiction and not the path that stops it.
+#[test]
+fn a_record_the_release_contradicts_stops_the_turn() {
+    let mut w = Cluster::new(256);
+    w.run_to_half_held(1);
+    let command = w.command(1);
+    let records = records_for(w.voters[0].node().applier(), [(command, retry_key(1))]);
+    assert_eq!(records.len(), 1);
+    let mut forked = records[0].1.clone();
+    forked.response.push(0xff);
+    let mut offered = 0;
+    let turn = offer([(command, forked.clone()), (command, forked)], |c, r| {
+        offered += 1;
+        w.collector
+            .settle_from_record(c, r.result_digest, r.revision, &r.response)
+            .map(Some)
+    });
+    assert_eq!(turn, Settled::Diverged(command));
+    assert_eq!(offered, 1, "nothing is offered after the mismatch");
+    assert!(w.collector.is_pending(&command), "nothing was settled");
+    let turn = offer(records, |c, r| {
+        w.collector
+            .settle_from_record(c, r.result_digest, r.revision, &r.response)
+            .map(Some)
+    });
+    let Settled::Offered {
+        settled: 1,
+        deliveries,
+    } = turn
+    else {
+        panic!("the true record did not settle: {turn:?}");
+    };
+    assert!(matches!(deliveries[..], [Progress::Released(_)]));
+    assert!(!w.collector.is_pending(&command));
 }
 
 /// A follower that campaigns while the leader is away leads the next

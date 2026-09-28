@@ -3717,6 +3717,16 @@ ledger, or a durable "executed" answer is a protocol decision for
 `coord-consensus`, and this change does not make it. The plan now owns
 it as task-d05, a prerequisite of task-64.
 
+**A limit of this change: a campaign that is making progress is still
+abandoned.** The election timer gives a campaign until its ceiling
+(16 s). A candidate still gathering payloads when that passes is
+replaced by the next ballot, which starts from scratch, even if it had
+most of what it needed. With the whole history to fetch at eight
+payloads an answer, that is how a restarted voter campaigned for ever
+in the Jepsen runs. With task-d05 a campaign fetches only the live
+window, so it is short and this rarely matters. It is recorded here
+because task-d05 removes it in practice, not by design.
+
 ## A request bound that bounded nothing
 
 The task-c01 follow-up. `limits.max_request_bytes` sized the collector's
@@ -3801,3 +3811,137 @@ The tests:
   so what refuses it is the pin and not the signature.
 - A `coord-membership` test covers the PEM round trip, a wrong key, and
   a key on another curve.
+
+## A retired command stays its key's latest
+
+task-d06, from finding 1 of the Jepsen client (#98). The client's run
+was `:valid? false`: G1a, a lost update, incompatible orders on about
+twenty keys, and a PL-1 cycle, all through one follower. The pause stress
+driver reproduced it without Jepsen, in ballot 0 with no election. A
+follower acknowledged about thirty appends as `ok` and served reads
+showing them, while the other voters read a different continuation from
+the same point; its log then showed `release-record-mismatch` for one
+command, past two thousand times.
+
+**Cause.** Every command is initialized on the conservative key, and
+depends on that key's latest command. That is what makes the chain total.
+`CommandTable::retire` cleared the key's latest when it retired it.
+`initialize` reclaims -- retiring every executed record -- exactly when
+the table is full, and before it computes the dependencies. So the first
+command a full leader proposed named no dependency at all.
+
+- On the leader nothing looked wrong: everything it retired had executed
+  there.
+- A follower still behind the command that should have been named (a
+  payload missing, its own table full, a proposal dropped) found the new
+  command committed and ready, with nothing ordering it after the
+  backlog, and executed it first.
+- Same committed set, two execution orders: a fork right after the common
+  prefix.
+
+The review proposed a ten-line test that decides it. Before the fix, the
+command initialized after a reclaim had no dependencies.
+
+**Fix.** `retire` keeps the key's latest.
+- A replica that already executed it reads the tombstone as EXECUTED.
+- A lagging replica waits until it has executed it, which is the order
+  every replica must keep.
+- The tombstone of a command that is still some key's latest is never
+  evicted by the recency bound, so the guards always answer for what the
+  next proposal on that key names. There is at most one per key, and each
+  goes in its turn once a newer command has taken its key.
+
+**The same break at an election.** The review of #99 found the chain
+broken a second way. A key's latest command is written by `initialize`,
+which on a follower runs when a payload arrives, so a follower's latest
+is the last payload to reach it, in arrival order, not the leader's
+proposal order. `accept` and `adopt` never move it. A follower that wins
+re-proposes the recovered order through `repropose`, which only accepts,
+so its first fresh proposal named whatever payload had reached it last.
+That can be a command in the middle of the recovered order. A voter
+holding the tail committed but without its payload then found the fresh
+command ready and executed it first: the same fork as the reclaim, at a
+ballot change. `Leader::from_recovered` already computed the tail, to
+chain the re-proposed set after it, and did not store it. Now it
+anchors the tail as the conservative key's latest (`CommandTable::anchor`,
+the third place that writes it, beside `initialize` and `restore`), so
+the first fresh command of a ballot depends on it.
+
+`restore` rebuilds the latest as the record nothing else depends on, and
+picks the largest identity if there are several. The review suggested
+asserting there is exactly one. That does not hold for every table a
+restart can find. A follower's record starts with the dependencies of
+its own arrival order and takes the leader's when it accepts, so before
+every record has been accepted the two orders can give two tails, or
+none. So there is no assertion there.
+
+**Divergence stops the node.** A `release-record-mismatch` means the
+leader's release of a command and this node's own execution record of it
+disagree, so this node executed the committed commands in another order.
+It used to be a recurring log line. Now `settle_from_records` returns it
+at once, sending none of the deliveries it had settled in that pass from
+the same record. The serve loop then stops right there, with
+`this node stopped: release-record-mismatch(<id>) ...`, before it
+re-offers, re-dials or takes another event, so no retry is answered from
+that record after the mismatch is seen. A first version recorded the
+mismatch and stopped at the top of the next pass, which left the rest of
+the batch and one event in between (review of #99). The decision is
+`coord_daemon::settle::offer`. It stops at the first mismatch and returns
+the command, and returns nothing that pass had settled. `serve.rs` stops
+the node on that answer.
+
+**What the frontend trusts.** Two paths answer a caller from this node's
+own execution record rather than from the leader's release, and both are
+sound only if every replica executes the committed commands in one
+order. This task is what makes that hold when a table reclaims.
+- `settle_from_records`: when the collector holds a command's votes but
+  not its release, it answers with the local response, and nothing
+  cross-checks it.
+- `retained_answer`: it answers a retry from the local record before
+  admission.
+
+The mismatch stop covers only the case where a release is held and
+disagrees. The votes-only case has nothing to compare against.
+
+### What the tests show
+
+- `graph.rs` `the_command_after_a_reclaim_still_depends_on_the_last_one`:
+  the review's test. A table at capacity, every record executed, one more
+  initialize: its dependency is the last command, which is retired and
+  answered for by its tombstone.
+- `graph.rs` `a_keys_latest_tombstone_outlives_the_bound`: a quiet key's
+  latest keeps its tombstone through many retirements on a busy key, and
+  the next command on it passes the guard. Once superseded, it goes in
+  its turn.
+- `activation.rs` `a_follower_behind_a_full_leader_executes_in_the_leaders_order`:
+  r2 never gets command 32's payload, and the full leader proposes 33
+  after a reclaim. Without the fix, r2 executes 33 before 32. With it, r2
+  waits, and once the payload arrives it executes both in the leader's
+  order.
+- `activation.rs` `a_new_leaders_first_command_follows_the_recovered_tail`:
+  the review's election case. r2 receives C's payload before B's, while
+  the leader ordered B then C. r1 holds C committed, without its payload.
+  r2 wins. Without the anchor, D names B, and r1 executes B, D where r2
+  executes B, C. With it, D names C, r1 waits for C's payload, and every
+  voter executes B, C, D.
+- `settle.rs` `a_mismatch_ends_the_turn_and_sends_nothing` and
+  `a_turn_without_a_mismatch_sends_what_settled`: `offer`'s stop, and
+  what it sends when nothing disagrees. `repair.rs`
+  `a_record_the_release_contradicts_stops_the_turn` stages the mismatch
+  through a real collector holding the leader's release. The
+  contradicting record stops the turn and settles nothing, and the true
+  record settles the command.
+- `graph.rs`
+  `a_hot_key_keeps_working_after_its_executed_predecessor_is_retired`
+  pinned the old rule: after the key's latest was retired, the next
+  command depended on nothing. It now requires the dependency on the
+  retired latest.
+
+### What is left
+
+- A follower that missed a proposal never learns the command, and holds
+  everything after it until a Sync. That is finding 3, now task-d07.
+- Recovery carries the whole history (task-d05). Past the tombstone
+  window, a lagging replica meets that limit as a stall, not as a fork.
+- A replica that already forked is not repaired by this change. The
+  divergence stop keeps it from answering from its record.
