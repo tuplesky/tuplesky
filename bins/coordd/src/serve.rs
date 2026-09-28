@@ -2116,8 +2116,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Backing::Voting(voter) if !voter.leads() => self.catch_up.next_deadline(),
             _ => None,
         };
+        // A campaign asks again for the report pages it lacks on the same
+        // interval, and a lost page or answer leaves nothing to arrive
+        // (task-d28, Codex review).
+        let pages = match &self.backing {
+            Backing::Voting(voter) if voter.node().machine().campaigning() => {
+                self.pages_asked.map(|at| at + RESEND_INTERVAL)
+            }
+            _ => None,
+        };
         [
-            expiry, parked, reoffer, redial, renewal, election, resend, catch_up,
+            expiry, parked, reoffer, redial, renewal, election, resend, catch_up, pages,
         ]
         .into_iter()
         .flatten()

@@ -6238,14 +6238,16 @@ snapshots from one replica as inconsistent.
 - **Asked for again.** `ReportPageRequest { ballot, pages }` is a new
   protocol message. The candidate sends it on an interval while its
   campaign selects (`request_report_pages`, driven by `coordd` at the
-  re-send interval and by the protocol simulator's timers).
+  re-send interval, with that interval in the domain's next deadline so
+  a quiet domain still wakes for it, and by the protocol simulator's
+  timers).
   - It goes to each voter that promised and whose report is incomplete.
   - It names the missing pages, at most `MAX_PAGE_ASK` (16), or none
     when no page has arrived, which asks for the first pages.
   - The voter answers only the candidate its report went to, for that
     ballot, from the same version.
 - **Bounded assembler.** A campaign refuses a report announcing more
-  pages than `max_report_entries(capacity)` entries take, plus one. The
+  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The
   extra page lets a report one entry past the bound still assemble, so
   task-d20 names it. The pages held are one campaign's, since a new
   campaign replaces the old one, plus the one report the voter serves.

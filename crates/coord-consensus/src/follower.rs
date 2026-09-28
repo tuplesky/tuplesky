@@ -818,10 +818,7 @@ impl Follower {
                 .encode(),
             });
         }
-        self.campaign = Some(
-            Campaign::new(config)
-                .bounded(crate::recovery::max_report_entries(self.config.capacity)),
-        );
+        self.campaign = Some(Campaign::new(config).bounded(crate::recovery::MAX_REPORT_ENTRIES));
         let mut out = alloc::vec![effects.persist];
         out.extend(self.release());
         out
