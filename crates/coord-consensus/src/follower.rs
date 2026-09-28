@@ -26,7 +26,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use coord_core::capability::{AdmissionFacts, admission_digest};
-use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch};
+use coord_core::effect::{BarrierId, BootId, Effect, PeerId, PersistBatch, StoreUpdate};
 use coord_core::event::{Event, StorageEvent};
 use coord_core::machine::DeterministicMachine;
 use coord_core::outbox::{BarrierAllocator, Outbox, PendingSend};
@@ -37,11 +37,14 @@ use coord_types::{CommandId, RetryKey};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::campaign::Campaign;
-use crate::catch_up::{CatchUp, CatchUpDivergence, DonorExecution, OwnExecution, Running};
+use crate::catch_up::{
+    CatchUp, CatchUpDivergence, DonorExecution, OwnExecution, Running, SinceBoot,
+};
 use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{
-    CatchUpEntry, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, ProtocolMessage,
+    CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
+    MAX_PROPOSAL_ASK, ProtocolMessage,
 };
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -199,6 +202,10 @@ pub enum FollowerRejection {
         /// The dependency the selection leaves this replica without.
         missing: CommandId,
     },
+    /// A campaign was not started: a window of pulled commands is
+    /// installed and not yet executed, and its comparison with the donor
+    /// is the follower's to make (task-d25). It executes first.
+    CatchingUp,
     /// A voter refused to promise this replica's campaign: it executed
     /// through `executed`, more than a table ahead of this replica. The
     /// campaign was abandoned (task-d10).
@@ -292,8 +299,19 @@ pub struct HeldProposal {
 enum Pending {
     /// Payload/dependency batch of a vote.
     Vote(CommandId),
-    /// Adoption batch.
+    /// Adoption batch; a catch-up window's names its first command.
     Adoption(CommandId),
+}
+
+/// What became of one pulled command offered to a window (task-d25).
+enum Pulled {
+    /// Installed in the window.
+    Installed,
+    /// Not in this window: the first of the next.
+    EndsWindow(alloc::boxed::Box<CatchUpEntry>),
+    /// The window's first, and what stops a page: nothing more of it is
+    /// installed.
+    Stopped,
 }
 
 /// A vote this replica produced whose supporting batch is not durable
@@ -622,6 +640,9 @@ impl Follower {
         }
         self.sweep_history();
         self.learner = Learner::with_mode(through, self.learner.mode());
+        // What executes from here on is compared with a donor's by the
+        // first ask, which starts here (task-d25).
+        self.catch_up.since_boot = SinceBoot::at(through);
         self
     }
 
@@ -761,6 +782,14 @@ impl Follower {
         }
         if let Some(missing) = self.behind {
             self.rejections.push(FollowerRejection::Behind { missing });
+            return Vec::new();
+        }
+        if !self.catch_up.running.is_empty() {
+            // A window's comparison with its donor is the follower's, and
+            // the role change a won campaign is would drop it: the window
+            // executes first, which takes no longer than its batch
+            // (task-d25).
+            self.rejections.push(FollowerRejection::CatchingUp);
             return Vec::new();
         }
         if let Some(needed) = self.behind_voters {
@@ -1577,14 +1606,15 @@ impl Follower {
 
     /// The next command to execute through the materializer, if any.
     ///
-    /// A pulled command installed by catch-up goes first, and alone: it is
-    /// the command at this replica's next position, and nothing else may
-    /// take that position while it waits (task-d08).
+    /// A window of pulled commands installed by catch-up goes first, one
+    /// command at a time in position order: its first is the command at
+    /// this replica's next position, and nothing else may take that
+    /// position while it waits (task-d08, task-d25).
     pub fn next_executable(&self) -> Option<CommandId> {
         if self.halted.is_some() || self.diverged.is_some() {
             return None;
         }
-        if let Some(running) = &self.catch_up.running {
+        if let Some(running) = self.catch_up.running.front() {
             return (running.durable
                 && self.table.phase_of(&running.command) == Some(Phase::Commit))
             .then_some(running.command);
@@ -1928,7 +1958,7 @@ impl Follower {
         self.check_pulled(command, outcome);
         self.learn();
         self.forget_history();
-        if self.diverged.is_none() && self.catch_up.running.is_none() {
+        if self.diverged.is_none() && self.catch_up.running.is_empty() {
             effects.extend(self.install_catch_up());
             if !self.catch_up.busy()
                 && let Some(donor) = self.catch_up.continue_from.take()
@@ -1943,16 +1973,23 @@ impl Follower {
     /// donor's (task-d08). A difference stops this replica; agreement
     /// sends a command the donor kept no decided record of to history,
     /// so the record this replica had of it is never reported as one.
+    ///
+    /// Anything else it executes is kept for the first page after a boot
+    /// to compare (task-d25).
     fn check_pulled(&mut self, command: CommandId, outcome: &AppliedOutcome) {
-        let Some(Running { donor, .. }) = self.catch_up.running.take_if(|r| r.command == command)
-        else {
-            return;
-        };
         let own = OwnExecution {
             position: outcome.position,
             revision: outcome.revision,
             result_digest: outcome.result_digest,
             response_len: outcome.response.len(),
+        };
+        let pulled = match self.catch_up.running.front() {
+            Some(r) if r.command == command => self.catch_up.running.pop_front(),
+            _ => None,
+        };
+        let Some(Running { donor, .. }) = pulled else {
+            self.catch_up.since_boot.note(command, own);
+            return;
         };
         if own.position != donor.position
             || own.revision != donor.revision
@@ -1978,8 +2015,9 @@ impl Follower {
             own,
         });
         self.catch_up.queue.clear();
-        self.catch_up.running = None;
+        self.catch_up.running.clear();
         self.catch_up.continue_from = None;
+        self.catch_up.since_boot.done();
     }
 
     /// A pulled command whose execution here disagreed with the donor's,
@@ -2039,11 +2077,14 @@ impl Follower {
         let context = self
             .ballots
             .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
-        let frame = ProtocolMessage::CatchUpRequest {
-            ballot,
-            after: self.learner.executed_through(),
-        }
-        .encode();
+        // After a boot, from the boot frontier until a page has covered
+        // what executed since (task-d25).
+        let after = self
+            .catch_up
+            .since_boot
+            .from
+            .unwrap_or_else(|| self.learner.executed_through());
+        let frame = ProtocolMessage::CatchUpRequest { ballot, after }.encode();
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.publish(PendingSend {
                 context,
@@ -2061,11 +2102,17 @@ impl Follower {
     /// A catch-up page from `from` (task-d08).
     ///
     /// Taken only from a voter of this configuration, answered at the
-    /// ballot this replica is synchronized at, following exactly this
-    /// replica's own frontier, and only when no page is in hand. Its
-    /// commands are kept while they are contiguous and whole: a payload
-    /// that rehashes to its identity, and a decided record, if any, bound
-    /// to that payload's admission. The first that is not ends the page.
+    /// ballot this replica is synchronized at, following exactly where
+    /// this replica asked from, and only when no page is in hand and no
+    /// campaign of its own is running. Its commands are kept while they
+    /// are contiguous and whole: a payload that rehashes to its identity,
+    /// and a decided record, if any, bound to that payload's admission.
+    /// The first that is not ends the page.
+    ///
+    /// The first ask after a boot starts at the frontier read at boot
+    /// (task-d25): each command of its page this replica has executed
+    /// since is compared with what it executed there, and only the rest
+    /// is installed.
     fn on_catch_up_page(
         &mut self,
         from: ReplicaId,
@@ -2084,15 +2131,18 @@ impl Follower {
                 .push(FollowerRejection::CatchUpDropped { from, ballot });
             return Vec::new();
         }
+        let executed = self.learner.executed_through();
         if self.catch_up.busy()
             || self.halted.is_some()
             || self.diverged.is_some()
-            || after != self.learner.executed_through()
+            || self.campaign.is_some()
+            || after != self.catch_up.since_boot.from.unwrap_or(executed)
         {
             return Vec::new();
         }
         let offered = entries.len();
         let mut next = after;
+        let mut taken = 0usize;
         for entry in entries.into_iter().take(MAX_CATCH_UP_COMMANDS) {
             let Ok(position) = next.checked_next() else {
                 break;
@@ -2101,9 +2151,27 @@ impl Follower {
                 break;
             }
             next = position;
+            taken += 1;
+            if position <= executed {
+                self.compare_since_boot(from, ballot, &entry);
+                if self.diverged.is_some() {
+                    return Vec::new();
+                }
+                continue;
+            }
             self.catch_up.queue.push_back((from, ballot, entry));
         }
-        let taken = self.catch_up.queue.len();
+        if self.catch_up.since_boot.from.is_some() {
+            if taken > 0 && next < executed && !self.catch_up.since_boot.outcomes.is_empty() {
+                // The page stopped short of what was kept: the next ask
+                // goes on from where it stopped.
+                self.catch_up.since_boot.from = Some(next);
+            } else {
+                // Covered -- or a donor that cannot show those rows any
+                // more, which nothing asked again would change.
+                self.catch_up.since_boot.done();
+            }
+        }
         if taken == 0 {
             return Vec::new();
         }
@@ -2113,35 +2181,143 @@ impl Follower {
         // the next ask as soon as it is executed: a replica thousands of
         // commands behind should not wait a timer's period per page.
         self.catch_up.continue_from = (taken == offered && next < through).then_some(from);
+        if !self.catch_up.busy() {
+            // Nothing to execute: a page of comparisons only.
+            return match self.catch_up.continue_from.take() {
+                Some(donor) => self.request_catch_up(donor),
+                None => Vec::new(),
+            };
+        }
         self.install_catch_up()
     }
 
-    /// Install the next pulled command as a decided commit (task-d08).
+    /// Compare a page's command at a position this replica executed since
+    /// its boot with what it executed there (task-d25). A difference, or
+    /// another command there, stops this replica as a pulled command's
+    /// does.
+    fn compare_since_boot(&mut self, donor: ReplicaId, ballot: Ballot, entry: &CatchUpEntry) {
+        let expected = DonorExecution {
+            donor,
+            ballot,
+            position: entry.position,
+            revision: entry.revision,
+            result_digest: entry.result_digest,
+        };
+        let kept = &mut self.catch_up.since_boot.outcomes;
+        while kept
+            .front()
+            .is_some_and(|(_, own)| own.position < entry.position)
+        {
+            kept.pop_front();
+        }
+        let here = kept
+            .front()
+            .is_some_and(|(_, own)| own.position == entry.position);
+        let Some((command, own)) = here.then(|| kept.pop_front()).flatten() else {
+            // Past what was kept: an execution no window of this boot's
+            // could have made.
+            return;
+        };
+        if command != entry.command
+            || own.revision != expected.revision
+            || own.result_digest != expected.result_digest
+        {
+            self.diverge(entry.command, expected, Some(own));
+        }
+    }
+
+    /// Install the next window of pulled commands as decided commits, in
+    /// one batch (task-d08, task-d25).
     ///
-    /// The same rules as a Sync's COMMIT entry (task-d14): a record here
-    /// committed or executed under other admission facts is a second
-    /// decision and stops this replica; one below COMMIT under other facts
-    /// is rebound to the donor's. The donor's decided dependencies replace
-    /// whatever this replica had recorded -- an acceptance of its own, a
-    /// placeholder -- so nothing is ever reported as committed with other
-    /// dependencies than the decided ones. It is let into a full table:
-    /// it is decided, and its turn has come.
+    /// Each command under the same rules as a Sync's COMMIT entry
+    /// (task-d14): a record here committed or executed under other
+    /// admission facts is a second decision and stops this replica; one
+    /// below COMMIT under other facts is rebound to the donor's. The
+    /// donor's decided dependencies replace whatever this replica had
+    /// recorded -- an acceptance of its own, a placeholder -- so nothing
+    /// is ever reported as committed with other dependencies than the
+    /// decided ones. It is let into a full table: it is decided, and its
+    /// turn has come.
     ///
     /// A command the donor keeps no decided record of is installed with
     /// no dependencies, its record here is deleted rather than rewritten,
     /// and it goes to history once executed: it is never reported.
+    ///
+    /// The window is as many of the page's commands, from its head, as
+    /// install cleanly in one batch: each is at the next position, is
+    /// executed under dependencies executed here already or earlier in
+    /// the window, and after the window's first names the command before
+    /// it among them. That last is what makes a window a restart executes
+    /// through the ordinary learner run in the donor's positions, and a
+    /// command the donor kept no row of has no dependencies to name, so
+    /// it is a window of its own. A command that does not install cleanly
+    /// ends the window and is dealt with as the first of the next, where
+    /// what stops a page stops it.
     fn install_catch_up(&mut self) -> Vec<Effect> {
-        if self.catch_up.running.is_some() || self.boot.is_none() {
+        if !self.catch_up.running.is_empty() || self.boot.is_none() {
             return Vec::new();
         }
-        let Some((donor, ballot, entry)) = self.catch_up.queue.pop_front() else {
+        let mut batch: Option<(BarrierId, Vec<StoreUpdate>)> = None;
+        let mut bytes = 0usize;
+        while let Some((donor, ballot, entry)) = self.catch_up.queue.pop_front() {
+            let first = self.catch_up.running.is_empty();
+            if !first {
+                bytes = bytes.saturating_add(entry.encoded_len());
+                if bytes > MAX_CATCH_UP_BYTES {
+                    self.catch_up.queue.push_front((donor, ballot, entry));
+                    break;
+                }
+            } else {
+                bytes = entry.encoded_len();
+            }
+            match self.install_pulled(donor, ballot, entry, &mut batch) {
+                Pulled::Installed => {}
+                Pulled::EndsWindow(entry) => {
+                    self.catch_up.queue.push_front((donor, ballot, *entry));
+                    break;
+                }
+                Pulled::Stopped => {
+                    self.catch_up.queue.clear();
+                    self.catch_up.continue_from = None;
+                    break;
+                }
+            }
+        }
+        let Some((barrier, updates)) = batch else {
             return Vec::new();
         };
+        let first = self.catch_up.running.front().expect("installed").command;
+        self.pending.insert(barrier, Pending::Adoption(first));
+        alloc::vec![Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates,
+        })]
+    }
+
+    /// Install one pulled command into the window `batch` is writing,
+    /// allocating its barrier for the first (task-d25). What would stop a
+    /// page ends the window instead, unless this is the window's first.
+    fn install_pulled(
+        &mut self,
+        donor: ReplicaId,
+        ballot: Ballot,
+        entry: CatchUpEntry,
+        batch: &mut Option<(BarrierId, Vec<StoreUpdate>)>,
+    ) -> Pulled {
+        let previous = self
+            .catch_up
+            .running
+            .back()
+            .map(|r| (r.command, r.donor.position, r.entry.decided.is_some()));
+        let ends = |entry: CatchUpEntry| Pulled::EndsWindow(alloc::boxed::Box::new(entry));
         if ballot != self.config.quorum.ballot() || self.ballots.synced() != ballot {
             // The page was answered at a ballot this replica has left.
-            self.catch_up.queue.clear();
-            self.catch_up.continue_from = None;
-            return Vec::new();
+            return if previous.is_some() {
+                ends(entry)
+            } else {
+                Pulled::Stopped
+            };
         }
         let command = entry.command;
         let digest = entry.payload.admission_digest();
@@ -2152,40 +2328,48 @@ impl Follower {
             revision: entry.revision,
             result_digest: entry.result_digest,
         };
-        if self.learner.executed_through().checked_next().ok() != Some(entry.position) {
+        let after = previous.map_or_else(|| self.learner.executed_through(), |(_, p, _)| p);
+        if after.checked_next().ok() != Some(entry.position) {
             // This replica moved on by itself: the page is stale.
-            self.catch_up.queue.clear();
-            self.catch_up.continue_from = None;
-            return Vec::new();
+            return if previous.is_some() {
+                ends(entry)
+            } else {
+                Pulled::Stopped
+            };
+        }
+        if let Some((_, _, decided)) = previous
+            && (!decided || entry.decided.is_none())
+        {
+            // A command the donor kept no row of is a window of its own.
+            return ends(entry);
         }
         if self.table.phase_of(&command) == Some(Phase::Executed) {
+            if previous.is_some() {
+                return ends(entry);
+            }
             // Executed here already, so at a position before the one the
             // donor executed it at: the two executed the domain's commands
             // in different orders.
             self.diverge(command, expected, None);
-            return Vec::new();
+            return Pulled::Stopped;
         }
-        if let Some(held) = self.table.record(&command).and_then(|r| r.payload)
+        let held = self.table.record(&command).and_then(|r| r.payload);
+        let committed = self.table.phase_of(&command) >= Some(Phase::Commit);
+        if let Some(held) = held
             && held != digest
+            && committed
         {
-            if self.table.phase_of(&command) >= Some(Phase::Commit) {
-                self.rejections
-                    .push(FollowerRejection::IncompatibleAdmission {
-                        command,
-                        held,
-                        selected: digest,
-                    });
-                self.halted = Some(command);
-                self.catch_up.queue.clear();
-                self.catch_up.continue_from = None;
-                return Vec::new();
+            if previous.is_some() {
+                return ends(entry);
             }
-            self.table.rebind(&command, digest);
-            self.served_payloads.remove(&command);
-        }
-        if self.table.phase_of(&command).is_none() {
-            let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
-            let _ = self.table.initialize_beyond_capacity(command, digest, keys);
+            self.rejections
+                .push(FollowerRejection::IncompatibleAdmission {
+                    command,
+                    held,
+                    selected: digest,
+                });
+            self.halted = Some(command);
+            return Pulled::Stopped;
         }
         let (deps, path) = entry.decided.as_ref().map_or_else(
             || (Vec::new(), crate::graph::empty_path()),
@@ -2194,28 +2378,48 @@ impl Follower {
         let paths = entry.decided.as_ref().map(|r| r.paths.clone());
         // A command committed here already keeps the dependencies it was
         // committed with: a decision is not taken twice. Either way, what
-        // it is executed under must be executed here already.
-        let committed = self.table.phase_of(&command) >= Some(Phase::Commit);
-        let executable = {
-            let under = match self.table.record(&command) {
-                Some(record) if committed => record.deps.clone(),
-                _ => deps.clone(),
-            };
-            crate::phase::guard_execute(&under, |d| self.table.phase_of(d)).is_ok()
+        // it is executed under must be executed here already or earlier
+        // in the window, and name the command before it in the window.
+        let under = match self.table.record(&command) {
+            Some(record) if committed => record.deps.clone(),
+            _ => deps.clone(),
         };
-        let installed = executable
-            && (committed
-                || (self
-                    .table
-                    .adopt(command, deps, paths.as_deref(), path)
-                    .is_ok()
-                    && self.table.commit(command).is_ok()));
-        if !installed {
+        let window = &self.catch_up.running;
+        let executable = under.iter().all(|d| {
+            self.table.phase_of(d) == Some(Phase::Executed)
+                || window.iter().any(|r| r.command == *d)
+        }) && previous.is_none_or(|(before, _, _)| under.contains(&before));
+        if !executable {
+            if previous.is_some() {
+                return ends(entry);
+            }
             self.rejections
                 .push(FollowerRejection::CatchUpNotInstalled(command));
-            self.catch_up.queue.clear();
-            self.catch_up.continue_from = None;
-            return Vec::new();
+            return Pulled::Stopped;
+        }
+        if let Some(held) = held
+            && held != digest
+        {
+            self.table.rebind(&command, digest);
+            self.served_payloads.remove(&command);
+        }
+        if self.table.phase_of(&command).is_none() {
+            let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
+            let _ = self.table.initialize_beyond_capacity(command, digest, keys);
+        }
+        let installed = committed
+            || (self
+                .table
+                .adopt(command, deps, paths.as_deref(), path)
+                .is_ok()
+                && self.table.commit(command).is_ok());
+        if !installed {
+            if previous.is_some() {
+                return ends(entry);
+            }
+            self.rejections
+                .push(FollowerRejection::CatchUpNotInstalled(command));
+            return Pulled::Stopped;
         }
         // Decided here now: nothing the leader or a Sync offers for it is
         // to be adopted over the decision.
@@ -2226,8 +2430,10 @@ impl Follower {
             .or_insert(command);
         self.payloads.insert(command, entry.payload.clone());
         let epoch = self.config.identity.epoch;
-        let barrier = self.alloc.as_mut().expect("booted").allocate();
-        let mut updates = alloc::vec![payload_update(&command, &entry.payload).expect("bounded")];
+        let (barrier, updates) = batch
+            .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
+        let barrier = *barrier;
+        updates.push(payload_update(&command, &entry.payload).expect("bounded"));
         if entry.decided.is_some() {
             let record = self.table.record(&command).expect("installed").clone();
             updates.push(dependency_update(epoch, &command, &record).expect("bounded"));
@@ -2236,20 +2442,14 @@ impl Follower {
             updates.push(dependency_delete(epoch, &command));
             self.ledger.retain(|c| *c != command);
         }
-        self.pending.insert(barrier, Pending::Adoption(command));
-        self.durable_payloads.insert(barrier, command);
-        self.catch_up.running = Some(Running {
+        self.catch_up.running.push_back(Running {
             command,
             donor: expected,
             barrier,
             durable: false,
             entry,
         });
-        alloc::vec![Effect::Persist(PersistBatch {
-            barrier,
-            base: None,
-            updates,
-        })]
+        Pulled::Installed
     }
 
     /// Drop the durable records and payloads of commands this replica
@@ -3390,10 +3590,13 @@ impl Follower {
                     {
                         entry.1 = true;
                     }
-                    if let Some(running) = self.catch_up.running.as_mut()
-                        && running.barrier == barrier
-                    {
-                        running.durable = true;
+                    // A window is one batch: every command of it is
+                    // decided here now, and its payload is on disk.
+                    for running in &mut self.catch_up.running {
+                        if running.barrier == barrier {
+                            running.durable = true;
+                            self.served_payloads.insert(running.command);
+                        }
                     }
                     // The evidence this replica produced is a fact now.
                     if let Some(deferred) = self.deferred.remove(&barrier)
@@ -3404,17 +3607,25 @@ impl Follower {
                 }
                 StorageEvent::Failed { .. } => {
                     self.pending.remove(&barrier);
-                    // A pulled command whose installation failed is put
-                    // back at the head of its page and installed again,
-                    // rather than left waiting on a batch that will never
-                    // be durable: nothing executes past it meanwhile, and
-                    // no further page is asked for (task-d08).
-                    if let Some(running) = self.catch_up.running.take_if(|r| r.barrier == barrier) {
-                        self.catch_up.queue.push_front((
-                            running.donor.donor,
-                            running.donor.ballot,
-                            running.entry,
-                        ));
+                    // A window whose installation failed is put back at
+                    // the head of its page and installed again, rather
+                    // than left waiting on a batch that will never be
+                    // durable: nothing executes past it meanwhile, and no
+                    // further page is asked for (task-d08, task-d25).
+                    if self
+                        .catch_up
+                        .running
+                        .front()
+                        .is_some_and(|r| r.barrier == barrier)
+                    {
+                        let window = core::mem::take(&mut self.catch_up.running);
+                        for running in window.into_iter().rev() {
+                            self.catch_up.queue.push_front((
+                                running.donor.donor,
+                                running.donor.ballot,
+                                running.entry,
+                            ));
+                        }
                         reinstall = true;
                     }
                     // The batch never happened: its vote is not evidence.

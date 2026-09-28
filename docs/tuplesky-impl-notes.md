@@ -6357,3 +6357,105 @@ finishes or recovers admitted commands could be refused by a full table.
   the two payload-transfer tests of `recovery.rs` use a 32-slot table
   so that twice the transfer bound still fits under it.
 
+
+## Catch-up installs a window at a time
+
+task-d25, from the checklist review (items B7 and B9). Catch-up
+(task-d08) installed one pulled command, waited for its batch to be
+durable, executed it, and only then installed the next: one durable batch
+and one execution per command. That is about a hundred commands a second
+on the test host, so a voter behind a domain admitting more than that
+never closed its gap.
+
+### What changed
+
+- **A window per batch.** `install_catch_up` installs as many of the
+  page's commands as install cleanly, from its head, in one batch: at
+  most the page, so 64 commands and 1 MiB (`MAX_CATCH_UP_COMMANDS`,
+  `MAX_CATCH_UP_BYTES`). Each command is installed under task-d08's rules
+  unchanged (task-d14's COMMIT-entry rules, the donor's dependencies,
+  let into a full table). A window joins a command only when:
+  - it is at the next position;
+  - every dependency it will execute under is executed here already or
+    earlier in the window;
+  - after the window's first, it names the command before it among
+    those dependencies.
+- **A command the donor kept no row of is a window of its own.** It has
+  no dependencies to name. What would stop a page (a stale ballot or
+  position, a second decision, a command executed here already, a
+  command not installable) ends the window instead, and is dealt with
+  when it is the first of the next window, exactly as before.
+- **Execution.** Only the window's first command is executable, so the
+  window runs in the donor's positions whatever else the table holds.
+  Each execution is compared with the donor's as before. The next
+  window is installed once the last one has run.
+- **Durability and failure.** The batch being durable makes every
+  command of the window executable and its payload servable. A failed
+  batch puts the whole window back at the head of the page, in order,
+  and it is installed again.
+- **The restart path.** A crash in the middle of a window leaves its
+  durable commits behind. The restart executes them through the ordinary
+  learner, with the page and the donor's word gone.
+  - The rule that each command names the one before it is what makes
+    the learner run them in the donor's positions.
+  - The follower keeps what it executes after the frontier it booted at
+    (`SinceBoot`, set by `restore_execution`), at most a window's worth.
+    Only one window is ever uncompared, and it is the first thing
+    executed after that frontier.
+  - The first ask after a boot starts at the boot frontier rather than
+    at the current one. Each command of that page at or below the
+    current frontier is compared with what was executed there: another
+    command, revision or result digest stops the voter as a
+    `CatchUpDivergence`, as a pulled command's does. The rest of the
+    page is installed as usual.
+  - A page that stops short of what was kept is followed at once from
+    where it stopped. A donor that can no longer show those rows ends
+    the comparison rather than block catch-up for ever.
+- **No campaign over a window.** A follower with a window installed and
+  not yet executed refuses to campaign (`FollowerRejection::CatchingUp`).
+  A won campaign changes the role, and the window's comparison is the
+  follower's. The window runs as soon as its batch is durable, so this
+  delays a campaign by at most that.
+- **Unchanged.** The page format and the donor's rules (review
+  boundary).
+
+### What this does not cover
+
+- A voter that wins a campaign after a restart and before its first ask
+  forgoes the since-boot comparison: the role change drops it, and a
+  leader does not ask.
+- An execution made durable just before a crash and not yet compared
+  (the materializer's row written, the comparison not yet run) is at or
+  below the boot frontier, so the first ask does not cover it. That gap
+  was task-d08's before this task and is unchanged.
+- The unthrottled `follower-out` run (about 113 appends a second, a
+  follower 3400 behind at its restart), with catch-up's rate reported
+  beside the domain's, is not run here: this environment has neither the
+  driver nor the test host. Its evidence is still owed.
+  - What the tests show is the structure that sets the rate: one durable
+    batch per page instead of one per command.
+  - Whether the domain leaves the execution headroom catch-up needs is
+    task-d26's contract.
+
+### Evidence
+
+- `a_page_installs_as_one_window_in_one_batch` (`catch_up`), over three
+  seeds: a page of a voter left behind goes in as one batch, every
+  command of it is a commit before the first executes, and they execute
+  in the donor's positions.
+- `a_command_the_donor_kept_no_row_of_is_a_window_of_its_own`: a page
+  whose fourth command has no row installs as three windows, the three
+  before it, it, and the rest, and executes in the donor's positions.
+- `a_crash_at_every_point_of_a_window_resumes_without_executing_twice`:
+  a crash before the window's batch is durable, and after each of its
+  commands executes. Each resumes without executing anything twice and
+  ends with the leader's history, and the first ask after each restart
+  starts at the boot frontier. With the since-boot comparison disabled,
+  this test and the next fail.
+- `a_window_executed_after_a_restart_is_compared_with_the_donor`: the
+  restart executes the rest of a window to another result at its fourth
+  command, and the first page after the boot stops the voter there,
+  naming both executions.
+- `a_voter_holding_a_window_does_not_campaign_until_it_ran`.
+- task-d08's eight catch-up tests pass unchanged, as do the protocol
+  simulator and the `coord-daemon` suites.

@@ -21,6 +21,15 @@
 //! trust the voter already gives that ballot's Sync. A donor that itself
 //! executed out of order is not caught here; its own divergence stops are
 //! what catch that.
+//!
+//! A page is installed a window at a time (task-d25): as many of its
+//! commands as follow one another in one batch, rather than one batch and
+//! one execution per command, which left a voter pulling about a hundred
+//! commands a second and never closing its gap under a domain admitting
+//! more. The window executes in the donor's positions, and after a
+//! restart the first ask starts at the frontier read at boot, so what the
+//! voter executed since then -- a window installed before the crash
+//! included -- is compared with the donor's too ([`SinceBoot`]).
 
 use alloc::collections::VecDeque;
 
@@ -29,7 +38,7 @@ use coord_types::CommandId;
 use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ExecutionPosition, KvRevision, ReplicaId};
 
-use crate::messages::CatchUpEntry;
+use crate::messages::{CatchUpEntry, MAX_CATCH_UP_COMMANDS};
 
 /// What a donor said a pulled command executed as (task-d08).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,33 +83,40 @@ pub struct CatchUpDivergence {
     pub own: Option<OwnExecution>,
 }
 
-/// The pulled command installed and waiting for the executor.
+/// A pulled command installed and waiting for the executor.
 #[derive(Clone, Debug)]
 pub(crate) struct Running {
     /// The command.
     pub(crate) command: CommandId,
     /// What the donor executed it as.
     pub(crate) donor: DonorExecution,
-    /// The batch that made its installation durable.
+    /// The batch that made its window durable: one for the window.
     pub(crate) barrier: BarrierId,
     /// Whether that batch is durable: a pulled command executes only once
     /// its decision is on disk here, as any other commit's is.
     pub(crate) durable: bool,
-    /// The page entry it came from, put back at the head of the page if
-    /// that batch fails, so it is installed again rather than left
-    /// waiting on a batch that will never be durable.
+    /// The page entry it came from, put back at the head of the page with
+    /// the rest of its window if that batch fails, so it is installed
+    /// again rather than left waiting on a batch that will never be
+    /// durable.
     pub(crate) entry: CatchUpEntry,
 }
 
-/// The catch-up this follower has in hand: at most one page, and the one
-/// command of it that is installed and not yet executed.
+/// The catch-up this follower has in hand: at most one page, and the
+/// window of it that is installed and not yet executed.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CatchUp {
     /// The page's commands not yet installed, in position order, with
     /// the donor and ballot they came from.
     pub(crate) queue: VecDeque<(ReplicaId, Ballot, CatchUpEntry)>,
-    /// The pulled command installed and waiting for the executor.
-    pub(crate) running: Option<Running>,
+    /// The window: pulled commands installed in one batch and not yet
+    /// executed, in position order (task-d25). Only its first executes,
+    /// so the window runs in the donor's positions whatever else the
+    /// table holds.
+    pub(crate) running: VecDeque<Running>,
+    /// What this replica executed since it booted and no donor has
+    /// confirmed yet (task-d25).
+    pub(crate) since_boot: SinceBoot,
     /// The donor the last page came from, and whether that page was full:
     /// a full page is followed by the next ask as soon as it is executed,
     /// rather than on the caller's timer.
@@ -114,6 +130,52 @@ pub(crate) struct CatchUp {
 impl CatchUp {
     /// Whether a page is in hand.
     pub(crate) fn busy(&self) -> bool {
-        self.running.is_some() || !self.queue.is_empty()
+        !self.running.is_empty() || !self.queue.is_empty()
+    }
+}
+
+/// What a replica executed after the frontier it booted at, kept until a
+/// donor's page covers it (task-d25).
+///
+/// A window's batch makes every command of it a durable commit, and a
+/// replica that crashes in the middle of the window executes the rest
+/// after its restart through the ordinary learner, with the page and the
+/// donor's word gone. So the first ask after a boot starts at the
+/// frontier read at boot rather than at the current one, and each
+/// command of that page at or below the current frontier is compared with
+/// what this replica executed there. At most a window's worth is kept:
+/// the only executions a donor has not confirmed are one window's, and
+/// they are the first after the boot frontier, since that window's first
+/// command is the one at the frontier's next position.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SinceBoot {
+    /// Where the next ask starts while what is kept waits for a donor:
+    /// the boot frontier, then the last position a page compared. `None`
+    /// once a page has covered what was kept.
+    pub(crate) from: Option<ExecutionPosition>,
+    /// The executions after `from`, in position order.
+    pub(crate) outcomes: VecDeque<(CommandId, OwnExecution)>,
+}
+
+impl SinceBoot {
+    /// Keep what executes after `frontier`, the one read at boot.
+    pub(crate) fn at(frontier: ExecutionPosition) -> Self {
+        SinceBoot {
+            from: Some(frontier),
+            outcomes: VecDeque::new(),
+        }
+    }
+
+    /// Keep this execution, while a window's worth is not kept already.
+    pub(crate) fn note(&mut self, command: CommandId, own: OwnExecution) {
+        if self.from.is_some() && self.outcomes.len() < MAX_CATCH_UP_COMMANDS {
+            self.outcomes.push_back((command, own));
+        }
+    }
+
+    /// Nothing more to compare.
+    pub(crate) fn done(&mut self) {
+        self.from = None;
+        self.outcomes = VecDeque::new();
     }
 }

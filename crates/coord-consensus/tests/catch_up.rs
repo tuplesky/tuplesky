@@ -135,6 +135,13 @@ struct Cluster {
     failed: usize,
     /// Payload values the applier produced, by node, to compare with.
     fork: Option<(usize, CommandId)>,
+    /// Nodes whose batches are written and never made durable: a crash
+    /// of theirs loses them (task-d25).
+    held: Vec<usize>,
+    /// Batches each node persisted.
+    batches: Vec<usize>,
+    /// Every catch-up ask sent: (from, after).
+    catch_up_asks: Vec<(usize, u64)>,
 }
 
 const SETTLE_STEPS: u32 = 200_000;
@@ -192,6 +199,9 @@ impl Cluster {
             failing: None,
             failed: 0,
             fork: None,
+            held: Vec::new(),
+            batches: vec![0; VOTERS as usize],
+            catch_up_asks: Vec::new(),
         }
     }
 
@@ -220,8 +230,12 @@ impl Cluster {
                         self.handle(i, more);
                         continue;
                     }
+                    self.batches[i] += 1;
                     let node = &mut self.nodes[i];
                     node.storage.submit(batch);
+                    if self.held.contains(&i) {
+                        continue;
+                    }
                     node.storage.complete(barrier).unwrap();
                     let more = node.step(Event::Storage(StorageEvent::JournalDurable {
                         barrier_id: barrier,
@@ -256,6 +270,7 @@ impl Cluster {
                         // Answered by the runtime from the donor's rows,
                         // which is what this does.
                         ProtocolMessage::CatchUpRequest { ballot, after } => {
+                            self.catch_up_asks.push((i, after.get()));
                             if self.serve {
                                 let page = self.page(dest as usize, *ballot, *after);
                                 self.pages += 1;
@@ -894,5 +909,197 @@ fn a_page_short_of_the_donors_frontier_is_followed_at_once() {
     assert_eq!(
         cluster.nodes[4].executed, cluster.nodes[0].executed,
         "r4 stopped after a short page"
+    );
+}
+
+impl Cluster {
+    /// What the runtime's pacer does once after a boot: ask r0, whatever
+    /// the node holds.
+    fn ask(&mut self, i: usize) {
+        let effects = self.nodes[i].follower_mut().request_catch_up(r(0));
+        self.handle(i, effects);
+        self.settle();
+    }
+}
+
+fn entries_of(page: &ProtocolMessage) -> &[CatchUpEntry] {
+    let ProtocolMessage::CatchUpPage { entries, .. } = page else {
+        unreachable!()
+    };
+    entries
+}
+
+/// A page goes in as one window, in one batch, ahead of execution
+/// (task-d25): every command of it is a durable commit before the first
+/// executes, and they execute in the donor's positions.
+#[test]
+fn a_page_installs_as_one_window_in_one_batch() {
+    for seed in [19, 23, 29] {
+        let (mut cluster, _) = left_behind(seed);
+        let after = cluster.follower(4).executed_through();
+        let page = cluster.page(0, ballot0(), after);
+        let entries = entries_of(&page).to_vec();
+        assert!(
+            entries.len() > 8,
+            "seed {seed}: a page of {}",
+            entries.len()
+        );
+        let batches = cluster.batches[4];
+        cluster.deliver_page(4, 0, &page);
+        assert_eq!(
+            cluster.batches[4] - batches,
+            1,
+            "seed {seed}: the page did not go in as one batch"
+        );
+        for e in &entries {
+            assert_eq!(
+                cluster.follower(4).table().phase_of(&e.command),
+                Some(Phase::Commit),
+                "seed {seed}"
+            );
+        }
+        cluster.settle();
+        let from = after.get() as usize;
+        assert_eq!(
+            cluster.nodes[4].executed[from..from + entries.len()],
+            cluster.nodes[0].executed[from..from + entries.len()],
+            "seed {seed}: the window ran out of the donor's positions"
+        );
+        assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    }
+}
+
+/// A command the donor kept no dependency row of has nothing to chain
+/// it to the window before it, so it is a window of its own (task-d25).
+#[test]
+fn a_command_the_donor_kept_no_row_of_is_a_window_of_its_own() {
+    let (mut cluster, _) = left_behind(31);
+    let after = cluster.follower(4).executed_through();
+    let mut page = cluster.page(0, ballot0(), after);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
+        unreachable!()
+    };
+    entries[3].decided = None;
+    let entries = entries.clone();
+    let batches = cluster.batches[4];
+    cluster.deliver_page(4, 0, &page);
+    assert_eq!(cluster.batches[4] - batches, 1);
+    let f = cluster.follower(4);
+    for e in &entries[..3] {
+        assert_eq!(f.table().phase_of(&e.command), Some(Phase::Commit));
+    }
+    assert!(f.table().phase_of(&entries[3].command) < Some(Phase::Commit));
+    cluster.settle();
+    // Three windows: the three before it, it, and the rest.
+    assert_eq!(cluster.batches[4] - batches, 3);
+    let from = after.get() as usize;
+    assert_eq!(
+        cluster.nodes[4].executed[from..from + entries.len()],
+        cluster.nodes[0].executed[from..from + entries.len()]
+    );
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+}
+
+/// A crash at every point of a window -- before its batch is durable,
+/// and after each of its commands executes -- resumes without executing
+/// anything twice, and the first ask after the restart starts at the
+/// frontier read at boot, so what the restart executed of the window is
+/// compared with the donor's (task-d25).
+#[test]
+fn a_crash_at_every_point_of_a_window_resumes_without_executing_twice() {
+    let (probe, _) = left_behind(37);
+    let after = probe.follower(4).executed_through();
+    let window = entries_of(&probe.page(0, ballot0(), after)).len();
+    // `None`: the batch never became durable.
+    let points = std::iter::once(None).chain((0..=window).map(Some));
+    for point in points {
+        let (mut cluster, _) = left_behind(37);
+        cluster.serve = false;
+        let page = cluster.page(0, ballot0(), after);
+        match point {
+            None => {
+                cluster.held = vec![4];
+                cluster.deliver_page(4, 0, &page);
+                cluster.held.clear();
+            }
+            Some(k) => {
+                cluster.deliver_page(4, 0, &page);
+                cluster.execute_at_most(4, k);
+            }
+        }
+        let boot = cluster.nodes[4].executed.len() as u64;
+        cluster.restart(4);
+        cluster.settle();
+        cluster.serve = true;
+        let asked = cluster.catch_up_asks.len();
+        cluster.ask(4);
+        assert_eq!(
+            cluster.catch_up_asks.get(asked),
+            Some(&(4, boot)),
+            "{point:?}: the first ask after the boot did not start at its frontier"
+        );
+        cluster.catching = vec![4];
+        cluster.settle_ticking(8);
+        let executed = &cluster.nodes[4].executed;
+        let unique: std::collections::BTreeSet<_> = executed.iter().collect();
+        assert_eq!(unique.len(), executed.len(), "{point:?}: executed twice");
+        assert_eq!(*executed, cluster.nodes[0].executed, "{point:?}");
+        assert_eq!(cluster.follower(4).catch_up_divergence(), None, "{point:?}");
+    }
+}
+
+/// What a restart executes of a window its crash left installed is
+/// compared with the donor by the first page after the boot: a
+/// difference stops the voter as a pulled command's does (task-d25).
+#[test]
+fn a_window_executed_after_a_restart_is_compared_with_the_donor() {
+    let (mut cluster, _) = left_behind(41);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    let forked = entries_of(&page)[3].command;
+    cluster.deliver_page(4, 0, &page);
+    cluster.execute_at_most(4, 1);
+    cluster.restart(4);
+    cluster.fork = Some((4, forked));
+    let before = cluster.nodes[4].executed.len();
+    cluster.settle();
+    assert!(
+        cluster.nodes[4].executed.len() > before + 3,
+        "the restart did not execute the rest of the window"
+    );
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    cluster.serve = true;
+    cluster.ask(4);
+    let f = cluster.follower(4);
+    let divergence = f.catch_up_divergence().expect("r4 stopped");
+    assert_eq!(divergence.command, forked);
+    assert_eq!(divergence.donor.result_digest, Digest32(forked.0.0));
+    let own = divergence.own.expect("r4 executed it");
+    assert_eq!(own.result_digest, Digest32([0xee; 32]));
+    assert_eq!(own.position, divergence.donor.position);
+    assert_eq!(f.next_executable(), None);
+}
+
+/// A window installed and not yet executed keeps its voter from
+/// campaigning until it has run (task-d25): a won campaign would change
+/// the role, and the window's comparison with the donor with it.
+#[test]
+fn a_voter_holding_a_window_does_not_campaign_until_it_ran() {
+    let (mut cluster, _) = left_behind(43);
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    cluster.deliver_page(4, 0, &page);
+    let next = Ballot {
+        number: 1,
+        leader: r(4),
+        ..ballot0()
+    };
+    let effects = cluster.nodes[4].follower_mut().campaign(next);
+    assert!(effects.is_empty());
+    let refused = cluster.nodes[4].follower_mut().take_rejections();
+    assert!(
+        refused.contains(&FollowerRejection::CatchingUp),
+        "{refused:?}"
     );
 }
