@@ -1145,6 +1145,12 @@ its followers had committed among themselves.
       `n4`, which went on to follow ballots 3 and 4 on the same store.
     * The command's order on each voter needs the run's store (its
       `executed_v1` rows), which this environment cannot download.
+    * Not reproduced locally in 12 runs on `9c23cc6` (three voters, 120 s):
+      6 with `--fault majority` and 6 with `--fault all`, which kills
+      every voter, then the leader. All served their final reads, with no
+      anomaly and no stop. In the `--fault all` runs, the voter that led
+      after a restart of all three had recovered behind another voter in
+      about 15 of 18 restarts, by a rough alignment of the voters' boots.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
