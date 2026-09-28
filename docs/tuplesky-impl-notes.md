@@ -6139,7 +6139,10 @@ ended the process in the middle of an election.
 
 - **One selection pending.** A Sync whose row is durable replaces what
   earlier Syncs left pending (`replace_sync_pending`), activated or
-  superseded. Its selection is the synchronized ballot's, and it
+  superseded, and the placeholders the superseded entries made go with
+  them unless a held proposal waits on the command (Codex review: kept,
+  repeated failed ballots filled the table with slots nothing fills).
+  Its selection is the synchronized ballot's, and it
   supersedes the earlier ones: a decision of an earlier ballot was
   accepted by a majority, which the later selection's reports
   intersect, so it is among the later entries. An earlier entry the
@@ -6147,7 +6150,13 @@ ended the process in the middle of an election.
   demoted with the later marker (task-d11). What an entry left out
   costs a voter that far behind is catch-up (task-d08), not recovery.
 - **A bound on reports.** `max_report_entries(capacity)` is twice the
-  capacity: the live records and the retirement window. A campaign sets
+  capacity: the live records and the retirement window. A campaign
+  applies it at the domain's largest capacity (`MAX_REPORT_ENTRIES`, from
+  `MAX_TABLE_CAPACITY`, which `coord_daemon`'s limit now is), not at its
+  own table. Voters of one domain may be configured differently, and a
+  voter with a small table legitimately reports more than twice it when
+  a leader with a larger one ordered commands past its limit (Codex
+  review). A campaign sets
   aside a report past it while a majority remains without it, as it
   sets aside a half-initialized one (task-d12), since any majority of
   promises is a sound basis for the selection. It never sets aside its
@@ -6199,6 +6208,11 @@ Nothing changes in what is selected, or in the Sync format.
   (`activation`): three promised ballots whose Syncs' entries never get
   their payloads. The report names only the third Sync's entries. It
   fails without `replace_sync_pending`, when the report names all nine.
+- The same test checks that the earlier Syncs' placeholders are gone.
+  It fails without their removal.
+- `a_report_past_twice_the_candidates_own_table_is_taken`
+  (`activation`): a candidate with a 32-slot table selects over a 74-entry
+  report. It fails with the bound taken from the candidate's own table.
 - `a_follower_sent_a_sync_past_its_row_refuses_it_by_name`
   (`activation`): a 16,000-entry Sync is refused, named, with nothing
   written and the synchronized ballot unchanged. Before this change the
@@ -6224,14 +6238,16 @@ snapshots from one replica as inconsistent.
 - **Asked for again.** `ReportPageRequest { ballot, pages }` is a new
   protocol message. The candidate sends it on an interval while its
   campaign selects (`request_report_pages`, driven by `coordd` at the
-  re-send interval and by the protocol simulator's timers).
+  re-send interval, with that interval in the domain's next deadline so
+  a quiet domain still wakes for it, and by the protocol simulator's
+  timers).
   - It goes to each voter that promised and whose report is incomplete.
   - It names the missing pages, at most `MAX_PAGE_ASK` (16), or none
     when no page has arrived, which asks for the first pages.
   - The voter answers only the candidate its report went to, for that
     ballot, from the same version.
 - **Bounded assembler.** A campaign refuses a report announcing more
-  pages than `max_report_entries(capacity)` entries take, plus one. The
+  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The
   extra page lets a report one entry past the bound still assemble, so
   task-d20 names it. The pages held are one campaign's, since a new
   campaign replaces the old one, plus the one report the voter serves.
