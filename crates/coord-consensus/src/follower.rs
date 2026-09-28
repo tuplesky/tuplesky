@@ -123,9 +123,10 @@ pub enum FollowerRejection {
     /// A higher ballot was promised before the synchronized row became
     /// durable; that cut supersedes this Sync.
     SyncSuperseded(Ballot),
-    /// This replica's own selection held a dependency cycle among its
-    /// entries, an invariant violation (task-d21); it halted before
-    /// binding it.
+    /// A selection held a dependency cycle among its entries, an
+    /// invariant violation (task-d21): this replica's own, before binding
+    /// it, or one it was sent or restarted from, before installing any of
+    /// it. It halted.
     RecoveryCycle {
         /// Every entry no order keeps, in identity order.
         commands: Vec<CommandId>,
@@ -357,9 +358,10 @@ pub struct Follower {
     /// A command a Sync named other facts for than this replica committed
     /// or executed it under (task-d14): it votes and executes nothing more.
     halted: Option<CommandId>,
-    /// The selected entries this replica's own selection could not order,
-    /// when it held a dependency cycle (task-d21). `halted` is set too,
-    /// so nothing more is voted or executed.
+    /// The selected entries a selection could not order, when it held a
+    /// dependency cycle (task-d21): this replica's own, a Sync it was
+    /// sent, or its Sync row at a restart. `halted` is set too, so
+    /// nothing more is voted or executed.
     recovery_cycle: Option<Vec<CommandId>>,
     /// The Sync whose synchronized-ballot row is in flight: the new ballot
     /// is activated only when that row is durable.
@@ -551,6 +553,13 @@ impl Follower {
         let Some(decision) = self.resumed.take() else {
             return self;
         };
+        // A durable selection with a cycle was written by another build:
+        // nothing of it is installed, and the replica stays halted
+        // (task-d21).
+        if let Err(cycle) = crate::recovery::entry_order(&decision) {
+            self.halt_on_cycle(cycle);
+            return self;
+        }
         self.named_facts = named_facts(&decision);
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
@@ -926,12 +935,8 @@ impl Follower {
             // stall louder. Nothing is bound or proposed; the node halts
             // and says which commands.
             if let Err(cycle) = crate::recovery::entry_order(&decision) {
-                self.rejections.push(FollowerRejection::RecoveryCycle {
-                    commands: cycle.clone(),
-                });
                 self.campaign = None;
-                self.halted = cycle.first().copied();
-                self.recovery_cycle = Some(cycle);
+                self.halt_on_cycle(cycle);
                 return Vec::new();
             }
             // A selected command this replica never stored (it was down
@@ -1071,6 +1076,15 @@ impl Follower {
                 ballot: decision.ballot,
                 promised,
             });
+            return Vec::new();
+        }
+        // A selection this replica cannot order is refused before any of
+        // it is kept or made durable, whoever bound it: a leader of this
+        // build halts on it before binding, so only another build or a
+        // corrupt peer sends one, and installing its acyclic part would
+        // execute what the rest of the domain may never (task-d21).
+        if let Err(cycle) = crate::recovery::entry_order(&decision) {
+            self.halt_on_cycle(cycle);
             return Vec::new();
         }
         if self.ballots.promises_in_flight().iter().any(|p| {
@@ -1326,11 +1340,22 @@ impl Follower {
         self.halted
     }
 
-    /// The selected entries this replica's own selection could not order
-    /// (task-d21): a dependency cycle, the invariant violation it halted
-    /// on.
+    /// The selected entries a selection could not order (task-d21): a
+    /// dependency cycle, the invariant violation this replica halted on,
+    /// in its own campaign's selection, a Sync it was sent, or the Sync
+    /// row it restarted from.
     pub fn recovery_cycle(&self) -> Option<&[CommandId]> {
         self.recovery_cycle.as_deref()
+    }
+
+    /// Halt on a selection whose entries hold a dependency cycle: nothing
+    /// more is voted or executed, and the commands are named.
+    fn halt_on_cycle(&mut self, cycle: Vec<CommandId>) {
+        self.rejections.push(FollowerRejection::RecoveryCycle {
+            commands: cycle.clone(),
+        });
+        self.halted = cycle.first().copied();
+        self.recovery_cycle = Some(cycle);
     }
 
     /// The next command to execute through the materializer, if any.
