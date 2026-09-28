@@ -176,10 +176,13 @@ and its behaviour under faults have something to be compared with:
     kill the start waits until the mix draws kill/start again. In
     September 2026 that left every node down for two to four minutes in
     four TupleSky runs and two etcd runs. `jepsen.tuplesky.nemesis` (in
-    tuplesky/jepsen) staggers the two flip-flops on their own, so a start
-    follows every kill within twice the fault interval. The job copies that
-    namespace into the etcd test and routes its packages through it, so
-    both tests keep one schedule.
+    tuplesky/jepsen) staggers the two flip-flops on their own, with delays
+    uniform up to twice the fault interval, so a start follows every kill
+    within 60 s. (From io.jepsen/generator 0.1.4, which the TupleSky test's
+    Jepsen uses, `gen/stagger` is exponential and capped at 100 s, so the
+    namespace draws its own uniform delays.) The job copies that namespace
+    into the etcd test and routes its packages through it, so both tests
+    keep one schedule.
 
 Its store is the `jepsen-store-etcd-append` artifact.
 
@@ -1033,6 +1036,20 @@ COMMIT. Wire and durable formats change, so every domain starts fresh.
   because the nemesis killed all five nodes at 5 s and started them again
   only at 159 s. No voter logged a stop, `HalfInitialized` or
   `IncompatibleAccepted`.
+* **Jepsen with kills and pauses on schedules of their own**
+  ([run 36362335496](https://github.com/tuplesky/tuplesky/actions/runs/36362335496),
+  attempt 3, head `f12fee0`, tuplesky/jepsen `15873307`):
+  * TupleSky: `:valid? true`, with 1797 `ok` of 2287, and every node
+    served its final reads. Each of the five kills was followed by a start
+    7 to 58 s later, and each of the four pauses by a resume 32 to 57 s
+    later. It served nothing while a majority was down: 150 s to 180 s
+    (`n1` killed, then `n2`, `n4` and `n5` paused) and 270 s to 330 s
+    (`n1`, `n4` and `n5` killed at 241 s and started at 293 s). The second
+    time it served again about 40 s after the start. No voter logged a
+    stop, `HalfInitialized` or `IncompatibleAccepted`.
+  * etcd 3.7.2: `:valid? true`, with 3486 `ok` of 4779; every kill of all
+    five nodes was followed by a start 5 to 30 s later. Attempt 1 of the
+    same run (2580 `ok` of 3589) restarted every kill within 5 to 52 s.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
