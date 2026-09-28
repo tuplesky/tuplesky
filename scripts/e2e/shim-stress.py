@@ -12,8 +12,10 @@ recorded. See docs/operations/jepsen.md.
 Faults: `none`, `leader` (kill the voter that last said it leads, then
 restart it), `random` (kill any voter, then restart it), `pause` (SIGSTOP
 a voter for eight seconds), all one voter at a time so a majority is
-always up; and `majority` (kill the leader and one other voter at once,
-restart both five seconds later), which takes the quorum away.
+always up; `majority` (kill the leader and one other voter at once,
+restart both five seconds later), which takes the quorum away; and `all`
+(kill every voter at once and restart them, then an interval later kill
+and restart whichever leads).
 `--faults 2,1` replaces the random choice with a fixed sequence of voters
 to kill and restart, one per interval, and then no more faults: a run
 that went wrong can be replayed on purpose.
@@ -54,7 +56,7 @@ def parse():
     p.add_argument("--bin", default=os.path.join(ROOT, "target", "debug"),
                    help="directory holding coordd, coord-harness and coord-jepsen")
     p.add_argument("--seconds", type=float, default=120)
-    p.add_argument("--fault", choices=["none", "leader", "random", "pause", "majority"], default="leader")
+    p.add_argument("--fault", choices=["none", "leader", "random", "pause", "majority", "all"], default="leader")
     p.add_argument("--clients", type=int, default=6)
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--interval", type=float, default=20, help="seconds between faults")
@@ -182,6 +184,31 @@ def leader():
 def nemesis():
     stop.wait(5)
     while not stop.is_set() and A.fault != "none":
+        if A.fault == "all":
+            # Every voter at once, then, an interval later, whichever
+            # leads: the Jepsen run where a leader came back behind its
+            # followers, led the next ballot and was killed in it.
+            for m in (1, 2, 3):
+                if daemons[m].poll() is None:
+                    daemons[m].kill()
+                    daemons[m].wait()
+            log("killed every voter")
+            stop.wait(5)
+            for m in (1, 2, 3):
+                start(m)
+            log("restarted every voter")
+            stop.wait(A.interval)
+            if stop.is_set():
+                break
+            n = leader()
+            daemons[n].kill()
+            daemons[n].wait()
+            log(f"killed voter {n}, the leader")
+            stop.wait(5)
+            start(n)
+            log(f"restarted voter {n}")
+            stop.wait(A.interval)
+            continue
         if A.fault == "majority":
             # Two of three at once, the leader among them: the domain has
             # no quorum until they are back.

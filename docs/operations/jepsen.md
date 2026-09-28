@@ -272,8 +272,8 @@ A smaller driver runs the shim against a local three-voter domain. It
 provisions a domain into a new directory, runs several clients doing
 list-append transactions on a few contended keys, kills and restarts a
 voter (or pauses one) every so often, one at a time, or kills the leader
-and one other voter at once (`--fault majority`), reads every key at the
-end, and checks the history with the checks a list-append history
+and one other voter at once (`--fault majority`), or every voter and then
+the leader (`--fault all`), reads every key at the end, and checks the history with the checks a list-append history
 can be held to without Elle: every read of a key is a prefix of the
 final list, nothing appears twice, no failed append is read, an append
 reported `ok` is in every read that began after it, and no two `ok`
