@@ -897,6 +897,8 @@ pub struct Domain<P: Persistence> {
     /// A command this voter holds two decisions of (task-d14). The serve
     /// loop stops on it as it stops on a release-record mismatch.
     admission_halt: Option<CommandId>,
+    /// The entries of a selection no order keeps (task-d21).
+    cycle_halt: Option<Vec<CommandId>>,
     /// A command this voter pulled from a peer's executed history and
     /// executed otherwise than that peer (task-d08). The serve loop stops
     /// on it as it stops on a release-record mismatch.
@@ -1331,6 +1333,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             settle_cursor: 0,
             answered_otherwise: None,
             admission_halt: None,
+            cycle_halt: None,
             caught_up_otherwise: None,
             catch_up: coord_daemon::catch_up::Pacer::default(),
             catch_up_said: 0,
@@ -1553,6 +1556,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
             // Two decisions of one command, found at a Sync or in this
             // voter's own selection (task-d14).
+            if let Some(cycle) = self.cycle_halt.take() {
+                say_recovery_cycle(&cycle);
+                return;
+            }
             if let Some(command) = self.admission_halt.take() {
                 say_two_decisions(&short_hex(&command));
                 return;
@@ -2322,7 +2329,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // Two decisions of one command: the machine votes and executes
         // nothing more, and the serve loop stops rather than leave a node
         // up that answers nothing (task-d14).
-        if let Some(command) = voter.node().machine().halted() {
+        // A dependency cycle in a selection is an invariant violation, not
+        // a failed campaign (task-d21): it stops the node like two
+        // decisions do, and says which commands.
+        if let Some(cycle) = voter.node().machine().recovery_cycle() {
+            self.cycle_halt = Some(cycle.to_vec());
+        } else if let Some(command) = voter.node().machine().halted() {
             self.admission_halt = Some(command);
         }
         // A pulled command this voter executed otherwise than its donor:
@@ -2882,6 +2894,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // and not what the parked frames or the records settle.
         if self.answered_otherwise.is_some()
             || self.admission_halt.is_some()
+            || self.cycle_halt.is_some()
             || self.caught_up_otherwise.is_some()
         {
             return;
@@ -3649,6 +3662,32 @@ fn digest_hex(digest: &coord_types::identity::Digest32) -> String {
 }
 
 /// Why a node stopped on two decisions of one command.
+fn say_recovery_cycle(commands: &[CommandId]) {
+    eprintln!("{}", describe_recovery_cycle(commands));
+}
+
+/// What a node that halts on a dependency cycle in a selection prints
+/// (task-d21): the prefix, how many entries no order keeps, and the first
+/// eight of them in full.
+fn describe_recovery_cycle(commands: &[CommandId]) -> String {
+    let first = commands.first().map_or_else(String::new, short_hex);
+    let named: Vec<String> = commands
+        .iter()
+        .take(8)
+        .map(|c| c.as_bytes().iter().map(|b| format!("{b:02x}")).collect())
+        .collect();
+    format!(
+        "this node stopped: recovery-cycle({first}): the selection it recovered holds a \
+         dependency cycle among its entries, which no quorum's order can produce. {} entr{} \
+         could not be ordered: {}{}. This node proposes, votes and executes nothing more; the \
+         reports it selected from are in its peers' stores",
+        commands.len(),
+        if commands.len() == 1 { "y" } else { "ies" },
+        named.join(", "),
+        if commands.len() > 8 { ", ..." } else { "" }
+    )
+}
+
 fn say_two_decisions(command: &str) {
     eprintln!(
         "this node stopped: incompatible-admission({command}): a selection names other \
@@ -5046,5 +5085,26 @@ mod tests {
             );
             assert!(said.contains("\n  differs: response\n"), "{said}");
         }
+    }
+
+    /// task-d21: a recovery-cycle stop names its prefix, how many entries
+    /// could not be ordered, and the first eight in full.
+    #[test]
+    fn a_recovery_cycle_stop_names_the_commands() {
+        let commands: Vec<super::CommandId> = (0..10u8)
+            .map(|i| super::CommandId(coord_types::identity::Digest32([0xc0 + i; 32])))
+            .collect();
+        let said = super::describe_recovery_cycle(&commands[..2]);
+        assert!(
+            said.starts_with("this node stopped: recovery-cycle(c0c0c0c0): "),
+            "{said}"
+        );
+        assert!(said.contains("2 entries could not be ordered"), "{said}");
+        assert!(said.contains(&"c1".repeat(32)), "{said}");
+        let said = super::describe_recovery_cycle(&commands);
+        assert!(said.contains("10 entries"), "{said}");
+        assert!(said.contains(&"c7".repeat(32)), "{said}");
+        assert!(!said.contains(&"c8".repeat(32)), "{said}");
+        assert!(said.contains(", ..."), "{said}");
     }
 }

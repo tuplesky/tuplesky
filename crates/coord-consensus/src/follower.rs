@@ -123,6 +123,13 @@ pub enum FollowerRejection {
     /// A higher ballot was promised before the synchronized row became
     /// durable; that cut supersedes this Sync.
     SyncSuperseded(Ballot),
+    /// This replica's own selection held a dependency cycle among its
+    /// entries, an invariant violation (task-d21); it halted before
+    /// binding it.
+    RecoveryCycle {
+        /// Every entry no order keeps, in identity order.
+        commands: Vec<CommandId>,
+    },
     /// A higher promise is in flight or durable, so the configured ballot
     /// no longer votes; the work belongs to the new leader.
     FencedByPromise {
@@ -350,6 +357,10 @@ pub struct Follower {
     /// A command a Sync named other facts for than this replica committed
     /// or executed it under (task-d14): it votes and executes nothing more.
     halted: Option<CommandId>,
+    /// The selected entries this replica's own selection could not order,
+    /// when it held a dependency cycle (task-d21). `halted` is set too,
+    /// so nothing more is voted or executed.
+    recovery_cycle: Option<Vec<CommandId>>,
     /// The Sync whose synchronized-ballot row is in flight: the new ballot
     /// is activated only when that row is durable.
     sync_barrier: Option<(BarrierId, SyncDecision)>,
@@ -513,6 +524,7 @@ impl Follower {
             sync_pending: BTreeMap::new(),
             named_facts: BTreeMap::new(),
             halted: None,
+            recovery_cycle: None,
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
@@ -639,6 +651,7 @@ impl Follower {
             sync_pending: BTreeMap::new(),
             named_facts: BTreeMap::new(),
             halted: None,
+            recovery_cycle: None,
             sync_barrier: None,
             sync_demoted: Vec::new(),
             won: None,
@@ -897,6 +910,20 @@ impl Follower {
                 ));
                 self.campaign = None;
                 self.halted = Some(command);
+                return Vec::new();
+            }
+            // A dependency cycle among the selected entries is an
+            // invariant violation, not a failed campaign (task-d21): every
+            // later campaign sees the same reports, so retrying would only
+            // stall louder. Nothing is bound or proposed; the node halts
+            // and says which commands.
+            if let Err(cycle) = crate::recovery::entry_order(&decision) {
+                self.rejections.push(FollowerRejection::RecoveryCycle {
+                    commands: cycle.clone(),
+                });
+                self.campaign = None;
+                self.halted = cycle.first().copied();
+                self.recovery_cycle = Some(cycle);
                 return Vec::new();
             }
             // A selected command this replica never stored (it was down
@@ -1286,6 +1313,13 @@ impl Follower {
     /// and executes nothing more, and the process running it is to stop.
     pub const fn halted(&self) -> Option<CommandId> {
         self.halted
+    }
+
+    /// The selected entries this replica's own selection could not order
+    /// (task-d21): a dependency cycle, the invariant violation it halted
+    /// on.
+    pub fn recovery_cycle(&self) -> Option<&[CommandId]> {
+        self.recovery_cycle.as_deref()
     }
 
     /// The next command to execute through the materializer, if any.

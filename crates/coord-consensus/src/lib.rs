@@ -175,7 +175,8 @@ pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};
 pub use recovery::{
-    RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, select, select_with,
+    RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, entry_order, select,
+    select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
 pub use role::{PendingReport, RecoveredState};
