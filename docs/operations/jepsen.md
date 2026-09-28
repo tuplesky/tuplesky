@@ -1174,10 +1174,10 @@ gets logged in its place.
   anomaly and no stop. No voter logged alert 120.
 * **What the dials failed on:** every "cannot reach a voter on the peer
   plane" named the peer address's own error,
-  `Rejected(Transport("connection lost"))`, 163 times over the 12 runs,
+  `Rejected(Transport("connection lost"))`, 190 times over the 12 runs,
   while the voter it dialled was down or restarting. The other failures
   were sends refused while a connection was down: `QueueFull` on the
-  Control lane (166) and `NotConnected` (64).
+  Control lane (206) and `NotConnected` (87).
 
 ### Under Jepsen: a domain that no longer binds sessions
 
