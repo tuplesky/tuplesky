@@ -191,9 +191,20 @@ Each test runs under `timeout`, bounded at the time limit plus 20
 minutes. A test whose final phase hangs then fails in that time, instead
 of holding its job until the job's own timeout (90 or 120 minutes). The
 job would also hold every later run of the workflow's concurrency group,
-which doesn't cancel runs in progress. One etcd run on this PR logged
-nothing for 84 minutes after its time limit ran out
-([run 36323935964](https://github.com/tuplesky/tuplesky/actions/runs/36323935964)).
+which doesn't cancel runs in progress. Two etcd runs on this PR stopped
+on a `:pause :all` whose result was never logged, and with the nemesis
+worker stuck in it, no later fault or heal ran:
+[run 36323935964](https://github.com/tuplesky/tuplesky/actions/runs/36323935964)
+logged nothing for 84 minutes after its time limit, and
+[run 36365926073](https://github.com/tuplesky/tuplesky/actions/runs/36365926073)
+(`:pause :all` 14 s after `:kill :all`) hit the bound. The etcd test pauses
+with `grepkill! :stop "etcd"`, which returned at once in the other runs
+that paused all five nodes, dead or alive. So `scripts/ci/jepsen_bounded.sh`
+runs each test under the bound, and a minute before it prints every JVM's
+threads (`jcmd Thread.print`) and each node's processes (state and wait
+channel) into a folded group in the job log. The next hang then says which
+thread waits, and on what node-side command, without the store, which the
+job log does not carry.
 
 Each job's summary digests its run, since the job log runs to thousands
 of lines. `scripts/ci/jepsen_summary.py` reads the test's store
@@ -1051,6 +1062,22 @@ COMMIT. Wire and durable formats change, so every domain starts fresh.
   * etcd 3.7.2: `:valid? true`, with 3486 `ok` of 4779; every kill of all
     five nodes was followed by a start 5 to 30 s later. Attempt 1 of the
     same run (2580 `ok` of 3589) restarted every kill within 5 to 52 s.
+
+`9c23cc6` carries #108 at `cd69f4b` and #109 at `5e669e9`. #108's head
+stops `coordd` on two decisions of one command, and answers nothing in
+the pass that halts. #109 has a leader re-send a proposal it holds below
+COMMIT until the voter's adoption of it arrives, however far past it that
+voter's counted adoptions reach: in rep108-3, repaf-4 and most likely
+raf-2, one lost acknowledgement left the leader unable to learn a command
+its followers had committed among themselves.
+* **Local runs:** 6 random-kill runs (120 s) and 6 replays
+  (`--faults 2,1`, 60 s), fresh domains. All 12 served their final reads,
+  with no anomaly. No voter logged a stop, `HalfInitialized`,
+  `IncompatibleAccepted`, `AdmissionConflict` or `IncompatibleAdmission`.
+  Each run's `ProposalRepublished` count stayed between 7 and 25, where
+  rep108-3's leader republished until its table filled.
+* **The etcd baseline** on the same run hung on a `:pause :all` (above).
+  It runs no TupleSky code.
 
 ### Under Jepsen: a domain that no longer binds sessions
 

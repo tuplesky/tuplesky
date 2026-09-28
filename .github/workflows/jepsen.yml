@@ -43,6 +43,7 @@ on:
     paths:
       - .github/workflows/jepsen.yml
       - crates/coord-jepsen/**
+      - scripts/ci/jepsen_bounded.sh
       - scripts/ci/jepsen_summary.py
   schedule:
     # Weekly, after the Kubernetes certification.
@@ -142,9 +143,12 @@ jobs:
         # Bounded at the time limit plus 20 minutes for setup, healing,
         # the final reads and the checkers: a test whose final phase hangs
         # fails here instead of holding the job, and every later run of
-        # this concurrency group, until the job's own timeout.
+        # this concurrency group, until the job's own timeout. A minute
+        # before the bound it prints every JVM's threads and each node's
+        # processes, to say where it hung.
         run: |
-          timeout -k 60 $((TIME_LIMIT + 1200)) lein run test \
+          "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
+            $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
             --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
             --username root \
@@ -294,10 +298,12 @@ jobs:
         working-directory: etcd-test
         # The tuplesky test's rate (20/s) and fault interval (30 s) rather
         # than the etcd test's defaults (200/s, 5 s). Bounded as the
-        # tuplesky test is: one etcd run hung for 84 minutes after its
-        # time limit.
+        # tuplesky test is, with the same dump before the bound: two etcd
+        # runs stopped on a :pause :all that never returned, one of them
+        # for 84 minutes after its time limit.
         run: |
-          timeout -k 60 $((TIME_LIMIT + 1200)) lein run test \
+          "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
+            $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
             --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
             --username root \
