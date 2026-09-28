@@ -1792,6 +1792,12 @@ impl Follower {
         let Some((donor, ballot, entry)) = self.catch_up.queue.pop_front() else {
             return Vec::new();
         };
+        if ballot != self.config.quorum.ballot() || self.ballots.synced() != ballot {
+            // The page was answered at a ballot this replica has left.
+            self.catch_up.queue.clear();
+            self.catch_up.continue_from = None;
+            return Vec::new();
+        }
         let command = entry.command;
         let digest = entry.payload.admission_digest();
         let expected = DonorExecution {
@@ -1893,6 +1899,7 @@ impl Follower {
             decided: entry.decided.is_some(),
             barrier,
             durable: false,
+            entry,
         });
         alloc::vec![Effect::Persist(PersistBatch {
             barrier,
@@ -2967,6 +2974,7 @@ impl Follower {
             out.extend(self.release());
             return out;
         }
+        let mut reinstall = false;
         if let Some(barrier) = event.barrier()
             && let Some(pending) = self.pending.get(&barrier).cloned()
         {
@@ -2996,6 +3004,19 @@ impl Follower {
                 }
                 StorageEvent::Failed { .. } => {
                     self.pending.remove(&barrier);
+                    // A pulled command whose installation failed is put
+                    // back at the head of its page and installed again,
+                    // rather than left waiting on a batch that will never
+                    // be durable: nothing executes past it meanwhile, and
+                    // no further page is asked for (task-d08).
+                    if let Some(running) = self.catch_up.running.take_if(|r| r.barrier == barrier) {
+                        self.catch_up.queue.push_front((
+                            running.donor.donor,
+                            running.donor.ballot,
+                            running.entry,
+                        ));
+                        reinstall = true;
+                    }
                     // The batch never happened: its vote is not evidence.
                     self.deferred.remove(&barrier);
                     self.ledger.failed(barrier);
@@ -3019,6 +3040,9 @@ impl Follower {
         }
         out.extend(self.deliver_due_report());
         self.learn();
+        if reinstall {
+            out.extend(self.install_catch_up());
+        }
         out.extend(self.release());
         out
     }

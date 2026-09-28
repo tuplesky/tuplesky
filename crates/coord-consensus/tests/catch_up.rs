@@ -24,7 +24,7 @@ use coord_consensus::{
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
 use coord_core::event::{
-    AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageEvent,
+    AdmittedRequest, AuthenticatedPeerMessage, Event, PeerProvenance, StorageError, StorageEvent,
 };
 use coord_core::machine::DeterministicMachine;
 use coord_sim::storage::StorageModel;
@@ -128,6 +128,11 @@ struct Cluster {
     serve: bool,
     /// Pages served.
     pages: usize,
+    /// A node whose next persisted batch fails, as a fence at a higher
+    /// promise refuses one, and how many more of its batches fail.
+    failing: Option<(usize, usize)>,
+    /// Batches failed so far.
+    failed: usize,
     /// Payload values the applier produced, by node, to compare with.
     fork: Option<(usize, CommandId)>,
 }
@@ -184,6 +189,8 @@ impl Cluster {
             catching: Vec::new(),
             serve: true,
             pages: 0,
+            failing: None,
+            failed: 0,
             fork: None,
         }
     }
@@ -200,6 +207,19 @@ impl Cluster {
             match e {
                 Effect::Persist(batch) => {
                     let barrier = batch.barrier;
+                    if let Some((node, left)) = self.failing
+                        && node == i
+                        && left > 0
+                    {
+                        self.failing = Some((node, left - 1));
+                        self.failed += 1;
+                        let more = self.nodes[i].step(Event::Storage(StorageEvent::Failed {
+                            barrier_id: barrier,
+                            error: StorageError::DefinitelyNotCommitted,
+                        }));
+                        self.handle(i, more);
+                        continue;
+                    }
                     let node = &mut self.nodes[i];
                     node.storage.submit(batch);
                     node.storage.complete(barrier).unwrap();
@@ -820,4 +840,28 @@ fn a_command_the_donor_keeps_no_row_of_goes_to_history() {
         cluster.dependency_rows(4).iter().all(|(c, _)| *c != bare),
         "r4 kept a dependency row the donor did not have"
     );
+}
+
+/// A pulled command whose installation batch fails is installed again,
+/// rather than left waiting on a batch that will never be durable: the
+/// voter does not wedge, and catches up once its store takes the batch
+/// (task-d08).
+#[test]
+fn a_failed_installation_is_installed_again() {
+    let (mut cluster, _) = left_behind(13);
+    let before = cluster.nodes[4].executed.len();
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    cluster.failing = Some((4, 2));
+    cluster.deliver_page(4, 0, &page);
+    assert_eq!(cluster.failed, 2, "both failures reached r4");
+    cluster.settle();
+    assert!(
+        cluster.nodes[4].executed.len() > before,
+        "r4 wedged on a failed installation"
+    );
+    cluster.catching = vec![4];
+    cluster.settle_ticking(8);
+    assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
+    assert!(!cluster.follower(4).holds_unexecuted());
 }

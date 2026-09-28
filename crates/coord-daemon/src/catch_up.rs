@@ -257,6 +257,10 @@ pub struct Pacer {
     asked: Option<Instant>,
     /// Asks gone unanswered since the frontier last moved.
     unanswered: u32,
+    /// Whether the last turn found a voter that may have to ask: one
+    /// that holds work, does not lead, and has no page in hand. Only
+    /// such a voter has a deadline ([`Pacer::next_deadline`]).
+    wanting: bool,
     /// Asks made (diagnostic).
     pub asks: u64,
 }
@@ -274,6 +278,7 @@ impl Pacer {
         leader: ReplicaId,
         voters: &[ReplicaId],
     ) -> Option<ReplicaId> {
+        self.wanting = standing.holds && !standing.leads && !standing.busy;
         let moved = self.still.is_none_or(|(at, _)| at != standing.executed);
         if moved || standing.busy {
             self.still = Some((standing.executed, now));
@@ -296,6 +301,9 @@ impl Pacer {
             }
             self.unanswered = self.unanswered.saturating_add(1);
         }
+        // Moved on before anything else, so the deadline moves past this
+        // turn whether or not there is anyone to ask.
+        self.asked = Some(now);
         let others: Vec<ReplicaId> = voters.iter().copied().filter(|v| *v != me).collect();
         let donor = if self.unanswered < LEADER_ASKS && leader != me {
             leader
@@ -303,9 +311,27 @@ impl Pacer {
             let turn = (self.unanswered.saturating_sub(LEADER_ASKS)) as usize;
             *others.get(turn % others.len().max(1))?
         };
-        self.asked = Some(now);
         self.asks += 1;
         Some(donor)
+    }
+
+    /// When the loop has to give this voter a turn even if nothing
+    /// arrives: the moment a still frontier has been still long enough to
+    /// ask, or an ask has gone unanswered long enough to ask again.
+    /// `None` for a voter with nothing to ask for.
+    ///
+    /// A follower with held work and no traffic is exactly the voter this
+    /// is for: nothing else wakes an idle loop, and a healthy follower has
+    /// no election deadline either.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        if !self.wanting {
+            return None;
+        }
+        match (self.asked, self.still) {
+            (Some(at), _) => Some(at + UNANSWERED),
+            (None, Some((_, since))) => Some(since + STILL_FOR),
+            (None, None) => None,
+        }
     }
 }
 
@@ -397,6 +423,41 @@ mod tests {
             pacer.due(t, standing(9, true), r(3), r(1), &voters),
             Some(r(1))
         );
+    }
+
+    /// The pacer registers when it next has to look, so an idle loop
+    /// wakes for it, and the deadline moves on once the turn it woke has
+    /// asked (task-d08).
+    #[test]
+    fn the_pacer_says_when_it_next_has_to_look() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let mut pacer = Pacer::default();
+        assert_eq!(pacer.next_deadline(), None);
+        pacer.due(t0, standing(5, true), r(3), r(1), &voters);
+        assert_eq!(pacer.next_deadline(), Some(t0 + STILL_FOR));
+        let t = t0 + STILL_FOR;
+        assert_eq!(
+            pacer.due(t, standing(5, true), r(3), r(1), &voters),
+            Some(r(1))
+        );
+        assert_eq!(pacer.next_deadline(), Some(t + UNANSWERED));
+        // Nothing held: nothing to wake for.
+        pacer.due(t, standing(5, false), r(3), r(1), &voters);
+        assert_eq!(pacer.next_deadline(), None);
+        // A page in hand makes progress by execution, not by the clock.
+        let busy = Standing {
+            busy: true,
+            ..standing(5, true)
+        };
+        pacer.due(t, busy, r(3), r(1), &voters);
+        assert_eq!(pacer.next_deadline(), None);
+        // Alone, with nobody to ask, the deadline still moves on.
+        let mut alone = Pacer::default();
+        alone.due(t0, standing(5, true), r(3), r(3), &[r(3)]);
+        let t = t0 + STILL_FOR;
+        assert_eq!(alone.due(t, standing(5, true), r(3), r(3), &[r(3)]), None);
+        assert_eq!(alone.next_deadline(), Some(t + UNANSWERED));
     }
 
     #[test]

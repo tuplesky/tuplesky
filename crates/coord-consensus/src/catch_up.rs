@@ -75,7 +75,7 @@ pub struct CatchUpDivergence {
 }
 
 /// The pulled command installed and waiting for the executor.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Running {
     /// The command.
     pub(crate) command: CommandId,
@@ -88,6 +88,10 @@ pub(crate) struct Running {
     /// Whether that batch is durable: a pulled command executes only once
     /// its decision is on disk here, as any other commit's is.
     pub(crate) durable: bool,
+    /// The page entry it came from, put back at the head of the page if
+    /// that batch fails, so it is installed again rather than left
+    /// waiting on a batch that will never be durable.
+    pub(crate) entry: CatchUpEntry,
 }
 
 /// The catch-up this follower has in hand: at most one page, and the one

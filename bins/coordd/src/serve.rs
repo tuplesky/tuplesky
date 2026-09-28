@@ -2097,10 +2097,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Backing::Voting(voter) if voter.leads() => self.resent.map(|at| at + RESEND_INTERVAL),
             _ => None,
         };
-        [expiry, parked, reoffer, redial, renewal, election, resend]
-            .into_iter()
-            .flatten()
-            .min()
+        // A follower holding work it does not execute asks a peer once
+        // its frontier has been still for a while, and again if nobody
+        // answers; on an idle domain nothing else would wake it to
+        // (task-d08).
+        let catch_up = match &self.backing {
+            Backing::Voting(voter) if !voter.leads() => self.catch_up.next_deadline(),
+            _ => None,
+        };
+        [
+            expiry, parked, reoffer, redial, renewal, election, resend, catch_up,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases

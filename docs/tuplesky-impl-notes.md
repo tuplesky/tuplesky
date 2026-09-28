@@ -5515,7 +5515,10 @@ behind by more than a table is sent nothing it can use.
   after that frontier: the leader first, then, after two unanswered
   asks, the other voters in turn (`coord_daemon::catch_up::Pacer`). One
   page outstanding; the machine asks again at once when a full page is
-  executed, so the pacer is the floor for an ask nobody answered.
+  executed, so the pacer is the floor for an ask nobody answered. The
+  pacer registers its next look as a serve-loop deadline, so an idle
+  follower with held work, which has no election deadline, still wakes
+  to ask and to ask again.
 - The donor answers only a voter of its configuration, only at a ballot
   it is synchronized at (it leads it, or follows it with its Sync
   installed), only while it has not itself stopped, and only up to its
@@ -5541,6 +5544,9 @@ behind by more than a table is sent nothing it can use.
   recorded, unless it had committed the command itself, and must all be
   executed here already. The payload and dependency rows are written in
   one batch, and the command executes only once that batch is durable.
+  A batch that fails (a fence at a higher promise refuses it) puts the
+  entry back at the head of the page and installs it again; a page
+  answered at a ballot the voter has since left is dropped instead.
 - Where the donor keeps no dependency row, the command is installed with
   no dependencies, this voter's own row is deleted in that batch, and the
   command goes to history once executed: nothing is reported committed
@@ -5604,7 +5610,11 @@ behind by more than a table is sent nothing it can use.
     frontier; no command executes twice and the history is the leader's.
   - `a_command_the_donor_keeps_no_row_of_goes_to_history`: executed at
     the donor's position, no record and no dependency row left.
-  - Negative control: with pages refused on arrival, all six fail.
+  - `a_failed_installation_is_installed_again`: two failed installation
+    batches, and r4 still catches up; with the entry left waiting on the
+    failed batch it wedges and the test fails.
+  - Negative control: with pages refused on arrival, the first six
+    fail.
 - `coord-daemon` `tests/catch_up.rs`,
   `a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal`:
   three voters over model-engine stores, a table of eight, r2 cut off
@@ -5614,7 +5624,8 @@ behind by more than a table is sent nothing it can use.
   without `Backpressure`; and its `executed_v1` rows are the leader's,
   row for row. Negative control: with the pacer's ask dropped, r2 is at
   61 of 861 after 10 s and the test fails.
-- `coord-daemon` `catch_up::tests`: the position order and the pacer.
+- `coord-daemon` `catch_up::tests`: the position order, the pacer, and
+  the deadline it registers (`the_pacer_says_when_it_next_has_to_look`).
 - `a_catch_up_mismatch_names_the_catch_up_check` and
   `a_divergence_stop_keeps_its_prefix` (`coordd`): the third check's
   wording, and the prefix on all three.
