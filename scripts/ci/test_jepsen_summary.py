@@ -54,6 +54,7 @@ this voter follows ballot 3 led by 02020202
 this voter's machine refused: Backpressure (1 so far)
 this voter's machine refused: Promise(CandidateBehind { candidate: ExecutionPosition(1), own: ExecutionPosition(9) }) (1 so far)
 cannot reach a voter on the peer plane: voter 02 Control: 127.0.0.1:7002: Rejected(Transport("connection lost")) (3 so far)
+cannot reach a voter to submit to it: voter 02: 127.0.0.1:7102: Rejected(Timeout) (1 so far)
 """
 
 
@@ -79,7 +80,9 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(v.ballot, 3)
         self.assertEqual(v.counts["Backpressure"], 5)
         self.assertEqual(v.counts["CandidateBehind"], 1)
-        self.assertEqual(v.counts["cannot reach a voter"], 5)
+        # Each plane keeps its own counter, so each has its own column.
+        self.assertEqual(v.counts["cannot reach (peer)"], 5)
+        self.assertEqual(v.counts["cannot reach (collector)"], 1)
         # The other plane's refusal is by design, not a failure.
         self.assertNotIn("alert 120", v.counts)
         self.assertNotIn("stopped", v.counts)
@@ -123,6 +126,13 @@ class SummaryTests(unittest.TestCase):
         os.mkdir(os.path.join(store, "n1"))
         with open(os.path.join(store, "n1", "coordd.log"), "w") as f:
             f.write(VOTER)
+        with open(os.path.join(store, "n1", "executed-at-end"), "w") as f:
+            f.write("5820\n")
+        os.mkdir(os.path.join(store, "n2"))
+        with open(os.path.join(store, "n2", "coordd.log"), "w") as f:
+            f.write(VOTER)
+        with open(os.path.join(store, "n2", "executed-at-end"), "w") as f:
+            f.write("cannot open n2.redb: I/O error\n")
         self.text = js.summarize(store, ["n1", "n2"], "Jepsen")
 
     def tearDown(self):
@@ -145,7 +155,13 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("<summary>Faults (2)</summary>", self.text)
         self.assertIn('| 10:00:04 | 3 | `:kill` | :all | {"n1" "", "n2" ""} |', self.text)
         self.assertIn("| 10:00:40 | 39 | `:start` | :all | - |", self.text)
-        self.assertIn("| n1 | 2 | 9 | follows ballot 3 led by 02020202 | 3 |", self.text)
+        self.assertIn("| n1 | 2 | 9 | 5820 | follows ballot 3 led by 02020202 | 3 |", self.text)
+        # A store that did not open reads "?", not a number.
+        self.assertIn("| n2 | 2 | 9 | ? | follows ballot 3 led by 02020202 | 3 |", self.text)
+
+    def test_executed_at_end_without_a_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(js.read_executed_at_end(d), "-")
 
     def test_missing_files_leave_sections_out(self):
         with tempfile.TemporaryDirectory() as empty:

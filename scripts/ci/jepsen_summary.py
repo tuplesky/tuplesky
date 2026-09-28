@@ -55,8 +55,10 @@ MARKERS = (
     ("BehindVoters", "BehindVoters"),
     ("Backpressure", "Backpressure"),
     ("ProposalRepublished", "ProposalRepublished"),
-    # A dial that reached none of a voter's addresses, and why (task-d16).
-    ("cannot reach a voter", "cannot reach a voter"),
+    # A dial that reached none of a voter's addresses, and why (task-d16);
+    # the two planes keep their own counters, so each has its column.
+    ("cannot reach (peer)", "cannot reach a voter on the peer plane"),
+    ("cannot reach (collector)", "cannot reach a voter to submit to it"),
 )
 # Not counted: TLS alert 120 (no_application_protocol). A node lists both of
 # its listeners without saying which is which, so a dial to the other
@@ -89,6 +91,9 @@ class Op:
 class Voter:
     boots: int = 0
     executed: str = "-"
+    # The highest executed position in the voter's store at the end, which
+    # the job writes to `executed-at-end` next to its log; "-" without one.
+    executed_at_end: str = "-"
     role: str = "-"
     ballot: int | None = None
     counts: dict = field(default_factory=dict)
@@ -136,6 +141,18 @@ def parse_results(text: str) -> tuple[str, list[str]]:
     for m in re.finditer(r":anomaly-types\s*[\[(]([^\])]*)[\])]", text):
         anomalies += [a for a in m[1].replace(",", " ").split() if a not in anomalies]
     return valid, anomalies
+
+
+def read_executed_at_end(node_dir) -> str:
+    """The voter's highest executed position at the end, as the job wrote it
+    from the store: "-" when there is no such file, "?" when it holds
+    anything but a number (the store did not open)."""
+    try:
+        with open(os.path.join(node_dir, "executed-at-end"), encoding="utf-8", errors="replace") as f:
+            text = f.read().strip()
+    except OSError:
+        return "-"
+    return text if text.isdigit() else "?"
 
 
 def parse_voter(lines) -> Voter:
@@ -328,21 +345,24 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         if os.path.isfile(path):
             with open(path, encoding="utf-8", errors="replace") as f:
                 voters[node] = parse_voter(f)
+            voters[node].executed_at_end = read_executed_at_end(os.path.join(store, node))
     if voters:
         keys = [k for k, _ in MARKERS]
         out.append("**Voters** (from each `coordd.log`; a refusal counts the highest \"so far\" in each boot)")
         out.append("")
         out.append(
-            "| Node | Boots | Executed at last boot | Last role | Highest ballot | "
+            "| Node | Boots | Executed at last boot | Executed at end | Last role | Highest ballot | "
             + " | ".join(keys)
             + " | ProposalRepublished after the final start |"
         )
-        out.append("| --- " * (6 + len(keys)) + "|")
+        out.append("| --- " * (7 + len(keys)) + "|")
         for node, v in voters.items():
             counts = " | ".join(str(v.counts.get(k, 0)) for k in keys)
             ballot = "-" if v.ballot is None else str(v.ballot)
             after = v.after_start.get("ProposalRepublished", 0)
-            out.append(f"| {node} | {v.boots} | {v.executed} | {v.role} | {ballot} | {counts} | {after} |")
+            out.append(
+                f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} | {v.role} | {ballot} | {counts} | {after} |"
+            )
         out.append("")
     return "\n".join(out) + "\n"
 

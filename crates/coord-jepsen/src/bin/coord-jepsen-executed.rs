@@ -10,6 +10,9 @@
 //! the rows around it on every voter show where their orders split, or,
 //! when the orders agree, where one command's results differ.
 //!
+//! With `--last`, only the highest executed position, for a test's
+//! summary of how far each voter got.
+//!
 //! It writes nothing itself, but opening a store that was not closed (a
 //! killed voter's, a crash image) lets `redb` repair it in place, so give
 //! it a scratch copy when the file must keep its bytes. One that does not
@@ -37,6 +40,9 @@ struct Cli {
     /// How many positions either side of a match to print.
     #[arg(long, default_value_t = 5)]
     span: u64,
+    /// Print only the highest executed position (0 when nothing executed).
+    #[arg(long, conflicts_with = "around")]
+    last: bool,
 }
 
 const EXECUTED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("executed_v1");
@@ -72,6 +78,11 @@ fn rows(store: &PathBuf) -> Result<Vec<Row>, String> {
     Ok(rows)
 }
 
+/// The highest executed position, or 0 when nothing executed.
+fn last_position(rows: &[Row]) -> u64 {
+    rows.iter().map(|r| r.position).max().unwrap_or(0)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -103,6 +114,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if cli.last {
+        println!("{}", last_position(&rows));
+        return ExitCode::SUCCESS;
+    }
     let selected = select(&rows, cli.around.as_deref(), cli.span);
     if let (Some(prefix), true) = (&cli.around, selected.is_empty()) {
         println!(
@@ -151,6 +166,15 @@ mod tests {
         assert_eq!(
             picked,
             vec![(8, false), (9, false), (10, true), (11, false), (12, false)]
+        );
+    }
+
+    #[test]
+    fn last_is_the_highest_position_or_zero() {
+        assert_eq!(last_position(&[]), 0);
+        assert_eq!(
+            last_position(&[row(3, "aa"), row(9, "bb"), row(4, "cc")]),
+            9
         );
     }
 

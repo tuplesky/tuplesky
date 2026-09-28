@@ -157,6 +157,23 @@ jobs:
             --nemesis "$NEMESIS" \
             --time-limit "$TIME_LIMIT" \
             --concurrency 2n
+      - name: Read how far each voter executed
+        if: always()
+        # Each voter's highest executed position at the end, from its store
+        # (a crash image, jepsen.tuplesky.db's log-files kills coordd first),
+        # for the summary's "Executed at end" column: a voter left behind
+        # shows here even when its log says nothing. Read from a scratch
+        # copy, since opening a crash image lets redb repair it.
+        run: |
+          shopt -s nullglob
+          for db in jepsen/tuplesky/store/latest/n*/domain.redb; do
+            dir=$(dirname "$db")
+            node=$(basename "$dir")
+            cp "$db" "$RUNNER_TEMP/$node-last.redb"
+            "$GITHUB_WORKSPACE/tuplesky/target/release/coord-jepsen-executed" \
+              "$RUNNER_TEMP/$node-last.redb" --last > "$dir/executed-at-end" || true
+            echo "$node: $(head -c 200 "$dir/executed-at-end")"
+          done
       - name: Summarize the run
         if: always()
         # The verdict, counts, final reads per node, faults and one row per

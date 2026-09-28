@@ -236,13 +236,16 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
 * the commonest reasons an operation was not `ok`, and the faults in
   order;
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
-  the position it last recovered at, its last role, its highest ballot,
-  and its stops, panics, `HalfInitialized`, `IncompatibleAccepted`,
-  `CandidateBehind`, `BehindVoters`, `Backpressure`,
-  `ProposalRepublished`, and "cannot reach a voter" (a dial that reached
-  none of a voter's addresses; the log line says why each failed). TLS
-  alert 120 is not counted: a dial to a node's
-  other listener is refused that way by design. A refusal the daemon logs
+  the position it last recovered at, the highest position it executed by
+  the end (read from its store by `coord-jepsen-executed --last`, so a
+  voter left behind shows even when its log says nothing), its last role,
+  its highest ballot, and its stops, panics, `HalfInitialized`,
+  `IncompatibleAccepted`, `CandidateBehind`, `BehindVoters`,
+  `Backpressure`, `ProposalRepublished`, and "cannot reach" on the peer
+  plane and on the collector plane (a dial that reached none of a voter's
+  addresses; the log line says why each failed; each plane keeps its own
+  counter). TLS alert 120 is not counted: a dial to a node's other
+  listener is refused that way by design. A refusal the daemon logs
   as "(N so far)" counts the highest N in each boot. A last column counts
   `ProposalRepublished` after the final start, from the last "Jepsen
   starting" line the final heal writes into every node's log. A leader
