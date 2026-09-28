@@ -5882,6 +5882,13 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
   eight in full.
 - A leader handed a cyclic selection anyway, from a Sync row bound before
   this check existed, proposes nothing and is not leading.
+- A follower checks every selection it would keep or install the same
+  way: a Sync it is sent, before anything of it is held, persisted or
+  installed, and the Sync row it restarts from, before any entry is
+  queued. On a cycle it halts naming the commands, and `coordd` stops as
+  above. A leader of this build never sends one, so only another build
+  or a corrupt peer can; installing the acyclic part would execute what
+  the rest of the domain may never (Codex review).
 - Nothing changes in what is selected.
 
 ### Evidence
@@ -5894,6 +5901,12 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
 - `a_leader_handed_a_cyclic_selection_proposes_nothing` (`activation`):
   `entry_order` returns the cycle, and `from_recovered` emits no effects
   and is not leading.
+- `a_follower_sent_a_cyclic_sync_halts_before_installing_any_of_it`
+  and `a_follower_restarting_from_a_cyclic_sync_row_stays_halted`
+  (`activation`): a promised follower sent such a Sync persists nothing,
+  stays at its synchronized ballot and halts with both named; restarted
+  from the row, it queues neither entry and is halted. Both fail without
+  the check.
 - `a_recovery_cycle_stop_names_the_commands` (`coordd`): the stop's
   prefix, the count, and the first eight entries in full.
 - Before this change, the candidate bound such a Sync, and the new leader
