@@ -150,6 +150,18 @@ pub fn dependency_update(
     })
 }
 
+/// The update deleting a command's dependency row in an epoch
+/// (task-d08): a command pulled from a peer without the peer's decided
+/// record goes to history, and the record this replica had of it must
+/// not come back after a restart to be reported as that decision.
+pub fn dependency_delete(epoch: ConfigurationEpoch, command: &CommandId) -> StoreUpdate {
+    StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: dependency_key(epoch, command),
+        value: None,
+    }
+}
+
 /// The immutable canonical command in `payload_v1`, keyed by command
 /// identity: retry key, canonical logical bytes (rehashed on read), and
 /// the admission the command was accepted under.

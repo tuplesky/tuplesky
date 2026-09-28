@@ -897,6 +897,14 @@ pub struct Domain<P: Persistence> {
     /// A command this voter holds two decisions of (task-d14). The serve
     /// loop stops on it as it stops on a release-record mismatch.
     admission_halt: Option<CommandId>,
+    /// A command this voter pulled from a peer's executed history and
+    /// executed otherwise than that peer (task-d08). The serve loop stops
+    /// on it as it stops on a release-record mismatch.
+    caught_up_otherwise: Option<Box<coord_collector::Mismatch>>,
+    /// When this voter asks a peer for what it is missing (task-d08).
+    catch_up: coord_daemon::catch_up::Pacer,
+    /// Catch-up pages taken, as last said (task-d08).
+    catch_up_said: u64,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -1323,6 +1331,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             settle_cursor: 0,
             answered_otherwise: None,
             admission_halt: None,
+            caught_up_otherwise: None,
+            catch_up: coord_daemon::catch_up::Pacer::default(),
+            catch_up_said: 0,
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
@@ -1531,6 +1542,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // says something else (task-d12). The caller was already told
             // the wrong thing; nothing more is.
             if let Some(mismatch) = self.answered_otherwise.take() {
+                say_diverged(&self.divergence(&mismatch));
+                return;
+            }
+            // A command pulled from a peer's executed history that this
+            // voter executed otherwise than that peer (task-d08).
+            if let Some(mismatch) = self.caught_up_otherwise.take() {
                 say_diverged(&self.divergence(&mismatch));
                 return;
             }
@@ -2080,10 +2097,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Backing::Voting(voter) if voter.leads() => self.resent.map(|at| at + RESEND_INTERVAL),
             _ => None,
         };
-        [expiry, parked, reoffer, redial, renewal, election, resend]
-            .into_iter()
-            .flatten()
-            .min()
+        // A follower holding work it does not execute asks a peer once
+        // its frontier has been still for a while, and again if nobody
+        // answers; on an idle domain nothing else would wake it to
+        // (task-d08).
+        let catch_up = match &self.backing {
+            Backing::Voting(voter) if !voter.leads() => self.catch_up.next_deadline(),
+            _ => None,
+        };
+        [
+            expiry, parked, reoffer, redial, renewal, election, resend, catch_up,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Authority epochs proposed, expiry candidates proposed, and leases
@@ -2209,6 +2236,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         } else {
             self.resent = None;
         }
+        // A voter that holds work it does not execute, and has not moved
+        // for a while, asks a peer for the commands it executed after
+        // this voter's frontier: the leader first, then the others
+        // (task-d08). One page at a time; a full one is followed by the
+        // next ask as soon as it is executed, by the machine itself.
+        out.absorb(voter.catch_up(&mut self.catch_up, std::time::Instant::now())?);
+        let (pages, pulled) = voter.node().machine().catch_up_counts();
+        if pages > self.catch_up_said {
+            if self.catch_up_said == 0 || pages % 64 == 0 {
+                eprintln!(
+                    "this voter is catching up from a peer's executed history: \
+                     {pages} page(s), {pulled} command(s) so far, executed through {}",
+                    voter.node().machine().executed_through()
+                );
+            }
+            self.catch_up_said = pages;
+        }
         // Expiry is the leader's to schedule, and every candidate it
         // produces is conditional: nothing here decides that a key
         // goes, only that the cluster should be asked.
@@ -2280,6 +2324,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // up that answers nothing (task-d14).
         if let Some(command) = voter.node().machine().halted() {
             self.admission_halt = Some(command);
+        }
+        // A pulled command this voter executed otherwise than its donor:
+        // the machine executes nothing more, and the serve loop stops
+        // (task-d08).
+        if self.caught_up_otherwise.is_none()
+            && let Some(divergence) = voter.node().machine().catch_up_divergence()
+        {
+            self.caught_up_otherwise = Some(Box::new(coord_daemon::catch_up::mismatch(
+                voter.node().applier(),
+                divergence,
+                voter.node().machine().identity().epoch,
+            )));
         }
         self.carry(api, out, provenance);
         // A submission is the only thing that can say where this voter's
@@ -2824,7 +2880,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // one command (task-d14), and the pass ends in the stop. Until it
         // does, nothing more goes out: not the rest of the voter's batch,
         // and not what the parked frames or the records settle.
-        if self.answered_otherwise.is_some() || self.admission_halt.is_some() {
+        if self.answered_otherwise.is_some()
+            || self.admission_halt.is_some()
+            || self.caught_up_otherwise.is_some()
+        {
             return;
         }
         let policy = StorePolicySource {
@@ -3474,26 +3533,39 @@ fn describe_divergence(
 ) -> String {
     use coord_collector::MismatchCheck;
     use std::fmt::Write as _;
-    let (check, own_is) = match mismatch.check {
+    let (check, own_is, theirs, whose) = match mismatch.check {
         MismatchCheck::HeldReleaseAgainstRecord => (
             "the leader's release this node held, against this node's own record of the command",
             "record",
+            "the leader's release of that command",
+            "the leader",
         ),
         MismatchCheck::LateReleaseAgainstAnswer => (
             "a release that arrived after this node answered, against the answer it gave",
             "answer",
+            "the leader's release of that command",
+            "the leader",
+        ),
+        MismatchCheck::CatchUpAgainstDonor => (
+            "catch-up: the execution a peer served this node with the command, against this \
+             node's own execution of it",
+            "own execution",
+            "the execution of that command a peer served this node to catch up from",
+            "that peer",
         ),
     };
     let why = if mismatch.differs.position {
-        "so this node executed the domain's commands in another order than the leader"
+        format!("so this node executed the domain's commands in another order than {whose}")
     } else {
-        "at the same position, so this node's execution of that command produced something \
-         else than the leader's"
+        format!(
+            "at the same position, so this node's execution of that command produced something \
+             else than {whose}'s"
+        )
     };
     let mut out = format!(
-        "this node stopped: release-record-mismatch({}): the leader's release of that command \
-         and this node's own execution of it disagree, {why}. Its store holds a history the \
-         domain did not decide, and this node does not answer from it",
+        "this node stopped: release-record-mismatch({}): {theirs} and this node's own execution \
+         of it disagree, {why}. Its store holds a history the domain did not decide, and this \
+         node does not answer from it",
         short_hex(&mismatch.command)
     );
     let differs = mismatch.differs.names();
@@ -4925,6 +4997,36 @@ mod tests {
         );
     }
 
+    /// A command pulled from a peer's executed history that this node
+    /// executed otherwise stops it under the same prefix, and the stop
+    /// names catch-up as what was compared and the peer as the other side
+    /// (task-d08).
+    #[test]
+    fn a_catch_up_mismatch_names_the_catch_up_check() {
+        use coord_collector::MismatchCheck;
+        let m = divergence::mismatch(MismatchCheck::CatchUpAgainstDonor, |own| {
+            own.result_digest = coord_types::identity::Digest32([0x33; 32]);
+        });
+        let said = divergence::describe(&m);
+        let first = said.lines().next().unwrap();
+        assert!(
+            first.starts_with("this node stopped: release-record-mismatch(abababab): "),
+            "{said}"
+        );
+        assert!(
+            first.contains("the execution of that command a peer served this node to catch up"),
+            "{said}"
+        );
+        assert!(first.contains("something else than that peer's"), "{said}");
+        assert!(said.contains("\n  compared: catch-up: "), "{said}");
+        assert!(said.contains("\n  differs: result digest\n"), "{said}");
+        assert!(said.contains("\n  release: sender 05050505 "), "{said}");
+        assert!(
+            said.contains("\n  own execution: from this node's record "),
+            "{said}"
+        );
+    }
+
     /// Whatever the stop goes on to say, its first line starts as every
     /// earlier stop's did, so what searches logs for it still finds it
     /// (task-d17).
@@ -4934,6 +5036,7 @@ mod tests {
         for check in [
             MismatchCheck::HeldReleaseAgainstRecord,
             MismatchCheck::LateReleaseAgainstAnswer,
+            MismatchCheck::CatchUpAgainstDonor,
         ] {
             let m = divergence::mismatch(check, |own| own.response_len += 1);
             let said = divergence::describe(&m);

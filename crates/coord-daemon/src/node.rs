@@ -175,6 +175,67 @@ impl Machine {
         }
     }
 
+    /// A pulled command whose execution here disagreed with its donor's
+    /// (task-d08). Only a follower catches up.
+    pub fn catch_up_divergence(&self) -> Option<&coord_consensus::CatchUpDivergence> {
+        match self {
+            Machine::Leader(_) => None,
+            Machine::Follower(m) => m.catch_up_divergence(),
+        }
+    }
+
+    /// Whether this replica holds work it has not executed (task-d08).
+    pub fn holds_unexecuted(&self) -> bool {
+        match self {
+            Machine::Leader(_) => false,
+            Machine::Follower(m) => m.holds_unexecuted(),
+        }
+    }
+
+    /// Whether a catch-up page is in hand (task-d08).
+    pub fn catching_up(&self) -> bool {
+        match self {
+            Machine::Leader(_) => false,
+            Machine::Follower(m) => m.catching_up(),
+        }
+    }
+
+    /// Catch-up pages taken and pulled commands executed (task-d08).
+    pub const fn catch_up_counts(&self) -> (u64, u64) {
+        match self {
+            Machine::Leader(_) => (0, 0),
+            Machine::Follower(m) => m.catch_up_counts(),
+        }
+    }
+
+    /// Ask `donor` for the commands it executed after this replica's
+    /// frontier (task-d08). A leader has nobody to ask.
+    pub fn request_catch_up(&mut self, donor: coord_types::ids::ReplicaId) -> Vec<Effect> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.request_catch_up(donor),
+        }
+    }
+
+    /// The configuration this replica votes in.
+    pub const fn identity(&self) -> &coord_consensus::ConfigurationIdentity {
+        match self {
+            Machine::Leader(m) => m.ballots().identity(),
+            Machine::Follower(m) => m.ballots().identity(),
+        }
+    }
+
+    /// Whether this replica is synchronized at `ballot`: it leads it, or
+    /// it follows it and installed its Sync (task-d08).
+    pub fn synchronized_at(&self, ballot: &Ballot) -> bool {
+        match self {
+            Machine::Leader(m) => m.config_quorum().ballot() == *ballot,
+            Machine::Follower(m) => {
+                m.quorum().ballot() == *ballot && m.ballots().synced() == *ballot
+            }
+        }
+    }
+
     /// The highest ballot this replica refused to a candidate as behind
     /// (task-d10), which its own next campaign has to go above.
     pub fn outranked(&self) -> Option<Ballot> {
@@ -374,6 +435,11 @@ pub struct Node<P: Persistence> {
     /// that ballot (task-d01). A voter that was away when it was
     /// published is sent it again when it promises the ballot.
     won: Option<SyncDecision>,
+    /// This node's executed commands in position order, once a peer has
+    /// asked to catch up from them (task-d08).
+    order: Option<crate::catch_up::ExecutedOrder>,
+    /// Catch-up pages this node served (diagnostic, task-d08).
+    pub pages_served: u64,
 }
 
 impl<P: Persistence> Node<P> {
@@ -393,6 +459,8 @@ impl<P: Persistence> Node<P> {
             recorder: None,
             awaiting: None,
             won: None,
+            order: None,
+            pages_served: 0,
         }
     }
 
@@ -605,6 +673,75 @@ impl<P: Persistence> Node<P> {
     ) -> Result<Outbound, DriveError> {
         let effects = self.machine_mut().request_payloads(from);
         self.carry_out(effects, ballot)
+    }
+
+    /// Ask `donor` for the commands it executed after this replica's
+    /// frontier (task-d08).
+    pub fn request_catch_up(
+        &mut self,
+        donor: coord_types::ids::ReplicaId,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().request_catch_up(donor);
+        self.carry_out(effects, ballot)
+    }
+
+    /// Answer `from`'s ask for what this node executed after `after`, at
+    /// `ballot` (task-d08).
+    ///
+    /// Answered only to a voter of this configuration other than this
+    /// one, and only by a donor synchronized at the ballot the requester
+    /// asked at, that has not itself stopped: a page from anyone else, or
+    /// at another ballot, would be dropped by the requester anyway. What
+    /// is served is what this node executed and holds durable rows for,
+    /// no further than its own frontier.
+    pub fn serve_catch_up(
+        &mut self,
+        from: coord_types::ids::ReplicaId,
+        ballot: Ballot,
+        after: coord_types::ids::ExecutionPosition,
+    ) -> Outbound {
+        let mut out = Outbound::default();
+        let machine = self.machine();
+        let identity = machine.identity();
+        if from == identity.replica
+            || !identity.voters.contains(&from)
+            || !machine.synchronized_at(&ballot)
+            || machine.halted().is_some()
+            || machine.catch_up_divergence().is_some()
+        {
+            return out;
+        }
+        let epoch = identity.epoch;
+        let through = machine.executed_through();
+        if after >= through {
+            return out;
+        }
+        if self.order.is_none() {
+            self.order = crate::catch_up::ExecutedOrder::read(&self.applier);
+        }
+        let Some(order) = self.order.as_ref() else {
+            return out;
+        };
+        let entries = crate::catch_up::page(&self.applier, order, epoch, after, through);
+        if entries.is_empty() {
+            return out;
+        }
+        self.pages_served += 1;
+        out.peer.push((
+            PeerId {
+                replica: from,
+                incarnation: coord_types::ids::ReplicaIncarnation::ZERO,
+            },
+            coord_consensus::ProtocolMessage::CatchUpPage {
+                ballot,
+                after,
+                through,
+                entries,
+            }
+            .encode(),
+        ));
+        out
     }
 
     /// The applier (watch hub, reader, store).
@@ -952,6 +1089,11 @@ impl<P: Persistence> Node<P> {
                 }
             })?;
             self.executed += 1;
+            if let Some(order) = self.order.as_mut()
+                && !order.note(outcome.position, command)
+            {
+                self.order = None;
+            }
             let effects = self.machine_mut().applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);
         }

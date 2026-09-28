@@ -8,9 +8,10 @@ use alloc::vec::Vec;
 use coord_types::CommandId;
 use coord_types::error::DecodeError;
 use coord_types::identity::Digest32;
-use coord_types::ids::{Ballot, ExecutionPosition, ReplicaId};
+use coord_types::ids::{Ballot, ExecutionPosition, KvRevision, ReplicaId};
 use serde::{Deserialize, Serialize};
 
+use crate::commands::CommandRecord;
 use crate::recovery::SyncDecision;
 use crate::rows::PayloadRecordV1;
 use crate::summary::ReportPage;
@@ -41,6 +42,23 @@ pub const MAX_PAYLOAD_TRANSFER: usize = 8;
 /// proposals and acknowledgements the domain is waiting for.
 pub const MAX_PROPOSAL_ASK: usize = 16;
 
+/// How many commands one [`ProtocolMessage::CatchUpPage`] carries at
+/// most (task-d08).
+///
+/// A page is executed before the next is asked for, so this bounds what a
+/// voter catching up holds beside its table, and what one ask can make a
+/// donor read and send on its bulk lane.
+pub const MAX_CATCH_UP_COMMANDS: usize = 64;
+
+/// How many payload bytes one [`ProtocolMessage::CatchUpPage`] carries
+/// at most, beyond its first command (task-d08).
+///
+/// A page always carries at least one command when the donor has one to
+/// give, whatever its size: a command larger than this would otherwise
+/// never be served. One command is bounded by the request frame, well
+/// inside a protocol frame.
+pub const MAX_CATCH_UP_BYTES: usize = 1024 * 1024;
+
 /// Whether an encoded protocol message is payload transfer.
 ///
 /// Payload transfer is bulk. A replica catching up moves whole command
@@ -58,10 +76,19 @@ pub const MAX_PROPOSAL_ASK: usize = 16;
 /// `payload_transfer_is_recognized_from_the_encoded_discriminant` pins
 /// these two bytes against the encoder, so a variant added above them
 /// fails a test rather than quietly mis-routing.
+///
+/// Catch-up is bulk for the same reason (task-d08): a page is up to
+/// [`MAX_CATCH_UP_COMMANDS`] payloads, and a voter far behind asks for
+/// one after another.
 pub fn is_payload_transfer(frame: &[u8]) -> bool {
     matches!(
         frame.first(),
-        Some(&PAYLOAD_REQUEST_TAG | &PAYLOAD_RESPONSE_TAG)
+        Some(
+            &PAYLOAD_REQUEST_TAG
+                | &PAYLOAD_RESPONSE_TAG
+                | &CATCH_UP_REQUEST_TAG
+                | &CATCH_UP_PAGE_TAG
+        )
     )
 }
 
@@ -70,6 +97,44 @@ const PAYLOAD_REQUEST_TAG: u8 = 7;
 
 /// The encoded discriminant of [`ProtocolMessage::PayloadResponse`].
 const PAYLOAD_RESPONSE_TAG: u8 = 8;
+
+/// The encoded discriminant of [`ProtocolMessage::CatchUpRequest`].
+const CATCH_UP_REQUEST_TAG: u8 = 15;
+
+/// The encoded discriminant of [`ProtocolMessage::CatchUpPage`].
+const CATCH_UP_PAGE_TAG: u8 = 16;
+
+/// One command of a catch-up page (task-d08): a command the donor
+/// executed, with what it was decided and executed as.
+///
+/// Everything here is read from the donor's durable rows: the payload
+/// from `payload_v1`, the decided record from its dependency row in
+/// `protocol_v1`, the position, revision and result digest from its
+/// `executed_v1` row. The admission digest is the payload's own.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CatchUpEntry {
+    /// Command.
+    pub command: CommandId,
+    /// Its payload, which the receiver rehashes against the identity.
+    pub payload: PayloadRecordV1,
+    /// The donor's dependency row of the command: the dependencies it was
+    /// decided with. `None` when the donor keeps no row for it.
+    pub decided: Option<CommandRecord>,
+    /// The position the donor executed it at.
+    pub position: ExecutionPosition,
+    /// The KV revision its execution produced there, if any.
+    pub revision: Option<KvRevision>,
+    /// The digest of its result there.
+    pub result_digest: Digest32,
+}
+
+impl CatchUpEntry {
+    /// The length of its encoding: what it costs a page against
+    /// [`MAX_CATCH_UP_BYTES`].
+    pub fn encoded_len(&self) -> usize {
+        postcard::to_allocvec(self).map_or(usize::MAX, |bytes| bytes.len())
+    }
+}
 
 /// A peer message of the ballot/promise increment.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -200,6 +265,31 @@ pub enum ProtocolMessage {
         /// What the refusing replica executed through.
         executed: ExecutionPosition,
     },
+    /// A voter behind its peers asks one of them for the commands it
+    /// executed after `after`, in execution order (task-d08).
+    ///
+    /// Answered only by a voter synchronized at `ballot`, from its durable
+    /// rows, with at most one [`ProtocolMessage::CatchUpPage`].
+    CatchUpRequest {
+        /// The ballot the asking voter is synchronized at.
+        ballot: Ballot,
+        /// What the asking voter executed through.
+        after: ExecutionPosition,
+    },
+    /// The answer to a [`ProtocolMessage::CatchUpRequest`] (task-d08):
+    /// the commands the donor executed at `after + 1` onward, contiguous
+    /// and in position order, at most [`MAX_CATCH_UP_COMMANDS`] of them.
+    CatchUpPage {
+        /// The ballot the donor is synchronized at; a page of any other
+        /// ballot is dropped.
+        ballot: Ballot,
+        /// The position the page follows.
+        after: ExecutionPosition,
+        /// What the donor executed through when it answered.
+        through: ExecutionPosition,
+        /// The commands.
+        entries: Vec<CatchUpEntry>,
+    },
 }
 
 impl ProtocolMessage {
@@ -231,6 +321,8 @@ impl ProtocolMessage {
             | ProtocolMessage::Committed { .. }
             | ProtocolMessage::ProposalRequest { .. }
             | ProtocolMessage::PromiseRefused { .. }
+            | ProtocolMessage::CatchUpRequest { .. }
+            | ProtocolMessage::CatchUpPage { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }
