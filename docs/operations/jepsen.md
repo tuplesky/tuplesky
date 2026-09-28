@@ -1122,6 +1122,29 @@ its followers had committed among themselves.
   * etcd 3.7.2: `:valid? true`, with 1611 `ok` of 2481. All six pauses
     returned, each within about 60 ms: five of them of all five nodes, one
     2 s after `:kill :all`.
+* **Two more runs on `9c23cc6` with the digest's column for republishes
+  after the final start** ([run 36382738086](https://github.com/tuplesky/tuplesky/actions/runs/36382738086)
+  on `f9fd914`, [run 36382758727](https://github.com/tuplesky/tuplesky/actions/runs/36382758727)
+  on `a27f64c`). Both are `:valid? true` for TupleSky and etcd, and every
+  etcd pause returned. The column is 0 on every voter in both.
+  * `a27f64c`: 2092 `ok` of 2461, and every node served its final reads.
+    `n2` and `n4`, restarted far behind, refused as `Backpressure`
+    (20480 and 12288), the case checkpoint catch-up is planned for.
+  * `f9fd914`: 662 `ok` of 1250. **`n4` stopped on
+    `release-record-mismatch(c96f0e70)`**, the divergence stop: the
+    leader's release of that command contradicted `n4`'s own execution
+    of it. It is the first since #99, and nothing `n4` answered from
+    it reached the history, which Elle found valid. What the voter logs
+    show:
+    * All five were killed at 5 s and started at 54 s. `n1`, the leader of
+      ballot 0, and `n2` recovered at `executed=121`; `n3`, `n4` and `n5`
+      at 122. `n1` then campaigned and led ballot 1.
+    * `n1` was killed at 100 s. `n5` led ballot 2, and `n4`, following
+      it, stopped on the mismatch before the next start at 153 s.
+    * With no durable stop marker yet (planned), that start restarted
+      `n4`, which went on to follow ballots 3 and 4 on the same store.
+    * The command's order on each voter needs the run's store (its
+      `executed_v1` rows), which this environment cannot download.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
