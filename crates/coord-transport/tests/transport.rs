@@ -1438,6 +1438,45 @@ async fn a_listener_of_one_plane_refuses_the_other_planes_alpn() {
     );
 }
 
+/// A voter that dials the api listener of a peer is told that the
+/// address serves the other plane, not a connection failure (task-d16).
+///
+/// A catalog lists both of a node's addresses without saying which is
+/// which, so a peer dial meets the api listener at every node whose api
+/// address comes first. Reported as a failure to connect, that refusal
+/// was the only error a dial kept whenever it was tried last, and it hid
+/// why the peer address had failed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dial_to_the_other_planes_listener_is_told_it_is_the_wrong_plane() {
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut local = f.ids[0].local(&f.ca, CLUSTER, DOMAIN, vec![1, 2]);
+    local.serves = Some(Class::Api);
+    let api = Transport::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        local,
+        f.binder.clone(),
+        limits(),
+    )
+    .unwrap();
+    let dialer = bind(&f, 1);
+
+    let refused = dialer
+        .connect(
+            api.local_addr().unwrap(),
+            &f.ids[0].name,
+            PeerRole::Voter,
+            Some(inc(1)),
+            Lane::Control,
+            f.ids[0].expected(),
+        )
+        .await;
+
+    assert!(
+        matches!(refused, Err(TransportError::WrongPlane)),
+        "{refused:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_session_binding_is_the_only_undecodable_kind_an_api_stream_may_carry() {
     // The binding frame's payload belongs to `coord-session`, so this
