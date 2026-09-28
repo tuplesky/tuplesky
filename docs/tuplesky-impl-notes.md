@@ -5904,3 +5904,116 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
 - The argument is on paper. task-d30's protocol oracle runs the real
   machines under faults at three and five voters, and any cycle there
   stops a node by this rule and fails the run.
+
+## What the protocol simulator found in recovery
+
+task-d34. task-d30's simulator drives the real `Leader` and `Follower`
+machines at three and five voters. It loses, duplicates, reorders and
+holds back messages, completes journal batches at random times, and
+crashes, restarts and campaigns nodes. Its oracle checks one execution
+order, promises never lowered, and one dependency set per command across
+the frontend's learning and every replica's execution. Its first runs
+found the decisions below lost or contradicted by recovery. Each was
+traced to its cause, and each has a deterministic test that fails
+without its change.
+
+### The findings
+
+1. **The source leader's report made the possible-fast rule skip
+   itself.**
+   - The leader's reply to the frontend waits for its proposal batch,
+     which records the command at PRE-ACCEPT (and a proposal row nothing
+     reads). The leader's own ACCEPT row is a later batch.
+   - A leader that crashed between the two reported PRE-ACCEPT. A
+     selection that heard the source leader returned from the rule
+     early, since "its rows are authoritative", and re-proposed a
+     command the frontend had learned fast.
+   - Now the source leader is one of the fast-set members the rule
+     reads. Test:
+     `a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row`.
+2. **A fast acknowledgement could carry the leader's path and other
+   dependencies.**
+   - A follower that received the leader's proposal before the payload
+     has the leader's digests in its logs (`record_leader_path`). When
+     the payload arrives, its fast acknowledgement carries that path
+     beside dependencies computed from its own log.
+   - The fast predicate compared paths only, so it learned the command
+     with the leader's dependencies, which the member had not recorded.
+     Recovery then rebuilt it from the member's.
+   - Fast learning, and the rule's candidates, now also require the
+     same dependency set: `[EXT: stricter]`. Tests:
+     `a_fast_acknowledgement_with_the_leaders_path_and_other_dependencies_decides_nothing`
+     and
+     `members_agreeing_on_a_path_but_not_on_dependencies_decide_nothing_fast`.
+3. **task-d11 demoted only what a Sync leaves out.**
+   - An earlier ballot's acceptance that the Sync carries with other
+     dependencies stayed at ACCEPT until the entry was installed, which
+     waits for dependencies and payloads.
+   - A report taken meanwhile presented it under the new synchronized
+     ballot, and the next selection halted on `IncompatibleAccepted`.
+   - It is now demoted in the same install batch. Test:
+     `a_sync_demotes_an_acceptance_it_carries_with_other_dependencies`.
+4. **A report could omit the synchronized selection.**
+   - Installing an entry removed it from the pending set when its batch
+     was queued, while the report reads the durable ledger. Between the
+     two, the report said the command was only pre-accepted, under the
+     ballot whose selection had accepted it.
+   - A Sync whose row landed after a higher promise's (superseded) was
+     neither installed nor reported, although the promise row said this
+     replica was synchronized to it.
+   - The synchronized ballot's selection is now kept once its row is
+     durable, and read back from that row on restart. The report takes
+     each of its entries over a durable record that is behind it or
+     orders the command otherwise. A superseded Sync's entries are held
+     for installation, as a restart would resume them. Tests:
+     `a_report_takes_the_selection_over_an_installation_still_in_flight`
+     and `a_superseded_sync_still_has_its_selection_reported`.
+5. **The rule's conflict check passed vacuously.**
+   - A candidate was checked against conflicting adopted commands
+     through the member's own records, so a decided command the member
+     never held passed, and the candidate was kept ahead of it with the
+     member's order.
+   - Now:
+     - a command the selection orders after the candidate constrains
+       nothing;
+     - an earlier ballot's decision the member does not hold may have
+       been executed and forgotten, and constrains nothing;
+     - an at-source command the member does not hold rules the
+       candidate out.
+   - Tests:
+     `a_candidate_its_member_ordered_without_an_accepted_command_is_not_kept`
+     and
+     `a_candidate_whose_member_forgot_an_earlier_ballots_decision_is_kept`.
+6. **A follower's ledger ignored batches it staged as leader.**
+   - The follower applied a completion to its ledger only for batches it
+     was waiting on. A batch its leader role staged and that completed
+     after a deposition was lost to its reports, and a later commit
+     landed on stale dependencies.
+   - The follower's ledger now covers every staged batch, as the
+     leader's did. Test:
+     `a_batch_staged_as_leader_reaches_the_followers_ledger`.
+
+The simulator also caught two infidelities of its own, fixed there and
+not here:
+- It delivered frames across a crash, which a connection per stream
+  does not.
+- It let an execution outrun earlier journal batches, which `coordd`'s
+  single-writer apply does not.
+
+### What is left
+
+- **A fast decision whose only reporting fast-set member recorded the
+  leader's path for commands it had not adopted.** Once the leader's
+  digests are copied into a member's logs, an equal path no longer
+  implies an equal history. The member's durable records for the
+  command's ancestors can keep their own order, and a recovery with the
+  leader absent cannot rebuild the leader's history from them. The rule
+  then refuses the ancestors and, with them, the decided command.
+- This is a design question, not a local fix. Options:
+  - a pre-accepted record takes the leader's dependencies with the
+    leader's path;
+  - fast acknowledgements carry only the member's own path.
+- It is left for review. At 100 seeds per row, fault rates set high
+  (rows 1 to 4 and 10, three and five voters), 14 of 1,000 runs still
+  fail. Traces sampled show this case and further stale-acceptance
+  cases.

@@ -3976,3 +3976,262 @@ fn a_leader_handed_a_cyclic_selection_proposes_nothing() {
     assert_eq!(leader.recovery_cycle(), Some(&cycle[..]));
     assert!(!leader.is_leading());
 }
+
+/// An admission of request `seq` on key `key`, and its command.
+fn admission(seq: u64, key: u8) -> (CommandId, Event) {
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![key],
+            value: vec![key],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let rk = RetryKey {
+        cluster_id: ClusterId([1; 16]),
+        domain_id: DomainId([2; 16]),
+        session_id: SessionId([3; 16]),
+        client_instance_id: ClientInstanceId([4; 16]),
+        request_sequence: RequestSequence::new(seq).unwrap(),
+    };
+    let command = CommandId::derive(&rk, &request).unwrap();
+    let frame = MessageV1::Request(RequestV1::new(rk, &request, 0, 0).unwrap())
+        .encode()
+        .unwrap();
+    let receipt = AdmissionReceipt::submitting(
+        VerifierToken::for_boundary(),
+        AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
+    );
+    (command, Event::Admitted(AdmittedRequest { receipt, frame }))
+}
+
+/// A Sync entry at ACCEPT with `deps`, naming no admission facts.
+fn selected(command: CommandId, deps: &[CommandId]) -> coord_consensus::SyncEntry {
+    coord_consensus::SyncEntry {
+        command,
+        phase: Phase::Accept,
+        deps: deps.to_vec(),
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: None,
+    }
+}
+
+/// A standalone follower r1 that promised `b` durably, holding x at
+/// PRE-ACCEPT durably.
+fn follower_with_x_promised(b: Ballot) -> (Follower, CommandId) {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let (x, admit) = admission(1, 1);
+    let effects = f.step(admit);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    let effects = f.step(peer_event(
+        b.leader,
+        ProtocolMessage::NewLeader {
+            ballot: b,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    assert_eq!(f.ballots().promised(), b);
+    (f, x)
+}
+
+/// task-d34 (found by the protocol simulator): a Sync that carries a
+/// command this replica holds at ACCEPT of an earlier ballot, with other
+/// dependencies, demotes that acceptance in its own install batch.
+///
+/// task-d11 demoted only the acceptances a Sync leaves out. One it
+/// carries with other dependencies stayed at ACCEPT until the entry was
+/// installed, which waits for the entry's dependencies and payloads; a
+/// report taken meanwhile presented the earlier ballot's acceptance under
+/// the new synchronized ballot, beside the new ballot's copies, and every
+/// later selection failed as `IncompatibleAccepted`.
+#[test]
+fn a_sync_demotes_an_acceptance_it_carries_with_other_dependencies() {
+    let mut cluster = Cluster::new(47);
+    let a = cluster.admit(1, 1);
+    let x = cluster.admit(2, 1);
+    cluster.no_execute = vec![1];
+    cluster.settle();
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let before = cluster.nodes[1].follower().report(ballot(1, 0));
+    let entry = before.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!((entry.phase, entry.deps.clone()), (Phase::Accept, vec![a]));
+    let b1 = ballot(1, 0);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(1, effects);
+    // x is selected after a command r1 has never seen, so its
+    // installation waits.
+    let unseen = CommandId(Digest32([0x5c; 32]));
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[unseen]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), b1);
+    let check = |cluster: &Cluster| {
+        let report = cluster.nodes[1].follower().report(ballot(2, 0));
+        let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+        assert_eq!(
+            (entry.phase, entry.deps.clone()),
+            (Phase::Accept, vec![unseen]),
+            "ballot 0's acceptance of x is reported as ballot 1's"
+        );
+        let rows = dependency_rows(&cluster.nodes[1].storage);
+        let row = rows.iter().find(|(c, _)| *c == x).unwrap();
+        assert_ne!(
+            (row.1.phase, row.1.deps.clone()),
+            (Phase::Accept, vec![a]),
+            "the acceptance is still durable"
+        );
+    };
+    check(&cluster);
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    check(&cluster);
+}
+
+/// task-d34 (found by the protocol simulator): the report takes an entry
+/// of the synchronized selection over a durable record that is behind it,
+/// while its installation is still becoming durable.
+///
+/// Installing an entry took it out of the pending set as soon as its
+/// batch was queued, and the report is read from the durable ledger, so
+/// between the two it said the command was only pre-accepted, under the
+/// ballot whose selection had accepted it.
+#[test]
+fn a_report_takes_the_selection_over_an_installation_still_in_flight() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    // The Sync row lands; the installation it starts does not yet.
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    let mut installs = Vec::new();
+    for e in durable_events(&marker) {
+        installs.extend(f.step(e));
+    }
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "x's installation was queued: {installs:?}"
+    );
+    assert_eq!(f.ballots().synced(), b1);
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
+}
+
+/// task-d34: a Sync whose row lands after a higher promise's still has its
+/// selection reported, as the synchronized ballot's.
+///
+/// Rows may complete in any order. The Sync was then superseded and not
+/// activated, and its entries were neither installed nor reported, while
+/// the durable promise row said this replica was synchronized to it.
+#[test]
+fn a_superseded_sync_still_has_its_selection_reported() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    let b2 = ballot(2, 0);
+    let promise = f.step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    // The higher promise lands first, then the Sync row.
+    for e in durable_events(&promise) {
+        f.step(e);
+    }
+    for e in durable_events(&marker) {
+        f.step(e);
+    }
+    assert_eq!(f.ballots().promised(), b2);
+    assert_eq!(f.ballots().synced(), b1);
+    let report = f.report(b2);
+    assert_eq!(report.committed_ballot, b1);
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
+}
+
+/// task-d34 (found by the protocol simulator): a batch this replica staged
+/// while it led, completing after it became a follower, reaches its
+/// durable ledger.
+///
+/// The follower applied a completion to its ledger only for the batches
+/// it was waiting on itself. The leader's batch was left staged, the
+/// ledger kept the older record, and a later commit landed on dependencies
+/// the command was never decided with.
+#[test]
+fn a_batch_staged_as_leader_reaches_the_followers_ledger() {
+    let mut leader = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(ballot(0, 0)),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        None,
+        ExecutionPosition::ZERO,
+    );
+    leader.step(boot_event(1));
+    let (x, admit) = admission(1, 1);
+    let proposed = leader.step(admit);
+    let completions = durable_events(&proposed);
+    assert!(!completions.is_empty());
+    // Deposed before the proposal's batch lands.
+    let q = leader.config_quorum();
+    let mut f = Follower::from_recovered(leader.into_recovered(), q);
+    for e in completions {
+        f.step(e);
+    }
+    let report = f.report(ballot(1, 1));
+    assert!(
+        report.entries.iter().any(|e| e.command == x),
+        "the durable proposal is missing from the report: {:?}",
+        report.entries
+    );
+}
