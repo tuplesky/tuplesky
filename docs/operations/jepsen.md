@@ -243,7 +243,7 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   `ProposalRepublished` after the final start, from the last "Jepsen
   starting" line the final heal writes into every node's log. A leader
   that goes on republishing its lease command after the heal, the stall
-  task-d15 closed, shows there.
+  #109 closed, shows there.
 
 The last 400 lines of each voter's log follow in the TupleSky job's log.
 
