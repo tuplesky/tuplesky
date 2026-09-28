@@ -1422,23 +1422,31 @@ impl Follower {
             .filter(|(c, _)| known.contains(c));
         for (command, entry) in self.sync_pending.iter().chain(selected) {
             if known.contains(command) {
-                // Known here below the selection, or with another order:
-                // a record older than the Sync, which the report must not
-                // present as this ballot's state. The selected entry is
-                // what this replica durably accepted at the synchronized
-                // ballot (a restart resumes installing it from the row),
-                // so it is reported in the record's place, with the
-                // record's payload facts (task-d30).
+                // Known here at or below the selection, or with another
+                // order: a record older than the Sync, which the report
+                // must not present as this ballot's state. The selected
+                // entry is what this replica durably accepted at the
+                // synchronized ballot (a restart resumes installing it
+                // from the row), so it is reported in the record's place
+                // (task-d30), whatever the record agrees with it on.
                 if let Some(e) = report.entries.iter_mut().find(|e| e.command == *command)
-                    && (e.phase < entry.phase || !crate::vote::same_set(&e.deps, &entry.deps))
+                    && (e.phase <= entry.phase || !crate::vote::same_set(&e.deps, &entry.deps))
                 {
                     e.phase = entry.phase;
                     e.deps = entry.deps.clone();
                     e.path = entry.path;
                     e.paths = entry.paths.clone();
                     e.seqnum = entry.seqnum;
-                    if entry.admission.is_some() {
-                        e.admission = entry.admission;
+                    // Selected under other facts than the record's: the
+                    // payload held here is another presentation's, and
+                    // the selected one is still to be fetched and rebound
+                    // (task-d14). Claiming it present would count this
+                    // replica as a supplier of a payload it cannot serve.
+                    if let Some(named) = entry.admission
+                        && e.admission != Some(named)
+                    {
+                        e.admission = Some(named);
+                        e.payload_present = false;
                     }
                 }
                 continue;

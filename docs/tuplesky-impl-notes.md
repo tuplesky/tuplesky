@@ -5976,11 +5976,22 @@ without its change.
      replica was synchronized to it.
    - The synchronized ballot's selection is now kept once its row is
      durable, and read back from that row on restart. The report takes
-     each of its entries over a durable record that is behind it or
-     orders the command otherwise. A superseded Sync's entries are held
-     for installation, as a restart would resume them. Tests:
+     each of its entries over a durable record that is not past it, or
+     that orders the command otherwise, facts included. A superseded
+     Sync's entries are held for installation, as a restart would resume
+     them. Tests:
      `a_report_takes_the_selection_over_an_installation_still_in_flight`
      and `a_superseded_sync_still_has_its_selection_reported`.
+   - The Codex review found two gaps in that overlay. A record at the
+     selected phase with the same dependencies but another presentation
+     kept its own admission, so a report carrying the selection's facts
+     made the next selection `IncompatibleAdmission`. And a replaced
+     admission kept the record's `payload_present`, so a selection could
+     count this replica as a supplier of a payload it does not hold. The
+     selected facts now replace the record's whenever the record is not
+     past the selected phase, and the payload is reported absent until
+     the rebind of task-d14 lands. Test:
+     `a_report_names_the_selected_facts_and_no_payload_held_under_others`.
 5. **The rule's conflict check passed vacuously.**
    - A candidate was checked against conflicting adopted commands
      through the member's own records, so a decided command the member
