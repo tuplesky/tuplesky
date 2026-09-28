@@ -55,8 +55,11 @@ MARKERS = (
     ("BehindVoters", "BehindVoters"),
     ("Backpressure", "Backpressure"),
     ("ProposalRepublished", "ProposalRepublished"),
-    ("alert 120", "error 120"),
 )
+# Not counted: TLS alert 120 (no_application_protocol). A node lists both of
+# its listeners without saying which is which, so a dial to the other
+# plane's listener is refused that way by design, and says nothing about
+# whether the node can be reached (task-d16 stops logging it).
 SO_FAR = re.compile(r"\((\d+) so far\)")
 ROLE = re.compile(
     r"this voter (leads ballot \d+|follows ballot \d+ led by \w+|is a candidate for ballot \d+)"

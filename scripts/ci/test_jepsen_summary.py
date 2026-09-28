@@ -78,7 +78,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(v.ballot, 3)
         self.assertEqual(v.counts["Backpressure"], 5)
         self.assertEqual(v.counts["CandidateBehind"], 1)
-        self.assertEqual(v.counts["alert 120"], 3)
+        # The other plane's refusal is by design, not a failure.
+        self.assertNotIn("alert 120", v.counts)
         self.assertNotIn("stopped", v.counts)
         self.assertEqual(v.after_start, {})
 
