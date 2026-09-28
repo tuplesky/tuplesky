@@ -174,7 +174,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d16](#task-d16) | Say why each address of a dial failed | task-d03 |
 | [task-d17](#task-d17) | Say what a divergence stop compared | task-d12 |
 | [task-d18](#task-d18) | Never let a Sync lower a durable promise | task-20, task-26, task-d11 |
-| [task-d19](#task-d19) | Recover every slow decision a fast acknowledgement helped learn | task-24, task-26, task-28 |
+| [task-d19](#task-d19) | Count only adoptions toward the slow majority | task-24, task-26, task-28 |
 | [task-d20](#task-d20) | Prove the largest Sync fits its row, or refuse the campaign | task-d05, task-d14 |
 | [task-d21](#task-d21) | Settle whether a recovery cycle is reachable, and never stall on one | task-26, task-d12 |
 | [task-d22](#task-d22) | End every collector entry the voters refuse | task-c01, task-c02, task-d14 |
@@ -1675,7 +1675,7 @@ This is the top liveness priority. Without it a domain that has executed more th
 **Review boundary:** Sync admission against promises in flight and the content of promise-row writes. No change to the commit rule, the Sync's selection or any row format.
 
 <a id="task-d19"></a>
-### task-d19: Recover every slow decision a fast acknowledgement helped learn
+### task-d19: Count only adoptions toward the slow majority
 
 **Prerequisites:** task-24, task-26, task-28.  
 **Design:** Sections 4.1, 4.9.
@@ -1742,7 +1742,7 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 **Prerequisites:** task-d08, task-d19, task-d20.  
 **Design:** Sections 5.3, 13.
 
-**Implement:** Work that finishes or recovers admitted commands can be refused by a full table. Installing a Sync entry drops its placeholder silently under backpressure, and the payload that follows goes through the bounded path, so only catch-up gets such an entry in. A record no Sync selected and no history names keeps its slot until the command is decided somewhere (task-d08's recorded residual). Sync entries enter a full table as pulled commands do. A share of the table is reserved for recovery and catch-up work. A record last written at a ballot below the installed Sync's, that the Sync neither selected nor re-proposed, is released from the table once that Sync is installed, and the key index is repaired; a record the new leader proposed after the Sync is in no Sync yet and is never released this way. The Sync is selected from a majority's reports, and selection keeps every command a quorum of an earlier ballot could have decided (at five voters only once task-d19 is in), so a command it leaves out cannot have been decided below its ballot. A later decision then reaches this voter as any other command does, through the leader or catch-up. The argument is recorded with the change, and no voter outside the majority is waited for. This takes up task-d08's residual on records decided nowhere (its requirement 7).
+**Implement:** Work that finishes or recovers admitted commands can be refused by a full table. Installing a Sync entry drops its placeholder silently under backpressure, and the payload that follows goes through the bounded path, so only catch-up gets such an entry in. A record no Sync selected and no history names keeps its slot until the command is decided somewhere (task-d08's recorded residual). Sync entries enter a full table as pulled commands do. A share of the table is reserved for recovery and catch-up work. In the Sync's own install batch, as task-d11 puts its demotions there, the records present when the Sync is installed that it neither selected nor re-proposed are released from the table and the key index is repaired. No ballot has to be tracked per record: a record the new leader proposes after the Sync does not exist yet at installation, and a restart resumes the installation from the Sync row, so nothing proposed after it is released this way. The Sync is selected from a majority's reports, and selection keeps every command a quorum of an earlier ballot could have decided (at five voters only once task-d19 is in), so a command it leaves out cannot have been decided below its ballot. A later decision then reaches this voter as any other command does, through the leader or catch-up. The argument is recorded with the change, and no voter outside the majority is waited for. This takes up task-d08's residual on records decided nowhere (its requirement 7).
 
 **Acceptance:** A voter with a full table installs a Sync whose entries it lacks and executes them. A table filled with records decided nowhere drains after the next Sync, with one voter permanently absent, and new work is admitted without `Backpressure`. A record the Sync selected or re-proposed, or one proposed after it, is never released. New admission never takes the reserved share.
 
@@ -1852,7 +1852,7 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 
 **Implement:** Add to task-d30's simulator a budget oracle, which checks every limit of task-d26's resource contract at its peak, and a progress oracle, which checks that once faults stop and admission pauses every admitted command settles and every voter executes as far as the leader.
 
-**Acceptance:** The checklist's failure-test matrix rows 5, 9 and 12 run at three and five voters and pass, along with task-d30's rows under the new oracles. The oracles find the bugs task-d22 and task-d28 fix when their fixes are reverted, and a budget violation when task-d24's reservation or task-d26's bounds are removed.
+**Acceptance:** The checklist's failure-test matrix rows 5, 9, 12 and 14 run at three and five voters and pass, along with task-d30's rows under the new oracles. The oracles find the bugs task-d22 and task-d28 fix when their fixes are reverted, and a budget violation when task-d24's reservation or task-d26's bounds are removed.
 
 **Review boundary:** The two oracles and the scenarios they add. No production code change beyond the hooks the simulator needs.
 
