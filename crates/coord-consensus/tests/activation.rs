@@ -4196,6 +4196,57 @@ fn a_superseded_sync_still_has_its_selection_reported() {
     assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
 }
 
+/// Codex review of task-d34: the report takes the selected facts over a
+/// record the selection agrees with on phase and dependencies, and claims
+/// no payload under them while the one held is another presentation's.
+///
+/// The overlay replaced a record only when it was behind the selection or
+/// on other dependencies, so an acceptance under other facts kept its own
+/// admission beside the new synchronized ballot, and a report carrying the
+/// selection's facts made every later selection `IncompatibleAdmission`.
+/// Replaced, it kept `payload_present` from the record, so a selection
+/// could count this replica as a supplier of a payload it does not hold.
+#[test]
+fn a_report_names_the_selected_facts_and_no_payload_held_under_others() {
+    let mut cluster = Cluster::new(47);
+    let a = cluster.admit(1, 1);
+    let x = cluster.admit(2, 1);
+    cluster.no_execute = vec![1];
+    cluster.settle();
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let before = cluster.nodes[1].follower().report(ballot(1, 0));
+    let held = before.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!((held.phase, held.deps.clone()), (Phase::Accept, vec![a]));
+    assert!(held.payload_present);
+    let b1 = ballot(1, 0);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(1, effects);
+    let other = Digest32([0x77; 32]);
+    assert_ne!(held.admission, Some(other));
+    let mut entry = selected(x, &[a]);
+    entry.admission = Some(other);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, entry)]),
+        reproposed: BTreeSet::new(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), b1);
+    let report = cluster.nodes[1].follower().report(ballot(2, 0));
+    let e = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(e.admission, Some(other), "{e:?}");
+    assert!(!e.payload_present, "{e:?}");
+}
+
 /// task-d34 (found by the protocol simulator): a batch this replica staged
 /// while it led, completing after it became a follower, reaches its
 /// durable ledger.
