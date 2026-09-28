@@ -167,9 +167,19 @@ and its behaviour under faults have something to be compared with:
 * **What differs:** the fault targets are each test's own (etcd's also
   aim at the leader), and after healing the etcd test waits 10 s before
   its final reads, where the TupleSky test waits 60 s.
-* **One change to the etcd test:** it starts etcd with `--enable-v2`,
-  which etcd 3.6 removed, so the job deletes that flag before running it.
-  The workloads use only the v3 API.
+* **Two changes to the etcd test:**
+  * It starts etcd with `--enable-v2`, which etcd 3.6 removed, so the job
+    deletes that flag before running it. The workloads use only the v3
+    API.
+  * It gets the TupleSky test's kill schedule. Jepsen's combined nemesis
+    draws kill/start and pause/resume from one staggered mix, so after a
+    kill the start waits until the mix draws kill/start again. In
+    September 2026 that left every node down for two to four minutes in
+    four TupleSky runs and two etcd runs. `jepsen.tuplesky.nemesis` (in
+    tuplesky/jepsen) staggers the two flip-flops on their own, so a start
+    follows every kill within twice the fault interval. The job copies that
+    namespace into the etcd test and routes its packages through it, so
+    both tests keep one schedule.
 
 Its store is the `jepsen-store-etcd-append` artifact.
 

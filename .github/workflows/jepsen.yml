@@ -262,6 +262,32 @@ jobs:
         # The test passes --enable-v2, which etcd 3.6 removed ("flag provided
         # but not defined"). The workloads here use only the v3 API.
         run: sed -i '/^[[:space:]]*:--enable-v2$/d' src/jepsen/etcd/db.clj
+      - name: Give the etcd test the TupleSky test's kill schedule
+        # The combined nemesis draws kill/start and pause/resume from one
+        # mix, so a start can wait minutes after a kill. jepsen.tuplesky
+        # staggers the two on their own (jepsen.tuplesky.nemesis); the
+        # baseline loads the same namespace so both tests keep one schedule.
+        run: |
+          mkdir -p etcd-test/src/jepsen/tuplesky
+          cp jepsen/tuplesky/src/jepsen/tuplesky/nemesis.clj etcd-test/src/jepsen/tuplesky/
+          python3 - etcd-test/src/jepsen/etcd/nemesis.clj <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          edits = [
+              ("            [jepsen.nemesis [combined :as nc]",
+               "            [jepsen.tuplesky.nemesis :as tn]\n"
+               "            [jepsen.nemesis [combined :as nc]"),
+              ("    (-> (nc/nemesis-packages opts)",
+               "    (-> (tn/separate-db-faults opts (nc/nemesis-packages opts))"),
+          ]
+          for old, new in edits:
+              if src.count(old) != 1:
+                  sys.exit(f"etcd nemesis.clj no longer has: {old!r}")
+              src = src.replace(old, new)
+          open(path, "w").write(src)
+          PY
+          grep -n 'tn/' etcd-test/src/jepsen/etcd/nemesis.clj
       - name: Stand the cluster up
         run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
       - name: Run the etcd test
