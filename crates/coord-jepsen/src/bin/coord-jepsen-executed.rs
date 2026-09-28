@@ -13,6 +13,7 @@
 //! opens at its last commit, and one that does not open says why.
 #![forbid(unsafe_code)]
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -100,12 +101,16 @@ fn main() -> ExitCode {
             rows.len()
         );
     }
+    // A reader that stops early (`| head`) ends the output, not a panic.
+    let mut out = std::io::stdout().lock();
     for (row, hit) in selected {
         let revision = row
             .revision
             .map_or_else(|| "-".to_owned(), |r| r.to_string());
         let mark = if hit { " *" } else { "" };
-        println!("{} {} {}{mark}", row.position, revision, row.command);
+        if writeln!(out, "{} {} {}{mark}", row.position, revision, row.command).is_err() {
+            break;
+        }
     }
     ExitCode::SUCCESS
 }

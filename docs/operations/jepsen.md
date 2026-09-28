@@ -1165,6 +1165,20 @@ its followers had committed among themselves.
       after a restart of all three had recovered behind another voter in
       about 15 of 18 restarts, by a rough alignment of the voters' boots.
 
+`3273306` carries #111 at `22af453`: a dial that reaches none of a
+peer's addresses says why each one that serves its plane failed, and a
+wrong-plane refusal (TLS alert 120, now `WrongPlane`) is no longer what
+gets logged in its place.
+* **Local runs:** 6 random-kill runs (120 s) and 6 replays (`--faults
+  2,1`, 60 s), fresh domains. All 12 served their final reads, with no
+  anomaly and no stop. No voter logged alert 120.
+* **What the dials failed on:** every "cannot reach a voter on the peer
+  plane" named the peer address's own error,
+  `Rejected(Transport("connection lost"))`, 163 times over the 12 runs,
+  while the voter it dialled was down or restarting. The other failures
+  were sends refused while a connection was down: `QueueFull` on the
+  Control lane (166) and `NotConnected` (64).
+
 ### Under Jepsen: a domain that no longer binds sessions
 
 That same run went on to the Jepsen test: list-append, five minutes of
