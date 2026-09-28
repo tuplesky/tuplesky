@@ -1016,6 +1016,13 @@ COMMIT. Wire and durable formats change, so every domain starts fresh.
     `NotConnected` (1336 frames, after a TLS alert 120 on the redial).
   * In raf-2 and repaf-4 no command's admission digest differs between
     any two voters either, so #108 does not explain either stall.
+* **Jepsen**
+  ([run 36360426479](https://github.com/tuplesky/tuplesky/actions/runs/36360426479),
+  head `3e57099`): `:valid? true`, with 1596 `ok` of 2050, and every node
+  served its final reads. It served nothing from about 30 s to 150 s,
+  because the nemesis killed all five nodes at 5 s and started them again
+  only at 159 s. No voter logged a stop, `HalfInitialized` or
+  `IncompatibleAccepted`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
