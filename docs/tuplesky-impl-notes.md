@@ -6088,7 +6088,9 @@ every step.
    decreases and is never below a ballot it published `Promise` for.
 3. **One dependency set per command.** The set a shadow collector learned
    it with (`VoteSet::learned` over what reached the frontend) equals the
-   set each replica executed it with.
+   set each replica executed it with. The shadow counts a leader reply
+   under the admission the command was submitted under, as the real
+   collector does, not under whichever acknowledgement came first.
 4. **No halt.** No replica stops on two decisions, a recovery cycle or
    `IncompatibleAccepted`.
 
@@ -6115,6 +6117,19 @@ Seeds that once failed are kept in
   stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
   seeds, not at every seed.
 - Budgets and progress after healing are task-d33's oracles.
+- **Catch-up.** With `PROTOCOL_SIM_CATCH_UP` set, a follower's timer asks
+  its leader for executed history, as `coordd`'s pacer does, and the
+  donor's page is served from its durable rows. A pulled command
+  executed otherwise than its donor is an oracle failure.
+  - At the default seeds it serves about 14,000 pages, executes about
+    1,300 pulled commands, and finds no catch-up divergence.
+  - It also shifts the schedules enough to reach the fast-path gap
+    above in 3 of 120 runs. Row 2, three voters, seed 2 is one: a
+    command fast-learned from its leader and one follower, the leader
+    crashed before its acceptance row was durable, and the next leader
+    re-proposed it. So it is off by default until the #116/#118 fix
+    lands.
+- Row 1 counts leader crashes and fails if a run of it crashed none.
 
 ## Bounded reports and Syncs
 
@@ -6303,7 +6318,18 @@ finishes or recovers admitted commands could be refused by a full table.
     command's own dependencies (`CommandTable::release`);
   - the ledger removes them only when the batch is durable
     (`DurableLedger::stage_removal`), so a report never loses a durable
-    record early.
+    record early;
+  - a voter restarted between its report and the Sync rebuilds the cut
+    from its undecided durable records while its promise is ahead of its
+    synchronized ballot. Nothing is admitted or adopted after a promise,
+    so those are the records the report named.
+- **Not yet: the path log.** A released command stays in its keys' path
+  logs, so the next command's path is hashed through it and this voter's
+  fast acknowledgements disagree with the other voters' for that key.
+  The fix (take it out and recompute the head) is written. It makes those
+  acknowledgements agree, so more fast decisions form, and the protocol
+  simulator then reaches the open fast-path recovery gap of #116/#118
+  (row 2, three voters, seed 2). It lands with that fix.
 - **The argument.** The Sync is selected from a majority's reports, and
   selection keeps every command a quorum of an earlier ballot could have
   decided (at five voters only with task-d19). So a command it leaves out
@@ -6349,6 +6375,11 @@ finishes or recovers admitted commands could be refused by a full table.
     the table and the ledger, payloads included, and the two stay.
   - New work is admitted again without `Backpressure`.
   - It fails without the release.
+- `a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out`
+  (`activation`): the voter is killed after its promise and brought back
+  from its rows, and the delayed Sync still releases the records it
+  leaves out, after which new work is admitted. It fails without the
+  rebuilt cut.
 - `releasing_the_latest_command_hands_the_key_back_to_its_predecessor`
   (`graph`): the next command on the key depends on the released one's
   predecessor, and a committed record is not released.
