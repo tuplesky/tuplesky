@@ -266,6 +266,31 @@ jobs:
         # The test passes --enable-v2, which etcd 3.6 removed ("flag provided
         # but not defined"). The workloads here use only the v3 API.
         run: sed -i '/^[[:space:]]*:--enable-v2$/d' src/jepsen/etcd/db.clj
+      - name: Let the etcd test pause etcd by process name
+        working-directory: etcd-test
+        # cu/grepkill! runs `pgrep -f etcd | xargs kill -stop` in a
+        # `bash -c` naming etcd. pgrep can list the pipeline's own xargs
+        # while it is still a fork of that bash, and xargs then stops
+        # itself: the pause never returns and holds the nemesis, so no
+        # start, resume or heal follows (runs 36323935964, 36365926073,
+        # 36368134612). cu/signal! is pkill by process name, which matches
+        # only etcd itself, as jepsen.tuplesky.db pauses coordd.
+        run: |
+          python3 - src/jepsen/etcd/db.clj <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          edits = [
+              ('(cu/grepkill! :stop "etcd")', '(cu/signal! "etcd" "STOP")'),
+              ('(cu/grepkill! :cont "etcd")', '(cu/signal! "etcd" "CONT")'),
+          ]
+          for old, new in edits:
+              if src.count(old) != 1:
+                  sys.exit(f"etcd db.clj no longer has: {old!r}")
+              src = src.replace(old, new)
+          open(path, "w").write(src)
+          PY
+          grep -n 'cu/signal!' src/jepsen/etcd/db.clj
       - name: Give the etcd test the TupleSky test's kill schedule
         # The combined nemesis draws kill/start and pause/resume from one
         # mix, so a start can wait minutes after a kill. jepsen.tuplesky

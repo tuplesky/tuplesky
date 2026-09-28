@@ -197,14 +197,31 @@ worker stuck in it, no later fault or heal ran:
 [run 36323935964](https://github.com/tuplesky/tuplesky/actions/runs/36323935964)
 logged nothing for 84 minutes after its time limit, and
 [run 36365926073](https://github.com/tuplesky/tuplesky/actions/runs/36365926073)
-(`:pause :all` 14 s after `:kill :all`) hit the bound. The etcd test pauses
-with `grepkill! :stop "etcd"`, which returned at once in the other runs
-that paused all five nodes, dead or alive. So `scripts/ci/jepsen_bounded.sh`
-runs each test under the bound, and a minute before it prints every JVM's
-threads (`jcmd Thread.print`) and each node's processes (state and wait
-channel) into a folded group in the job log. The next hang then says which
-thread waits, and on what node-side command, without the store, which the
-job log does not carry.
+(`:pause :all` 14 s after `:kill :all`) hit the bound. So
+`scripts/ci/jepsen_bounded.sh` runs each test under the bound, and a
+minute before it prints every JVM's threads (`jcmd Thread.print`) and each
+node's processes (state and wait channel) into a folded group in the job
+log, which says where a test hung without the store.
+
+The third hang
+([run 36368134612](https://github.com/tuplesky/tuplesky/actions/runs/36368134612))
+had the dump, and it names the cause:
+* The nemesis thread waited in `on-nodes` for `n1`'s thread, which waited
+  on its SSH channel in `grepkill!`, under `jepsen.etcd.db/pause!`.
+* On `n1`, the command was `pgrep -f --ignore-ancestors etcd | xargs
+  --no-run-if-empty kill -stop` in a `bash -c`. Its `xargs` was in state
+  `T` (stopped) with its `kill` a zombie, and no etcd was running.
+* `pgrep -f` matches whole command lines. When it scanned, the pipeline's
+  `xargs` was still a fork of the `bash -c` that names `etcd`, and not an
+  ancestor of `pgrep`, so `pgrep` listed it. `xargs` then sent `SIGSTOP`
+  to itself, and the pause never returned. It is a race, so most pauses
+  pass.
+
+The job now rewrites the etcd test's pause and resume to `cu/signal!`,
+which is `pkill` by process name. That matches only `etcd`: the wrappers
+are named `sudo`, `bash` and `xargs`. `jepsen.tuplesky.db` pauses
+`coordd` the same way (tuplesky/jepsen `c6fb18a8`); it used `grepkill!` on
+`coordd` and could hang the same way.
 
 Each job's summary digests its run, since the job log runs to thousands
 of lines. `scripts/ci/jepsen_summary.py` reads the test's store
