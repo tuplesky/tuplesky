@@ -659,10 +659,16 @@ impl Leader {
     /// that fast-acknowledged a command it never received the proposal of
     /// used to be credited with it -- and with every proposal before it.
     /// The dependency chain is total, so a voter that adopted a proposal
-    /// holds every earlier one, and only proposals after the latest it
-    /// adopted are sent. One it never acknowledges -- a command it
-    /// executed and retired and keeps no record of -- stops being sent
-    /// once it adopts a later one. Only durable proposals go: a proposal
+    /// holds every earlier one, but that says nothing about which of its
+    /// acknowledgements reached this leader: one for an earlier proposal
+    /// can be lost while a later one is counted. So a proposal this
+    /// leader has not committed is sent until the voter's adoption of it
+    /// arrives, however far past it the voter's counted adoptions reach;
+    /// without it the leader may never learn the command, and everything
+    /// chained after it waits (task-d15). Only a proposal the leader has
+    /// committed is skipped once the voter adopts a later one: the voter
+    /// it still lacks may have executed and retired the command and keep
+    /// no record to answer from. Only durable proposals go: a proposal
     /// still becoming durable has its first send queued behind its batch
     /// already.
     ///
@@ -699,7 +705,14 @@ impl Leader {
                 .max();
             for (_, command) in order
                 .iter()
-                .filter(|(s, c)| through.is_none_or(|t| *s > t) && !voted(c))
+                .filter(|(s, c)| {
+                    !voted(c)
+                        && (through.is_none_or(|t| *s > t)
+                            || self
+                                .table
+                                .phase_of(c)
+                                .is_none_or(|phase| phase < Phase::Commit))
+                })
                 .take(per_voter)
             {
                 let p = &self.proposals[command];

@@ -165,6 +165,16 @@ impl Machine {
         }
     }
 
+    /// The command this replica holds two decisions of (task-d14): other
+    /// admission facts than it committed or executed it under. Only a
+    /// follower finds one, at installation or in its own selection.
+    pub const fn halted(&self) -> Option<CommandId> {
+        match self {
+            Machine::Leader(_) => None,
+            Machine::Follower(m) => m.halted(),
+        }
+    }
+
     /// The highest ballot this replica refused to a candidate as behind
     /// (task-d10), which its own next campaign has to go above.
     pub fn outranked(&self) -> Option<Ballot> {

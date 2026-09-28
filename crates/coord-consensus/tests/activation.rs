@@ -1381,6 +1381,69 @@ fn a_lost_acknowledgement_is_published_again_on_a_resend() {
     }
 }
 
+/// An acknowledgement lost behind a counted one is asked for again
+/// (task-d15).
+///
+/// With r1 down, r2's acknowledgements are all r0 has to learn from. The
+/// one for c2 is lost and the one for c3 is counted. The re-send used to
+/// skip every proposal at or below the latest one r2's adoption was
+/// counted for, so c2 was never sent again: r0 never learned it and held
+/// c3, chained after it on the same key, at ACCEPT, while r2 committed
+/// both from its own adoption and executed them.
+#[test]
+fn a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again() {
+    let mut cluster = Cluster::new(41);
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.crash(1);
+    cluster.drop_acks = vec![(2, 0)];
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    cluster.drop_acks.clear();
+    let c3 = cluster.admit(3, 2);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[0].executed,
+        vec![c1],
+        "r0 lacks r2's vote on c2"
+    );
+    assert_eq!(cluster.nodes[2].executed, vec![c1, c2, c3]);
+    cluster.settle_resending(4);
+    for i in [0usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2, c3], "node {i}");
+    }
+}
+
+/// What the re-send still skips (task-d15): a proposal the leader has
+/// committed is not sent again to a voter whose adoption of a later one
+/// was counted. That voter may have executed and retired the command and
+/// keep no record to answer from, and the leader no longer needs its vote.
+#[test]
+fn a_committed_proposal_behind_a_counted_acknowledgement_is_not_sent_again() {
+    let mut cluster = Cluster::new(43);
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.drop_acks = vec![(2, 0)];
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    cluster.drop_acks.clear();
+    let c3 = cluster.admit(3, 2);
+    cluster.settle();
+    // r0 committed c2 on r1's vote and never counted r2's.
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2, c3], "node {i}");
+    }
+    cluster.proposals_sent.clear();
+    cluster.settle_resending(4);
+    assert!(
+        !cluster
+            .proposals_sent
+            .iter()
+            .any(|(from, to)| *from == 0 && *to == 2),
+        "c2 was committed, and r2 adopted c3 after it"
+    );
+}
+
 /// The same, with the voter restarted before the re-send (task-d07).
 ///
 /// What a voter published is kept for its boot, so after a restart it
@@ -2981,8 +3044,7 @@ fn two_presentations(cluster: &mut Cluster) -> (CommandId, CommandId, Digest32, 
 /// follower held the command at ACCEPT under the old leader's, answered
 /// `AdmissionConflict` and never voted, so with the third voter out the
 /// command never reached a majority and everything chained after it
-/// waited: the shape of raf-2 and repaf-4, a leader republishing its
-/// lease command until the end.
+/// waited, the leader's own lease command included.
 #[test]
 fn a_new_leader_re_proposes_under_the_facts_its_reporters_accepted() {
     let mut cluster = Cluster::new(41);
@@ -3200,6 +3262,11 @@ fn a_voter_handed_other_facts_for_a_command_it_committed_stops() {
         None,
         "a voter holding two decisions of one command executes nothing more"
     );
+    assert_eq!(
+        cluster.nodes[1].follower().halted(),
+        Some(x),
+        "the process running it is told to stop"
+    );
 }
 
 /// A voter holding a command at ACCEPT under other facts than a Sync
@@ -3373,6 +3440,7 @@ fn a_voter_handed_other_facts_for_a_command_it_retired_stops() {
         "{rejections:?}"
     );
     assert_eq!(cluster.nodes[1].next_executable(), None);
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(x));
 }
 
 /// A re-proposal under the selected facts that arrives before their

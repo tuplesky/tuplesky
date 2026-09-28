@@ -856,6 +856,7 @@ impl Follower {
                     },
                 ));
                 self.campaign = None;
+                self.halted = Some(command);
                 return Vec::new();
             }
             // A selected command this replica never stored (it was down
@@ -1230,6 +1231,14 @@ impl Follower {
                 self.ledger.stage(barrier, command, record);
             }
         }
+    }
+
+    /// The command this replica holds two decisions of, if it found one
+    /// (task-d14): a Sync, or its own selection, named other admission
+    /// facts than it committed or executed the command under. It votes
+    /// and executes nothing more, and the process running it is to stop.
+    pub const fn halted(&self) -> Option<CommandId> {
+        self.halted
     }
 
     /// The next command to execute through the materializer, if any.
