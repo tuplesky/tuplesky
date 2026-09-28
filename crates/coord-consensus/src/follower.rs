@@ -507,6 +507,12 @@ impl Follower {
         let rows: Vec<(CommandId, CommandRecord)> = rows.into_iter().collect();
         let ledger = DurableLedger::restore(rows.iter().cloned());
         let table = CommandTable::restore(Some(config.capacity), rows);
+        // A promise not yet synchronized owes the Sync of its ballot its
+        // cut (task-d24). The report that named it went with the process,
+        // but nothing is admitted or adopted after a promise, so the
+        // undecided durable records are the ones it named.
+        let report_cut = (ballots.promised() != ballots.synced())
+            .then(|| (ballots.promised(), table.undecided().copied().collect()));
         let adopted = table
             .records()
             .filter(|(_, r)| r.phase >= Phase::Accept)
@@ -550,7 +556,7 @@ impl Follower {
             behind_voters: None,
             report_due: None,
             served_report: None,
-            report_cut: None,
+            report_cut,
             sync_pending: BTreeMap::new(),
             named_facts: BTreeMap::new(),
             halted: None,

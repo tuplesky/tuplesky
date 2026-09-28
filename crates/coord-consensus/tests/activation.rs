@@ -4933,3 +4933,114 @@ fn records_decided_nowhere_are_released_by_the_next_sync() {
         "new work is admitted after the release"
     );
 }
+
+/// Step `f`, writing its batches to `storage` and making them durable.
+fn step_stored(f: &mut Follower, storage: &mut StorageModel, event: Event) {
+    let effects = f.step(event);
+    for e in &effects {
+        if let Effect::Persist(batch) = e {
+            let barrier = batch.barrier;
+            storage.submit(batch.clone());
+            storage.complete(barrier).unwrap();
+            let more = f.step(Event::Storage(StorageEvent::JournalDurable {
+                barrier_id: barrier,
+                journal_seq: LocalJournalSeq::new(1).unwrap(),
+            }));
+            for e in &more {
+                if let Effect::Persist(b) = e {
+                    storage.submit(b.clone());
+                    storage.complete(b.barrier).unwrap();
+                    f.step(Event::Storage(StorageEvent::JournalDurable {
+                        barrier_id: b.barrier,
+                        journal_seq: LocalJournalSeq::new(1).unwrap(),
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// A voter restarted between its report and the Sync still releases
+/// what the Sync leaves out (task-d24): the cut is rebuilt from the
+/// undecided durable records of a promise not yet synchronized, which
+/// after the promise's fence are the ones the report named. Without it
+/// the delayed Sync released nothing and the table stayed full.
+#[test]
+fn a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut storage = StorageModel::default();
+    let mut f = standalone(1, capacity);
+    let held: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_stored(&mut f, &mut storage, e);
+            c
+        })
+        .collect();
+    step_stored(
+        &mut f,
+        &mut storage,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    assert_eq!(f.ballots().promised(), b);
+    // Killed before the Sync arrives, and brought back from its rows.
+    storage.crash();
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            genesis: ballot(0, 0),
+            quorum: quorum(ballot(0, 0)),
+            frontend: FRONTEND,
+            capacity,
+        },
+        promise_row(&storage),
+        None,
+        dependency_rows(&storage),
+        payload_rows(&storage),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    )
+    .restore_execution(ExecutionPosition::ZERO, [])
+    .restore_payloads(payload_rows(&storage));
+    f.step(boot_event(9));
+    assert_eq!(f.ballots().promised(), b);
+    let (sel, rep) = (held[3], held[7]);
+    let mut entry = selected(sel, &[]);
+    entry.admission = f.table().record(&sel).and_then(|r| r.payload);
+    step_stored(
+        &mut f,
+        &mut storage,
+        peer_event(
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::from([(sel, entry)]),
+                reproposed: BTreeSet::from([rep]),
+            }),
+        ),
+    );
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        if *c == sel || *c == rep {
+            assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+        } else {
+            assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+        }
+    }
+    let (_, again) = admission(1000, 1);
+    step_stored(&mut f, &mut storage, again);
+    assert!(
+        !f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new work is admitted after the release"
+    );
+}

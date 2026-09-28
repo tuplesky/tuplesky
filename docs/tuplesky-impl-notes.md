@@ -6303,7 +6303,18 @@ finishes or recovers admitted commands could be refused by a full table.
     command's own dependencies (`CommandTable::release`);
   - the ledger removes them only when the batch is durable
     (`DurableLedger::stage_removal`), so a report never loses a durable
-    record early.
+    record early;
+  - a voter restarted between its report and the Sync rebuilds the cut
+    from its undecided durable records while its promise is ahead of its
+    synchronized ballot. Nothing is admitted or adopted after a promise,
+    so those are the records the report named.
+- **Not yet: the path log.** A released command stays in its keys' path
+  logs, so the next command's path is hashed through it and this voter's
+  fast acknowledgements disagree with the other voters' for that key.
+  The fix (take it out and recompute the head) is written. It makes those
+  acknowledgements agree, so more fast decisions form, and the protocol
+  simulator then reaches the open fast-path recovery gap of #116/#118
+  (row 2, three voters, seed 2). It lands with that fix.
 - **The argument.** The Sync is selected from a majority's reports, and
   selection keeps every command a quorum of an earlier ballot could have
   decided (at five voters only with task-d19). So a command it leaves out
@@ -6349,6 +6360,11 @@ finishes or recovers admitted commands could be refused by a full table.
     the table and the ledger, payloads included, and the two stay.
   - New work is admitted again without `Backpressure`.
   - It fails without the release.
+- `a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out`
+  (`activation`): the voter is killed after its promise and brought back
+  from its rows, and the delayed Sync still releases the records it
+  leaves out, after which new work is admitted. It fails without the
+  rebuilt cut.
 - `releasing_the_latest_command_hands_the_key_back_to_its_predecessor`
   (`graph`): the next command on the key depends on the released one's
   predecessor, and a committed record is not released.
