@@ -8,9 +8,9 @@ use std::ops::Bound;
 
 use coord_consensus::rows::{
     DEPENDENCY_TAG, PromiseRecordV1, SYNC_TAG, SealRecordV1, decode_dependency, decode_payload,
-    decode_promise, decode_seal, decode_sync, payload_key, promise_key, seal_key,
+    decode_promise, decode_seal, decode_sync, dependency_key, payload_key, promise_key, seal_key,
 };
-use coord_consensus::{CommandRecord, PayloadRecordV1, SyncDecision};
+use coord_consensus::{CatchUpEntry, CommandRecord, PayloadRecordV1, SyncDecision};
 use coord_store_api::engine::{Direction, EngineError, ErrorClass, OrderedRead, ScanRequest};
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
@@ -310,6 +310,89 @@ pub fn executed_near<V: OrderedRead>(
     }
     rows.sort_unstable_by_key(|(command, record)| (record.position, *command));
     Ok(rows)
+}
+
+/// Every `executed_v1` row, as (position, command), in position order
+/// (task-d08).
+///
+/// What a donor serves a lagging voter from: the table is keyed by
+/// command identity, so the order of execution has to be read out of
+/// the whole of it, paged within `budget`. Read once and kept, by the
+/// caller, rather than once per page: this is O(history), and a durable
+/// position index is what would make it less.
+pub fn executed_order<V: OrderedRead>(
+    view: &V,
+    budget: ViewBudget,
+) -> Result<Vec<(ExecutionPosition, CommandId)>, EngineError> {
+    let mut order: Vec<(ExecutionPosition, CommandId)> = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            Collection::ExecutedV1.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.clone(),
+                max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
+                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+            },
+        )?;
+        for row in &page.rows {
+            let id: [u8; 32] = row
+                .key
+                .as_slice()
+                .try_into()
+                .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
+            let ExecutedRecordV1 { position, .. } = codecs::decode_executed(&row.value)?;
+            order.push((position, CommandId(Digest32(id))));
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    order.sort_unstable();
+    Ok(order)
+}
+
+/// What a donor sends a lagging voter of one command it executed
+/// (task-d08), read from its durable rows: the execution from
+/// `executed_v1`, the payload from `payload_v1`, and the decided record
+/// from the epoch's dependency row in `protocol_v1`, if it keeps one.
+///
+/// `None` when the command has no executed row or no payload here: a
+/// donor serves only what it executed and can show.
+pub fn catch_up_entry<V: OrderedRead>(
+    view: &V,
+    epoch: ConfigurationEpoch,
+    command: &CommandId,
+) -> Result<Option<CatchUpEntry>, EngineError> {
+    let Some(executed) = view.get(Collection::ExecutedV1.id(), &codecs::executed_key(command))?
+    else {
+        return Ok(None);
+    };
+    let ExecutedRecordV1 {
+        position,
+        revision,
+        result_digest,
+    } = codecs::decode_executed(&executed)?;
+    let Some(payload) = view.get(Collection::PayloadV1.id(), &payload_key(command))? else {
+        return Ok(None);
+    };
+    let payload = decode_payload(&payload)?;
+    let decided = view
+        .get(Collection::ProtocolV1.id(), &dependency_key(epoch, command))?
+        .map(|bytes| decode_dependency(&bytes))
+        .transpose()?;
+    Ok(Some(CatchUpEntry {
+        command: *command,
+        payload,
+        decided,
+        position,
+        revision,
+        result_digest,
+    }))
 }
 
 /// Every executed identity without a dependency row among `records`,

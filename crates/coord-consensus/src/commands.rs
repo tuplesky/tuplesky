@@ -36,7 +36,7 @@ use crate::graph::{ClosureCursor, ClosureProgress, PathLog, combined_path};
 use crate::phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 
 /// A command as this replica knows it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommandRecord {
     /// Phase.
     pub phase: Phase,

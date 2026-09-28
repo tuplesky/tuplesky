@@ -5044,8 +5044,9 @@ and catch-up (task-d08, task-d10) is what brings it back.
   A link-layer defect, recorded for task-d03 to root-cause with those
   logs.
 - A node stopped on a divergence serves again from its store after a
-  restart. task-d13 keeps it stopped until an operator clears it or
-  catch-up rebuilds it; planned behind task-d08.
+  restart. task-d13 keeps it stopped until an operator clears it; a
+  diverged node is rebuilt by replacement through membership, not by
+  catch-up (task-d08).
 - The random-kill stress runs and the five-node Jepsen run with this
   carried are the acceptance.
 
@@ -5485,3 +5486,156 @@ it, and the harness replays did not reproduce it.
 
 - n4's stop in that run is still unexplained. The next runs keep the
   stores, and a stop there now says what it compared.
+
+## A voter behind by more than a table catches up from a peer's history
+
+task-d08, as decided on #98. The Jepsen runs cut `n2` and `n4` off for
+100 s under load; both came back holding tables of commands they could
+never commit, and refused new work as `Backpressure` to the end of the
+run. The leader re-sends only what its table still holds, so a voter
+behind by more than a table is sent nothing it can use.
+
+### Why not the checkpoint
+
+- The plan's catch-up installed a peer's checkpoint. A checkpoint
+  installs into an empty store only (`install_shared` refuses one with
+  protocol rows), and `attach_with_baseline` replays the journal on top
+  of the baseline it names, so a live voter's generation cannot be
+  swapped under it.
+- Nothing trims `payload_v1`, `executed_v1` or the dependency rows: the
+  reference trim never touches them, so every peer still holds every
+  command a lagging voter lacks. What `n2` and `n4` lacked was a way to
+  ask for them.
+
+### The rule
+
+- A follower that holds work it does not execute, and whose
+  `executed_through` has not moved for a second, asks a peer
+  (`ProtocolMessage::CatchUpRequest`, bulk lane) for what it executed
+  after that frontier: the leader first, then, after two unanswered
+  asks, the other voters in turn (`coord_daemon::catch_up::Pacer`). One
+  page outstanding; the machine asks again at once when a full page is
+  executed, so the pacer is the floor for an ask nobody answered.
+- The donor answers only a voter of its configuration, only at a ballot
+  it is synchronized at (it leads it, or follows it with its Sync
+  installed), only while it has not itself stopped, and only up to its
+  own `executed_through`. A page is at most 64 commands and 1 MiB beyond
+  its first, each read from the donor's durable rows: the payload row,
+  the epoch's dependency row if it keeps one, and the executed row
+  (`coord_storage::protocol::catch_up_entry`). The page stops at the
+  first command whose rows it cannot read: never a page with a hole.
+- The donor's position order is read once, from the whole of
+  `executed_v1`, the first time a peer asks, and then kept current from
+  the donor's own executions (`ExecutedOrder::note`); no page rescans the
+  table.
+- The requester drops a page from another ballot or a non-voter
+  (`CatchUpDropped`), and ignores one that does not start at its own
+  frontier or arrives while a page is in hand. It keeps the page's
+  contiguous prefix whose payloads rehash to their identities and whose
+  dependency rows name that payload's admission.
+- Each command is installed as a decided commit under task-d14's rules:
+  executed here already is a divergence; a record at COMMIT or beyond
+  under other facts is `IncompatibleAdmission` and halts; below COMMIT
+  under other facts it is rebound. A missing record is created past the
+  table's capacity. The donor's dependencies replace whatever this voter
+  recorded, unless it had committed the command itself, and must all be
+  executed here already. The payload and dependency rows are written in
+  one batch, and the command executes only once that batch is durable.
+- Where the donor keeps no dependency row, the command is installed with
+  no dependencies, this voter's own row is deleted in that batch, and the
+  command goes to history once executed: nothing is reported committed
+  with other than the decided dependencies.
+- While a pulled command waits, `next_executable` offers it alone: it is
+  the command at this voter's next position.
+- After execution the voter compares position, revision and result
+  digest with the donor's executed row. A difference is
+  `CatchUpDivergence`: the machine executes nothing more, and `coordd`
+  stops as on any divergence, through `describe_divergence` with a third
+  check, `MismatchCheck::CatchUpAgainstDonor`. The first line keeps its
+  prefix; the donor's execution is the release side. Where this voter
+  had executed the command earlier, its side is its own `executed_v1`
+  row.
+- A restart forgets the page. The voter asks again from its durable
+  frontier; a pulled command whose commit was durable executes as any
+  committed command does, without the comparison, and the executed row
+  keeps anything from executing twice.
+
+### Where held and abandoned records go
+
+- A record whose command the domain decided drains through catch-up: a
+  submission this voter initialized and could never learn, a proposal it
+  held without its dependencies, or an acceptance a Sync demoted is
+  installed over, executed and retired. The tests below show the table
+  empty of unexecuted records afterwards, and no more `Backpressure`.
+- A record whose command the domain never decided does not. That is a
+  submission that reached only this voter, or proposals a leader made
+  that no quorum saw, such as `n2`'s ballot-1 proposals when its
+  collector could reach no other voter. It leaves the table only when
+  the command is decided: the collector's re-offer (task-64) while the
+  caller is still waiting, a caller's retry, or a later selection that
+  carries it. Until then it counts toward the table's capacity, and the
+  voter asks for catch-up once a second and is answered with nothing.
+- Evicting such a record needs its own argument. A Sync that did not
+  carry it shows the command undecided before that ballot, but the
+  table's rule is that nothing unresolved is evicted, and the key index
+  names the record as the next command's local dependency. It is left
+  to its own task rather than folded in here.
+
+### Evidence
+
+- `coord-consensus` `tests/catch_up.rs`, five voters and a table of
+  eight, r4 cut off for five tables' worth and brought back under load:
+  - `a_voter_past_a_full_table_catches_up_and_its_table_drains`, four
+    seeds: r4's table is full (it refused for `Backpressure`), it
+    executes the leader's history in the leader's order, holds nothing
+    unexecuted afterwards, and takes two tables' worth of new work
+    without `Backpressure`.
+  - `nothing_caught_up_is_reported_committed_with_other_than_the_decided_deps`:
+    every dependency row r4 holds at COMMIT or beyond names the leader's
+    dependencies, and the leader holds a row for it.
+  - `a_page_from_another_ballot_or_a_stranger_is_dropped`: both are
+    refused as `CatchUpDropped` and execute nothing; the same page from
+    a voter at the ballot is taken.
+  - `a_pulled_command_executed_otherwise_stops_the_voter`: another
+    result digest on the second pulled command stops r4 with both sides,
+    and nothing more executes.
+  - `a_restart_in_the_middle_of_a_page_resumes_without_executing_twice`:
+    three of a page executed, a restart, and catch-up from the durable
+    frontier; no command executes twice and the history is the leader's.
+  - `a_command_the_donor_keeps_no_row_of_goes_to_history`: executed at
+    the donor's position, no record and no dependency row left.
+  - Negative control: with pages refused on arrival, all six fail.
+- `coord-daemon` `tests/catch_up.rs`,
+  `a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal`:
+  three voters over model-engine stores, a table of eight, r2 cut off
+  for 30 simulated seconds at 20 operations a second (600 commands
+  behind), then healed under the same load. Within 10 s it has executed
+  as far as the leader and holds nothing unexecuted; it takes new work
+  without `Backpressure`; and its `executed_v1` rows are the leader's,
+  row for row. Negative control: with the pacer's ask dropped, r2 is at
+  61 of 861 after 10 s and the test fails.
+- `coord-daemon` `catch_up::tests`: the position order and the pacer.
+- `a_catch_up_mismatch_names_the_catch_up_check` and
+  `a_divergence_stop_keeps_its_prefix` (`coordd`): the third check's
+  wording, and the prefix on all three.
+
+### What is left
+
+- Once quorum-certified forgetting (task-52, task-53) is wired, a voter
+  behind that floor cannot pull below it; the forgetting task decides
+  how it comes back.
+- The donor's first read of its order is O(history), in time and in
+  memory (32 bytes a command). A durable position index would remove it,
+  and is out of scope.
+- A donor that executed in another order than the domain is not caught
+  here: the requester trusts one peer's order at one ballot, as it
+  trusts that ballot's Sync. The donor's own divergence stops are what
+  catch it.
+- A pulled command whose decided dependencies name a command this voter
+  executed and has since forgotten (more than a table's retirements ago,
+  and no key's latest) is refused as `CatchUpNotInstalled`, and catch-up
+  stops there.
+- Records whose commands were never decided, above.
+- The two-voter 100 s partition and the 30 s follower partition are to
+  be run on `coordd` and in Jepsen with this carried; the job's
+  `coord-jepsen-executed --last` is #98's.

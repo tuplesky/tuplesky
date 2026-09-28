@@ -37,15 +37,20 @@ use coord_types::{CommandId, RetryKey};
 
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::campaign::Campaign;
+use crate::catch_up::{CatchUp, CatchUpDivergence, DonorExecution, OwnExecution, Running};
 use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::{MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, ProtocolMessage};
+use crate::messages::{
+    CatchUpEntry, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, ProtocolMessage,
+};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryError, SyncDecision, SyncEntry};
 use crate::recovery::{RecoveryReport, ReportEntry};
 use crate::role::RecoveredState;
-use crate::rows::{PayloadRecordV1, PromiseRecordV1, dependency_update, payload_update};
+use crate::rows::{
+    PayloadRecordV1, PromiseRecordV1, dependency_delete, dependency_update, payload_update,
+};
 use crate::rows::{SyncRecordV1, promise_update, sync_update};
 use crate::summary::DurableLedger;
 use crate::summary::{MAX_PAGE_ENTRIES, PageError, paginate};
@@ -206,6 +211,19 @@ pub enum FollowerRejection {
         /// The digest the Sync named.
         selected: Digest32,
     },
+    /// A catch-up page from a peer that is not a voter of this
+    /// configuration, or answered at a ballot this replica is not
+    /// synchronized at (task-d08). Dropped whole.
+    CatchUpDropped {
+        /// The peer.
+        from: ReplicaId,
+        /// The ballot it answered at.
+        ballot: Ballot,
+    },
+    /// A pulled command this replica could not install as decided: its
+    /// decided dependencies are not executed here (task-d08). The rest of
+    /// the page is dropped and asked for again.
+    CatchUpNotInstalled(CommandId),
 }
 
 /// A report owed once every batch submitted before the cut is durable.
@@ -366,6 +384,11 @@ pub struct Follower {
     /// for payloads (task-d09).
     proposal_cursor: usize,
     rejections: Vec<FollowerRejection>,
+    /// The catch-up page in hand, if any (task-d08).
+    catch_up: CatchUp,
+    /// A pulled command whose execution here disagreed with the donor's
+    /// (task-d08): this replica executes nothing more.
+    diverged: Option<CatchUpDivergence>,
     /// What this replica published to the frontend for each command it
     /// still remembers, kept so an exact duplicate submission can offer
     /// it to the submitter again (task-c02). Never recovered: the outbox
@@ -442,6 +465,8 @@ impl Follower {
             .collect();
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
+            catch_up: CatchUp::default(),
+            diverged: None,
             config,
             sync_barrier: None,
             sync_demoted: Vec::new(),
@@ -612,6 +637,8 @@ impl Follower {
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
+            catch_up: CatchUp::default(),
+            diverged: None,
         }
     }
 
@@ -1242,9 +1269,18 @@ impl Follower {
     }
 
     /// The next command to execute through the materializer, if any.
+    ///
+    /// A pulled command installed by catch-up goes first, and alone: it is
+    /// the command at this replica's next position, and nothing else may
+    /// take that position while it waits (task-d08).
     pub fn next_executable(&self) -> Option<CommandId> {
-        if self.halted.is_some() {
+        if self.halted.is_some() || self.diverged.is_some() {
             return None;
+        }
+        if let Some(running) = &self.catch_up.running {
+            return (running.durable
+                && self.table.phase_of(&running.command) == Some(Phase::Commit))
+            .then_some(running.command);
         }
         self.learner
             .next_executable(&self.table, |c| self.adopted.get(c).map(|(s, _)| *s))
@@ -1547,9 +1583,322 @@ impl Follower {
             self.config.quorum.ballot(),
             outcome,
         )?;
+        let mut effects = alloc::vec![Effect::Established(result)];
+        self.check_pulled(command, outcome);
         self.learn();
         self.forget_history();
-        Ok(alloc::vec![Effect::Established(result)])
+        if self.diverged.is_none() && self.catch_up.running.is_none() {
+            effects.extend(self.install_catch_up());
+            if !self.catch_up.busy()
+                && let Some(donor) = self.catch_up.continue_from.take()
+            {
+                effects.extend(self.request_catch_up(donor));
+            }
+        }
+        Ok(effects)
+    }
+
+    /// Compare this replica's execution of a pulled command with the
+    /// donor's (task-d08). A difference stops this replica; agreement
+    /// sends a command the donor kept no decided record of to history,
+    /// so the record this replica had of it is never reported as one.
+    fn check_pulled(&mut self, command: CommandId, outcome: &AppliedOutcome) {
+        let Some(Running { donor, decided, .. }) =
+            self.catch_up.running.take_if(|r| r.command == command)
+        else {
+            return;
+        };
+        let own = OwnExecution {
+            position: outcome.position,
+            revision: outcome.revision,
+            result_digest: outcome.result_digest,
+            response_len: outcome.response.len(),
+        };
+        if own.position != donor.position
+            || own.revision != donor.revision
+            || own.result_digest != donor.result_digest
+        {
+            self.diverge(command, donor, Some(own));
+            return;
+        }
+        self.catch_up.executed += 1;
+        if !decided {
+            let _ = self.table.retire(&command);
+        }
+    }
+
+    fn diverge(&mut self, command: CommandId, donor: DonorExecution, own: Option<OwnExecution>) {
+        self.diverged = Some(CatchUpDivergence {
+            command,
+            donor,
+            own,
+        });
+        self.catch_up.queue.clear();
+        self.catch_up.running = None;
+        self.catch_up.continue_from = None;
+    }
+
+    /// A pulled command whose execution here disagreed with the donor's,
+    /// if one did (task-d08). This replica executes nothing more, and the
+    /// process running it is to stop.
+    pub const fn catch_up_divergence(&self) -> Option<&CatchUpDivergence> {
+        self.diverged.as_ref()
+    }
+
+    /// Whether a catch-up page is in hand (task-d08).
+    pub fn catching_up(&self) -> bool {
+        self.catch_up.busy()
+    }
+
+    /// Catch-up pages taken and pulled commands executed, since this
+    /// replica started (task-d08).
+    pub const fn catch_up_counts(&self) -> (u64, u64) {
+        (self.catch_up.pages, self.catch_up.executed)
+    }
+
+    /// Whether this replica holds work it has not executed: a record
+    /// below EXECUTED, a proposal it holds, or a Sync entry it has not
+    /// installed. A replica that holds such work and does not execute it
+    /// is one a caller may bring up from a peer (task-d08).
+    pub fn holds_unexecuted(&self) -> bool {
+        !self.held.is_empty()
+            || !self.sync_pending.is_empty()
+            || self
+                .table
+                .records()
+                .any(|(_, r)| r.payload.is_some() && r.phase < Phase::Executed)
+    }
+
+    /// Ask `donor` for the commands it executed after this replica's own
+    /// frontier (task-d08).
+    ///
+    /// Nothing is asked while a page is in hand -- one page at a time,
+    /// executed before the next -- nor by a replica that is not
+    /// synchronized at its ballot, has stopped, or would ask itself or a
+    /// peer that is not a voter of this configuration. Published under
+    /// the promised ballot, as payload transfer is: it is not a voting
+    /// transition.
+    pub fn request_catch_up(&mut self, donor: ReplicaId) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let ballot = self.config.quorum.ballot();
+        if self.catch_up.busy()
+            || self.halted.is_some()
+            || self.diverged.is_some()
+            || self.ballots.synced() != ballot
+            || donor == self.config.identity.replica
+            || !self.config.identity.voters.contains(&donor)
+        {
+            return Vec::new();
+        }
+        let context = self
+            .ballots
+            .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
+        let frame = ProtocolMessage::CatchUpRequest {
+            ballot,
+            after: self.learner.executed_through(),
+        }
+        .encode();
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: PeerId {
+                    replica: donor,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame,
+            });
+        }
+        self.release()
+    }
+
+    /// A catch-up page from `from` (task-d08).
+    ///
+    /// Taken only from a voter of this configuration, answered at the
+    /// ballot this replica is synchronized at, following exactly this
+    /// replica's own frontier, and only when no page is in hand. Its
+    /// commands are kept while they are contiguous and whole: a payload
+    /// that rehashes to its identity, and a decided record, if any, bound
+    /// to that payload's admission. The first that is not ends the page.
+    fn on_catch_up_page(
+        &mut self,
+        from: ReplicaId,
+        ballot: Ballot,
+        after: ExecutionPosition,
+        entries: Vec<CatchUpEntry>,
+    ) -> Vec<Effect> {
+        let at = self.config.quorum.ballot();
+        if ballot != at
+            || self.ballots.synced() != at
+            || from == self.config.identity.replica
+            || !self.config.identity.voters.contains(&from)
+        {
+            self.rejections
+                .push(FollowerRejection::CatchUpDropped { from, ballot });
+            return Vec::new();
+        }
+        if self.catch_up.busy()
+            || self.halted.is_some()
+            || self.diverged.is_some()
+            || after != self.learner.executed_through()
+        {
+            return Vec::new();
+        }
+        let offered = entries.len();
+        let mut next = after;
+        for entry in entries.into_iter().take(MAX_CATCH_UP_COMMANDS) {
+            let Ok(position) = next.checked_next() else {
+                break;
+            };
+            if entry.position != position || !pulled_entry_is_whole(&entry) {
+                break;
+            }
+            next = position;
+            self.catch_up.queue.push_back((from, ballot, entry));
+        }
+        let taken = self.catch_up.queue.len();
+        if taken == 0 {
+            return Vec::new();
+        }
+        self.catch_up.pages += 1;
+        // A full page, taken whole, is followed by the next ask as soon as
+        // it is executed: a replica thousands of commands behind should
+        // not wait a timer's period per page.
+        self.catch_up.continue_from =
+            (taken == offered && taken >= MAX_CATCH_UP_COMMANDS).then_some(from);
+        self.install_catch_up()
+    }
+
+    /// Install the next pulled command as a decided commit (task-d08).
+    ///
+    /// The same rules as a Sync's COMMIT entry (task-d14): a record here
+    /// committed or executed under other admission facts is a second
+    /// decision and stops this replica; one below COMMIT under other facts
+    /// is rebound to the donor's. The donor's decided dependencies replace
+    /// whatever this replica had recorded -- an acceptance of its own, a
+    /// placeholder -- so nothing is ever reported as committed with other
+    /// dependencies than the decided ones. It is let into a full table:
+    /// it is decided, and its turn has come.
+    ///
+    /// A command the donor keeps no decided record of is installed with
+    /// no dependencies, its record here is deleted rather than rewritten,
+    /// and it goes to history once executed: it is never reported.
+    fn install_catch_up(&mut self) -> Vec<Effect> {
+        if self.catch_up.running.is_some() || self.boot.is_none() {
+            return Vec::new();
+        }
+        let Some((donor, ballot, entry)) = self.catch_up.queue.pop_front() else {
+            return Vec::new();
+        };
+        let command = entry.command;
+        let digest = entry.payload.admission_digest();
+        let expected = DonorExecution {
+            donor,
+            ballot,
+            position: entry.position,
+            revision: entry.revision,
+            result_digest: entry.result_digest,
+        };
+        if self.learner.executed_through().checked_next().ok() != Some(entry.position) {
+            // This replica moved on by itself: the page is stale.
+            self.catch_up.queue.clear();
+            self.catch_up.continue_from = None;
+            return Vec::new();
+        }
+        if self.table.phase_of(&command) == Some(Phase::Executed) {
+            // Executed here already, so at a position before the one the
+            // donor executed it at: the two executed the domain's commands
+            // in different orders.
+            self.diverge(command, expected, None);
+            return Vec::new();
+        }
+        if let Some(held) = self.table.record(&command).and_then(|r| r.payload)
+            && held != digest
+        {
+            if self.table.phase_of(&command) >= Some(Phase::Commit) {
+                self.rejections
+                    .push(FollowerRejection::IncompatibleAdmission {
+                        command,
+                        held,
+                        selected: digest,
+                    });
+                self.halted = Some(command);
+                self.catch_up.queue.clear();
+                self.catch_up.continue_from = None;
+                return Vec::new();
+            }
+            self.table.rebind(&command, digest);
+            self.served_payloads.remove(&command);
+        }
+        if self.table.phase_of(&command).is_none() {
+            let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
+            let _ = self.table.initialize_beyond_capacity(command, digest, keys);
+        }
+        let (deps, path) = entry.decided.as_ref().map_or_else(
+            || (Vec::new(), crate::graph::empty_path()),
+            |r| (r.deps.clone(), r.path),
+        );
+        let paths = entry.decided.as_ref().map(|r| r.paths.clone());
+        // A command committed here already keeps the dependencies it was
+        // committed with: a decision is not taken twice. Either way, what
+        // it is executed under must be executed here already.
+        let committed = self.table.phase_of(&command) >= Some(Phase::Commit);
+        let executable = {
+            let under = match self.table.record(&command) {
+                Some(record) if committed => record.deps.clone(),
+                _ => deps.clone(),
+            };
+            crate::phase::guard_execute(&under, |d| self.table.phase_of(d)).is_ok()
+        };
+        let installed = executable
+            && (committed
+                || (self
+                    .table
+                    .adopt(command, deps, paths.as_deref(), path)
+                    .is_ok()
+                    && self.table.commit(command).is_ok()));
+        if !installed {
+            self.rejections
+                .push(FollowerRejection::CatchUpNotInstalled(command));
+            self.catch_up.queue.clear();
+            self.catch_up.continue_from = None;
+            return Vec::new();
+        }
+        // Decided here now: nothing the leader or a Sync offers for it is
+        // to be adopted over the decision.
+        self.held.remove(&command);
+        self.sync_pending.remove(&command);
+        self.bindings
+            .entry(entry.payload.retry_key)
+            .or_insert(command);
+        self.payloads.insert(command, entry.payload.clone());
+        let epoch = self.config.identity.epoch;
+        let barrier = self.alloc.as_mut().expect("booted").allocate();
+        let mut updates = alloc::vec![payload_update(&command, &entry.payload).expect("bounded")];
+        if entry.decided.is_some() {
+            let record = self.table.record(&command).expect("installed").clone();
+            updates.push(dependency_update(epoch, &command, &record).expect("bounded"));
+            self.ledger.stage(barrier, command, record);
+        } else {
+            updates.push(dependency_delete(epoch, &command));
+            self.ledger.retain(|c| *c != command);
+        }
+        self.pending.insert(barrier, Pending::Adoption(command));
+        self.durable_payloads.insert(barrier, command);
+        self.catch_up.running = Some(Running {
+            command,
+            donor: expected,
+            decided: entry.decided.is_some(),
+            barrier,
+            durable: false,
+        });
+        alloc::vec![Effect::Persist(PersistBatch {
+            barrier,
+            base: None,
+            updates,
+        })]
     }
 
     /// Drop the durable records and payloads of commands this replica
@@ -2633,6 +2982,11 @@ impl Follower {
                     {
                         entry.1 = true;
                     }
+                    if let Some(running) = self.catch_up.running.as_mut()
+                        && running.barrier == barrier
+                    {
+                        running.durable = true;
+                    }
                     // The evidence this replica produced is a fact now.
                     if let Some(deferred) = self.deferred.remove(&barrier)
                         && let Some(set) = self.votes.get_mut(&deferred.command)
@@ -2738,6 +3092,15 @@ impl Follower {
             // campaign will not get, and a leader that far behind could
             // not serve. It campaigns again only once it has executed as
             // far as the refuser.
+            ProtocolMessage::CatchUpPage {
+                ballot,
+                after,
+                entries,
+                ..
+            } => self.on_catch_up_page(from.replica, ballot, after, entries),
+            // Answered by the runtime, from this replica's durable rows:
+            // the machine keeps no executed history to answer from.
+            ProtocolMessage::CatchUpRequest { .. } => Vec::new(),
             ProtocolMessage::PromiseRefused {
                 ballot,
                 replica,
@@ -3050,6 +3413,23 @@ impl Follower {
         self.learn();
         Vec::new()
     }
+}
+
+/// Whether a pulled command is whole (task-d08): its payload rehashes to
+/// the identity it claims, and the decided record that came with it, if
+/// any, is bound to that payload's admission.
+fn pulled_entry_is_whole(entry: &CatchUpEntry) -> bool {
+    let request: Result<(coord_types::logical_v1::LogicalRequest, &[u8]), _> =
+        postcard::take_from_bytes(&entry.payload.logical);
+    let identity = request
+        .ok()
+        .filter(|(_, rest)| rest.is_empty())
+        .and_then(|(r, _)| CommandId::derive(&entry.payload.retry_key, &r).ok());
+    identity == Some(entry.command)
+        && entry
+            .decided
+            .as_ref()
+            .is_none_or(|r| r.payload == Some(entry.payload.admission_digest()))
 }
 
 /// The admission digest a selection names for each of its entries.

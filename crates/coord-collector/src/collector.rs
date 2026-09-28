@@ -463,6 +463,10 @@ pub enum MismatchCheck {
     /// A release that arrived after this collector answered, against the
     /// answer it gave (task-d12).
     LateReleaseAgainstAnswer,
+    /// A command this node pulled from a peer's executed history, its own
+    /// execution against the one the peer served with it (task-d08). The
+    /// release side is the donor's execution.
+    CatchUpAgainstDonor,
 }
 
 /// What one side of a [`Mismatch`] says the command produced.

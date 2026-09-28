@@ -857,7 +857,19 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
             admission: None,
         },
     };
-    for message in [&request, &response] {
+    // A catch-up exchange is bulk transfer too (task-d08): a page can be
+    // a megabyte, and must not hold up a vote behind it.
+    let catch_up = ProtocolMessage::CatchUpRequest {
+        ballot: ballot(1, 0),
+        after: coord_types::ids::ExecutionPosition::ZERO,
+    };
+    let page = ProtocolMessage::CatchUpPage {
+        ballot: ballot(1, 0),
+        after: coord_types::ids::ExecutionPosition::ZERO,
+        through: coord_types::ids::ExecutionPosition::ZERO,
+        entries: vec![],
+    };
+    for message in [&request, &response, &catch_up, &page] {
         assert!(
             coord_consensus::is_payload_transfer(&message.encode()),
             "payload transfer not recognized: {message:?}"
