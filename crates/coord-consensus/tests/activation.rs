@@ -4501,6 +4501,77 @@ fn a_voter_behind_across_failed_ballots_reports_one_ballots_worth() {
     let report = f.report(ballot(4, 0));
     let reported: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
     assert_eq!(reported, last.iter().copied().collect(), "{report:?}");
+    // The earlier Syncs' placeholders went with their entries: repeated
+    // failed ballots do not fill the table with slots nothing fills.
+    for k in 1..=2u64 {
+        for i in 0..3u8 {
+            let c = CommandId(Digest32([0x40 + 0x10 * k as u8 + i; 32]));
+            assert_eq!(
+                f.table().phase_of(&c),
+                None,
+                "ballot {k}'s {c:?} kept a slot"
+            );
+        }
+    }
+    assert_eq!(f.table().len(), last.len());
+}
+
+/// task-d20 (Codex review): the report bound is the domain's, not the
+/// candidate's own table. A voter with a small table legitimately reports
+/// more than twice it when a leader with a larger one ordered commands
+/// past its limit; the candidate takes such a report.
+#[test]
+fn a_report_past_twice_the_candidates_own_table_is_taken() {
+    let capacity = 32;
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity,
+    });
+    f.step(boot_event(1));
+    let b = ballot(1, 1);
+    let effects = f.campaign(b);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    let big = 2 * capacity + 10;
+    assert!(big <= coord_consensus::MAX_REPORT_ENTRIES);
+    let report = RecoveryReport {
+        replica: r(0),
+        ballot: b,
+        committed_ballot: ballot(0, 0),
+        entries: (0..big as u16)
+            .map(|n| {
+                let mut d = [0x33; 32];
+                d[..2].copy_from_slice(&n.to_be_bytes());
+                accepted_entry(CommandId(Digest32(d)), &[])
+            })
+            .collect(),
+    };
+    f.step(peer_event(
+        r(0),
+        ProtocolMessage::Promise {
+            ballot: b,
+            synced: ballot(0, 0),
+            replica: r(0),
+        },
+    ));
+    for page in coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES) {
+        f.step(peer_event(r(0), ProtocolMessage::ReportPage(page)));
+    }
+    assert!(
+        !f.take_rejections()
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::Campaign(_))),
+        "the campaign failed"
+    );
+    let decision = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .expect("selected over the large report");
+    assert_eq!(decision.entries.len(), big);
 }
 
 /// task-d20: a follower sent a Sync that does not fit its row refuses it

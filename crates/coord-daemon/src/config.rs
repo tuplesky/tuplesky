@@ -84,7 +84,7 @@ pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
 /// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`). A
 /// selection with more dependencies per entry that still does not fit is
 /// refused by name, not written.
-pub const MAX_COMMAND_TABLE_CAPACITY: usize = 1000;
+pub const MAX_COMMAND_TABLE_CAPACITY: usize = coord_consensus::MAX_TABLE_CAPACITY;
 
 const fn default_command_table_capacity() -> usize {
     DEFAULT_COMMAND_TABLE_CAPACITY

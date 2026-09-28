@@ -901,10 +901,7 @@ impl Follower {
                 }
                 None => table.phase_of(c).is_some(),
             };
-            match campaign.try_select(
-                crate::recovery::max_report_entries(self.config.capacity),
-                supplied,
-            ) {
+            match campaign.try_select(crate::recovery::MAX_REPORT_ENTRIES, supplied) {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
@@ -1257,6 +1254,20 @@ impl Follower {
     /// it, so a voter behind across failed ballots reported more each
     /// time, and the Sync selected from its report grew with them.
     fn replace_sync_pending(&mut self, decision: &SyncDecision) {
+        // The placeholders the superseded entries made go with them,
+        // unless a proposal held here is waiting on the command: kept,
+        // repeated failed ballots with entries whose payloads never came
+        // filled the table with slots nothing would ever fill (Codex
+        // review).
+        let superseded: Vec<CommandId> = self
+            .sync_pending
+            .keys()
+            .filter(|c| !decision.entries.contains_key(c) && !self.held.contains_key(c))
+            .copied()
+            .collect();
+        for command in superseded {
+            self.table.forget_placeholder(&command);
+        }
         self.sync_pending.clear();
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {

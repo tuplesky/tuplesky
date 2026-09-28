@@ -214,16 +214,26 @@ pub enum RecoveryError {
 /// The most entries a recovery report may carry from a replica whose
 /// command table holds `capacity` records (task-d20): its live records
 /// and its retirement window, each at most the capacity.
-///
-/// A campaign selects over up to five reports, and the Sync it binds is
-/// one row: the largest capacity a voter may be configured with is the one
-/// at which five disjoint reports of this size fit that row
-/// (`coord_daemon::config::MAX_COMMAND_TABLE_CAPACITY`). A voter that
-/// holds more -- far behind, with a large selection still to install --
-/// reports it all; its report is set aside rather than selected over.
 pub const fn max_report_entries(capacity: usize) -> usize {
     capacity.saturating_mul(2)
 }
+
+/// The largest command table a voter may be configured with (task-d20):
+/// five disjoint reports of [`max_report_entries`] at this capacity give a
+/// Sync that fits its row (`coord_daemon`'s
+/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`).
+pub const MAX_TABLE_CAPACITY: usize = 1000;
+
+/// The most entries a campaign takes a report with (task-d20).
+///
+/// The bound is the domain's, not the reporter's own table: voters of one
+/// domain may be configured with different capacities, and a follower
+/// with a small table legitimately holds more than twice it when a leader
+/// with a larger one orders commands past its limit (Codex review). A
+/// voter that holds more -- far behind, with a large selection still to
+/// install -- reports it all; its report is set aside rather than
+/// selected over.
+pub const MAX_REPORT_ENTRIES: usize = max_report_entries(MAX_TABLE_CAPACITY);
 
 /// The order a new leader re-proposes a selection's entries in: each
 /// command after every dependency that is itself an entry (task-d21).
