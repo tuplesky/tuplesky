@@ -1106,6 +1106,18 @@ its followers had committed among themselves.
   reads through it.
 * **The etcd baseline** on the same run hung on a `:pause :all` (above).
   It runs no TupleSky code.
+* **Jepsen with pauses by process name**
+  ([run 36370167293](https://github.com/tuplesky/tuplesky/actions/runs/36370167293),
+  head `6ca07a4`, tuplesky/jepsen `c6fb18a8`):
+  * TupleSky: `:valid? true`, with 2304 `ok` of 2721, and every node
+    served its final reads. Each kill was followed by a start 12 to 47 s
+    later. No voter logged a stop, `HalfInitialized`,
+    `IncompatibleAccepted` or `CandidateBehind`. The leader, `n5`
+    (ballot 3), republished one command twice. Its log ends with the
+    peers reconnecting after the final start, not with a republish.
+  * etcd 3.7.2: `:valid? true`, with 1611 `ok` of 2481. All six pauses
+    returned, each within about 60 ms, four of them of all five nodes, one
+    right after `:kill :all`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
