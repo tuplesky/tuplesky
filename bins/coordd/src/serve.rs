@@ -893,6 +893,9 @@ pub struct Domain<P: Persistence> {
     /// already gave from its own record (task-d12). The serve loop stops
     /// on it as it stops on a record contradicting a held release.
     answered_otherwise: Option<CommandId>,
+    /// A command this voter holds two decisions of (task-d14). The serve
+    /// loop stops on it as it stops on a release-record mismatch.
+    admission_halt: Option<CommandId>,
     /// Peers this node currently cannot queue a frame for, and how many
     /// frames it has dropped for each since it last could. Kept so the
     /// condition is said once when it starts and once when it ends,
@@ -1318,6 +1321,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
             answered_otherwise: None,
+            admission_halt: None,
             undeliverable: BTreeMap::new(),
             no_plane_said: false,
             recurring: Recurring::default(),
@@ -1527,6 +1531,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // the wrong thing; nothing more is.
             if let Some(command) = self.answered_otherwise.take() {
                 say_diverged(&short_hex(&command));
+                return;
+            }
+            // Two decisions of one command, found at a Sync or in this
+            // voter's own selection (task-d14).
+            if let Some(command) = self.admission_halt.take() {
+                say_two_decisions(&short_hex(&command));
                 return;
             }
             // A submission a destination could not take is offered
@@ -2263,6 +2273,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             if let Some(n) = self.recurring.seen(&why) {
                 eprintln!("this voter's machine refused: {why} ({n} so far)");
             }
+        }
+        // Two decisions of one command: the machine votes and executes
+        // nothing more, and the serve loop stops rather than leave a node
+        // up that answers nothing (task-d14).
+        if let Some(command) = voter.node().machine().halted() {
+            self.admission_halt = Some(command);
         }
         self.carry(api, out, provenance);
         // A submission is the only thing that can say where this voter's
@@ -3389,6 +3405,16 @@ fn say_diverged(command: &str) {
          command and this node's own execution of it disagree, so this node executed the \
          domain's commands in another order than the leader. Its store holds a history the \
          domain did not decide, and this node does not answer from it"
+    );
+}
+
+/// Why a node stopped on two decisions of one command.
+fn say_two_decisions(command: &str) {
+    eprintln!(
+        "this node stopped: incompatible-admission({command}): a selection names other \
+         admission facts for that command than this node committed or executed it under, so \
+         the domain decided it twice. This node votes, executes and answers nothing more; \
+         its store is to be rebuilt from a peer's checkpoint"
     );
 }
 

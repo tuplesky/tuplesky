@@ -3200,6 +3200,11 @@ fn a_voter_handed_other_facts_for_a_command_it_committed_stops() {
         None,
         "a voter holding two decisions of one command executes nothing more"
     );
+    assert_eq!(
+        cluster.nodes[1].follower().halted(),
+        Some(x),
+        "the process running it is told to stop"
+    );
 }
 
 /// A voter holding a command at ACCEPT under other facts than a Sync
@@ -3373,6 +3378,7 @@ fn a_voter_handed_other_facts_for_a_command_it_retired_stops() {
         "{rejections:?}"
     );
     assert_eq!(cluster.nodes[1].next_executable(), None);
+    assert_eq!(cluster.nodes[1].follower().halted(), Some(x));
 }
 
 /// A re-proposal under the selected facts that arrives before their

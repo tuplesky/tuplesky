@@ -5210,7 +5210,10 @@ command that writes another receipt identity into replicated state
   A payload under other facts than a selection names is not taken.
 - At COMMIT or beyond, a different digest is two decisions of one
   command. The voter does not install the entry, reports
-  `IncompatibleAdmission`, and stops voting and executing.
+  `IncompatibleAdmission`, and stops voting and executing; a candidate
+  that finds one in its own selection stops the same way. `coordd` then
+  stops the process, as on `release-record-mismatch`, saying
+  `incompatible-admission` and the command.
 - A command executed and retired has no record; it is compared against
   its payload row where one is kept, by the candidate and by a voter
   installing a Sync. With none it has nothing to compare. After this
@@ -5271,11 +5274,10 @@ the Sync after a proposal's rebind, the entry stays uninstalled.
 
 ### What is left
 
-- The stop on a committed mismatch lives in the consensus follower: it
-  stops voting and executing and reports the alarm. It is in memory
-  only. `coordd` does not turn it into a process stop, and a restarted
-  voter does not stop again, since a resumed Sync re-queues only entries
-  below COMMIT. task-d13's durable marker would be the place for both.
+- The stop on a committed mismatch is not durable. A restarted voter
+  does not stop again, since a resumed Sync re-queues only entries below
+  COMMIT; that half is task-d13's durable marker, as for the other
+  stops.
 - A Sync entry that names no facts (no reporter held a payload, and the
   candidate supplies it by having executed it) is installed under
   whatever facts a voter holds, as before.
