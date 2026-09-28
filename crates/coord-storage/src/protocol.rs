@@ -259,6 +259,59 @@ pub fn read_protocol<V: OrderedRead>(
     })
 }
 
+/// Every `executed_v1` row whose position is within `radius` of one of
+/// `around`, in position order (task-d17).
+///
+/// What a node that stopped on a release its execution contradicts shows
+/// of its own execution: the commands it executed next to where it put
+/// the command and next to where the leader did. The table is keyed by
+/// command identity, so the whole of it is read, paged within `budget`;
+/// this is read once, at a stop, and never on a serving path.
+pub fn executed_near<V: OrderedRead>(
+    view: &V,
+    around: &[ExecutionPosition],
+    radius: u64,
+    budget: ViewBudget,
+) -> Result<Vec<(CommandId, ExecutedRecordV1)>, EngineError> {
+    let near = |position: ExecutionPosition| {
+        around
+            .iter()
+            .any(|centre| centre.get().abs_diff(position.get()) <= radius)
+    };
+    let mut rows: Vec<(CommandId, ExecutedRecordV1)> = Vec::new();
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let page = view.scan_page(
+            Collection::ExecutedV1.id(),
+            &ScanRequest {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+                direction: Direction::Forward,
+                resume_after: resume.clone(),
+                max_rows: budget.max_rows.max(1).try_into().expect("non-zero"),
+                max_bytes: budget.max_bytes.max(1).try_into().expect("non-zero"),
+            },
+        )?;
+        for row in &page.rows {
+            let id: [u8; 32] = row
+                .key
+                .as_slice()
+                .try_into()
+                .map_err(|_| corrupt("an executed row's key is not a command identity"))?;
+            let record = codecs::decode_executed(&row.value)?;
+            if near(record.position) {
+                rows.push((CommandId(Digest32(id)), record));
+            }
+        }
+        match page.rows.last() {
+            Some(last) if !page.exhausted => resume = Some(last.key.clone()),
+            _ => break,
+        }
+    }
+    rows.sort_unstable_by_key(|(command, record)| (record.position, *command));
+    Ok(rows)
+}
+
 /// Every executed identity without a dependency row among `records`,
 /// read from `executed_v1` itself (task-d05), in execution order.
 ///

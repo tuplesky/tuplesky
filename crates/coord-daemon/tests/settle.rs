@@ -6,7 +6,7 @@
 //! never settle here does not keep the ones behind it from being looked
 //! at, however many turns it stays pending.
 
-use coord_collector::SettleError;
+use coord_collector::{Differs, Mismatch, MismatchCheck, Said, SettleError};
 use coord_daemon::settle::{Settled, offer, window};
 use coord_storage::codecs::RetryRecordV1;
 use coord_types::CommandId;
@@ -106,14 +106,42 @@ fn a_turn_without_a_mismatch_sends_what_settled() {
 /// and nothing after it is offered (task-d06).
 #[test]
 fn a_mismatch_ends_the_turn_and_sends_nothing() {
+    let (command, own) = record(2);
+    let mismatch = Mismatch {
+        command,
+        check: MismatchCheck::HeldReleaseAgainstRecord,
+        release: Said {
+            position: ExecutionPosition::new(3).unwrap(),
+            ..said(&own)
+        },
+        own: said(&own),
+        differs: Differs {
+            position: true,
+            ..Differs::default()
+        },
+    };
     let mut offered = Vec::new();
     let turn = offer((1..=3).map(record), |c, _| {
         offered.push(c.as_bytes()[0]);
         match c.as_bytes()[0] {
-            2 => Err(SettleError::Mismatch),
+            2 => Err(SettleError::Mismatch(Box::new(mismatch.clone()))),
             n => Ok(Some(n)),
         }
     });
-    assert_eq!(turn, Settled::Diverged(record(2).0));
+    assert_eq!(
+        turn,
+        Settled::Diverged(Box::new(mismatch)),
+        "what was compared is carried out whole (task-d17)"
+    );
     assert_eq!(offered, vec![1, 2]);
+}
+
+fn said(record: &RetryRecordV1) -> Said {
+    Said {
+        release: None,
+        position: record.position,
+        revision: record.revision,
+        result_digest: record.result_digest,
+        response_len: record.response.len(),
+    }
 }

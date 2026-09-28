@@ -47,9 +47,10 @@ pub mod wire;
 pub use admission::{Admission, AdmissionLimits, AdmissionRefusal, Caller};
 pub use clock::MonotonicMillis;
 pub use collector::{
-    Collector, CollectorConfig, EvidenceError, Expired, FanOut, HoldReason, OFFER_CEILING_MILLIS,
-    OfferOutcome, Offered, Progress, Release, Resolution, SUBMIT_ENVELOPE_ALLOWANCE, SettleError,
-    SubmitRefusal, Submitted, undelivered_budget,
+    Collector, CollectorConfig, Differs, EvidenceError, Expired, FanOut, HoldReason, Mismatch,
+    MismatchCheck, OFFER_CEILING_MILLIS, OfferOutcome, Offered, Progress, Release, ReleaseOrigin,
+    Resolution, SUBMIT_ENVELOPE_ALLOWANCE, Said, SettleError, SubmitRefusal, Submitted,
+    undelivered_budget,
 };
 pub use dispatch::{Action, Delivery, Dispatcher};
 pub use ingress::{IngressError, admitted_from_submit, frontend_frame};
