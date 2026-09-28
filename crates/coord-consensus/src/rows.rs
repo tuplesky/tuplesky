@@ -464,6 +464,39 @@ pub fn decode_sync(bytes: &[u8]) -> Result<SyncRecordV1, EngineError> {
     }
 }
 
+/// The update binding `decision`, if its Sync fits both the row it is
+/// written in and the frame it is published in (task-d20); otherwise the
+/// named refusal, with its size.
+///
+/// A Sync is written as one row by the candidate and by every voter that
+/// installs it, and a write that did not fit ended the process in the
+/// middle of an election.
+pub fn bounded_sync_update(
+    epoch: ConfigurationEpoch,
+    decision: &crate::recovery::SyncDecision,
+) -> Result<StoreUpdate, crate::recovery::RecoveryError> {
+    let frame_limit = coord_types::wire_v1::KindRange::ProtocolEvidence.max_frame_length() as usize;
+    let limit = coord_store_api::envelope::MAX_ENVELOPE_PAYLOAD.min(frame_limit);
+    let too_large = |bytes: usize| crate::recovery::RecoveryError::SyncTooLarge {
+        entries: decision.entries.len(),
+        bytes,
+        limit,
+    };
+    let frame = crate::messages::ProtocolMessage::Sync(decision.clone())
+        .encode()
+        .len();
+    if frame > frame_limit {
+        return Err(too_large(frame));
+    }
+    sync_update(
+        epoch,
+        &SyncRecordV1 {
+            decision: decision.clone(),
+        },
+    )
+    .map_err(|_| too_large(frame))
+}
+
 /// The update persisting a bound Sync selection.
 pub fn sync_update(
     epoch: ConfigurationEpoch,

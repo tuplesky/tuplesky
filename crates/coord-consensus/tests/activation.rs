@@ -2316,13 +2316,13 @@ fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
     deliver(&mut c, &report(r(4), vec![dead.clone()]));
     deliver(&mut c, &report(r(1), vec![]));
     assert_eq!(
-        c.try_select(|_, _| false),
+        c.try_select(usize::MAX, |_, _| false),
         Ok(None),
         "no majority without r4 yet: wait for the others rather than fail"
     );
     deliver(&mut c, &report(r(2), vec![]));
     let decision = c
-        .try_select(|_, _| false)
+        .try_select(usize::MAX, |_, _| false)
         .expect("selected without r4's report")
         .expect("a majority without r4");
     assert!(
@@ -2337,10 +2337,10 @@ fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
     for i in 1..4 {
         deliver(&mut own, &report(r(i), vec![]));
     }
-    assert_eq!(own.try_select(|_, _| false), Ok(None));
+    assert_eq!(own.try_select(usize::MAX, |_, _| false), Ok(None));
     deliver(&mut own, &report(r(4), vec![]));
     assert!(matches!(
-        own.try_select(|_, _| false),
+        own.try_select(usize::MAX, |_, _| false),
         Err(RecoveryError::HalfInitialized { replica, command })
             if replica == r(0) && command == x
     ));
@@ -2385,12 +2385,12 @@ fn a_campaign_supplies_what_its_candidate_executed() {
         c.page(page).unwrap();
     }
     assert_eq!(
-        c.try_select(|_, _| false),
+        c.try_select(usize::MAX, |_, _| false),
         Ok(None),
         "nobody supplies x and no majority remains without r2: wait"
     );
     let decision = c
-        .try_select(|command, _| *command == x)
+        .try_select(usize::MAX, |command, _| *command == x)
         .expect("the candidate supplies x")
         .expect("selected");
     assert_eq!(decision.entries[&x].deps, vec![d]);
@@ -4386,4 +4386,175 @@ fn a_follower_restarting_from_a_cyclic_sync_row_stays_halted() {
     assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
     assert!(f.halted().is_some());
     assert!(f.table().phase_of(&a).is_none() && f.table().phase_of(&b).is_none());
+}
+
+/// task-d20: a report carrying more than the bound is set aside while a
+/// majority remains without it, and named when the campaign cannot go on:
+/// the candidate's own, or every voter reported and too few fit.
+#[test]
+fn a_campaign_sets_aside_a_report_past_its_bound_and_names_it() {
+    let config = quorum(ballot(1, 0));
+    let cmd = |n: u8| CommandId(Digest32([n; 32]));
+    let report = |replica, entries: Vec<coord_consensus::ReportEntry>| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries,
+    };
+    let entries = |from: u8, n: u8| {
+        (from..from + n)
+            .map(|c| accepted_entry(cmd(c), &[]))
+            .collect::<Vec<_>>()
+    };
+    let deliver = |c: &mut coord_consensus::Campaign, rep: &RecoveryReport| {
+        c.promise(rep.replica);
+        for page in coord_consensus::paginate(rep, 64) {
+            c.page(page).unwrap();
+        }
+    };
+    let limit = 3;
+
+    // r1's report is past the bound; r0 and r2 are a majority without it.
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(0), entries(0x10, 2)));
+    deliver(&mut c, &report(r(1), entries(0x20, limit as u8 + 1)));
+    assert_eq!(c.try_select(limit, |_, _| true), Ok(None));
+    deliver(&mut c, &report(r(2), entries(0x30, limit as u8)));
+    let decision = c
+        .try_select(limit, |_, _| true)
+        .expect("selected without r1's report")
+        .expect("a majority without it");
+    assert_eq!(decision.entries.len(), 2 + limit);
+    assert!(!decision.entries.contains_key(&cmd(0x20)));
+
+    // The candidate's own report is never set aside.
+    let mut own = coord_consensus::Campaign::new(config.clone());
+    own.own_report(report(r(0), entries(0x10, limit as u8 + 1)));
+    deliver(&mut own, &report(r(1), vec![]));
+    assert_eq!(
+        own.try_select(limit, |_, _| true),
+        Err(RecoveryError::ReportTooLarge {
+            replica: r(0),
+            entries: limit + 1,
+            limit,
+        })
+    );
+
+    // Every voter reported, and only the candidate's fits.
+    let mut all = coord_consensus::Campaign::new(config.clone());
+    all.own_report(report(r(0), vec![]));
+    deliver(&mut all, &report(r(1), entries(0x20, limit as u8 + 1)));
+    deliver(&mut all, &report(r(2), entries(0x30, limit as u8 + 2)));
+    assert_eq!(
+        all.try_select(limit, |_, _| true),
+        Err(RecoveryError::ReportTooLarge {
+            replica: r(1),
+            entries: limit + 1,
+            limit,
+        })
+    );
+}
+
+/// task-d20: a voter behind through three failed ballots reports no more
+/// than one ballot's worth. Each Sync's entries wait for payloads that
+/// never come; the earlier ones used to stay pending beside the later, and
+/// every report carried all of them.
+#[test]
+fn a_voter_behind_across_failed_ballots_reports_one_ballots_worth() {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let mut last = Vec::new();
+    for k in 1..=3u64 {
+        let b = ballot(k, 2);
+        let effects = f.step(peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ));
+        for e in durable_events(&effects) {
+            f.step(e);
+        }
+        assert_eq!(f.ballots().promised(), b);
+        last = (0..3u8)
+            .map(|i| CommandId(Digest32([0x40 + 0x10 * k as u8 + i; 32])))
+            .collect();
+        let decision = SyncDecision {
+            ballot: b,
+            source_ballot: ballot(0, 0),
+            entries: last.iter().map(|c| (*c, selected(*c, &[]))).collect(),
+            reproposed: BTreeSet::new(),
+        };
+        let effects = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+        for e in durable_events(&effects) {
+            f.step(e);
+        }
+        assert_eq!(f.ballots().synced(), b);
+    }
+    let report = f.report(ballot(4, 0));
+    let reported: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+    assert_eq!(reported, last.iter().copied().collect(), "{report:?}");
+}
+
+/// task-d20: a follower sent a Sync that does not fit its row refuses it
+/// by name before marking anything, rather than ending the process at the
+/// write.
+#[test]
+fn a_follower_sent_a_sync_past_its_row_refuses_it_by_name() {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let b = ballot(1, 2);
+    let effects = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    let id = |n: u32| {
+        let mut d = [0xeeu8; 32];
+        d[..4].copy_from_slice(&n.to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let decision = SyncDecision {
+        ballot: b,
+        source_ballot: ballot(0, 0),
+        entries: (0..16_000u32)
+            .map(|n| {
+                let mut e = selected(id(n), &[id(n + 20_000)]);
+                e.admission = Some(Digest32([0xee; 32]));
+                (id(n), e)
+            })
+            .collect(),
+        reproposed: BTreeSet::new(),
+    };
+    let effects = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "a Sync past its row was written"
+    );
+    assert_eq!(f.ballots().synced(), ballot(0, 0));
+    assert!(
+        f.take_rejections().iter().any(|x| matches!(
+            x,
+            FollowerRejection::SyncTooLarge { ballot: sb, bytes, limit } if *sb == b && bytes > limit
+        )),
+        "the refusal is named"
+    );
 }

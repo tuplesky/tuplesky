@@ -956,25 +956,90 @@ fn the_command_table_capacity_is_configuration_within_bounds() {
 }
 
 /// The largest configured table still gives a Sync that can be written
-/// as one row and sent as one frame (task-d05).
+/// as one row and sent as one frame (task-d05, measured again in
+/// task-d20).
 ///
-/// A report names what its voter has not executed and what it executed
-/// recently -- at most its live records and its tombstones, about twice
-/// the capacity -- and a Sync is selected from a majority of reports. A
-/// capacity whose worst case did not fit would fail at the moment an
-/// election binds its selection, which is the worst moment to find out.
+/// A campaign selects over every complete report it holds, up to five,
+/// and a report carries at most `max_report_entries` of its table's
+/// capacity: its live records and its retirement window. The worst case
+/// is five such reports with nothing in common, every entry with the
+/// admission digest it has carried since task-d14, one dependency and the
+/// largest sequence number; `select` makes the Sync, and the row it is
+/// bound in takes it. A capacity whose worst case did not fit would fail
+/// at the moment an election binds its selection, which is the worst
+/// moment to find out; past it, the campaign is refused by name
+/// (`a_sync_past_its_row_refuses_the_campaign_by_name`).
 #[test]
 fn the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame() {
-    use coord_consensus::rows::{SyncRecordV1, sync_update};
-    use coord_consensus::{Phase, ProtocolMessage, SyncDecision, SyncEntry};
+    use coord_consensus::{
+        BallotConfiguration, Phase, RecoveryReport, ReportEntry, bounded_sync_update,
+        max_report_entries, select,
+    };
     use coord_daemon::config::MAX_COMMAND_TABLE_CAPACITY;
     use coord_types::CommandId;
     use coord_types::identity::Digest32;
     use coord_types::ids::{Ballot, ConfigurationEpoch, ReplicaId};
-    use coord_types::wire_v1::KindRange;
 
-    // Five voters: a majority of three reports, disjoint in the worst case.
-    let worst = 3 * (2 * MAX_COMMAND_TABLE_CAPACITY + 1);
+    let per_report = max_report_entries(MAX_COMMAND_TABLE_CAPACITY);
+    let id = |n: usize| {
+        let mut d = [0xffu8; 32];
+        d[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let epoch = ConfigurationEpoch::new(u64::MAX).unwrap();
+    let voters: Vec<ReplicaId> = (0..5u8).map(|i| ReplicaId([0xf0 + i; 16])).collect();
+    let new = Ballot {
+        epoch,
+        number: u64::MAX,
+        leader: voters[0],
+    };
+    let source = Ballot {
+        epoch,
+        number: u64::MAX - 1,
+        leader: voters[1],
+    };
+    let config =
+        BallotConfiguration::c2_default(epoch, new, voters.iter().copied().collect()).unwrap();
+    let reports: Vec<RecoveryReport> = voters
+        .iter()
+        .enumerate()
+        .map(|(v, replica)| RecoveryReport {
+            replica: *replica,
+            ballot: new,
+            committed_ballot: source,
+            entries: (0..per_report)
+                .map(|n| {
+                    let n = v * per_report + n;
+                    ReportEntry {
+                        command: id(n),
+                        phase: Phase::Commit,
+                        deps: vec![id(n + 5 * per_report)],
+                        path: Digest32([0xff; 32]),
+                        paths: vec![(b"*".to_vec(), Digest32([0xff; 32]))],
+                        seqnum: u64::MAX,
+                        keys: vec![b"*".to_vec()],
+                        payload_present: true,
+                        admission: Some(Digest32([0xff; 32])),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    let decision = select(&config, &reports).unwrap();
+    assert_eq!(decision.entries.len(), 5 * per_report);
+    bounded_sync_update(epoch, &decision).expect("a worst-case Sync fits one row and one frame");
+}
+
+/// task-d20: a selection whose Sync does not fit its row is refused with
+/// its size, not written: the write used to end the process in the middle
+/// of an election.
+#[test]
+fn a_sync_past_its_row_refuses_the_campaign_by_name() {
+    use coord_consensus::{Phase, RecoveryError, SyncDecision, SyncEntry, bounded_sync_update};
+    use coord_types::CommandId;
+    use coord_types::identity::Digest32;
+    use coord_types::ids::{Ballot, ConfigurationEpoch, ReplicaId};
+
     let id = |n: usize| {
         let mut d = [0xffu8; 32];
         d[..8].copy_from_slice(&(n as u64).to_be_bytes());
@@ -985,33 +1050,37 @@ fn the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame() {
         number: u64::MAX,
         leader: ReplicaId([0xff; 16]),
     };
-    let entries = (0..worst)
-        .map(|n| {
-            (
-                id(n),
-                SyncEntry {
-                    command: id(n),
-                    phase: Phase::Commit,
-                    deps: vec![id(n + worst)],
-                    path: Digest32([0xff; 32]),
-                    paths: vec![(b"*".to_vec(), Digest32([0xff; 32]))],
-                    seqnum: u64::MAX,
-                    admission: None,
-                },
-            )
-        })
-        .collect();
+    let entries = 12_000;
     let decision = SyncDecision {
         ballot,
         source_ballot: ballot,
-        entries,
+        entries: (0..entries)
+            .map(|n| {
+                (
+                    id(n),
+                    SyncEntry {
+                        command: id(n),
+                        phase: Phase::Commit,
+                        deps: vec![id(n + entries)],
+                        path: Digest32([0xff; 32]),
+                        paths: vec![(b"*".to_vec(), Digest32([0xff; 32]))],
+                        seqnum: u64::MAX,
+                        admission: Some(Digest32([0xff; 32])),
+                    },
+                )
+            })
+            .collect(),
         reproposed: Default::default(),
     };
-    let frame = ProtocolMessage::Sync(decision.clone()).encode();
-    assert!(
-        frame.len() <= KindRange::ProtocolEvidence.max_frame_length() as usize,
-        "a worst-case Sync is {} bytes",
-        frame.len()
-    );
-    sync_update(ballot.epoch, &SyncRecordV1 { decision }).expect("a worst-case Sync fits one row");
+    match bounded_sync_update(ballot.epoch, &decision) {
+        Err(RecoveryError::SyncTooLarge {
+            entries: n,
+            bytes,
+            limit,
+        }) => {
+            assert_eq!(n, entries);
+            assert!(bytes > limit, "{bytes} <= {limit}");
+        }
+        other => panic!("{other:?}"),
+    }
 }

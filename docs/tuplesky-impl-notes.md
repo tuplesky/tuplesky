@@ -3967,9 +3967,9 @@ hold them anyway. With 387 commands executed, a restarted voter's
 campaign counted 330 missing payloads and never bound.
 
 `limits.command_table_capacity` now sets it.
-- The default is 1024.
-- The accepted range is 32 to 1536. A value outside it is refused at
-  start, naming the setting.
+- The default is 1024 (1000 since task-d20, below).
+- The accepted range is 32 to 1536 (1000 since task-d20). A value
+  outside it is refused at start, naming the setting.
 - The maximum comes from the Sync, not from memory. A report names up to
   about twice the table: its live records and its tombstones. A Sync is
   selected from a majority of reports, and it is written as one row
@@ -6115,3 +6115,91 @@ Seeds that once failed are kept in
   stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
   seeds, not at every seed.
 - Budgets and progress after healing are task-d33's oracles.
+
+## Bounded reports and Syncs
+
+task-d20, from the checklist review (item R2).
+
+`MAX_COMMAND_TABLE_CAPACITY` (1536) rested on one test that sized a Sync
+from three disjoint reports whose entries carried no admission digest.
+Four things made the real worst case larger:
+- A campaign selects over every complete report it holds, up to five,
+  not over a majority.
+- Entries carry an admission digest since task-d14.
+- Nothing bounded what a report carried.
+- `sync_pending` was never cleared between Syncs, so a voter behind
+  across failed ballots reported every earlier selection beside the
+  later one, and each Sync selected from its report grew with them.
+
+The candidate bound the Sync with `sync_update(..).expect("bounded")`,
+and every installer wrote it the same way, so a Sync over the row limit
+ended the process in the middle of an election.
+
+### What changed
+
+- **One selection pending.** A Sync whose row is durable replaces what
+  earlier Syncs left pending (`replace_sync_pending`), activated or
+  superseded. Its selection is the synchronized ballot's, and it
+  supersedes the earlier ones: a decision of an earlier ballot was
+  accepted by a majority, which the later selection's reports
+  intersect, so it is among the later entries. An earlier entry the
+  later selection leaves out was never decided, and its acceptance was
+  demoted with the later marker (task-d11). What an entry left out
+  costs a voter that far behind is catch-up (task-d08), not recovery.
+- **A bound on reports.** `max_report_entries(capacity)` is twice the
+  capacity: the live records and the retirement window. A campaign sets
+  aside a report past it while a majority remains without it, as it
+  sets aside a half-initialized one (task-d12), since any majority of
+  promises is a sound basis for the selection. It never sets aside its
+  own. It fails as `RecoveryError::ReportTooLarge`, naming the reporter,
+  when its own report is past the bound, or when every voter reported
+  and too few fit. A voter that holds more than the bound is far behind,
+  with a large selection still to install. Setting its report aside
+  costs liveness only when a majority is that far behind, which is
+  task-d32's case.
+- **A measured capacity limit.** A worst-case entry has its admission
+  digest, one dependency, the conservative key's path and the largest
+  sequence number. It encodes in 208 bytes (240 with two dependencies),
+  and the row, the stricter of the row and the frame, takes 10,180 of
+  them. Five disjoint reports of `2 x capacity` entries fit at a
+  capacity of 1018 at most. `MAX_COMMAND_TABLE_CAPACITY` is now 1000,
+  and the default, which may not exceed it, is 1000 instead of 1024.
+- **A named refusal.** `bounded_sync_update` checks the Sync against its
+  frame and its row before anything is written.
+  - The candidate refuses the campaign as `RecoveryError::SyncTooLarge`
+    with the entry count, the size and the limit. This is what a
+    selection past the measured worst case meets, for instance one
+    whose entries carry more dependencies.
+  - A follower sent such a Sync refuses it as
+    `FollowerRejection::SyncTooLarge` before marking anything. A
+    candidate of this build never binds one.
+
+Nothing changes in what is selected, or in the Sync format.
+
+### Evidence
+
+- `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`
+  (`coord-daemon`, `compose`):
+  - Five disjoint reports of `max_report_entries(1000)` worst-case
+    entries go through `select`, which gives 10,000 entries.
+  - `bounded_sync_update` takes the result.
+  - At the old maximum it would be 15,360 entries, and at the old
+    default 10,240. Neither fits.
+- `a_sync_past_its_row_refuses_the_campaign_by_name` (`compose`): a
+  12,000-entry selection is `SyncTooLarge`, with its size over its
+  limit, and nothing panics.
+- `a_campaign_sets_aside_a_report_past_its_bound_and_names_it`
+  (`activation`) covers three cases:
+  - a report one entry past the bound is set aside, and the selection
+    is made from the majority without it;
+  - the candidate's own oversize report fails as `ReportTooLarge`;
+  - with every voter reported and too few fitting, the campaign fails
+    naming the first oversize reporter.
+- `a_voter_behind_across_failed_ballots_reports_one_ballots_worth`
+  (`activation`): three promised ballots whose Syncs' entries never get
+  their payloads. The report names only the third Sync's entries. It
+  fails without `replace_sync_pending`, when the report names all nine.
+- `a_follower_sent_a_sync_past_its_row_refuses_it_by_name`
+  (`activation`): a 16,000-entry Sync is refused, named, with nothing
+  written and the synchronized ballot unchanged. Before this change the
+  write panicked.

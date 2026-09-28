@@ -186,6 +186,43 @@ pub enum RecoveryError {
         /// The other's.
         second: Digest32,
     },
+    /// A report carrying more entries than [`max_report_entries`] allows
+    /// (task-d20). Another voter's is set aside while a majority remains
+    /// without it; this is the campaign's failure when it is the
+    /// candidate's own, or when every voter reported and too few fit.
+    ReportTooLarge {
+        /// Reporter.
+        replica: ReplicaId,
+        /// Entries it carried.
+        entries: usize,
+        /// The most a report may carry.
+        limit: usize,
+    },
+    /// A selection whose Sync does not fit the row it is bound in or the
+    /// frame it is published in (task-d20): the campaign is refused
+    /// rather than the process ended mid-election.
+    SyncTooLarge {
+        /// Entries selected.
+        entries: usize,
+        /// Encoded size of the Sync.
+        bytes: usize,
+        /// The smaller of the row and frame limits.
+        limit: usize,
+    },
+}
+
+/// The most entries a recovery report may carry from a replica whose
+/// command table holds `capacity` records (task-d20): its live records
+/// and its retirement window, each at most the capacity.
+///
+/// A campaign selects over up to five reports, and the Sync it binds is
+/// one row: the largest capacity a voter may be configured with is the one
+/// at which five disjoint reports of this size fit that row
+/// (`coord_daemon::config::MAX_COMMAND_TABLE_CAPACITY`). A voter that
+/// holds more -- far behind, with a large selection still to install --
+/// reports it all; its report is set aside rather than selected over.
+pub const fn max_report_entries(capacity: usize) -> usize {
+    capacity.saturating_mul(2)
 }
 
 /// The order a new leader re-proposes a selection's entries in: each

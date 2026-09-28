@@ -66,18 +66,25 @@ const fn default_checkpoint_after() -> u64 {
     4096
 }
 
-/// The command table capacity a configuration that names none gets.
-pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = 1024;
+/// The command table capacity a configuration that names none gets: the
+/// largest (task-d20).
+pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = MAX_COMMAND_TABLE_CAPACITY;
 /// The smallest command table capacity a voter is configured with. A
 /// table must hold a proposal's worth of in-flight commands and still
 /// reclaim, and the follower's held-proposal bound is a multiple of it.
 pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
-/// The largest. A Sync is selected from a majority of reports, and each
-/// report names up to about twice the table (its live records and its
-/// tombstones), so the table bounds the Sync -- which is written as one
-/// row and sent as one frame. At this capacity a worst-case Sync for five
-/// voters is about 1.6 MiB, inside the row's 2 MiB.
-pub const MAX_COMMAND_TABLE_CAPACITY: usize = 1536;
+/// The largest. A Sync is selected from up to five reports, and a report
+/// carries at most twice the table (its live records and its retirement
+/// window, `coord_consensus::max_report_entries`; a larger one is set
+/// aside), so the table bounds the Sync -- which is written as one row
+/// and sent as one frame. A worst-case entry, with its admission digest,
+/// one dependency and the largest sequence number, is 208 bytes, and the
+/// row takes 10,180 of them; five disjoint reports at this capacity are
+/// 10,000 (task-d20, measured by
+/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`). A
+/// selection with more dependencies per entry that still does not fit is
+/// refused by name, not written.
+pub const MAX_COMMAND_TABLE_CAPACITY: usize = 1000;
 
 const fn default_command_table_capacity() -> usize {
     DEFAULT_COMMAND_TABLE_CAPACITY
