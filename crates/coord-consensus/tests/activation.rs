@@ -3976,3 +3976,104 @@ fn a_leader_handed_a_cyclic_selection_proposes_nothing() {
     assert_eq!(leader.recovery_cycle(), Some(&cycle[..]));
     assert!(!leader.is_leading());
 }
+
+/// A selection with a dependency cycle, as another build could bind it.
+fn cyclic_selection(a: CommandId, b: CommandId) -> SyncDecision {
+    let entry = |c: CommandId, dep: CommandId| coord_consensus::SyncEntry {
+        command: c,
+        phase: Phase::Accept,
+        deps: vec![dep],
+        path: Digest32([0; 32]),
+        paths: vec![],
+        seqnum: 1,
+        admission: None,
+    };
+    SyncDecision {
+        ballot: ballot(1, 1),
+        source_ballot: ballot(0, 0),
+        entries: [(a, entry(a, b)), (b, entry(b, a))].into_iter().collect(),
+        reproposed: BTreeSet::new(),
+    }
+}
+
+/// Codex review of task-d21: a Sync whose selection holds a cycle, bound
+/// by a leader of another build, reaches a follower of this one. It halts
+/// naming the commands, before any of the selection is made durable or
+/// installed, and stays at its old synchronized ballot.
+#[test]
+fn a_follower_sent_a_cyclic_sync_halts_before_installing_any_of_it() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut cycle = vec![a, b];
+    cycle.sort();
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(2),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(2));
+    let effects = f.step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 1),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    for event in durable_events(&effects) {
+        f.step(event);
+    }
+    assert_eq!(f.ballots().promised(), ballot(1, 1));
+    let effects = f.step(peer_event(
+        r(1),
+        ProtocolMessage::Sync(cyclic_selection(a, b)),
+    ));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "{effects:?}"
+    );
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some());
+    assert_eq!(f.ballots().synced(), ballot(0, 0));
+    assert!(
+        f.take_rejections().iter().any(
+            |x| matches!(x, FollowerRejection::RecoveryCycle { commands } if *commands == cycle)
+        )
+    );
+}
+
+/// The same selection read back from a Sync row at a restart: nothing of
+/// it is queued for installation, and the replica is halted.
+#[test]
+fn a_follower_restarting_from_a_cyclic_sync_row_stays_halted() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut cycle = [a, b];
+    cycle.sort();
+    let f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(2),
+            genesis: ballot(0, 0),
+            quorum: quorum(ballot(1, 1)),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: ballot(1, 1),
+            synced: ballot(1, 1),
+        }),
+        None,
+        Vec::new(),
+        Vec::new(),
+        [(ballot(1, 1), cyclic_selection(a, b))],
+        coord_types::ids::ExecutionPosition::ZERO,
+    );
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some());
+    assert!(f.table().phase_of(&a).is_none() && f.table().phase_of(&b).is_none());
+}
