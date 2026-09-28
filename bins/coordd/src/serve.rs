@@ -2805,10 +2805,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// barrier.
     fn answer(&mut self, delivery: coord_collector::Delivery) {
         // A late release has contradicted an answer this node gave from
-        // its own record (task-d12), and the pass ends in the stop. Until
-        // it does, nothing more goes out: not the rest of the voter's
-        // batch, and not what the parked frames or the records settle.
-        if self.answered_otherwise.is_some() {
+        // its own record (task-d12), or this voter holds two decisions of
+        // one command (task-d14), and the pass ends in the stop. Until it
+        // does, nothing more goes out: not the rest of the voter's batch,
+        // and not what the parked frames or the records settle.
+        if self.answered_otherwise.is_some() || self.admission_halt.is_some() {
             return;
         }
         let policy = StorePolicySource {
