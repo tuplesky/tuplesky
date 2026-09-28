@@ -1076,6 +1076,17 @@ its followers had committed among themselves.
   `IncompatibleAccepted`, `AdmissionConflict` or `IncompatibleAdmission`.
   Each run's `ProposalRepublished` count stayed between 7 and 25, where
   rep108-3's leader republished until its table filled.
+* **Jepsen**
+  ([run 36365926073](https://github.com/tuplesky/tuplesky/actions/runs/36365926073),
+  head `9c23cc6`): `:valid? true`, with 1678 `ok` of 2164, and every node
+  served its final reads. Every kill was followed by a start within 52 s,
+  and the run ended with all five nodes killed at 286 s and started at
+  296 s. No voter logged a stop, `HalfInitialized`, `IncompatibleAccepted`
+  or `CandidateBehind`. The leader, `n5` (ballot 5), republished one
+  command (`64618041…`) 8 times, and those are the last lines of its log,
+  so it was still republishing it after the final start. rep108-3's leader
+  republished until its table filled; here every node served its final
+  reads through it.
 * **The etcd baseline** on the same run hung on a `:pause :all` (above).
   It runs no TupleSky code.
 
