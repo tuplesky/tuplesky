@@ -6017,3 +6017,77 @@ not here:
   (rows 1 to 4 and 10, three and five voters), 14 of 1,000 runs still
   fail. Traces sampled show this case and further stale-acceptance
   cases.
+
+## The real replica machines under a protocol oracle
+
+task-d30. `coord-sim` ran only reference actors, and the multi-node tests
+that run `Leader` and `Follower` drop messages by hand for a few seeds.
+`crates/coord-consensus/tests/protocol_sim.rs` runs the real machines at
+three and five voters, table capacity 32, under one seeded schedule
+(`coord_sim::rng::NamedStreams`), and checks a protocol oracle after
+every step.
+
+### The simulator
+
+- **Machines as `coordd` runs them:**
+  - full learning;
+  - the role changes a won campaign or a deposition asks for
+    (`Node::change_role`);
+  - restarts rebuilt from durable rows only, at the synchronized ballot,
+    as `main.rs` builds them;
+  - the leader's re-send and the follower's payload asks on a timer.
+- **The network:**
+  - Delivers in any order, loses and duplicates, and holds some frames
+    back until a later campaign (old-ballot messages).
+  - Each frame is its own stream of a connection, so a crash ends what
+    was in flight to or from the crashed node.
+- **Storage:**
+  - Each node's journal completes its batches in submission order at
+    times of the schedule's choosing. A crash loses what is not durable.
+  - An execution first flushes the journal, since `coordd` applies
+    through the same single-writer journal and waits for its batch.
+- **Scenarios:** the checklist's failure-test matrix rows 1 (fill
+  capacity, fail the leader), 2 (different tentative sets), 3 (dense
+  conflicts, early missing dependency), 4 (acknowledgement before
+  payload, repeated) and 10 (delayed old-ballot messages), as knob
+  presets. Each is run for 12 seeds at each size by default;
+  `PROTOCOL_SIM_SEEDS` raises that.
+- **Replay:** `PROTOCOL_SIM_ONE=row,voters,seed` with
+  `PROTOCOL_SIM_TRACE=1` replays one seed and prints its trace:
+  deliveries, completions, executions, campaigns, the reports a winning
+  campaign selected from, and what the frontend learned.
+
+### The oracle
+
+1. **One order.** Every replica executes a prefix of one sequence.
+2. **Promises never lowered.** A node's durable promise row never
+   decreases and is never below a ballot it published `Promise` for.
+3. **One dependency set per command.** The set a shadow collector learned
+   it with (`VoteSet::learned` over what reached the frontend) equals the
+   set each replica executed it with.
+4. **No halt.** No replica stops on two decisions, a recovery cycle or
+   `IncompatibleAccepted`.
+
+Seeds that once failed are kept in
+`fixtures/protocol_sim/seeds.json` and replayed on every run.
+
+### Evidence
+
+- **At the default seeds** (12 per row and size, 120 runs), every row
+  passes with task-d34, and the kept seeds pass.
+- **With task-d18 reverted** (40 seeds per row and size, 400 runs): 85
+  runs fail the promise check, against none in the baseline.
+- **With task-d19 reverted** (same seeds): 28 runs fail, 5 of them at
+  five voters. The baseline has 6 failures, 2 at five voters.
+- **Before task-d34:** the simulator found its six defects, each kept as
+  a seed.
+
+### What is left
+
+- At 100 seeds per row and size, 14 of 1,000 runs still fail. The
+  sampled traces show the design question recorded under task-d34 (a
+  fast decision whose only reporting fast-set member recorded the
+  leader's path for commands it had not adopted) and further
+  stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
+  seeds, not at every seed.
+- Budgets and progress after healing are task-d33's oracles.
