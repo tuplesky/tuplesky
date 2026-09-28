@@ -186,8 +186,12 @@ jobs:
         # A voter that stops on a command, a release contradicting its own
         # execution or two decisions of one command, names it by an id
         # prefix. Each voter's store comes with its log (jepsen.tuplesky.db's
-        # log-files), and the rows around that command on every voter show
-        # where their orders split, from the job log alone.
+        # log-files kills coordd first, so it is a crash image), and the
+        # rows around that command on every voter show where their orders
+        # split, or where one command's results differ, from the job log
+        # alone. Each store is dumped from a scratch copy: opening a crash
+        # image lets redb repair it, and the packed store keeps the bytes as
+        # fetched.
         run: |
           shopt -s nullglob
           store=jepsen/tuplesky/store/latest
@@ -195,14 +199,31 @@ jobs:
             | grep -oE 'this node stopped: [a-z-]+\([0-9a-f]+\)' \
             | sed -E 's/.*\(([0-9a-f]+)\)/\1/' | sort -u)
           for prefix in $prefixes; do
-            echo "::group::Every voter's execution order around $prefix (position revision command)"
+            echo "::group::Every voter's execution order around $prefix (position revision digest command)"
             for db in "$store"/n*/domain.redb; do
-              echo "--- $(basename "$(dirname "$db")")"
+              node=$(basename "$(dirname "$db")")
+              echo "--- $node"
+              cp "$db" "$RUNNER_TEMP/$node.redb"
               "$GITHUB_WORKSPACE/tuplesky/target/release/coord-jepsen-executed" \
-                "$db" --around "$prefix" --span 8 || true
+                "$RUNNER_TEMP/$node.redb" --around "$prefix" --span 8 || true
             done
             echo "::endgroup::"
           done
+      - name: Fail on a divergence stop
+        if: always()
+        # A voter that stops because the domain's commands diverged is a
+        # safety tripwire firing, whatever Elle concludes about the history
+        # the clients saw: the job fails, so it is not left for someone to
+        # notice in the digest.
+        run: |
+          shopt -s nullglob
+          stops=$(grep -HE 'this node stopped: (release-record-mismatch|incompatible-admission)\(' \
+            jepsen/tuplesky/store/latest/n*/coordd.log || true)
+          if [ -n "$stops" ]; then
+            echo "$stops" | cut -c1-300
+            echo "::error::A voter stopped on a divergence (above); the execution order around it is in the step before."
+            exit 1
+          fi
       - name: Pack the Jepsen store
         if: always()
         # Jepsen names each run's directory by its start time, and

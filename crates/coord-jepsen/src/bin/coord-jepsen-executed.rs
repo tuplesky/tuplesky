@@ -2,15 +2,18 @@
 //! log.
 //!
 //! Prints a store's `executed_v1` rows in position order, one line each:
-//! `position revision command`. With `--around PREFIX`, only the rows
-//! within `--span` positions of each command whose id starts with that hex
+//! `position revision digest command`, the digest being the result
+//! digest's first 4 bytes. With `--around PREFIX`, only the rows within
+//! `--span` positions of each command whose id starts with that hex
 //! prefix, the match marked `*`. A voter that stops on a release that
 //! contradicts its own execution names the command by such a prefix, and
-//! the rows around it on every voter show where their orders split.
+//! the rows around it on every voter show where their orders split, or,
+//! when the orders agree, where one command's results differ.
 //!
-//! It opens the store read-only and changes nothing. The file may be a
-//! copy taken while `coordd` ran: `redb` commits are atomic, so a copy
-//! opens at its last commit, and one that does not open says why.
+//! It writes nothing itself, but opening a store that was not closed (a
+//! killed voter's, a crash image) lets `redb` repair it in place, so give
+//! it a scratch copy when the file must keep its bytes. One that does not
+//! open says why.
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -23,7 +26,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 #[derive(Parser)]
 #[command(
     name = "coord-jepsen-executed",
-    about = "Print a voter store's executed_v1 rows in position order"
+    about = "Print a voter store's executed_v1 rows in position order, with result digests"
 )]
 struct Cli {
     /// The store: a voter's `domain.redb`.
@@ -38,11 +41,12 @@ struct Cli {
 
 const EXECUTED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("executed_v1");
 
-/// One executed command: its position, its revision (if it wrote) and its
-/// id, as hex.
+/// One executed command: its position, its revision (if it wrote), the
+/// first 4 bytes of its result digest and its id, both as hex.
 struct Row {
     position: u64,
     revision: Option<u64>,
+    digest: String,
     command: String,
 }
 
@@ -60,11 +64,16 @@ fn rows(store: &PathBuf) -> Result<Vec<Row>, String> {
         rows.push(Row {
             position: record.position.get(),
             revision: record.revision.map(|r| r.get()),
-            command: key.value().iter().map(|b| format!("{b:02x}")).collect(),
+            digest: hex(&record.result_digest.0[..4]),
+            command: hex(key.value()),
         });
     }
     rows.sort_by_key(|r| r.position);
     Ok(rows)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The rows to print: all of them, or those within `span` positions of a
@@ -108,7 +117,11 @@ fn main() -> ExitCode {
             .revision
             .map_or_else(|| "-".to_owned(), |r| r.to_string());
         let mark = if hit { " *" } else { "" };
-        if writeln!(out, "{} {} {}{mark}", row.position, revision, row.command).is_err() {
+        let line = format!(
+            "{} {} {} {}",
+            row.position, revision, row.digest, row.command
+        );
+        if writeln!(out, "{line}{mark}").is_err() {
             break;
         }
     }
@@ -123,6 +136,7 @@ mod tests {
         Row {
             position,
             revision: None,
+            digest: "00000000".to_owned(),
             command: command.to_owned(),
         }
     }
