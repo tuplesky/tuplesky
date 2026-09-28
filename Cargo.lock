@@ -1161,6 +1161,7 @@ dependencies = [
  "coord-store-testkit",
  "coord-sts",
  "coord-transport",
+ "coord-transport-testkit",
  "coord-types",
  "coord-wan-bench",
  "jsonwebtoken",

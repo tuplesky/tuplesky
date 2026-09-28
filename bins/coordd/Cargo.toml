@@ -75,3 +75,5 @@ coord-jepsen.workspace = true
 time.workspace = true
 axum.workspace = true
 coord-authn.workspace = true
+# A dial against real listeners of both planes (task-d16).
+coord-transport-testkit.workspace = true
