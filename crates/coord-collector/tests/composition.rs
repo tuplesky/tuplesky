@@ -1752,3 +1752,106 @@ fn the_default_bound_refuses_nothing_the_protocol_admits() {
     gate.admit(0, &caller(), &largest)
         .expect("the protocol's largest write");
 }
+
+/// task-d19: the collector releases a result only on the leader's proposal
+/// and adoptions, never on a fast acknowledgement counted as an adoption.
+///
+/// Five voters, fast set {r0, r1, r2}. r1's fast acknowledgement carries
+/// the leader's dependencies over another path, and r3 adopts. That used to
+/// be a slow majority, and a recovery from r1, r2 and r4 then re-proposed
+/// the command with other dependencies after the caller was answered.
+#[test]
+fn a_fast_acknowledgement_is_not_counted_as_an_adoption() {
+    let mut c = Collector::new(CollectorConfig {
+        quorum: quorum(5),
+        max_pending: 8,
+        max_resolved: 8,
+        max_undelivered_bytes: usize::MAX,
+    });
+    let (command, req) = request(1, put(b"x", b"1"), 0);
+    let admitted = AdmittedRequest {
+        receipt: AdmissionReceipt::submitting(
+            VerifierToken::for_boundary(),
+            AttestedAdmission {
+                cluster: CLUSTER,
+                domain: DOMAIN,
+                session: SESSION,
+                rule_generation: 1,
+                scope_ceiling: u32::MAX,
+                receipt_id: Digest32([7; 32]),
+                admitted_at_ticks: 0,
+            },
+        ),
+        frame: MessageV1::Request(req).encode().unwrap(),
+    };
+    c.submit(MonotonicMillis::ZERO, &admitted).unwrap();
+    let path = Digest32([1; 32]);
+    let released = ReleasedResult::from_gate(
+        EstablishedResult::establish(EstablishmentEvidence {
+            command,
+            epoch: epoch(),
+            ballot: ballot(),
+            position: ExecutionPosition::new(1).unwrap(),
+            closed_predecessors: vec![],
+            result_digest: Digest32([2; 32]),
+            revision: Some(KvRevision::new(1).unwrap()),
+            fast_path: false,
+        })
+        .unwrap(),
+        vec![0xaa],
+        false,
+    );
+    assert_eq!(
+        c.on_release(provenance(r(0), 1), released),
+        Ok(Progress::Held(HoldReason::AwaitingVotes))
+    );
+    let admitted_under = c.admission(&command).expect("outstanding");
+    let reply = ProtocolMessage::LeaderReply {
+        ballot: ballot(),
+        command,
+        seqnum: 1,
+        deps: vec![],
+        path,
+    };
+    assert_eq!(
+        c.on_evidence(provenance(r(0), 1), reply),
+        Ok(Progress::Held(HoldReason::AwaitingVotes))
+    );
+    // r1: the leader's dependencies, another path.
+    let fast = ProtocolMessage::FastAck(FastAck {
+        replica: r(1),
+        ballot: ballot(),
+        command,
+        deps: vec![],
+        paths: vec![],
+        path: Digest32([9; 32]),
+        admission: admitted_under,
+        seqnum: None,
+    });
+    assert_eq!(
+        c.on_evidence(provenance(r(1), 2), fast),
+        Ok(Progress::Held(HoldReason::AwaitingVotes))
+    );
+    let slow = |replica: u8| {
+        ProtocolMessage::SlowAck(SlowAck {
+            replica: r(replica),
+            ballot: ballot(),
+            command,
+            admission: admitted_under,
+        })
+    };
+    assert_eq!(
+        c.on_evidence(provenance(r(3), 3), slow(3)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "the leader, r1's fast acknowledgement and r3's adoption released the result"
+    );
+    assert!(c.is_pending(&command));
+    // r1 adopts: the leader and two adoptions are the slow majority.
+    match c.on_evidence(provenance(r(1), 2), slow(1)) {
+        Ok(Progress::Released(release)) => {
+            assert!(!release.fast);
+            assert_eq!(ok_result(&release.response), (Some(1), vec![0xaa]));
+        }
+        other => panic!("{other:?}"),
+    }
+}

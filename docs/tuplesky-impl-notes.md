@@ -5711,3 +5711,89 @@ happens at any cluster size.
 
 - The protocol oracle of task-d30 checks the same property on the real
   machines under a simulated network.
+
+## Only adoptions count toward the slow majority
+
+task-d19, from the checklist review (items P5, P6 and S6).
+`VoteSet::learned` and `learned_slow` used to count a fast-set member's
+fast acknowledgement toward the slow majority when its dependencies
+equalled the leader's, as the prototype's `acceptFastAndSlowAck` does.
+Recovery keeps a PRE-ACCEPT only through the possible-fast rule, which
+needs every reporting fast-set member to hold the command with the same
+path.
+
+Take five voters with fast set {r0, r1, r2}:
+1. x is learned from r0's proposal, r1's fast acknowledgement and r3's
+   adoption.
+2. r2 recovers from r1, r2 and r4. The one member of the deciding quorum
+   among them is r1, at PRE-ACCEPT.
+3. r2 re-proposes x with new dependencies, although the collector may
+   already have released its result.
+
+With three voters the fast set is a majority, and the possible-fast rule
+covers the case.
+
+### The rule
+
+- Only adoption acknowledgements count toward the slow majority. The fast
+  predicate is unchanged.
+- A slow decision is now the leader plus `slow_size - 1` durable ACCEPT
+  copies at its ballot. Any majority of reports holds one of them, and
+  selection keeps ACCEPT at the source.
+- Recovery could not be made to keep the pre-accept instead. At five
+  voters, {r1, r2, r4} can hold two fast-set pre-accepts of one command
+  with different dependencies, and no leader or ACCEPT copy to choose
+  between them.
+- Every learner uses `VoteSet`, so the change reaches all of them: the
+  leader's, the followers' `commit_learned` and the collector's release.
+- The cost is latency only. Every non-leader already adopts and sends its
+  adoption acknowledgement, and `adopted_by` and the re-send already
+  counted adoptions only.
+- The mapping row is now `[EXT: stricter]`. The paper's recovery appendix
+  was not consulted. The rule stands without it because it counts a
+  subset of the evidence the source counts.
+
+### Evidence
+
+- `a_slow_decision_counting_a_fast_ack_survives_recovery`
+  (`coord-consensus`, `model`): the review's probe. Its first assertion
+  was that x is learned, which at `d4bd28c` it was, and the selection
+  then re-proposed x. It now asserts that r1's fast acknowledgement
+  learns nothing. Once r1 adopts, x is learned, and recovery from r1, r2
+  and r4 selects x with `[y]`.
+- `every_learned_decision_is_selected_by_every_recovering_majority`
+  (`model`): at three and five voters, it covers every combination of
+  what each non-leader did with x:
+  - nothing;
+  - pre-accepted with the leader's dependencies or others;
+  - adopted, after a fast acknowledgement of either kind or none.
+
+  For each combination whose vote set learns x, it tries every majority
+  of reports and every new leader among them, and `select` keeps x with
+  the learned dependencies. With the old rule it fails at five voters on
+  exactly the review's case, `[Pre(true), None, Adopted(None), None]`
+  recovered from {r1, r2, r4}.
+- `a_fast_acknowledgement_is_not_counted_as_an_adoption`
+  (`coord-collector`, `composition`): the leader's release, its reply,
+  r1's fast acknowledgement with the leader's dependencies over another
+  path, and r3's adoption are held as `AwaitingVotes`, and r1's adoption
+  releases. It fails with the old rule.
+
+### The five-node stop, read again
+
+`release-record-mismatch(c96f0e70)` (`docs/operations/jepsen.md`, run
+36382738086) stopped `n4` while it followed ballot 2, led by `n5` after
+`n1`, the leader of ballot 1, was killed. That is the shape this fix
+removes:
+1. A command decided in ballot 1 by counting a fast acknowledgement is
+   committed and executed by `n4` under the leader's dependencies.
+2. Ballot 2 recovers from a majority without `n1` and re-proposes it
+   with others.
+3. `n5`'s release then contradicts `n4`'s record.
+
+The run kept no stores, so the command's order on each voter cannot be
+read, and the stop is not shown to have had this cause. The conclusion
+recorded: consistent with this bug, and not reproducible from what was
+kept. Five-node Jepsen results stay provisional until this change is
+carried to #98. A recurrence with this change carried would be a
+different cause, and the stores are now kept.

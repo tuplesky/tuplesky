@@ -10,10 +10,19 @@
 //! * fast: the leader's proposal plus fast-set members whose dependency
 //!   path digest equals the leader's (prototype client `accept`: checksum
 //!   equality), `fast_size` members in total including the leader;
-//! * slow: the leader's proposal plus adoption acknowledgements (a slow
-//!   acknowledgement, or a fast acknowledgement whose dependency set equals
-//!   the leader's; prototype `acceptFastAndSlowAck`), `slow_size` members
-//!   in total including the leader.
+//! * slow: the leader's proposal plus adoption acknowledgements,
+//!   `slow_size` members in total including the leader. Only adoptions
+//!   count (task-d19). The prototype's `acceptFastAndSlowAck` also counts a
+//!   fast acknowledgement whose dependency set equals the leader's; that
+//!   is stricter here (`[EXT: stricter]` in the source mapping). At five
+//!   voters a slow decision counting a fast-set member's fast
+//!   acknowledgement is not always visible to recovery: a recovering
+//!   majority can hold two fast-set pre-accepts of one command with
+//!   different dependencies and neither the leader nor an ACCEPT copy, and
+//!   then cannot tell which of them was decided. With adoptions only, a
+//!   slow decision is the leader and `slow_size - 1` durable ACCEPT copies
+//!   at its ballot, every majority of reports holds one of them, and
+//!   selection keeps ACCEPT at the source ballot.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -280,16 +289,15 @@ impl VoteSet {
 
     /// The conservative slow predicate only (task-24 learner): the leader
     /// proposal adopted by a majority including the leader.
+    ///
+    /// Only adoption acknowledgements count toward that majority, never a
+    /// fast acknowledgement, whatever dependencies it carries (task-d19):
+    /// an adoption is a durable ACCEPT copy at this ballot, which any later
+    /// majority of recovery reports holds and selection keeps, and a
+    /// fast-set member's PRE-ACCEPT is not.
     pub fn learned_slow(&self) -> Option<Learned> {
         let leader = self.leader.as_ref()?;
-        let mut adopting: BTreeSet<ReplicaId> = self.slow.clone();
-        adopting.extend(
-            self.fast
-                .values()
-                .filter(|a| same_set(&a.deps, &leader.deps))
-                .map(|a| a.replica),
-        );
-        (adopting.len() + 1 >= self.config.slow_size()).then(|| Learned::Slow {
+        (self.slow.len() + 1 >= self.config.slow_size()).then(|| Learned::Slow {
             deps: leader.deps.clone(),
         })
     }
@@ -316,19 +324,7 @@ impl VoteSet {
                 deps: leader.deps.clone(),
             });
         }
-        let mut adopting: BTreeSet<ReplicaId> = self.slow.clone();
-        adopting.extend(
-            self.fast
-                .values()
-                .filter(|a| same_set(&a.deps, &leader.deps))
-                .map(|a| a.replica),
-        );
-        if adopting.len() + 1 >= self.config.slow_size() {
-            return Some(Learned::Slow {
-                deps: leader.deps.clone(),
-            });
-        }
-        None
+        self.learned_slow()
     }
 }
 
