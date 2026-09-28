@@ -148,8 +148,8 @@ uploaded as an artifact, without the provisioned run directory, which
 holds the domain's fixture keys. The containers share the runner's clock,
 so the workflow does not offer the `clock` fault.
 
-Until `tuplesky/jepsen` merges the project, `jepsen-ref` defaults to its
-branch, `claude/tuplesky-jepsen-docker-tests`.
+`jepsen-ref` defaults to `main` of `tuplesky/jepsen`, where the project
+merged (tuplesky/jepsen#1); a run can name another branch, tag or commit.
 
 Beside it, on a runner of its own, the `etcd-baseline` job runs Jepsen's
 own etcd test ([jepsen-io/etcd](https://github.com/jepsen-io/etcd),

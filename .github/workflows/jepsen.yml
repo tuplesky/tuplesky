@@ -21,7 +21,7 @@ on:
     inputs:
       jepsen-ref:
         description: Branch, tag or commit of tuplesky/jepsen to run
-        default: claude/tuplesky-jepsen-docker-tests
+        default: main
       workload:
         description: "append, wr or register"
         default: append
@@ -60,7 +60,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # Scheduled runs have no inputs; these are the dispatch defaults.
-  JEPSEN_REF: ${{ inputs.jepsen-ref || 'claude/tuplesky-jepsen-docker-tests' }}
+  JEPSEN_REF: ${{ inputs.jepsen-ref || 'main' }}
   WORKLOAD: ${{ inputs.workload || 'append' }}
   NEMESIS: ${{ inputs.nemesis || 'kill,pause,partition' }}
   TIME_LIMIT: ${{ inputs.time-limit || '300' }}
