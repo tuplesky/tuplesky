@@ -4225,7 +4225,9 @@ Three triggers were known:
   so a voter that adopted a proposal holds every earlier one, and only
   proposals after the latest it adopted are sent. One it never
   acknowledges -- a command it executed and keeps no record of -- stops
-  being sent once it adopts a later one.
+  being sent once it adopts a later one. (task-d15 narrows this: only a
+  proposal the leader has committed stops being sent. See "A leader asks
+  again for every vote it still needs".)
 - **A duplicate proposal is re-acknowledged.** A follower that receives
   a proposal it already adopted or holds publishes to the leader, again,
   what it acknowledged for that command in this ballot. It is the same
@@ -4320,7 +4322,8 @@ file passed 10 of 10 runs, where it had failed on the first run before.
   (swept as history, or trimmed with a checkpoint's prefix) draws no
   answer from `acknowledge_decided`. It is re-sent to that voter every
   interval until the voter adopts a later proposal. That is one small
-  frame per 250 ms, within the 16 per voter.
+  frame per 250 ms, within the 16 per voter. (After task-d15, a proposal
+  the leader has not committed is re-sent past that point too.)
 - `shim-stress.py --fault leader` and `--fault majority`, and the Jepsen
   workflow, were run on #98 with this branch's code carried byte for
   byte, not on this branch itself. The stress runs pass (4 of 4, exit 0).
@@ -5284,3 +5287,68 @@ the Sync after a proposal's rebind, the entry stays uninstalled.
 - A Sync entry that names no facts (no reporter held a payload, and the
   candidate supplies it by having executed it) is installed under
   whatever facts a voter holds, as before.
+
+## A leader asks again for every vote it still needs
+
+task-d15. The stress runs raf-2, repaf-4 and rep108-3 ended with a
+leader republishing its lease command until its table filled, while its
+followers went on committing and executing its proposals: in rep108-3,
+`n2` executed its ballot's seqnums 0 to 52 and nothing after, and `n1`
+and `n3` executed all 1077, through position 1432.
+
+### Why the leader never learned seqnum 53
+
+- `Leader::resend_unvoted` (task-d07) sends a voter the durable
+  proposals it has not adopted, and the voter answers each again
+  (`reacknowledge`, or `acknowledge_decided` for a command it committed
+  or executed). So a lost adoption acknowledgement is asked for again.
+- But it sent only proposals after the latest one whose adoption from
+  that voter the leader had counted. The premise, that a voter that
+  adopted a proposal holds every earlier one, is true of the voter. It
+  says nothing about which of its acknowledgements reached the leader.
+- One acknowledgement for 53 lost and one for 54 counted, and 53 was
+  never sent to that voter again. `n1`'s frames to `n2` were refused as
+  `QueueFull` and `n2` could not reach `n1`, so `n3` was the only vote
+  there was. The leader never learned 53, and everything chained after
+  it waited at ACCEPT, the lease command included.
+- The followers did not stall: with three voters, a follower's own
+  adoption and the leader's proposal are a slow quorum, so each commits
+  the leader's proposals on its own.
+
+What lost the one acknowledgement does not matter here: the re-send
+exists so that one lost frame is harmless.
+
+### The rule
+
+- A proposal the leader holds below COMMIT is sent until the voter's
+  adoption of it arrives, however far past it that voter's counted
+  adoptions reach.
+- The skip stays for a proposal the leader has committed. That is the
+  case it was written for: a voter that executed and retired the command
+  may keep no record to answer from, and the leader no longer needs its
+  vote.
+- The budget is unchanged: at most `RESEND_PER_VOTER` (16) per voter per
+  call, oldest first.
+
+### Evidence
+
+- `a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again`: with
+  r1 down, r2's acknowledgement of c2 is lost and its acknowledgement of
+  c3, on the same key, is counted. r0 executes both within four re-send
+  rounds. With task-d07's rule, r0 executes only c1 while r2 executes
+  all three.
+- `a_committed_proposal_behind_a_counted_acknowledgement_is_not_sent_again`:
+  with every voter up, r0 commits c2 on r1's vote, r2's acknowledgement
+  of c2 is lost and its acknowledgement of c3 counted. No proposal goes
+  from r0 to r2 in four re-send rounds. Without the skip, c2 is sent.
+
+### What is left
+
+- A voter that swept a command's record (more than four tables of
+  history later) before its acknowledgement got through cannot answer,
+  and with no other vote the leader cannot learn the command. Closing it
+  would have a follower answer from its executed row, which needs its
+  own argument about which ballot's order it executed under.
+- An uncommitted proposal that stays unanswerable takes one slot of the
+  voter's 16 per round for as long as it does. The chain bounds that to
+  the table the leader cannot move past anyway.

@@ -1381,6 +1381,69 @@ fn a_lost_acknowledgement_is_published_again_on_a_resend() {
     }
 }
 
+/// An acknowledgement lost behind a counted one is asked for again
+/// (task-d15).
+///
+/// With r1 down, r2's acknowledgements are all r0 has to learn from. The
+/// one for c2 is lost and the one for c3 is counted. The re-send used to
+/// skip every proposal at or below the latest one r2's adoption was
+/// counted for, so c2 was never sent again: r0 never learned it and held
+/// c3, chained after it on the same key, at ACCEPT, while r2 committed
+/// both from its own adoption and executed them.
+#[test]
+fn a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again() {
+    let mut cluster = Cluster::new(41);
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.crash(1);
+    cluster.drop_acks = vec![(2, 0)];
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    cluster.drop_acks.clear();
+    let c3 = cluster.admit(3, 2);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[0].executed,
+        vec![c1],
+        "r0 lacks r2's vote on c2"
+    );
+    assert_eq!(cluster.nodes[2].executed, vec![c1, c2, c3]);
+    cluster.settle_resending(4);
+    for i in [0usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2, c3], "node {i}");
+    }
+}
+
+/// What the re-send still skips (task-d15): a proposal the leader has
+/// committed is not sent again to a voter whose adoption of a later one
+/// was counted. That voter may have executed and retired the command and
+/// keep no record to answer from, and the leader no longer needs its vote.
+#[test]
+fn a_committed_proposal_behind_a_counted_acknowledgement_is_not_sent_again() {
+    let mut cluster = Cluster::new(43);
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.drop_acks = vec![(2, 0)];
+    let c2 = cluster.admit(2, 2);
+    cluster.settle();
+    cluster.drop_acks.clear();
+    let c3 = cluster.admit(3, 2);
+    cluster.settle();
+    // r0 committed c2 on r1's vote and never counted r2's.
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, vec![c1, c2, c3], "node {i}");
+    }
+    cluster.proposals_sent.clear();
+    cluster.settle_resending(4);
+    assert!(
+        !cluster
+            .proposals_sent
+            .iter()
+            .any(|(from, to)| *from == 0 && *to == 2),
+        "c2 was committed, and r2 adopted c3 after it"
+    );
+}
+
 /// The same, with the voter restarted before the re-send (task-d07).
 ///
 /// What a voter published is kept for its boot, so after a restart it
