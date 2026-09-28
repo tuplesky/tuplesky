@@ -3888,7 +3888,8 @@ mismatch and stopped at the top of the next pass, which left the rest of
 the batch and one event in between (review of #99). The decision is
 `coord_daemon::settle::offer`. It stops at the first mismatch and returns
 the command, and returns nothing that pass had settled. `serve.rs` stops
-the node on that answer.
+the node on that answer. Since task-d17 the stop also says what it
+compared; see "A divergence stop says what it compared".
 
 **What the frontend trusts.** Two paths answer a caller from this node's
 own execution record rather than from the leader's release, and both are
@@ -5407,3 +5408,80 @@ it hid the error that mattered.
 - The replay that produced rep108-3 has to be run with this carried to
   see what the restarted voters' dials really fail on. The fix for that,
   if any, is its own task.
+
+## A divergence stop says what it compared
+
+task-d17. A five-node Jepsen run stopped n4 on `release-record-mismatch`
+right after it followed a new ballot, and the run kept only
+`coordd.log`: the teardown removed the stores. The stop said the
+command's first four bytes and that n4 "executed the domain's commands
+in another order than the leader", which is what the sentence always
+said, whatever the comparison had found. Nothing more could be read from
+it, and the harness replays did not reproduce it.
+
+### What was compared
+
+- Two checks stop a node on a mismatch: a release the collector holds
+  against this node's own record of the command (task-d06,
+  `settle_from_record`), and a release that arrives after the collector
+  answered against the answer it gave (task-d12, `check_release`).
+- Both now return a `Mismatch`: which check, the full command identity,
+  the release's side and this node's side, and which of the compared
+  fields differ. A side (`Said`) is the position, revision, result digest
+  and response length, and for a release the sender, epoch, ballot and
+  `speculative` flag. This node's side is its record, or the answer it
+  gave; an answer given from an earlier release carries that release's
+  origin, so the collector keeps the sender of each release it holds and
+  retains each answer's `Said` in place of the old `Executed`.
+- The compared fields are the position, revision, result digest and
+  response bytes, as before. The sender, epoch, ballot and flag are
+  shown, not compared. The revision is part of the answer a caller is
+  handed, so on the late-release check a forked revision is a forked
+  response too.
+- `SettleError::Mismatch` and `EvidenceError::AnsweredOtherwise` carry it
+  boxed, and `Settled::Diverged` carries it out of the settle turn.
+
+### What the stop prints
+
+- The first line keeps its prefix, `this node stopped:
+  release-record-mismatch(<8 hex>): `, so anything searching logs for it
+  still finds it. "In another order than the leader" is said only when
+  the positions differ; otherwise the line says the two disagree at the
+  same position.
+- Then: which check, the full command, both sides, which fields differ,
+  this node's ballot, leader and `executed_through` at the stop (unknown
+  when no voter runs in the process), and this node's own `executed_v1`
+  rows within eight positions of either side's position, as `position
+  revision digest command`.
+- The rows are read once, at the stop. `executed_v1` is keyed by command,
+  so the whole table is scanned, paged
+  (`coord_storage::protocol::executed_near`). A store that cannot be
+  read shows no rows and the stop still says what it compared.
+
+### Evidence
+
+- `a_record_the_release_contradicts_stops_the_turn` (`coord-daemon`): a
+  record with forked bytes stops the turn with the held-release check,
+  the record's side with no origin, the release's side from the leader
+  under the counted ballot, `differs` naming the response alone, and the
+  command among the rows the stop would print, all within eight
+  positions.
+- `a_late_release_that_contradicts_the_answer_is_refused`
+  (`coord-daemon`): each fork (response, result digest, position,
+  revision) is refused with the late-release check, both sides, and
+  exactly the fields that fork changed; the revision fork also changes
+  the response.
+- `a_mismatch_ends_the_turn_and_sends_nothing` (`coord-daemon`): the
+  mismatch comes out of the settle turn whole.
+- `a_position_only_mismatch_says_another_order_and_names_the_position`,
+  `a_digest_only_mismatch_does_not_say_another_order` and
+  `a_divergence_stop_keeps_its_prefix` (`coordd`): the wording, the
+  sides, the state and the rows as printed, and the prefix on both
+  checks.
+- Negative control: with "in another order" said whatever differs, the
+  digest-only test fails.
+
+### What is left
+
+- n4's stop in that run is still unexplained. The next runs keep the
+  stores, and a stop there now says what it compared.

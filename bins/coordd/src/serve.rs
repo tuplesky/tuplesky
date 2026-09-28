@@ -890,9 +890,10 @@ pub struct Domain<P: Persistence> {
     /// ones behind it from being looked at.
     settle_cursor: usize,
     /// A command whose late release contradicted the answer this node
-    /// already gave from its own record (task-d12). The serve loop stops
-    /// on it as it stops on a record contradicting a held release.
-    answered_otherwise: Option<CommandId>,
+    /// already gave from its own record (task-d12), with what was
+    /// compared (task-d17). The serve loop stops on it as it stops on a
+    /// record contradicting a held release.
+    answered_otherwise: Option<Box<coord_collector::Mismatch>>,
     /// A command this voter holds two decisions of (task-d14). The serve
     /// loop stops on it as it stops on a release-record mismatch.
     admission_halt: Option<CommandId>,
@@ -1521,16 +1522,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // A release this node's own execution contradicts stops it
             // here, before anything else this pass can answer a caller
             // from that execution (task-d06).
-            if let Some(command) = self.settle_from_records() {
-                say_diverged(&command);
+            if let Some(mismatch) = self.settle_from_records() {
+                say_diverged(&self.divergence(&mismatch));
                 return;
             }
             // The same, found the other way round: a release that came
             // after this node had already answered from its record, and
             // says something else (task-d12). The caller was already told
             // the wrong thing; nothing more is.
-            if let Some(command) = self.answered_otherwise.take() {
-                say_diverged(&short_hex(&command));
+            if let Some(mismatch) = self.answered_otherwise.take() {
+                say_diverged(&self.divergence(&mismatch));
                 return;
             }
             // Two decisions of one command, found at a Sync or in this
@@ -2664,15 +2665,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Bounded per turn, and cheap when nothing is half held, which is
     /// nearly always.
     ///
-    /// Returns the command whose leader's release and this node's own
-    /// execution record disagree, if one does (task-d06). That is replicas
+    /// Returns what was compared for the command whose leader's release
+    /// and this node's own execution record disagree, if one does
+    /// (task-d06, task-d17). That is replicas
     /// executing the same committed commands in different orders, and
     /// every answer this node's frontend gives from its own record -- a
     /// retry, a delivery whose half was lost -- then comes from a state
     /// the domain did not decide. So nothing this pass settled goes out,
     /// and the caller stops the node.
     #[must_use]
-    fn settle_from_records(&mut self) -> Option<String> {
+    fn settle_from_records(&mut self) -> Option<Box<coord_collector::Mismatch>> {
         let half = self.frontend.frontend.dispatcher_mut().half_established();
         if half.is_empty() {
             return None;
@@ -2710,8 +2712,23 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 }
                 None
             }
-            coord_daemon::settle::Settled::Diverged(command) => Some(short_hex(&command)),
+            coord_daemon::settle::Settled::Diverged(mismatch) => Some(mismatch),
         }
+    }
+
+    /// What a node that stops on `mismatch` says (task-d17): what was
+    /// compared, this node's ballot, leader and execution frontier at the
+    /// stop, and its own executed rows around both positions.
+    fn divergence(&self, mismatch: &coord_collector::Mismatch) -> String {
+        let (ballot, executed_through) = match &self.backing {
+            Backing::Voting(voter) => (
+                voter.ballot(),
+                Some(voter.node().machine().executed_through()),
+            ),
+            Backing::Serving(_) => (self.frontend.frontend.dispatcher().ballot(), None),
+        };
+        let rows = coord_daemon::settle::executed_near(self.backing.applier(), mismatch);
+        describe_divergence(mismatch, ballot, executed_through, &rows)
     }
 
     /// Which collector this voter owes a frame to, where it knows.
@@ -2752,10 +2769,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .on_release(provenance, released)
                 {
                     Ok(delivery) => delivery,
-                    Err(coord_collector::collector::EvidenceError::AnsweredOtherwise {
-                        command,
-                    }) => {
-                        self.answered_otherwise = Some(command);
+                    Err(coord_collector::collector::EvidenceError::AnsweredOtherwise(mismatch)) => {
+                        self.answered_otherwise = Some(mismatch);
                         None
                     }
                     Err(_) => None,
@@ -3439,13 +3454,126 @@ fn short_hex(command: &CommandId) -> String {
 }
 
 /// Why a node stopped on a release its own execution contradicts.
-fn say_diverged(command: &str) {
-    eprintln!(
-        "this node stopped: release-record-mismatch({command}): the leader's release of that \
-         command and this node's own execution of it disagree, so this node executed the \
-         domain's commands in another order than the leader. Its store holds a history the \
-         domain did not decide, and this node does not answer from it"
+fn say_diverged(description: &str) {
+    eprintln!("{description}");
+}
+
+/// What a node that stops on `mismatch` prints (task-d17).
+///
+/// The first line keeps the prefix every earlier stop printed,
+/// `this node stopped: release-record-mismatch(<8 hex>)`, so what
+/// searches for it still finds it; everything after it says what was
+/// compared. "In another order" is said only when the two positions
+/// differ: a disagreement at one position is the command producing
+/// something else there, not the commands being ordered otherwise.
+fn describe_divergence(
+    mismatch: &coord_collector::Mismatch,
+    ballot: coord_types::ids::Ballot,
+    executed_through: Option<coord_types::ids::ExecutionPosition>,
+    rows: &[(CommandId, coord_storage::codecs::ExecutedRecordV1)],
+) -> String {
+    use coord_collector::MismatchCheck;
+    use std::fmt::Write as _;
+    let (check, own_is) = match mismatch.check {
+        MismatchCheck::HeldReleaseAgainstRecord => (
+            "the leader's release this node held, against this node's own record of the command",
+            "record",
+        ),
+        MismatchCheck::LateReleaseAgainstAnswer => (
+            "a release that arrived after this node answered, against the answer it gave",
+            "answer",
+        ),
+    };
+    let why = if mismatch.differs.position {
+        "so this node executed the domain's commands in another order than the leader"
+    } else {
+        "at the same position, so this node's execution of that command produced something \
+         else than the leader's"
+    };
+    let mut out = format!(
+        "this node stopped: release-record-mismatch({}): the leader's release of that command \
+         and this node's own execution of it disagree, {why}. Its store holds a history the \
+         domain did not decide, and this node does not answer from it",
+        short_hex(&mismatch.command)
     );
+    let differs = mismatch.differs.names();
+    let _ = write!(
+        out,
+        "\n  compared: {check}\n  command: {}\n  release: {}\n  {own_is}: {}\n  differs: {}",
+        coord_collector::trace::command_hex(&mismatch.command),
+        said(&mismatch.release),
+        said(&mismatch.own),
+        if differs.is_empty() {
+            "nothing".to_string()
+        } else {
+            differs.join(", ")
+        },
+    );
+    let _ = write!(
+        out,
+        "\n  this node: ballot {} leader {} executed_through {}",
+        ballot.number,
+        hex4(&ballot.leader),
+        executed_through.map_or_else(
+            || "unknown (no voter runs here)".to_string(),
+            |p| p.to_string()
+        ),
+    );
+    let _ = write!(
+        out,
+        "\n  executed_v1 within {} of positions {} and {} (position revision digest command):",
+        coord_daemon::settle::NEAR_POSITIONS,
+        mismatch.own.position,
+        mismatch.release.position,
+    );
+    if rows.is_empty() {
+        out.push_str("\n    none");
+    }
+    for (command, record) in rows {
+        let _ = write!(
+            out,
+            "\n    {} {} {} {}",
+            record.position,
+            revision_text(record.revision),
+            digest_hex(&record.result_digest),
+            coord_collector::trace::command_hex(command),
+        );
+    }
+    out
+}
+
+/// One side of a mismatch, on one line.
+fn said(said: &coord_collector::Said) -> String {
+    let origin = said.release.map_or_else(
+        || "from this node's record".to_string(),
+        |r| {
+            format!(
+                "sender {} epoch {} ballot {} (leader {}) speculative {}",
+                hex4(&r.sender),
+                r.epoch,
+                r.ballot.number,
+                hex4(&r.ballot.leader),
+                r.speculative,
+            )
+        },
+    );
+    format!(
+        "{origin} position {} revision {} digest {} response {} bytes",
+        said.position,
+        revision_text(said.revision),
+        digest_hex(&said.result_digest),
+        said.response_len,
+    )
+}
+
+/// A revision as a stop prints it: `-` for none.
+fn revision_text(revision: Option<coord_types::ids::KvRevision>) -> String {
+    revision.map_or_else(|| "-".to_string(), |r| r.to_string())
+}
+
+/// Hex of a digest.
+fn digest_hex(digest: &coord_types::identity::Digest32) -> String {
+    digest.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Why a node stopped on two decisions of one command.
@@ -4635,5 +4763,185 @@ mod tests {
             unreached.to_string(),
             "every address listed serves the other plane"
         );
+    }
+
+    /// The pieces of a divergence stop's description (task-d17).
+    mod divergence {
+        use coord_collector::{Differs, Mismatch, MismatchCheck, ReleaseOrigin, Said};
+        use coord_storage::codecs::ExecutedRecordV1;
+        use coord_types::CommandId;
+        use coord_types::identity::Digest32;
+        use coord_types::ids::{
+            Ballot, ConfigurationEpoch, ExecutionPosition, KvRevision, ReplicaId,
+        };
+
+        pub(super) const COMMAND: CommandId = CommandId(Digest32([0xab; 32]));
+
+        fn ballot(number: u64, leader: u8) -> Ballot {
+            Ballot {
+                epoch: ConfigurationEpoch::new(1).unwrap(),
+                number,
+                leader: ReplicaId([leader; 16]),
+            }
+        }
+
+        fn at(position: u64) -> ExecutionPosition {
+            ExecutionPosition::new(position).unwrap()
+        }
+
+        /// A mismatch on `check`, where the release and this node agree
+        /// except on what `fork` changes on this node's side.
+        pub(super) fn mismatch(check: MismatchCheck, fork: impl FnOnce(&mut Said)) -> Mismatch {
+            let release = Said {
+                release: Some(ReleaseOrigin {
+                    sender: ReplicaId([5; 16]),
+                    epoch: ConfigurationEpoch::new(1).unwrap(),
+                    ballot: ballot(2, 5),
+                    speculative: true,
+                }),
+                position: at(122),
+                revision: Some(KvRevision::new(40).unwrap()),
+                result_digest: Digest32([0x11; 32]),
+                response_len: 9,
+            };
+            let mut own = Said {
+                release: None,
+                ..release
+            };
+            fork(&mut own);
+            Mismatch {
+                command: COMMAND,
+                check,
+                release,
+                own,
+                differs: Differs {
+                    position: release.position != own.position,
+                    revision: release.revision != own.revision,
+                    result_digest: release.result_digest != own.result_digest,
+                    response: release.response_len != own.response_len,
+                },
+            }
+        }
+
+        pub(super) fn describe(mismatch: &Mismatch) -> String {
+            let rows = [120, 121, 122, 123].map(|p| {
+                (
+                    CommandId(Digest32([u8::try_from(p).unwrap(); 32])),
+                    ExecutedRecordV1 {
+                        position: at(p),
+                        revision: None,
+                        result_digest: Digest32([0x22; 32]),
+                    },
+                )
+            });
+            super::super::describe_divergence(mismatch, ballot(2, 5), Some(at(123)), &rows)
+        }
+    }
+
+    /// A stop whose release and record disagree only on the position says
+    /// the commands were executed in another order, and says which field
+    /// differs (task-d17).
+    #[test]
+    fn a_position_only_mismatch_says_another_order_and_names_the_position() {
+        use coord_collector::MismatchCheck;
+        let m = divergence::mismatch(MismatchCheck::HeldReleaseAgainstRecord, |own| {
+            own.position = coord_types::ids::ExecutionPosition::new(121).unwrap();
+        });
+        let said = divergence::describe(&m);
+        let first = said.lines().next().unwrap();
+        assert!(first.contains("in another order than the leader"), "{said}");
+        assert!(said.contains("\n  differs: position\n"), "{said}");
+        assert!(
+            said.contains(
+                "\n  compared: the leader's release this node held, against this node's own \
+                 record of the command\n"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "\n  command: {}\n",
+                coord_collector::trace::command_hex(&divergence::COMMAND)
+            )),
+            "{said}"
+        );
+        // Both sides, the release with where it came from and the record
+        // with nothing to say about that.
+        assert!(
+            said.contains(
+                "\n  release: sender 05050505 epoch 1 ballot 2 (leader 05050505) speculative \
+                 true position 122 revision 40 digest 1111"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("\n  record: from this node's record position 121 revision 40"),
+            "{said}"
+        );
+        assert!(said.contains(" response 9 bytes"), "{said}");
+        assert!(
+            said.contains("\n  this node: ballot 2 leader 05050505 executed_through 123\n"),
+            "{said}"
+        );
+        assert!(
+            said.contains(
+                "\n  executed_v1 within 8 of positions 121 and 122 (position revision digest \
+                 command):\n    120 - 2222"
+            ),
+            "{said}"
+        );
+        assert_eq!(said.lines().filter(|l| l.starts_with("    12")).count(), 4);
+    }
+
+    /// A stop whose release and answer disagree only on the result digest
+    /// does not say the commands were ordered otherwise: at one position,
+    /// the command produced something else (task-d17).
+    #[test]
+    fn a_digest_only_mismatch_does_not_say_another_order() {
+        use coord_collector::MismatchCheck;
+        let m = divergence::mismatch(MismatchCheck::LateReleaseAgainstAnswer, |own| {
+            own.result_digest = coord_types::identity::Digest32([0x33; 32]);
+        });
+        let said = divergence::describe(&m);
+        assert!(!said.contains("another order"), "{said}");
+        assert!(
+            said.lines()
+                .next()
+                .unwrap()
+                .contains("disagree, at the same position,"),
+            "{said}"
+        );
+        assert!(said.contains("\n  differs: result digest\n"), "{said}");
+        assert!(
+            said.contains(
+                "\n  compared: a release that arrived after this node answered, against the \
+                 answer it gave\n"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("\n  answer: from this node's record "),
+            "{said}"
+        );
+    }
+
+    /// Whatever the stop goes on to say, its first line starts as every
+    /// earlier stop's did, so what searches logs for it still finds it
+    /// (task-d17).
+    #[test]
+    fn a_divergence_stop_keeps_its_prefix() {
+        use coord_collector::MismatchCheck;
+        for check in [
+            MismatchCheck::HeldReleaseAgainstRecord,
+            MismatchCheck::LateReleaseAgainstAnswer,
+        ] {
+            let m = divergence::mismatch(check, |own| own.response_len += 1);
+            let said = divergence::describe(&m);
+            assert!(
+                said.starts_with("this node stopped: release-record-mismatch(abababab): "),
+                "{said}"
+            );
+            assert!(said.contains("\n  differs: response\n"), "{said}");
+        }
     }
 }

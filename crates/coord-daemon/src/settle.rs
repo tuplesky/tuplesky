@@ -19,7 +19,9 @@
 //! ([`coord_collector::Collector::settle_from_record`]), and it is the
 //! collector that decides whether its own evidence corroborates it.
 
-use coord_storage::codecs::RetryRecordV1;
+use coord_collector::Mismatch;
+use coord_storage::codecs::{ExecutedRecordV1, RetryRecordV1};
+use coord_storage::views::ViewBudget;
 use coord_storage::{Applier, Persistence};
 use coord_types::{CommandId, RetryKey};
 
@@ -88,8 +90,8 @@ pub enum Settled<D> {
     /// command contradicts (task-d06). This node executed the domain's
     /// commands in another order than the leader, so nothing it read
     /// from that record this turn goes out, and nothing after the
-    /// mismatch is offered.
-    Diverged(CommandId),
+    /// mismatch is offered. What was compared comes with it (task-d17).
+    Diverged(Box<Mismatch>),
 }
 
 /// Offer each of `records` to `settle` in turn, and say what goes out.
@@ -112,7 +114,9 @@ pub fn offer<D>(
                 settled += 1;
                 deliveries.extend(delivery);
             }
-            Err(coord_collector::SettleError::Mismatch) => return Settled::Diverged(command),
+            Err(coord_collector::SettleError::Mismatch(mismatch)) => {
+                return Settled::Diverged(mismatch);
+            }
             Err(_) => {}
         }
     }
@@ -120,4 +124,32 @@ pub fn offer<D>(
         settled,
         deliveries,
     }
+}
+
+/// How far either side of a stopped command's two positions the stop
+/// shows this node's executed rows (task-d17).
+pub const NEAR_POSITIONS: u64 = 8;
+
+/// This node's `executed_v1` rows within [`NEAR_POSITIONS`] of where it
+/// executed `mismatch`'s command and of where the leader's release put
+/// it, in position order (task-d17).
+///
+/// Read once, when the node stops on the mismatch, so that the stop
+/// shows the order this node executed in around the command. A store
+/// that cannot be read shows nothing, and the stop still says what it
+/// compared.
+pub fn executed_near<P: Persistence>(
+    applier: &Applier<P>,
+    mismatch: &Mismatch,
+) -> Vec<(CommandId, ExecutedRecordV1)> {
+    let Ok(gated) = applier.store().reader().snapshot() else {
+        return Vec::new();
+    };
+    coord_storage::protocol::executed_near(
+        gated.view(),
+        &[mismatch.own.position, mismatch.release.position],
+        NEAR_POSITIONS,
+        ViewBudget::default(),
+    )
+    .unwrap_or_default()
 }
