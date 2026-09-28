@@ -648,7 +648,13 @@ impl Follower {
         self.learner = Learner::with_mode(through, self.learner.mode());
         // What executes from here on is compared with a donor's by the
         // first ask, which starts here (task-d25).
-        self.catch_up.since_boot = SinceBoot::at(through);
+        let restored = self
+            .table
+            .records()
+            .filter(|(_, r)| r.phase == Phase::Commit)
+            .map(|(c, _)| *c)
+            .collect();
+        self.catch_up.since_boot = SinceBoot::at(through, restored);
         self
     }
 
@@ -2168,13 +2174,16 @@ impl Follower {
             self.catch_up.queue.push_back((from, ballot, entry));
         }
         if self.catch_up.since_boot.from.is_some() {
-            if taken > 0 && next < executed && !self.catch_up.since_boot.outcomes.is_empty() {
-                // The page stopped short of what was kept: the next ask
-                // goes on from where it stopped.
+            if taken == 0 {
+                // A donor that cannot show those rows any more, which
+                // nothing asked again would change.
+                self.catch_up.since_boot.done();
+            } else if self.catch_up.since_boot.waiting() {
+                // Something kept is past this page, or something expected
+                // has not executed yet: the next ask goes on from where
+                // this page stopped.
                 self.catch_up.since_boot.from = Some(next);
             } else {
-                // Covered -- or a donor that cannot show those rows any
-                // more, which nothing asked again would change.
                 self.catch_up.since_boot.done();
             }
         }
@@ -2187,6 +2196,11 @@ impl Follower {
         // the next ask as soon as it is executed: a replica thousands of
         // commands behind should not wait a timer's period per page.
         self.catch_up.continue_from = (taken == offered && next < through).then_some(from);
+        if self.catch_up.since_boot.from.is_some() && next < executed {
+            // Executions this replica has made past the page are still to
+            // be compared: asked for at once, as a full page's rest is.
+            self.catch_up.continue_from = Some(from);
+        }
         if !self.catch_up.busy() {
             // Nothing to execute: a page of comparisons only.
             return match self.catch_up.continue_from.take() {
@@ -2209,19 +2223,9 @@ impl Follower {
             revision: entry.revision,
             result_digest: entry.result_digest,
         };
-        let kept = &mut self.catch_up.since_boot.outcomes;
-        while kept
-            .front()
-            .is_some_and(|(_, own)| own.position < entry.position)
-        {
-            kept.pop_front();
-        }
-        let here = kept
-            .front()
-            .is_some_and(|(_, own)| own.position == entry.position);
-        let Some((command, own)) = here.then(|| kept.pop_front()).flatten() else {
-            // Past what was kept: an execution no window of this boot's
-            // could have made.
+        let Some((command, own)) = self.catch_up.since_boot.outcomes.remove(&entry.position) else {
+            // Not an execution of a commit restored at boot: nothing a
+            // window of an earlier boot could have left behind.
             return;
         };
         if command != entry.command

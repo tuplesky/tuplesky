@@ -142,6 +142,9 @@ struct Cluster {
     batches: Vec<usize>,
     /// Every catch-up ask sent: (from, after).
     catch_up_asks: Vec<(usize, u64)>,
+    /// The most commands a served page carries: a donor whose byte bound
+    /// cuts pages short.
+    page_limit: usize,
 }
 
 const SETTLE_STEPS: u32 = 200_000;
@@ -202,6 +205,7 @@ impl Cluster {
             held: Vec::new(),
             batches: vec![0; VOTERS as usize],
             catch_up_asks: Vec::new(),
+            page_limit: MAX_CATCH_UP_COMMANDS,
         }
     }
 
@@ -551,7 +555,7 @@ impl Cluster {
             .iter()
             .enumerate()
             .skip(after.get() as usize)
-            .take(MAX_CATCH_UP_COMMANDS)
+            .take(self.page_limit)
             .map(|(i, c)| {
                 let payload = rows
                     .iter()
@@ -1101,5 +1105,43 @@ fn a_voter_holding_a_window_does_not_campaign_until_it_ran() {
     assert!(
         refused.contains(&FollowerRejection::CatchingUp),
         "{refused:?}"
+    );
+}
+
+/// Every execution of a commit restored at boot is compared, however many
+/// pages that takes (task-d25, Codex review on #123): with the donor's
+/// pages cut to three commands, the restart's execution of the eleventh
+/// command of the window is still reached, and its difference stops the
+/// voter.
+#[test]
+fn every_restored_commit_is_compared_however_many_pages_it_takes() {
+    let (mut cluster, _) = left_behind(47);
+    cluster.serve = false;
+    let after = cluster.follower(4).executed_through();
+    let page = cluster.page(0, ballot0(), after);
+    let entries = entries_of(&page).to_vec();
+    assert!(entries.len() > 12, "a window of {}", entries.len());
+    let forked = entries[10].command;
+    cluster.deliver_page(4, 0, &page);
+    cluster.restart(4);
+    cluster.fork = Some((4, forked));
+    cluster.settle();
+    assert!(cluster.nodes[4].executed.len() >= after.get() as usize + entries.len());
+    assert_eq!(cluster.follower(4).catch_up_divergence(), None);
+    cluster.serve = true;
+    cluster.page_limit = 3;
+    let asked = cluster.catch_up_asks.len();
+    cluster.ask(4);
+    let f = cluster.follower(4);
+    let divergence = f.catch_up_divergence().expect("r4 stopped");
+    assert_eq!(divergence.command, forked);
+    assert_eq!(
+        divergence.own.map(|o| o.result_digest),
+        Some(Digest32([0xee; 32]))
+    );
+    assert!(
+        cluster.catch_up_asks.len() - asked >= 4,
+        "the comparison went on page after page: {:?}",
+        &cluster.catch_up_asks[asked..]
     );
 }

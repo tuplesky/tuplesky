@@ -6429,19 +6429,23 @@ never closed its gap.
   learner, with the page and the donor's word gone.
   - The rule that each command names the one before it is what makes
     the learner run them in the donor's positions.
-  - The follower keeps what it executes after the frontier it booted at
-    (`SinceBoot`, set by `restore_execution`), at most a window's worth.
-    Only one window is ever uncompared, and it is the first thing
-    executed after that frontier.
+  - At boot the follower takes the commits it restored and has not
+    executed as expected (`SinceBoot`, set by `restore_execution`). It
+    keeps each one's execution, by position. Only a restored commit can
+    be part of a window whose comparison the crash lost, so this is
+    bounded by what the table restored, not by how much executes after
+    the restart. (Codex review: a first version kept at most 64
+    executions and dropped the rest, so a restart that executed more
+    before its first ask never compared them.)
   - The first ask after a boot starts at the boot frontier rather than
-    at the current one. Each command of that page at or below the
-    current frontier is compared with what was executed there: another
-    command, revision or result digest stops the voter as a
-    `CatchUpDivergence`, as a pulled command's does. The rest of the
-    page is installed as usual.
-  - A page that stops short of what was kept is followed at once from
-    where it stopped. A donor that can no longer show those rows ends
-    the comparison rather than block catch-up for ever.
+    at the current one. Each command of a page at a kept position is
+    compared with what was executed there: another command, revision
+    or result digest stops the voter as a `CatchUpDivergence`, as a
+    pulled command's does. The rest of the page is installed as usual.
+  - While anything expected or kept is left, the next ask goes on from
+    where the last page stopped, at once when this replica has executed
+    past it. A donor that can no longer show those rows ends the
+    comparison rather than block catch-up for ever.
 - **No campaign over a window.** A follower with a window installed and
   not yet executed refuses to campaign (`FollowerRejection::CatchingUp`).
   A won campaign changes the role, and the window's comparison is the
@@ -6488,5 +6492,10 @@ never closed its gap.
   command, and the first page after the boot stops the voter there,
   naming both executions.
 - `a_voter_holding_a_window_does_not_campaign_until_it_ran`.
+- `every_restored_commit_is_compared_however_many_pages_it_takes`: the
+  restart executes a restored window whose eleventh command differs,
+  the donor's pages carry three commands each, and the comparison goes
+  on page after page until it stops the voter there. It fails when the
+  kept executions are capped below the window.
 - task-d08's eight catch-up tests pass unchanged, as do the protocol
   simulator and the `coord-daemon` suites.

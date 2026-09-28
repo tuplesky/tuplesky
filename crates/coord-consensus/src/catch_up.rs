@@ -31,14 +31,14 @@
 //! voter executed since then -- a window installed before the crash
 //! included -- is compared with the donor's too ([`SinceBoot`]).
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_core::effect::BarrierId;
 use coord_types::CommandId;
 use coord_types::identity::Digest32;
 use coord_types::ids::{Ballot, ExecutionPosition, KvRevision, ReplicaId};
 
-use crate::messages::{CatchUpEntry, MAX_CATCH_UP_COMMANDS};
+use crate::messages::CatchUpEntry;
 
 /// What a donor said a pulled command executed as (task-d08).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,48 +134,59 @@ impl CatchUp {
     }
 }
 
-/// What a replica executed after the frontier it booted at, kept until a
-/// donor's page covers it (task-d25).
+/// What a replica executed after the frontier it booted at that a donor
+/// has not confirmed yet (task-d25).
 ///
 /// A window's batch makes every command of it a durable commit, and a
 /// replica that crashes in the middle of the window executes the rest
 /// after its restart through the ordinary learner, with the page and the
-/// donor's word gone. So the first ask after a boot starts at the
-/// frontier read at boot rather than at the current one, and each
-/// command of that page at or below the current frontier is compared with
-/// what this replica executed there. At most a window's worth is kept:
-/// the only executions a donor has not confirmed are one window's, and
-/// they are the first after the boot frontier, since that window's first
-/// command is the one at the frontier's next position.
+/// donor's word gone. So the commits restored at boot and not executed
+/// are expected: each one's execution is kept, by position, and the
+/// first ask after a boot starts at the frontier read at boot rather than
+/// at the current one. Each command of a page at a kept position is
+/// compared with what this replica executed there, and asks go on from
+/// where the last page stopped until nothing expected or kept is left.
+/// Bounded by the restored commits, which the table bounds: an execution
+/// of anything else was never pulled, and the protocol decided it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SinceBoot {
-    /// Where the next ask starts while what is kept waits for a donor:
-    /// the boot frontier, then the last position a page compared. `None`
-    /// once a page has covered what was kept.
+    /// Where the next ask starts while something waits for a donor: the
+    /// boot frontier, then the last position a page covered. `None` once
+    /// nothing does.
     pub(crate) from: Option<ExecutionPosition>,
-    /// The executions after `from`, in position order.
-    pub(crate) outcomes: VecDeque<(CommandId, OwnExecution)>,
+    /// Commits restored at boot and not executed yet.
+    pub(crate) expected: BTreeSet<CommandId>,
+    /// Executions of those, by position, not yet compared.
+    pub(crate) outcomes: BTreeMap<ExecutionPosition, (CommandId, OwnExecution)>,
 }
 
 impl SinceBoot {
-    /// Keep what executes after `frontier`, the one read at boot.
-    pub(crate) fn at(frontier: ExecutionPosition) -> Self {
+    /// Compare the executions of `expected` after `frontier`, the one
+    /// read at boot.
+    pub(crate) fn at(frontier: ExecutionPosition, expected: BTreeSet<CommandId>) -> Self {
         SinceBoot {
-            from: Some(frontier),
-            outcomes: VecDeque::new(),
+            from: (!expected.is_empty()).then_some(frontier),
+            expected,
+            outcomes: BTreeMap::new(),
         }
     }
 
-    /// Keep this execution, while a window's worth is not kept already.
+    /// Keep this execution if it is one of the restored commits.
     pub(crate) fn note(&mut self, command: CommandId, own: OwnExecution) {
-        if self.from.is_some() && self.outcomes.len() < MAX_CATCH_UP_COMMANDS {
-            self.outcomes.push_back((command, own));
+        if self.from.is_some() && self.expected.remove(&command) {
+            self.outcomes.insert(own.position, (command, own));
         }
+    }
+
+    /// Whether anything still waits for a donor.
+    pub(crate) fn waiting(&self) -> bool {
+        !self.expected.is_empty() || !self.outcomes.is_empty()
     }
 
     /// Nothing more to compare.
     pub(crate) fn done(&mut self) {
         self.from = None;
-        self.outcomes = VecDeque::new();
+        self.expected = BTreeSet::new();
+        self.outcomes = BTreeMap::new();
     }
 }
