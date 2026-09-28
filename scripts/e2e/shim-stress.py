@@ -60,8 +60,15 @@ def parse():
     p.add_argument("--bin", default=os.path.join(ROOT, "target", "debug"),
                    help="directory holding coordd, coord-harness and coord-jepsen")
     p.add_argument("--seconds", type=float, default=120)
-    p.add_argument("--fault", choices=["none", "leader", "random", "pause", "majority", "all", "pause-majority"], default="leader")
+    p.add_argument("--fault", choices=["none", "leader", "random", "pause", "majority", "all", "pause-majority",
+                                       "follower-out"], default="leader")
+    p.add_argument("--out", type=float, default=30,
+                   help="with --fault follower-out: seconds a follower stays down")
+    p.add_argument("--capacity", type=int,
+                   help="each voter's command table capacity (limits.command_table_capacity)")
     p.add_argument("--clients", type=int, default=6)
+    p.add_argument("--rate", type=float,
+                   help="operations a second across all clients (default: as fast as answered)")
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--interval", type=float, default=20, help="seconds between faults")
     p.add_argument("--recovery", type=float, default=45, help="seconds to wait before the final read")
@@ -113,6 +120,19 @@ def up():
     subprocess.run([os.path.join(A.bin, "coord-harness"), "provision", "--dir", RUN],
                    check=True, stdout=subprocess.DEVNULL)
     for n in (1, 2, 3):
+        if A.capacity is not None:
+            toml = os.path.join(RUN, f"n{n}", "coordd.toml")
+            with open(toml) as f:
+                text = f.read()
+            line = f"command_table_capacity = {A.capacity}\n"
+            if "\n[limits]\n" in text:
+                text = text.replace("\n[limits]\n", "\n[limits]\n" + line, 1)
+            else:
+                # A [limits] table names every limit; these are the defaults.
+                text += ("\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n"
+                         "max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n" + line)
+            with open(toml, "w") as f:
+                f.write(text)
         subprocess.run([COORDD, "--config", os.path.join(RUN, f"n{n}", "coordd.toml"), "init"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         start(n)
@@ -149,6 +169,10 @@ def client(i):
                     history.append(["open-fail", i, ready.get("error")])
                 time.sleep(0.5)
                 continue
+        if A.rate:
+            # Each client takes its share of the rate; an operation that
+            # took longer than its slot is not made up for.
+            stop.wait(A.clients / A.rate)
         mops = []
         for _ in range(random.randint(1, 3)):
             k = random.randrange(A.keys)
@@ -252,6 +276,29 @@ def nemesis():
             log(f"restarted voters {pair}")
             stop.wait(A.interval)
             continue
+        if A.fault == "follower-out":
+            # #113's shape: one follower down for --out seconds while
+            # the others take the load, then back. Reported: how long after
+            # its restart it first serves a read, and whether it refused
+            # work as Backpressure after that. Once, then no more faults.
+            n = next(m for m in (1, 2, 3) if m != leader())
+            daemons[n].kill()
+            daemons[n].wait()
+            with lock:
+                before = counter[0]
+            log(f"took voter {n} out")
+            stop.wait(A.out)
+            with lock:
+                during = counter[0] - before
+            back = time.time()
+            start(n)
+            log(f"brought voter {n} back after {A.out:.0f}s; about {during} appends went on without it")
+            served = probe(n, back)
+            log(f"voter {n} served a read {served:.1f}s after it came back" if served is not None
+                else f"voter {n} served no read within 60s of coming back")
+            with lock:
+                history.append(["follower-out", n, during, served])
+            break
         if A.faults is not None:
             if not A.faults:
                 break
@@ -275,6 +322,28 @@ def nemesis():
             start(n)
             log(f"restarted voter {n}")
         stop.wait(A.interval)
+
+
+def probe(n, since):
+    """Seconds after `since` at which voter n first served a read, or None."""
+    attempt = 0
+    while time.time() - since < 60:
+        attempt += 1
+        p, ready = open_shim(n, 50000 + attempt)
+        if p is None:
+            log(f"probe of voter {n}: no session at +{time.time() - since:.1f}s: {ready.get('error')}")
+            time.sleep(0.5)
+            continue
+        p.stdin.write(json.dumps({"f": "txn", "value": [["r", 0, None]]}) + "\n")
+        p.stdin.flush()
+        answer = json.loads(p.stdout.readline() or '{"type": "fail"}')
+        p.stdin.close()
+        p.wait()
+        if answer["type"] == "ok":
+            return time.time() - since
+        log(f"probe of voter {n}: {answer.get('type')} at +{time.time() - since:.1f}s: {answer.get('error')}")
+        time.sleep(0.5)
+    return None
 
 
 def final_read():

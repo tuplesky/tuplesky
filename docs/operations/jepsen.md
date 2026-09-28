@@ -302,7 +302,11 @@ voter (or pauses one) every so often, one at a time, or kills the leader
 and one other voter at once (`--fault majority`), or every voter and then
 the leader (`--fault all`), or pauses both followers while the leader
 takes submissions alone, then kills the leader and lifts the pause
-(`--fault pause-majority`). It reads every key at the end, and checks the
+(`--fault pause-majority`), or takes one follower down for `--out`
+seconds and reports how soon after its restart it serves a read
+(`--fault follower-out`, the shape of #113). `--rate` holds the clients to
+that many operations a second between them, and `--capacity` sets each
+voter's command table capacity. It reads every key at the end, and checks the
 history with the checks a list-append history can be held to without
 Elle: every read of a key is a prefix of the
 final list, nothing appears twice, no failed append is read, an append
@@ -1221,6 +1225,31 @@ domains:
 * **The kill runs' dials:** every "cannot reach a voter" again named the
   peer address's own `Rejected(Transport("connection lost"))`, 161 lines
   over the 12 runs.
+
+`44b4bab` carries #113 at `d4bd28c`: a voter behind by more than a table
+asks a peer for the commands executed after its own frontier, one page at
+a time. Local runs on it, `--fault follower-out --out 30
+--capacity 32 --clients 6` (a table of 32, so every run leaves the
+follower many tables behind), fresh domains:
+
+| `--rate` | Runs | Behind at its restart | Served a read after | Executed at end (leader, follower) | Anomaly |
+| --- | --- | --- | --- | --- | --- |
+| 20 (4 clients) | 3 | 406 to 437 appends | 6.1 s, 6.9 s, 5.8 s | equal | none |
+| 50 | 1 | 936 appends | 10.7 s | 7250, 7250 | none |
+| 100 (about 54 appends a second answered) | 1 | 1617 appends | 30.6 s | 11056, 11056 | none |
+| none (about 113 appends a second) | 1 | 3400 appends | not within 60 s | 17506, 9912 | none |
+
+* **#113's 30-s acceptance holds on `coordd`** at its own load (20
+  operations a second): the follower serves 6 to 7 s after it restarts,
+  store recovery included.
+* **Catch-up runs at about 100 commands a second** on this host. Each
+  pulled command is installed, made durable, and only then executed, one
+  at a time, so every command costs two storage round trips. A follower
+  closes its gap at the difference between that and the domain's own
+  rate: under an unthrottled load it never does. After that run's load
+  stopped it went on catching up, but was still 7594 behind when the
+  domain was stopped.
+* No run stopped a voter, and every run's final lists agreed.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
