@@ -238,8 +238,10 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
 * for the TupleSky job, one row per voter from its `coordd.log`: boots,
   the position it last recovered at, its last role, its highest ballot,
   and its stops, panics, `HalfInitialized`, `IncompatibleAccepted`,
-  `CandidateBehind`, `BehindVoters`, `Backpressure` and
-  `ProposalRepublished`. TLS alert 120 is not counted: a dial to a node's
+  `CandidateBehind`, `BehindVoters`, `Backpressure`,
+  `ProposalRepublished`, and "cannot reach a voter" (a dial that reached
+  none of a voter's addresses; the log line says why each failed). TLS
+  alert 120 is not counted: a dial to a node's
   other listener is refused that way by design. A refusal the daemon logs
   as "(N so far)" counts the highest N in each boot. A last column counts
   `ProposalRepublished` after the final start, from the last "Jepsen
@@ -295,8 +297,11 @@ provisions a domain into a new directory, runs several clients doing
 list-append transactions on a few contended keys, kills and restarts a
 voter (or pauses one) every so often, one at a time, or kills the leader
 and one other voter at once (`--fault majority`), or every voter and then
-the leader (`--fault all`), reads every key at the end, and checks the history with the checks a list-append history
-can be held to without Elle: every read of a key is a prefix of the
+the leader (`--fault all`), or pauses both followers while the leader
+takes submissions alone, then kills the leader and lifts the pause
+(`--fault pause-majority`). It reads every key at the end, and checks the
+history with the checks a list-append history can be held to without
+Elle: every read of a key is a prefix of the
 final list, nothing appears twice, no failed append is read, an append
 reported `ok` is in every read that began after it, and no two `ok`
 transactions read the same value of a key and then both appended to it

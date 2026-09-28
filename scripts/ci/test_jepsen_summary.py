@@ -46,13 +46,14 @@ this voter leads ballot 0
 this voter's machine refused: Backpressure (1 so far)
 this voter's machine refused: Backpressure (2 so far)
 this voter's machine refused: Backpressure (4 so far)
+cannot reach a voter on the peer plane: voter 03 Control: 127.0.0.1:7003: Rejected(Transport("connection lost")) (2 so far)
 metrics {"stages":[]}
 coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true
 recovered promise=Some(1) records=10 payloads=10 executed=9 history=0 frontier=9 position=9
 this voter follows ballot 3 led by 02020202
 this voter's machine refused: Backpressure (1 so far)
 this voter's machine refused: Promise(CandidateBehind { candidate: ExecutionPosition(1), own: ExecutionPosition(9) }) (1 so far)
-cannot reach a voter on the peer plane: voter 02 Control: Connect("error 120: no protocol") (3 so far)
+cannot reach a voter on the peer plane: voter 02 Control: 127.0.0.1:7002: Rejected(Transport("connection lost")) (3 so far)
 """
 
 
@@ -78,6 +79,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(v.ballot, 3)
         self.assertEqual(v.counts["Backpressure"], 5)
         self.assertEqual(v.counts["CandidateBehind"], 1)
+        self.assertEqual(v.counts["cannot reach a voter"], 5)
         # The other plane's refusal is by design, not a failure.
         self.assertNotIn("alert 120", v.counts)
         self.assertNotIn("stopped", v.counts)

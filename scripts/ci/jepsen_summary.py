@@ -55,6 +55,8 @@ MARKERS = (
     ("BehindVoters", "BehindVoters"),
     ("Backpressure", "Backpressure"),
     ("ProposalRepublished", "ProposalRepublished"),
+    # A dial that reached none of a voter's addresses, and why (task-d16).
+    ("cannot reach a voter", "cannot reach a voter"),
 )
 # Not counted: TLS alert 120 (no_application_protocol). A node lists both of
 # its listeners without saying which is which, so a dial to the other

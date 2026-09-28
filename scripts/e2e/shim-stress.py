@@ -13,9 +13,13 @@ Faults: `none`, `leader` (kill the voter that last said it leads, then
 restart it), `random` (kill any voter, then restart it), `pause` (SIGSTOP
 a voter for eight seconds), all one voter at a time so a majority is
 always up; `majority` (kill the leader and one other voter at once,
-restart both five seconds later), which takes the quorum away; and `all`
+restart both five seconds later), which takes the quorum away; `all`
 (kill every voter at once and restart them, then an interval later kill
-and restart whichever leads).
+and restart whichever leads); and `pause-majority` (SIGSTOP both of the
+leader's followers for ten seconds while clients go on submitting to the
+leader, kill the leader, resume the followers with what queued for them,
+and restart the leader five seconds later): the three-voter form of a
+five-node Jepsen run's window before a divergence stop.
 `--faults 2,1` replaces the random choice with a fixed sequence of voters
 to kill and restart, one per interval, and then no more faults: a run
 that went wrong can be replayed on purpose.
@@ -56,7 +60,7 @@ def parse():
     p.add_argument("--bin", default=os.path.join(ROOT, "target", "debug"),
                    help="directory holding coordd, coord-harness and coord-jepsen")
     p.add_argument("--seconds", type=float, default=120)
-    p.add_argument("--fault", choices=["none", "leader", "random", "pause", "majority", "all"], default="leader")
+    p.add_argument("--fault", choices=["none", "leader", "random", "pause", "majority", "all", "pause-majority"], default="leader")
     p.add_argument("--clients", type=int, default=6)
     p.add_argument("--keys", type=int, default=4)
     p.add_argument("--interval", type=float, default=20, help="seconds between faults")
@@ -207,6 +211,29 @@ def nemesis():
             stop.wait(5)
             start(n)
             log(f"restarted voter {n}")
+            stop.wait(A.interval)
+            continue
+        if A.fault == "pause-majority":
+            # The leader runs alone with both followers paused, taking
+            # submissions it cannot commit; it is killed, and the pause
+            # lifts with the followers' backlog.
+            first = leader()
+            followers = [m for m in (1, 2, 3) if m != first]
+            paused = [m for m in followers if daemons[m].poll() is None]
+            for m in paused:
+                daemons[m].send_signal(signal.SIGSTOP)
+            log(f"paused voters {paused}; voter {first} leads alone")
+            stop.wait(10)
+            if daemons[first].poll() is None:
+                daemons[first].kill()
+                daemons[first].wait()
+            log(f"killed voter {first}, the leader")
+            for m in paused:
+                daemons[m].send_signal(signal.SIGCONT)
+            log(f"resumed voters {paused}")
+            stop.wait(5)
+            start(first)
+            log(f"restarted voter {first}")
             stop.wait(A.interval)
             continue
         if A.fault == "majority":
