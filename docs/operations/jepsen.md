@@ -1116,8 +1116,8 @@ its followers had committed among themselves.
     (ballot 3), republished one command twice. Its log ends with the
     peers reconnecting after the final start, not with a republish.
   * etcd 3.7.2: `:valid? true`, with 1611 `ok` of 2481. All six pauses
-    returned, each within about 60 ms, four of them of all five nodes, one
-    right after `:kill :all`.
+    returned, each within about 60 ms: five of them of all five nodes, one
+    2 s after `:kill :all`.
 
 ### Under Jepsen: a domain that no longer binds sessions
 
