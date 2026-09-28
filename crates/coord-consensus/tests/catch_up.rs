@@ -670,6 +670,11 @@ fn a_voter_past_a_full_table_catches_up_and_its_table_drains() {
             .filter(|(_, r)| r.payload.is_some() && r.phase < Phase::Executed)
             .count();
         assert_eq!(live, 0, "seed {seed}: the table did not drain");
+        assert!(
+            f.table().records().count() <= capacity,
+            "seed {seed}: pulled commands were left in the table past its capacity: {}",
+            f.table().records().count()
+        );
         // And it takes new work as any voter does.
         cluster.nodes[4].follower_mut().take_rejections();
         for seq in 61..=61 + capacity as u64 * 2 {
@@ -830,7 +835,11 @@ fn a_command_the_donor_keeps_no_row_of_goes_to_history() {
     cluster.settle();
     let f = cluster.follower(4);
     assert_eq!(f.catch_up_divergence(), None);
-    assert_eq!(cluster.nodes[4].executed.last(), Some(&bare));
+    // At the donor's position; the short page is followed by the rest.
+    assert_eq!(
+        cluster.nodes[4].executed.get(after.get() as usize),
+        Some(&bare)
+    );
     assert_eq!(f.table().phase_of(&bare), Some(Phase::Executed));
     assert!(
         f.table().record(&bare).is_none(),
@@ -864,4 +873,26 @@ fn a_failed_installation_is_installed_again() {
     cluster.settle_ticking(8);
     assert_eq!(cluster.nodes[4].executed, cluster.nodes[0].executed);
     assert!(!cluster.follower(4).holds_unexecuted());
+}
+
+/// A page cut short of what the donor executed -- by the byte bound as
+/// much as the command bound -- is followed by the next ask as soon as it
+/// is executed, without waiting for the pacer (task-d08).
+#[test]
+fn a_page_short_of_the_donors_frontier_is_followed_at_once() {
+    let (mut cluster, _) = left_behind(17);
+    let after = cluster.follower(4).executed_through();
+    let mut page = cluster.page(0, ballot0(), after);
+    let ProtocolMessage::CatchUpPage { entries, .. } = &mut page else {
+        unreachable!()
+    };
+    // What a donor sends when three commands reach the byte bound.
+    entries.truncate(3);
+    assert!(cluster.catching.is_empty(), "no pacer in this test");
+    cluster.deliver_page(4, 0, &page);
+    cluster.settle();
+    assert_eq!(
+        cluster.nodes[4].executed, cluster.nodes[0].executed,
+        "r4 stopped after a short page"
+    );
 }

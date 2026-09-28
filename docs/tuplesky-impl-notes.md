@@ -5518,7 +5518,12 @@ behind by more than a table is sent nothing it can use.
   executed, so the pacer is the floor for an ask nobody answered. The
   pacer registers its next look as a serve-loop deadline, so an idle
   follower with held work, which has no election deadline, still wakes
-  to ask and to ask again.
+  to ask and to ask again. A voter also asks once after it starts,
+  whatever it holds: a restart forgets the page, and a command whose
+  donor kept no row leaves none here either until it executes, so a
+  voter restarted behind can hold nothing that would prompt an ask. A
+  page taken whole that stops short of the donor's `through` (the
+  command bound or the byte bound) is followed at once.
 - The donor answers only a voter of its configuration, only at a ballot
   it is synchronized at (it leads it, or follows it with its Sync
   installed), only while it has not itself stopped, and only up to its
@@ -5552,7 +5557,10 @@ behind by more than a table is sent nothing it can use.
   command goes to history once executed: nothing is reported committed
   with other than the decided dependencies.
 - While a pulled command waits, `next_executable` offers it alone: it is
-  the command at this voter's next position.
+  the command at this voter's next position. Once executed it is retired
+  from the table at once, decided or not: it came in past the table's
+  capacity, and installation does not reclaim, so a voter far behind
+  would otherwise hold its whole missed history in the table.
 - After execution the voter compares position, revision and result
   digest with the donor's executed row. A difference is
   `CatchUpDivergence`: the machine executes nothing more, and `coordd`
@@ -5613,8 +5621,12 @@ behind by more than a table is sent nothing it can use.
   - `a_failed_installation_is_installed_again`: two failed installation
     batches, and r4 still catches up; with the entry left waiting on the
     failed batch it wedges and the test fails.
-  - Negative control: with pages refused on arrival, the first six
-    fail.
+  - `a_page_short_of_the_donors_frontier_is_followed_at_once`: a page
+    of three, with no pacer, and r4 still catches up.
+  - Negative controls: with pages refused on arrival, the first six
+    fail; with only a 64-command page followed at once, the short-page
+    test fails; with executed pulled commands left in the table, the
+    drain test finds 60 records in a table of 8.
 - `coord-daemon` `tests/catch_up.rs`,
   `a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal`:
   three voters over model-engine stores, a table of eight, r2 cut off

@@ -1603,8 +1603,7 @@ impl Follower {
     /// sends a command the donor kept no decided record of to history,
     /// so the record this replica had of it is never reported as one.
     fn check_pulled(&mut self, command: CommandId, outcome: &AppliedOutcome) {
-        let Some(Running { donor, decided, .. }) =
-            self.catch_up.running.take_if(|r| r.command == command)
+        let Some(Running { donor, .. }) = self.catch_up.running.take_if(|r| r.command == command)
         else {
             return;
         };
@@ -1622,9 +1621,13 @@ impl Follower {
             return;
         }
         self.catch_up.executed += 1;
-        if !decided {
-            let _ = self.table.retire(&command);
-        }
+        // Retired as soon as it is executed, decided or not: pulled
+        // commands are let into the table past its capacity, and one left
+        // behind each would grow it by the whole missed history, since
+        // installation does not reclaim. A command the donor kept no row
+        // of is never reported; one it did stays in the durable ledger
+        // until the history sweep, as any executed command does.
+        let _ = self.table.retire(&command);
     }
 
     fn diverge(&mut self, command: CommandId, donor: DonorExecution, own: Option<OwnExecution>) {
@@ -1727,6 +1730,7 @@ impl Follower {
         from: ReplicaId,
         ballot: Ballot,
         after: ExecutionPosition,
+        through: ExecutionPosition,
         entries: Vec<CatchUpEntry>,
     ) -> Vec<Effect> {
         let at = self.config.quorum.ballot();
@@ -1763,11 +1767,11 @@ impl Follower {
             return Vec::new();
         }
         self.catch_up.pages += 1;
-        // A full page, taken whole, is followed by the next ask as soon as
-        // it is executed: a replica thousands of commands behind should
-        // not wait a timer's period per page.
-        self.catch_up.continue_from =
-            (taken == offered && taken >= MAX_CATCH_UP_COMMANDS).then_some(from);
+        // A page taken whole that stops short of what the donor executed
+        // -- it hit the command bound or the byte bound -- is followed by
+        // the next ask as soon as it is executed: a replica thousands of
+        // commands behind should not wait a timer's period per page.
+        self.catch_up.continue_from = (taken == offered && next < through).then_some(from);
         self.install_catch_up()
     }
 
@@ -1896,7 +1900,6 @@ impl Follower {
         self.catch_up.running = Some(Running {
             command,
             donor: expected,
-            decided: entry.decided.is_some(),
             barrier,
             durable: false,
             entry,
@@ -3119,9 +3122,9 @@ impl Follower {
             ProtocolMessage::CatchUpPage {
                 ballot,
                 after,
+                through,
                 entries,
-                ..
-            } => self.on_catch_up_page(from.replica, ballot, after, entries),
+            } => self.on_catch_up_page(from.replica, ballot, after, through, entries),
             // Answered by the runtime, from this replica's durable rows:
             // the machine keeps no executed history to answer from.
             ProtocolMessage::CatchUpRequest { .. } => Vec::new(),

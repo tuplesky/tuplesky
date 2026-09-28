@@ -11,7 +11,9 @@
 //! The requester half, [`Pacer`], decides when a voter asks and whom. A
 //! voter that holds work it is not executing, and whose frontier has not
 //! moved for [`STILL_FOR`], asks the leader; one that is not answered
-//! asks the other voters in turn. The machine asks again at once when a
+//! asks the other voters in turn. A voter asks once after it starts,
+//! whatever it holds, since a restart can leave it behind holding
+//! nothing. The machine asks again at once when a
 //! full page is executed, so the pacer is the floor for an ask nobody
 //! answered, not the rate a voter catches up at.
 
@@ -258,9 +260,16 @@ pub struct Pacer {
     /// Asks gone unanswered since the frontier last moved.
     unanswered: u32,
     /// Whether the last turn found a voter that may have to ask: one
-    /// that holds work, does not lead, and has no page in hand. Only
-    /// such a voter has a deadline ([`Pacer::next_deadline`]).
+    /// that holds work (or has not asked since it started), does not
+    /// lead, and has no page in hand. Only such a voter has a deadline
+    /// ([`Pacer::next_deadline`]).
     wanting: bool,
+    /// Whether this voter has asked since it started. A voter restarted
+    /// behind can hold nothing at all -- its catch-up state is not
+    /// durable, and a page's command the donor kept no row of leaves no
+    /// row here either until it executes -- so it asks once, whatever it
+    /// holds, and a donor with nothing past its frontier answers nothing.
+    probed: bool,
     /// Asks made (diagnostic).
     pub asks: u64,
 }
@@ -278,7 +287,8 @@ impl Pacer {
         leader: ReplicaId,
         voters: &[ReplicaId],
     ) -> Option<ReplicaId> {
-        self.wanting = standing.holds && !standing.leads && !standing.busy;
+        let holds = standing.holds || !self.probed;
+        self.wanting = holds && !standing.leads && !standing.busy;
         let moved = self.still.is_none_or(|(at, _)| at != standing.executed);
         if moved || standing.busy {
             self.still = Some((standing.executed, now));
@@ -286,7 +296,7 @@ impl Pacer {
             self.unanswered = 0;
             return None;
         }
-        if standing.leads || !standing.holds {
+        if standing.leads || !holds {
             self.asked = None;
             self.unanswered = 0;
             return None;
@@ -312,6 +322,10 @@ impl Pacer {
             *others.get(turn % others.len().max(1))?
         };
         self.asks += 1;
+        self.probed = true;
+        // Probed now: a voter that holds nothing has no more reason to
+        // wake for this one.
+        self.wanting = standing.holds;
         Some(donor)
     }
 
@@ -460,12 +474,34 @@ mod tests {
         assert_eq!(alone.next_deadline(), Some(t + UNANSWERED));
     }
 
+    /// A voter asks once after it starts, whatever it holds, and then
+    /// only when it holds work: a restart can leave it behind holding
+    /// nothing (task-d08).
+    #[test]
+    fn a_started_voter_asks_once_whatever_it_holds() {
+        let voters = [r(1), r(2), r(3)];
+        let t0 = Instant::now();
+        let mut pacer = Pacer::default();
+        pacer.due(t0, standing(5, false), r(3), r(1), &voters);
+        assert_eq!(pacer.next_deadline(), Some(t0 + STILL_FOR));
+        let t = t0 + STILL_FOR;
+        assert_eq!(
+            pacer.due(t, standing(5, false), r(3), r(1), &voters),
+            Some(r(1))
+        );
+        assert_eq!(pacer.next_deadline(), None);
+        let t = t + UNANSWERED * 3;
+        assert_eq!(pacer.due(t, standing(5, false), r(3), r(1), &voters), None);
+    }
+
     #[test]
     fn a_voter_with_nothing_held_or_that_leads_does_not_ask() {
         let voters = [r(1), r(2), r(3)];
         let t0 = Instant::now();
         let mut pacer = Pacer::default();
+        // The probe after start, out of the way.
         pacer.due(t0, standing(5, false), r(3), r(1), &voters);
+        pacer.due(t0 + STILL_FOR, standing(5, false), r(3), r(1), &voters);
         let t = t0 + STILL_FOR * 3;
         assert_eq!(pacer.due(t, standing(5, false), r(3), r(1), &voters), None);
         let leads = Standing {

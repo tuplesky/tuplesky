@@ -81,8 +81,6 @@ pub(crate) struct Running {
     pub(crate) command: CommandId,
     /// What the donor executed it as.
     pub(crate) donor: DonorExecution,
-    /// Whether the donor's decided record came with it.
-    pub(crate) decided: bool,
     /// The batch that made its installation durable.
     pub(crate) barrier: BarrierId,
     /// Whether that batch is durable: a pulled command executes only once
