@@ -182,7 +182,8 @@ and its behaviour under faults have something to be compared with:
     Jepsen uses, `gen/stagger` is exponential and capped at 100 s, so the
     namespace draws its own uniform delays.) The job copies that namespace
     into the etcd test and routes its packages through it, so both tests
-    keep one schedule.
+    keep one schedule. Runs from `f12fee0` on are a new series: compare
+    their `ok` counts with each other, not with earlier runs.
 
 Its store is the `jepsen-store-etcd-append` artifact.
 
