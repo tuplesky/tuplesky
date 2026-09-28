@@ -80,6 +80,33 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(v.counts["CandidateBehind"], 1)
         self.assertEqual(v.counts["alert 120"], 3)
         self.assertNotIn("stopped", v.counts)
+        self.assertEqual(v.after_start, {})
+
+    def test_counts_after_the_final_start(self):
+        republished = "this voter's machine refused: ProposalRepublished(CommandIdDigest32(ab)) ({} so far)\n"
+        running = [
+            "coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true\n",
+            republished.format(1),
+            "2026-09-28 02:40:28 Jepsen starting  /opt/tuplesky/coordd --config coordd.toml\n",
+            republished.format(1),  # an earlier start: not the final one
+            republished.format(2),
+            "2026-09-28 02:45:28 Jepsen starting  /opt/tuplesky/coordd --config coordd.toml\n",
+            "/opt/tuplesky/coordd already running.\n",
+            republished.format(4),
+            republished.format(8),
+        ]
+        v = js.parse_voter(running)
+        self.assertEqual(v.counts["ProposalRepublished"], 8)
+        self.assertEqual(v.after_start, {"ProposalRepublished": 6})
+        # Started again by the final heal: its new boot counts from zero.
+        restarted = running[:6] + [
+            "coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true\n",
+            republished.format(1),
+        ]
+        v = js.parse_voter(restarted)
+        self.assertEqual(v.after_start, {"ProposalRepublished": 1})
+        # Quiet after the final start.
+        self.assertEqual(js.parse_voter(running[:7]).after_start, {})
 
 
 class SummaryTests(unittest.TestCase):

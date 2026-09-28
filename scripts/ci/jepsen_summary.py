@@ -65,6 +65,8 @@ BALLOT = re.compile(r"ballot (\d+)")
 # `[:no-client "throw+: {:type :ns/kind, ... :error \"why\"}"]`
 SLINGSHOT = re.compile(r':type :[\w.-]+/([\w-]+).*?:error \\?"([^"\\]*)')
 RECOVERED = re.compile(r"^recovered .*\bexecuted=(\d+)")
+# Written into the log by Jepsen's start-daemon!, one per :start of the node.
+STARTING = "Jepsen starting "
 
 
 @dataclass
@@ -85,6 +87,10 @@ class Voter:
     role: str = "-"
     ballot: int | None = None
     counts: dict = field(default_factory=dict)
+    # Counted the same way from the last "Jepsen starting" line on: the
+    # final heal starts every node (or finds it running) and says so in
+    # its log, so this is what a voter did after the final heal.
+    after_start: dict = field(default_factory=dict)
 
 
 def parse_time(ts: str) -> datetime.datetime:
@@ -130,13 +136,29 @@ def parse_results(text: str) -> tuple[str, list[str]]:
 def parse_voter(lines) -> Voter:
     v = Voter()
     boot: dict = {}
+    # The current boot's counts when the last "Jepsen starting" was seen,
+    # or None before it.
+    base: dict | None = None
+
+    def since_start():
+        for k, n in boot.items():
+            if n > base.get(k, 0):
+                v.after_start[k] = v.after_start.get(k, 0) + n - base.get(k, 0)
+
     for line in lines:
         if line.startswith("metrics "):
+            continue
+        if STARTING in line:
+            v.after_start = {}
+            base = dict(boot)
             continue
         if line.startswith("coordd domain="):
             v.boots += 1
             for k, n in boot.items():
                 v.counts[k] = v.counts.get(k, 0) + n
+            if base is not None:
+                since_start()
+                base = {}
             boot = {}
             continue
         m = RECOVERED.match(line)
@@ -155,6 +177,8 @@ def parse_voter(lines) -> Voter:
                 boot[key] = max(boot.get(key, 0), n)
     for k, n in boot.items():
         v.counts[k] = v.counts.get(k, 0) + n
+    if base is not None:
+        since_start()
     return v
 
 
@@ -303,12 +327,17 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         keys = [k for k, _ in MARKERS]
         out.append("**Voters** (from each `coordd.log`; a refusal counts the highest \"so far\" in each boot)")
         out.append("")
-        out.append("| Node | Boots | Executed at last boot | Last role | Highest ballot | " + " | ".join(keys) + " |")
-        out.append("| --- " * (5 + len(keys)) + "|")
+        out.append(
+            "| Node | Boots | Executed at last boot | Last role | Highest ballot | "
+            + " | ".join(keys)
+            + " | ProposalRepublished after the final start |"
+        )
+        out.append("| --- " * (6 + len(keys)) + "|")
         for node, v in voters.items():
             counts = " | ".join(str(v.counts.get(k, 0)) for k in keys)
             ballot = "-" if v.ballot is None else str(v.ballot)
-            out.append(f"| {node} | {v.boots} | {v.executed} | {v.role} | {ballot} | {counts} |")
+            after = v.after_start.get("ProposalRepublished", 0)
+            out.append(f"| {node} | {v.boots} | {v.executed} | {v.role} | {ballot} | {counts} | {after} |")
         out.append("")
     return "\n".join(out) + "\n"
 

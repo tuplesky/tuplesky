@@ -239,7 +239,11 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   and its stops, panics, `HalfInitialized`, `IncompatibleAccepted`,
   `CandidateBehind`, `BehindVoters`, `Backpressure`,
   `ProposalRepublished` and TLS alert 120. A refusal the daemon logs as
-  "(N so far)" counts the highest N in each boot.
+  "(N so far)" counts the highest N in each boot. A last column counts
+  `ProposalRepublished` after the final start, from the last "Jepsen
+  starting" line the final heal writes into every node's log. A leader
+  that goes on republishing its lease command after the heal, the stall
+  task-d15 closed, shows there.
 
 The last 400 lines of each voter's log follow in the TupleSky job's log.
 
