@@ -5662,3 +5662,52 @@ behind by more than a table is sent nothing it can use.
 - The two-voter 100 s partition and the 30 s follower partition are to
   be run on `coordd` and in Jepsen with this carried; the job's
   `coord-jepsen-executed --last` is #98's.
+
+## A Sync never lowers a durable promise
+
+task-d18, from the checklist review (items D1 and D4). A voter that had
+promised P1 durably accepted a `NewLeader` for P3 and queued the promise
+row `{P3}`. P1's delayed Sync then passed `Follower::on_sync`: its ballot
+equalled the durable promise, and unlike `may_vote` it never looked at a
+promise in flight. `BallotState::mark_synced` built `{promised: P1,
+synced: P1}` and queued it after the P3 row. The journal applies rows in
+order, so the durable promise ended at P1 after the voter had published
+`Promise(P3)`, and a crash brought it back willing to vote in P1. This
+happens at any cluster size.
+
+### The rule
+
+- A Sync of the promised ballot that arrives while a higher promise is in
+  flight is held in `Follower::sync_behind_promise`, as a Sync ahead of
+  the promise is held in `early_sync`. After every storage event it is
+  dropped (`SyncSuperseded`) once a higher promise is durable, and
+  installed once no higher promise is in flight, which means every higher
+  promise's row failed.
+- Every write of the promise row carries the highest promise already
+  queued for disk (`BallotState::highest_queued`). A promise from
+  `on_new_leader` carries a ballot above it by construction. A Sync's row
+  carries the bound itself, so it can never fall below a promise in
+  flight, even if a later change lets one through. The seal writes its
+  own row, not the promise row.
+- Nothing changes in the commit rule, the Sync's selection or any row
+  format.
+
+### Evidence
+
+- `a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise`
+  (`coord-consensus`, `activation`): the checklist review's probe. At
+  `d4bd28c` the durable row reads `promised: (1, 2)` after `Promise(3,
+  0)` was published. It passes now.
+- `no_order_of_two_promises_and_a_sync_lowers_the_durable_promise`
+  (`activation`): a model of every order of `NewLeader` for P1 and P3,
+  P1's Sync, and each queued row completing durably or failing, in
+  journal order (92 complete orders). After every step, the durable
+  promise is at least every ballot a `Promise` was published for. P1's
+  Sync is never installed behind P3's live promise. Some orders install
+  it after P3's row failed, and some drop it after P3's row landed.
+- Negative control: with the change to `src` reverted, both tests fail.
+
+### What is left
+
+- The protocol oracle of task-d30 checks the same property on the real
+  machines under a simulated network.

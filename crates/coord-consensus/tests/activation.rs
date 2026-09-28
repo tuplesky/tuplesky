@@ -3549,3 +3549,288 @@ fn a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting() {
         "the Sync entry installed with the rebind"
     );
 }
+
+/// Checklist D1/D4 probe: a Sync of the promised ballot, arriving while a
+/// higher promise is still being written, must not lower the durable
+/// promise below the one already sent.
+#[test]
+fn a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise() {
+    let mut cluster = Cluster::new(41);
+    let _c1 = cluster.admit(1, 1);
+    cluster.settle();
+    // r2 is elected at P1 = (1, 2); r1 promises it durably, but r2's Sync
+    // does not reach r1.
+    cluster.drop_sync.push((2, 1));
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    assert_eq!(
+        cluster.nodes[1].follower().ballots().promised(),
+        ballot(1, 2)
+    );
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), ballot(0, 0));
+    let sync = sync_rows(&cluster.nodes[2].storage)
+        .into_iter()
+        .find(|d| d.ballot == ballot(1, 2))
+        .expect("r2 bound its Sync");
+    // r0 campaigns at P3 = (3, 0): r1 accepts, and its promise row is
+    // queued but not yet durable.
+    let node = &mut cluster.nodes[1];
+    let promise_effects = node.step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(3, 0),
+            executed: ExecutionPosition::new(1).unwrap(),
+        },
+    ));
+    let mut batches = Vec::new();
+    for e in &promise_effects {
+        if let Effect::Persist(b) = e {
+            batches.push(b.clone());
+        }
+    }
+    assert_eq!(batches.len(), 1, "{promise_effects:?}");
+    // The delayed Sync of P1 arrives now.
+    let sync_effects = node.step(peer_event(r(2), ProtocolMessage::Sync(sync)));
+    for e in &sync_effects {
+        if let Effect::Persist(b) = e {
+            batches.push(b.clone());
+        }
+    }
+    // Every batch lands, in the order it was queued.
+    let mut released = Vec::new();
+    for b in batches {
+        let barrier = b.barrier;
+        node.storage.submit(b);
+        node.storage.complete(barrier).unwrap();
+        let more = node.step(Event::Storage(StorageEvent::JournalDurable {
+            barrier_id: barrier,
+            journal_seq: LocalJournalSeq::new(1).unwrap(),
+        }));
+        released.extend(more);
+    }
+    let promised_p3 = promise_effects.iter().chain(released.iter()).any(|e| {
+        matches!(e, Effect::SendWhenDurable { frame, .. }
+            if matches!(ProtocolMessage::decode(frame),
+                Ok(ProtocolMessage::Promise { ballot: b, .. }) if b == ballot(3, 0)))
+    });
+    assert!(promised_p3, "r1 sent its promise of P3");
+    node.storage.crash();
+    let row = promise_row(&node.storage).expect("promise row");
+    assert_eq!(
+        row.promised,
+        ballot(3, 0),
+        "the durable promise fell below the promise r1 sent: {row:?}"
+    );
+}
+
+/// One step of the promise-order model: a message delivered to the voter,
+/// or the oldest queued batch completing durably or failing.
+#[derive(Clone, Copy, Debug)]
+enum PromiseStep {
+    Deliver(usize),
+    Durable,
+    Fail,
+}
+
+/// What one run of the promise-order model saw.
+#[derive(Default)]
+struct PromiseRun {
+    /// Every `Promise` published so far.
+    published: Vec<Ballot>,
+    /// Queued batches, oldest first, with whether each carries P3's
+    /// promise row.
+    queue: VecDeque<(coord_core::effect::BarrierId, bool)>,
+    /// How P3's promise row ended: `Some(true)` durable, `Some(false)`
+    /// failed.
+    p3: Option<bool>,
+    p3_queued: bool,
+    /// Whether P1's Sync row was queued, and whether P3 had been accepted
+    /// without failing by then.
+    sync_queued: bool,
+    sync_behind_live_p3: bool,
+    delivered: Vec<bool>,
+}
+
+fn promise_model_messages() -> Vec<(ReplicaId, ProtocolMessage)> {
+    vec![
+        (
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(1, 2),
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+        (
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(3, 0),
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+        (
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: ballot(1, 2),
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::new(),
+                reproposed: BTreeSet::new(),
+            }),
+        ),
+    ]
+}
+
+/// Replay `path` against a fresh voter and check, after every step, that
+/// the durable promise is at least every ballot a `Promise` was published
+/// for. Returns the run and the voter's storage.
+fn replay_promise_model(path: &[PromiseStep]) -> (PromiseRun, Follower, StorageModel) {
+    let messages = promise_model_messages();
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let mut storage = StorageModel::default();
+    let mut run = PromiseRun {
+        delivered: vec![false; messages.len()],
+        ..PromiseRun::default()
+    };
+    let observe = |run: &mut PromiseRun, storage: &mut StorageModel, effects: Vec<Effect>| {
+        for e in effects {
+            match e {
+                Effect::Persist(b) => {
+                    let mut carries_p3 = false;
+                    for u in &b.updates {
+                        if u.collection == Collection::ProtocolV1.id() {
+                            let v = u.value.as_ref();
+                            if u.key.len() == 9
+                                && v.is_some_and(|v| {
+                                    decode_promise(v).unwrap().promised == ballot(3, 0)
+                                })
+                                && !run.p3_queued
+                            {
+                                carries_p3 = true;
+                            }
+                            if u.key.len() == 33 && u.key[8] == 0x03 {
+                                run.sync_queued = true;
+                                run.sync_behind_live_p3 |= run.p3_queued && run.p3 != Some(false);
+                            }
+                        }
+                    }
+                    if carries_p3 {
+                        run.p3_queued = true;
+                    }
+                    run.queue.push_back((b.barrier, carries_p3));
+                    storage.submit(b);
+                }
+                Effect::SendWhenDurable { frame, .. } => {
+                    if let Ok(ProtocolMessage::Promise { ballot: b, .. }) =
+                        ProtocolMessage::decode(&frame)
+                    {
+                        run.published.push(b);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    for step in path {
+        let effects = match *step {
+            PromiseStep::Deliver(i) => {
+                run.delivered[i] = true;
+                let (from, m) = messages[i].clone();
+                f.step(peer_event(from, m))
+            }
+            PromiseStep::Durable | PromiseStep::Fail => {
+                let (barrier, carries_p3) = run.queue.pop_front().expect("queued");
+                let event = if matches!(step, PromiseStep::Durable) {
+                    storage.complete(barrier).unwrap();
+                    StorageEvent::JournalDurable {
+                        barrier_id: barrier,
+                        journal_seq: LocalJournalSeq::new(storage.durable_seq()).unwrap(),
+                    }
+                } else {
+                    storage.fail(barrier, coord_core::event::StorageError::NoSpace);
+                    StorageEvent::Failed {
+                        barrier_id: barrier,
+                        error: coord_core::event::StorageError::NoSpace,
+                    }
+                };
+                if carries_p3 {
+                    run.p3 = Some(matches!(step, PromiseStep::Durable));
+                }
+                f.step(Event::Storage(event))
+            }
+        };
+        observe(&mut run, &mut storage, effects);
+        let durable = promise_row(&storage).map_or(ballot(0, 0), |p| p.promised);
+        for b in &run.published {
+            assert_ne!(
+                durable.compare_same_epoch(b),
+                Some(core::cmp::Ordering::Less),
+                "durable promise {durable:?} below the published {b:?} after {path:?}"
+            );
+        }
+    }
+    (run, f, storage)
+}
+
+/// task-d18's model: every order of `NewLeader` for P1 = (1, 2) and
+/// P3 = (3, 0), P1's Sync, and each queued row completing durably or
+/// failing. In no order is the durable promise below a ballot `Promise`
+/// was published for, and P1's Sync is installed behind P3's promise only
+/// once that promise's row failed.
+#[test]
+fn no_order_of_two_promises_and_a_sync_lowers_the_durable_promise() {
+    let mut stack: Vec<Vec<PromiseStep>> = vec![Vec::new()];
+    let (mut runs, mut installed_after_failure, mut held_then_dropped) = (0u32, 0u32, 0u32);
+    while let Some(path) = stack.pop() {
+        let (run, f, _) = replay_promise_model(&path);
+        assert!(
+            !run.sync_behind_live_p3,
+            "P1's Sync was installed behind P3's live promise: {path:?}"
+        );
+        let mut next = Vec::new();
+        for (i, done) in run.delivered.iter().enumerate() {
+            if !done {
+                next.push(PromiseStep::Deliver(i));
+            }
+        }
+        if !run.queue.is_empty() {
+            next.push(PromiseStep::Durable);
+            next.push(PromiseStep::Fail);
+        }
+        if next.is_empty() {
+            runs += 1;
+            // Delivered after P3 was accepted and installed after its row
+            // failed.
+            let sync_at = path
+                .iter()
+                .position(|s| matches!(s, PromiseStep::Deliver(2)));
+            let p3_at = path
+                .iter()
+                .position(|s| matches!(s, PromiseStep::Deliver(1)));
+            if run.sync_queued && run.p3 == Some(false) && sync_at > p3_at {
+                installed_after_failure += 1;
+            }
+            if run.p3 == Some(true) && f.ballots().promised() == ballot(3, 0) && !run.sync_queued {
+                held_then_dropped += 1;
+            }
+            continue;
+        }
+        for s in next {
+            let mut p = path.clone();
+            p.push(s);
+            stack.push(p);
+        }
+    }
+    assert!(runs >= 90, "{runs}");
+    assert!(
+        installed_after_failure > 0,
+        "no run installed the held Sync"
+    );
+    assert!(held_then_dropped > 0, "no run dropped the held Sync");
+}
