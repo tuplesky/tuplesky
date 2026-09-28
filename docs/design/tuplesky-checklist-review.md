@@ -1,6 +1,6 @@
 # SwiftPaxos correctness checklist review
 
-**Status:** Review record, 2026-09-28. Not a specification: the tasks it gives rise to are specified in [the plan](tuplesky-prs-plan.md), as [task-d18](tuplesky-prs-plan.md#task-d18) through [task-d32](tuplesky-prs-plan.md#task-d32).
+**Status:** Review record, 2026-09-28. Not a specification: the tasks it gives rise to are specified in [the plan](tuplesky-prs-plan.md), as [task-d18](tuplesky-prs-plan.md#task-d18) through [task-d33](tuplesky-prs-plan.md#task-d33).
 
 **What was reviewed:** the implementation stack at `d4bd28c` (task-d08 at its head) and the Jepsen client, its stress driver and their findings at `377d0a0`. The checklist is "TupleSky SwiftPaxos implementation correctness checklist" (GPT-6, 2026-09-28): 56 items in nine sections (A contract, P protocol, E evidence, D durability, B bounds, R repair, G reclamation, S application semantics, M membership) and a 15-row failure-test matrix, under one central gate: every state reachable under admission limits stays recoverable within configured limits once a valid quorum and stable communication return, without the original client, an excluded replica, deleted evidence or a manual increase in limits.
 
@@ -10,7 +10,7 @@
 - An item counts as covered only with a code location and a test; a document's claim alone does not count.
 - The two safety bugs below were reproduced with new tests against `d4bd28c`. Both fail. They are not in this change; they open [task-d18](tuplesky-prs-plan.md#task-d18) and [task-d19](tuplesky-prs-plan.md#task-d19).
 - The other findings rest on reading. Their key facts were checked, but they are not yet shown by a test; each task opens with one.
-- The paper's recovery appendix could not be consulted, so the possible-fast rule is still unchecked against it; that is task-d19's first step.
+- The paper's recovery appendix could not be consulted. The task-d19 decision does not depend on it: counting only adoptions toward the slow majority is safe with selection as it is (see task-d19).
 
 ## Verdict
 
@@ -59,7 +59,7 @@ The central gate is not met.
 | A ballot change voids collector evidence with nothing asking again | R5, E4 | The collector starts a new vote set and re-offers nothing | [task-d22](tuplesky-prs-plan.md#task-d22) |
 | Client outcomes blur executed and not admitted | A4, R3 | Withheld output answers `NOT_ADMITTED`, which the SDK treats as a definite failure; `ResolveRequest` never reads the durable record | [task-d23](tuplesky-prs-plan.md#task-d23) |
 | A Sync entry cannot enter a full table | B3 | The placeholder is dropped under backpressure; only catch-up passes capacity | [task-d24](tuplesky-prs-plan.md#task-d24) |
-| A recovery cycle stops re-proposal silently | P4 | The ordering loop in `Leader::from_recovered` breaks without an error | [task-d21](tuplesky-prs-plan.md#task-d21) |
+| A recovery cycle stops re-proposal silently | P4 | The ordering loop in `Leader::from_recovered` breaks without an error; whether a cycle is reachable is not argued | [task-d21](tuplesky-prs-plan.md#task-d21) |
 | Nothing reclaims history | A2, G4, B8 | Per-boot bindings and the history set grow; payload, executed, protocol, session and retry rows are never trimmed by `coordd` | [task-d26](tuplesky-prs-plan.md#task-d26), [task-d27](tuplesky-prs-plan.md#task-d27) |
 | Catch-up is slower than the domain | B7, B9 | About 100 commands a second, one durable install and one execution each | [task-d25](tuplesky-prs-plan.md#task-d25) |
 | Report pages are sent once on a lane that drops | B5 | Nothing asks for a missing page | [task-d28](tuplesky-prs-plan.md#task-d28) |
@@ -76,10 +76,10 @@ The central gate is not met.
 | A4 Client outcomes | Gap | `saturation_after_dispatch_never_becomes_a_refusal` | No retired outcome; `NOT_ADMITTED` for executed commands; `Unknown` is final | task-d23 |
 | A5 Recovery ownership | Gap | `a_callers_deadline_does_not_discard_the_delivery_obligation` | Refused entries and follower-only commands have no trigger or escalation | task-d22, task-d29 |
 | P1 Identities, determinism, conflicts | Covered | `reordered_and_duplicate_requests_cannot_bind_conflicting_payload`, `forced_slow_and_fast_learning_yield_equal_results` | Every command conflicts through the conservative key | — |
-| P2 Quorum shape | Covered | `quorum_policy_matches_the_design_table` | — | — |
-| P3 Fixed fast quorum | Covered | `VoteError::NotInFastSet`; model scenario `arbitrary-fastest-majority-is-not-c2` | Latent: recovery hard-codes `c2_default` | task-d31 |
+| P2 Quorum shape | Covered | `quorum_policy_matches_the_design_table` | Quorum sizes only; which acknowledgements make up a slow quorum is P5 | task-d19 |
+| P3 Fixed fast quorum | Covered, latent gap | `VoteError::NotInFastSet`; model scenario `arbitrary-fastest-majority-is-not-c2` | Recovery hard-codes `c2_default`; every production path builds `c2_default` today, so the gap is not reachable yet | task-d31 |
 | P4 Dependencies agree, acyclic | Partial | Guards; `a_follower_behind_a_full_leader_executes_in_the_leaders_order` | A recovery cycle stops re-proposal silently | task-d21 |
-| P5 Vote revision | Gap | — | Confirmed bug | task-d19 |
+| P5 Vote revision | Gap | — | Confirmed bug; decided fix: only adoptions count toward the slow majority | task-d19 |
 | P6 Recovery keeps committed outcomes | Gap | `possible_fast_decisions_are_recovered_from_the_fixed_fast_set` (three voters) | Confirmed bug; unchecked against Appendix A | task-d19 |
 | P7 Transitions map to the specification | Partial | `spec/swiftpaxos-mapping.md` | No refinement argument for slow counting; no model joins learning with recovery | task-d19 |
 | E1 Immutable binding | Partial | `other_facts_under_the_same_identity_are_a_conflict_and_replay_nothing` | Collector entry stays pending after a silent refusal | task-d22 |
@@ -139,22 +139,23 @@ The deterministic clusters run three voters at table capacity 32 and five voters
 | 2 | Different maximum tentative sets | Partial | `a_follower_whose_table_filled_while_it_could_not_learn_catches_up` (five voters) | task-d30 |
 | 3 | Dense conflicts, early missing dependency | Partial | `a_follower_asks_first_for_what_the_leader_committed_in_its_order` | task-d30 |
 | 4 | Ack before payload, hold expires, repeat | Partial | `a_duplicate_after_the_hold_expired_repairs_the_callers_evidence` (three voters) | task-d30 |
-| 5 | Client or collector dies mid-dissemination | Gap | Client detach only | task-d22, task-d30 |
+| 5 | Client or collector dies mid-dissemination | Gap | Client detach only | task-d22, task-d33 |
 | 6 | Crash around write, publication, materialization | Storage level | `crash_at_every_write_and_sync_boundary`; not in a cluster | task-j05 |
 | 7 | Crash between mutation, marker, response | Component | `crash_between_materialization_and_notification_never_duplicates` | — |
 | 8 | Crash during checkpoint, truncation, install | Component | `a_crash_between_the_certificate_and_the_floor_deletes_nothing` | task-j05 |
-| 9 | Repeated interrupted elections | Partial | `competing_campaigns_and_delayed_replies_cannot_establish_divergence`; flat budgets unshown | task-d28, task-d30 |
+| 9 | Repeated interrupted elections | Partial | `competing_campaigns_and_delayed_replies_cannot_establish_divergence`; flat budgets unshown | task-d28, task-d33 |
 | 10 | Delayed old-ballot messages | Partial | `old_ballot_work_is_held_across_recovery`; the promise bug is a gap here | task-d18, task-d30 |
 | 11 | Replica offline through many checkpoints | Partial | task-d08 catch-up and the follower-out driver; no floor to test | task-d27, task-d32 |
-| 12 | Loss beyond the repair-cache window | Partial | `a_refused_repair_falls_back_to_the_durable_record`; neither half stalls | task-d22, task-d30 |
+| 12 | Loss beyond the repair-cache window | Partial | `a_refused_repair_falls_back_to_the_durable_record`; neither half stalls | task-d22, task-d33 |
 | 13 | Disk full, fsync failure, slow materializer | Partial | `enospc_fails_the_commit` (engine only) | task-j05 |
-| 14 | Lost response, same-ID and new-payload retries | Partial | `lost_response_with_the_same_identity_returns_the_same_result`; not under faults at three or five voters | task-d23, task-d30 |
+| 14 | Lost response, same-ID and new-payload retries | Partial | `lost_response_with_the_same_identity_returns_the_same_result`; not under faults at three or five voters | task-d23, task-d33 |
 | 15 | Partition, lease expiry, regional reads, membership change | Gap | None | task-64 |
 
 ## Order
 
-- **Safety first.** task-d18 through task-d21 go ahead of further Jepsen conclusions. Every task here is a prerequisite of task-64.
-- **Then ownership:** task-d22 through task-d25.
-- **Then bounds:** task-d26 through task-d28, and task-d32 after task-d27.
-- **Then the contract and simulation:** task-d29 through task-d31.
-- **task-d25 waits on a decision:** leaving catch-up as it is, or windowed installation.
+Every task here is a prerequisite of task-64. The order follows the goal: correctness first, then bounded recovery time, then bounded storage.
+
+1. **Safety:** task-d18, task-d19, task-d21, and task-d30 (the real machines under a protocol oracle). These go ahead of further Jepsen conclusions.
+2. **Bounded recovery time:** task-d20, task-d28, task-d24, task-d25 (windowed catch-up, decided on #114) and task-d22.
+3. **Bounded storage:** task-d26, task-d27, then task-d32.
+4. **The contract:** task-d23, task-d29, task-d31, and task-d33 (budget and progress oracles).
