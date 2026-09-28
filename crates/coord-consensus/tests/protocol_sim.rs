@@ -272,6 +272,16 @@ struct Sim {
     owed_to_leader: Vec<(u32, u64, u8)>,
     highest_ballot: u64,
     shadow: BTreeMap<(u64, ReplicaId, CommandId), Shadow>,
+    /// Whether a follower's timer asks for the leader's executed history
+    /// (task-d08's pacer). Off unless `PROTOCOL_SIM_CATCH_UP` is set:
+    /// with it on, the default seeds reach the open fast-path recovery
+    /// gap of #116/#118 (a fast decision lost when its leader crashes
+    /// before its acceptance row is durable), and it turns on by default
+    /// with that fix.
+    catch_up: bool,
+    /// The admission each command was submitted under, as the collector
+    /// stores it beside its entry: what a leader reply is counted under.
+    submitted: BTreeMap<CommandId, Digest32>,
     /// The one dependency set of each decided command, and who said so.
     decided: BTreeMap<CommandId, (BTreeSet<CommandId>, String)>,
     /// The one execution order.
@@ -289,6 +299,11 @@ struct Stats {
     learned: usize,
     campaigns: u32,
     crashes: u32,
+    /// Crashes of a node that was leading its ballot.
+    leader_crashes: u32,
+    /// Catch-up pages answered, and commands executed from them.
+    catch_up_pages: u32,
+    caught_up: u64,
     ballots: u64,
 }
 
@@ -348,6 +363,8 @@ impl Sim {
             owed_to_leader: Vec::new(),
             highest_ballot: 0,
             shadow: BTreeMap::new(),
+            submitted: BTreeMap::new(),
+            catch_up: std::env::var_os("PROTOCOL_SIM_CATCH_UP").is_some(),
             decided: BTreeMap::new(),
             order: Vec::new(),
             step: 0,
@@ -454,13 +471,17 @@ impl Sim {
         let set = shadow
             .set
             .get_or_insert_with(|| VoteSet::new(quorum(b, n), command));
+        // A leader reply is compact: the collector counts it under the
+        // admission its entry was submitted under, never under whatever
+        // acknowledgement came first.
+        if shadow.admission.is_none() {
+            shadow.admission = self.submitted.get(&command).copied();
+        }
         match message {
             ProtocolMessage::FastAck(a) => {
-                shadow.admission.get_or_insert(a.admission);
                 let _ = set.add(Vote::Fast(a));
             }
             ProtocolMessage::SlowAck(a) => {
-                shadow.admission.get_or_insert(a.admission);
                 let _ = set.add(Vote::Slow(a));
             }
             ProtocolMessage::LeaderReply {
@@ -629,6 +650,10 @@ impl Sim {
                     admitted_at_ticks: 0,
                 },
             );
+            self.submitted.insert(
+                command,
+                coord_core::capability::admission_digest(Some(&receipt.facts()), 0),
+            );
             self.step_node(
                 i,
                 Event::Admitted(AdmittedRequest {
@@ -730,11 +755,63 @@ impl Sim {
             let (f, t) = (msg.from, msg.to);
             self.note(|| format!("deliver {f}->{t} {d}"));
         }
+        // A catch-up ask is answered by the donor's runtime from its
+        // durable rows, not by its machine (task-d08).
+        if let Ok(ProtocolMessage::CatchUpRequest { ballot: b, after }) =
+            ProtocolMessage::decode(&msg.frame)
+        {
+            let page = self.page(msg.to, b, after);
+            self.stats.catch_up_pages += 1;
+            self.net.push(Msg {
+                from: msg.to,
+                to: msg.from,
+                frame: page.encode(),
+            });
+            return;
+        }
         let event = Event::Peer(AuthenticatedPeerMessage::new(
             PeerProvenance::from_transport(r(msg.from), ReplicaIncarnation::new(1).unwrap(), 1),
             msg.frame,
         ));
         self.step_node(msg.to, event);
+    }
+
+    /// What `coordd` serves for a catch-up ask at `ballot` after
+    /// `after`: the donor's executed commands from there, each with its
+    /// durable payload and dependency row, stopping at the first it
+    /// cannot show.
+    fn page(&self, donor: u8, ballot: Ballot, after: ExecutionPosition) -> ProtocolMessage {
+        let node = &self.nodes[usize::from(donor)];
+        let payloads: BTreeMap<CommandId, coord_consensus::PayloadRecordV1> =
+            payload_rows(&node.storage).into_iter().collect();
+        let rows: BTreeMap<CommandId, CommandRecord> =
+            dependency_rows(&node.storage).into_iter().collect();
+        let mut entries = Vec::new();
+        for (i, c) in node
+            .executed
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(after.get()).unwrap_or(usize::MAX))
+            .take(coord_consensus::MAX_CATCH_UP_COMMANDS)
+        {
+            let Some(payload) = payloads.get(c) else {
+                break;
+            };
+            entries.push(coord_consensus::CatchUpEntry {
+                command: *c,
+                payload: payload.clone(),
+                decided: rows.get(c).cloned(),
+                position: ExecutionPosition::new(i as u64 + 1).unwrap(),
+                revision: None,
+                result_digest: Digest32(c.0.0),
+            });
+        }
+        ProtocolMessage::CatchUpPage {
+            ballot,
+            after,
+            through: ExecutionPosition::new(node.executed.len() as u64).unwrap(),
+            entries,
+        }
     }
 
     fn complete(&mut self, i: u8) {
@@ -794,14 +871,27 @@ impl Sim {
             result_digest: Digest32(c.0.0),
             response: c.0.0.to_vec(),
         };
-        let effects = match node.role.as_mut().expect("alive") {
-            Role::Leader(m) => m.applied(c, &outcome),
-            Role::Follower(m) => m.applied(c, &outcome),
+        let (effects, pulled) = match node.role.as_mut().expect("alive") {
+            Role::Leader(m) => (m.applied(c, &outcome), false),
+            Role::Follower(m) => {
+                let before = m.catch_up_counts().1;
+                let effects = m.applied(c, &outcome);
+                // A pulled command whose execution disagrees with the
+                // donor's stops the voter: here it is an oracle failure.
+                if let Some(d) = m.catch_up_divergence() {
+                    let d = d.clone();
+                    self.fail(&format!("node {i} diverged from its catch-up donor: {d:?}"));
+                }
+                (effects, m.catch_up_counts().1 > before)
+            }
         };
         let effects = match effects {
             Ok(e) => e,
             Err(e) => self.fail(&format!("node {i} could not apply {c:?}: {e:?}")),
         };
+        if pulled {
+            self.stats.caught_up += 1;
+        }
         let k = self.nodes[usize::from(i)].executed.len();
         {
             let d = deps.as_deref().map(shorts).unwrap_or_default();
@@ -909,6 +999,9 @@ impl Sim {
         // (Within a live connection frames are delayed, reordered and
         // lost at will.)
         self.note(|| format!("crash node {i}"));
+        if self.leader_index() == Some(i) {
+            self.stats.leader_crashes += 1;
+        }
         self.net.retain(|m| m.from != i && m.to != i);
         self.held.retain(|m| m.from != i && m.to != i);
         let node = &mut self.nodes[usize::from(i)];
@@ -982,14 +1075,23 @@ impl Sim {
 
     /// The periodic work of `coordd`'s timers: the leader re-sends what
     /// voters have not voted on, a follower asks its leader for payloads
-    /// it lacks.
+    /// it lacks, and one that holds work it does not execute asks for the
+    /// leader's executed history (task-d08's pacer).
     fn timers(&mut self) {
         for i in 0..self.n {
+            let executable = self.executable(i);
             let effects = match self.nodes[usize::from(i)].role.as_mut() {
                 Some(Role::Leader(l)) => l.resend_unvoted(coord_consensus::RESEND_PER_VOTER),
-                Some(Role::Follower(f)) if !f.missing_payloads().is_empty() => {
+                Some(Role::Follower(f)) => {
                     let leader = f.quorum().leader();
-                    f.request_payloads(leader)
+                    let mut effects = Vec::new();
+                    if !f.missing_payloads().is_empty() {
+                        effects.extend(f.request_payloads(leader));
+                    }
+                    if self.catch_up && !executable && f.holds_unexecuted() && !f.catching_up() {
+                        effects.extend(f.request_catch_up(leader));
+                    }
+                    effects
                 }
                 _ => Vec::new(),
             };
@@ -1247,6 +1349,9 @@ fn run_row(row: u8) {
                     totals.learned += s.learned;
                     totals.campaigns += s.campaigns;
                     totals.crashes += s.crashes;
+                    totals.leader_crashes += s.leader_crashes;
+                    totals.catch_up_pages += s.catch_up_pages;
+                    totals.caught_up += s.caught_up;
                     totals.ballots += s.ballots;
                 }
                 Err(e) => failures.push(e),
@@ -1267,6 +1372,14 @@ fn run_row(row: u8) {
         totals.executed > 0 && totals.campaigns > 0,
         "row {row} ran idle: {totals:?}"
     );
+    // Row 1 is defined by a leader failing: a schedule that never took
+    // the crash branch against a leader has lost its coverage.
+    if row == 1 {
+        assert!(
+            totals.leader_crashes > 0,
+            "row 1 crashed no leader: {totals:?}"
+        );
+    }
 }
 
 #[test]
