@@ -408,7 +408,18 @@ pub enum TransportError {
     /// one the far end should refuse, and one it did not would be
     /// serving on a credential nobody vouches for any more.
     CredentialExpired,
+    /// The address serves the other plane: its listener negotiated none
+    /// of the application protocols this dial offered (TLS alert
+    /// `no_application_protocol`). A node lists both of its listeners'
+    /// addresses without saying which is which, so this is how a dial
+    /// learns an address is not the one it wants, and says nothing about
+    /// whether the node can be reached (task-d16).
+    WrongPlane,
 }
+
+/// The TLS alert a listener sends when it serves none of the offered
+/// application protocols (RFC 7301).
+const NO_APPLICATION_PROTOCOL: u8 = 120;
 
 impl From<std::io::Error> for TransportError {
     fn from(e: std::io::Error) -> Self {
@@ -787,6 +798,12 @@ impl Dialer {
         let limits = self.shared.limits;
         let conn = match timeout(limits.handshake_timeout, connecting).await {
             Ok(Ok(c)) => c,
+            Ok(Err(quinn::ConnectionError::ConnectionClosed(close)))
+                if close.error_code
+                    == quinn::TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL) =>
+            {
+                return Err(TransportError::WrongPlane);
+            }
             Ok(Err(e)) => return Err(TransportError::Connect(e.to_string())),
             Err(_) => return Err(TransportError::Rejected(CloseReason::Timeout)),
         };

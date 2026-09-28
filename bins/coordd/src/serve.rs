@@ -1730,7 +1730,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                             outcome.reached = false;
                             outcome
                                 .error
-                                .get_or_insert_with(|| format!("{lane:?}: {e:?}"));
+                                .get_or_insert_with(|| format!("{lane:?}: {e}"));
                         }
                     }
                     outcome
@@ -1770,7 +1770,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     plane: Plane::Collector,
                     index: i,
                     reached: result.is_ok(),
-                    error: result.err().map(|e| format!("{e:?}")),
+                    error: result.err().map(|e| e.to_string()),
                 }
             });
             self.dialling.insert(task.id(), (Plane::Collector, i));
@@ -3346,30 +3346,69 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
 /// tried. The identity expected on the other end is the committed one
 /// throughout, so a certificate that is not this domain's voter at its
 /// committed incarnation fails the handshake whichever address answered.
+///
+/// A dial that reaches no address keeps every address's error, so that
+/// what is said is why the address that serves this plane failed, and
+/// not the other listener's refusal of it (task-d16).
 async fn dial(
     transport: &coord_transport::Dialer,
     peer: &crate::peers::Peer,
     me: Option<coord_types::ids::ReplicaIncarnation>,
     role: coord_types::wire_v1::PeerRole,
     lane: coord_transport::Lane,
-) -> Result<coord_transport::ConnectionId, coord_transport::TransportError> {
+) -> Result<coord_transport::ConnectionId, Unreached> {
     let expected = coord_transport::BoundIdentity {
         role: coord_types::wire_v1::PeerRole::Voter,
         replica: Some(peer.replica),
         incarnation: Some(peer.incarnation),
         capabilities: Vec::new(),
     };
-    let mut last = coord_transport::TransportError::Connect("no address listed".into());
+    let mut failed = Vec::new();
     for (address, server_name) in &peer.addresses {
         match transport
             .connect(*address, server_name, role, me, lane, expected.clone())
             .await
         {
             Ok(connection) => return Ok(connection),
-            Err(e) => last = e,
+            Err(e) => failed.push((*address, e)),
         }
     }
-    Err(last)
+    Err(Unreached(failed))
+}
+
+/// Why a dial reached none of a peer's addresses: each address's own
+/// error, in the order they were tried (task-d16).
+#[derive(Debug)]
+struct Unreached(Vec<(std::net::SocketAddr, coord_transport::TransportError)>);
+
+impl std::fmt::Display for Unreached {
+    /// The failures of the addresses that could have served this dial.
+    ///
+    /// An address that answered for the other plane is left out: a node
+    /// lists both of its listeners without saying which is which, so one
+    /// of them refuses every dial by design, and its refusal says nothing
+    /// about whether the node can be reached. Said in its place, it hid
+    /// the error that did.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("no address listed");
+        }
+        let failures: Vec<_> = self
+            .0
+            .iter()
+            .filter(|(_, e)| !matches!(e, coord_transport::TransportError::WrongPlane))
+            .collect();
+        if failures.is_empty() {
+            return f.write_str("every address listed serves the other plane");
+        }
+        for (i, (address, e)) in failures.into_iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{address}: {e:?}")?;
+        }
+        Ok(())
+    }
 }
 
 /// The peer a protocol frame may actually be sent to.
@@ -4474,5 +4513,127 @@ mod tests {
             .expect("ends at the moved deadline")
             .expect("no panic");
         assert!(super::unix_millis() >= now + 600);
+    }
+
+    /// A dial that reaches none of a voter's addresses says why the one
+    /// that serves its plane failed, whichever order they are listed in
+    /// (task-d16).
+    ///
+    /// The voter's api address answers every peer dial with the other
+    /// plane's refusal (TLS alert 120). A dial kept only the last
+    /// address's error, so a catalog that listed the peer address first
+    /// logged that refusal and discarded why the peer address itself had
+    /// failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_dial_names_the_peer_addresss_error_not_the_api_listeners_refusal() {
+        use coord_transport::{Class, Lane, Limits, Transport, TransportError};
+        use coord_transport_testkit::{TestBinder, TestCa};
+        use coord_types::ids::{ClusterId, DomainId};
+        use coord_types::wire_v1::PeerRole;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const CLUSTER: ClusterId = ClusterId([1; 16]);
+        const DOMAIN: DomainId = DomainId([2; 16]);
+        let limits = Limits {
+            handshake_timeout: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let ca = TestCa::new();
+        let target = ca.issue(
+            "node-0",
+            ReplicaId([0; 16]),
+            ReplicaIncarnation::new(1).unwrap(),
+            PeerRole::Voter,
+        );
+        let me = ca.issue(
+            "node-1",
+            ReplicaId([1; 16]),
+            ReplicaIncarnation::new(1).unwrap(),
+            PeerRole::Voter,
+        );
+        let mut binder = TestBinder::new(CLUSTER, DOMAIN);
+        binder.register(&target);
+        binder.register(&me);
+        let binder = Arc::new(binder);
+        // The target's api listener, and a peer address nothing answers.
+        let mut local = target.local(&ca, CLUSTER, DOMAIN, vec![1, 2]);
+        local.serves = Some(Class::Api);
+        let api = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            local,
+            binder.clone(),
+            limits,
+        )
+        .unwrap();
+        let api_address = api.local_addr().unwrap();
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let dialer = Transport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            me.local(&ca, CLUSTER, DOMAIN, vec![1, 2]),
+            binder,
+            limits,
+        )
+        .unwrap();
+
+        for addresses in [[closed, api_address], [api_address, closed]] {
+            let peer = crate::peers::Peer {
+                replica: target.replica,
+                incarnation: target.incarnation,
+                addresses: addresses
+                    .iter()
+                    .map(|a| (*a, target.name.clone()))
+                    .collect(),
+            };
+            let unreached = super::dial(
+                &dialer.dialer(),
+                &peer,
+                Some(me.incarnation),
+                PeerRole::Voter,
+                Lane::Control,
+            )
+            .await
+            .expect_err("nothing serves the peer plane");
+            // Both addresses were tried, and the api listener's answer
+            // was the refusal of the other plane.
+            assert_eq!(unreached.0.len(), 2);
+            assert!(
+                unreached
+                    .0
+                    .iter()
+                    .any(|(address, e)| *address == api_address
+                        && matches!(e, TransportError::WrongPlane))
+            );
+            let said = unreached.to_string();
+            assert!(
+                said.starts_with(&format!("{closed}: ")),
+                "{addresses:?}: {said}"
+            );
+            assert!(!said.contains(&api_address.to_string()), "{said}");
+        }
+
+        // A voter all of whose addresses serve the other plane is said to
+        // be that, not a connection failure.
+        let peer = crate::peers::Peer {
+            replica: target.replica,
+            incarnation: target.incarnation,
+            addresses: vec![(api_address, target.name.clone())],
+        };
+        let unreached = super::dial(
+            &dialer.dialer(),
+            &peer,
+            Some(me.incarnation),
+            PeerRole::Voter,
+            Lane::Control,
+        )
+        .await
+        .expect_err("the api listener serves no peer dial");
+        assert_eq!(
+            unreached.to_string(),
+            "every address listed serves the other plane"
+        );
     }
 }

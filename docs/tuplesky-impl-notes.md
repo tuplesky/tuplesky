@@ -5352,3 +5352,58 @@ exists so that one lost frame is harmless.
 - An uncommitted proposal that stays unanswerable takes one slot of the
   voter's 16 per round for as long as it does. The chain bounds that to
   the table the leader cannot move past anyway.
+
+## A dial says why each address failed
+
+task-d16. Every failed peer dial in the Jepsen and stress runs was
+logged as TLS alert 120, in all 52 runs. That alert is by design, and
+it hid the error that mattered.
+
+### Why alert 120 was all a dial said
+
+- A node has two listeners, one per plane, and each offers only its own
+  plane's application protocol. The catalog lists both of a node's
+  addresses without saying which is which, so a dial tries each in turn
+  and the other plane's listener refuses it: TLS alert 120,
+  `no_application_protocol`.
+- `dial` in `serve.rs` kept only the last address's error. When the
+  address that serves the dial's plane was listed first and failed, the
+  other listener's refusal came last, and that was what was logged.
+- So why the peer address failed was discarded. That is the likely
+  reason `n2`'s dials to `n1` never recovered in d12-15, and why `n2`
+  held 1336 frames as `NotConnected` in rep108-3; the logs never showed
+  either.
+
+### The rule
+
+- The transport reports the other plane's refusal as its own error,
+  `TransportError::WrongPlane`, read from the alert the listener closes
+  the handshake with, not as a failure to connect.
+- A dial that reaches no address keeps every address's error, in the
+  order tried (`Unreached`).
+- What is logged is the error of each address that could have served the
+  dial. A `WrongPlane` refusal is left out, so it is not counted as a
+  failure, in the log or in anything that counts its lines. A voter whose
+  every address serves the other plane is said to be that.
+- Which addresses are tried, and in what order, is unchanged, and so is
+  the re-dial schedule.
+
+### Evidence
+
+- `a_dial_to_the_other_planes_listener_is_told_it_is_the_wrong_plane`
+  (`coord-transport`): a voter dialling a peer's api listener gets
+  `WrongPlane`.
+- `a_failed_dial_names_the_peer_addresss_error_not_the_api_listeners_refusal`
+  (`coordd`): a voter listed with a closed peer address and its api
+  address, in either order, is said to have failed on the peer address,
+  and the api address is not named. A voter listed with its api address
+  alone is said to serve the other plane.
+- Negative controls: without the transport reading the alert, both tests
+  fail; with the `WrongPlane` refusal kept in what is said, the `coordd`
+  test fails on the api address being named.
+
+### What is left
+
+- The replay that produced rep108-3 has to be run with this carried to
+  see what the restarted voters' dials really fail on. The fix for that,
+  if any, is its own task.
