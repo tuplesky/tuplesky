@@ -23,8 +23,16 @@ path = "src/lib.rs"
 name = "coord-jepsen"
 path = "src/bin/coord-jepsen.rs"
 
+# Prints a voter store's execution order for a test's log (Jepsen dumps
+# it around the command a voter stopped on).
+[[bin]]
+name = "coord-jepsen-executed"
+path = "src/bin/coord-jepsen-executed.rs"
+
 [dependencies]
 coord-types.workspace = true
+coord-storage.workspace = true
+redb.workspace = true
 coord-state.workspace = true
 coord-harness.workspace = true
 coord-membership.workspace = true

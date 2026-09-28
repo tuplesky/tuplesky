@@ -248,6 +248,16 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
 
 The last 400 lines of each voter's log follow in the TupleSky job's log.
 
+Each voter's store comes with its log: `jepsen.tuplesky.db`'s `log-files`
+also fetches the newest `gen-*/domain.redb`, before the teardown removes
+it, so it is in the test's store and the artifact. When a voter stops on
+a command (`release-record-mismatch(..)` or `incompatible-admission(..)`),
+the job prints every voter's `executed_v1` rows within 8 positions of it,
+as `position revision command`, with `coord-jepsen-executed` (a test-only
+binary in `coord-jepsen`). Where the voters' orders split is then in the
+job log. The store is copied while `coordd` runs; `redb` commits are
+atomic, so the copy opens at its last commit.
+
 The first paired run, on `65336cf`
 ([run 36273802438](https://github.com/tuplesky/tuplesky/actions/runs/36273802438)),
 was `:valid? true` for both, with etcd 3.7.2. Each test draws its own
@@ -1144,8 +1154,10 @@ its followers had committed among themselves.
       it, stopped on the mismatch before the next start at 153 s.
     * With no durable stop marker yet (planned), that start restarted
       `n4`, which went on to follow ballots 3 and 4 on the same store.
-    * The command's order on each voter needs the run's store (its
-      `executed_v1` rows), which this environment cannot download.
+    * The command's order on each voter was in the voters' stores (their
+      `executed_v1` rows), which the teardown removed: until then the job
+      fetched only each voter's log. It now fetches the stores too, and
+      prints the rows around a stopped command (above).
     * Not reproduced locally in 12 runs on `9c23cc6` (three voters, 120 s):
       6 with `--fault majority` and 6 with `--fault all`, which kills
       every voter, then the leader. All served their final reads, with no

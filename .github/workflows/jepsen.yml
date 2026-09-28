@@ -181,6 +181,28 @@ jobs:
             grep -v '^metrics ' "$log" | tail -n 400
             echo "::endgroup::"
           done
+      - name: Show every voter's execution order around a stop
+        if: always()
+        # A voter that stops on a command, a release contradicting its own
+        # execution or two decisions of one command, names it by an id
+        # prefix. Each voter's store comes with its log (jepsen.tuplesky.db's
+        # log-files), and the rows around that command on every voter show
+        # where their orders split, from the job log alone.
+        run: |
+          shopt -s nullglob
+          store=jepsen/tuplesky/store/latest
+          prefixes=$(cat "$store"/n*/coordd.log 2>/dev/null \
+            | grep -oE 'this node stopped: [a-z-]+\([0-9a-f]+\)' \
+            | sed -E 's/.*\(([0-9a-f]+)\)/\1/' | sort -u)
+          for prefix in $prefixes; do
+            echo "::group::Every voter's execution order around $prefix (position revision command)"
+            for db in "$store"/n*/domain.redb; do
+              echo "--- $(basename "$(dirname "$db")")"
+              "$GITHUB_WORKSPACE/tuplesky/target/release/coord-jepsen-executed" \
+                "$db" --around "$prefix" --span 8 || true
+            done
+            echo "::endgroup::"
+          done
       - name: Pack the Jepsen store
         if: always()
         # Jepsen names each run's directory by its start time, and
