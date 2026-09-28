@@ -6088,7 +6088,9 @@ every step.
    decreases and is never below a ballot it published `Promise` for.
 3. **One dependency set per command.** The set a shadow collector learned
    it with (`VoteSet::learned` over what reached the frontend) equals the
-   set each replica executed it with.
+   set each replica executed it with. The shadow counts a leader reply
+   under the admission the command was submitted under, as the real
+   collector does, not under whichever acknowledgement came first.
 4. **No halt.** No replica stops on two decisions, a recovery cycle or
    `IncompatibleAccepted`.
 
@@ -6115,6 +6117,19 @@ Seeds that once failed are kept in
   stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
   seeds, not at every seed.
 - Budgets and progress after healing are task-d33's oracles.
+- **Catch-up.** With `PROTOCOL_SIM_CATCH_UP` set, a follower's timer asks
+  its leader for executed history, as `coordd`'s pacer does, and the
+  donor's page is served from its durable rows. A pulled command
+  executed otherwise than its donor is an oracle failure.
+  - At the default seeds it serves about 14,000 pages, executes about
+    1,300 pulled commands, and finds no catch-up divergence.
+  - It also shifts the schedules enough to reach the fast-path gap
+    above in 3 of 120 runs. Row 2, three voters, seed 2 is one: a
+    command fast-learned from its leader and one follower, the leader
+    crashed before its acceptance row was durable, and the next leader
+    re-proposed it. So it is off by default until the #116/#118 fix
+    lands.
+- Row 1 counts leader crashes and fails if a run of it crashed none.
 
 ## Bounded reports and Syncs
 
