@@ -1196,6 +1196,29 @@ gets logged in its place.
   were sends refused while a connection was down: `QueueFull` on the
   Control lane (206) and `NotConnected` (87).
 
+`59022b1` carries #112 at `1e76054`: a divergence stop says what it
+compared (which check fired, both sides, which fields differ, and the
+node's `executed_v1` rows around both positions). Local runs on it, fresh
+domains:
+
+| Driver | Runs | Final read not served | Anomaly | Stop | "cannot reach a voter" |
+| --- | --- | --- | --- | --- | --- |
+| `--fault random --seconds 120` | 6 | 0 | none | 0 | 8 to 30 per run |
+| `--fault random --faults 2,1 --seconds 60` | 6 | 0 | none | 0 | 6 to 8 per run |
+| `--fault pause-majority --seconds 120` | 6 | 0 | none | 0 | 0 |
+
+* **`pause-majority`** went through its window 4 times in each run, 24 in
+  all: both followers paused for 10 s while the leader took submissions
+  alone, the leader killed, the followers resumed with their backlog, and
+  the leader restarted 5 s later. None stopped a voter, and every run's
+  final lists agreed.
+* **Its dials:** no "cannot reach a voter" at all. A paused voter keeps
+  its connections, so what the pause shows is sends refused with a full
+  Control lane (91) while a follower is stopped.
+* **The kill runs' dials:** every "cannot reach a voter" again named the
+  peer address's own `Rejected(Transport("connection lost"))`, 161 lines
+  over the 12 runs.
+
 ### Under Jepsen: a domain that no longer binds sessions
 
 That same run went on to the Jepsen test: list-append, five minutes of
