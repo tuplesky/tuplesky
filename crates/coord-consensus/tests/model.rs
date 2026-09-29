@@ -1488,6 +1488,62 @@ fn a_command_adopted_after_a_candidate_follows_what_that_candidate_follows() {
     assert!(decision.reproposed.is_empty(), "{:?}", decision.reproposed);
 }
 
+/// A member's order is read through what the selection decided, not
+/// through the member's stale record of it (task-d33, protocol_sim row 10,
+/// five voters, seed 67).
+///
+/// r1, in ballot 0's fast set, pre-accepted d after a, a after w, and c
+/// after d. r2 holds d committed after w, and a accepted after d. Read
+/// over r1's records, c's closure reached a through d, so a passed as
+/// ordered before c. But d executes after w, not after a: the selection
+/// kept c after d beside a after d, two commands of one key that neither
+/// orders, and the voters executed them in different orders.
+#[test]
+fn a_candidate_is_not_ordered_after_an_adopted_command_through_a_stale_record() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (w, d, a, c) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(w, Phase::Commit, &[]),
+                pre_accept_with(d, &[a], 5),
+                pre_accept_with(a, &[w], 6),
+                pre_accept_with(c, &[d], 7),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(w, Phase::Commit, &[]),
+                entry(d, Phase::Commit, &[w]),
+                entry(a, Phase::Accept, &[d]),
+            ],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    let after_d: Vec<CommandId> = decision
+        .entries
+        .values()
+        .filter(|e| e.deps == vec![d])
+        .map(|e| e.command)
+        .collect();
+    assert!(
+        after_d.len() <= 1,
+        "two commands follow d unordered: {after_d:?}, reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(
+        decision.reproposed.contains(&c),
+        "{:?}",
+        decision.entries.get(&c)
+    );
+}
+
 /// The same check does not drop a candidate for a decision of an earlier
 /// ballot its member executed and forgot (task-d34).
 #[test]

@@ -7274,6 +7274,20 @@ dependencies. One was `IncompatibleAccepted`.
   and each pass judges every candidate against the candidates that pass
   keeps, so the order read through one is the order the selection ends
   with. `a_command_adopted_after_a_candidate_follows_what_that_candidate_follows`.
+- **A member's order read through its stale record of a decided
+  command** (10,5,67, found under #131's oracles). The member had
+  pre-accepted d after a, and c after d; the selection committed d after
+  w and adopted a after d. Over the member's records, c's closure reached
+  a through d, so a passed as ordered before c. But d executes after w,
+  not after a: the selection kept c after d beside a after d, two
+  commands of one key that neither orders, and two voters executed them
+  in different orders. Whether an adopted command precedes the candidate
+  is now read over the member's records except through a command the
+  selection holds, which is followed by the selection's dependencies. The
+  member's own closure stays the evidence of its path, for the rule that
+  the candidate's closure be decided: a stale record there still shows
+  that the member's path is not the leader's.
+  `a_candidate_is_not_ordered_after_an_adopted_command_through_a_stale_record`.
 - **A report that overlaid its selection on a decision** (5,3,39). A voter
   synchronized at a selection holding x at ACCEPT then pulled x's decision
   of a later ballot, with other dependencies. Its report overlaid the
