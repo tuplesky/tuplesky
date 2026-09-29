@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use coord_types::wire_v1::{Frame, FrameReader, WireError, encode_frame};
+use coord_types::wire_v1::{Frame, FrameReader, HEADER_LEN, WireError, encode_frame};
 use quinn::RecvStream;
 use tokio::time::timeout;
 
@@ -82,6 +82,14 @@ async fn read_frame_inner(
                     .map_err(FrameError::Budget)?,
             );
         }
+        // Under a budget, nothing past the header is read before the
+        // frame holds its permit (Codex review): a read of a whole chunk
+        // first would leave each waiting stream holding up to a chunk of
+        // payload the budget never counted.
+        let want = match (&_held, budget) {
+            (None, Some(_)) => HEADER_LEN.saturating_sub(reader.pending()).max(1),
+            _ => CHUNK,
+        };
         if let Some(frame) = reader.next_frame().map_err(FrameError::Wire)? {
             if exact_stream {
                 // Nothing may follow: the reader must be empty and the
@@ -95,7 +103,7 @@ async fn read_frame_inner(
             }
             return Ok(frame);
         }
-        match recv.read(&mut buf).await {
+        match recv.read(&mut buf[..want]).await {
             Ok(Some(n)) => reader.push(&buf[..n]).map_err(FrameError::Wire)?,
             Ok(None) => return Err(FrameError::Truncated),
             Err(e) => return Err(FrameError::Stream(e.to_string())),
