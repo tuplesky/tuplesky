@@ -255,6 +255,69 @@ pub enum FollowerRejection {
 /// A recovery report this replica owes a candidate.
 type ReportDue = crate::role::PendingReport;
 
+/// Report each selected entry in its record's place: the selected phase,
+/// order and facts supersede a record at or below them, and an entry with
+/// no record here is reported as selected with its payload outstanding
+/// (task-d30, task-d34). A follower overlays the Sync it is installing; a
+/// leader overlays the selection it leads from, whose entries it may not
+/// have proposed.
+pub(crate) fn overlay_selected<'a>(
+    report: &mut RecoveryReport,
+    entries: impl Iterator<Item = (&'a CommandId, &'a SyncEntry)>,
+) {
+    let known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+    for (command, entry) in entries {
+        if known.contains(command) {
+            // Known here at or below the selection, or with another
+            // order: a record older than the Sync, which the report
+            // must not present as this ballot's state. The selected
+            // entry is what this replica durably accepted at the
+            // synchronized ballot (a restart resumes installing it
+            // from the row), so it is reported in the record's place
+            // (task-d30), whatever the record agrees with it on.
+            if let Some(e) = report.entries.iter_mut().find(|e| e.command == *command)
+                && (e.phase <= entry.phase || !crate::vote::same_set(&e.deps, &entry.deps))
+            {
+                e.phase = entry.phase;
+                e.deps = entry.deps.clone();
+                e.path = entry.path;
+                e.paths = entry.paths.clone();
+                e.seqnum = entry.seqnum;
+                // Selected under other facts than the record's: the
+                // payload held here is another presentation's, and
+                // the selected one is still to be fetched and rebound
+                // (task-d14). Claiming it present would count this
+                // replica as a supplier of a payload it cannot serve.
+                if let Some(named) = entry.admission
+                    && e.admission != Some(named)
+                {
+                    e.admission = Some(named);
+                    e.payload_present = false;
+                }
+            }
+            continue;
+        }
+        report.entries.push(ReportEntry {
+            command: *command,
+            phase: entry.phase,
+            deps: entry.deps.clone(),
+            path: entry.path,
+            paths: entry.paths.clone(),
+            seqnum: entry.seqnum,
+            // The conflict keys come from the payload, which is
+            // exactly what has not arrived. The per-key digests the
+            // selection installed name the keys the selected order
+            // was recorded against, which is what a reader of this
+            // entry can rely on.
+            keys: entry.paths.iter().map(|(k, _)| k.clone()).collect(),
+            payload_present: false,
+            // The facts the selection named: the payload that arrives
+            // has to be the one under them (task-d14).
+            admission: entry.admission,
+        });
+    }
+}
+
 /// Report every command this replica executed as committed (task-d05).
 ///
 /// A commit is not written as a row, so a durable record says ACCEPT for
@@ -705,6 +768,15 @@ impl Follower {
 
     /// A follower from state carried across a role change, under `quorum`.
     pub fn from_recovered(state: RecoveredState, quorum: BallotConfiguration) -> Self {
+        // The selection of the ballot this replica is synchronized to, as a
+        // restart reads it from the durable Sync row: a deposed leader's
+        // own, whose entries it may not have installed (task-d34). Without
+        // it, a selected command whose payload the leader lacked was
+        // pre-accepted afresh when the payload came, and reported so under
+        // the synchronized ballot.
+        let selection = state
+            .synced_selection
+            .filter(|d| d.ballot == state.ballots.synced());
         Follower {
             config: FollowerConfig {
                 identity: state.identity,
@@ -754,16 +826,17 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
-            resumed: None,
+            resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
-            synced_selection: None,
+            synced_selection: selection,
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
             catch_up: CatchUp::default(),
             diverged: None,
         }
+        .resume_sync()
     }
 
     /// Give up the role: everything durable or learned, nothing
@@ -786,6 +859,7 @@ impl Follower {
             report_cut: self.report_cut,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
+            synced_selection: self.synced_selection,
         }
     }
 
@@ -1780,56 +1854,7 @@ impl Follower {
             .into_iter()
             .flat_map(|d| d.entries.iter())
             .filter(|(c, _)| known.contains(c));
-        for (command, entry) in self.sync_pending.iter().chain(selected) {
-            if known.contains(command) {
-                // Known here at or below the selection, or with another
-                // order: a record older than the Sync, which the report
-                // must not present as this ballot's state. The selected
-                // entry is what this replica durably accepted at the
-                // synchronized ballot (a restart resumes installing it
-                // from the row), so it is reported in the record's place
-                // (task-d30), whatever the record agrees with it on.
-                if let Some(e) = report.entries.iter_mut().find(|e| e.command == *command)
-                    && (e.phase <= entry.phase || !crate::vote::same_set(&e.deps, &entry.deps))
-                {
-                    e.phase = entry.phase;
-                    e.deps = entry.deps.clone();
-                    e.path = entry.path;
-                    e.paths = entry.paths.clone();
-                    e.seqnum = entry.seqnum;
-                    // Selected under other facts than the record's: the
-                    // payload held here is another presentation's, and
-                    // the selected one is still to be fetched and rebound
-                    // (task-d14). Claiming it present would count this
-                    // replica as a supplier of a payload it cannot serve.
-                    if let Some(named) = entry.admission
-                        && e.admission != Some(named)
-                    {
-                        e.admission = Some(named);
-                        e.payload_present = false;
-                    }
-                }
-                continue;
-            }
-            report.entries.push(ReportEntry {
-                command: *command,
-                phase: entry.phase,
-                deps: entry.deps.clone(),
-                path: entry.path,
-                paths: entry.paths.clone(),
-                seqnum: entry.seqnum,
-                // The conflict keys come from the payload, which is
-                // exactly what has not arrived. The per-key digests the
-                // selection installed name the keys the selected order
-                // was recorded against, which is what a reader of this
-                // entry can rely on.
-                keys: entry.paths.iter().map(|(k, _)| k.clone()).collect(),
-                payload_present: false,
-                // The facts the selection named: the payload that arrives
-                // has to be the one under them (task-d14).
-                admission: entry.admission,
-            });
-        }
+        overlay_selected(&mut report, self.sync_pending.iter().chain(selected));
         // History is left out: a command this replica executed and keeps
         // nothing else about. Every command a report names is one the
         // candidate may need to install or fetch, and reporting the whole

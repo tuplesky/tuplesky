@@ -6134,6 +6134,35 @@ Evidence:
   and the two remaining failures at 1,000 runs, root-caused under
   task-d30.
 
+### A deposed leader's selection
+
+Found on #122's branch at 100 seeds (row 2, three voters, seed 45):
+- A leader can win with a selection naming a command whose payload it
+  does not hold. `Leader::repropose` skips a placeholder, so nothing is
+  proposed for it.
+- Deposed, it became a follower that did not carry its own Sync, since
+  `RecoveredState` had no place for it. Its reports under the
+  synchronized ballot omitted the command.
+- When the payload came, it pre-accepted the command afresh and reported
+  that PRE-ACCEPT at the source ballot. The next selection re-proposed a
+  command another voter had executed.
+
+The leader now keeps the selection it leads from. `into_recovered`
+hands it on as `RecoveredState::synced_selection`, and
+`Follower::from_recovered` resumes it as a restart resumes the durable
+Sync row: entries it has not installed are pending, and reports name the
+selected facts.
+
+The leader's own report overlays that selection too, through the same
+`overlay_selected` the follower uses. The report a deposed leader owes is
+often built while it still leads, from its rows alone. Seed 45's was: its
+re-proposal of the command was not durable yet, so the report showed its
+older PRE-ACCEPT under the synchronized ballot.
+
+Test: `a_deposed_leader_keeps_its_selection_for_what_it_never_proposed`
+(`activation`). It fails at the leader's report without the overlay, and
+at the follower's without the carried selection.
+
 ## The real replica machines under a protocol oracle
 
 task-d30. `coord-sim` ran only reference actors, and the multi-node tests
@@ -6464,8 +6493,19 @@ finishes or recovers admitted commands could be refused by a full table.
     When the payload arrived it pre-accepted ab51 afresh, reported that
     PRE-ACCEPT at the source ballot, and the next selection re-proposed
     a command another voter had executed.
-  - That is the role change, not the release: the next change carries a
-    deposed leader's uninstalled Sync entries into its follower.
+  - That is the role change, not the release. task-d34 now carries a
+    deposed leader's selection into its follower, and the leader's own
+    report overlays it; seed 45 passes.
+  - Seed 58 still fails, and the cause is not established yet. What is
+    known so far:
+    - r2 reported 9a0f and 65b2 at ACCEPT (b10's selection) for b11 and
+      b16. Its own report for its b17 campaign omits both, and no Sync
+      reached it in between.
+    - b17's selection then kept 0db8 at ACCEPT `<9a0f>` and re-proposed
+      9a0f, chaining a95c after it with `<9a0f>` as well. The order forks
+      at 9a0f.
+    - Ruled out: a release, a ledger removal, and a forgotten placeholder
+      of 9a0f.
 - **The argument.** The Sync is selected from a majority's reports, and
   selection keeps every command a quorum of an earlier ballot could have
   decided (at five voters only with task-d19). So a command it leaves out
