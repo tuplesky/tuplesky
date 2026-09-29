@@ -2506,11 +2506,27 @@ outside it looked exactly like a domain that had stopped accepting
 sessions, which is why it took a counter to see.
 
 The bias is a budget now: after `PEER_BEFORE_API` consecutive peer
-events the caller's plane is polled first for one turn. 64 is high
+events the caller's plane is polled first for one turn. 8 is high
 enough that the ordering still holds for the case it is for -- a burst
 of votes for one command, a recovery summary -- and low enough that a
 caller waits for a bounded number of frames rather than for the domain
 to go quiet.
+
+It was 64 until task-d33, and a bound is not the only thing the number
+sets: it is also the caller's plane's *share* while the peer plane never
+goes quiet, one event in `PEER_BEFORE_API + 1`. A replica catching up
+keeps it busy for a minute at a time. Counted per second in
+`a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+under load, one voter took 200 to 400 peer events a second and 2 to 7 of
+its callers', where the other two took 40 to 80. That plane carries more
+than callers: it is where the other frontends' collectors submit and
+where the evidence for this node's own collector comes back. So a
+caller's request sat 36 seconds in the transport before the loop read it,
+and evidence the other voters sent in 150 ms reached the collector 28
+seconds later; the answer came just after the caller's 45 seconds. Four
+copies at a time on four cores, the test failed 8 runs of 28 at 64 and
+none of 20 at 8, and the runs finished in 73 to 87 seconds rather than 85
+to 104.
 
 On the same sequence of eleven rows against one standing domain:
 
