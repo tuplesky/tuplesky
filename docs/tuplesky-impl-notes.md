@@ -6193,6 +6193,32 @@ Residual: a retired ancestor the selection no longer carries, because
 every reporter forgot it, reaches nothing further. A candidate behind it
 can still be dropped.
 
+### Re-proposals after the entries that follow them
+
+Found on #122's branch at 100 seeds (row 10, three voters, seed 58). The
+fork predates the failing ballot:
+- b17's selection kept 0db8 at ACCEPT with dependency 9a0f, which it
+  re-proposed rather than selected. ef62 and 15a3 followed 0db8.
+- The new leader chained its re-proposals after the recovered tail:
+  9a0f, then a95c, b135 and ff68 after it. 0db8 and a95c both followed
+  9a0f, two branches of one key's order, and the voters executed ff68
+  and 0db8 in different orders.
+- Chaining the re-proposals after such an entry instead makes a cycle
+  with the command it waits on.
+- The entry itself was re-proposed before its dependency, and the
+  acceptance guard refused it.
+
+`Leader::from_recovered` now:
+- leaves out of the first chain every entry that follows a re-proposed
+  command;
+- re-proposes such an entry right after the last re-proposed command it
+  follows;
+- goes on with the chain after the last of those entries.
+
+Test: `reproposals_go_on_after_the_entries_that_follow_them`
+(`activation`). It requires every two of the commands to be ordered and
+none to be on a cycle, and it fails without the change.
+
 ### A deposed leader's selection
 
 Found on #122's branch at 100 seeds (row 2, three voters, seed 45):
