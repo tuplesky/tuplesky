@@ -6130,9 +6130,68 @@ Evidence:
     this change.
   - 100 seeds: 2 of 1,000 fail, against 8.
   - Catch-up at the default seeds: all 120 pass, against 1 failure.
-- Still owed: the fast-path rate before and after on the stress driver,
-  and the two remaining failures at 1,000 runs, root-caused under
-  task-d30.
+- Still owed: the fast-path rate before and after on the stress driver.
+  The two remaining failures at 1,000 runs are the two cases below.
+
+Aligning at adoption left two more ways for a path to name a history the
+records do not hold. task-d30's simulator found both at row 10, three
+voters, without catch-up (seeds 52 and 86):
+- **A command left behind a synchronization.** Aligning a log to one
+  command leaves every command the replica pre-accepted before it in the
+  pending suffix, now placed after it. Their records still hold the
+  dependencies they were pre-accepted with, without it. The log now keeps
+  those commands as reordered. Until each is synchronized itself, or
+  executed and retired, its head is `reordered_path` of the true one,
+  which no leader path equals. Test:
+  `a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders`
+  (`graph`).
+- **A new leader's anchor.** A new leader anchors its first fresh
+  proposal after the recovered order's tails, and its path log went on
+  digesting its own appends, which need not pass through them. In seed
+  52 the leader installed 454d from its Sync, and its path for 65da
+  skipped 454d while its dependencies named it. r2 had never held 454d,
+  and its appends were the same. It reached the same path for 65da with
+  other dependencies, then an equal path and equal dependencies for 81be.
+  The collector learned 81be fast over two histories, and recovery
+  without the leader re-proposed it after 454d. `anchor_all` now
+  re-anchors the log at `anchored_path` of the tails, which a follower
+  reaches only by synchronizing to a path chained from it. Test:
+  `a_leaders_path_follows_the_tails_it_anchors_after` (`graph`).
+- Both tests fail without their change. With both, task-d30's rows run
+  clean at 1,000 seeds (100 per row and size), with catch-up and
+  without.
+- Cost: after a leader change, a follower's fast acknowledgements match
+  again only once it has adopted one fresh proposal. A pre-accepted
+  command reordered behind a synchronization holds its replica's head
+  off the leader's until its own order arrives.
+
+### Item 5: a member that forgot an at-source command
+
+The possible-fast rule dropped a candidate when a conflicting command
+accepted at the source ballot, and not ordered after it, was missing from
+the member's records. That case is reachable. A member executes a and
+then f, both accepted at the source ballot. It retires both, which
+nothing stops while a later command is still pre-accepted. Its
+pre-acceptance of x names f. Its report then holds x, but not f or a.
+The rule refused x, which may have been decided fast, and that is the
+unsafe direction.
+
+History does not need to travel in the report: the member's own records
+already say what its order put before x. The rule now also keeps x when
+the missing command is in x's closure over the member's records. It also
+keeps x when the missing command was decided before a command in that
+closure that the member no longer holds. Such a command was executed
+there after everything the selection orders before it. A missing command
+reached neither way still drops the candidate.
+
+Test:
+`a_candidate_whose_member_forgot_an_at_source_command_it_ordered_first_is_kept`
+(`model`). It fails without the change, and its second half keeps the
+drop for a command the forgotten one says nothing about.
+
+Residual: a retired ancestor the selection no longer carries, because
+every reporter forgot it, reaches nothing further. A candidate behind it
+can still be dropped.
 
 ### A deposed leader's selection
 
@@ -6257,17 +6316,22 @@ Seeds that once failed are kept in
     as `coordd`'s pacer always runs.
   - With catch-up: the default seeds and 100 seeds per row and size pass,
     all 1,000 runs.
-  - Without catch-up: 40 seeds pass (400 runs), and 100 seeds fail 2 of
-    1,000 (row 10, three voters, seeds 52 and 86).
-  - Seed 52, traced, is the same class through a Sync's installation. In
-    b1, r2 pre-accepted 65da with `<b002>` before installing b1's Sync,
-    which carries 454d. The installation then aligned r2's log with
-    454d's anchor ahead of 65da. r2 fast-acknowledged 81be with the
-    leader's path, while its records say 65da never followed 454d. With
-    the leader absent, recovery refused 81be and re-proposed it.
-  - Not fixed here. The next change is to keep a record's history and
-    its log consistent when an alignment lands behind a pending
-    pre-accept.
+  - Without catch-up, before #118's last two path changes: 40 seeds
+    pass (400 runs), and 100 seeds fail 2 of 1,000 (row 10, three
+    voters, seeds 52 and 86).
+  - Seed 52, traced with the path each proposal and fast
+    acknowledgement carries: b1's leader installed 454d from its own
+    Sync and anchored its first fresh proposal, 65da, after it. Its path
+    log still digested only its own appends, so 65da's path skipped 454d
+    while its dependencies named it. r2 never held 454d, pre-accepted
+    65da with `<b002>` and reached the same path. It then fast-acknowledged
+    81be with the leader's path and dependencies over another history.
+    With the leader absent, recovery re-proposed 81be after 454d.
+  - Seed 86 is a command pre-accepted ahead of one the log was then
+    aligned to, left behind it in the log without it in its record.
+  - Both are fixed on #118 (see "F7: a path from an order the replica
+    does not hold"). With them, and #118 item 5, 100 seeds per row and
+    size pass, all 1,000 runs, with catch-up and without.
 - Budgets and progress after healing are task-d33's oracles.
 - **Catch-up.** A follower's timer asks its leader for executed
   history, as `coordd`'s pacer does, and the donor's page is served from
