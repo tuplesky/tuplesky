@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 
 use coord_consensus::{
     ClosureProgress, CommandRecord, CommandTable, GuardViolation, InitError, Phase, RetireError,
-    chain, decode_dependency, dependency_key, dependency_update, empty_path,
+    anchored_path, chain, decode_dependency, dependency_key, dependency_update, empty_path,
+    reordered_path,
 };
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
@@ -119,6 +120,112 @@ fn leader_synchronization_aligns_follower_paths() {
     late.record_leader_path(d, 3, &ld.paths);
     let fd = late.initialize(d, payload(4), k("key")).unwrap();
     assert_eq!(fd.paths, ld.paths);
+}
+
+/// A command pre-accepted ahead of one the leader then ordered first is
+/// left behind it in the log, pre-accepted without it (task-d34, F7).
+///
+/// The follower saw x, then y; the leader ordered y, then x. Aligned to y
+/// alone, the follower's log reads y then x, which is the leader's order,
+/// while its record of x still does not depend on y. A fast
+/// acknowledgement of a next command z with that head would claim a
+/// history the follower's records do not hold, and with the leader
+/// absent recovery could not rebuild z's ancestors from them. Until x is
+/// synchronized itself, the head is on no leader path.
+#[test]
+fn a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders() {
+    let (x, y, z) = (cmd(1), cmd(2), cmd(3));
+    let mut leader = CommandTable::new();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let lx = leader.initialize(x, payload(1), k("key")).unwrap();
+    assert_eq!(lx.deps, vec![y]);
+    let mut follower = CommandTable::new();
+    let fx = follower.initialize(x, payload(1), k("key")).unwrap();
+    assert!(!fx.deps.contains(&y));
+    follower.initialize(y, payload(2), k("key")).unwrap();
+
+    follower.record_leader_path(y, 0, &ly.paths);
+    let log = follower.log(b"key").unwrap();
+    assert_eq!(log.pending(), &[x]);
+    assert_eq!(log.reordered(), &BTreeSet::from([x]));
+    // Without the rule this is chain(y's anchor, x): the leader's head.
+    assert_eq!(
+        follower.path_head(b"key"),
+        chain(&reordered_path(&ly.paths[0].1), &x)
+    );
+    assert_ne!(follower.path_head(b"key"), leader.path_head(b"key"));
+    let lz = leader.initialize(z, payload(3), k("key")).unwrap();
+    let mut early = follower.clone();
+    let fz = early.initialize(z, payload(3), k("key")).unwrap();
+    assert_ne!(fz.path, lz.path, "no fast evidence over x's stale record");
+
+    // Synchronized itself, x takes the leader's order, and the head is the
+    // leader's again.
+    follower.record_leader_path(x, 1, &lx.paths);
+    assert!(follower.log(b"key").unwrap().reordered().is_empty());
+    assert_eq!(follower.path_head(b"key"), lx.paths[0].1);
+    let fz = follower.initialize(z, payload(3), k("key")).unwrap();
+    assert_eq!(fz.path, lz.path);
+
+    // A synchronization that arrived before its command was appended here
+    // leaves all of the suffix behind it too.
+    let mut late = CommandTable::new();
+    late.record_leader_path(y, 0, &ly.paths);
+    late.initialize(x, payload(1), k("key")).unwrap();
+    late.initialize(y, payload(2), k("key")).unwrap();
+    assert_eq!(late.log(b"key").unwrap().reordered(), &BTreeSet::from([x]));
+    assert_ne!(late.path_head(b"key"), leader.path_head(b"key"));
+
+    // Executed and retired without a synchronization of its own, x holds a
+    // decided order, and it no longer keeps the head off.
+    early.accept(y, vec![]).unwrap();
+    early.accept(x, vec![y]).unwrap();
+    early.commit(y).unwrap();
+    early.commit(x).unwrap();
+    early.execute(y).unwrap();
+    early.execute(x).unwrap();
+    early.retire(&x).unwrap();
+    assert!(early.log(b"key").unwrap().reordered().is_empty());
+}
+
+/// A new leader's first fresh proposal follows the recovered tails, and
+/// so does its path (task-d34, F7).
+///
+/// The leader's own appends never passed through t, which it installed
+/// from a Sync and anchors after. A follower whose appends were the same,
+/// and which has not installed t, derives x from b alone. Hashed through
+/// the leader's appends, x's path was the same on both while its
+/// dependencies were not, and the fast acknowledgement of the command
+/// after x, with equal dependencies and an equal path, was a fast decision
+/// over two histories (protocol_sim row 10, three voters, seed 52).
+#[test]
+fn a_leaders_path_follows_the_tails_it_anchors_after() {
+    let (b, t, x, y) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let mut leader = CommandTable::new();
+    let mut follower = CommandTable::new();
+    let lb = leader.initialize(b, payload(1), k("key")).unwrap();
+    follower.initialize(b, payload(1), k("key")).unwrap();
+    follower.record_leader_path(b, 0, &lb.paths);
+    assert_eq!(leader.path_head(b"key"), follower.path_head(b"key"));
+
+    leader.anchor_all(b"key", &[t, b]);
+    assert_eq!(leader.path_head(b"key"), anchored_path(&[b, t]));
+    let lx = leader.initialize(x, payload(3), k("key")).unwrap();
+    let fx = follower.initialize(x, payload(3), k("key")).unwrap();
+    assert_eq!(lx.deps, vec![t, b]);
+    assert_eq!(fx.deps, vec![b]);
+    assert_ne!(lx.path, fx.path);
+    let ly = leader.initialize(y, payload(4), k("key")).unwrap();
+    let mut behind = follower.clone();
+    let fy = behind.initialize(y, payload(4), k("key")).unwrap();
+    assert_eq!(ly.deps, fy.deps);
+    assert_ne!(ly.path, fy.path, "equal dependencies over another history");
+
+    // Synchronized to the leader's order for x, the follower's paths are
+    // the leader's again.
+    follower.record_leader_path(x, 1, &lx.paths);
+    let fy = follower.initialize(y, payload(4), k("key")).unwrap();
+    assert_eq!(fy.path, ly.path);
 }
 
 #[test]
@@ -827,4 +934,25 @@ fn a_released_command_leaves_the_path_log() {
         .unwrap();
     assert_eq!(after_release.paths, without.paths);
     assert_eq!(after_release.path, without.path);
+}
+
+/// A released command that was reordered behind a synchronization no
+/// longer holds the head off the leader's paths (task-d24 with task-d34):
+/// released, it stands for no history at all.
+#[test]
+fn a_released_reordered_command_frees_the_head() {
+    let (x, y) = (cmd(1), cmd(2));
+    let mut leader = CommandTable::new();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let mut follower = CommandTable::new();
+    follower.initialize(x, payload(1), k("key")).unwrap();
+    follower.initialize(y, payload(2), k("key")).unwrap();
+    follower.record_leader_path(y, 0, &ly.paths);
+    assert_eq!(
+        follower.log(b"key").unwrap().reordered(),
+        &BTreeSet::from([x])
+    );
+    assert!(follower.release(&x));
+    assert!(follower.log(b"key").unwrap().reordered().is_empty());
+    assert_eq!(follower.path_head(b"key"), leader.path_head(b"key"));
 }
