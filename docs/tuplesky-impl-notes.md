@@ -7419,12 +7419,16 @@ After every step, every limit of the resource contract (design Section
   - The entries examined while installing one never exceed four times the
     Sync's size (task-d26).
 - **Frames and journal records.** A frame is at most 4 MiB. A journal
-  record is at most 4,096 updates and 4 MiB.
+  record is at most 4,096 updates and 4 MiB, counted as the journal
+  admits a batch: sixteen bytes more per update, 64 per batch and 512 for
+  the record's header.
 
 ### The progress oracle
 
 After the fault schedule, the faults stop and admission pauses:
-- every node is restarted;
+- every node restarts, the live ones too, so what the domain settles
+  from there it settles from durable rows, not from tables and journal
+  writes a restart would discard;
 - nothing is lost, duplicated or held back;
 - campaigns happen only as `coordd`'s election makes them, with per-voter
   backoff and jitter;

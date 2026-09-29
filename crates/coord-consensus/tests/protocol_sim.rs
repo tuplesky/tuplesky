@@ -30,7 +30,7 @@
 //!    retry-key bindings, report pages and assemblies, the work of
 //!    installing a Sync, the size of a Sync, a frame and a journal record.
 //! 6. **Progress after healing** (task-d33). Once the faults stop and
-//!    admission pauses -- every node restarted, no loss, no duplication,
+//!    admission pauses -- every node restarted, the live ones too, no loss, no duplication,
 //!    nothing held back, campaigns only as `coordd`'s election makes them --
 //!    every admitted command settles and every voter executes as far as
 //!    the others, within a budget of steps. A command settles as the
@@ -590,12 +590,20 @@ impl Sim {
         for e in effects {
             match e {
                 Effect::Persist(batch) => {
-                    // Oracle 5: one journal record (design Section 13.1).
+                    // Oracle 5: one journal record (design Section 13.1),
+                    // counted as the journal admits it: `batch_bytes` of
+                    // coord-storage (sixteen bytes per update and 64 per
+                    // batch) plus the record header's allowance of 512,
+                    // against `MAX_RECORD_BYTES` and `MAX_RECORD_UPDATES`
+                    // of coord-journal-api. A batch past it is refused as
+                    // `TooLarge` before it is queued.
                     let bytes: usize = batch
                         .updates
                         .iter()
-                        .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len))
-                        .sum();
+                        .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len) + 16)
+                        .sum::<usize>()
+                        + 64
+                        + 512;
                     if batch.updates.len() > 4_096 || bytes > 4 << 20 {
                         self.fail(&format!(
                             "node {i} wrote a journal record of {} updates and {bytes} bytes",
@@ -1861,10 +1869,15 @@ impl Sim {
         self.net.append(&mut self.held);
         self.retries.clear();
         self.owed_to_leader.clear();
+        // Every node restarts, the live ones too: what the domain settles
+        // from here it settles from durable rows, as after a restart of
+        // the whole domain, not from volatile tables and journal writes a
+        // restart would discard.
         for i in 0..self.n {
-            if !self.nodes[usize::from(i)].alive() {
-                self.restart(i);
+            if self.nodes[usize::from(i)].alive() {
+                self.crash(i);
             }
+            self.restart(i);
         }
         let start = self.step + 1;
         self.heal_start = start;
