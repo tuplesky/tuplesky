@@ -6316,17 +6316,22 @@ Seeds that once failed are kept in
     as `coordd`'s pacer always runs.
   - With catch-up: the default seeds and 100 seeds per row and size pass,
     all 1,000 runs.
-  - Without catch-up: 40 seeds pass (400 runs), and 100 seeds fail 2 of
-    1,000 (row 10, three voters, seeds 52 and 86).
-  - Seed 52, traced, is the same class through a Sync's installation. In
-    b1, r2 pre-accepted 65da with `<b002>` before installing b1's Sync,
-    which carries 454d. The installation then aligned r2's log with
-    454d's anchor ahead of 65da. r2 fast-acknowledged 81be with the
-    leader's path, while its records say 65da never followed 454d. With
-    the leader absent, recovery refused 81be and re-proposed it.
-  - Not fixed here. The next change is to keep a record's history and
-    its log consistent when an alignment lands behind a pending
-    pre-accept.
+  - Without catch-up, before #118's last two path changes: 40 seeds
+    pass (400 runs), and 100 seeds fail 2 of 1,000 (row 10, three
+    voters, seeds 52 and 86).
+  - Seed 52, traced with the path each proposal and fast
+    acknowledgement carries: b1's leader installed 454d from its own
+    Sync and anchored its first fresh proposal, 65da, after it. Its path
+    log still digested only its own appends, so 65da's path skipped 454d
+    while its dependencies named it. r2 never held 454d, pre-accepted
+    65da with `<b002>` and reached the same path. It then fast-acknowledged
+    81be with the leader's path and dependencies over another history.
+    With the leader absent, recovery re-proposed 81be after 454d.
+  - Seed 86 is a command pre-accepted ahead of one the log was then
+    aligned to, left behind it in the log without it in its record.
+  - Both are fixed on #118 (see "F7: a path from an order the replica
+    does not hold"). With them, and #118 item 5, 100 seeds per row and
+    size pass, all 1,000 runs, with catch-up and without.
 - Budgets and progress after healing are task-d33's oracles.
 - **Catch-up.** A follower's timer asks its leader for executed
   history, as `coordd`'s pacer does, and the donor's page is served from

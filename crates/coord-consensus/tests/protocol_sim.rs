@@ -1195,18 +1195,22 @@ fn bn(b: &Ballot) -> String {
 fn describe(m: &ProtocolMessage) -> String {
     match m {
         ProtocolMessage::Proposal(a) => format!(
-            "Proposal {} {} deps[{}] seq{:?}",
+            "Proposal {} {} deps[{}] seq{:?} path {:02x}{:02x}",
             bn(&a.ballot),
             short(&a.command),
             shorts(&a.deps),
-            a.seqnum
+            a.seqnum,
+            a.path.0[0],
+            a.path.0[1]
         ),
         ProtocolMessage::FastAck(a) => format!(
-            "FastAck {} {} from {} deps[{}]",
+            "FastAck {} {} from {} deps[{}] path {:02x}{:02x}",
             bn(&a.ballot),
             short(&a.command),
             a.replica.0[0],
-            shorts(&a.deps)
+            shorts(&a.deps),
+            a.path.0[0],
+            a.path.0[1]
         ),
         ProtocolMessage::SlowAck(a) => format!(
             "SlowAck {} {} from {}",
