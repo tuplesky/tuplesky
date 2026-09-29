@@ -640,6 +640,17 @@ fn possible_fast_decisions(
         }
         false
     };
+    // Whether the member's order put `a` before a command whose closure
+    // over the member's records is `prefix`: `a` is in it, or is decided
+    // before a command in it that the member no longer holds. Such a
+    // command was executed there, after everything the selection orders
+    // before it, and retiring it cut the member's own closure short.
+    let forgotten_before = |prefix: &BTreeSet<CommandId>, a: &CommandId| -> bool {
+        prefix.contains(a)
+            || prefix
+                .iter()
+                .any(|d| record(first, d).is_none() && selected.contains_key(d) && after(d, a))
+    };
     loop {
         let before = candidates.len();
         let keys: Vec<CommandId> = candidates.keys().copied().collect();
@@ -661,11 +672,19 @@ fn possible_fast_decisions(
                     // the source ballot ordered; the member may simply
                     // have executed it and forgotten it.
                     None if from_below.contains(&adopted.command) => true,
+                    // Absent from the member's records, but its order put
+                    // it before `c`: `c`'s own dependencies name it, or a
+                    // command they name that the member no longer holds
+                    // was decided after it. The member executed and
+                    // retired it, and an ancestor it held is no evidence
+                    // against the member's path (task-d34, #118 item 5).
+                    None if forgotten_before(&prefix, &adopted.command) => true,
                     // Accepted at the source ballot and before `c` there,
-                    // yet absent from the member's records: the member's
-                    // order never placed it, so its path for `c` is not
-                    // the leader's, whatever it says (task-d30). Only a
-                    // command with no conflict keys at all is exempt.
+                    // yet absent from the member's records and from what
+                    // its order put before `c`: the member's order never
+                    // placed it, so its path for `c` is not the leader's,
+                    // whatever it says (task-d30). Only a command with no
+                    // conflict keys at all is exempt.
                     None => {
                         let keys: Vec<Vec<u8>> =
                             adopted.paths.iter().map(|(k, _)| k.clone()).collect();

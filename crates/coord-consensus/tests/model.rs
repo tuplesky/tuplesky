@@ -1390,6 +1390,58 @@ fn a_candidate_its_member_ordered_without_an_accepted_command_is_not_kept() {
     assert!(decision.reproposed.contains(&x));
 }
 
+/// Nor for a command accepted at the source ballot that its member
+/// executed and forgot, where its own order put that command before the
+/// candidate (task-d34, #118 item 5).
+///
+/// r1 executed a, then f, and retired both; x, pre-accepted after f,
+/// names f. Its records hold neither, but x's dependencies place f before
+/// x, and the selection decided a before f. Dropping x here would
+/// re-propose a command that may have been decided fast, which is the
+/// unsafe direction.
+#[test]
+fn a_candidate_whose_member_forgot_an_at_source_command_it_ordered_first_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (a, f, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        // r1, in ballot 0's fast set, executed and retired a and f.
+        report_for(1, ballot(1, 2), 0, vec![pre_accept_with(x, &[f], 5)]),
+        // r2 committed f after a at the source ballot.
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(a, Phase::Commit, &[]), entry(f, Phase::Commit, &[a])],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    // A command the member no longer holds is evidence only for what the
+    // selection decided before it: f after a says nothing of g.
+    let g = cmd(4);
+    let reports = vec![
+        report_for(1, ballot(1, 2), 0, vec![pre_accept_with(x, &[f], 5)]),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                entry(f, Phase::Commit, &[a]),
+                entry(g, Phase::Commit, &[a]),
+            ],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+}
+
 /// The same check does not drop a candidate for a decision of an earlier
 /// ballot its member executed and forgot (task-d34).
 #[test]
