@@ -4434,6 +4434,14 @@ fn a_deposed_leader_keeps_its_selection_for_what_it_never_proposed() {
     };
     let (mut leader, _) = Leader::from_recovered(f.into_recovered(), quorum(b1), &decision);
     assert!(leader.proposal(&x).is_none());
+    // Its own report names x as selected, not as never accepted.
+    let own = leader.report(b2);
+    let e = own
+        .entries
+        .iter()
+        .find(|e| e.command == x)
+        .unwrap_or_else(|| panic!("x is missing from the leader's report: {:?}", own.entries));
+    assert_eq!((e.phase, e.deps.clone()), (Phase::Accept, vec![]), "{e:?}");
     // Deposed by r2's campaign.
     let promised = leader.step(peer_event(
         r(2),

@@ -6151,6 +6151,14 @@ The leader now keeps the selection it leads from. `into_recovered`
 hands it on as `RecoveredState::synced_selection`, and
 `Follower::from_recovered` resumes it as a restart resumes the durable
 Sync row: entries it has not installed are pending, and reports name the
-selected facts. Test:
-`a_deposed_leader_keeps_its_selection_for_what_it_never_proposed`
-(`activation`), which fails without the change.
+selected facts.
+
+The leader's own report overlays that selection too, through the same
+`overlay_selected` the follower uses. The report a deposed leader owes is
+often built while it still leads, from its rows alone. Seed 45's was: its
+re-proposal of the command was not durable yet, so the report showed its
+older PRE-ACCEPT under the synchronized ballot.
+
+Test: `a_deposed_leader_keeps_its_selection_for_what_it_never_proposed`
+(`activation`). It fails at the leader's report without the overlay, and
+at the follower's without the carried selection.
