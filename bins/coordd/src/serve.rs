@@ -4055,7 +4055,7 @@ fn retained_answer<P: Persistence>(
     if !binding.active(health) || binding.session != key.session_id {
         return None;
     }
-    let (logical, resolved, executed) = {
+    let (logical, resolved, executed, below_floor) = {
         let gated = store.reader().snapshot().ok()?;
         let view = gated.view();
         let logical = logical.or_else(|| requested(view, key, command));
@@ -4063,9 +4063,10 @@ fn retained_answer<P: Persistence>(
             Some(logical) => resolve_retained(view, key, command, logical).ok()??,
             // Nothing to gate a result against: whatever the record holds
             // is not handed out, and only a retirement, which needs no
-            // request, is answered.
+            // request, is answered -- the floor's own, or one read below
+            // for a session that may no longer execute.
             None => match resolve_retained_unread(view, key, command).ok()?? {
-                retired @ Resolution::Retired { .. } => retired,
+                known @ (Resolution::Retired { .. } | Resolution::NoSession) => known,
                 _ => return None,
             },
         };
@@ -4074,7 +4075,18 @@ fn retained_answer<P: Persistence>(
                 .ok()
                 .flatten()
                 .is_some_and(|record| record.command_id == command);
-        (logical, resolved, executed)
+        // A session that may no longer execute is answered `NoSession`
+        // before its floor is read, and retirement deleted the rows it
+        // covered. The floor row is still durable, and a sequence at or
+        // below it was retired: that is known here, whatever the
+        // collector still remembers.
+        let below_floor = matches!(resolved, Resolution::NoSession)
+            && resolving
+            && !executed
+            && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
+                .ok()
+                .is_some_and(|floor| key.request_sequence <= floor.floor);
+        (logical, resolved, executed, below_floor)
     };
     let record = match resolved {
         Resolution::Result(record) => record,
@@ -4090,8 +4102,16 @@ fn retained_answer<P: Persistence>(
             return withheld(command, "the session may no longer read this result");
         }
         // The session may no longer execute, and nothing says this
-        // command ran: a request is not admitted, and a resolve is left
+        // command ran: a request is not admitted, and a resolve is
+        // answered retired when the floor covers it and is otherwise left
         // to the collector's memory.
+        Resolution::NoSession if below_floor => {
+            return status(
+                command,
+                coord_collector::codes::RESULT_RETIRED,
+                "retired: the result is no longer kept",
+            );
+        }
         Resolution::NoSession if resolving => return None,
         Resolution::NoSession => {
             return refusal(command, "the session may no longer execute");
@@ -4744,6 +4764,23 @@ mod tests {
                 &resolve_frame(key5, command5)
             )),
             Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        // A session that may no longer execute is refused before its
+        // floor is read, and retirement deleted the row: what the floor
+        // covers is still retired, not left to the collector's memory.
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key4, command4)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Above the floor, with no record, nothing is known here.
+        let (key6, command6) = invocation(6);
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key6, command6)),
+            None
         );
     }
 

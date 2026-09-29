@@ -231,7 +231,9 @@ as `SettledFromRecord` followed by the `Released` it produced, whose
   `coordd` asks its durable record first (task-d23): the executed result,
   gated against the request its payload row names; `Err OutputWithheld`
   (`0x0007`) when the caller may not read it; `Err ResultRetired`
-  (`0x0008`) at or below the retirement floor. What the record does not
+  (`0x0008`) at or below the retirement floor, including for a session
+  retired or whose trust rule is disabled, whose floor row outlives its
+  retry rows. What the record does not
   settle, and a result whose payload row is gone, is the collector's to
   answer as above.
 
