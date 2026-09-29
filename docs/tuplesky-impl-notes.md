@@ -6163,7 +6163,11 @@ voters, without catch-up (seeds 52 and 86):
 - Cost: after a leader change, a follower's fast acknowledgements match
   again only once it has adopted one fresh proposal. A pre-accepted
   command reordered behind a synchronization holds its replica's head
-  off the leader's until its own order arrives.
+  off the leader's until its own order arrives. A command retired while
+  still in a log's pending suffix stays there: `PathLog::forget` clears
+  only its reordered mark, so the next `sync_known` marks it reordered
+  again, and that key's head stays off the leader's until a restart
+  rebuilds the log.
 
 ### Item 5: a member that forgot an at-source command
 
@@ -6191,7 +6195,10 @@ drop for a command the forgotten one says nothing about.
 
 Residual: a retired ancestor the selection no longer carries, because
 every reporter forgot it, reaches nothing further. A candidate behind it
-can still be dropped.
+can still be dropped. That drop does not depend on the new rule:
+`prefix_decided` (`recovery.rs`) already drops a candidate whose
+member's prefix names a command that is neither selected nor a
+candidate, whatever the rule above decides.
 
 ### Re-proposals after the entries that follow them
 
@@ -6219,6 +6226,17 @@ Test: `reproposals_go_on_after_the_entries_that_follow_them`
 (`activation`). It requires every two of the commands to be ordered and
 none to be on a cycle, and it fails without the change.
 
+A re-proposed command this leader already holds at or past COMMIT keeps
+the dependencies it was decided with and is not proposed again. The
+entries that follow it are still proposed, right after it, and the chain
+goes on after them. Skipped along with it, as they first were, they were
+proposed nowhere: followers installed them at ACCEPT with nothing to vote
+on, the leader never committed them, and everything chained after them
+waited. The reachable case is a reporter behind the source ballot
+re-proposing a command the at-source voters retired. Test:
+`entries_that_follow_a_reproposed_command_the_leader_executed_are_proposed`
+(`activation`), which fails without the change.
+
 The selection that re-proposed 9a0f had a cause of its own. r2 held 9a0f
 and 65b2 at ACCEPT through b10's selection, and its b11 and b16 reports
 named them. Their payloads reached it while it campaigned for b17. Each
@@ -6229,7 +6247,24 @@ named, so r2's own report left both out, and b17 re-proposed them. The
 report now overlays the whole synchronized selection; what the replica
 executed and forgot is still left out. Test:
 `a_selected_entry_installing_from_a_late_payload_is_reported`
-(`activation`), which fails without the change.
+(`activation`), which fails without the change. An entry both pending
+and selected is reported once; it was pushed twice.
+
+### An older Sync's pending entries
+
+Found by task-d30's simulator (row 2, five voters, seed 0) once the
+leader's own adoption (#116) was merged. A voter restarted with an older
+Sync still installing, took a newer one, and activation added the newer
+entries beside the older ones. The older entry's payload then arrived,
+and it installed at ACCEPT from the older selection, at the newer
+synchronized ballot and over the demotion. The next campaign stopped on
+`IncompatibleAccepted`. A Sync's activation, and a Sync held for
+installation because a higher promise overtook its row, now clear what
+an older one left pending. task-d20's `replace_sync_pending` supersedes
+this where it lands. Tests (`activation`), each failing without the
+change:
+- `an_older_syncs_pending_entry_does_not_install_after_a_newer_sync`;
+- `an_older_syncs_pending_entry_does_not_install_after_a_superseded_newer_sync`.
 
 ### A deposed leader's selection
 

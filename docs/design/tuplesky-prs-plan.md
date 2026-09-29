@@ -1870,10 +1870,15 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 - A report takes the synchronized selection's entry over a durable record that is behind it, while its installation is in flight or the Sync was superseded.
 - The rule checked a candidate against conflicting adopted commands through the member's own records, so a command the member never held passed vacuously. Commands the selection orders after the candidate are exempt; an earlier ballot's decision the member may have forgotten is allowed; an at-source command the member does not hold rules the candidate out.
 - A follower's ledger applies only the batches it waits on, so a batch it staged as leader and completing after it was deposed was lost to its reports.
+- A replica aligned its per-key logs to the leader's order when a proposal arrived, so a fast acknowledgement's path could name a history its records did not hold. Logs align only where the replica takes the order as its own: at adoption and at a Sync's installation (the `recordLeaderHash` mapping row becomes `[EXT: stricter]`). A command pre-accepted before an alignment and left behind it keeps the head off every leader path until it is aligned itself or retired, and a new leader's log is anchored at the tails it chains after.
+- The possible-fast rule dropped a candidate when its member had executed and retired an at-source command the candidate followed. It now keeps the candidate when the missing command is in its closure over the member's records, or was decided before a command in that closure the member no longer holds.
+- A report left out selected entries whose installation was in flight; it now overlays the whole synchronized selection, each entry once.
+- The re-proposal chain forked at a re-proposed dependency. An entry that follows a re-proposed command is re-proposed right after it, also when the new leader already committed that command, and the chain goes on after it.
+- An older Sync's pending entry installed after a newer Sync was activated, at the newer ballot and over its demotion. Activating a Sync, or holding one a higher promise overtook, clears what an older one left pending.
 
-**Acceptance:** Each item has a deterministic test that fails without its change. The protocol simulator's rows pass at its default seeds with the changes.
+**Acceptance:** Each item has a deterministic test that fails without its change. The protocol simulator's rows pass at 1,000 runs (100 seeds per row and size), with catch-up and without.
 
-**Review boundary:** Recovery selection's possible-fast rule, the fast predicate's dependency check, Sync installation, reports and the follower's ledger. No row or message format changes.
+**Review boundary:** Recovery selection's possible-fast rule, the fast predicate's dependency check, Sync installation, reports, the follower's ledger, the per-key path log (`PathLog`, `anchor_all`) and the new leader's re-proposals (`Leader::from_recovered`). No row or message format changes.
 
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report
