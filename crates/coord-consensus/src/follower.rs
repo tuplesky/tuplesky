@@ -1745,14 +1745,20 @@ impl Follower {
         // drop a selected command entirely. The entries are reported for
         // what they are — selected, with their order, payload still
         // outstanding — so the selection preserves them.
-        let known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+        //
+        // The whole synchronized selection, not only the commands the
+        // ledger names: an entry whose late payload let it install has
+        // left the pending set, and until its row is durable the ledger
+        // does not name it either (task-d34, protocol_sim row 10, three
+        // voters, seed 58). Left out, a candidate reading the report
+        // re-proposed a command its own synchronized selection held at
+        // ACCEPT. What this replica executed and forgot is left out below.
         let selected = self
             .synced_selection
             .as_ref()
             .filter(|d| d.ballot == self.ballots.synced())
             .into_iter()
-            .flat_map(|d| d.entries.iter())
-            .filter(|(c, _)| known.contains(c));
+            .flat_map(|d| d.entries.iter());
         overlay_selected(&mut report, self.sync_pending.iter().chain(selected));
         // History is left out: a command this replica executed and keeps
         // nothing else about. Every command a report names is one the

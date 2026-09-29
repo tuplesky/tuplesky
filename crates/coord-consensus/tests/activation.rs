@@ -1908,6 +1908,82 @@ fn reproposals_follow_the_recovered_order_not_identity_order() {
     );
 }
 
+/// task-d34 (found by the protocol simulator, row 10, three voters, seed
+/// 58): an acceptance the selection carries can name a dependency the
+/// selection re-proposes, and the re-proposals go on after it.
+///
+/// x was accepted after r at the source ballot; r was not, and is
+/// re-proposed, as is y. Chained after the recovered tail, x among it, r
+/// made a cycle with x. Chained after r alone, y and x both followed r:
+/// two branches of one key's order, which the voters executed in
+/// different orders. Every two of them must be ordered by the
+/// dependencies the new leader proposes and installs.
+#[test]
+fn reproposals_go_on_after_the_entries_that_follow_them() {
+    let mut c = Cluster::new(3);
+    c.no_execute = vec![2];
+    let a = c.admit(1, 1);
+    c.settle();
+    let (r, x, y) = (
+        c.admit_at(2, 2, &[2]),
+        c.admit_at(3, 3, &[2]),
+        c.admit_at(4, 4, &[2]),
+    );
+    let new = ballot(1, 2);
+    let entry = |command, deps: Vec<CommandId>| coord_consensus::SyncEntry {
+        command,
+        phase: Phase::Accept,
+        deps,
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: None,
+    };
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(a, entry(a, vec![])), (x, entry(x, vec![r]))]),
+        reproposed: [r, y].into_iter().collect(),
+    };
+    let (leader, _) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    let deps_of = |cmd: &CommandId| -> Vec<CommandId> {
+        match decision.entries.get(cmd) {
+            Some(e) => e.deps.clone(),
+            None => leader.proposal(cmd).expect("re-proposed").deps.clone(),
+        }
+    };
+    let reaches = |from: &CommandId, to: &CommandId| -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = deps_of(from);
+        while let Some(d) = stack.pop() {
+            if d == *to {
+                return true;
+            }
+            if seen.insert(d) && [a, r, x, y].contains(&d) {
+                stack.extend(deps_of(&d));
+            }
+        }
+        false
+    };
+    for p in [a, r, x, y] {
+        assert!(!reaches(&p, &p), "{p:?} is on a cycle");
+        for q in [a, r, x, y] {
+            if p < q {
+                assert!(
+                    reaches(&p, &q) || reaches(&q, &p),
+                    "{p:?} ({:?}) and {q:?} ({:?}) are unordered",
+                    deps_of(&p),
+                    deps_of(&q)
+                );
+            }
+        }
+    }
+}
+
 /// The role-independent state of whichever role a node holds.
 fn role_into_recovered(role: Role) -> coord_consensus::RecoveredState {
     match role {
@@ -4166,6 +4242,55 @@ fn a_report_takes_the_selection_over_an_installation_still_in_flight() {
     let report = f.report(ballot(2, 0));
     let entry = report.entries.iter().find(|e| e.command == x).unwrap();
     assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
+}
+
+/// task-d34 (found by the protocol simulator, row 10, three voters, seed
+/// 58): a selected entry whose payload arrives after the Sync row is
+/// reported while its installation becomes durable.
+///
+/// The payload let the entry install, which took it out of the pending
+/// set; its row was not durable, so the ledger did not name it; and the
+/// synchronized selection was overlaid only on commands the ledger named.
+/// The report left the entry out altogether, and the candidate reading it
+/// re-proposed a command its own synchronized selection held at ACCEPT.
+#[test]
+fn a_selected_entry_installing_from_a_late_payload_is_reported() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    for e in durable_events(&marker) {
+        let installs = f.step(e);
+        for e in durable_events(&installs) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b1);
+    let before = f.report(ballot(2, 0));
+    assert!(
+        before.entries.iter().any(|e| e.command == z),
+        "pending entry reported"
+    );
+    // z's payload arrives; its installation is queued and not durable.
+    let installs = f.step(admit_z);
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "z's installation was queued: {installs:?}"
+    );
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == z);
+    assert_eq!(
+        entry.map(|e| (e.phase, e.deps.clone())),
+        Some((Phase::Accept, vec![x])),
+        "{:?}",
+        report.entries
+    );
 }
 
 /// task-d34: a Sync whose row lands after a higher promise's still has its
