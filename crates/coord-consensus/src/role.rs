@@ -61,4 +61,10 @@ pub struct RecoveredState {
     pub frontend: PeerId,
     /// Command table capacity.
     pub capacity: usize,
+    /// The selection of the synchronized ballot, when this replica holds
+    /// it: a deposed leader's own Sync, whose entries it may not have
+    /// installed (task-d34). Its follower resumes it as a restart resumes
+    /// the durable Sync row, so the entries install at the selected facts
+    /// and every report names them.
+    pub synced_selection: Option<crate::recovery::SyncDecision>,
 }
