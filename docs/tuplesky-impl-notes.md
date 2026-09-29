@@ -6193,6 +6193,44 @@ Residual: a retired ancestor the selection no longer carries, because
 every reporter forgot it, reaches nothing further. A candidate behind it
 can still be dropped.
 
+### Re-proposals after the entries that follow them
+
+Found on #122's branch at 100 seeds (row 10, three voters, seed 58). The
+fork predates the failing ballot:
+- b17's selection kept 0db8 at ACCEPT with dependency 9a0f, which it
+  re-proposed rather than selected. ef62 and 15a3 followed 0db8.
+- The new leader chained its re-proposals after the recovered tail:
+  9a0f, then a95c, b135 and ff68 after it. 0db8 and a95c both followed
+  9a0f, two branches of one key's order, and the voters executed ff68
+  and 0db8 in different orders.
+- Chaining the re-proposals after such an entry instead makes a cycle
+  with the command it waits on.
+- The entry itself was re-proposed before its dependency, and the
+  acceptance guard refused it.
+
+`Leader::from_recovered` now:
+- leaves out of the first chain every entry that follows a re-proposed
+  command;
+- re-proposes such an entry right after the last re-proposed command it
+  follows;
+- goes on with the chain after the last of those entries.
+
+Test: `reproposals_go_on_after_the_entries_that_follow_them`
+(`activation`). It requires every two of the commands to be ordered and
+none to be on a cycle, and it fails without the change.
+
+The selection that re-proposed 9a0f had a cause of its own. r2 held 9a0f
+and 65b2 at ACCEPT through b10's selection, and its b11 and b16 reports
+named them. Their payloads reached it while it campaigned for b17. Each
+then installed, which took it out of the pending set, and its row was
+not durable yet, so the durable ledger did not name it either. The
+report overlaid the synchronized selection only on commands the ledger
+named, so r2's own report left both out, and b17 re-proposed them. The
+report now overlays the whole synchronized selection; what the replica
+executed and forgot is still left out. Test:
+`a_selected_entry_installing_from_a_late_payload_is_reported`
+(`activation`), which fails without the change.
+
 ### A deposed leader's selection
 
 Found on #122's branch at 100 seeds (row 2, three voters, seed 45):
