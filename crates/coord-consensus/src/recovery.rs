@@ -298,6 +298,21 @@ pub fn select_with(
     reports: &[RecoveryReport],
     supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
 ) -> Result<SyncDecision, RecoveryError> {
+    select_from(config, reports, supplied, |_| None)
+}
+
+/// [`select_with`], where `source` gives the configuration the source
+/// ballot ran under, if the candidate knows it (task-d31). Its fast set
+/// is the one a fast decision of the source ballot was made by, so the
+/// possible-fast rule is applied to it; a ballot whose configuration is
+/// not known ran under the default fast set, as every production path
+/// builds (`BallotConfiguration::c2_default`).
+pub fn select_from(
+    config: &BallotConfiguration,
+    reports: &[RecoveryReport],
+    supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
+    source_configuration: impl Fn(&Ballot) -> Option<BallotConfiguration>,
+) -> Result<SyncDecision, RecoveryError> {
     let mut seen = BTreeSet::new();
     for r in reports {
         if !config.is_voter(&r.replica) {
@@ -496,7 +511,17 @@ pub fn select_with(
             }
         }
     }
-    possible_fast_decisions(config, source_ballot, reports, &mut entries, &from_below);
+    let source_config = source_configuration(&source_ballot).filter(|c| {
+        c.ballot() == source_ballot && c.epoch() == config.epoch() && c.voters() == config.voters()
+    });
+    possible_fast_decisions(
+        config,
+        source_ballot,
+        source_config,
+        reports,
+        &mut entries,
+        &from_below,
+    );
     for c in entries.keys() {
         reproposed.remove(c);
     }
@@ -527,15 +552,17 @@ pub fn select_with(
 fn possible_fast_decisions(
     config: &BallotConfiguration,
     source_ballot: Ballot,
+    source_config: Option<BallotConfiguration>,
     reports: &[RecoveryReport],
     entries: &mut BTreeMap<CommandId, SyncEntry>,
     from_below: &BTreeSet<CommandId>,
 ) {
-    // The fast set of the source ballot (the default rule until the
-    // retained operator quorum table of task-m01).
-    let Ok(source_config) =
-        BallotConfiguration::c2_default(config.epoch(), source_ballot, config.voters().clone())
-    else {
+    // The fast set of the source ballot: its own configuration where the
+    // candidate knows it (task-d31), else the default rule every
+    // production path builds.
+    let Some(source_config) = source_config.or_else(|| {
+        BallotConfiguration::c2_default(config.epoch(), source_ballot, config.voters().clone()).ok()
+    }) else {
         return;
     };
     let fast_reporters: Vec<&RecoveryReport> = reports

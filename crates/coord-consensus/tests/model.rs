@@ -1389,3 +1389,43 @@ fn a_candidate_whose_member_forgot_an_earlier_ballots_decision_is_kept() {
         decision.reproposed
     );
 }
+
+/// Recovery reads the source ballot's fast set from its configuration
+/// where it is known (task-d31). Ballot 0 ran with the fast set {r0, r2},
+/// not the default {r0, r1}: r2's pre-acceptance may be a fast decision,
+/// which the default rule, looking at r1 instead, would re-propose.
+#[test]
+fn possible_fast_decisions_follow_the_source_ballots_own_fast_set() {
+    let cfg = config(3, 1, &[1, 0], 1);
+    let source = config(3, 0, &[0, 2], 0);
+    let c1 = cmd(1);
+    let reports = vec![
+        report_for(1, ballot(1, 1), 0, vec![]),
+        report_for(2, ballot(1, 1), 0, vec![entry(c1, Phase::PreAccept, &[])]),
+    ];
+    let known = coord_consensus::select_from(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |b| (*b == source.ballot()).then(|| source.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        known.entries.get(&c1).map(|e| e.phase),
+        Some(Phase::Accept),
+        "a possible fast decision of the source ballot was not kept: {known:?}"
+    );
+    assert!(known.reproposed.is_empty());
+    // Under the default fast set r1 is the member heard, and it holds
+    // nothing: the command is re-proposed.
+    let default = select(&cfg, &reports).unwrap();
+    assert!(!default.entries.contains_key(&c1));
+    assert_eq!(default.reproposed, BTreeSet::from([c1]));
+    // A configuration of another ballot, epoch or voter set is not taken
+    // for the source's.
+    let other = config(3, 0, &[0, 2], 7);
+    let ignored =
+        coord_consensus::select_from(&cfg, &reports, |_, _| false, |_| Some(other.clone()))
+            .unwrap();
+    assert_eq!(ignored, default);
+}
