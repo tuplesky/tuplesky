@@ -5737,9 +5737,10 @@ covers the case.
 
 - Only adoption acknowledgements count toward the slow majority. The fast
   predicate is unchanged.
-- A slow decision is now the leader plus `slow_size - 1` durable ACCEPT
-  copies at its ballot. Any majority of reports holds one of them, and
-  selection keeps ACCEPT at the source.
+- A slow decision is now `slow_size` durable ACCEPT copies at its ballot,
+  the leader's own among them once its acceptance row is durable (see
+  "The leader's own adoption" below). Any majority of reports holds one
+  of them, and selection keeps ACCEPT at the source.
 - Recovery could not be made to keep the pre-accept instead. At five
   voters, {r1, r2, r4} can hold two fast-set pre-accepts of one command
   with different dependencies, and no leader or ACCEPT copy to choose
@@ -5776,8 +5777,8 @@ covers the case.
 - `a_fast_acknowledgement_is_not_counted_as_an_adoption`
   (`coord-collector`, `composition`): the leader's release, its reply,
   r1's fast acknowledgement with the leader's dependencies over another
-  path, and r3's adoption are held as `AwaitingVotes`, and r1's adoption
-  releases. It fails with the old rule.
+  path, and r3's adoption are held as `AwaitingVotes`. r1's adoption and
+  then the leader's own release it. It fails with the old rule.
 
 ### The five-node stop, read again
 
@@ -5797,6 +5798,71 @@ recorded: consistent with this bug, and not reproducible from what was
 kept. Five-node Jepsen results stay provisional until this change is
 carried to #98. A recurrence with this change carried would be a
 different cause, and the stores are now kept.
+
+### The leader's own adoption
+
+The first version of this change still counted the leader for its
+proposal. Codex's review of #116 found that wrong as well:
+- The leader's proposal row is PRE-ACCEPT. It writes its ACCEPT row in a
+  separate batch, once the dependency guard passes.
+- The followers' adoptions can make a majority with the proposal while
+  that batch is still in flight. A crash that loses it restarts the
+  leader at PRE-ACCEPT.
+- At three voters, the leader and the voter that did not adopt then form
+  a majority with no ACCEPT copy. At five, so do the leader and two
+  non-adopters. Recovery re-proposes the command with other dependencies
+  after its result may have been released.
+
+The fix is vicaya's option 1 (#116):
+- The leader acknowledges its own order like any voter. `Leader::adopt_own`
+  publishes a `SlowAck` to the voters and the frontend.
+- The acknowledgement requires the batch carrying the leader's ACCEPT row
+  and every batch submitted before it. That batch is the acceptance batch
+  for a fresh proposal, and the proposal batch for a re-proposal, which
+  writes its ACCEPT row there.
+- It is kept for re-offer beside the leader's reply. The leader counts it
+  in its own vote set when the batch is durable.
+- If an earlier batch it waited on fails, the outbox drops the
+  publication. It is then published again over what is still in flight.
+- `resend_unvoted` and `serve_proposals` send it again with the proposal,
+  once the leader has counted it. A voter that missed the first send
+  otherwise lacks the leader's copy.
+- `VoteSet` accepts the leader's `SlowAck`, so `VoteError::LeaderSlowAck`
+  is gone, and `learned_slow` counts `slow_size` adoptions with no +1 for
+  the proposal. Every learner uses `VoteSet`: the leader, the followers
+  and the collector.
+
+The cost:
+- A slow decision now waits for the leader's acceptance row to become
+  durable, or for one more follower adoption.
+- A single voter learns slowly only through its own acknowledgement, so
+  its commit now waits for its acceptance row. It used to commit on the
+  proposal row.
+
+Evidence:
+- `every_learned_decision_is_selected_by_every_recovering_majority` also
+  varies the leader's state: its acceptance durable, reported at ACCEPT
+  with its adoption counted, or not, reported at PRE-ACCEPT with its
+  proposal only.
+  - Restoring the old count (non-leader adoptions + 1) fails it at three
+    voters on `leader_adopted=false, [Adopted(None), None]` recovered from
+    {r0, r2}. Restricted to five voters, it fails on
+    `[Adopted(None), Adopted(None), None, None]` from {r0, r3, r4}.
+  - A fast decision whose leader holds only its proposal row needs the
+    source leader counted among the fast-set members to be recovered. #116
+    skips it, and #118 (item 1) adds that rule and checks it here too:
+    with #118, the model passes with the skip removed.
+- `the_leaders_reply_is_not_its_adoption_at_five_voters`
+  (`coord-collector`, `composition`): the leader's release and reply plus
+  two adoptions stay `AwaitingVotes`, and the leader's `SlowAck` or a
+  third adoption releases.
+- The leader, follower and activation tests deliver the leader's
+  acknowledgement where they relied on the proposal. The golden
+  `leader_normal.json` gains the two acknowledgements released when the
+  acceptance rows become durable.
+- Still to measure: the d30 simulator rows (#119) with this change
+  merged, and the slow-path latency on the stress driver at three voters
+  with the next carry.
 
 ## A recovery cycle is an invariant violation
 
@@ -6110,12 +6176,27 @@ Seeds that once failed are kept in
 
 ### What is left
 
-- At 100 seeds per row and size, 14 of 1,000 runs still fail. The
+- At 100 seeds per row and size, 14 of 1,000 runs still failed. The
   sampled traces show the design question recorded under task-d34 (a
   fast decision whose only reporting fast-set member recorded the
   leader's path for commands it had not adopted) and further
   stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
   seeds, not at every seed.
+- **With the leader's own adoption (#116, option 1) merged:**
+  - Default seeds: all 120 runs pass.
+  - 40 seeds: 2 of 400 runs fail, against 6 before.
+  - 100 seeds: 8 of 1,000 fail, against 14.
+  - Catch-up at the default seeds: 1 of 120 fails, against 3.
+  - Every remaining failure is row 10 (delayed old-ballot messages) at
+    three voters, a command executed with two dependency sets. The
+    fast-path gap below is gone.
+  - The merge moved one schedule onto a stale-Sync case:
+    `IncompatibleAccepted` at row 2, five voters, seed 0, now a kept
+    seed. A voter restarted with an older Sync still installing, took a
+    newer one, and `activate` added the newer entries beside the older
+    ones. The older entry then wrote the old ballot's ACCEPT back over
+    the demotion. `activate` now clears what an older Sync left pending,
+    the part of task-d20's `replace_sync_pending` this branch needs.
 - Budgets and progress after healing are task-d33's oracles.
 - **Catch-up.** With `PROTOCOL_SIM_CATCH_UP` set, a follower's timer asks
   its leader for executed history, as `coordd`'s pacer does, and the

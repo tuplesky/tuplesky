@@ -970,8 +970,9 @@ fn voter_identities_are_counted_rather_than_connections() {
         c.on_release(provenance(r(0), 1), released.clone()),
         Ok(Progress::Held(HoldReason::AwaitingVotes))
     );
-    // The leader's proposal plus one adopter is the slow majority of three:
-    // with the release already present, the second identity releases.
+    // Two adoptions are the slow majority of three, the leader's own among
+    // them once its acceptance row is durable (task-d19): with the release
+    // already present, the second adoption releases.
     let admitted_under = c.admission(&command).expect("outstanding");
     let slow = |replica: u8| {
         ProtocolMessage::SlowAck(SlowAck {
@@ -985,7 +986,12 @@ fn voter_identities_are_counted_rather_than_connections() {
         c.on_evidence(provenance(r(0), 1), reply.clone()),
         Ok(Progress::Held(HoldReason::AwaitingVotes))
     );
-    match c.on_evidence(provenance(r(2), 20), slow(2)) {
+    assert_eq!(
+        c.on_evidence(provenance(r(2), 20), slow(2)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "the leader's reply is not its adoption"
+    );
+    match c.on_evidence(provenance(r(0), 1), slow(0)) {
         Ok(Progress::Released(release)) => {
             assert!(!release.fast);
             assert_eq!(ok_result(&release.response), (Some(1), vec![0xaa]));
@@ -1115,7 +1121,12 @@ fn voter_identities_are_counted_rather_than_connections() {
             admission: admitted_under,
         })
     };
-    match c.on_evidence(provenance(r(2), 3), slow(2)) {
+    assert_eq!(
+        c.on_evidence(provenance(r(2), 3), slow(2)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "r2 and the leader's reply: the leader has not adopted yet"
+    );
+    match c.on_evidence(provenance(r(0), 1), slow(0)) {
         Ok(Progress::Released(release)) => {
             assert!(!release.fast);
             assert_eq!(release.command, command);
@@ -1848,12 +1859,108 @@ fn a_fast_acknowledgement_is_not_counted_as_an_adoption() {
         "the leader, r1's fast acknowledgement and r3's adoption released the result"
     );
     assert!(c.is_pending(&command));
-    // r1 adopts: the leader and two adoptions are the slow majority.
-    match c.on_evidence(provenance(r(1), 2), slow(1)) {
+    // r1 adopts, then the leader's own adoption arrives: three adoptions
+    // are the slow majority (task-d19).
+    assert_eq!(
+        c.on_evidence(provenance(r(1), 2), slow(1)),
+        Ok(Progress::Held(HoldReason::AwaitingVotes)),
+        "the leader's reply is not its adoption"
+    );
+    match c.on_evidence(provenance(r(0), 1), slow(0)) {
         Ok(Progress::Released(release)) => {
             assert!(!release.fast);
             assert_eq!(ok_result(&release.response), (Some(1), vec![0xaa]));
         }
         other => panic!("{other:?}"),
+    }
+}
+
+/// At five voters the leader's proposal is not its adoption (task-d19):
+/// the leader's reply and two adoptions are not a slow majority, and the
+/// command releases only on the leader's own adoption -- sent once its
+/// acceptance row is durable -- or a third adopter's.
+#[test]
+fn the_leaders_reply_is_not_its_adoption_at_five_voters() {
+    for third in [0u8, 3] {
+        let mut c = Collector::new(CollectorConfig {
+            quorum: quorum(5),
+            max_pending: 8,
+            max_resolved: 8,
+            max_undelivered_bytes: usize::MAX,
+        });
+        let (command, req) = request(1, put(b"x", b"1"), 0);
+        let admitted = AdmittedRequest {
+            receipt: AdmissionReceipt::submitting(
+                VerifierToken::for_boundary(),
+                AttestedAdmission {
+                    cluster: CLUSTER,
+                    domain: DOMAIN,
+                    session: SESSION,
+                    rule_generation: 1,
+                    scope_ceiling: u32::MAX,
+                    receipt_id: Digest32([7; 32]),
+                    admitted_at_ticks: 0,
+                },
+            ),
+            frame: MessageV1::Request(req).encode().unwrap(),
+        };
+        c.submit(MonotonicMillis::ZERO, &admitted).unwrap();
+        let released = ReleasedResult::from_gate(
+            EstablishedResult::establish(EstablishmentEvidence {
+                command,
+                epoch: epoch(),
+                ballot: ballot(),
+                position: ExecutionPosition::new(1).unwrap(),
+                closed_predecessors: vec![],
+                result_digest: Digest32([2; 32]),
+                revision: Some(KvRevision::new(1).unwrap()),
+                fast_path: false,
+            })
+            .unwrap(),
+            vec![0xaa],
+            true,
+        );
+        assert_eq!(
+            c.on_release(provenance(r(0), 1), released),
+            Ok(Progress::Held(HoldReason::AwaitingVotes))
+        );
+        let reply = ProtocolMessage::LeaderReply {
+            ballot: ballot(),
+            command,
+            seqnum: 1,
+            deps: vec![],
+            path: Digest32([1; 32]),
+        };
+        assert_eq!(
+            c.on_evidence(provenance(r(0), 1), reply),
+            Ok(Progress::Held(HoldReason::AwaitingVotes))
+        );
+        let admitted_under = c.admission(&command).expect("outstanding");
+        let slow = |replica: u8| {
+            ProtocolMessage::SlowAck(SlowAck {
+                replica: r(replica),
+                ballot: ballot(),
+                command,
+                admission: admitted_under,
+            })
+        };
+        for adopter in [1u8, 2] {
+            assert_eq!(
+                c.on_evidence(
+                    provenance(r(adopter), 10 + u64::from(adopter)),
+                    slow(adopter)
+                ),
+                Ok(Progress::Held(HoldReason::AwaitingVotes)),
+                "the leader's reply and r{adopter}: its proposal is not an adoption"
+            );
+        }
+        match c.on_evidence(provenance(r(third), 20), slow(third)) {
+            Ok(Progress::Released(release)) => {
+                assert!(!release.fast);
+                assert_eq!(ok_result(&release.response), (Some(1), vec![0xaa]));
+            }
+            other => panic!("third adoption from r{third}: {other:?}"),
+        }
+        assert!(!c.is_pending(&command));
     }
 }
