@@ -658,20 +658,58 @@ fn possible_fast_decisions(
         }
         seen
     };
+    // The same closure, followed through what the selection holds by the
+    // dependencies the selection gives it. It is what the member's order
+    // says the selection executes before a command. The member's record
+    // of a command the selection holds can be stale -- a pre-acceptance
+    // the command was since decided past, under other dependencies -- and
+    // the order it gives never executes (task-d33, protocol_sim row 10,
+    // five voters, seed 67): read through it, an adopted command passed as
+    // ordered before the candidate while the selection ordered both after
+    // the same command. The member's own closure stays the evidence of its
+    // path (`prefix_decided`).
+    let executed_closure = |m: &RecoveryReport, c: &CommandId| -> BTreeSet<CommandId> {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<CommandId> = record(m, c).map(|e| e.deps.clone()).unwrap_or_default();
+        while let Some(d) = stack.pop() {
+            if !seen.insert(d) {
+                continue;
+            }
+            if let Some(e) = entries.get(&d) {
+                stack.extend(e.deps.iter().copied());
+            } else if let Some(e) = record(m, &d) {
+                stack.extend(e.deps.iter().copied());
+            }
+        }
+        seen
+    };
     let conflicts = |a: &[Vec<u8>], b: &[Vec<u8>]| a.iter().any(|k| b.contains(k));
     // Whether the selection orders `x` after `c`: `c` is in `x`'s closure
-    // over the selected entries' dependencies.
-    let selected: BTreeMap<CommandId, Vec<CommandId>> =
-        entries.iter().map(|(k, e)| (*k, e.deps.clone())).collect();
-    let after = |x: &CommandId, c: &CommandId| -> bool {
+    // over the dependencies of the selected entries and of the candidates
+    // still kept. A kept candidate is selected with the dependencies it
+    // was reported with, and every pass judges each candidate against the
+    // candidates that pass keeps, so the order read through one is the
+    // order the selection ends with (#130 review). Read through the
+    // entries alone, a command adopted after a candidate that follows
+    // another was not seen to follow that other one.
+    let after = |candidates: &BTreeMap<CommandId, (ReportEntry, usize)>,
+                 x: &CommandId,
+                 c: &CommandId|
+     -> bool {
+        let deps_of = |d: &CommandId| -> Option<&Vec<CommandId>> {
+            entries
+                .get(d)
+                .map(|e| &e.deps)
+                .or_else(|| candidates.get(d).map(|(e, _)| &e.deps))
+        };
         let mut seen = BTreeSet::new();
-        let mut stack: Vec<CommandId> = selected.get(x).cloned().unwrap_or_default();
+        let mut stack: Vec<CommandId> = deps_of(x).cloned().unwrap_or_default();
         while let Some(d) = stack.pop() {
             if d == *c {
                 return true;
             }
             if seen.insert(d)
-                && let Some(deps) = selected.get(&d)
+                && let Some(deps) = deps_of(&d)
             {
                 stack.extend(deps.iter().copied());
             }
@@ -683,13 +721,16 @@ fn possible_fast_decisions(
     // before a command in it that the member no longer holds. Such a
     // command was executed there, after everything the selection orders
     // before it, and retiring it cut the member's own closure short.
-    let forgotten_before =
-        |m: &RecoveryReport, prefix: &BTreeSet<CommandId>, a: &CommandId| -> bool {
-            prefix.contains(a)
-                || prefix
-                    .iter()
-                    .any(|d| record(m, d).is_none() && selected.contains_key(d) && after(d, a))
-        };
+    let forgotten_before = |candidates: &BTreeMap<CommandId, (ReportEntry, usize)>,
+                            m: &RecoveryReport,
+                            prefix: &BTreeSet<CommandId>,
+                            a: &CommandId|
+     -> bool {
+        prefix.contains(a)
+            || prefix.iter().any(|d| {
+                record(m, d).is_none() && entries.contains_key(d) && after(candidates, d, a)
+            })
+    };
     // The commands `deps` reach, followed through the selection and the
     // candidates, that neither holds and a report holds undecided (or,
     // with `member`, that member holds undecided): the ones the selection
@@ -739,6 +780,7 @@ fn possible_fast_decisions(
             let (entry, member) = candidates[&c].clone();
             let first = fast_reporters[member];
             let prefix = closure(first, &c);
+            let ordered = executed_closure(first, &c);
             // The commands no ballot decided that `c` follows, which this
             // selection re-proposes: its own dependencies, followed
             // through what the selection keeps, reach them. The
@@ -768,7 +810,7 @@ fn possible_fast_decisions(
             let ordered_after_adopted = entries.values().all(|adopted| {
                 // Ordered after `c` by the selection itself: nothing it
                 // says constrains the member's order before `c`.
-                if after(&adopted.command, &c) {
+                if after(&candidates, &adopted.command, &c) {
                     return true;
                 }
                 // Before the re-proposals `c` follows, whatever the
@@ -810,7 +852,7 @@ fn possible_fast_decisions(
                     // executed there before it, so before `c`.
                     Some(a) => {
                         !conflicts(&entry.keys, &a.keys)
-                            || forgotten_before(first, &prefix, &adopted.command)
+                            || forgotten_before(&candidates, first, &ordered, &adopted.command)
                     }
                     // A decision of an earlier ballot precedes everything
                     // the source ballot ordered; the member may simply
@@ -822,7 +864,9 @@ fn possible_fast_decisions(
                     // was decided after it. The member executed and
                     // retired it, and an ancestor it held is no evidence
                     // against the member's path (task-d34, #118 item 5).
-                    None if forgotten_before(first, &prefix, &adopted.command) => true,
+                    None if forgotten_before(&candidates, first, &ordered, &adopted.command) => {
+                        true
+                    }
                     // Accepted at the source ballot and before `c` there,
                     // yet absent from the member's records and from what
                     // its order put before `c`: the member's order never

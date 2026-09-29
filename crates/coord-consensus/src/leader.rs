@@ -271,14 +271,17 @@ pub struct Leader {
     /// it is deposed (task-d34): an entry whose payload this leader lacked
     /// was never proposed, and the follower installs it from here.
     selection: Option<SyncDecision>,
-    /// The voters known to follow this leader's ballot: those its
-    /// campaign heard from, and those that have voted in it since. The
-    /// others missed the campaign -- down, cut off, or leading an older
-    /// ballot themselves -- and nothing else would ever tell them of this
-    /// one: its proposals are foreign to them, and a quiet domain sends
-    /// them nothing at all. They are asked again (`resend_unvoted`) and
+    /// The voters known to follow this leader's ballot: itself, and
+    /// those that have voted in it. A promise made during the campaign
+    /// does not count: the Sync that answered it is one unacknowledged
+    /// frame. The others missed the campaign -- down, cut off, or
+    /// leading an older ballot themselves -- or promised in it and lost
+    /// the Sync, and nothing else would ever tell them of this ballot:
+    /// its proposals are foreign to them, and a quiet domain sends them
+    /// nothing at all. They are asked again (`resend_unvoted`) and
     /// answered with the Sync (task-d33), until a vote shows they
-    /// installed it: a Sync lost on the way is sent again.
+    /// installed it. One that installed it with nothing to vote on yet
+    /// ignores the ask.
     joined: BTreeSet<ReplicaId>,
 }
 
@@ -423,7 +426,6 @@ impl Leader {
             frontend: self.config.frontend,
             capacity: self.config.capacity,
             synced_selection: self.selection,
-            joined: BTreeSet::new(),
             arrived: BTreeSet::new(),
         }
     }
@@ -472,10 +474,12 @@ impl Leader {
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
             selection: Some(decision.clone()),
-            joined: state.joined,
+            // Only this leader: a voter the campaign heard from has
+            // promised, but its Sync is one unacknowledged frame, and
+            // counted as joined it would never be asked again if that
+            // frame were lost (task-d33). A vote at this ballot joins it.
+            joined: BTreeSet::from([identity.replica]),
         };
-        leader.joined.insert(leader.config.identity.replica);
-        let _ = identity;
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
         // violation (task-d21): the candidate halts before binding such a
@@ -940,9 +944,10 @@ impl Leader {
     }
 
     /// A voter's promise of this leader's own ballot, after its campaign:
-    /// a voter the campaign missed, answering `resend_unvoted`'s ask. It
-    /// is sent the Sync this leader leads from, which it installs as the
-    /// voters the campaign heard from did (task-d33).
+    /// a voter the campaign missed or whose Sync was lost, answering
+    /// `resend_unvoted`'s ask. It is sent the Sync this leader leads
+    /// from, which it installs as the voters the campaign heard from did
+    /// (task-d33).
     fn on_late_promise(
         &mut self,
         from: ReplicaId,
@@ -1688,9 +1693,12 @@ impl Leader {
             }
             None => {}
         }
-        // Executed and forgotten, its binding with it (task-d26): the same
-        // answer as a bound command whose payload went to history.
-        if self.table.forgotten(&command) {
+        // Executed and retired: forgotten, its binding with it (task-d26),
+        // or inside the window with its key left unbound by a restart that
+        // found two executed presentations under it (task-d33). The same
+        // answer as a bound command whose payload went to history; the
+        // table holds no record, so initializing would take it as new.
+        if self.table.retired(&command) {
             self.rejections.push(Rejection::Duplicate(command));
             return self.refuse(command, SubmissionRefusal::Forgotten);
         }
