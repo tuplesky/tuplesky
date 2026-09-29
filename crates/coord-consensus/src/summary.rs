@@ -152,6 +152,11 @@ impl DurableLedger {
             .and_then(|s| s.first().map(|(c, _)| *c))
     }
 
+    /// The barriers of the batches still in flight.
+    pub fn in_flight(&self) -> impl Iterator<Item = BarrierId> + '_ {
+        self.staged.keys().copied()
+    }
+
     /// Durable record of a command.
     pub fn record(&self, command: &CommandId) -> Option<&CommandRecord> {
         self.records.get(command)
