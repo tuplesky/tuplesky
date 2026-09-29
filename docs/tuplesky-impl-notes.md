@@ -7287,6 +7287,21 @@ dependencies. One was `IncompatibleAccepted`.
   An entry now waits only on a re-proposed command the leader has not
   committed. `an_entry_after_a_command_the_leader_committed_is_in_the_chain`.
 
+### Safety: a report that left out what its replica had just executed
+
+- **Retirement in identity order** (3,3,22). A deposed leader reclaimed
+  more executed records at once than the window its report names: records
+  let in past the table's capacity, and a recovery's reserve, make that
+  possible. They retired in the order their identities sort, so a command
+  it had executed a moment before went into the window and out of it in
+  the same reclaim, and its report left it out as history. The candidate,
+  far behind, still held it pre-accepted, re-proposed it, and the voters
+  executed two decisions of one command. A replica refuses a candidate
+  behind it only once it has executed a table's capacity of commands
+  past it (task-d10), and the window has to count the same thing: a
+  reclaim now retires in the order the commands executed.
+  `a_reclaim_retires_in_the_order_commands_executed` (`graph`).
+
 ### Progress: work admitted and never finished
 
 - **A command a candidate took in after cutting its report** (5,3,3; also
@@ -7356,3 +7371,5 @@ dependencies. One was `IncompatibleAccepted`.
 - `cargo test --workspace`, clippy with `-D warnings`, `cargo fmt` and the
   docs check are clean.
 - The oracles and rows that found these are the next change (task-d33).
+  With every fix here, its rows 1 to 14 run clean at 100 seeds per row
+  and size, three and five voters (2,000 runs).

@@ -773,6 +773,36 @@ fn history_on_distinct_keys_is_forgotten_past_the_window() {
     }
 }
 
+/// A reclaim retires what executed in the order it executed (task-d33,
+/// protocol_sim row 3, three voters, seed 22).
+///
+/// A table past its capacity -- commands let in beyond it, a recovery's
+/// reserve -- reclaims more executed records at once than the window a
+/// report names. Retired in identity order, a command executed a moment
+/// before could go into the window first and out of it within the same
+/// reclaim: the deposed leader's report left it out, the candidate still
+/// held it pre-accepted and re-proposed it, and the voters executed two
+/// decisions of it. The window has to be the last `capacity` commands
+/// executed, which is what a replica's refusal of a candidate behind it
+/// counts.
+#[test]
+fn a_reclaim_retires_in_the_order_commands_executed() {
+    let capacity = 4usize;
+    let mut t = CommandTable::with_capacity(capacity);
+    for i in 1..=12u8 {
+        let deps = t
+            .initialize_beyond_capacity(cmd(i), payload(i), vec![alloc_key(i)])
+            .unwrap()
+            .deps;
+        t.accept(cmd(i), deps).unwrap();
+        t.commit(cmd(i)).unwrap();
+        t.execute(cmd(i)).unwrap();
+    }
+    assert_eq!(t.reclaim(), 12);
+    let remembered: Vec<u8> = (1..=12u8).filter(|i| !t.forgotten(&cmd(*i))).collect();
+    assert_eq!(remembered, vec![9, 10, 11, 12]);
+}
+
 fn alloc_key(i: u8) -> Vec<u8> {
     vec![b'k', i]
 }
