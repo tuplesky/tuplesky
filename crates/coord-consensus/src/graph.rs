@@ -247,6 +247,7 @@ impl PathLog {
         self.pending.retain(|c| c != command);
         self.applied.remove(command);
         self.early.remove(command);
+        self.reordered.remove(command);
         self.recompute();
     }
 

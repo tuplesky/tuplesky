@@ -935,3 +935,24 @@ fn a_released_command_leaves_the_path_log() {
     assert_eq!(after_release.paths, without.paths);
     assert_eq!(after_release.path, without.path);
 }
+
+/// A released command that was reordered behind a synchronization no
+/// longer holds the head off the leader's paths (task-d24 with task-d34):
+/// released, it stands for no history at all.
+#[test]
+fn a_released_reordered_command_frees_the_head() {
+    let (x, y) = (cmd(1), cmd(2));
+    let mut leader = CommandTable::new();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let mut follower = CommandTable::new();
+    follower.initialize(x, payload(1), k("key")).unwrap();
+    follower.initialize(y, payload(2), k("key")).unwrap();
+    follower.record_leader_path(y, 0, &ly.paths);
+    assert_eq!(
+        follower.log(b"key").unwrap().reordered(),
+        &BTreeSet::from([x])
+    );
+    assert!(follower.release(&x));
+    assert!(follower.log(b"key").unwrap().reordered().is_empty());
+    assert_eq!(follower.path_head(b"key"), leader.path_head(b"key"));
+}
