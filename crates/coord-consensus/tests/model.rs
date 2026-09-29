@@ -1508,3 +1508,53 @@ fn possible_fast_decisions_follow_the_source_ballots_own_fast_set() {
             .unwrap();
     assert_eq!(ignored, default);
 }
+
+/// Under C1 a fast quorum is any `fast_size` voters with the leader, not a
+/// fixed set (task-d31, Codex review on #127). With five voters it is any
+/// four with r0. Reports from r0, r1 and r2 where r0 and r1 pre-accepted x
+/// alike and r2 holds nothing: {r0, r1, r3, r4} may have decided x fast,
+/// and r2 was simply outside that quorum. Requiring every reporting
+/// member to agree re-proposed a command that may have been learned.
+#[test]
+fn a_c1_candidate_needs_only_the_members_a_fast_quorum_could_not_miss() {
+    let cfg = config(5, 1, &[1, 0, 2], 1);
+    let source = BallotConfiguration::c1(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(0, 0),
+        (0..5).map(r).collect(),
+    )
+    .unwrap();
+    let under_c1 = |reports: &[RecoveryReport]| {
+        coord_consensus::select_from(
+            &cfg,
+            reports,
+            |_, _| false,
+            |b| (*b == source.ballot()).then(|| source.clone()),
+        )
+        .unwrap()
+    };
+    let x = cmd(1);
+    let held = |replica| report_for(replica, ballot(1, 1), 0, vec![pre_accept_with(x, &[], 5)]);
+    let empty = |replica| report_for(replica, ballot(1, 1), 0, vec![]);
+
+    // Two of three reporters agree, one of them the leader: kept.
+    let decision = under_c1(&[held(0), held(1), empty(2)]);
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.phase),
+        Some(Phase::Accept),
+        "{decision:?}"
+    );
+    // Without the leader's report, two agreeing members still fit a fast
+    // quorum with the two that did not report.
+    let decision = under_c1(&[held(1), held(2), empty(3)]);
+    assert!(decision.entries.contains_key(&x), "{decision:?}");
+    // The leader is in every fast quorum: its report without x rules a
+    // fast decision out.
+    let decision = under_c1(&[empty(0), held(1), held(2)]);
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+    // One agreeing member of three reports cannot be a fast quorum's share.
+    let decision = under_c1(&[held(1), empty(2), empty(3)]);
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+}

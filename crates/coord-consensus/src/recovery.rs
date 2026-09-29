@@ -571,49 +571,81 @@ fn possible_fast_decisions(
             r.committed_ballot == source_ballot && source_config.fast_set().contains(&r.replica)
         })
         .collect();
-    let Some(first) = fast_reporters.first() else {
+    if fast_reporters.is_empty() {
         return;
-    };
+    }
     fn record<'a>(r: &'a RecoveryReport, c: &CommandId) -> Option<&'a ReportEntry> {
         r.entries.iter().find(|e| e.command == *c)
     }
-    // Candidates: pre-accepted by every reporting fast-set member with the
-    // same path evidence, and not already adopted.
-    let mut candidates: BTreeMap<CommandId, ReportEntry> = BTreeMap::new();
-    for e in &first.entries {
-        // A record a Sync demoted was pre-accepted in an earlier ballot:
-        // no evidence of a fast decision in this one (task-d11).
-        if e.phase != Phase::PreAccept
-            || !e.payload_present
-            || e.path == crate::graph::demoted_path()
-            || entries.contains_key(&e.command)
-        {
-            continue;
-        }
-        let agreed = fast_reporters.iter().all(|r| {
+    // How many reporting members must hold a pre-acceptance alike for a
+    // fast quorum to have decided it. C2 has one fast set, and every
+    // reporting member of it is in it: all of them. C1 decides with any
+    // `fast_size` voters that include the leader (task-d31, Codex review
+    // on #127): the voters that did not report may all have been in it,
+    // so the reporting members that agree need only make up the rest,
+    // and a reporting member that holds nothing may have been outside
+    // it. Two different pre-acceptances cannot both reach that count,
+    // since two fast quorums and a majority of reports intersect.
+    let c1 = source_config.class() == crate::quorum::FastQuorumClass::C1;
+    let needed = if c1 {
+        let unreported = source_config.voters().len().saturating_sub(reports.len());
+        source_config.fast_size().saturating_sub(unreported).max(1)
+    } else {
+        fast_reporters.len()
+    };
+    let source_leader = fast_reporters
+        .iter()
+        .position(|r| r.replica == source_ballot.leader);
+    // Candidates: pre-accepted alike (the same path, dependencies and
+    // admission) by enough reporting fast-set members, and not already
+    // adopted; each with the first of those members, whose records the
+    // order checks below read. Under C2 that member is the first
+    // reporting member of the fast set, as before.
+    let mut candidates: BTreeMap<CommandId, (ReportEntry, usize)> = BTreeMap::new();
+    for (index, reporter) in fast_reporters.iter().enumerate() {
+        for e in &reporter.entries {
+            // A record a Sync demoted was pre-accepted in an earlier
+            // ballot: no evidence of a fast decision in this one
+            // (task-d11).
+            if e.phase != Phase::PreAccept
+                || !e.payload_present
+                || e.path == crate::graph::demoted_path()
+                || entries.contains_key(&e.command)
+                || candidates.contains_key(&e.command)
+            {
+                continue;
+            }
             // A fast decision counted one digest (task-d14): members
             // holding the command under different facts never decided it
             // together.
-            record(r, &e.command).is_some_and(|o| {
-                o.phase == Phase::PreAccept
-                    && o.path == e.path
-                    && same_set(&o.deps, &e.deps)
-                    && o.payload_present
-                    && o.admission == e.admission
-            })
-        });
-        if agreed {
-            candidates.insert(e.command, e.clone());
+            let alike: Vec<usize> = fast_reporters
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    record(r, &e.command).is_some_and(|o| {
+                        o.phase == Phase::PreAccept
+                            && o.path == e.path
+                            && same_set(&o.deps, &e.deps)
+                            && o.payload_present
+                            && o.admission == e.admission
+                    })
+                })
+                .map(|(i, _)| i)
+                .collect();
+            // The source leader is in every fast quorum.
+            let leader_agrees = !c1 || source_leader.is_none_or(|l| alike.contains(&l));
+            if alike.len() >= needed && leader_agrees && alike.first() == Some(&index) {
+                candidates.insert(e.command, (e.clone(), index));
+            }
         }
     }
-    // The member's dependency closure of a command (over its own records).
-    let closure = |c: &CommandId| -> BTreeSet<CommandId> {
+    // A member's dependency closure of a command (over its own records).
+    let closure = |m: &RecoveryReport, c: &CommandId| -> BTreeSet<CommandId> {
         let mut seen = BTreeSet::new();
-        let mut stack: Vec<CommandId> =
-            record(first, c).map(|e| e.deps.clone()).unwrap_or_default();
+        let mut stack: Vec<CommandId> = record(m, c).map(|e| e.deps.clone()).unwrap_or_default();
         while let Some(d) = stack.pop() {
             if seen.insert(d)
-                && let Some(e) = record(first, &d)
+                && let Some(e) = record(m, &d)
             {
                 stack.extend(e.deps.iter().copied());
             }
@@ -645,18 +677,20 @@ fn possible_fast_decisions(
     // before a command in it that the member no longer holds. Such a
     // command was executed there, after everything the selection orders
     // before it, and retiring it cut the member's own closure short.
-    let forgotten_before = |prefix: &BTreeSet<CommandId>, a: &CommandId| -> bool {
-        prefix.contains(a)
-            || prefix
-                .iter()
-                .any(|d| record(first, d).is_none() && selected.contains_key(d) && after(d, a))
-    };
+    let forgotten_before =
+        |m: &RecoveryReport, prefix: &BTreeSet<CommandId>, a: &CommandId| -> bool {
+            prefix.contains(a)
+                || prefix
+                    .iter()
+                    .any(|d| record(m, d).is_none() && selected.contains_key(d) && after(d, a))
+        };
     loop {
         let before = candidates.len();
         let keys: Vec<CommandId> = candidates.keys().copied().collect();
         for c in keys {
-            let entry = candidates[&c].clone();
-            let prefix = closure(&c);
+            let (entry, member) = candidates[&c].clone();
+            let first = fast_reporters[member];
+            let prefix = closure(first, &c);
             let ordered_after_adopted = entries.values().all(|adopted| {
                 // Ordered after `c` by the selection itself: nothing it
                 // says constrains the member's order before `c`.
@@ -678,7 +712,7 @@ fn possible_fast_decisions(
                     // was decided after it. The member executed and
                     // retired it, and an ancestor it held is no evidence
                     // against the member's path (task-d34, #118 item 5).
-                    None if forgotten_before(&prefix, &adopted.command) => true,
+                    None if forgotten_before(first, &prefix, &adopted.command) => true,
                     // Accepted at the source ballot and before `c` there,
                     // yet absent from the member's records and from what
                     // its order put before `c`: the member's order never
@@ -703,7 +737,7 @@ fn possible_fast_decisions(
             break;
         }
     }
-    for (c, e) in candidates {
+    for (c, (e, _)) in candidates {
         entries.insert(
             c,
             SyncEntry {
