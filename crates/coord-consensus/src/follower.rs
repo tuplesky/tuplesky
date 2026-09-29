@@ -842,6 +842,27 @@ impl Follower {
     /// Give up the role: everything durable or learned, nothing
     /// ballot-scoped.
     pub fn into_recovered(self) -> RecoveredState {
+        // Taken in after the campaign cut its own report: pre-accepted
+        // here and fenced from any acknowledgement (`on_admitted`), so no
+        // ballot decided them and no selection of this campaign names
+        // them. A retry finds them initialized and is answered as a
+        // duplicate, so unless the leader proposes them nothing does
+        // (task-d33, protocol_sim row 5, three voters, seed 3).
+        let arrived: BTreeSet<CommandId> = self
+            .campaign
+            .as_ref()
+            .and_then(Campaign::own)
+            .map(|own| {
+                let named: BTreeSet<CommandId> = own.entries.iter().map(|e| e.command).collect();
+                self.table
+                    .records()
+                    .filter(|(c, r)| {
+                        r.phase == Phase::PreAccept && r.payload.is_some() && !named.contains(c)
+                    })
+                    .map(|(c, _)| *c)
+                    .collect()
+            })
+            .unwrap_or_default();
         RecoveredState {
             identity: self.config.identity,
             ballots: self.ballots,
@@ -860,6 +881,12 @@ impl Follower {
             frontend: self.config.frontend,
             capacity: self.config.capacity,
             synced_selection: self.synced_selection,
+            joined: self
+                .campaign
+                .as_ref()
+                .map(|c| c.promised().clone())
+                .unwrap_or_default(),
+            arrived,
         }
     }
 
@@ -1454,7 +1481,12 @@ impl Follower {
                 .copied()
                 .collect();
             for command in &released {
-                if self.ledger.record(command).is_some() {
+                // A record whose batch is still in flight too: written
+                // after this deletion was decided, it became durable
+                // beside the marker, and every later report named an
+                // acceptance the Sync had released (task-d33,
+                // protocol_sim row 4, five voters, seed 6).
+                if self.ledger.written(command) {
                     updates.push(dependency_delete(epoch, command));
                     self.ledger.stage_removal(barrier, *command);
                 }
@@ -1860,7 +1892,22 @@ impl Follower {
             .filter(|d| d.ballot == self.ballots.synced())
             .into_iter()
             .flat_map(|d| d.entries.iter());
-        overlay_selected(&mut report, self.sync_pending.iter().chain(selected));
+        // Not over a decision taken here since: a command this replica
+        // committed -- a later ballot's decision it pulled, whose
+        // dependencies can differ from the acceptance its own selection
+        // held -- is reported as committed, under the dependencies it was
+        // decided with (task-d33, protocol_sim row 5, three voters, seed
+        // 39). Overlaid, the report presented the selection's acceptance
+        // as this replica's commit, and the next selection found two
+        // decisions of one command.
+        let table = &self.table;
+        overlay_selected(
+            &mut report,
+            self.sync_pending
+                .iter()
+                .chain(selected)
+                .filter(|(c, _)| table.phase_of(c) < Some(Phase::Commit)),
+        );
         // History is left out: a command this replica executed and keeps
         // nothing else about. Every command a report names is one the
         // candidate may need to install or fetch, and reporting the whole
@@ -2099,6 +2146,10 @@ impl Follower {
             outcome,
         )?;
         let mut effects = alloc::vec![Effect::Established(result)];
+        // Executed is supplied: a selection that waited on it may go on.
+        if let Some(c) = self.campaign.as_mut() {
+            c.supply_moved();
+        }
         self.check_pulled(command, outcome);
         self.learn();
         self.forget_history();
@@ -2187,7 +2238,13 @@ impl Follower {
     /// installed. A replica that holds such work and does not execute it
     /// is one a caller may bring up from a peer (task-d08).
     pub fn holds_unexecuted(&self) -> bool {
-        !self.held.is_empty()
+        // A voter refused a promise as behind knows there is history
+        // past it to fetch, whether or not it holds any of it: without
+        // this it held nothing, asked for nothing, and its next campaign
+        // was refused the same way for ever (task-d33).
+        self.behind_voters
+            .is_some_and(|needed| self.learner.executed_through() < needed)
+            || !self.held.is_empty()
             || !self.sync_pending.is_empty()
             || self
                 .table
@@ -3184,8 +3241,18 @@ impl Follower {
         // instead of quietly replacing what this replica accepted.
         let keys = alloc::vec![crate::leader::CONSERVATIVE_KEY.to_vec()];
         // A command a Sync selected enters a full table as a pulled one
-        // does (task-d24): it finishes admitted work.
-        let recovering = self.sync_pending.contains_key(&command);
+        // does (task-d24): it finishes admitted work. So does one this
+        // replica's own campaign selected and is fetching before it binds
+        // (task-d33): refused, the campaign waits for it for ever, and a
+        // domain whose voters all hold full tables elects no one.
+        let recovering = self.sync_pending.contains_key(&command)
+            || self.campaign.as_ref().is_some_and(|c| {
+                c.binding().is_none()
+                    && !c.is_durable()
+                    && c.decision().is_some_and(|d| {
+                        d.entries.contains_key(&command) || d.reproposed.contains(&command)
+                    })
+            });
         let initialized = if recovering || self.turn_has_come(&command, payload.admission_digest())
         {
             self.table
@@ -3195,7 +3262,12 @@ impl Follower {
                 .initialize(command, payload.admission_digest(), keys)
         };
         let init = match initialized {
-            Ok(i) => i,
+            Ok(i) => {
+                if let Some(c) = self.campaign.as_mut() {
+                    c.supply_moved();
+                }
+                i
+            }
             Err(InitError::Backpressure) => {
                 // No room for this command -- and returning here would
                 // also skip `advance_pending`, which is what adopts the
@@ -3907,6 +3979,24 @@ impl Follower {
                 {
                     Ok(effects) => {
                         self.awaiting_sync.clear();
+                        // A campaign of this replica's own for a lower
+                        // ballot can no longer win: the promise just made
+                        // fences it. Kept, it went on standing in for a
+                        // campaign in progress, and a voter holding one
+                        // takes no catch-up page, so it stayed behind for
+                        // ever once the domain went quiet (task-d33).
+                        if self.campaign.as_ref().is_some_and(|c| c.ballot() != ballot) {
+                            self.campaign = None;
+                        }
+                        // The frontier the new leader executed through is
+                        // history this replica has to fetch: a voter that
+                        // joins a ballot late holds none of what the
+                        // leader executed and retired before it joined
+                        // (task-d33).
+                        if executed > own {
+                            self.behind_voters =
+                                Some(self.behind_voters.map_or(executed, |p| p.max(executed)));
+                        }
                         self.report_due = Some(ReportDue {
                             ballot,
                             to: from,
@@ -4058,8 +4148,10 @@ impl Follower {
                     self.payloads_asked.remove(&command);
                     self.payloads_answered = self.payloads_answered.saturating_add(1);
                 }
-                if self.campaign.is_some() {
-                    // A campaign waiting for this payload can bind now.
+                if let Some(c) = self.campaign.as_mut() {
+                    // A campaign waiting for this payload can select or
+                    // bind now.
+                    c.supply_moved();
                     out.extend(self.advance_campaign());
                 }
                 out
@@ -4157,6 +4249,30 @@ impl Follower {
         // done. Nothing has been accepted over the placeholder -- a
         // placeholder cannot be accepted -- so there is no order here to
         // overwrite.
+        // Its identity bound here to another presentation, one this
+        // replica took first: the order it was fetched for -- a leader's
+        // proposal, a Sync, or this replica's own campaign's selection --
+        // binds the identity to this one, and first presentation wins at
+        // the leader, not here. Refused as an identity conflict, the
+        // payload never arrived, and the proposal and everything after it
+        // waited for ever, or the campaign never bound (task-d33,
+        // protocol_sim row 14, three voters, seeds 3 and 5).
+        if !self.table.is_initialized(&command)
+            && self
+                .bindings
+                .get(&payload.retry_key)
+                .is_some_and(|bound| *bound != command)
+            && (self.held.contains_key(&command)
+                || self.sync_pending.contains_key(&command)
+                || self.adopted.contains_key(&command)
+                || self.campaign.as_ref().is_some_and(|c| {
+                    c.decision().is_some_and(|d| {
+                        d.entries.contains_key(&command) || d.reproposed.contains(&command)
+                    })
+                }))
+        {
+            self.bindings.remove(&payload.retry_key);
+        }
         if !self.table.is_initialized(&command) {
             return self.on_request(
                 payload.retry_key,

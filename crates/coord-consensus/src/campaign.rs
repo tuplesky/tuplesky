@@ -39,6 +39,14 @@ pub struct Campaign {
     payloads_requested: BTreeSet<ReplicaId>,
     /// How many times the complete reports were assembled (task-d26).
     assemblies: u64,
+    /// The complete reports last assembled from, by count, and whether a
+    /// payload arrived since: a selection that waited is tried again only
+    /// when one of the two moved (task-d33).
+    assembled_from: Option<usize>,
+    supply_moved: bool,
+    /// How many times a payload or an execution arrived while the
+    /// campaign had not selected (diagnostic, task-d33).
+    supply_moves: u64,
     /// Configurations of earlier ballots the candidate ran under, the
     /// source ballot's among them if it is known (task-d31).
     sources: Vec<BallotConfiguration>,
@@ -59,6 +67,9 @@ impl Campaign {
             published: false,
             payloads_requested: BTreeSet::new(),
             assemblies: 0,
+            assembled_from: None,
+            supply_moved: false,
+            supply_moves: 0,
             sources: Vec::new(),
         }
     }
@@ -116,6 +127,11 @@ impl Campaign {
         self.own = Some(report);
     }
 
+    /// The candidate's own report, once taken.
+    pub const fn own(&self) -> Option<&RecoveryReport> {
+        self.own.as_ref()
+    }
+
     /// A report page from a voter.
     pub fn page(&mut self, page: ReportPage) -> Result<(), PageError> {
         self.assembler.accept(page)
@@ -165,6 +181,21 @@ impl Campaign {
                 )),
             })
             .collect()
+    }
+
+    /// A payload arrived that the selection may have been waiting on: the
+    /// next [`Campaign::try_select`] assembles again (task-d33).
+    pub fn supply_moved(&mut self) {
+        self.supply_moved = true;
+        if self.decision.is_none() {
+            self.supply_moves += 1;
+        }
+    }
+
+    /// How many times something the selection may wait on arrived before
+    /// it was made: each may cost one more assembly (task-d33).
+    pub const fn supply_moves(&self) -> u64 {
+        self.supply_moves
     }
 
     /// How many times the complete reports were assembled for a selection
@@ -252,6 +283,15 @@ impl Campaign {
         if could_be_complete < self.config.slow_size() {
             return Ok(None);
         }
+        // A campaign is asked again on every page, promise and payload
+        // that arrives. Nothing it selects from moved unless another
+        // report completed or a payload arrived: assembled again, the
+        // same reports gave the same wait (task-d33).
+        if self.assembled_from == Some(could_be_complete) && !self.supply_moved {
+            return Ok(None);
+        }
+        self.assembled_from = Some(could_be_complete);
+        self.supply_moved = false;
         self.assemblies += 1;
         let mut reports = self.reports();
         let everyone = reports.len() >= self.config.voters().len();

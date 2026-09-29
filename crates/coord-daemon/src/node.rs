@@ -256,6 +256,26 @@ impl Machine {
         }
     }
 
+    /// Whether this replica is synchronized at `ballot` or at a later
+    /// ballot of its epoch: what it executed then includes everything
+    /// decided at `ballot`, so it can serve a voter still there its
+    /// executed history (task-d33). A voter that promised a ballot of its
+    /// own the others never followed, and was refused as behind, asks at
+    /// the ballot it last synchronized; a donor answering only its own
+    /// ballot left it behind for good.
+    pub fn synchronized_at_or_after(&self, ballot: &Ballot) -> bool {
+        let at_or_after = |own: Ballot| {
+            own.compare_same_epoch(ballot)
+                .is_some_and(|o| o != core::cmp::Ordering::Less)
+        };
+        match self {
+            Machine::Leader(m) => at_or_after(m.config_quorum().ballot()),
+            Machine::Follower(m) => {
+                m.quorum().ballot() == m.ballots().synced() && at_or_after(m.ballots().synced())
+            }
+        }
+    }
+
     /// The highest ballot this replica refused to a candidate as behind
     /// (task-d10), which its own next campaign has to go above.
     pub fn outranked(&self) -> Option<Ballot> {
@@ -733,7 +753,7 @@ impl<P: Persistence> Node<P> {
         let identity = machine.identity();
         if from == identity.replica
             || !identity.voters.contains(&from)
-            || !machine.synchronized_at(&ballot)
+            || !machine.synchronized_at_or_after(&ballot)
             || machine.halted().is_some()
             || machine.catch_up_divergence().is_some()
         {

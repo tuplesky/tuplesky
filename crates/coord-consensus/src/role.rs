@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use coord_core::effect::{BarrierId, BootId, PeerId};
 use coord_core::outbox::{BarrierAllocator, Outbox};
-use coord_types::ids::Ballot;
+use coord_types::ids::{Ballot, ReplicaId};
 use coord_types::{CommandId, RetryKey};
 
 use crate::ballot::{BallotState, ConfigurationIdentity};
@@ -74,4 +74,13 @@ pub struct RecoveredState {
     /// the durable Sync row, so the entries install at the selected facts
     /// and every report names them.
     pub synced_selection: Option<crate::recovery::SyncDecision>,
+    /// The voters that promised the ballot this replica's campaign won,
+    /// itself included; empty when it won none. A leader re-prepares the
+    /// others (task-d33).
+    pub joined: BTreeSet<ReplicaId>,
+    /// Commands this replica took in after its campaign cut its own
+    /// report, still only pre-accepted here: no selection of that
+    /// campaign can name them, so the leader it becomes proposes them
+    /// (task-d33).
+    pub arrived: BTreeSet<CommandId>,
 }

@@ -7184,3 +7184,130 @@ section ends with the conditional argument for why the work completes.
     `coordd init` itself. `a_start_never_initializes_a_voter_without_state`
     covers the refusal. `multi-host-local.sh` and the `multi_host` tests
     start each voter with `--init` once and restart it without.
+
+## What the simulator's budget and progress oracles found
+
+task-d33 gives the protocol simulator two new oracles. One checks each
+node's resource budgets every step. The other stops the faults and gives
+the domain a bounded number of synchronous rounds to settle everything it
+admitted. Built as the plan asked, with no production change beyond hooks,
+they failed on the tree as it stood. The fixes are here, each with a unit
+test that fails without it; the oracles and the new rows follow on top.
+Seeds are `row, voters, seed` of `protocol_sim`.
+
+### Safety: what a selection keeps as possibly learned fast
+
+Three of these were two dependency sets for one command: the frontend
+learned it fast, and a later selection re-proposed it with other
+dependencies. One was `IncompatibleAccepted`.
+
+- **An ancestor pre-accepted on the member's own path** (14,3,10). The
+  candidate check dropped a command whose member held an adopted ancestor
+  under another path than the leader's. A leader synchronization re-bases
+  the member's log after that ancestor, while its record keeps the path it
+  was pre-accepted with. So a member whose path for the candidate is the
+  leader's can hold an ancestor under another path, and that is no
+  evidence either way. Only the order counts: the ancestor is in the
+  member's closure.
+  `a_candidate_is_kept_when_its_member_pre_accepted_an_ancestor_on_its_own_path`.
+- **A held command before one the member retired** (14,3,79; also 12,3,9).
+  The member's closure of the candidate stops at a command it executed and
+  retired. A conflicting command it still holds, which the selection orders
+  before the retired one, was in neither the closure nor after the
+  candidate, so the candidate was dropped. That command was executed there
+  before the retired one, so before the candidate. The rule that already
+  covered such a command when the member no longer held it
+  (`forgotten_before`, task-d34) now covers it held too.
+  `a_candidate_is_kept_when_a_held_command_precedes_one_its_member_retired`.
+- **A dependency a Sync demoted** (4,3,85). The source leader re-proposed
+  f, and no quorum accepted it; x was then decided fast with f as its
+  dependency. The member holds f as the Sync demoted it, which is neither
+  adopted nor a candidate. The rule that every command of the candidate's
+  closure be decided dropped x. A demoted record is no evidence against
+  x: the selection re-proposes f and orders x after it (task-d34's
+  re-proposal chain).
+  `a_candidate_is_kept_over_a_dependency_a_sync_demoted`.
+- **A report that overlaid its selection on a decision** (5,3,39). A voter
+  synchronized at a selection holding x at ACCEPT then pulled x's decision
+  of a later ballot, with other dependencies. Its report overlaid the
+  selection on the record and, since x was executed, reported the
+  selection's acceptance as its commit. The next selection found two
+  decisions of x. The overlay now leaves out whatever the replica has
+  committed. `a_pulled_decision_is_reported_over_the_selection_the_voter_held`
+  (`catch_up`).
+
+### Safety: an order the new leader forked
+
+- **An entry after a command the leader committed** (4,3,11 of task-d30's
+  row 4; it showed only once a voter the campaign missed could join the
+  ballot). The selection re-proposed r, which the new leader had already
+  committed, and carried x accepted after r. An entry after a re-proposed
+  command waits for that command's re-proposal (task-d34), but a
+  committed command is not proposed again. So x was never proposed, and
+  the re-proposals chained after r without it: two branches of one key's
+  order. The voters that held both commits executed them in one order.
+  The late voter had only one of them committed, and executed it first.
+  An entry now waits only on a re-proposed command the leader has not
+  committed. `an_entry_after_a_command_the_leader_committed_is_in_the_chain`.
+
+### Progress: work admitted and never finished
+
+- **A command a candidate took in after cutting its report** (5,3,3; also
+  5,3,9, 4,3,3 and 12,3,7). A proposal's payload arrived while its holder
+  campaigned. It was pre-accepted and fenced from any acknowledgement, and
+  it is in no selection of that campaign. Every retry then found it
+  initialized and was answered as a duplicate, so nothing ever proposed
+  it. The leader the candidate becomes now proposes what arrived after its
+  own report (`RecoveredState::arrived`) after the recovered order.
+  `a_command_a_candidate_took_in_after_its_report_is_proposed_when_it_leads`.
+- **An identity bound to another presentation** (14,3,5 and 14,3,3; also
+  14,5,3 and 14,5,4). A follower that took one request under a retry key
+  first refused, as an identity conflict, the payload of the leader's
+  proposal of another request under the same key. The proposal, and
+  everything after it, waited for ever. The same happened to a campaign's
+  own selection. First presentation wins at the leader: a payload fetched
+  for a proposal, a Sync entry or the campaign's selection now takes the
+  binding over. `a_follower_takes_the_leaders_presentation_of_an_identity_it_bound_otherwise`.
+- **A release that missed a row in flight** (4,5,6). A Sync deleted the
+  row of a command it released only if the row was already durable. The
+  installation of an earlier Sync's entry, written after the release was
+  decided, became durable beside the marker. Every later report named that
+  acceptance, as a dependency no selection carried, and every campaign
+  stopped as `Behind`. The deletion now follows a row still in flight
+  (`DurableLedger::written`).
+  `a_released_command_whose_row_was_in_flight_is_not_reported`.
+- **A candidate with a full table.** It refused, for backpressure, the
+  payloads its own selection waited on. A domain whose voters all held
+  full tables elected no one. Those payloads enter a full table, as a
+  Sync's entries do (task-d24).
+  `a_candidate_with_a_full_table_takes_its_selections_payloads`.
+- **A campaign superseded by a promise.** A voter's own campaign for a
+  lower ballot went on standing in for a campaign in progress after it
+  promised another voter's, and a voter holding one takes no catch-up
+  page. It is dropped. `a_campaign_superseded_by_a_promise_is_dropped`.
+- **History to fetch after a promise.** A voter that promised a leader
+  ahead of it held nothing unexecuted and asked for nothing. It now
+  counts the leader's frontier as history to fetch.
+  `a_promise_to_a_leader_ahead_leaves_history_to_fetch`.
+- **A voter the campaign missed.** A voter cut off while the campaign ran
+  never heard of the new ballot. The leader's proposals were foreign to
+  it, and a quiet domain sent it nothing at all. The leader's re-send now
+  asks every voter that has not promised its ballot, and answers a late
+  promise with its Sync. `a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows`.
+- **A donor that served only its own ballot.** A voter refused as behind
+  asks for history at the ballot it last synchronized. Donors answered only
+  at their own, so it stayed behind. `coordd` now serves any ballot of the
+  epoch at or before the donor's own (`Machine::synchronized_at_or_after`).
+  `a_donor_serves_a_voter_at_an_earlier_ballot` (`coord-daemon`).
+- **A campaign that assembled on every message.** It re-assembled every
+  complete report on every page, promise and payload, and got the same
+  wait at a cost that grew with the reports. It now assembles again only
+  when another report completed or something it waits on arrived.
+  `a_waiting_campaign_assembles_again_only_when_something_moved`.
+
+### Evidence
+
+- Each test above fails with its fix reverted and passes with it.
+- `cargo test --workspace`, clippy with `-D warnings`, `cargo fmt` and the
+  docs check are clean.
+- The oracles and rows that found these are the next change (task-d33).

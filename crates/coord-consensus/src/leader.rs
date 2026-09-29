@@ -271,6 +271,14 @@ pub struct Leader {
     /// it is deposed (task-d34): an entry whose payload this leader lacked
     /// was never proposed, and the follower installs it from here.
     selection: Option<SyncDecision>,
+    /// The voters that promised this leader's ballot: those its campaign
+    /// heard from, and those that promised since. The others missed the
+    /// campaign -- down, cut off, or leading an older ballot themselves --
+    /// and nothing else would ever tell them of this one: its proposals
+    /// are foreign to them, and a quiet domain sends them nothing at all.
+    /// They are asked again (`resend_unvoted`) and answered with the Sync
+    /// (task-d33).
+    joined: BTreeSet<ReplicaId>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -340,6 +348,8 @@ impl Leader {
         Leader {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             selection: None,
+            // Every voter of the genesis ballot is in it from the start.
+            joined: config.identity.voters.iter().copied().collect(),
             config,
             boot: None,
             alloc: None,
@@ -412,6 +422,8 @@ impl Leader {
             frontend: self.config.frontend,
             capacity: self.config.capacity,
             synced_selection: self.selection,
+            joined: BTreeSet::new(),
+            arrived: BTreeSet::new(),
         }
     }
 
@@ -459,7 +471,9 @@ impl Leader {
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
             selection: Some(decision.clone()),
+            joined: state.joined,
         };
+        leader.joined.insert(leader.config.identity.replica);
         let _ = identity;
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -510,8 +524,21 @@ impl Leader {
         }
         // For each entry that follows a re-proposed command, the
         // re-proposed commands it follows.
+        //
+        // Not one this leader committed: it is not proposed again (below),
+        // so nothing would ever re-propose an entry waiting on it or chain
+        // after one. The entry was left out of the order while the
+        // re-proposals went on after the command it follows: two branches
+        // of one key's order, which a voter that joined late executed the
+        // other way round (task-d33, protocol_sim row 4, three voters,
+        // seed 11). It is accepted here already, so the entry is proposed
+        // with the others.
         let mut awaits: BTreeMap<CommandId, BTreeSet<CommandId>> = BTreeMap::new();
-        for r in &decision.reproposed {
+        for r in decision
+            .reproposed
+            .iter()
+            .filter(|r| leader.table.phase_of(r) < Some(Phase::Commit))
+        {
             let mut stack = dependents.get(r).cloned().unwrap_or_default();
             while let Some(e) = stack.pop() {
                 if awaits.entry(e).or_default().insert(*r) {
@@ -602,6 +629,25 @@ impl Leader {
             published += 1;
             effects.extend(leader.repropose(*c, deps, publish));
             effects.extend(leader.repropose_entries(decision, &ready, &mut published));
+        }
+        // What the candidate took in after cutting its own report, which
+        // its selection cannot name, is proposed after the recovered
+        // order as a fresh command would be (task-d33). This replica
+        // acknowledged none of it, and a command a quorum accepted, or a
+        // fast quorum could have learned, is in the selection, whose
+        // reports intersect every such quorum: what is left was decided
+        // nowhere.
+        for c in &state.arrived {
+            if decision.entries.contains_key(c)
+                || decision.reproposed.contains(c)
+                || leader.table.phase_of(c) != Some(Phase::PreAccept)
+            {
+                continue;
+            }
+            let deps = core::mem::replace(&mut last, alloc::vec![*c]);
+            let publish = published < REPROPOSE_BATCH;
+            published += 1;
+            effects.extend(leader.repropose(*c, deps, publish));
         }
         // The first fresh proposal of this ballot follows the recovered
         // order's tail. Re-proposing moved nothing in the table, so its
@@ -864,6 +910,24 @@ impl Leader {
                 sends.extend(self.own_adoption_send(*command, to));
             }
         }
+        // A voter that has not promised this ballot is asked to, with the
+        // frontier this leader executed through, which a late joiner has
+        // to fetch (task-d33). Its promise is answered with the Sync.
+        let executed = self.learner.executed_through();
+        for voter in &self.config.identity.voters {
+            if self.joined.contains(voter) {
+                continue;
+            }
+            sends.push(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: ProtocolMessage::NewLeader { ballot, executed }.encode(),
+            });
+        }
         if sends.is_empty() {
             return Vec::new();
         }
@@ -871,6 +935,44 @@ impl Leader {
         for send in sends {
             outbox.publish(send);
         }
+        self.release()
+    }
+
+    /// A voter's promise of this leader's own ballot, after its campaign:
+    /// a voter the campaign missed, answering `resend_unvoted`'s ask. It
+    /// is sent the Sync this leader leads from, which it installs as the
+    /// voters the campaign heard from did (task-d33).
+    fn on_late_promise(
+        &mut self,
+        from: ReplicaId,
+        ballot: Ballot,
+        replica: ReplicaId,
+    ) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        if replica != from
+            || ballot != self.config.quorum.ballot()
+            || !self.config.identity.voters.contains(&replica)
+            || !self.is_leading()
+        {
+            return Vec::new();
+        }
+        let Some(decision) = self.selection.clone() else {
+            return Vec::new();
+        };
+        self.joined.insert(replica);
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut().expect("booted");
+        outbox.publish(PendingSend {
+            context,
+            requires: Vec::new(),
+            to: PeerId {
+                replica,
+                incarnation: ReplicaIncarnation::ZERO,
+            },
+            frame: ProtocolMessage::Sync(decision).encode(),
+        });
         self.release()
     }
 
@@ -2256,10 +2358,12 @@ impl Leader {
             ProtocolMessage::ReportPageRequest { ballot, pages } => {
                 self.answer_report_pages(from.replica, ballot, &pages)
             }
+            ProtocolMessage::Promise {
+                ballot, replica, ..
+            } => self.on_late_promise(from.replica, ballot, replica),
             ProtocolMessage::Sealed { .. }
             | ProtocolMessage::Committed { .. }
             | ProtocolMessage::Proposal(_)
-            | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::Refused { .. }
             | ProtocolMessage::ReportPage(_)

@@ -698,9 +698,20 @@ fn possible_fast_decisions(
                     return true;
                 }
                 match record(first, &adopted.command) {
+                    // Held by the member: before `c` in its order, or no
+                    // conflict. Its own path for it is no evidence either
+                    // way (task-d33): a leader synchronization re-bases
+                    // the member's log after it, while its record keeps
+                    // the path it was pre-accepted with, so a member
+                    // whose path for `c` is the leader's -- and whose
+                    // fast acknowledgement of `c` decided it -- can hold
+                    // an ancestor under another. Nor is a closure the
+                    // member cut short by retiring a command it executed:
+                    // what the selection orders before that command was
+                    // executed there before it, so before `c`.
                     Some(a) => {
                         !conflicts(&entry.keys, &a.keys)
-                            || (prefix.contains(&adopted.command) && a.path == adopted.path)
+                            || forgotten_before(first, &prefix, &adopted.command)
                     }
                     // A decision of an earlier ballot precedes everything
                     // the source ballot ordered; the member may simply
@@ -726,9 +737,18 @@ fn possible_fast_decisions(
                     }
                 }
             });
-            let prefix_decided = prefix
-                .iter()
-                .all(|d| entries.contains_key(d) || candidates.contains_key(d));
+            // A command a Sync demoted at the member is no evidence
+            // against `c` either (task-d33): that Sync re-proposed it, and
+            // the member pre-accepted `c` after it before any ballot
+            // decided it. The source leader proposed `c` after its
+            // re-proposal, so a fast decision of `c` can name it while it
+            // is still undecided; this selection re-proposes it, and
+            // `c` after it (task-d34).
+            let prefix_decided = prefix.iter().all(|d| {
+                entries.contains_key(d)
+                    || candidates.contains_key(d)
+                    || record(first, d).is_some_and(|r| r.path == crate::graph::demoted_path())
+            });
             if !ordered_after_adopted || !prefix_decided {
                 candidates.remove(&c);
             }
