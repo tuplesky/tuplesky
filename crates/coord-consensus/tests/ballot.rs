@@ -497,6 +497,30 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     };
 }
 
+/// A promise is repeated for a leader that asks again only while no
+/// higher promise is in flight (task-d33, #130 review): that promise
+/// voids the lower one, and repeating it would tell the lower leader this
+/// replica still follows it.
+#[test]
+fn a_promise_is_not_repeated_below_one_in_flight() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let low = ballot(1, 5, 2);
+    let e5 = state.on_new_leader(peer(2), low, b, &mut a, &[]).unwrap();
+    let barrier = match &e5.persist {
+        Effect::Persist(batch) => batch.barrier,
+        other => panic!("{other:?}"),
+    };
+    state.on_storage(&durable(barrier, 1));
+    assert_eq!(state.promised(), low);
+    assert!(state.promise_again(peer(2), low, b).is_some());
+    state
+        .on_new_leader(peer(0), ballot(1, 10, 0), b, &mut a, &[])
+        .unwrap();
+    assert!(state.promise_again(peer(2), low, b).is_none());
+}
+
 #[test]
 fn every_in_flight_promise_completes_independently() {
     let b = boot(1);

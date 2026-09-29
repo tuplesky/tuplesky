@@ -7264,6 +7264,16 @@ dependencies. One was `IncompatibleAccepted`.
   failing ones that follow no other failing candidate; a set of failing
   candidates that all follow one another goes together. The test above
   runs both orders.
+- **An adopted command ordered after a candidate through another
+  candidate** (#130 review). With x a candidate after w, y a candidate
+  after x and a adopted after y, the rule asked whether the selection
+  orders a after x through the adopted entries alone. It stopped at y and
+  judged x against a as if a came first, and x was dropped with y after
+  it. It now follows the dependencies of the candidates still kept too: a
+  kept candidate is selected with the dependencies it was reported with,
+  and each pass judges every candidate against the candidates that pass
+  keeps, so the order read through one is the order the selection ends
+  with. `a_command_adopted_after_a_candidate_follows_what_that_candidate_follows`.
 - **A report that overlaid its selection on a decision** (5,3,39). A voter
   synchronized at a selection holding x at ACCEPT then pulled x's decision
   of a later ballot, with other dependencies. Its report overlaid the
@@ -7337,13 +7347,31 @@ dependencies. One was `IncompatibleAccepted`.
   the next exact presentation to bind; it used to bind whichever command
   sorted last.
   `a_binding_taken_over_for_the_leaders_presentation_survives_a_restart`.
+  A takeover removes a binding whatever phase its command is at, so
+  consensus can decide a second presentation under a key whose first
+  already executed: at three voters, A took d first, the leader's c
+  displaced it and executed, the leader died, A's report re-proposed d,
+  and C's takeover displaced k→c for d's payload. What keeps "at most the
+  first presentation" is the retry row at execution: `retry::admit`
+  finds the key's record naming c and answers `Conflict`, so d executes
+  as the identity refusal (`RetryConflict`, the outcome task-d22
+  settles on). The cost is a decided-then-refused command. Displacing
+  only a binding whose command is below COMMIT, and skipping such a
+  re-proposal, would save that round and is left for later: the refusal
+  at execution is the guarantee either way. A tie left unbound after a
+  restart likewise admits a third payload under the key as a new command
+  (it used to be refused as `OtherCommand`), which the retry row refuses
+  at execution the same way.
 - **A release that missed a row in flight** (4,5,6). A Sync deleted the
   row of a command it released only if the row was already durable. The
   installation of an earlier Sync's entry, written after the release was
   decided, became durable beside the marker. Every later report named that
   acceptance, as a dependency no selection carried, and every campaign
   stopped as `Behind`. The deletion now follows a row still in flight
-  (`DurableLedger::written`).
+  (`DurableLedger::written`). That the deletion lands after the write it
+  follows rests on journal sequence numbers following submission order:
+  the journaled store queues a domain's submissions first in, first out
+  and numbers their records in that order.
   `a_released_command_whose_row_was_in_flight_is_not_reported`.
 - **A candidate with a full table.** It refused, for backpressure, the
   payloads its own selection waited on. A domain whose voters all held
@@ -7364,8 +7392,20 @@ dependencies. One was `IncompatibleAccepted`.
   asks every voter that has not voted in its ballot, and answers a late
   promise with its Sync. A voter that promised and has not synchronized
   answers the ask with its promise again, so a lost Sync is sent again.
+  A voter the campaign heard from is not counted either (#130 review):
+  its Sync is one unacknowledged frame, and counted as following at the
+  campaign it was never asked again if that frame was lost. The leader
+  counts only itself until a voter votes in its ballot. A voter that
+  installed the Sync with nothing to vote on yet ignores the ask instead
+  of refusing it, so a quiet domain costs one `NewLeader` per idle voter
+  per re-send tick until the first command. A promise is not repeated
+  while a higher one is in flight: that promise voids it. (A Sync that
+  answers a repeated promise is already held behind a higher promise in
+  flight, `on_sync`, task-d18.)
   `a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows`,
-  `a_late_voter_whose_sync_was_lost_is_sent_it_again`.
+  `a_late_voter_whose_sync_was_lost_is_sent_it_again`,
+  `a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again`,
+  `a_promise_is_not_repeated_below_one_in_flight` (`ballot`).
 - **A donor that served only its own ballot.** A voter refused as behind
   asks for history at the ballot it last synchronized. Donors answered only
   at their own, so it stayed behind. `coordd` now serves any ballot of the
