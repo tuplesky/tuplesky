@@ -168,6 +168,16 @@ impl PathLog {
         self.early.remove(command);
     }
 
+    /// Take a released command out of the log (task-d24): it leaves the
+    /// pending suffix, and the head is recomputed without it, so the next
+    /// command's path is the one a replica that never held it computes.
+    pub fn remove(&mut self, command: &CommandId) {
+        self.pending.retain(|c| c != command);
+        self.applied.remove(command);
+        self.early.remove(command);
+        self.recompute();
+    }
+
     /// Commands whose synchronization is applied and not yet forgotten.
     pub fn applied(&self) -> &BTreeSet<CommandId> {
         &self.applied

@@ -3203,11 +3203,15 @@ impl Follower {
             }
             rebinding = true;
         }
-        // The leader's order is recorded into the path logs as soon as it is
-        // known (prototype `recordLeaderHash`); a missing payload only makes
-        // a placeholder that nothing can see.
-        self.table
-            .record_leader_path(command, proposal.seqnum.unwrap_or(0), &proposal.paths);
+        // The leader's order goes into the path logs only when this replica
+        // takes it as its own, at adoption (`advance_pending`) or a Sync's
+        // installation, not on arrival as the prototype's
+        // `recordLeaderHash` does (task-d34, F7): a command pre-accepted
+        // after an arrival-time alignment took the leader's path over this
+        // replica's own history, so an equal path no longer meant an equal
+        // history, and with the leader absent recovery could not rebuild a
+        // fast decision's ancestors from this replica's records. A missing
+        // payload only makes a placeholder that nothing can see.
         if self.table.phase_of(&command).is_none() && self.table.expect(command).is_err() {
             // No room for a placeholder. That is a reason to wait, and it
             // is emphatically not a reason to return: what this function
@@ -3407,6 +3411,14 @@ impl Follower {
                         .push(FollowerRejection::AdmissionConflict { command, accepted });
                     continue;
                 }
+                // Taken as this replica's own order now, so its logs follow
+                // the leader's from here (task-d34, F7), as a Sync's
+                // installation aligns them beside `adopt`.
+                self.table.record_leader_path(
+                    command,
+                    held.proposal.seqnum.unwrap_or(0),
+                    &held.proposal.paths,
+                );
                 // A command already learned or executed (installed from a
                 // Sync, or durable across a restart) keeps its phase: the
                 // re-proposal only supplies the new ballot's order.
