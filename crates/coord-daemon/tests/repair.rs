@@ -572,8 +572,10 @@ impl Cluster {
             vec![
                 Progress::Held(HoldReason::AwaitingVotes),
                 Progress::Held(HoldReason::AwaitingVotes),
+                Progress::Held(HoldReason::AwaitingVotes),
             ],
-            "the leader's reply and its release both reached the collector, and it holds them: {:?}",
+            "the leader's reply, its own adoption (task-d19) and its release all reached \
+             the collector, and it holds them: {:?}",
             self.progress
         );
         for i in 1..3 {

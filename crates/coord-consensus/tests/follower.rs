@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use coord_consensus::{
     BallotConfiguration, CONSERVATIVE_KEY, CommandRecord, ConfigurationIdentity, FastAck, Follower,
     FollowerConfig, FollowerRejection, PayloadRecordV1, Phase, ProtocolMessage, ReplayRefusal,
-    ReplicaRole, decode_dependency, decode_payload, dependency_key,
+    ReplicaRole, SlowAck, decode_dependency, decode_payload, dependency_key,
 };
 use coord_core::capability::{AdmissionReceipt, AttestedAdmission, VerifierToken};
 use coord_core::effect::{BootId, Effect, PeerId};
@@ -124,6 +124,24 @@ fn peer(from: u8, message: ProtocolMessage) -> Event {
         PeerProvenance::from_transport(r(from), ReplicaIncarnation::new(1).unwrap(), 1),
         message.encode(),
     ))
+}
+
+/// The leader's own adoption of `command`, sent once its acceptance row is
+/// durable (task-d19): the leader's copy of the slow majority.
+fn leader_adoption(f: &Follower, command: CommandId) -> Event {
+    peer(
+        0,
+        ProtocolMessage::SlowAck(SlowAck {
+            replica: r(0),
+            ballot: ballot(0, 0),
+            command,
+            admission: f
+                .table()
+                .record(&command)
+                .and_then(|r| r.payload)
+                .expect("admitted"),
+        }),
+    )
 }
 
 /// The leader's proposal for `command` with `deps`, computed by a leader
@@ -339,10 +357,20 @@ fn a_proposal_before_the_payload_is_held_against_an_invisible_placeholder() {
         assert_eq!(row.phase, Phase::Accept, "adoption {i} persisted");
     }
     // The adoption rows become durable: only now does this replica's own
-    // slow vote count, and the commands are learned.
+    // slow vote count, and with the leader's adoption the commands are
+    // learned. The leader's proposal alone is not its adoption (task-d19).
     let mut released = Vec::new();
     for event in durable_of(&adoptions, 3) {
         released.extend(f.step(event));
+    }
+    assert_eq!(
+        f.table().phase_of(&c1),
+        Some(Phase::Accept),
+        "the leader's acceptance is not known durable yet"
+    );
+    for c in [c1, c2] {
+        let adoption = leader_adoption(&f, c);
+        released.extend(f.step(adoption));
     }
     assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
     assert_eq!(f.table().phase_of(&c2), Some(Phase::Commit));
@@ -402,6 +430,10 @@ fn conflict_arrival_permutations_converge_on_the_leader_order() {
             acks += sends(&f.step(d)).len();
         }
         assert_eq!(acks, 6);
+        for c in [c1, c2] {
+            let adoption = leader_adoption(f, c);
+            f.step(adoption);
+        }
         assert_eq!(f.table().record(&c1).unwrap().deps, vec![]);
         assert_eq!(f.table().record(&c2).unwrap().deps, vec![c1]);
         assert_eq!(f.table().phase_of(&c1), Some(Phase::Commit));
@@ -614,6 +646,12 @@ fn equal_direct_dependencies_are_not_learning_and_guards_are_explicit() {
     let adoption = f.step(peer(0, p1));
     assert_eq!(adoption.len(), 1);
     f.step(durable_of(&adoption, 2).remove(0));
+    assert!(
+        f.votes(&c1).unwrap().learned_slow().is_none(),
+        "the leader's proposal is not its adoption"
+    );
+    let leader = leader_adoption(&f, c1);
+    f.step(leader);
     let votes = f.votes(&c1).unwrap();
     assert!(votes.learned_slow().is_some(), "the slow predicate holds");
     assert_eq!(

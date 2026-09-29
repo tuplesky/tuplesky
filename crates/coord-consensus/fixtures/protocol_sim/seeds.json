@@ -8,5 +8,6 @@
   {"row": 10, "voters": 3, "seed": 0, "found": "task-d18 reverted: the durable promise fell below a published Promise"},
   {"row": 10, "voters": 3, "seed": 1, "found": "task-d18 reverted: the durable promise fell below a published Promise"},
   {"row": 3, "voters": 5, "seed": 3, "found": "task-d19 reverted: two dependency sets at five voters"},
-  {"row": 10, "voters": 5, "seed": 0, "found": "task-d19 reverted: two dependency sets at five voters"}
+  {"row": 10, "voters": 5, "seed": 0, "found": "task-d19 reverted: two dependency sets at five voters"},
+  {"row": 2, "voters": 5, "seed": 0, "found": "task-d19: an older Sync resumed after a restart and left pending beside a newer one wrote its ACCEPT back over the demotion"}
 ]
