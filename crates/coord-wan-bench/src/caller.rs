@@ -300,6 +300,8 @@ fn refusal(outcome: &coord_sdk::Outcome) -> String {
     match outcome {
         coord_sdk::Outcome::Established { .. } => "established".into(),
         coord_sdk::Outcome::Unknown => "unknown".into(),
+        coord_sdk::Outcome::Withheld => "withheld".into(),
+        coord_sdk::Outcome::Retired => "retired".into(),
         coord_sdk::Outcome::Failed(error) => format!("{error:?}")
             .split(['(', ' ', '{'])
             .next()
