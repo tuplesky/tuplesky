@@ -681,6 +681,15 @@ pub enum ConfigError {
     /// A test-only switch set in a build without debug assertions. The
     /// field is named.
     TestOnlySwitch(&'static str),
+    /// Two stores that each reclaim what they do not keep given the same
+    /// directory, or one inside the other: each would take the other's
+    /// images for its own leftovers and remove them.
+    SharedDirectory {
+        /// The one setting.
+        first: &'static str,
+        /// The other.
+        second: &'static str,
+    },
 }
 
 /// Which build is validating: whether test-only switches may be set.
@@ -912,8 +921,46 @@ impl Config {
                 return Err(ConfigError::EmptyPath(name));
             }
         }
+        // The floor's images and the local checkpoints are each reclaimed
+        // down to what their own store keeps, and both name an image by a
+        // 64-hex directory. Given one directory, or one inside the other,
+        // the local store would remove the images a floor promise names
+        // and the floor would remove the selected recovery checkpoint.
+        if self.floor.enabled {
+            if self.floor.images.trim().is_empty() {
+                return Err(ConfigError::EmptyPath("floor.images"));
+            }
+            let images = resolved(&self.state_directory, &self.floor.images);
+            let checkpoints = resolved(&self.state_directory, &self.state.checkpoints);
+            if images.starts_with(&checkpoints) || checkpoints.starts_with(&images) {
+                return Err(ConfigError::SharedDirectory {
+                    first: "floor.images",
+                    second: "state.checkpoints",
+                });
+            }
+        }
         Ok(())
     }
+}
+
+/// `path` under `state_directory` unless absolute, with `.` and `..`
+/// taken out lexically, so two spellings of one directory compare equal.
+/// Links are not followed here: the store compares the directories it
+/// opened as well (`coordd`'s `keep_floor`).
+pub fn resolved(state_directory: &str, path: &str) -> std::path::PathBuf {
+    use std::path::{Component, Path, PathBuf};
+    let joined = Path::new(state_directory).join(path);
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Refuse an engine or profile this build does not serve.
@@ -1022,5 +1069,40 @@ allow_insecure_loopback = {allow}
         assert!(on.enabled);
         assert_ne!(on.images, state_checkpoints());
         assert!(toml::from_str::<FloorConfig>("interval = 8").is_err());
+    }
+
+    /// Turned on, the floor refuses a directory the local checkpoints
+    /// reclaim, however it is spelled: each store would remove the
+    /// other's images.
+    #[test]
+    fn the_floor_keeps_its_images_apart_from_the_local_checkpoints() {
+        let on = |images: &str, checkpoints: &str| {
+            let mut config = with_renewal(false);
+            config.renewal = None;
+            config.floor.enabled = true;
+            config.floor.images = images.to_owned();
+            config.state.checkpoints = checkpoints.to_owned();
+            config.validate_as(Build::Test)
+        };
+        let shared = Err(ConfigError::SharedDirectory {
+            first: "floor.images",
+            second: "state.checkpoints",
+        });
+        assert_eq!(on("floor-images", "checkpoints"), Ok(()));
+        assert_eq!(on("checkpoints", "checkpoints"), shared);
+        assert_eq!(on("./checkpoints/", "checkpoints"), shared);
+        assert_eq!(on("/var/lib/coord/a/checkpoints", "checkpoints"), shared);
+        assert_eq!(on("x/../checkpoints", "checkpoints"), shared);
+        assert_eq!(on("checkpoints/floor", "checkpoints"), shared);
+        assert_eq!(on(".", "checkpoints"), shared);
+        assert_eq!(
+            on("", "checkpoints"),
+            Err(ConfigError::EmptyPath("floor.images"))
+        );
+        // Off, the setting is not used and not checked.
+        let mut off = with_renewal(false);
+        off.renewal = None;
+        off.floor.images = "checkpoints".to_owned();
+        assert_eq!(off.validate_as(Build::Test), Ok(()));
     }
 }

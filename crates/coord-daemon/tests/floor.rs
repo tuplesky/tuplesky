@@ -521,3 +521,155 @@ fn a_promise_is_taken_only_from_the_voter_it_names() {
     assert_eq!(after.rejected, held.rejected + 1);
     assert_eq!(after.heard, held.heard);
 }
+
+/// Copy an images directory, image by image.
+fn copy_images(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("created");
+    for entry in std::fs::read_dir(from).expect("listed") {
+        let entry = entry.expect("entry");
+        let path = entry.path();
+        if path.is_dir() {
+            copy_images(&path, &to.join(entry.file_name()));
+        } else {
+            std::fs::copy(&path, to.join(entry.file_name())).expect("copied");
+        }
+    }
+}
+
+/// The images kept in `dir`.
+fn kept(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).expect("listed").count()
+}
+
+/// A superseded image stays until the batch that superseded it is
+/// durable: until then, the rows naming it are what a crash leaves, and
+/// the promise they record is about those bytes.
+#[test]
+fn a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable() {
+    let mut cluster = Cluster::new([0; 3]);
+    cluster.run(3);
+    assert_eq!(cluster.executed_through(0), INTERVAL);
+    // A floor of voter 0's store beside its own, with its own images.
+    let alone = cluster.images().join("alone");
+    copy_images(&cluster.images().join("voter-0"), &alone);
+    let mut floor = open_floor(&cluster.voters[0], {
+        let mut s = settings(0, cluster.images(), 0);
+        s.images = alone.clone();
+        s
+    });
+    let first = floor.activated().expect("activated").root;
+    assert_eq!(floor.promised().map(|p| p.get()), Some(INTERVAL));
+
+    cluster.run(4);
+    assert_eq!(cluster.executed_through(0), 2 * INTERVAL);
+    let applier = cluster.voters[0].node().applier();
+    let gated = applier.store().reader().snapshot().expect("snapshot");
+    let view = gated.view();
+    let position = coord_types::ids::ExecutionPosition::new(2 * INTERVAL).unwrap();
+    assert!(floor.due(position));
+    floor.boundary(view, position).expect("promised");
+    let promised = floor.barrier();
+    // Voter 1's promise at the same boundary activates the floor there.
+    let theirs = coord_checkpoint::read_readiness(view, &coord_checkpoint::TrimLimits::default())
+        .expect("read")
+        .into_iter()
+        .find(|x| x.voter == r(1) && x.boundary.execution_position == position)
+        .expect("voter 1 promised");
+    floor
+        .hear(view, r(1), &theirs.encode().unwrap())
+        .expect("recorded");
+    let activated = floor.barrier();
+    let second = floor.activated().expect("activated").root;
+    assert_ne!(first, second);
+
+    // Neither batch durable: both images stay.
+    floor.settle(|_| false, |_| false);
+    assert_eq!(kept(&alone), 2);
+    // The promise durable, the activation not: the rows still name the
+    // first image as the floor.
+    floor.settle(|b| *b == promised, |_| false);
+    assert_eq!(kept(&alone), 2);
+    // Both durable: nothing names the first image any more.
+    floor.settle(|b| *b == promised || *b == activated, |_| false);
+    assert_eq!(kept(&alone), 1);
+    let store = coord_checkpoint::SharedImageStore::open(&alone).expect("images");
+    assert!(store.holds(&second) && !store.holds(&first));
+}
+
+/// A batch that fails reclaims nothing, and neither does a later one
+/// that is durable: the rows the failed batch would have written are not
+/// there, so the old ones may still name the old image.
+#[test]
+fn a_failed_batch_reclaims_nothing() {
+    let mut cluster = Cluster::new([0; 3]);
+    cluster.run(3);
+    let alone = cluster.images().join("alone");
+    copy_images(&cluster.images().join("voter-0"), &alone);
+    let mut floor = open_floor(&cluster.voters[0], {
+        let mut s = settings(0, cluster.images(), 0);
+        s.images = alone.clone();
+        s
+    });
+    cluster.run(4);
+    let applier = cluster.voters[0].node().applier();
+    let gated = applier.store().reader().snapshot().expect("snapshot");
+    let position = coord_types::ids::ExecutionPosition::new(2 * INTERVAL).unwrap();
+    floor.boundary(gated.view(), position).expect("promised");
+    let promised = floor.barrier();
+    floor.settle(|_| false, |b| *b == promised);
+    assert_eq!(kept(&alone), 2);
+    // A later batch durable: the own promise its images name was never
+    // written, so the first image is still the promise the rows hold.
+    let later = floor.barrier();
+    floor.settle(|b| *b == later, |_| false);
+    assert_eq!(kept(&alone), 2);
+}
+
+/// A voter whose promised image is gone or damaged does not reopen its
+/// floor: it would serve on advertising a promise it cannot keep.
+#[test]
+fn a_voter_whose_promised_image_is_lost_does_not_reopen_its_floor() {
+    let mut cluster = Cluster::new([0; 3]);
+    cluster.run(5);
+    let promised = cluster.floor(1).promised().expect("promised");
+
+    // Gone: an empty images directory.
+    let applier = cluster.voters[1].node().applier();
+    let gated = applier.store().reader().snapshot().expect("snapshot");
+    let mut empty = settings(1, cluster.images(), 0);
+    empty.images = cluster.images().join("empty");
+    let refused = Floor::open(empty, gated.view(), inc(), applier.store().boot())
+        .expect_err("opened without its image");
+    assert!(refused.contains("cannot be read back"), "{refused}");
+    assert!(refused.contains(&promised.get().to_string()), "{refused}");
+
+    // Damaged: a chunk cut short.
+    let damaged = cluster.images().join("damaged");
+    copy_images(&cluster.images().join("voter-1"), &damaged);
+    let image = std::fs::read_dir(&damaged)
+        .expect("listed")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.is_dir())
+        .expect("an image");
+    let chunk = std::fs::read_dir(&image)
+        .expect("listed")
+        .map(|e| e.expect("entry").path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("chunk-")
+        })
+        .expect("a chunk");
+    let bytes = std::fs::read(&chunk).expect("read");
+    std::fs::write(&chunk, &bytes[..bytes.len() - 1]).expect("cut");
+    let mut cut = settings(1, cluster.images(), 0);
+    cut.images = damaged;
+    let refused = Floor::open(cut, gated.view(), inc(), applier.store().boot())
+        .expect_err("opened with a damaged image");
+    assert!(refused.contains("cannot be read back"), "{refused}");
+
+    // Intact, it reopens.
+    open_floor(&cluster.voters[1], settings(1, cluster.images(), 0));
+}

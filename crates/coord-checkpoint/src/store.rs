@@ -49,6 +49,7 @@ use coord_types::identity::Digest32;
 use crate::local::{LocalCheckpointV1, LocalError, LocalManifestV1, verify_local};
 use crate::manifest::{
     ArtifactError, ChunkV1, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, SharedCheckpointV1,
+    SharedManifestV1,
 };
 use crate::verify::verify_shared;
 
@@ -68,7 +69,8 @@ pub enum StoreError {
     /// The artifact could not be encoded or decoded.
     Artifact(ArtifactError),
     /// The image the selected pointer names is damaged: missing, short,
-    /// long, or not what the pointer says it is.
+    /// long, or not what the pointer says it is. For a shared image, the
+    /// one a floor promise names ([`SharedImageStore::verify`]).
     ///
     /// This quarantines the scope. A node that published a pointer
     /// knows the image existed, so its absence is the loss of a durable
@@ -87,7 +89,7 @@ impl fmt::Display for StoreError {
             StoreError::Io(e) => write!(f, "checkpoint store: {e}"),
             StoreError::Artifact(e) => write!(f, "checkpoint artifact: {e}"),
             StoreError::Quarantine { reason } => {
-                write!(f, "the selected local checkpoint is damaged: {reason}")
+                write!(f, "the checkpoint image is damaged: {reason}")
             }
             StoreError::Invalid(e) => write!(f, "the selected local checkpoint is invalid: {e}"),
         }
@@ -401,6 +403,37 @@ impl SharedImageStore {
     /// Whether a complete image with `root` is kept here.
     pub fn holds(&self, root: &Digest32) -> bool {
         self.root.join(hex(root)).is_dir()
+    }
+
+    /// Read back the image kept under `root` and verify it: every chunk
+    /// its manifest names, and the root they compute.
+    ///
+    /// A voter that promised about this image said it holds these bytes,
+    /// so an image that is missing, short, long or computes another root
+    /// is [`StoreError::Quarantine`]: the loss of a promise, not an
+    /// absence to start over from.
+    pub fn verify(&self, root: &Digest32) -> Result<(), StoreError> {
+        let dir = self.root.join(hex(root));
+        if !dir.is_dir() {
+            return Err(StoreError::Quarantine {
+                reason: "the shared image a floor promise names is not present",
+            });
+        }
+        let manifest =
+            SharedManifestV1::decode(&read_bounded(&dir.join(MANIFEST), MAX_MANIFEST_BYTES)?)?;
+        let mut chunks = Vec::with_capacity(manifest.chunks.len());
+        for descriptor in &manifest.chunks {
+            chunks.push(read_bounded(
+                &dir.join(chunk_name(descriptor.ordinal)),
+                MAX_CHUNK_BYTES,
+            )?);
+        }
+        match verify_shared(&manifest, &chunks) {
+            Ok(computed) if computed == *root => Ok(()),
+            _ => Err(StoreError::Quarantine {
+                reason: "the shared image a floor promise names does not verify",
+            }),
+        }
     }
 
     /// Remove every image but those in `keep`, and any leftover pending

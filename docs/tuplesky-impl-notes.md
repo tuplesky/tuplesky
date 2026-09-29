@@ -7596,6 +7596,21 @@ default (`[floor] enabled = false`).
   read with `rustix::fs::statvfs`. Short of it, the boundary is refused
   and said so, and no promise is made. Only images a standing promise
   names are kept: this voter's latest, and the activated floor's.
+- **An image outlives the rows that name it.** A new promise or
+  activation supersedes older images, but until its batch is durable
+  the older rows are what a crash leaves. So superseded images are
+  reclaimed only once the outbox reports the superseding batch durable
+  (`Floor::settle`, at the end of each `carry_out`). After a batch
+  fails, nothing is reclaimed until a restart reads the rows back: a
+  later batch's images are no longer what the rows name. On reopening, the image this voter's latest durable
+  promise names is read back and verified
+  (`SharedImageStore::verify`). Missing or damaged, the voter does not
+  start: it would advertise a promise it cannot keep.
+- **Its own directory.** The floor's images and the local checkpoints
+  each reclaim every 64-hex directory their own store does not keep. A
+  configuration that gives both one directory, or puts one inside the
+  other, is refused (`ConfigError::SharedDirectory`). `coordd` compares
+  the canonical paths again at start, so a link cannot join them.
 - **Not yet.** A promise sent while the voter's ballot changes is
   dropped with the other sends of the old ballot. A voter that missed a
   peer's promise activates from the next boundary's. Neither blocks
@@ -7608,3 +7623,10 @@ default (`[floor] enabled = false`).
   - `a_restarted_voter_reads_back_its_promise_and_its_floor` fails
     without the read-back.
   - `a_voter_short_of_headroom_promises_nothing_and_two_still_activate`.
+  - `a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable`
+    fails when images are reclaimed as the rows are made.
+  - `a_failed_batch_reclaims_nothing`.
+  - `a_voter_whose_promised_image_is_lost_does_not_reopen_its_floor`
+    fails without the read-back verification.
+  - `the_floor_keeps_its_images_apart_from_the_local_checkpoints`
+    (config).

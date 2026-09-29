@@ -26,6 +26,15 @@
 //! and only through [`record_readiness`], which refuses a promise that
 //! goes back or competes with one held.
 //!
+//! **An image outlives every durable row that names it.** A new
+//! promise or activation supersedes the images the older rows named,
+//! but those rows stay what recovery reads until the new batch is
+//! durable. So superseded images are reclaimed only once the batch
+//! that superseded them is ([`Floor::settle`]), and a batch that fails
+//! reclaims nothing. On reopening, the image this voter's own latest
+//! durable promise names is read back and verified: a voter that lost
+//! it does not serve on advertising a promise it cannot keep.
+//!
 //! **Activation.** When a majority's promises name one checkpoint, the
 //! certificate is journaled. Nothing is deleted below it here: that is
 //! trimming's, which comes after the agreement it rests on.
@@ -43,6 +52,7 @@ use coord_consensus::quorum::EpochVoters;
 use coord_core::effect::{BarrierId, BootId, StoreUpdate};
 use coord_core::outbox::BarrierAllocator;
 use coord_store_api::engine::OrderedRead;
+use coord_types::identity::Digest32;
 use coord_types::ids::{ExecutionPosition, ReplicaId, ReplicaIncarnation};
 
 /// Executed positions between floor boundaries.
@@ -159,6 +169,16 @@ pub struct Floor {
     /// journal is not in the view yet.
     heard: BTreeMap<ReplicaId, CheckpointReadinessV1>,
     activated: Option<ActivatedFloorV1>,
+    /// The images the durable rows name: this voter's latest durable
+    /// promise and the latest durable activation.
+    standing: Vec<Digest32>,
+    /// Batches of this floor's rows not yet durable, oldest first, each
+    /// with the images its rows name.
+    unsettled: Vec<(BarrierId, Vec<Digest32>)>,
+    /// A batch of this boot failed: what the durable rows name is no
+    /// longer what any later batch held, so nothing is reclaimed until a
+    /// restart reads the rows back.
+    diverged: bool,
     last_image_bytes: u64,
     barriers: BarrierAllocator,
     incarnation: ReplicaIncarnation,
@@ -194,14 +214,26 @@ impl Floor {
             .configuration;
         let voters = EpochVoters::new(epoch, settings.voters)
             .ok_or("a floor is agreed by voters, and there are none")?;
-        let heard = read_readiness(view, &TrimLimits::default())
-            .map_err(|e| format!("the recorded floor promises: {e:?}"))?
-            .into_iter()
-            .filter(|r| r.configuration == epoch && voters.is_voter(&r.voter))
-            .map(|r| (r.voter, r))
-            .collect();
+        let heard: BTreeMap<ReplicaId, CheckpointReadinessV1> =
+            read_readiness(view, &TrimLimits::default())
+                .map_err(|e| format!("the recorded floor promises: {e:?}"))?
+                .into_iter()
+                .filter(|r| r.configuration == epoch && voters.is_voter(&r.voter))
+                .map(|r| (r.voter, r))
+                .collect();
         let activated =
             published_activation(view).map_err(|e| format!("the activated floor: {e:?}"))?;
+        // Rows are durable only after the image they name was kept, so an
+        // image missing now was lost after the promise was made.
+        if let Some(own) = heard.get(&settings.me) {
+            images.verify(&own.root).map_err(|e| {
+                format!(
+                    "the image this voter promised at {} cannot be read back: {e}",
+                    own.boundary.execution_position.get()
+                )
+            })?;
+        }
+        let standing = roots(heard.get(&settings.me), activated.as_ref());
         Ok(Floor {
             interval: settings.interval,
             images,
@@ -211,6 +243,9 @@ impl Floor {
             me: settings.me,
             heard,
             activated,
+            standing,
+            unsettled: Vec::new(),
+            diverged: false,
             last_image_bytes: 0,
             barriers: BarrierAllocator::new(incarnation, boot).for_runtime(),
             incarnation,
@@ -286,7 +321,6 @@ impl Floor {
         self.heard.insert(self.me, readiness);
         let mut updates = vec![row];
         updates.extend(self.activation());
-        self.reclaim();
         Ok(Promised {
             updates,
             readiness: encoded,
@@ -335,23 +369,54 @@ impl Floor {
         self.heard.insert(from, record);
         self.counts.heard += 1;
         let mut updates = vec![row];
-        if let Some(activation) = self.activation() {
-            updates.push(activation);
-            self.reclaim();
-        }
+        updates.extend(self.activation());
         Some(updates)
     }
 
-    /// Remove the images no standing promise names: all but this voter's
-    /// latest and the activated floor's. A failure costs space, not a
-    /// promise, so it is counted rather than refused.
-    fn reclaim(&mut self) {
-        let keep: Vec<_> = self
-            .heard
-            .get(&self.me)
-            .map(|own| own.root)
-            .into_iter()
-            .chain(self.activated.as_ref().map(|a| a.root))
+    /// Take what became of this floor's batches, and reclaim the images
+    /// no durable row names any more once one of them is durable.
+    ///
+    /// Kept: the images the latest durable batch names (this voter's own
+    /// promise and the activated floor), those of every batch still
+    /// unsettled, and those this voter holds now. A batch that failed
+    /// wrote nothing, so a later one's images are no longer what the
+    /// rows name: from then on nothing is reclaimed until a restart reads
+    /// the rows back. A failure to remove costs space, not a promise, so
+    /// it is counted rather than refused.
+    pub fn settle(
+        &mut self,
+        durable: impl Fn(&BarrierId) -> bool,
+        failed: impl Fn(&BarrierId) -> bool,
+    ) {
+        if self.unsettled.is_empty() {
+            return;
+        }
+        if self.unsettled.iter().any(|(b, _)| failed(b)) {
+            self.diverged = true;
+        }
+        // The journal makes batches durable in order, so the last durable
+        // one names what recovery would read, and any before it are
+        // superseded whatever became of them.
+        let mut moved = false;
+        if let Some(last) = self.unsettled.iter().rposition(|(b, _)| durable(b)) {
+            let (_, roots) = self
+                .unsettled
+                .drain(..=last)
+                .next_back()
+                .expect("one at least");
+            self.standing = roots;
+            moved = true;
+        }
+        self.unsettled.retain(|(b, _)| !failed(b));
+        if !moved || self.diverged {
+            return;
+        }
+        let keep: Vec<Digest32> = self
+            .standing
+            .iter()
+            .chain(self.unsettled.iter().flat_map(|(_, roots)| roots))
+            .copied()
+            .chain(roots(self.heard.get(&self.me), self.activated.as_ref()))
             .collect();
         if self.images.reclaim(&keep).is_err() {
             self.counts.unreclaimed += 1;
@@ -377,9 +442,14 @@ impl Floor {
         Some(update)
     }
 
-    /// A barrier for a batch of this floor's rows.
+    /// A barrier for a batch of this floor's rows, which name what this
+    /// voter holds now: those images are not reclaimed until the batch
+    /// has settled ([`Floor::settle`]).
     pub fn barrier(&mut self) -> BarrierId {
-        self.barriers.allocate()
+        let barrier = self.barriers.allocate();
+        let named = roots(self.heard.get(&self.me), self.activated.as_ref());
+        self.unsettled.push((barrier, named));
+        barrier
     }
 
     /// The voters a promise goes to: every one but this.
@@ -429,6 +499,17 @@ impl Floor {
     pub const fn last_refusal(&self) -> Option<&FloorRefusal> {
         self.last_refusal.as_ref()
     }
+}
+
+/// The images a voter's own promise and an activated floor name.
+fn roots(
+    own: Option<&CheckpointReadinessV1>,
+    activated: Option<&ActivatedFloorV1>,
+) -> Vec<Digest32> {
+    own.map(|own| own.root)
+        .into_iter()
+        .chain(activated.map(|a| a.root))
+        .collect()
 }
 
 /// Bytes free to an unprivileged writer on the filesystem holding `path`.

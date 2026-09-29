@@ -544,6 +544,15 @@ impl<P: Persistence> Node<P> {
         self.carry_out(effects, ballot)
     }
 
+    /// Hand the floor what became of its batches, so it reclaims the
+    /// images superseded by one that is durable, and only then.
+    fn settle_floor(&mut self) {
+        if let Some(floor) = self.floor.as_mut() {
+            let outbox = &self.outbox;
+            floor.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b));
+        }
+    }
+
     /// Export, keep and promise the checkpoint at the boundary this
     /// node just applied.
     fn floor_boundary(
@@ -912,6 +921,7 @@ impl<P: Persistence> Node<P> {
         // here rather than be visible as a fault.
         for _ in 0..MAX_ROUNDS {
             if queue.is_empty() && !release {
+                self.settle_floor();
                 return Ok(out);
             }
             release = false;

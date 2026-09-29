@@ -1556,9 +1556,10 @@ fn keep_floor(
         return Ok(voter);
     }
     let m = &placed.membership;
+    let settings_images = store::root_path(&config.state_directory, &config.floor.images);
     let settings = FloorSettings {
         interval: FLOOR_INTERVAL,
-        images: store::root_path(&config.state_directory, &config.floor.images),
+        images: settings_images.clone(),
         headroom_bytes: config.floor.headroom_bytes,
         origin: coord_checkpoint::CheckpointOrigin {
             cluster: m.cluster(),
@@ -1583,6 +1584,23 @@ fn keep_floor(
         )
         .map_err(|e| format!("the floor cannot start: {e}"))?
     };
+    // The configuration refused one directory spelled two ways; this
+    // refuses one reached through a link. Each store reclaims every
+    // image it does not keep, so sharing one would remove the other's.
+    let checkpoints = store::root_path(&config.state_directory, &config.state.checkpoints);
+    let (Ok(images), Ok(checkpoints)) = (
+        std::fs::canonicalize(&settings_images),
+        std::fs::canonicalize(&checkpoints),
+    ) else {
+        return Err("the floor cannot compare its images' directory with the checkpoints'".into());
+    };
+    if images.starts_with(&checkpoints) || checkpoints.starts_with(&images) {
+        return Err(format!(
+            "the floor's images ({}) and the local checkpoints ({}) share a directory",
+            images.display(),
+            checkpoints.display()
+        ));
+    }
     println!(
         "floor interval={FLOOR_INTERVAL} promised={} activated={}",
         floor.promised().map_or(0, |p| p.get()),
