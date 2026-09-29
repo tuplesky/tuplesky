@@ -799,3 +799,32 @@ fn releasing_the_latest_command_hands_the_key_back_to_its_predecessor() {
     t.commit(id(1)).unwrap();
     assert!(!t.release(&id(1)), "a decided record stays");
 }
+
+/// A released command leaves the key's path log (task-d24): the next
+/// command's path is the one a replica that never held it computes, so
+/// its fast-path evidence agrees with theirs.
+#[test]
+fn a_released_command_leaves_the_path_log() {
+    let id = |n: u8| CommandId(Digest32([n; 32]));
+    let key = vec![b"*".to_vec()];
+    let mut released = CommandTable::with_capacity(16);
+    released
+        .initialize(id(1), Digest32([1; 32]), key.clone())
+        .unwrap();
+    released
+        .initialize(id(2), Digest32([2; 32]), key.clone())
+        .unwrap();
+    assert!(released.release(&id(2)));
+    let after_release = released
+        .initialize(id(3), Digest32([3; 32]), key.clone())
+        .unwrap();
+    let mut never = CommandTable::with_capacity(16);
+    never
+        .initialize(id(1), Digest32([1; 32]), key.clone())
+        .unwrap();
+    let without = never
+        .initialize(id(3), Digest32([3; 32]), key.clone())
+        .unwrap();
+    assert_eq!(after_release.paths, without.paths);
+    assert_eq!(after_release.path, without.path);
+}

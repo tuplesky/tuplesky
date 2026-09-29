@@ -337,7 +337,9 @@ impl CommandTable {
     /// the conflict index: a key whose latest command it was takes the
     /// released command's own dependencies in its place, those still
     /// known here, so the next command on the key still follows what the
-    /// released one followed. A decided record is never released.
+    /// released one followed. It leaves each key's path log too, so no
+    /// later path is hashed through it. A decided record is never
+    /// released.
     pub fn release(&mut self, command: &CommandId) -> bool {
         match self.records.get(command) {
             Some(r) if r.phase < Phase::Commit => {}
@@ -348,6 +350,7 @@ impl CommandTable {
             let Some(state) = self.keys.get_mut(key) else {
                 continue;
             };
+            state.log.remove(command);
             let tails: Vec<CommandId> =
                 state.last.into_iter().chain(state.also.drain(..)).collect();
             let mut repaired: Vec<CommandId> = Vec::new();
