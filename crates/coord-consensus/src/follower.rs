@@ -936,11 +936,6 @@ impl Follower {
             frontend: self.config.frontend,
             capacity: self.config.capacity,
             synced_selection: self.synced_selection,
-            joined: self
-                .campaign
-                .as_ref()
-                .map(|c| c.promised().clone())
-                .unwrap_or_default(),
             arrived,
         }
     }
@@ -3297,9 +3292,12 @@ impl Follower {
             }
             None => {}
         }
-        // Executed and forgotten, its binding with it (task-d26): the same
-        // answer as a bound command whose payload went to history.
-        if self.table.forgotten(&command) {
+        // Executed and retired: forgotten, its binding with it (task-d26),
+        // or inside the window with its key left unbound by a restart that
+        // found two executed presentations under it (task-d33). The same
+        // answer as a bound command whose payload went to history; the
+        // table holds no record, so initializing would take it as new.
+        if self.table.retired(&command) {
             self.rejections.push(FollowerRejection::Duplicate(command));
             return self.refuse(command, SubmissionRefusal::Forgotten);
         }
@@ -4090,6 +4088,18 @@ impl Follower {
                                 outbox.publish(reply);
                             }
                             return self.release();
+                        }
+                        // Asked again for the ballot this replica already
+                        // follows: the leader asks every voter it has not
+                        // yet heard vote in its ballot, and one that
+                        // installed the Sync with nothing to vote on yet is
+                        // one of them (task-d33). Nothing to answer, and
+                        // nothing refused.
+                        if self.ballots.promised() == ballot
+                            && self.ballots.synced() == ballot
+                            && ballot.leader == from.replica
+                        {
+                            return Vec::new();
                         }
                         self.rejections.push(FollowerRejection::Promise(e));
                         Vec::new()

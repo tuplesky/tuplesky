@@ -346,6 +346,10 @@ struct Offer {
     seq: u64,
     key: u8,
     variant: u8,
+    /// The node whose frontend took the caller's request: its collector
+    /// holds the entry and answers it from that node's own durable
+    /// record once the entry is one only the record answers.
+    host: u8,
 }
 
 /// Commands a key may be the latest of: the most tombstones a table keeps
@@ -405,6 +409,12 @@ struct Sim {
     learned: BTreeSet<CommandId>,
     /// Commands a voter refused for another bound under their retry key.
     refused_for: BTreeMap<CommandId, CommandId>,
+    /// Commands a voter told the frontend it keeps no payload of any
+    /// more (`Refused { Forgotten }`): the collector answers them from
+    /// the durable record of their execution.
+    forgotten: BTreeSet<CommandId>,
+    /// Commands the collector presented again after the faults stopped.
+    reoffered: BTreeSet<CommandId>,
     /// Commands executed anywhere: each has a record that answers it.
     executed_anywhere: BTreeSet<CommandId>,
     /// Faults have stopped.
@@ -412,6 +422,13 @@ struct Sim {
     /// Entries and edges of the Syncs each node's current machine was
     /// given to install (oracle 5).
     sync_work: Vec<u64>,
+    /// The most entries of any one Sync each node was given, its own
+    /// selection included: how far recovery work may take its table past
+    /// the capacity.
+    sync_entries: Vec<usize>,
+    /// The most commands of any one catch-up page each node was given:
+    /// pulled commands enter a full table too (task-d24).
+    pulled_entries: Vec<usize>,
     /// When each node last restarted, and when it last began a campaign.
     booted_at: Vec<u32>,
     campaign_at: Vec<u32>,
@@ -528,9 +545,13 @@ impl Sim {
             offers: BTreeMap::new(),
             learned: BTreeSet::new(),
             refused_for: BTreeMap::new(),
+            forgotten: BTreeSet::new(),
+            reoffered: BTreeSet::new(),
             executed_anywhere: BTreeSet::new(),
             healing: false,
             sync_work: vec![0; usize::from(n)],
+            sync_entries: vec![0; usize::from(n)],
+            pulled_entries: vec![0; usize::from(n)],
             booted_at: vec![0; usize::from(n)],
             campaign_at: vec![0; usize::from(n)],
             leaderless_since: vec![None; usize::from(n)],
@@ -596,7 +617,9 @@ impl Sim {
                     // batch) plus the record header's allowance of 512,
                     // against `MAX_RECORD_BYTES` and `MAX_RECORD_UPDATES`
                     // of coord-journal-api. A batch past it is refused as
-                    // `TooLarge` before it is queued.
+                    // `TooLarge` before it is queued. At capacity 32 with
+                    // one-byte keys no batch comes near it: the check is
+                    // vacuous at this scale, and there for a larger one.
                     let bytes: usize = batch
                         .updates
                         .iter()
@@ -615,7 +638,9 @@ impl Sim {
                     node.storage.submit(batch);
                 }
                 Effect::SendWhenDurable { to, frame, .. } => {
-                    // Oracle 5: a protocol frame, and a Sync's entries.
+                    // Oracle 5: a protocol frame, and a Sync's entries. The
+                    // frame bound, like the journal record's, is vacuous
+                    // at this scale.
                     if frame.len() > 4 << 20 {
                         self.fail(&format!("node {i} sent a frame of {} bytes", frame.len()));
                     }
@@ -678,6 +703,14 @@ impl Sim {
                 ..
             } => {
                 self.refused_for.insert(*command, *bound);
+                return;
+            }
+            ProtocolMessage::Refused {
+                command,
+                refusal: coord_consensus::SubmissionRefusal::Forgotten,
+                ..
+            } => {
+                self.forgotten.insert(*command);
                 return;
             }
             _ => return,
@@ -778,6 +811,8 @@ impl Sim {
                 let effects = match pending {
                     Some((from, d)) => {
                         self.sync_work[usize::from(i)] += sync_size(&d);
+                        let most = &mut self.sync_entries[usize::from(i)];
+                        *most = (*most).max(sync_entries(&d));
                         f.on_sync(from, d)
                     }
                     None => Vec::new(),
@@ -1003,9 +1038,13 @@ impl Sim {
             .encode()
             .unwrap();
         let command = CommandId::derive(&rk, &request).unwrap();
-        self.offers
-            .entry(command)
-            .or_insert(Offer { seq, key, variant });
+        let host = at.first().copied().unwrap_or(0);
+        self.offers.entry(command).or_insert(Offer {
+            seq,
+            key,
+            variant,
+            host,
+        });
         self.note(|| format!("admit {} seq {seq}/{variant} at {at:?}", short(&command)));
         for &i in at {
             if !self.nodes[usize::from(i)].alive() {
@@ -1195,6 +1234,13 @@ impl Sim {
             )
         {
             self.sync_work[usize::from(msg.to)] += sync_size(&d);
+            self.given_sync(msg.to, &d);
+        }
+        if let Ok(ProtocolMessage::CatchUpPage { entries, .. }) =
+            ProtocolMessage::decode(&msg.frame)
+        {
+            let most = &mut self.pulled_entries[usize::from(msg.to)];
+            *most = (*most).max(entries.len());
         }
         let event = Event::Peer(AuthenticatedPeerMessage::new(
             PeerProvenance::from_transport(r(msg.from), ReplicaIncarnation::new(1).unwrap(), 1),
@@ -1423,13 +1469,22 @@ impl Sim {
         }
     }
 
+    /// Node `i` was given the Sync `d`: its table may hold that many
+    /// commands past the capacity.
+    fn given_sync(&mut self, i: u8, d: &SyncDecision) {
+        let most = &mut self.sync_entries[usize::from(i)];
+        *most = (*most).max(sync_entries(d));
+    }
+
     fn crash(&mut self, i: u8) {
         // Every frame travels on its own stream of a connection the crash
         // ends: what was in flight to or from this node is gone with it.
         // (Within a live connection frames are delayed, reordered and
         // lost at will.)
         self.note(|| format!("crash node {i}"));
-        if self.leader_index() == Some(i) {
+        // Healing restarts every node; a leader it takes down is no
+        // fault of the schedule's.
+        if !self.healing && self.leader_index() == Some(i) {
             self.stats.leader_crashes += 1;
         }
         self.net.retain(|m| m.from != i && m.to != i);
@@ -1462,6 +1517,16 @@ impl Sim {
             .map(|d| (d.ballot, d))
             .collect();
         self.sync_work[usize::from(i)] = syncs.iter().map(|(_, d)| sync_size(d)).sum();
+        // The table reloads the rows earlier recovery work wrote, and a
+        // Sync row may have gone since: the most this node was ever given
+        // stands.
+        let rows = syncs
+            .iter()
+            .map(|(_, d)| sync_entries(d))
+            .max()
+            .unwrap_or(0);
+        let most = &mut self.sync_entries[usize::from(i)];
+        *most = (*most).max(rows);
         self.booted_at[usize::from(i)] = self.step;
         self.probed[usize::from(i)] = false;
         self.asked_at[usize::from(i)] = None;
@@ -1733,8 +1798,8 @@ impl Sim {
         let report_pages = (2 * CAPACITY).div_ceil(coord_consensus::MAX_PAGE_ENTRIES) + 1;
         // The ledger, payloads, votes and bindings: the live and recently
         // retired commands, swept once they pass four tables; the peak is
-        // that plus the live table and the retirement window it sweeps
-        // down to.
+        // those four, the live table and the retirement window the sweep
+        // goes down to, six tables in all.
         let kept = 6 * CAPACITY;
         for i in 0..self.n {
             let node = &self.nodes[usize::from(i)];
@@ -1750,19 +1815,24 @@ impl Sim {
             // Admitted work stops an eighth short of the capacity; recovery
             // work (a Sync's entries, a candidate's selection, pulled
             // commands, a command whose turn has come) may pass it, bounded
-            // by the largest Sync, and nothing executed is kept past it
-            // (task-d24, design Section 13.1).
-            if records
-                > CAPACITY - CAPACITY / coord_consensus::RECOVERY_RESERVE_PARTS
-                    + 5 * coord_consensus::max_report_entries(CAPACITY)
-            {
+            // by the largest Sync and the largest catch-up page this node
+            // was given, and nothing executed is kept past it (task-d24,
+            // design Section 13.1).
+            let (sync, pulled) = (
+                self.sync_entries[usize::from(i)],
+                self.pulled_entries[usize::from(i)],
+            );
+            if records > CAPACITY + sync + pulled {
                 let mut phases: BTreeMap<String, usize> = BTreeMap::new();
                 for (_, r) in table.records() {
                     *phases.entry(format!("{:?}", r.phase)).or_default() += 1;
                 }
                 let placeholders = records - phases.values().sum::<usize>();
+                let kind = matches!(role, Role::Leader(_));
                 over.push(format!(
-                    "{records} table records, capacity {CAPACITY}: {phases:?}, {placeholders} placeholders"
+                    "{records} table records, capacity {CAPACITY}, largest Sync {sync}, \
+                     largest catch-up page {pulled}, leader {kind}: {phases:?}, \
+                     {placeholders} placeholders"
                 ));
             }
             let tombstones = table.tombstones().len();
@@ -1779,7 +1849,7 @@ impl Sim {
             let mut examinations_pct = 0;
             if let Role::Follower(f) = role {
                 held = f.held().len();
-                if held > 8 * CAPACITY {
+                if held > coord_consensus::HELD_PROPOSAL_SLACK * CAPACITY {
                     over.push(format!("{held} held proposals"));
                 }
                 if let Some(c) = f.campaign_state() {
@@ -1811,6 +1881,9 @@ impl Sim {
                 {
                     self.selection_counted[usize::from(i)] = Some(d.ballot);
                     self.sync_work[usize::from(i)] += sync_size(d);
+                    let entries = sync_entries(d);
+                    let most = &mut self.sync_entries[usize::from(i)];
+                    *most = (*most).max(entries);
                 }
                 let work = self.sync_work[usize::from(i)];
                 let examinations = f.sync_examinations();
@@ -1833,14 +1906,33 @@ impl Sim {
         }
     }
 
-    /// Whether `command` has an answer the collector can give.
+    /// Whether `command` has an answer its collector can give, as
+    /// `coordd`'s does: it learned the decision, or the entry is one only
+    /// the durable record answers and the record of the node that hosts
+    /// the collector holds it. An entry becomes one when the collector
+    /// asks for it again, or a voter refuses it as `Forgotten` or bound to
+    /// another command (`Collector::half_established`, task-d22), and
+    /// `coordd` then settles it from its own node's executed rows
+    /// (`settle_from_record`), or as a conflict when that node's record
+    /// binds the key to the other command and executed it
+    /// (`settle_conflict_from_record`). What the simulator knows some
+    /// other node executed is not an answer.
     fn settled(&self, command: &CommandId) -> bool {
-        self.learned.contains(command)
-            || self.executed_anywhere.contains(command)
+        if self.learned.contains(command) {
+            return true;
+        }
+        let from_record = self.reoffered.contains(command)
+            || self.forgotten.contains(command)
+            || self.refused_for.contains_key(command);
+        if !from_record {
+            return false;
+        }
+        let host = &self.nodes[usize::from(self.offers[command].host)];
+        host.executed.contains(command)
             || self
                 .refused_for
                 .get(command)
-                .is_some_and(|bound| self.executed_anywhere.contains(bound))
+                .is_some_and(|bound| host.executed.contains(bound))
     }
 
     fn unsettled(&self) -> Vec<CommandId> {
@@ -1851,13 +1943,21 @@ impl Sim {
             .collect()
     }
 
-    /// Every admitted command settled, and every voter executed as far as
-    /// the others and has nothing left it could execute.
+    /// Every admitted command settled, every decision the frontend
+    /// learned or a voter executed is in the one order, and every voter
+    /// executed as far as the others and has nothing left it could
+    /// execute. A decision learned from a durable majority that the next
+    /// selection dropped would otherwise pass as settled.
     fn healed(&self) -> bool {
         self.leader_index().is_some()
             && (0..self.n).all(|i| {
                 self.nodes[usize::from(i)].executed.len() == self.order.len() && !self.executable(i)
             })
+            && self.learned.is_subset(&self.executed_anywhere)
+            && self
+                .decided
+                .keys()
+                .all(|c| self.executed_anywhere.contains(c))
             && self.unsettled().is_empty()
     }
 
@@ -1930,14 +2030,23 @@ impl Sim {
                 format!("{} {}", short(c), at.join("/"))
             })
             .collect();
+        let lost: Vec<CommandId> = self
+            .decided
+            .keys()
+            .filter(|c| !self.executed_anywhere.contains(c))
+            .copied()
+            .collect();
         self.fail(&format!(
             "not healed {HEAL_BUDGET} rounds after the faults stopped: roles {}, \
-             executed {executed:?} of {}, {} unsettled [{}]; phases {}",
+             executed {executed:?} of {}, {} unsettled [{}]; phases {}; \
+             {} decided and never executed [{}]",
             self.roles(),
             self.order.len(),
             unsettled.len(),
             shorts(&unsettled),
-            phases.join(", ")
+            phases.join(", "),
+            lost.len(),
+            shorts(&lost)
         ));
     }
 
@@ -1969,6 +2078,7 @@ impl Sim {
     fn offer_unsettled(&mut self) {
         let all: Vec<u8> = (0..self.n).collect();
         for c in self.unsettled() {
+            self.reoffered.insert(c);
             let o = self.offers[&c];
             self.admit(o.seq, o.key, o.variant, &all);
         }
@@ -2076,6 +2186,11 @@ impl Sim {
 }
 
 /// The entries and edges a Sync gives a follower to install.
+/// The commands a Sync puts in a table: its entries and its re-proposals.
+fn sync_entries(d: &SyncDecision) -> usize {
+    d.entries.len() + d.reproposed.len()
+}
+
 fn sync_size(d: &SyncDecision) -> u64 {
     d.entries
         .values()
