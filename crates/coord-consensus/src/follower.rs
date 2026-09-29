@@ -540,6 +540,46 @@ pub struct Follower {
     replay: crate::replay::EvidenceStore,
 }
 
+/// The retry-key bindings a restart restores from the payload rows
+/// (task-d33).
+///
+/// A replica can hold two payload rows under one retry key: the payload
+/// fetched for a leader's proposal, a Sync entry or its own selection
+/// takes the binding over from a presentation this replica took first,
+/// and a pulled decision is written beside one it holds. The binding goes
+/// to the command the table holds furthest along. A tie is left unbound:
+/// the next exact presentation of either command binds it again
+/// (`on_request`, `AlreadyInitialized`). Collected in identity order, the
+/// binding went to whichever command sorted last, and a restart could
+/// restore the presentation the leader's had displaced and refuse exact
+/// retries of the leader's command as another command's.
+fn restored_bindings<'a>(
+    table: &CommandTable,
+    payloads: impl IntoIterator<Item = (&'a CommandId, &'a PayloadRecordV1)>,
+) -> BTreeMap<RetryKey, CommandId> {
+    let mut furthest: BTreeMap<RetryKey, (Option<Phase>, Option<CommandId>)> = BTreeMap::new();
+    for (c, p) in payloads {
+        let phase = table.phase_of(c);
+        match furthest.get_mut(&p.retry_key) {
+            None => {
+                furthest.insert(p.retry_key, (phase, Some(*c)));
+            }
+            Some((at, bound)) => {
+                if phase > *at {
+                    *at = phase;
+                    *bound = Some(*c);
+                } else if phase == *at {
+                    *bound = None;
+                }
+            }
+        }
+    }
+    furthest
+        .into_iter()
+        .filter_map(|(key, (_, c))| c.map(|c| (key, c)))
+        .collect()
+}
+
 impl Follower {
     /// A follower from its configuration, the recovered promise row, the
     /// durable dependency rows of the epoch and the durable payload rows.
@@ -608,6 +648,7 @@ impl Follower {
         // undecided durable records are the ones it named.
         let report_cut = (ballots.promised() != ballots.synced())
             .then(|| (ballots.promised(), table.undecided().copied().collect()));
+        let bindings = restored_bindings(&table, payloads.iter());
         let adopted = table
             .records()
             .filter(|(_, r)| r.phase >= Phase::Accept)
@@ -626,10 +667,7 @@ impl Follower {
             outbox: None,
             ballots,
             table,
-            bindings: payloads
-                .iter()
-                .map(|(command, record)| (record.retry_key, *command))
-                .collect(),
+            bindings,
             held: BTreeMap::new(),
             adopted,
             pending: BTreeMap::new(),
@@ -748,6 +786,7 @@ impl Follower {
         mut self,
         payloads: impl IntoIterator<Item = (CommandId, PayloadRecordV1)>,
     ) -> Self {
+        let mut touched: BTreeSet<RetryKey> = BTreeSet::new();
         for (c, p) in payloads {
             if self.table.phase_of(&c).is_none() {
                 continue;
@@ -759,9 +798,25 @@ impl Follower {
             if self.table.forgotten(&c) {
                 continue;
             }
-            self.bindings.insert(p.retry_key, c);
+            touched.insert(p.retry_key);
             self.payloads.insert(c, p);
             self.served_payloads.insert(c);
+        }
+        let restored = restored_bindings(
+            &self.table,
+            self.payloads
+                .iter()
+                .filter(|(_, p)| touched.contains(&p.retry_key)),
+        );
+        for key in touched {
+            match restored.get(&key) {
+                Some(c) => {
+                    self.bindings.insert(key, *c);
+                }
+                None => {
+                    self.bindings.remove(&key);
+                }
+            }
         }
         self
     }
@@ -4010,6 +4065,18 @@ impl Follower {
                         out
                     }
                     Err(e) => {
+                        // Asked again for a ballot this replica promised
+                        // and has not synchronized to: the leader's Sync
+                        // was lost, and the leader asks until this replica
+                        // follows (task-d33). Refused, it stayed promised
+                        // and unsynchronized, and held every proposal of
+                        // the ballot for ever.
+                        if let Some(reply) = self.ballots.promise_again(from, ballot, boot) {
+                            if let Some(outbox) = self.outbox.as_mut() {
+                                outbox.publish(reply);
+                            }
+                            return self.release();
+                        }
                         self.rejections.push(FollowerRejection::Promise(e));
                         Vec::new()
                     }

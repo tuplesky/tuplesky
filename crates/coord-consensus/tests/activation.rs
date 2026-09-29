@@ -5575,6 +5575,57 @@ fn a_follower_takes_the_leaders_presentation_of_an_identity_it_bound_otherwise()
     }
 }
 
+/// The binding the leader's presentation took over survives a restart
+/// (task-d33). Both payload rows stay under the one retry key, and a
+/// restart used to bind the key to whichever command sorted last: when
+/// that was the displaced one, exact retries of the leader's command
+/// were refused as another command's.
+#[test]
+fn a_binding_taken_over_for_the_leaders_presentation_survives_a_restart() {
+    let mut cluster = Cluster::new(67);
+    cluster.admit(1, 1);
+    cluster.settle();
+    cluster.no_execute = vec![2];
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    cluster.settle_resending(3);
+    assert!(
+        mine > theirs,
+        "the displaced presentation sorts last, as a restart used to bind"
+    );
+    assert!(
+        cluster.nodes[2]
+            .follower()
+            .table()
+            .phase_of(&theirs)
+            .is_some_and(|p| p >= Phase::Commit),
+        "r2 took the leader's presentation over"
+    );
+    cluster.crash(2);
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[2]);
+    cluster.settle();
+    let refused: Vec<_> = cluster
+        .frontend
+        .iter()
+        .filter(|(from, m)| {
+            *from == r(2)
+                && matches!(
+                    m,
+                    ProtocolMessage::Refused {
+                        refusal: coord_consensus::SubmissionRefusal::OtherCommand { .. },
+                        ..
+                    }
+                )
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "an exact retry of the leader's command was refused as another's: {refused:?}"
+    );
+}
+
 /// task-d33 (protocol_sim row 4, five voters, seed 6): a Sync that
 /// releases a command whose row is still being written deletes that row
 /// too. The deletion used to follow only a durable row: the installation
@@ -5715,6 +5766,33 @@ fn a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows() {
     cluster.settle();
     assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
     cluster.cut.clear();
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
+/// task-d33: a voter the campaign missed, whose Sync from the leader was
+/// lost, is asked again and sent the Sync again. The leader used to count
+/// it as following once it promised: nothing asked it again, and it held
+/// every proposal of the ballot, promised and never synchronized.
+#[test]
+fn a_late_voter_whose_sync_was_lost_is_sent_it_again() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut = vec![(0, 2), (2, 0), (1, 2), (2, 1)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    cluster.cut.clear();
+    cluster.drop_sync = vec![(1, 2)];
+    cluster.settle_resending(2);
+    let ballots = cluster.nodes[2].follower().ballots();
+    assert_eq!(ballots.promised(), b1, "r2 promised the late ask");
+    assert_ne!(ballots.synced(), b1, "and its Sync was lost");
+    cluster.drop_sync.clear();
     let y = cluster.admit(2, 1);
     cluster.settle_resending(4);
     assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);

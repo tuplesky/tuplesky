@@ -7268,6 +7268,11 @@ dependencies. One was `IncompatibleAccepted`.
   own selection. First presentation wins at the leader: a payload fetched
   for a proposal, a Sync entry or the campaign's selection now takes the
   binding over. `a_follower_takes_the_leaders_presentation_of_an_identity_it_bound_otherwise`.
+  Both payload rows stay under the key, so a restart binds the key to the
+  command the table holds furthest along, and leaves a tie unbound for
+  the next exact presentation to bind; it used to bind whichever command
+  sorted last.
+  `a_binding_taken_over_for_the_leaders_presentation_survives_a_restart`.
 - **A release that missed a row in flight** (4,5,6). A Sync deleted the
   row of a command it released only if the row was already durable. The
   installation of an earlier Sync's entry, written after the release was
@@ -7292,8 +7297,11 @@ dependencies. One was `IncompatibleAccepted`.
 - **A voter the campaign missed.** A voter cut off while the campaign ran
   never heard of the new ballot. The leader's proposals were foreign to
   it, and a quiet domain sent it nothing at all. The leader's re-send now
-  asks every voter that has not promised its ballot, and answers a late
-  promise with its Sync. `a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows`.
+  asks every voter that has not voted in its ballot, and answers a late
+  promise with its Sync. A voter that promised and has not synchronized
+  answers the ask with its promise again, so a lost Sync is sent again.
+  `a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows`,
+  `a_late_voter_whose_sync_was_lost_is_sent_it_again`.
 - **A donor that served only its own ballot.** A voter refused as behind
   asks for history at the ballot it last synchronized. Donors answered only
   at their own, so it stayed behind. `coordd` now serves any ballot of the

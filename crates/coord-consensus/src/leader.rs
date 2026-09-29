@@ -271,13 +271,14 @@ pub struct Leader {
     /// it is deposed (task-d34): an entry whose payload this leader lacked
     /// was never proposed, and the follower installs it from here.
     selection: Option<SyncDecision>,
-    /// The voters that promised this leader's ballot: those its campaign
-    /// heard from, and those that promised since. The others missed the
-    /// campaign -- down, cut off, or leading an older ballot themselves --
-    /// and nothing else would ever tell them of this one: its proposals
-    /// are foreign to them, and a quiet domain sends them nothing at all.
-    /// They are asked again (`resend_unvoted`) and answered with the Sync
-    /// (task-d33).
+    /// The voters known to follow this leader's ballot: those its
+    /// campaign heard from, and those that have voted in it since. The
+    /// others missed the campaign -- down, cut off, or leading an older
+    /// ballot themselves -- and nothing else would ever tell them of this
+    /// one: its proposals are foreign to them, and a quiet domain sends
+    /// them nothing at all. They are asked again (`resend_unvoted`) and
+    /// answered with the Sync (task-d33), until a vote shows they
+    /// installed it: a Sync lost on the way is sent again.
     joined: BTreeSet<ReplicaId>,
 }
 
@@ -961,7 +962,6 @@ impl Leader {
         let Some(decision) = self.selection.clone() else {
             return Vec::new();
         };
-        self.joined.insert(replica);
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut().expect("booted");
         outbox.publish(PendingSend {
@@ -2478,6 +2478,11 @@ impl Leader {
         if vote.replica() != from {
             self.rejections.push(Rejection::Vote(VoteError::NotAVoter));
             return Vec::new();
+        }
+        // A voter votes in a ballot only once it has installed its Sync:
+        // one that missed the campaign follows now (task-d33).
+        if vote.ballot() == self.config.quorum.ballot() {
+            self.joined.insert(from);
         }
         let command = vote.command();
         let Some(set) = self.votes.get_mut(&command) else {

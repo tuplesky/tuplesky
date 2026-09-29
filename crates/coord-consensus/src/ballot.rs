@@ -563,6 +563,27 @@ impl BallotState {
         }
     }
 
+    /// The promise of `ballot` again, for the candidate `to` that asks for
+    /// it once more (task-d33): this replica promised it and has not
+    /// synchronized to it, so the Sync that answered the promise may have
+    /// been lost, and the leader asks until this replica follows. The row
+    /// is durable already, so the reply requires nothing.
+    pub fn promise_again(&self, to: PeerId, ballot: Ballot, boot: BootId) -> Option<PendingSend> {
+        (self.promised() == ballot && self.synced != ballot && ballot.leader == to.replica).then(
+            || PendingSend {
+                context: self.context(boot, ballot, LocalJournalSeq::ZERO),
+                requires: Vec::new(),
+                to,
+                frame: ProtocolMessage::Promise {
+                    ballot,
+                    synced: self.synced,
+                    replica: self.identity.replica,
+                }
+                .encode(),
+            },
+        )
+    }
+
     /// The highest ballot refused as behind, which this replica's next
     /// campaign has to go above.
     pub const fn outranked(&self) -> Option<Ballot> {
