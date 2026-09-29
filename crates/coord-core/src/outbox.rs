@@ -205,6 +205,12 @@ impl Outbox {
 /// two, and the upper half is the applier's.
 pub const APPLICATION_BARRIERS: u64 = 1 << 63;
 
+/// The first sequence of the runtime's own barriers: batches a replica's
+/// runtime persists for itself, beside its protocol machine and its
+/// applier, such as a forgetting floor's readiness (task-d27). Below
+/// [`APPLICATION_BARRIERS`], so the applier hands their facts on.
+pub const RUNTIME_BARRIERS: u64 = 1 << 62;
+
 /// Whether `barrier` was allocated by an applier ([`BarrierAllocator::for_application`]).
 pub const fn is_application(barrier: &BarrierId) -> bool {
     barrier.sequence >= APPLICATION_BARRIERS
@@ -221,7 +227,7 @@ pub struct BarrierAllocator {
 }
 
 impl BarrierAllocator {
-    /// New allocator for this boot, below [`APPLICATION_BARRIERS`].
+    /// New allocator for this boot, below [`RUNTIME_BARRIERS`].
     pub const fn new(
         node_generation: coord_types::ids::ReplicaIncarnation,
         boot_id: BootId,
@@ -230,8 +236,19 @@ impl BarrierAllocator {
             node_generation,
             boot_id,
             next: 1,
-            end: APPLICATION_BARRIERS,
+            end: RUNTIME_BARRIERS,
         }
+    }
+
+    /// The same allocator moved to the runtime's own sequences, between
+    /// the protocol's and the application's.
+    #[must_use]
+    pub const fn for_runtime(mut self) -> Self {
+        if self.next < RUNTIME_BARRIERS {
+            self.next = RUNTIME_BARRIERS;
+        }
+        self.end = APPLICATION_BARRIERS;
+        self
     }
 
     /// The same allocator moved to the application's half of the

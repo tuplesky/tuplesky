@@ -96,7 +96,7 @@ pub use handoff::{
     read_installs, record_install, record_local_install, select_certificate,
 };
 pub use maintain::{BaselineError, LocalBaseline, Publication};
-pub use store::{LocalCheckpointStore, StoreError};
+pub use store::{LocalCheckpointStore, SharedImageStore, StoreError};
 
 pub use install::{
     ChunkSet, InstallError, InstallLimits, InstallRequirements, Installed, InstalledCheckpointV1,

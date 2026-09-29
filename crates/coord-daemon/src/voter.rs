@@ -471,6 +471,14 @@ impl<P: Persistence> Voter<P> {
         if let Some(coord_consensus::ProtocolMessage::CatchUpRequest { ballot, after }) = &message {
             out.absorb(self.node.serve_catch_up(provenance.from(), *ballot, *after));
         }
+        // A peer's promise about a floor boundary is recorded from its own
+        // link: the runtime's, like the checkpoint it names (task-d27).
+        if let Some(coord_consensus::ProtocolMessage::FloorReadiness { readiness }) = &message {
+            out.absorb(
+                self.node
+                    .hear_floor(provenance.from(), readiness, &self.ballot)?,
+            );
+        }
         out.absorb(self.node.on_event(
             Event::Peer(AuthenticatedPeerMessage::new(provenance, frame)),
             &self.ballot,

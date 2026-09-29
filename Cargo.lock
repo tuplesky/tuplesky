@@ -661,6 +661,7 @@ dependencies = [
 name = "coord-daemon"
 version = "0.1.0"
 dependencies = [
+ "coord-checkpoint",
  "coord-collector",
  "coord-consensus",
  "coord-core",
@@ -676,10 +677,12 @@ dependencies = [
  "coord-transport-testkit",
  "coord-types",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "toml",

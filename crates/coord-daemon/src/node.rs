@@ -483,6 +483,9 @@ pub struct Node<P: Persistence> {
     /// Storage facts reached the outbox outside a round, so it may hold
     /// sends they released that no round has handed out yet.
     unreleased: bool,
+    /// The forgetting floor this voter agrees with its peers, when it
+    /// takes part (task-d27).
+    floor: Option<crate::floor::Floor>,
 }
 
 impl<P: Persistence> Node<P> {
@@ -505,7 +508,65 @@ impl<P: Persistence> Node<P> {
             order: None,
             pages_served: 0,
             unreleased: false,
+            floor: None,
         }
+    }
+
+    /// Take part in agreeing a forgetting floor (task-d27).
+    pub fn keep_floor(&mut self, floor: crate::floor::Floor) {
+        self.floor = Some(floor);
+    }
+
+    /// The forgetting floor, when this voter takes part.
+    pub const fn floor(&self) -> Option<&crate::floor::Floor> {
+        self.floor.as_ref()
+    }
+
+    /// A peer's promise about a floor boundary, over its own link: its
+    /// row, and the floor it may activate, are journaled.
+    pub fn hear_floor(
+        &mut self,
+        from: coord_types::ids::ReplicaId,
+        readiness: &[u8],
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let Some(floor) = self.floor.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let Ok(gated) = self.applier.store().reader().snapshot() else {
+            return Ok(Outbound::default());
+        };
+        let Some(updates) = floor.hear(gated.view(), from, readiness) else {
+            return Ok(Outbound::default());
+        };
+        drop(gated);
+        let effects = floor_effects(floor, updates, None, ballot);
+        self.carry_out(effects, ballot)
+    }
+
+    /// Export, keep and promise the checkpoint at the boundary this
+    /// node just applied.
+    fn floor_boundary(
+        &mut self,
+        position: coord_types::ids::ExecutionPosition,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let Some(floor) = self.floor.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let gated = match self.applier.store().reader().snapshot() {
+            Ok(gated) => gated,
+            Err(e) => {
+                floor.refuse(crate::floor::FloorRefusal::Export(format!("{e:?}")));
+                return Ok(Outbound::default());
+            }
+        };
+        let Some(promised) = floor.boundary(gated.view(), position) else {
+            return Ok(Outbound::default());
+        };
+        drop(gated);
+        let effects = floor_effects(floor, promised.updates, Some(promised.readiness), ballot);
+        self.carry_out(effects, ballot)
     }
 
     /// Record this node's journal and materialization work in
@@ -1188,6 +1249,16 @@ impl<P: Persistence> Node<P> {
             self.absorb_foreign(&mut effects);
             effects.extend(self.machine_mut().applied(command, &outcome)?);
             out.absorb(self.carry_out(effects, ballot)?);
+            // At a floor boundary the view is exactly the command's: the
+            // apply returned once its batch was readable, and only a
+            // command moves the frontier (task-d27).
+            if self
+                .floor
+                .as_ref()
+                .is_some_and(|floor| floor.due(outcome.position))
+            {
+                out.absorb(self.floor_boundary(outcome.position, ballot)?);
+            }
         }
         Ok(out)
     }
@@ -1218,3 +1289,43 @@ impl<P: Persistence> Node<P> {
 /// How many times storage facts may produce further effects within one
 /// event before the driver calls it a fault.
 const MAX_ROUNDS: usize = 32;
+
+/// The batch that journals a floor's rows under its own barrier, and,
+/// for this voter's own promise, the sends to its peers that wait on it.
+fn floor_effects(
+    floor: &mut crate::floor::Floor,
+    updates: Vec<coord_core::effect::StoreUpdate>,
+    readiness: Option<Vec<u8>>,
+    ballot: &Ballot,
+) -> Vec<Effect> {
+    let barrier = floor.barrier();
+    let mut effects = vec![Effect::Persist(PersistBatch {
+        barrier,
+        base: None,
+        updates,
+    })];
+    if let Some(readiness) = readiness {
+        let (incarnation, boot_id) = floor.stamp();
+        let context = coord_core::effect::EffectContext {
+            domain: floor.origin().domain,
+            replica_incarnation: incarnation,
+            boot_id,
+            configuration: floor.voters().epoch(),
+            ballot: *ballot,
+            required_journal_seq: coord_types::ids::LocalJournalSeq::ZERO,
+        };
+        let frame = coord_consensus::ProtocolMessage::FloorReadiness { readiness }.encode();
+        for peer in floor.peers() {
+            effects.push(Effect::SendWhenDurable {
+                context,
+                requires: vec![barrier],
+                to: PeerId {
+                    replica: peer,
+                    incarnation: coord_types::ids::ReplicaIncarnation::ZERO,
+                },
+                frame: frame.clone(),
+            });
+        }
+    }
+    effects
+}

@@ -47,7 +47,10 @@ use coord_journal_api::record::RecordOrigin;
 use coord_types::identity::Digest32;
 
 use crate::local::{LocalCheckpointV1, LocalError, LocalManifestV1, verify_local};
-use crate::manifest::{ArtifactError, ChunkV1, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
+use crate::manifest::{
+    ArtifactError, ChunkV1, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, SharedCheckpointV1,
+};
+use crate::verify::verify_shared;
 
 /// Name of the manifest inside an image directory.
 const MANIFEST: &str = "manifest.bin";
@@ -316,6 +319,117 @@ impl LocalCheckpointStore {
         }
         out.sort_by_key(|d| d.0);
         Ok(out)
+    }
+}
+
+/// Where a voter keeps the shared checkpoints it promised a forgetting
+/// floor about (task-d27).
+///
+/// Its own directory, never a [`LocalCheckpointStore`]'s: that store
+/// reclaims every image but the selected one, and a shared image is
+/// selected by no pointer. It is kept because this voter's readiness
+/// says it holds these bytes, and a promise about bytes that were
+/// reclaimed is not one.
+///
+/// The same crash-safe order as a local image: a pending directory,
+/// every file synced, the directory synced, renamed into place, the root
+/// synced. A directory that exists is complete.
+#[derive(Clone, Debug)]
+pub struct SharedImageStore {
+    root: PathBuf,
+}
+
+impl SharedImageStore {
+    /// Open (creating) the directory `root`, syncing its creation.
+    pub fn open(root: &Path) -> Result<Self, StoreError> {
+        fs::create_dir_all(root)?;
+        if let Some(parent) = root.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(SharedImageStore {
+            root: root.to_path_buf(),
+        })
+    }
+
+    /// Where the images live.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Verify `checkpoint` and keep it durably, named by its root.
+    /// Returns the bytes written.
+    ///
+    /// Verified first, from the encoded chunks, so the root a readiness
+    /// promises about is one computed from the bytes on disk and not only
+    /// the one the exporter reported. Idempotent: an image already kept
+    /// under that root is left as it is.
+    pub fn keep(&self, checkpoint: &SharedCheckpointV1) -> Result<u64, StoreError> {
+        let chunks = checkpoint
+            .chunks
+            .iter()
+            .map(ChunkV1::encode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let root =
+            verify_shared(&checkpoint.manifest, &chunks).map_err(|_| StoreError::Quarantine {
+                reason: "an exported shared checkpoint does not verify",
+            })?;
+        let manifest = checkpoint.manifest.encode()?;
+        let bytes = chunks
+            .iter()
+            .map(|c| c.len() as u64)
+            .sum::<u64>()
+            .saturating_add(manifest.len() as u64);
+        let image = self.root.join(hex(&root));
+        if image.exists() {
+            return Ok(bytes);
+        }
+        let pending = self.root.join(format!("{PENDING}{}", hex(&root)));
+        if pending.exists() {
+            fs::remove_dir_all(&pending)?;
+        }
+        fs::create_dir(&pending)?;
+        for (chunk, encoded) in checkpoint.chunks.iter().zip(&chunks) {
+            write_synced(&pending.join(chunk_name(chunk.ordinal)), encoded)?;
+        }
+        write_synced(&pending.join(MANIFEST), &manifest)?;
+        sync_dir(&pending)?;
+        fs::rename(&pending, &image)?;
+        sync_dir(&self.root)?;
+        Ok(bytes)
+    }
+
+    /// Whether a complete image with `root` is kept here.
+    pub fn holds(&self, root: &Digest32) -> bool {
+        self.root.join(hex(root)).is_dir()
+    }
+
+    /// Remove every image but those in `keep`, and any leftover pending
+    /// directory. Retryable and idempotent. Returns how many directories
+    /// were removed.
+    ///
+    /// A voter keeps what a standing promise names: its own latest one,
+    /// and the activated floor's. Its older promises were superseded by
+    /// higher ones, which is the only way a promise moves.
+    pub fn reclaim(&self, keep: &[Digest32]) -> Result<usize, StoreError> {
+        let survivors: Vec<String> = keep.iter().map(hex).collect();
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if survivors.iter().any(|s| s == name) || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if !name.starts_with(PENDING) && !is_image_name(name) {
+                continue;
+            }
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+        if removed > 0 {
+            sync_dir(&self.root)?;
+        }
+        Ok(removed)
     }
 }
 

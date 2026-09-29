@@ -960,6 +960,8 @@ pub struct Domain<P: Persistence> {
     role_said: Option<(coord_types::ids::Ballot, bool)>,
     /// How many fenced transitions this voter has said it refused.
     fenced_said: u64,
+    /// The floor's counts last reported (task-d27).
+    floor_said: coord_daemon::floor::FloorCounts,
     /// What a peer's frame or a collector's submission was refused by
     /// this voter's own fence for, where the refusal stops the voter
     /// (`DriveError::Fenced`). Those paths only log a `DriveError`, so the
@@ -1359,6 +1361,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             election,
             role_said: None,
             fenced_said: 0,
+            floor_said: coord_daemon::floor::FloorCounts::default(),
             fenced_stop: None,
             peer_streak: 0,
             budgets,
@@ -2322,6 +2325,32 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 fenced - self.fenced_said
             );
             self.fenced_said = fenced;
+        }
+        // A floor boundary refused is said with its reason, and a promise
+        // or an activation with where the floor stands (task-d27).
+        if let Some(floor) = voter.node().floor()
+            && floor.counts != self.floor_said
+        {
+            let counts = floor.counts;
+            if counts.refused > self.floor_said.refused
+                && let Some(refusal) = floor.last_refusal()
+            {
+                eprintln!("this voter refused a floor boundary: {refusal}");
+            }
+            if counts.promised > self.floor_said.promised
+                || counts.activated > self.floor_said.activated
+            {
+                eprintln!(
+                    "floor promised={} activated={} heard={} rejected={}",
+                    floor.promised().map_or(0, |p| p.get()),
+                    floor
+                        .activated()
+                        .map_or(0, |a| a.boundary.execution_position.get()),
+                    counts.heard,
+                    counts.rejected,
+                );
+            }
+            self.floor_said = counts;
         }
         let role = (voter.ballot(), voter.leads());
         if self.role_said != Some(role) {

@@ -1040,7 +1040,9 @@ fn main() -> ExitCode {
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
     let backing = if roles.votes() {
-        match voter(&placed, applier, boot, config.limits.command_table_capacity) {
+        match voter(&placed, applier, boot, config.limits.command_table_capacity)
+            .and_then(|v| keep_floor(&placed, &config, v))
+        {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
                 eprintln!("{e}");
@@ -1536,6 +1538,59 @@ fn voter(
             promised.number
         );
     }
+    Ok(voter)
+}
+
+/// Take part in agreeing a forgetting floor, when configured to
+/// (task-d27): the promises and the floor this store already holds are
+/// read back, so a restarted voter neither promises less than it did nor
+/// forgets a floor it activated.
+fn keep_floor(
+    placed: &membership::Placed,
+    config: &coord_daemon::config::Config,
+    mut voter: coord_daemon::Voter<store::Persistence>,
+) -> Result<coord_daemon::Voter<store::Persistence>, String> {
+    use coord_daemon::floor::{FLOOR_INTERVAL, Floor, FloorSettings};
+
+    if !config.floor.enabled {
+        return Ok(voter);
+    }
+    let m = &placed.membership;
+    let settings = FloorSettings {
+        interval: FLOOR_INTERVAL,
+        images: store::root_path(&config.state_directory, &config.floor.images),
+        headroom_bytes: config.floor.headroom_bytes,
+        origin: coord_checkpoint::CheckpointOrigin {
+            cluster: m.cluster(),
+            domain: m.domain(),
+        },
+        voters: m.voters().map(|v| v.node).collect(),
+        me: placed.replica,
+    };
+    let floor = {
+        use coord_storage::Persistence;
+        let applier = voter.node().applier();
+        let gated = applier
+            .store()
+            .reader()
+            .snapshot()
+            .map_err(|e| format!("the floor cannot read this store: {e:?}"))?;
+        Floor::open(
+            settings,
+            gated.view(),
+            placed.incarnation,
+            applier.store().boot(),
+        )
+        .map_err(|e| format!("the floor cannot start: {e}"))?
+    };
+    println!(
+        "floor interval={FLOOR_INTERVAL} promised={} activated={}",
+        floor.promised().map_or(0, |p| p.get()),
+        floor
+            .activated()
+            .map_or(0, |a| a.boundary.execution_position.get()),
+    );
+    voter.node_mut().keep_floor(floor);
     Ok(voter)
 }
 

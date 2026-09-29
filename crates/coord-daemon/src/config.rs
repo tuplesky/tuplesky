@@ -126,6 +126,54 @@ impl Default for Limits {
     }
 }
 
+/// Agreeing a forgetting floor (task-d27; design Section 5.3).
+///
+/// A voter that takes part exports the shared checkpoint at every floor
+/// boundary ([`crate::floor::FLOOR_INTERVAL`] executed positions), keeps
+/// the image, and promises its peers it holds it. A majority promising
+/// one checkpoint activates the floor. Nothing is forgotten below it
+/// yet: this is the agreement, and trimming comes after it.
+///
+/// Off by default. The interval is the schema's rather than this file's,
+/// so voters that take part agree on the boundaries without having to
+/// agree on a setting; one that does not take part simply promises
+/// nothing, and a floor then needs a majority of the others.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloorConfig {
+    /// Whether this voter exports and promises at floor boundaries.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory the promised images are kept in, relative to
+    /// `state_directory` unless absolute. Not the local checkpoints'
+    /// directory: that one reclaims every image but the selected one.
+    #[serde(default = "floor_images")]
+    pub images: String,
+    /// Free bytes the images' filesystem must keep beyond the image an
+    /// export would add. Short of it, the boundary is refused and said
+    /// so, and no promise is made.
+    #[serde(default = "floor_headroom_bytes")]
+    pub headroom_bytes: u64,
+}
+
+fn floor_images() -> String {
+    "floor-images".to_owned()
+}
+
+const fn floor_headroom_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+impl Default for FloorConfig {
+    fn default() -> Self {
+        FloorConfig {
+            enabled: false,
+            images: floor_images(),
+            headroom_bytes: floor_headroom_bytes(),
+        }
+    }
+}
+
 /// The local capability: what this process's storage and buffers can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -546,6 +594,10 @@ pub struct Config {
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
+    /// Agreeing a forgetting floor with the other voters (task-d27).
+    /// Absent, it is off.
+    #[serde(default)]
+    pub floor: FloorConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).
@@ -957,5 +1009,18 @@ allow_insecure_loopback = {allow}
         for build in [Build::Test, Build::Release] {
             assert_eq!(unset.validate_as(build), Err(ConfigError::InsecureIssuer));
         }
+    }
+
+    /// The floor is off unless a configuration turns it on, and turned on
+    /// it keeps its images apart from the local checkpoints (task-d27).
+    #[test]
+    fn the_forgetting_floor_is_off_unless_configured() {
+        use super::{FloorConfig, state_checkpoints};
+        assert_eq!(with_renewal(true).floor, FloorConfig::default());
+        assert!(!FloorConfig::default().enabled);
+        let on: FloorConfig = toml::from_str("enabled = true").expect("parses");
+        assert!(on.enabled);
+        assert_ne!(on.images, state_checkpoints());
+        assert!(toml::from_str::<FloorConfig>("interval = 8").is_err());
     }
 }
