@@ -153,7 +153,11 @@ impl Admission {
             None => full,
             Some(at) => self
                 .tokens
-                .saturating_add(now.get().saturating_sub(at.get()) * u64::from(per_second))
+                .saturating_add(
+                    now.get()
+                        .saturating_sub(at.get())
+                        .saturating_mul(u64::from(per_second)),
+                )
                 .min(full),
         };
         self.counted_at = Some(now);

@@ -23,8 +23,7 @@ use tokio::time::{timeout, timeout_at};
 use crate::budget::{Budget, BudgetError, Opens};
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
 use crate::frames::{
-    ControlStream, FrameError, KIND_PEER_EVIDENCE, PEER_EVIDENCE_VERSION, read_frame,
-    read_frame_within,
+    ControlStream, FrameError, KIND_PEER_EVIDENCE, PEER_EVIDENCE_VERSION, read_frame_within,
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
@@ -1554,7 +1553,17 @@ impl Transport {
         .await
         .map_err(|_| RequestError::Timeout)??;
         let left = until.saturating_duration_since(tokio::time::Instant::now());
-        match read_frame(&mut recv, left, true).await {
+        // The answer is a frame being received like any other (Codex
+        // review): many small questions must not each hold a class-limit
+        // answer outside the receive budget.
+        match read_frame_within(
+            &mut recv,
+            left,
+            true,
+            Some((&self.shared.receive_budget, lane)),
+        )
+        .await
+        {
             Ok(answer) => Ok(answer),
             Err(FrameError::Timeout) => Err(RequestError::Timeout),
             Err(FrameError::Wire(e)) => Err(RequestError::Malformed(format!("{e:?}"))),
