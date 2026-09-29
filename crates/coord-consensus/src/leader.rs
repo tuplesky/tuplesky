@@ -46,7 +46,7 @@ use crate::rows::{
 };
 use crate::speculation::{ReleaseGate, Speculation, SpeculationRequest, TentativeOutcome};
 use crate::summary::DurableLedger;
-use crate::vote::{FastAck, Vote, VoteError, VoteSet};
+use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
 
 /// The single conservative conflict key: every command in a domain
 /// conflicts with every other (design Section 3, reference contract).
@@ -166,6 +166,10 @@ pub struct Proposal {
     pub updates: Vec<StoreUpdate>,
     /// Persistence attempts made for this proposal.
     pub attempts: u32,
+    /// Whether the batch writes the leader's acceptance too: a
+    /// re-proposal carries its ACCEPT row in the proposal batch, a fresh
+    /// proposal writes it once the dependency guard passes (task-d19).
+    pub accepts: bool,
     /// Whether this command has executed.
     ///
     /// Recorded here rather than read from the command table, because
@@ -259,6 +263,21 @@ pub struct Leader {
     /// offer it to the submitter again (task-c02). Never recovered: the
     /// outbox it went through is this boot's.
     replay: crate::replay::EvidenceStore,
+    /// The batches carrying this leader's acceptance of a command, until
+    /// they are durable: each is then its own adoption, counted like a
+    /// follower's (task-d19).
+    own_adoptions: BTreeMap<BarrierId, OwnAdoption>,
+}
+
+/// This leader's adoption of its own order, published and waiting on the
+/// batch carrying its acceptance row (task-d19).
+#[derive(Clone, Debug)]
+struct OwnAdoption {
+    command: CommandId,
+    vote: Vote,
+    /// The barriers its publication required: if one of them fails, the
+    /// outbox drops the publication and it is made again.
+    requires: Vec<BarrierId>,
 }
 
 impl Leader {
@@ -320,6 +339,7 @@ impl Leader {
             rejections: Vec::new(),
             fenced: None,
             recovery_cycle: None,
+            own_adoptions: BTreeMap::new(),
         }
     }
 
@@ -397,6 +417,7 @@ impl Leader {
             votes: BTreeMap::new(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
+            own_adoptions: BTreeMap::new(),
             payloads: state.payloads,
             served_payloads: state.served_payloads,
             ledger: state.ledger,
@@ -639,9 +660,13 @@ impl Leader {
                 durable: false,
                 updates: updates.clone(),
                 attempts: 1,
+                accepts: true,
                 executed: false,
             },
         );
+        // The row is ACCEPT at this ballot (or a decision): once it is
+        // durable, it is this leader's adoption of its own order.
+        self.adopt_own(command, barrier);
         alloc::vec![Effect::Persist(PersistBatch {
             barrier,
             base: None,
@@ -723,15 +748,17 @@ impl Leader {
             {
                 let p = &self.proposals[command];
                 let frame = self.proposal_frame(p);
+                let to = PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                };
                 sends.push(PendingSend {
                     context,
                     requires: alloc::vec![p.barrier],
-                    to: PeerId {
-                        replica: *voter,
-                        incarnation: ReplicaIncarnation::ZERO,
-                    },
+                    to,
                     frame,
                 });
+                sends.extend(self.own_adoption_send(*command, to));
             }
         }
         if sends.is_empty() {
@@ -742,6 +769,30 @@ impl Leader {
             outbox.publish(send);
         }
         self.release()
+    }
+
+    /// This leader's adoption of `command`, to be sent to `to` again beside
+    /// its proposal, once it has counted it: a voter the first send
+    /// missed would otherwise lack the leader's copy of the slow majority
+    /// (task-d19). Sent as it was first published, context and barriers
+    /// included.
+    fn own_adoption_send(&self, command: CommandId, to: PeerId) -> Option<PendingSend> {
+        let me = self.config.identity.replica;
+        if !self.votes.get(&command).is_some_and(|v| v.adopted_by(&me)) {
+            return None;
+        }
+        self.replay.kept(&command).iter().find_map(|e| {
+            matches!(
+                ProtocolMessage::decode(&e.frame),
+                Ok(ProtocolMessage::SlowAck(ref ack)) if ack.replica == me
+            )
+            .then(|| PendingSend {
+                context: e.context,
+                requires: e.requires.clone(),
+                to,
+                frame: e.frame.clone(),
+            })
+        })
     }
 
     /// The proposal frame for `p`, as it was first published.
@@ -776,19 +827,23 @@ impl Leader {
             return Vec::new();
         }
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let to = PeerId {
+            replica: to,
+            incarnation: ReplicaIncarnation::ZERO,
+        };
         let sends: Vec<PendingSend> = commands
             .iter()
             .filter_map(|c| self.proposals.get(c))
             .filter(|p| p.durable)
             .take(crate::messages::MAX_PROPOSAL_ASK)
-            .map(|p| PendingSend {
-                context,
-                requires: alloc::vec![p.barrier],
-                to: PeerId {
-                    replica: to,
-                    incarnation: ReplicaIncarnation::ZERO,
-                },
-                frame: self.proposal_frame(p),
+            .flat_map(|p| {
+                core::iter::once(PendingSend {
+                    context,
+                    requires: alloc::vec![p.barrier],
+                    to,
+                    frame: self.proposal_frame(p),
+                })
+                .chain(self.own_adoption_send(p.command, to))
             })
             .collect();
         if sends.is_empty() {
@@ -1534,6 +1589,7 @@ impl Leader {
                 durable: false,
                 updates,
                 attempts: 1,
+                accepts: false,
                 executed: false,
             },
         );
@@ -1548,6 +1604,17 @@ impl Leader {
         // Ledger bookkeeping covers every batch this machine staged, not
         // only the proposal batches: an acceptance row carries its own
         // barrier and is what a recovery report must show.
+        // This leader's acceptance row is durable: it counts as its own
+        // adoption, as a follower's does once its row is (task-d19). A
+        // failed batch adopted nothing.
+        if let Some(barrier) = event.barrier()
+            && let Some(own) = self.own_adoptions.remove(&barrier)
+            && matches!(event, StorageEvent::JournalDurable { .. })
+            && let Some(set) = self.votes.get_mut(&own.command)
+            && let Err(e) = set.add(own.vote)
+        {
+            self.rejections.push(Rejection::Vote(e));
+        }
         if let Some(barrier) = event.barrier() {
             match event {
                 StorageEvent::JournalDurable { journal_seq, .. } => {
@@ -1555,6 +1622,19 @@ impl Leader {
                 }
                 StorageEvent::Failed { .. } => {
                     self.ledger.failed(barrier);
+                    // An adoption that waited on the failed batch as an
+                    // earlier one was dropped with it; its own batch may
+                    // still be written, so it is published again over what
+                    // is in flight now.
+                    let dropped: Vec<(BarrierId, CommandId)> = self
+                        .own_adoptions
+                        .iter()
+                        .filter(|(_, own)| own.requires.contains(&barrier))
+                        .map(|(b, own)| (*b, own.command))
+                        .collect();
+                    for (own_barrier, command) in dropped {
+                        self.adopt_own(command, own_barrier);
+                    }
                 }
                 _ => {}
             }
@@ -1686,8 +1766,104 @@ impl Leader {
             },
             &self.table,
         );
+        // A re-proposal's batch is also its acceptance: the adoption rests
+        // on the new batch now, and the one on the rejected batch was
+        // dropped with it.
+        let accepts = self.proposals.get(&command).is_some_and(|p| p.accepts);
+        self.own_adoptions.retain(|_, own| own.command != command);
+        if accepts {
+            self.adopt_own(command, barrier);
+        }
         self.rejections.push(Rejection::ProposalRetried(command));
         alloc::vec![Effect::Persist(batch)]
+    }
+
+    /// Publish this leader's adoption of its own order for `command`, to
+    /// the voters and the frontend, once `barrier` -- the batch carrying
+    /// its acceptance row -- and every batch submitted before it are
+    /// durable (task-d19; design Section 4.8). It is kept for re-offer
+    /// beside the leader's reply, and counted in the leader's own vote set
+    /// when the batch is durable.
+    ///
+    /// The proposal is not an acceptance: its row is PRE-ACCEPT, and a
+    /// crash that loses the acceptance batch leaves a restarted leader
+    /// reporting PRE-ACCEPT. Counting the leader for its proposal made a
+    /// slow majority that a recovering majority could miss entirely.
+    fn adopt_own(&mut self, command: CommandId, barrier: BarrierId) {
+        let (Some(boot), Some(admission)) = (
+            self.boot,
+            self.proposals
+                .get(&command)
+                .map(|p| p.admission)
+                .or_else(|| self.table.record(&command).and_then(|r| r.payload)),
+        ) else {
+            return;
+        };
+        let ballot = self.config.quorum.ballot();
+        let ack = SlowAck {
+            replica: self.config.identity.replica,
+            ballot,
+            command,
+            admission,
+        };
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        // Batches may complete in any order: the acknowledgement waits on
+        // every batch submitted before its own, not on its own alone.
+        let requires: Vec<BarrierId> = self
+            .proposals
+            .values()
+            .filter(|p| !p.durable)
+            .map(|p| p.barrier)
+            .chain(self.own_adoptions.keys().copied())
+            .chain(self.ledger.in_flight())
+            .filter(|b| !self.outbox.as_ref().is_some_and(|o| o.is_failed(b)))
+            .chain(core::iter::once(barrier))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let frame = ProtocolMessage::SlowAck(ack.clone()).encode();
+        let Some(outbox) = self.outbox.as_mut() else {
+            return;
+        };
+        for voter in &self.config.identity.voters {
+            if *voter == self.config.identity.replica {
+                continue;
+            }
+            outbox.publish(PendingSend {
+                context,
+                requires: requires.clone(),
+                to: PeerId {
+                    replica: *voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: frame.clone(),
+            });
+        }
+        outbox.publish(PendingSend {
+            context,
+            requires: requires.clone(),
+            to: self.config.frontend,
+            frame: frame.clone(),
+        });
+        self.replay.retain(
+            command,
+            crate::replay::RetainedEvidence {
+                barrier,
+                ballot,
+                context,
+                requires: requires.clone(),
+                frame,
+            },
+            &self.table,
+        );
+        self.own_adoptions.insert(
+            barrier,
+            OwnAdoption {
+                command,
+                vote: Vote::Slow(ack),
+                requires,
+            },
+        );
     }
 
     /// Adopt the leader's own order for every durable proposal whose
@@ -1731,6 +1907,7 @@ impl Leader {
                             dependency_update(epoch, &command, &record).expect("bounded")
                         ],
                     }));
+                    self.adopt_own(command, barrier);
                 }
             }
             if !progressed {
