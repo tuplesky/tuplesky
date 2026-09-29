@@ -5842,6 +5842,44 @@ fn a_late_voter_whose_sync_was_lost_is_sent_it_again() {
     assert_eq!(cluster.nodes[2].executed, vec![a, y]);
 }
 
+/// task-d33: a voter that promised during the campaign, whose Sync was
+/// lost, is asked again and sent the Sync again. The leader used to seed
+/// its followers with every voter the campaign heard from: nothing asked
+/// this one again, and it held every proposal of the ballot, promised and
+/// never synchronized, until the next election. A voter that installed
+/// the Sync and has nothing to vote on yet ignores the ask, refusing
+/// nothing.
+#[test]
+fn a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.drop_sync = vec![(1, 2)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    let ballots = cluster.nodes[2].follower().ballots();
+    assert_eq!(ballots.promised(), b1, "r2 promised during the campaign");
+    assert_ne!(ballots.synced(), b1, "and its Sync was lost");
+    assert_eq!(cluster.nodes[0].follower().ballots().synced(), b1);
+    cluster.drop_sync.clear();
+    cluster.settle_resending(2);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    for i in [0, 2] {
+        let refused = cluster.nodes[i].follower_mut().take_rejections();
+        assert!(
+            !refused
+                .iter()
+                .any(|e| matches!(e, FollowerRejection::Promise(_))),
+            "r{i} refused the leader's ask: {refused:?}"
+        );
+    }
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
 /// task-d33: a voter's own campaign for a ballot it no longer holds is
 /// dropped when it promises another voter's higher one. Kept, it stood
 /// in for a campaign in progress, and a voter holding one takes no

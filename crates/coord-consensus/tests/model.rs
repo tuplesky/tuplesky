@@ -1442,6 +1442,52 @@ fn a_candidate_whose_member_forgot_an_at_source_command_it_ordered_first_is_kept
     assert!(decision.reproposed.contains(&x));
 }
 
+/// A command adopted after a candidate that follows another candidate is
+/// ordered after both by the selection (#130 review). The selection's
+/// order was read through the adopted entries alone: a, adopted after y,
+/// was not seen to follow x through y, so x was judged against a as if
+/// the selection placed a before it, and dropped with y after it.
+///
+/// r1, in ballot 0's fast set, pre-accepted x after w and y after x; r2
+/// accepted a after y.
+#[test]
+fn a_command_adopted_after_a_candidate_follows_what_that_candidate_follows() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (w, x, y, a) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(w, Phase::Commit, &[]),
+                pre_accept_with(x, &[w], 5),
+                pre_accept_with(y, &[x], 6),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(w, Phase::Commit, &[]), entry(a, Phase::Accept, &[y])],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![w]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert_eq!(
+        decision.entries.get(&y).map(|e| e.deps.clone()),
+        Some(vec![x]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(decision.reproposed.is_empty(), "{:?}", decision.reproposed);
+}
+
 /// The same check does not drop a candidate for a decision of an earlier
 /// ballot its member executed and forgot (task-d34).
 #[test]
