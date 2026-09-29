@@ -6447,6 +6447,18 @@ ended the process in the middle of an election.
   - A follower sent such a Sync refuses it as
     `FollowerRejection::SyncTooLarge` before marking anything. A
     candidate of this build never binds one.
+  - A Sync that fits its frame but not its row is reported with the
+    row's size.
+- **Nothing installs while a marker is in flight** (review). Between a
+  Sync's marker being issued, with the demotions computed then, and its
+  durability, a payload for an older Sync's entry that the new one left
+  out installed that entry at ACCEPT, journaled after the marker and
+  never demoted. The next report named it at ACCEPT at the new ballot,
+  and the acceptance guard kept it as decided. `advance_sync` now
+  installs nothing while `sync_barrier` is set; activation replaces what
+  is pending, so nothing is lost. Test:
+  `a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing`
+  (`activation`), which fails without the change.
 
 Nothing changes in what is selected, or in the Sync format.
 

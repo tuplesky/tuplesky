@@ -4833,3 +4833,108 @@ fn a_deposed_leader_keeps_its_selection_for_what_it_never_proposed() {
     assert_eq!((e.phase, e.deps.clone()), (Phase::Accept, vec![]), "{e:?}");
     assert!(!e.payload_present, "{e:?}");
 }
+
+/// task-d20 review: nothing installs while a newer Sync's marker is still
+/// becoming durable.
+///
+/// b1's Sync left z pending, its payload not here yet. b2's Sync leaves z
+/// out, and its marker's demotions were computed when it was issued. z's
+/// payload arrived before the marker was durable and installed z at
+/// ACCEPT from b1's entry, journaled after the marker and never demoted:
+/// the next report named it at ACCEPT at b2, which the acceptance guard
+/// keeps as decided.
+#[test]
+fn a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing() {
+    let (b1, b2) = (ballot(1, 2), ballot(2, 0));
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let older = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    drive_durable(&mut f, peer_event(r(2), ProtocolMessage::Sync(older)));
+    assert_eq!(f.ballots().synced(), b1);
+    drive_durable(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b2,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let newer = SyncDecision {
+        ballot: b2,
+        source_ballot: b1,
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(0), ProtocolMessage::Sync(newer)));
+    // z's payload arrives from a peer while the marker is in flight.
+    let installs = f.step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: z,
+            payload: payload_record(admit_z),
+        },
+    ));
+    for e in durable_events(&marker) {
+        let more = f.step(e);
+        for e in durable_events(&more) {
+            f.step(e);
+        }
+    }
+    for e in durable_events(&installs) {
+        let more = f.step(e);
+        for e in durable_events(&more) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b2);
+    let report = f.report(ballot(3, 0));
+    let entry = report.entries.iter().find(|e| e.command == z);
+    assert!(
+        entry.is_none_or(|e| e.phase < Phase::Accept),
+        "b1's entry installed at b2: {entry:?}"
+    );
+}
+
+/// The payload row a replica writes for the admission `admit`.
+fn payload_record(admit: Event) -> coord_consensus::PayloadRecordV1 {
+    let mut other = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    other.step(boot_event(1));
+    other
+        .step(admit)
+        .iter()
+        .find_map(|e| match e {
+            Effect::Persist(b) => b.updates.iter().find_map(|u| {
+                (u.collection == Collection::PayloadV1.id())
+                    .then(|| coord_consensus::decode_payload(u.value.as_ref()?).ok())
+                    .flatten()
+            }),
+            _ => None,
+        })
+        .expect("the admission writes its payload row")
+}
+
+/// Step `event`, then everything it persisted as durable, until nothing
+/// more is persisted.
+fn drive_durable(f: &mut Follower, event: Event) {
+    let mut effects = f.step(event);
+    loop {
+        let events = durable_events(&effects);
+        if events.is_empty() {
+            return;
+        }
+        effects = events.into_iter().flat_map(|e| f.step(e)).collect();
+    }
+}

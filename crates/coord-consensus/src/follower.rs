@@ -1356,11 +1356,19 @@ impl Follower {
     fn advance_sync(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         loop {
+            // Nothing installs while a Sync's marker is not durable. Its
+            // demotions were computed when the marker was issued, so an
+            // older Sync's entry installed now, from a payload arriving
+            // in the window, would be journaled after the marker and
+            // undemoted: an acceptance the next report names at the new
+            // ballot, which the guard keeps as decided (task-d20 review).
+            // Activation replaces what is pending anyway.
             let ready: Vec<CommandId> = self
                 .sync_pending
                 .iter()
                 .filter(|(c, e)| {
-                    self.table.phase_of(c).is_some()
+                    self.sync_barrier.is_none()
+                        && self.table.phase_of(c).is_some()
                         && !self.awaits_selected_facts(c)
                         && crate::phase::guard_accept(&e.deps, |d| self.table.phase_of(d)).is_ok()
                 })
