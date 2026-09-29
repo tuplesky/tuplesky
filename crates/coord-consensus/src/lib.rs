@@ -155,7 +155,7 @@ pub use follower::{
 };
 pub use graph::{
     Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, demoted_path,
-    empty_path,
+    empty_path, reordered_path,
 };
 pub use handoff::{
     ActivationCertificate, CancellationCertificate, Evidence, HandoffError, InstallRecord,
