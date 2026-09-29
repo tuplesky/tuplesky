@@ -7526,8 +7526,13 @@ store as the protocol's and the application's.
   outcomes were thrown away, so a vote or promise made durable there
   never released the send waiting on it, until a new ballot or a
   restart. The applier now keeps those facts (`Applier::take_foreign`),
-  and the node hands them to the outbox and the machine before the
-  command's own outcome, then releases what they made durable.
+  and the node hands them to the outbox and the machine right after the
+  command's own outcome, then releases what they made durable. After,
+  not before: delivered ahead of the outcome, under load a lagging
+  voter's callers went unanswered in
+  `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+  (18 of 24 runs, four at a time on four cores, against 3 of 16 on the
+  base and 4 of 24 with them delivered after).
 - **An uncertain append waited for a command.** The node surfaced an
   indeterminate lowering as a failed round and never reconciled it. The
   domain then refused every protocol batch as not ready, and only the

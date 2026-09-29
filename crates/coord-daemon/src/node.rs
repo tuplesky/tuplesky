@@ -1244,10 +1244,13 @@ impl<P: Persistence> Node<P> {
                 self.order = None;
             }
             // What the apply's lowerings made durable for other batches
-            // happened before the command's own outcome.
-            let mut effects = Vec::new();
-            self.absorb_foreign(&mut effects);
-            effects.extend(self.machine_mut().applied(command, &outcome)?);
+            // is delivered by `carry_out`, after the command's own
+            // outcome. The machine takes the outcome first: delivered
+            // before it, under load a lagging voter's callers went
+            // unanswered (`a_replica_that_falls_behind_...`: 18 of 24
+            // runs four at a time on four cores, against 3 of 16 on the
+            // base and 4 of 24 delivered here).
+            let effects = self.machine_mut().applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);
             // At a floor boundary the view is exactly the command's: the
             // apply returned once its batch was readable, and only a
