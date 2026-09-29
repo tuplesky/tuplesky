@@ -65,7 +65,10 @@ node. `coord-harness up` initializes each node's first generation and starts
 every committed voter, waiting until each one is actually serving. It
 initializes a node once: a node it initialized whose `state` directory is
 gone is refused, never initialized again as an empty voter under the same
-identity (design Section 5.4, task-d29). The
+identity (design Section 5.4, task-d29). A voter run from a copied bundle
+(`coord-harness start`) is initialized only when the operator passes `--init`,
+because a bundle copied again after a host lost it carries no evidence that
+it ran. The
 daemons run the production startup checks against this material, so a harness
 bug shows up as a harness bug rather than as a result. With `--hosts` it
 provisions the same domain for voters on separate hosts instead; that

@@ -149,14 +149,22 @@ constrain this.
 
 ## 6. Start the voters
 
-On each voter host, with `N` its voter number:
+On each voter host, with `N` its voter number, the first time:
 
 ```text
-coord-harness start --dir /opt/tuplesky --node N --coordd /usr/local/bin/coordd
+coord-harness start --dir /opt/tuplesky --node N --coordd /usr/local/bin/coordd --init
 ```
 
-`start` runs `coordd init` from the bundle if it has no store yet (and never
-otherwise), starts `coordd` from the bundle directory, waits for it to report
+`--init` runs `coordd init` from the bundle, once. Give it only for a voter
+that has never run. Without it, `start` refuses a bundle with no store and runs
+nothing. That covers a bundle copied again after its host lost the first copy:
+it looks exactly like a fresh one, and initializing it would start an empty
+voter under an identity that has already voted. Such a voter comes back through
+membership as a learner with a new generation (design Section 5.4), not by
+running `--init` again. A voter that was initialized is refused `--init` all
+the same while its mark is still there.
+
+`start` then starts `coordd` from the bundle directory, waits for it to report
 `coordd phase=live`, prints
 
 ```text
@@ -276,13 +284,13 @@ Requests keep being served by the remaining two. Wait for both lines before
 restarting it: until then a survivor may still hold the peer link it dialled
 to the killed process, and the restarted voter's own dials lose to that link
 until it idles out, so it rejoins the peer plane up to thirty seconds late.
-Restart it exactly as it was started:
+Restart it as it was started, without `--init`:
 
 ```text
 coord-harness start --dir /opt/tuplesky --node 3 --coordd /usr/local/bin/coordd
 ```
 
-It recovers from its own store (`init` is skipped), dials the others itself,
+It recovers from its own store, dials the others itself,
 and the survivors dial it again on their re-dial timer (task-d03; the ceiling
 between attempts is ten seconds). Within seconds of its `node-ready` line every
 voter reports the full mesh of step 7 again, and requests through Kine and

@@ -461,7 +461,10 @@ whose state is gone is not a voter that restarted: it may have voted, and
 an empty voter under the same identity could vote otherwise. It comes
 back only through Section 5.4, and the certification harness refuses to
 initialize over it: a node directory it initialized carries a marker, and
-a marker without state is `StateLost`, not a fresh node.
+a marker without state is `StateLost`, not a fresh node. A voter run from a
+copied bundle is never initialized by a start: a bundle copied again after
+its host lost it has neither state nor marker, so only the operator's
+explicit `--init` for a voter that never ran initializes one.
 
 **Obligations.** Each has one owner, the event that makes the owner act,
 and what the owner does when acting does not discharge it. The last

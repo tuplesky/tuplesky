@@ -7172,3 +7172,15 @@ section ends with the conditional argument for why the work completes.
     working.
   - `a_voter_whose_state_is_gone_is_refused_not_initialized_again`
     drives it with a stand-in `coordd`.
+  - The marker lives in the node's bundle, so it goes when the whole
+    bundle does. A bundle copied again from the provisioning host then
+    has neither state nor marker, exactly like one that never ran, and
+    `coord-harness start` initialized it (Codex review on #129). A start
+    now never initializes: `resume_node` refuses a voter without state as
+    `RunError::NotInitialized` and runs nothing, and only
+    `coord-harness start --init`, which the runbook reserves for a voter's
+    first start, runs `initialize_node`. The harness cannot tell the two
+    bundles apart, so the operator's intent is the evidence, as with
+    `coordd init` itself. `a_start_never_initializes_a_voter_without_state`
+    covers the refusal. `multi-host-local.sh` and the `multi_host` tests
+    start each voter with `--init` once and restart it without.
