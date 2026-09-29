@@ -62,7 +62,10 @@ one certificate authority, per-node voter and collector credentials, a
 genesis manifest that commits the key each node will present, one signed
 endpoint catalog, the issuer's published keys, and a strict `coordd.toml` per
 node. `coord-harness up` initializes each node's first generation and starts
-every committed voter, waiting until each one is actually serving. The
+every committed voter, waiting until each one is actually serving. It
+initializes a node once: a node it initialized whose `state` directory is
+gone is refused, never initialized again as an empty voter under the same
+identity (design Section 5.4, task-d29). The
 daemons run the production startup checks against this material, so a harness
 bug shows up as a harness bug rather than as a result. With `--hosts` it
 provisions the same domain for voters on separate hosts instead; that
