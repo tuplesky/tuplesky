@@ -658,6 +658,31 @@ fn possible_fast_decisions(
         }
         seen
     };
+    // The same closure, followed through what the selection holds by the
+    // dependencies the selection gives it. It is what the member's order
+    // says the selection executes before a command. The member's record
+    // of a command the selection holds can be stale -- a pre-acceptance
+    // the command was since decided past, under other dependencies -- and
+    // the order it gives never executes (task-d33, protocol_sim row 10,
+    // five voters, seed 67): read through it, an adopted command passed as
+    // ordered before the candidate while the selection ordered both after
+    // the same command. The member's own closure stays the evidence of its
+    // path (`prefix_decided`).
+    let executed_closure = |m: &RecoveryReport, c: &CommandId| -> BTreeSet<CommandId> {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<CommandId> = record(m, c).map(|e| e.deps.clone()).unwrap_or_default();
+        while let Some(d) = stack.pop() {
+            if !seen.insert(d) {
+                continue;
+            }
+            if let Some(e) = entries.get(&d) {
+                stack.extend(e.deps.iter().copied());
+            } else if let Some(e) = record(m, &d) {
+                stack.extend(e.deps.iter().copied());
+            }
+        }
+        seen
+    };
     let conflicts = |a: &[Vec<u8>], b: &[Vec<u8>]| a.iter().any(|k| b.contains(k));
     // Whether the selection orders `x` after `c`: `c` is in `x`'s closure
     // over the dependencies of the selected entries and of the candidates
@@ -755,6 +780,7 @@ fn possible_fast_decisions(
             let (entry, member) = candidates[&c].clone();
             let first = fast_reporters[member];
             let prefix = closure(first, &c);
+            let ordered = executed_closure(first, &c);
             // The commands no ballot decided that `c` follows, which this
             // selection re-proposes: its own dependencies, followed
             // through what the selection keeps, reach them. The
@@ -826,7 +852,7 @@ fn possible_fast_decisions(
                     // executed there before it, so before `c`.
                     Some(a) => {
                         !conflicts(&entry.keys, &a.keys)
-                            || forgotten_before(&candidates, first, &prefix, &adopted.command)
+                            || forgotten_before(&candidates, first, &ordered, &adopted.command)
                     }
                     // A decision of an earlier ballot precedes everything
                     // the source ballot ordered; the member may simply
@@ -838,7 +864,9 @@ fn possible_fast_decisions(
                     // was decided after it. The member executed and
                     // retired it, and an ancestor it held is no evidence
                     // against the member's path (task-d34, #118 item 5).
-                    None if forgotten_before(&candidates, first, &prefix, &adopted.command) => true,
+                    None if forgotten_before(&candidates, first, &ordered, &adopted.command) => {
+                        true
+                    }
                     // Accepted at the source ballot and before `c` there,
                     // yet absent from the member's records and from what
                     // its order put before `c`: the member's order never
