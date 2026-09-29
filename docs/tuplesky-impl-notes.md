@@ -6442,13 +6442,30 @@ finishes or recovers admitted commands could be refused by a full table.
     from its undecided durable records while its promise is ahead of its
     synchronized ballot. Nothing is admitted or adopted after a promise,
     so those are the records the report named.
-- **Not yet: the path log.** A released command stays in its keys' path
-  logs, so the next command's path is hashed through it and this voter's
-  fast acknowledgements disagree with the other voters' for that key.
-  The fix (take it out and recompute the head) is written. It makes those
-  acknowledgements agree, so more fast decisions form, and the protocol
-  simulator then reaches the open fast-path recovery gap of #116/#118
-  (row 2, three voters, seed 2). It lands with that fix.
+- **The path log.** A released command left its keys' path logs too
+  (Codex review). Kept, the next command's path was hashed through it,
+  so this voter's fast acknowledgements disagreed with the other voters'
+  for that key, and repeated releases grew the log. `PathLog::remove`
+  takes it out and recomputes the head. Test:
+  `a_released_command_leaves_the_path_log`, which fails without the
+  removal.
+  - It was held until #116's leader adoption and #118's path-log
+    alignment (F7) landed: with the voters' acknowledgements agreeing
+    again, the simulator reached the fast-path gap those close. With
+    both merged, the default seeds pass.
+  - At 100 seeds per row and size, 2 of 1,000 runs fail on this branch
+    with or without the removal: row 2 (three voters, seed 45) and
+    row 10 (three voters, seed 58), an execution-order divergence. The
+    branch below passes all 1,000.
+  - Seed 45, traced: the leader of b7 selected ab51 at ACCEPT without
+    holding its payload. `Leader::repropose` skips a placeholder, and
+    the leader ignores `PayloadResponse`, so it never wrote the ACCEPT
+    row. Deposed, it became a follower that did not carry its own Sync.
+    When the payload arrived it pre-accepted ab51 afresh, reported that
+    PRE-ACCEPT at the source ballot, and the next selection re-proposed
+    a command another voter had executed.
+  - That is the role change, not the release: the next change carries a
+    deposed leader's uninstalled Sync entries into its follower.
 - **The argument.** The Sync is selected from a majority's reports, and
   selection keeps every command a quorum of an earlier ballot could have
   decided (at five voters only with task-d19). So a command it leaves out
