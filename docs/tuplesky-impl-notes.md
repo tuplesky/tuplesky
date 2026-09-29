@@ -7471,13 +7471,20 @@ After every step, every limit of the resource contract (design Section
 `max_report_entries` is the report bound of task-d20.
 
 - **Table.**
-  - Records never exceed capacity less the recovery reserve (task-d24),
-    plus one Sync's worth of entries that enter a full table.
+  - Records never exceed capacity plus the most entries (and
+    re-proposals) of any one Sync the node was given, its own selection
+    included, plus the most commands of any one catch-up page it was
+    given: both enter a full table. The most is kept across restarts:
+    the table reloads the rows earlier recovery work wrote, while the
+    Sync row that brought them may have gone. The bound used to be five reports' worth of
+    entries, eleven times the capacity, which caught nothing short of a
+    runaway (#131 review).
   - A fresh admission never lands past the reserve.
   - Tombstones never exceed capacity plus the conservative keys.
 - **Ledger and bindings.** Durable records and retry-key bindings never
-  exceed six tables: the history sweep's bound (task-d26), with the
-  sweep's own margin.
+  exceed six tables. The history sweep (task-d26) runs once they pass
+  four; the peak is those four, the live table, and the retirement
+  window the sweep goes down to.
 - **Held proposals.** Never more than `HELD_PROPOSAL_SLACK` tables.
 - **Campaigns.**
   - Report pages held never exceed what the promising voters' reports
@@ -7492,7 +7499,9 @@ After every step, every limit of the resource contract (design Section
 - **Frames and journal records.** A frame is at most 4 MiB. A journal
   record is at most 4,096 updates and 4 MiB, counted as the journal
   admits a batch: sixteen bytes more per update, 64 per batch and 512 for
-  the record's header.
+  the record's header. At capacity 32 with one-byte keys neither bound is
+  approached: both checks are vacuous at this scale, and there for a
+  larger one.
 
 ### The progress oracle
 
@@ -7506,11 +7515,22 @@ After the fault schedule, the faults stop and admission pauses:
 - the donor rule and pacer of catch-up are `coordd`'s.
 
 The domain then runs in synchronous rounds, and has 400 of them to reach a
-leader, with every admitted command settled and every voter at the same
-execution position with nothing left it could execute.
-- **Settled** is the collector's notion: learned from the evidence, answered
-  from a record of its execution, or refused for another command bound
-  under its retry key that executed.
+leader, with every admitted command settled, every decision the frontend
+learned or a voter executed in the one order, and every voter at the same
+execution position with nothing left it could execute. A decision learned
+from a durable majority that the next selection dropped fails the second.
+- **Settled** is what the collector can answer, from what it received:
+  - the decision, learned from the evidence; or
+  - the record of its own node, once the entry is one only the record
+    answers. It becomes one when the collector asks for it again, or a
+    voter refuses it as `Forgotten` or as bound to another command, as
+    `Collector::half_established` has it. `coordd` then settles it from
+    its node's executed rows, or as a conflict when those rows bind the key
+    to another command that executed.
+  Each command's collector is on the node that took the caller's request.
+  What the simulator knows another node executed answers nothing (#131
+  review: it used to count, so a voter that ignored or wrongly refused a
+  re-offer would have passed).
 - **Re-offers.** Every eight rounds the frontend offers what has not
   settled again (Section 5.5, O1).
 - **Campaigns.** A campaign that a majority holds, whose promisers
@@ -7540,6 +7560,10 @@ execution position with nothing left it could execute.
 
 Each runs at three and five voters, beside task-d30's rows 1 to 4 and 10.
 
+Healing restarts every node; a leader it takes down is not counted as a
+leader crash of the schedule's, so row 1's check that its schedule
+crashed a leader still means something.
+
 ### What the oracles catch
 
 Each of the four earlier fixes the task names was taken out, and the rows
@@ -7555,6 +7579,12 @@ run at their default seeds:
 Before the page loss while healing, taking out task-d28's re-ask was
 caught by no row: healing starts no campaign that has lost a page, and
 the campaigns of the faulty phase were superseded before the ceiling.
+
+Counting only what the collector received also found a safety bug. Once
+executed commands it had not answered were re-offered, row 14 at three
+voters, seed 0, had a leader take one of them again as new work. The
+leader had retired it inside the window with its key left unbound. The
+fix, `CommandTable::retired`, is in the findings change.
 
 ### Diagnostics
 
