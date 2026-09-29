@@ -6493,8 +6493,19 @@ finishes or recovers admitted commands could be refused by a full table.
     When the payload arrived it pre-accepted ab51 afresh, reported that
     PRE-ACCEPT at the source ballot, and the next selection re-proposed
     a command another voter had executed.
-  - That is the role change, not the release: the next change carries a
-    deposed leader's uninstalled Sync entries into its follower.
+  - That is the role change, not the release. task-d34 now carries a
+    deposed leader's selection into its follower, and the leader's own
+    report overlays it; seed 45 passes.
+  - Seed 58 still fails, and the cause is not established yet. What is
+    known so far:
+    - r2 reported 9a0f and 65b2 at ACCEPT (b10's selection) for b11 and
+      b16. Its own report for its b17 campaign omits both, and no Sync
+      reached it in between.
+    - b17's selection then kept 0db8 at ACCEPT `<9a0f>` and re-proposed
+      9a0f, chaining a95c after it with `<9a0f>` as well. The order forks
+      at 9a0f.
+    - Ruled out: a release, a ledger removal, and a forgotten placeholder
+      of 9a0f.
 - **The argument.** The Sync is selected from a majority's reports, and
   selection keeps every command a quorum of an earlier ballot could have
   decided (at five voters only with task-d19). So a command it leaves out
