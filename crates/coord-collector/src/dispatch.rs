@@ -181,13 +181,16 @@ impl Dispatcher {
         match message {
             MessageV1::Request(request) => {
                 let key = request.retry_key;
-                let admitted = match self.admission.admit(now_ticks, caller, &request) {
+                let admitted = match self.admission.admit_at(now_ticks, now, caller, &request) {
                     Ok(a) => a,
                     Err(refusal) => {
                         let (code, detail) = match refusal {
                             AdmissionRefusal::Malformed => (codes::MALFORMED_REQUEST, "malformed"),
                             AdmissionRefusal::SessionBusy { .. } => {
                                 (codes::BACKPRESSURE, "session busy")
+                            }
+                            AdmissionRefusal::RateLimited { .. } => {
+                                (codes::BACKPRESSURE, "admission rate")
                             }
                             AdmissionRefusal::RequestTooLarge { .. } => {
                                 (codes::REQUEST_TOO_LARGE, "request too large")

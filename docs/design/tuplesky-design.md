@@ -1087,6 +1087,39 @@ Audit accepted/rejected policy, session, enrollment, membership, compaction and 
 
 At-rest encrypted volumes and scoped access protect files/checkpoints/backups. Voters, collectors and observers see role-required data; no operator-blind encryption claim. A domain's scalar revision can disclose aggregate activity across namespaces; independent domains avoid a fleet-wide counter side channel. Protocol/data feature activation is replicated after compatible binaries; unsupported versions fail explicitly. Upgrades retain recovery and rollback rules.
 
+<a id="s13-1"></a>
+### 13.1 Resource contract
+
+Every resource a node holds for a domain has a stated limit, and the limit belongs to one class: memory, durable protocol data, application data, a single message, a queue, or temporary files. The configuration names the operator-set ones (`limits.*`); the rest are build constants, and those that decide a replicated result are schema. Limits hold at the peak, not in the steady state: a structure built from another counts at its size beside it while both exist. The contract below is what a test drives past its limit (task-d26); what is not yet bounded is named at the end.
+
+| Class | Resource | Limit |
+|---|---|---|
+| Memory | Command table | `limits.command_table_capacity` records (32 to 1,000), an eighth of them reserved for recovery and catch-up; retired tombstones up to the capacity plus each key's latest command |
+| Memory | Held proposals (follower) | 8 × capacity |
+| Memory | Ledger, payloads, votes, adoptions, retry-key bindings | the live and recently retired commands, swept once they pass 4 × capacity; a binding goes with its command, and a boot restores none for a forgotten one |
+| Memory | Sync being installed | the Sync's entries, at most 5 × `max_report_entries(capacity)`; installation examines an entry once per change to what it waits on, so it costs time linear in entries and edges |
+| Memory | Candidate reports | per reporter, `ceil(2 × capacity / 256) + 1` pages of 256 entries; the complete reports are assembled, a copy of every entry, only once a majority could be complete, so at most `voters - majority + 1` times per campaign |
+| Memory | Sync binding | the selection and one encoding of it; the frame size is counted from that encoding |
+| Memory | Catch-up window | one page: 64 commands and 1 MiB |
+| Memory | Collector | `limits.max_outstanding_per_session` entries per session, and undelivered bytes of that many requests of `limits.max_request_bytes` plus 128 KiB each |
+| Memory | Transport send | 16 MiB in flight per destination and 64 MiB per node, 2 MiB of each reserved for the control lane |
+| Memory | Transport receive | 64 MiB of frames being received per node, the same control reserve; a frame takes its whole length once its header is in and waits for room before its payload is read |
+| Memory | Executor working set | the view budget (schema: 10,000 rows, 16 MiB of what the command reads) plus one page of stored history (256 rows, 16 MiB) at a time; plan limits (schema): 8 MiB response, 4,096 events per revision, 4,096 deleted keys, 128 lease attachments; speculation 64 commands and 4 MiB |
+| Durable protocol | One row | the store envelope, 2 MiB and 20 KiB; a Sync fits one row and one frame or the campaign is refused by name |
+| Durable protocol | Journal record | 4 MiB and 4,096 updates |
+| Application | Request | `limits.max_request_bytes` (at most 2 MiB); keys 8 KiB, values 1 MiB, 128 transaction operations |
+| Application | Response | 8 MiB (schema); `limits.max_response_bytes` is what this node buffers per subscription and must cover it |
+| Application | Stored history | the revisions above the replicated compaction floor (task-14) |
+| Single message | Frame | per class: API 3 MiB, protocol evidence 4 MiB, watch, observer and collector evidence 8 MiB and 64 KiB, snapshot 1 MiB and 64 KiB, configuration 256 KiB, negotiation and read fence 64 KiB |
+| Queue | Transport lanes | per lane and group: control 256, unary 64, bulk 64, watch 16 frames; 1,024 events per lane to the runtime |
+| Queue | Storage writer | one batch of at most 8 MiB |
+| Temporary files | Checkpoint images | one image being written beside the published one, under a pending name; a crash's leftovers and every superseded image are removed at the next reclaim |
+| Rate | Admission | `limits.max_admitted_per_second` new requests per frontend, a second's worth as a burst; a retry of an outstanding request takes nothing |
+
+The admission rate is bounded below the rate at which a voter catching up executes: a window of up to 64 commands per durable batch (task-d25). A voter returning behind a domain gains on it by the difference, so the time it needs is bounded by its gap divided by that difference; admitted faster than it executes, it never closes the gap. The bound is per frontend, and a domain served by several admits their sum.
+
+Not yet bounded, and owned: the executed-history set (one identity per command executed, which recovery asks about), the tombstones kept for keys no longer written, and every durable row of an executed command grow with history until quorum-safe forgetting trims below its floor (task-d27); disk headroom before a checkpoint is task-d27's too.
+
 <a id="s14"></a>
 ## 14. Evaluation and architectural milestones
 

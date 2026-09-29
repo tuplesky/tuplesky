@@ -384,6 +384,20 @@ pub struct Follower {
     /// report named (task-d24).
     report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
     sync_pending: BTreeMap<CommandId, SyncEntry>,
+    /// The Sync entries not yet installable, under the one command each
+    /// waits on first: its own record or facts, or a dependency below
+    /// ACCEPT (task-d26). A change the table notes for that command
+    /// re-examines them, and nothing else does, so a Sync installs in
+    /// time linear in its entries and edges rather than rescanning every
+    /// pending entry each round.
+    sync_waiters: BTreeMap<CommandId, BTreeSet<CommandId>>,
+    /// Every pending entry is to be examined at the next pass: set when
+    /// the entries were replaced or restored, before any waits on
+    /// anything.
+    sync_rescan: bool,
+    /// How many times a pending Sync entry was examined for
+    /// installation, ever: what installing a Sync cost (task-d26).
+    sync_examined: u64,
     /// The admission digest the synchronized selection named for each of
     /// its entries (task-d14). Kept past installation: a payload that
     /// arrives for an entry installed over a placeholder has to be the
@@ -576,6 +590,9 @@ impl Follower {
             served_report: None,
             report_cut,
             sync_pending: BTreeMap::new(),
+            sync_waiters: BTreeMap::new(),
+            sync_rescan: false,
+            sync_examined: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -615,6 +632,8 @@ impl Follower {
                 self.sync_pending.insert(*c, e.clone());
             }
         }
+        self.sync_rescan = true;
+        self.table.watch_raises(!self.sync_pending.is_empty());
         self.won = None;
         self
     }
@@ -670,13 +689,14 @@ impl Follower {
             if self.table.phase_of(&c).is_none() {
                 continue;
             }
-            self.bindings.insert(p.retry_key, c);
             // History stays swept: `restore_execution` has just forgotten
             // it, and reloading it here would hold a payload per command
-            // ever executed until the next sweep (task-d05).
+            // ever executed until the next sweep (task-d05), and a binding
+            // per command ever executed for good (task-d26).
             if self.table.forgotten(&c) {
                 continue;
             }
+            self.bindings.insert(p.retry_key, c);
             self.payloads.insert(c, p);
             self.served_payloads.insert(c);
         }
@@ -722,6 +742,9 @@ impl Follower {
             served_report: state.served_report,
             report_cut: state.report_cut,
             sync_pending: BTreeMap::new(),
+            sync_waiters: BTreeMap::new(),
+            sync_rescan: false,
+            sync_examined: 0,
             named_facts: BTreeMap::new(),
             halted: None,
             recovery_cycle: None,
@@ -1472,24 +1495,82 @@ impl Follower {
             }
             self.sync_pending.insert(*c, e.clone());
         }
+        self.sync_waiters.clear();
+        self.sync_rescan = true;
+        self.table.watch_raises(!self.sync_pending.is_empty());
+    }
+
+    /// What a pending Sync entry waits on before it can be installed, or
+    /// `None` if it can be installed now: the entry itself while it has
+    /// no record here or awaits the selected facts, else its first
+    /// dependency below ACCEPT.
+    fn sync_blocker(&self, command: &CommandId, entry: &SyncEntry) -> Option<CommandId> {
+        if self.table.phase_of(command).is_none() || self.awaits_selected_facts(command) {
+            return Some(*command);
+        }
+        match crate::phase::guard_accept(&entry.deps, |d| self.table.phase_of(d)) {
+            Ok(()) => None,
+            Err(
+                crate::phase::GuardViolation::DependencyUnknown { dep }
+                | crate::phase::GuardViolation::DependencyNotAccepted { dep }
+                | crate::phase::GuardViolation::DependencyNotCommitted { dep }
+                | crate::phase::GuardViolation::DependencyNotExecuted { dep },
+            ) => Some(dep),
+        }
+    }
+
+    /// The pending Sync entries to examine now: every one after a
+    /// replacement or a restart, else the ones waiting on a command the
+    /// table noted a change for, and each such command's own entry.
+    fn sync_candidates(&mut self) -> BTreeSet<CommandId> {
+        let raised = self.table.take_raised();
+        if core::mem::take(&mut self.sync_rescan) {
+            self.sync_waiters.clear();
+            return self.sync_pending.keys().copied().collect();
+        }
+        let mut out = BTreeSet::new();
+        for command in raised {
+            if let Some(waiting) = self.sync_waiters.remove(&command) {
+                out.extend(waiting);
+            }
+            if self.sync_pending.contains_key(&command) {
+                out.insert(command);
+            }
+        }
+        out
     }
 
     /// Install every Sync entry whose payload is known and whose
     /// dependencies are at least ACCEPT; repeat while progress is made.
+    ///
+    /// Only the entries a change could have made installable are examined
+    /// (task-d26): each entry that cannot be installed yet waits under the
+    /// one command it waits on first, and a change the table notes for
+    /// that command is what brings it back.
     fn advance_sync(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         loop {
-            let ready: Vec<CommandId> = self
-                .sync_pending
-                .iter()
-                .filter(|(c, e)| {
-                    self.table.phase_of(c).is_some()
-                        && !self.awaits_selected_facts(c)
-                        && crate::phase::guard_accept(&e.deps, |d| self.table.phase_of(d)).is_ok()
-                })
-                .map(|(c, _)| *c)
-                .collect();
+            let mut ready = Vec::new();
+            for command in self.sync_candidates() {
+                let Some(entry) = self.sync_pending.get(&command) else {
+                    continue;
+                };
+                self.sync_examined += 1;
+                match self.sync_blocker(&command, entry) {
+                    None => ready.push(command),
+                    Some(blocker) => {
+                        self.sync_waiters
+                            .entry(blocker)
+                            .or_default()
+                            .insert(command);
+                    }
+                }
+            }
             if ready.is_empty() {
+                if self.sync_pending.is_empty() {
+                    self.sync_waiters.clear();
+                    self.table.watch_raises(false);
+                }
                 self.learn();
                 return effects;
             }
@@ -1590,6 +1671,13 @@ impl Follower {
         }
     }
 
+    /// How many times a pending Sync entry was examined for installation
+    /// (task-d26): linear in a Sync's entries and edges, however its
+    /// payloads arrive.
+    pub const fn sync_examinations(&self) -> u64 {
+        self.sync_examined
+    }
+
     /// The command this replica holds two decisions of, if it found one
     /// (task-d14): a Sync, or its own selection, named other admission
     /// facts than it committed or executed the command under. It votes
@@ -1638,6 +1726,12 @@ impl Follower {
     /// The durable ledger (journal-durable records only).
     pub const fn ledger(&self) -> &DurableLedger {
         &self.ledger
+    }
+
+    /// Retry keys bound to a command here (task-d26): the commands still
+    /// live or recently retired, never every key submitted.
+    pub fn bindings_held(&self) -> usize {
+        self.bindings.len()
     }
 
     /// The recovery report for `ballot` from durable state at this cut.
@@ -2489,6 +2583,11 @@ impl Follower {
         // and kept without its payload it would read as a payload still
         // missing.
         self.adopted.retain(|c, _| !table.forgotten(c));
+        // A retry of a forgotten command is refused from the table's
+        // executed answer (`on_request`), so its binding is not needed for
+        // that, and kept it grew with every key ever submitted -- at boot,
+        // with every payload row there is (task-d26).
+        self.bindings.retain(|_, c| !table.forgotten(c));
     }
 
     fn learn(&mut self) {
@@ -3033,6 +3132,12 @@ impl Follower {
                 };
             }
             None => {}
+        }
+        // Executed and forgotten, its binding with it (task-d26): the same
+        // answer as a bound command whose payload went to history.
+        if self.table.forgotten(&command) {
+            self.rejections.push(FollowerRejection::Duplicate(command));
+            return self.refuse(command, SubmissionRefusal::Forgotten);
         }
         // Atomic initialization; the placeholder of an early proposal (if
         // any) becomes the record in this same transition. What is bound

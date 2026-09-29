@@ -444,8 +444,22 @@ impl ReportAssembler {
         Ok(())
     }
 
+    /// The replicas every page of whose report is held, not yet verified
+    /// against the report digest: what [`ReportAssembler::complete`] can
+    /// at most return, found without assembling anything (task-d26).
+    pub fn all_pages_held(&self) -> impl Iterator<Item = &ReplicaId> {
+        self.pages.iter().filter_map(|(replica, pages)| {
+            self.totals
+                .get(replica)
+                .is_some_and(|(total, _, _)| pages.len() == *total as usize)
+                .then_some(replica)
+        })
+    }
+
     /// The complete, verified reports; a replica with any page missing is
-    /// absent and never counts.
+    /// absent and never counts. Each call assembles every complete report
+    /// afresh, a copy of every entry held: a caller asks only once enough
+    /// of them could be complete to act on (task-d26).
     pub fn complete(&self) -> Vec<RecoveryReport> {
         let mut out = Vec::new();
         for (replica, pages) in &self.pages {

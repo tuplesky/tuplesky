@@ -537,6 +537,10 @@ impl Leader {
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.proposals.retain(|c, _| !table.forgotten(c));
         self.votes.retain(|c, _| !table.forgotten(c));
+        // A retry of a forgotten command is refused from the table's
+        // executed answer (`propose`), so its binding is not needed for
+        // that, and kept it grew with every key ever submitted (task-d26).
+        self.bindings.retain(|_, c| !table.forgotten(c));
     }
 
     /// Propose a known command under this ballot with `deps`. With
@@ -945,6 +949,12 @@ impl Leader {
     /// The durable ledger (journal-durable records only).
     pub const fn ledger(&self) -> &DurableLedger {
         &self.ledger
+    }
+
+    /// Retry keys bound to a command here (task-d26): the commands still
+    /// live or recently retired, never every key submitted.
+    pub fn bindings_held(&self) -> usize {
+        self.bindings.len()
     }
 
     /// The recovery report for `ballot` from durable state at this cut.
@@ -1405,6 +1415,12 @@ impl Leader {
                 };
             }
             None => {}
+        }
+        // Executed and forgotten, its binding with it (task-d26): the same
+        // answer as a bound command whose payload went to history.
+        if self.table.forgotten(&command) {
+            self.rejections.push(Rejection::Duplicate(command));
+            return self.refuse(command, SubmissionRefusal::Forgotten);
         }
         // Atomic initialization: admission binding, conservative
         // dependencies, path evidence and index publication in one

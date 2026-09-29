@@ -1027,7 +1027,19 @@ fn the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame() {
         .collect();
     let decision = select(&config, &reports).unwrap();
     assert_eq!(decision.entries.len(), 5 * per_report);
-    bounded_sync_update(epoch, &decision).expect("a worst-case Sync fits one row and one frame");
+    let update = bounded_sync_update(epoch, &decision)
+        .expect("a worst-case Sync fits one row and one frame");
+    // Encoded once, the row is still the record's (task-d26).
+    assert_eq!(
+        update,
+        coord_consensus::sync_update(
+            epoch,
+            &coord_consensus::SyncRecordV1 {
+                decision: decision.clone()
+            }
+        )
+        .unwrap()
+    );
 }
 
 /// task-d20: a selection whose Sync does not fit its row is refused with
@@ -1080,6 +1092,14 @@ fn a_sync_past_its_row_refuses_the_campaign_by_name() {
         }) => {
             assert_eq!(n, entries);
             assert!(bytes > limit, "{bytes} <= {limit}");
+            // The size named is the frame's, counted without encoding it
+            // (task-d26).
+            assert_eq!(
+                bytes,
+                coord_consensus::ProtocolMessage::Sync(decision.clone())
+                    .encode()
+                    .len()
+            );
         }
         other => panic!("{other:?}"),
     }

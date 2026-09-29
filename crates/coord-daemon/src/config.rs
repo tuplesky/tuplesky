@@ -60,10 +60,32 @@ pub struct Limits {
     /// moves that cliff; it does not remove it.
     #[serde(default = "default_command_table_capacity")]
     pub command_table_capacity: usize,
+    /// New requests each frontend admits a second, with a second's worth
+    /// as a burst (task-d26). A retry of a request still outstanding is
+    /// not a new one.
+    ///
+    /// Bounded below the rate at which a voter catching up executes: a
+    /// page of up to 64 commands installed in one batch (task-d25). A
+    /// voter returning behind gains on the domain by the difference, so
+    /// the time it takes to close a gap is bounded by the gap; admitted
+    /// faster than it can execute, it never closes it. The bound is per
+    /// frontend: a domain served by several admits their sum.
+    #[serde(default = "default_max_admitted_per_second")]
+    pub max_admitted_per_second: u32,
 }
 
 const fn default_checkpoint_after() -> u64 {
     4096
+}
+
+/// The admission rate a configuration that names none gets (task-d26):
+/// under a sixth of what catch-up executes at one 64-command window per
+/// durable batch of 10 ms, so one frontend at its bound leaves a
+/// returning voter most of its catch-up rate to gain with.
+pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
+
+const fn default_max_admitted_per_second() -> u32 {
+    DEFAULT_MAX_ADMITTED_PER_SECOND
 }
 
 /// The command table capacity a configuration that names none gets: the
@@ -99,6 +121,7 @@ impl Default for Limits {
             max_live_subscriptions: 4096,
             checkpoint_after_records: default_checkpoint_after(),
             command_table_capacity: default_command_table_capacity(),
+            max_admitted_per_second: default_max_admitted_per_second(),
         }
     }
 }
@@ -763,6 +786,13 @@ impl Config {
                 field: "limits.command_table_capacity",
                 min: MIN_COMMAND_TABLE_CAPACITY as u64,
                 max: MAX_COMMAND_TABLE_CAPACITY as u64,
+            });
+        }
+        if self.limits.max_admitted_per_second == 0 {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.max_admitted_per_second",
+                min: 1,
+                max: u64::from(u32::MAX),
             });
         }
         // Durable state is opened under the name this build implements or
