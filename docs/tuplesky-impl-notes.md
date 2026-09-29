@@ -6090,20 +6090,46 @@ not here:
 - It let an execution outrun earlier journal batches, which `coordd`'s
   single-writer apply does not.
 
-### What is left
+### F7: a path from an order the replica does not hold
 
-- **A fast decision whose only reporting fast-set member recorded the
-  leader's path for commands it had not adopted.** Once the leader's
-  digests are copied into a member's logs, an equal path no longer
-  implies an equal history. The member's durable records for the
-  command's ancestors can keep their own order, and a recovery with the
-  leader absent cannot rebuild the leader's history from them. The rule
-  then refuses the ancestors and, with them, the decided command.
-- This is a design question, not a local fix. Options:
-  - a pre-accepted record takes the leader's dependencies with the
-    leader's path;
-  - fast acknowledgements carry only the member's own path.
-- It is left for review. At 100 seeds per row, fault rates set high
-  (rows 1 to 4 and 10, three and five voters), 14 of 1,000 runs still
-  fail. Traces sampled show this case and further stale-acceptance
-  cases.
+A fast decision failed when its only reporting fast-set member had
+recorded the leader's path for commands it had not adopted:
+- `record_leader_path` ran when a proposal arrived. It aligned the
+  per-key logs to the leader's order while the record kept its own
+  dependencies.
+- A command pre-accepted after that took the leader's path over this
+  replica's own history, so an equal path no longer meant an equal
+  history.
+- With the leader absent, recovery could not rebuild the fast decision's
+  ancestors from the member's records. The rule refused them and, with
+  them, the decided command.
+
+Two options were put to review. vicaya chose the second on #118:
+- The logs follow the leader's order only when the replica takes it as
+  its own: at adoption (`advance_pending`) and at a Sync's installation,
+  which already paired the alignment with `adopt`. Not when a proposal
+  arrives.
+- A fast acknowledgement's path, and a record's reported path, come from
+  those logs only. A fast acknowledgement stays evidence of the replica's
+  own durable history, the principle task-d19 applies to the slow path.
+- The first option, where a pre-accepted record takes the leader's
+  dependencies, needed a durable PRE-ACCEPT rewrite on every arrival and
+  changed what a PRE-ACCEPT record means.
+- The cost is fast-path rate when payloads reach a member in another
+  order than the leader's proposals.
+- The mapping row for `recordLeaderHash` is `[EXT: stricter]`.
+
+Evidence:
+- `a_proposal_that_is_not_adopted_leaves_the_path_log_alone`
+  (`follower`): the leader orders cz, c0, c1. A replica that never held
+  cz pre-accepts c0, takes c0's proposal (held for cz), then pre-accepts
+  c1. c1's path is the one a replica that never saw the proposal
+  computes. It fails with the arrival-time alignment.
+- task-d30's simulator (#119), with task-d19's leader adoption merged:
+  - 40 seeds: every one of 400 runs passes, against 2 failures before
+    this change.
+  - 100 seeds: 2 of 1,000 fail, against 8.
+  - Catch-up at the default seeds: all 120 pass, against 1 failure.
+- Still owed: the fast-path rate before and after on the stress driver,
+  and the two remaining failures at 1,000 runs, root-caused under
+  task-d30.

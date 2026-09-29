@@ -1248,3 +1248,57 @@ fn a_proposal_held_across_a_higher_promise_is_not_accepted_after_it() {
         "acknowledged c2 in the ballot it promised away: {sent:?}"
     );
 }
+
+/// A proposal's arrival does not align this replica's path logs; only
+/// adopting it does (task-d34, F7; vicaya on #118).
+///
+/// The leader ordered cz, c0, c1. r1 never received cz. It pre-accepted
+/// c0 with its own dependencies (none it can see), then took c0's
+/// proposal, which it cannot adopt while cz is unknown. Aligned on
+/// arrival, its log took the leader's anchor for c0, and c1 pre-accepted
+/// next carried the leader's path over r1's own history: an equal path
+/// without cz behind it. With the leader absent, a recovery could not
+/// rebuild the fast decision's ancestors from r1's records, and refused
+/// the decided command. r1's path for c1 is now the one a replica that
+/// never received the proposal computes.
+#[test]
+fn a_proposal_that_is_not_adopted_leaves_the_path_log_alone() {
+    let (_, cz) = admitted(1, 1, 1);
+    let (e0, c0) = admitted(2, 2, 2);
+    let (e1, c1) = admitted(3, 3, 3);
+    let mut leader_view = coord_consensus::CommandTable::new();
+    for c in [cz, c0, c1] {
+        leader_view
+            .initialize(c, c.0, vec![CONSERVATIVE_KEY.to_vec()])
+            .unwrap();
+    }
+    let l0 = leader_view.record(&c0).unwrap().clone();
+    let l1 = leader_view.record(&c1).unwrap().clone();
+    assert_eq!(l0.deps, vec![cz]);
+    let mut aligned = booted(1);
+    let mut plain = booted(1);
+    for f in [&mut aligned, &mut plain] {
+        let effects = f.step(e0.clone());
+        f.step(durable_of(&effects, 1).remove(0));
+    }
+    // c0's proposal reaches `aligned`: held, since cz is unknown here.
+    let p0 = proposal(c0, vec![cz], 1, l0.paths.clone(), l0.path);
+    aligned.step(peer(0, p0));
+    assert!(aligned.held().contains_key(&c0));
+    assert_eq!(aligned.table().phase_of(&c0), Some(Phase::PreAccept));
+    for f in [&mut aligned, &mut plain] {
+        let effects = f.step(e1.clone());
+        f.step(durable_of(&effects, 2).remove(0));
+    }
+    let a = aligned.table().record(&c1).unwrap();
+    let p = plain.table().record(&c1).unwrap();
+    assert_eq!(a.deps, vec![c0]);
+    assert_eq!(
+        a.path, p.path,
+        "the path is this replica's own history, not the leader's"
+    );
+    assert_ne!(
+        a.path, l1.path,
+        "the leader's path for c1 runs through cz, which this replica never held"
+    );
+}
