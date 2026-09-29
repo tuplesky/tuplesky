@@ -1955,13 +1955,27 @@ impl Follower {
         // 39). Overlaid, the report presented the selection's acceptance
         // as this replica's commit, and the next selection found two
         // decisions of one command.
+        //
+        // Only over another decision, though: a command committed from
+        // the selection itself keeps its ledger record until the
+        // installation writes its own row, so the ledger can still hold
+        // the pre-acceptance from before the Sync (task-d33, row 2, three
+        // voters, seed 12). Left out of the overlay, a deposed candidate
+        // reported that stale record at the ballot its own selection
+        // established, and the next selection re-proposed commands it had
+        // committed.
         let table = &self.table;
         overlay_selected(
             &mut report,
             self.sync_pending
                 .iter()
                 .chain(selected)
-                .filter(|(c, _)| table.phase_of(c) < Some(Phase::Commit)),
+                .filter(|(c, selected)| {
+                    table.phase_of(c) < Some(Phase::Commit)
+                        || table
+                            .record(c)
+                            .is_some_and(|r| crate::vote::same_set(&r.deps, &selected.deps))
+                }),
         );
         // History is left out: a command this replica executed and keeps
         // nothing else about. Every command a report names is one the

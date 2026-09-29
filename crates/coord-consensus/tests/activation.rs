@@ -4311,6 +4311,49 @@ fn a_report_takes_the_selection_over_an_installation_still_in_flight() {
     assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
 }
 
+/// task-d33 (found by the protocol simulator, row 2, three voters, seed
+/// 12): a command the selection committed is reported as committed while
+/// its installation becomes durable.
+///
+/// Installing it commits it in the table at once. The report left out of
+/// the overlay every command the table had committed, since one this
+/// replica pulled from a later ballot may be decided under other
+/// dependencies (row 5, seed 39); so it reported the durable record from
+/// before the Sync, a pre-acceptance, at the ballot the selection
+/// established. The next selection re-proposed a command already decided,
+/// under other dependencies.
+#[test]
+fn a_report_takes_a_committed_selection_over_an_installation_still_in_flight() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            x,
+            coord_consensus::SyncEntry {
+                phase: Phase::Commit,
+                ..selected(x, &[])
+            },
+        )]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    let mut installs = Vec::new();
+    for e in durable_events(&marker) {
+        installs.extend(f.step(e));
+    }
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "x's installation was queued: {installs:?}"
+    );
+    assert_eq!(f.ballots().synced(), b1);
+    assert!(f.table().phase_of(&x) >= Some(Phase::Commit));
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::Commit, "{entry:?}");
+}
+
 /// task-d34 (found by the protocol simulator, row 10, three voters, seed
 /// 58): a selected entry whose payload arrives after the Sync row is
 /// reported while its installation becomes durable.

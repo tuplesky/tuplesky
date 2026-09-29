@@ -7269,9 +7269,21 @@ dependencies. One was `IncompatibleAccepted`.
   of a later ballot, with other dependencies. Its report overlaid the
   selection on the record and, since x was executed, reported the
   selection's acceptance as its commit. The next selection found two
-  decisions of x. The overlay now leaves out whatever the replica has
-  committed. `a_pulled_decision_is_reported_over_the_selection_the_voter_held`
+  decisions of x. The overlay now leaves out a command the replica has
+  committed under other dependencies than the selection's.
+  `a_pulled_decision_is_reported_over_the_selection_the_voter_held`
   (`catch_up`).
+- **A report that left out a commit its own selection made** (2,3,12).
+  Leaving out every committed command was too wide. Installing a
+  selection commits its committed entries in the table at once. The
+  ledger keeps the record from before the Sync until the installation's
+  row is durable. A deposed candidate promised the next ballot in that
+  window and reported the pre-acceptance at the ballot its own selection
+  had established. The next selection re-proposed two commands it had
+  committed, and chained a third after one of them: two decisions at one
+  position. A command committed under the selection's own dependencies is
+  overlaid again.
+  `a_report_takes_a_committed_selection_over_an_installation_still_in_flight`.
 
 ### Safety: an order the new leader forked
 
