@@ -4628,6 +4628,7 @@ fn a_follower_sent_a_sync_past_its_row_refuses_it_by_name() {
         )),
         "the refusal is named"
     );
+}
 
 /// task-d34 (found by the protocol simulator): a deposed leader keeps the
 /// selection it led from for the entries it never proposed.
