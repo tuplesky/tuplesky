@@ -7109,6 +7109,12 @@ What changed:
     answers from its memory.
   - Past the floor the answer is `RESULT_RETIRED`, which needs no
     request.
+  - A session that is retired, or whose trust rule is disabled, is
+    answered `NoSession` before `retry::resolve` reads its floor, and
+    retirement deleted the retry rows the floor covers. The floor row
+    stays, so a resolve at or below it is answered `RESULT_RETIRED` from
+    that row, not left to a collector that may have evicted the outcome
+    (Codex on #128).
 - **The SDK** gains `Outcome::Withheld` and `Outcome::Retired`, both
   final. Neither invalidates the credential, and `retry()` replays them
   without sending. `retry()` after `Unknown` submits the same invocation
