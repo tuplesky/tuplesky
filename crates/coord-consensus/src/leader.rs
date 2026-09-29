@@ -267,6 +267,10 @@ pub struct Leader {
     /// they are durable: each is then its own adoption, counted like a
     /// follower's (task-d19).
     own_adoptions: BTreeMap<BarrierId, OwnAdoption>,
+    /// The selection this leader leads from, handed to its follower when
+    /// it is deposed (task-d34): an entry whose payload this leader lacked
+    /// was never proposed, and the follower installs it from here.
+    selection: Option<SyncDecision>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -315,6 +319,7 @@ impl Leader {
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
             replay: crate::replay::EvidenceStore::new(config.capacity),
+            selection: None,
             config,
             boot: None,
             alloc: None,
@@ -386,6 +391,7 @@ impl Leader {
             outbox: self.outbox,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
+            synced_selection: self.selection,
         }
     }
 
@@ -432,6 +438,7 @@ impl Leader {
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
+            selection: Some(decision.clone()),
         };
         let _ = identity;
         // Dependency order among the entries: a command follows every
@@ -1010,8 +1017,24 @@ impl Leader {
         let mut report =
             self.ledger
                 .report(self.config.identity.replica, ballot, self.ballots.synced());
+        // The report is labelled with the ballot this leader synchronized
+        // to, and its selection is that ballot's state, whether or not its
+        // re-proposal batches are durable yet, or were made at all for an
+        // entry whose payload it lacks (task-d34). Reported from the rows
+        // alone, a command it selected at ACCEPT read as this replica's
+        // older PRE-ACCEPT, or as never accepted, at the source ballot,
+        // and the next selection re-proposed a command another voter had
+        // executed.
+        if let Some(selection) = self
+            .selection
+            .as_ref()
+            .filter(|d| d.ballot == self.ballots.synced())
+        {
+            crate::follower::overlay_selected(&mut report, selection.entries.iter());
+        }
         report.entries.retain(|e| !self.table.forgotten(&e.command));
         crate::follower::report_executed_as_committed(&mut report, &self.table);
+        report.entries.sort_by_key(|e| e.command);
         report
     }
 
