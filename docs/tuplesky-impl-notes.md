@@ -6317,7 +6317,10 @@ every step.
   - Delivers in any order, loses and duplicates, and holds some frames
     back until a later campaign (old-ballot messages).
   - Each frame is its own stream of a connection, so a crash ends what
-    was in flight to or from the crashed node.
+    was in flight to or from the crashed node. That includes frames
+    already delivered to a peer's buffer and not yet read, which is
+    stronger than a real crash: a stale frame from a dead node arriving
+    after its death is under-tested.
 - **Storage:**
   - Each node's journal completes its batches in submission order at
     times of the schedule's choosing. A crash loses what is not durable.
@@ -6326,7 +6329,9 @@ every step.
 - **Scenarios:** the checklist's failure-test matrix rows 1 (fill
   capacity, fail the leader), 2 (different tentative sets), 3 (dense
   conflicts, early missing dependency), 4 (acknowledgement before
-  payload, repeated) and 10 (delayed old-ballot messages), as knob
+  payload, repeated; the checklist's "hold expires" has no machine timer
+  to fire here, so the row is the acknowledgement before the payload,
+  presented again) and 10 (delayed old-ballot messages), as knob
   presets. Each is run for 12 seeds at each size by default;
   `PROTOCOL_SIM_SEEDS` raises that.
 - **Replay:** `PROTOCOL_SIM_ONE=row,voters,seed` with
@@ -6346,6 +6351,24 @@ every step.
    collector does, not under whichever acknowledgement came first.
 4. **No halt.** No replica stops on two decisions, a recovery cycle or
    `IncompatibleAccepted`.
+5. **Every learned decision executes.** After the fault schedule every
+   node comes back and loss, duplication, crashes and admissions stop.
+   The domain then runs, with an election whenever nothing executes for
+   6,000 steps, until what the frontend learned has executed, for at most
+   60,000 steps. Oracle 3 compares a decision only when a replica
+   executes it, so a decision learned from a durable majority, dropped by
+   the next selection and never re-proposed, passed the other four.
+   - One stall is counted rather than failed: every follower's table is
+     full and refuses work (`Backpressure`), so nothing more is proposed
+     or executed. That is task-d24's gap (table room for recovery, #122,
+     above this branch), and the exemption goes when it is merged up. At
+     the default seeds, 6 of 120 runs end that way; at 40 seeds, 32 of
+     400. No run fails the oracle otherwise.
+- **Coverage.** Each row checks, at each size, that more runs learned a
+  decision than learned none, or the frontend's oracles are vacuous.
+  Row 3 at five voters learns nothing in 4 of 12 runs, and rows 1 and 2
+  in 1 and 4: admissions there reach too few voters for a quorum before
+  the schedule ends. A per-run minimum would fail those rows as defined.
 
 Seeds that once failed are kept in
 `fixtures/protocol_sim/seeds.json` and replayed on every run.
@@ -6382,7 +6405,9 @@ Seeds that once failed are kept in
     newer one, and `activate` added the newer entries beside the older
     ones. The older entry then wrote the old ballot's ACCEPT back over
     the demotion. `activate` now clears what an older Sync left pending,
-    the part of task-d20's `replace_sync_pending` this branch needs.
+    the part of task-d20's `replace_sync_pending` this branch needs. The
+    fix is task-d34's, with its tests ("An older Sync's pending
+    entries"); this branch keeps the seed.
 - **With #118's F7 decision merged as well** (path logs aligned only at
   adoption and a Sync's installation):
   - Catch-up is on by default (`PROTOCOL_SIM_NO_CATCH_UP` turns it off),
