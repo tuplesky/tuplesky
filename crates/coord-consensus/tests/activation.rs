@@ -5669,6 +5669,82 @@ fn a_binding_taken_over_for_the_leaders_presentation_survives_a_restart() {
     );
 }
 
+/// task-d33 (#131, protocol_sim row 14, three voters, seed 0): a voter
+/// that executed a command and retired it inside the window, its retry
+/// key left unbound, refuses a re-offer of it as history. The key was
+/// unbound because the restart found two executed presentations under it
+/// (the second executed as the identity refusal), and with no binding and
+/// no record the command was initialized again as new work, and decided a
+/// second time with other dependencies.
+#[test]
+fn an_executed_command_retired_with_its_key_unbound_is_not_taken_again() {
+    let mut cluster = Cluster::with_capacity(71, 8);
+    cluster.admit(1, 1);
+    cluster.settle();
+    // r2 takes one presentation under retry key 5, the leader another.
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    cluster.settle_resending(3);
+    // The leader dies; r2 leads and re-proposes its own presentation.
+    cluster.crash(0);
+    let b1 = ballot(1, 2);
+    cluster.campaign(2, b1);
+    cluster.settle_resending(4);
+    for c in [mine, theirs] {
+        assert!(cluster.nodes[1].executed.contains(&c), "r1 executed both");
+    }
+    // r1 restarts into a tie under the key, and executes more work.
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    cluster.settle_resending(2);
+    for n in 0..6u8 {
+        cluster.admit_at(20 + u64::from(n), 40 + n, &[1, 2]);
+        cluster.settle_resending(2);
+    }
+    let table = cluster.nodes[1].follower().table();
+    assert!(table.record(&theirs).is_none(), "r1 retired it");
+    assert!(!table.forgotten(&theirs), "inside the window");
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[1]);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&theirs)
+            .is_none(),
+        "r1 took an executed command again as new work"
+    );
+    assert!(
+        cluster.frontend.iter().any(|(from, m)| *from == r(1)
+            && matches!(
+                m,
+                ProtocolMessage::Refused {
+                    command,
+                    refusal: coord_consensus::SubmissionRefusal::Forgotten,
+                    ..
+                } if *command == theirs
+            )),
+        "{:?}",
+        cluster.frontend
+    );
+    // The same as the leader it becomes: the simulator found it there.
+    cluster.campaign(1, ballot(2, 1));
+    cluster.settle_resending(3);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    assert!(l.table().record(&theirs).is_none());
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[1]);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    assert!(
+        l.table().record(&theirs).is_none(),
+        "the leader proposed an executed command again"
+    );
+}
+
 /// task-d33 (protocol_sim row 4, five voters, seed 6): a Sync that
 /// releases a command whose row is still being written deletes that row
 /// too. The deletion used to follow only a durable row: the installation

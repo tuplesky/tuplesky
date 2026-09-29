@@ -7295,6 +7295,22 @@ dependencies. One was `IncompatibleAccepted`.
   overlaid again.
   `a_report_takes_a_committed_selection_over_an_installation_still_in_flight`.
 
+### Safety: an executed command taken again as new work
+
+- **A retired command under an unbound key** (14,3,0, found once the
+  progress oracle re-offered what its collector could not yet answer,
+  #131 review). A voter that executed two presentations under one retry
+  key, the second as the identity refusal, restarted into a tie and left
+  the key unbound. A reclaim then retired the command inside the window.
+  A re-offer of it found no binding, no record and a command not yet
+  `forgotten`, so the leader initialized it as new work and proposed it:
+  the frontend learned it a second time, after other dependencies.
+  Admission now refuses every command the table retired, forgotten or
+  inside the window (`CommandTable::retired`), as `Forgotten`, on the
+  leader and the follower alike.
+  `an_executed_command_retired_with_its_key_unbound_is_not_taken_again`,
+  which fails on either path with its guard reverted.
+
 ### Safety: an order the new leader forked
 
 - **An entry after a command the leader committed** (4,3,11 of task-d30's
@@ -7361,7 +7377,8 @@ dependencies. One was `IncompatibleAccepted`.
   at execution is the guarantee either way. A tie left unbound after a
   restart likewise admits a third payload under the key as a new command
   (it used to be refused as `OtherCommand`), which the retry row refuses
-  at execution the same way.
+  at execution the same way. It must not admit either executed
+  presentation again, which the next section's guard ensures.
 - **A release that missed a row in flight** (4,5,6). A Sync deleted the
   row of a command it released only if the row was already durable. The
   installation of an earlier Sync's entry, written after the release was
