@@ -957,6 +957,15 @@ impl CommandTable {
         &self.executed
     }
 
+    /// Whether this replica executed `command` and retired its record,
+    /// forgotten or still inside the window (task-d33). A command it
+    /// retired is history here whatever else it holds: a submission of it
+    /// again is a duplicate, never new work, even when no retry-key
+    /// binding says so any more.
+    pub fn retired(&self, command: &CommandId) -> bool {
+        !self.records.contains_key(command) && self.history.contains(command)
+    }
+
     /// Whether this replica executed `command` and retired it longer ago
     /// than its last `capacity` retirements (task-d05).
     ///

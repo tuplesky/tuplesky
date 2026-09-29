@@ -1693,9 +1693,12 @@ impl Leader {
             }
             None => {}
         }
-        // Executed and forgotten, its binding with it (task-d26): the same
-        // answer as a bound command whose payload went to history.
-        if self.table.forgotten(&command) {
+        // Executed and retired: forgotten, its binding with it (task-d26),
+        // or inside the window with its key left unbound by a restart that
+        // found two executed presentations under it (task-d33). The same
+        // answer as a bound command whose payload went to history; the
+        // table holds no record, so initializing would take it as new.
+        if self.table.retired(&command) {
             self.rejections.push(Rejection::Duplicate(command));
             return self.refuse(command, SubmissionRefusal::Forgotten);
         }
