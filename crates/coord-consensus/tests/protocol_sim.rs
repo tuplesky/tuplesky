@@ -273,11 +273,9 @@ struct Sim {
     highest_ballot: u64,
     shadow: BTreeMap<(u64, ReplicaId, CommandId), Shadow>,
     /// Whether a follower's timer asks for the leader's executed history
-    /// (task-d08's pacer). Off unless `PROTOCOL_SIM_CATCH_UP` is set:
-    /// with it on, the default seeds reach the open fast-path recovery
-    /// gap of #116/#118 (a fast decision lost when its leader crashes
-    /// before its acceptance row is durable), and it turns on by default
-    /// with that fix.
+    /// (task-d08's pacer). On unless `PROTOCOL_SIM_NO_CATCH_UP` is set.
+    /// It was off while it reached the fast-path gap that #116's leader
+    /// adoption and #118's path-log alignment (F7) closed.
     catch_up: bool,
     /// The admission each command was submitted under, as the collector
     /// stores it beside its entry: what a leader reply is counted under.
@@ -364,7 +362,7 @@ impl Sim {
             highest_ballot: 0,
             shadow: BTreeMap::new(),
             submitted: BTreeMap::new(),
-            catch_up: std::env::var_os("PROTOCOL_SIM_CATCH_UP").is_some(),
+            catch_up: std::env::var_os("PROTOCOL_SIM_NO_CATCH_UP").is_none(),
             decided: BTreeMap::new(),
             order: Vec::new(),
             step: 0,

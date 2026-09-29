@@ -6090,23 +6090,49 @@ not here:
 - It let an execution outrun earlier journal batches, which `coordd`'s
   single-writer apply does not.
 
-### What is left
+### F7: a path from an order the replica does not hold
 
-- **A fast decision whose only reporting fast-set member recorded the
-  leader's path for commands it had not adopted.** Once the leader's
-  digests are copied into a member's logs, an equal path no longer
-  implies an equal history. The member's durable records for the
-  command's ancestors can keep their own order, and a recovery with the
-  leader absent cannot rebuild the leader's history from them. The rule
-  then refuses the ancestors and, with them, the decided command.
-- This is a design question, not a local fix. Options:
-  - a pre-accepted record takes the leader's dependencies with the
-    leader's path;
-  - fast acknowledgements carry only the member's own path.
-- It is left for review. At 100 seeds per row, fault rates set high
-  (rows 1 to 4 and 10, three and five voters), 14 of 1,000 runs still
-  fail. Traces sampled show this case and further stale-acceptance
-  cases.
+A fast decision failed when its only reporting fast-set member had
+recorded the leader's path for commands it had not adopted:
+- `record_leader_path` ran when a proposal arrived. It aligned the
+  per-key logs to the leader's order while the record kept its own
+  dependencies.
+- A command pre-accepted after that took the leader's path over this
+  replica's own history, so an equal path no longer meant an equal
+  history.
+- With the leader absent, recovery could not rebuild the fast decision's
+  ancestors from the member's records. The rule refused them and, with
+  them, the decided command.
+
+Two options were put to review. vicaya chose the second on #118:
+- The logs follow the leader's order only when the replica takes it as
+  its own: at adoption (`advance_pending`) and at a Sync's installation,
+  which already paired the alignment with `adopt`. Not when a proposal
+  arrives.
+- A fast acknowledgement's path, and a record's reported path, come from
+  those logs only. A fast acknowledgement stays evidence of the replica's
+  own durable history, the principle task-d19 applies to the slow path.
+- The first option, where a pre-accepted record takes the leader's
+  dependencies, needed a durable PRE-ACCEPT rewrite on every arrival and
+  changed what a PRE-ACCEPT record means.
+- The cost is fast-path rate when payloads reach a member in another
+  order than the leader's proposals.
+- The mapping row for `recordLeaderHash` is `[EXT: stricter]`.
+
+Evidence:
+- `a_proposal_that_is_not_adopted_leaves_the_path_log_alone`
+  (`follower`): the leader orders cz, c0, c1. A replica that never held
+  cz pre-accepts c0, takes c0's proposal (held for cz), then pre-accepts
+  c1. c1's path is the one a replica that never saw the proposal
+  computes. It fails with the arrival-time alignment.
+- task-d30's simulator (#119), with task-d19's leader adoption merged:
+  - 40 seeds: every one of 400 runs passes, against 2 failures before
+    this change.
+  - 100 seeds: 2 of 1,000 fail, against 8.
+  - Catch-up at the default seeds: all 120 pass, against 1 failure.
+- Still owed: the fast-path rate before and after on the stress driver,
+  and the two remaining failures at 1,000 runs, root-caused under
+  task-d30.
 
 ## The real replica machines under a protocol oracle
 
@@ -6188,8 +6214,7 @@ Seeds that once failed are kept in
   - 100 seeds: 8 of 1,000 fail, against 14.
   - Catch-up at the default seeds: 1 of 120 fails, against 3.
   - Every remaining failure is row 10 (delayed old-ballot messages) at
-    three voters, a command executed with two dependency sets. The
-    fast-path gap below is gone.
+    three voters, a command executed with two dependency sets.
   - The merge moved one schedule onto a stale-Sync case:
     `IncompatibleAccepted` at row 2, five voters, seed 0, now a kept
     seed. A voter restarted with an older Sync still installing, took a
@@ -6197,17 +6222,30 @@ Seeds that once failed are kept in
     ones. The older entry then wrote the old ballot's ACCEPT back over
     the demotion. `activate` now clears what an older Sync left pending,
     the part of task-d20's `replace_sync_pending` this branch needs.
+- **With #118's F7 decision merged as well** (path logs aligned only at
+  adoption and a Sync's installation):
+  - Catch-up is on by default (`PROTOCOL_SIM_NO_CATCH_UP` turns it off),
+    as `coordd`'s pacer always runs.
+  - With catch-up: the default seeds and 100 seeds per row and size pass,
+    all 1,000 runs.
+  - Without catch-up: 40 seeds pass (400 runs), and 100 seeds fail 2 of
+    1,000 (row 10, three voters, seeds 52 and 86).
+  - Seed 52, traced, is the same class through a Sync's installation. In
+    b1, r2 pre-accepted 65da with `<b002>` before installing b1's Sync,
+    which carries 454d. The installation then aligned r2's log with
+    454d's anchor ahead of 65da. r2 fast-acknowledged 81be with the
+    leader's path, while its records say 65da never followed 454d. With
+    the leader absent, recovery refused 81be and re-proposed it.
+  - Not fixed here. The next change is to keep a record's history and
+    its log consistent when an alignment lands behind a pending
+    pre-accept.
 - Budgets and progress after healing are task-d33's oracles.
-- **Catch-up.** With `PROTOCOL_SIM_CATCH_UP` set, a follower's timer asks
-  its leader for executed history, as `coordd`'s pacer does, and the
-  donor's page is served from its durable rows. A pulled command
-  executed otherwise than its donor is an oracle failure.
+- **Catch-up.** A follower's timer asks its leader for executed
+  history, as `coordd`'s pacer does, and the donor's page is served from
+  its durable rows. A pulled command executed otherwise than its donor is
+  an oracle failure.
   - At the default seeds it serves about 14,000 pages, executes about
     1,300 pulled commands, and finds no catch-up divergence.
-  - It also shifts the schedules enough to reach the fast-path gap
-    above in 3 of 120 runs. Row 2, three voters, seed 2 is one: a
-    command fast-learned from its leader and one follower, the leader
-    crashed before its acceptance row was durable, and the next leader
-    re-proposed it. So it is off by default until the #116/#118 fix
-    lands.
+  - It was off by default while it reached the fast-path gap that #116
+    and #118 closed.
 - Row 1 counts leader crashes and fails if a run of it crashed none.
