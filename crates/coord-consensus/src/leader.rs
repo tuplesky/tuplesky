@@ -262,6 +262,10 @@ pub struct Leader {
     /// they are durable: each is then its own adoption, counted like a
     /// follower's (task-d19).
     own_adoptions: BTreeMap<BarrierId, OwnAdoption>,
+    /// The selection this leader leads from, handed to its follower when
+    /// it is deposed (task-d34): an entry whose payload this leader lacked
+    /// was never proposed, and the follower installs it from here.
+    selection: Option<SyncDecision>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -310,6 +314,7 @@ impl Leader {
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
             replay: crate::replay::EvidenceStore::new(config.capacity),
+            selection: None,
             config,
             boot: None,
             alloc: None,
@@ -377,6 +382,7 @@ impl Leader {
             outbox: self.outbox,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
+            synced_selection: self.selection,
         }
     }
 
@@ -421,6 +427,7 @@ impl Leader {
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
+            selection: Some(decision.clone()),
         };
         let _ = identity;
         // Dependency order among the entries: a command follows every

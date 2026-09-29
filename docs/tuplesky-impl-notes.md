@@ -6134,6 +6134,27 @@ Evidence:
   and the two remaining failures at 1,000 runs, root-caused under
   task-d30.
 
+### A deposed leader's selection
+
+Found on #122's branch at 100 seeds (row 2, three voters, seed 45):
+- A leader can win with a selection naming a command whose payload it
+  does not hold. `Leader::repropose` skips a placeholder, so nothing is
+  proposed for it.
+- Deposed, it became a follower that did not carry its own Sync, since
+  `RecoveredState` had no place for it. Its reports under the
+  synchronized ballot omitted the command.
+- When the payload came, it pre-accepted the command afresh and reported
+  that PRE-ACCEPT at the source ballot. The next selection re-proposed a
+  command another voter had executed.
+
+The leader now keeps the selection it leads from. `into_recovered`
+hands it on as `RecoveredState::synced_selection`, and
+`Follower::from_recovered` resumes it as a restart resumes the durable
+Sync row: entries it has not installed are pending, and reports name the
+selected facts. Test:
+`a_deposed_leader_keeps_its_selection_for_what_it_never_proposed`
+(`activation`), which fails without the change.
+
 ## The real replica machines under a protocol oracle
 
 task-d30. `coord-sim` ran only reference actors, and the multi-node tests
