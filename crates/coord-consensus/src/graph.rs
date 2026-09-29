@@ -52,6 +52,21 @@ pub fn reordered_path(anchor: &Digest32) -> Digest32 {
     HashDomain::DependencyPath.digest(&[b"reordered", &anchor.0])
 }
 
+/// The head of a log re-anchored after `tails` ([`PathLog::anchored`]): a
+/// digest no [`chain`] link or follower log reaches except by synchronizing
+/// to a path chained from it.
+pub fn anchored_path(tails: &[CommandId]) -> Digest32 {
+    let mut sorted: Vec<&CommandId> = tails.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(sorted.len() + 1);
+    parts.push(b"anchored");
+    for tail in sorted {
+        parts.push(tail.as_bytes());
+    }
+    HashDomain::DependencyPath.digest(&parts)
+}
+
 /// One key's conflict log (prototype `HashLog`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathLog {
@@ -116,6 +131,16 @@ impl PathLog {
             applied: BTreeSet::new(),
             reordered: BTreeSet::new(),
         }
+    }
+
+    /// A log whose next command follows `tails` (task-d34, F7): a new
+    /// leader anchors its first fresh proposal after the recovered order's
+    /// tails, which its own appends need not have passed through, so its
+    /// head digests them rather than those appends. Its paths from here
+    /// are chained from [`anchored_path`], which a follower's log equals
+    /// only once it synchronized to one of them.
+    pub fn anchored(tails: &[CommandId]) -> Self {
+        PathLog::resumed(anchored_path(tails))
     }
 
     /// Digest of the whole log: the path evidence for the next command.

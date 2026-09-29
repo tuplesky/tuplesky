@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 
 use coord_consensus::{
     ClosureProgress, CommandRecord, CommandTable, GuardViolation, InitError, Phase, RetireError,
-    chain, decode_dependency, dependency_key, dependency_update, empty_path, reordered_path,
+    anchored_path, chain, decode_dependency, dependency_key, dependency_update, empty_path,
+    reordered_path,
 };
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
@@ -185,6 +186,46 @@ fn a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders() {
     early.execute(x).unwrap();
     early.retire(&x).unwrap();
     assert!(early.log(b"key").unwrap().reordered().is_empty());
+}
+
+/// A new leader's first fresh proposal follows the recovered tails, and
+/// so does its path (task-d34, F7).
+///
+/// The leader's own appends never passed through t, which it installed
+/// from a Sync and anchors after. A follower whose appends were the same,
+/// and which has not installed t, derives x from b alone. Hashed through
+/// the leader's appends, x's path was the same on both while its
+/// dependencies were not, and the fast acknowledgement of the command
+/// after x, with equal dependencies and an equal path, was a fast decision
+/// over two histories (protocol_sim row 10, three voters, seed 52).
+#[test]
+fn a_leaders_path_follows_the_tails_it_anchors_after() {
+    let (b, t, x, y) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let mut leader = CommandTable::new();
+    let mut follower = CommandTable::new();
+    let lb = leader.initialize(b, payload(1), k("key")).unwrap();
+    follower.initialize(b, payload(1), k("key")).unwrap();
+    follower.record_leader_path(b, 0, &lb.paths);
+    assert_eq!(leader.path_head(b"key"), follower.path_head(b"key"));
+
+    leader.anchor_all(b"key", &[t, b]);
+    assert_eq!(leader.path_head(b"key"), anchored_path(&[b, t]));
+    let lx = leader.initialize(x, payload(3), k("key")).unwrap();
+    let fx = follower.initialize(x, payload(3), k("key")).unwrap();
+    assert_eq!(lx.deps, vec![t, b]);
+    assert_eq!(fx.deps, vec![b]);
+    assert_ne!(lx.path, fx.path);
+    let ly = leader.initialize(y, payload(4), k("key")).unwrap();
+    let mut behind = follower.clone();
+    let fy = behind.initialize(y, payload(4), k("key")).unwrap();
+    assert_eq!(ly.deps, fy.deps);
+    assert_ne!(ly.path, fy.path, "equal dependencies over another history");
+
+    // Synchronized to the leader's order for x, the follower's paths are
+    // the leader's again.
+    follower.record_leader_path(x, 1, &lx.paths);
+    let fy = follower.initialize(y, payload(4), k("key")).unwrap();
+    assert_eq!(fy.path, ly.path);
 }
 
 #[test]
