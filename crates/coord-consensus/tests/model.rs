@@ -263,6 +263,9 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("r1-forged-proposal", fast(1, b, c1, &deps, 7, Some(3))),
             ("r2-slow", slow(2, b, c1)),
             ("r2-slow-redelivered", slow(2, b, c1)),
+            // The leader's proposal is not its adoption: its acceptance
+            // row is durable only once this arrives (task-d19).
+            ("leader-adoption", slow(0, b, c1)),
             ("leader-redelivered", fast(0, b, c1, &deps, 7, Some(0))),
             ("leader-without-seqnum", fast(0, b, c1, &deps, 7, None)),
         ],
@@ -339,7 +342,8 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
     assert!(!fast_path.rejected.contains_key("r1-slow-adoption"));
 
     // Differing dependency path: no fast learning; the leader order is
-    // adopted by r1 (equal deps) and r2 (slow ack) -> slow path.
+    // adopted by r2 and by the leader itself once its acceptance row is
+    // durable (task-d19) -> slow path.
     let slow_path = explore(
         "slow-path-path-disagreement",
         &cfg,
@@ -348,6 +352,7 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("leader-proposal", fast(0, b, c1, &deps, 7, Some(0))),
             ("r1-fast-other-path", fast(1, b, c1, &deps, 8, None)),
             ("r2-slow", slow(2, b, c1)),
+            ("leader-adoption", slow(0, b, c1)),
         ],
     );
     assert_eq!(
@@ -1087,8 +1092,11 @@ fn a_slow_decision_counting_a_fast_ack_survives_recovery() {
         "a fast acknowledgement counted as an adoption"
     );
     assert_eq!(set.learned_slow(), None);
-    // r1 adopts: now x is learned, and r1 holds x at ACCEPT.
+    // r1 adopts, and r1 holds x at ACCEPT; with the leader's own adoption,
+    // its acceptance row durable, x is learned (task-d19).
     set.add(slow(1, b0, x)).unwrap();
+    assert_eq!(set.learned(), None, "the leader's proposal counted");
+    set.add(slow(0, b0, x)).unwrap();
     assert_eq!(set.learned(), Some(Learned::Slow { deps: vec![y] }));
     // r0 and r3 are gone. r2 leads ballot 1 and hears r1, r2 and r4: the
     // one member of the deciding quorum it hears is r1, at ACCEPT.
@@ -1140,9 +1148,15 @@ const X_STATES: [XState; 6] = [
 
 /// task-d19's bounded model, joining learning with selection at three and
 /// five voters: every combination of what the non-leaders did with one
-/// command x, whose leader ordered it after y; for every combination whose
-/// vote set learns x, every majority of reports, under every new leader
-/// among them, selects x with the learned dependencies.
+/// command x, whose leader ordered it after y, and of whether the leader's
+/// own acceptance row became durable; for every combination whose vote
+/// set learns x, every majority of reports, under every new leader among
+/// them, selects x with the learned dependencies.
+///
+/// A leader whose acceptance row is not durable reports x at PRE-ACCEPT,
+/// as a restarted leader does when a crash lost that batch: its proposal
+/// row is all it holds. Counting the proposal toward the slow majority
+/// fails here (the Codex case on #116).
 #[test]
 fn every_learned_decision_is_selected_by_every_recovering_majority() {
     let (y, x) = (cmd(0), cmd(1));
@@ -1158,7 +1172,9 @@ fn every_learned_decision_is_selected_by_every_recovering_majority() {
         .unwrap();
         let others = usize::from(n - 1);
         let combos = X_STATES.len().pow(others as u32);
-        for code in 0..combos {
+        for (code, leader_adopted) in
+            (0..combos).flat_map(|code| [false, true].map(|adopted| (code, adopted)))
+        {
             let mut states = Vec::new();
             let mut c = code;
             for _ in 0..others {
@@ -1168,6 +1184,9 @@ fn every_learned_decision_is_selected_by_every_recovering_majority() {
             let b0 = ballot(0, 0);
             let mut set = VoteSet::new(src.clone(), x);
             set.add(fast(0, b0, x, &leader_deps, 7, Some(1))).unwrap();
+            if leader_adopted {
+                set.add(slow(0, b0, x)).unwrap();
+            }
             for (i, s) in states.iter().enumerate() {
                 let replica = (i + 1) as u8;
                 let fast_eligible = src.fast_eligible(&r(replica));
@@ -1190,9 +1209,20 @@ fn every_learned_decision_is_selected_by_every_recovering_majority() {
             let Some(learned) = set.learned() else {
                 continue;
             };
+            // A fast decision whose leader holds only its PRE-ACCEPT
+            // proposal row is recovered once the source leader counts
+            // among the fast-set members (#118, item 1).
+            if !leader_adopted && matches!(learned, Learned::Fast { .. }) {
+                continue;
+            }
             let entry_of = |replica: u8| -> Option<ReportEntry> {
                 if replica == 0 {
-                    return Some(entry(x, Phase::Accept, &leader_deps));
+                    let phase = if leader_adopted {
+                        Phase::Accept
+                    } else {
+                        Phase::PreAccept
+                    };
+                    return Some(entry(x, phase, &leader_deps));
                 }
                 match states[usize::from(replica) - 1] {
                     XState::None => None,
@@ -1222,13 +1252,16 @@ fn every_learned_decision_is_selected_by_every_recovering_majority() {
                         })
                         .collect();
                     let decision = select(&cfg, &reports).unwrap_or_else(|e| {
-                        panic!("n={n} states={states:?} members={members:?}: {e:?}")
+                        panic!(
+                            "n={n} leader_adopted={leader_adopted} states={states:?} \
+                             members={members:?}: {e:?}"
+                        )
                     });
                     let kept = decision.entries.get(&x);
                     assert!(
                         kept.is_some_and(|e| e.deps == learned.deps()),
-                        "n={n} states={states:?} learned {learned:?}, members {members:?} \
-                         under r{new_leader} selected {kept:?}"
+                        "n={n} leader_adopted={leader_adopted} states={states:?} learned \
+                         {learned:?}, members {members:?} under r{new_leader} selected {kept:?}"
                     );
                     checked += 1;
                 }
