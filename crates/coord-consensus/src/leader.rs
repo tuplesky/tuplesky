@@ -1007,8 +1007,24 @@ impl Leader {
         let mut report =
             self.ledger
                 .report(self.config.identity.replica, ballot, self.ballots.synced());
+        // The report is labelled with the ballot this leader synchronized
+        // to, and its selection is that ballot's state, whether or not its
+        // re-proposal batches are durable yet, or were made at all for an
+        // entry whose payload it lacks (task-d34). Reported from the rows
+        // alone, a command it selected at ACCEPT read as this replica's
+        // older PRE-ACCEPT, or as never accepted, at the source ballot,
+        // and the next selection re-proposed a command another voter had
+        // executed.
+        if let Some(selection) = self
+            .selection
+            .as_ref()
+            .filter(|d| d.ballot == self.ballots.synced())
+        {
+            crate::follower::overlay_selected(&mut report, selection.entries.iter());
+        }
         report.entries.retain(|e| !self.table.forgotten(&e.command));
         crate::follower::report_executed_as_committed(&mut report, &self.table);
+        report.entries.sort_by_key(|e| e.command);
         report
     }
 
