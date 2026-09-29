@@ -248,7 +248,7 @@ pub(crate) fn overlay_selected<'a>(
     report: &mut RecoveryReport,
     entries: impl Iterator<Item = (&'a CommandId, &'a SyncEntry)>,
 ) {
-    let known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+    let mut known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
     for (command, entry) in entries {
         if known.contains(command) {
             // Known here at or below the selection, or with another
@@ -298,6 +298,9 @@ pub(crate) fn overlay_selected<'a>(
             // has to be the one under them (task-d14).
             admission: entry.admission,
         });
+        // A selected entry still pending comes twice, from the pending
+        // set and from the selection: reported once.
+        known.insert(*command);
     }
 }
 
@@ -1281,10 +1284,10 @@ impl Follower {
         self.named_facts = named_facts(&decision);
         // What an earlier Sync left uninstalled is superseded: its entries
         // are not this ballot's, and installing one would write an
-        // acceptance the new selection re-proposed or left out (a restart
-        // that resumed an older Sync, then took a newer one, wrote the old
-        // ballot's ACCEPT back over the demotion). task-d20 does this
-        // with its placeholders too.
+        // acceptance the new selection re-proposed or left out, back over
+        // the demotion (task-d34: a restart resumed an older Sync, took a
+        // newer one, and the older entry's ACCEPT came back at the new
+        // synchronized ballot).
         self.sync_pending.clear();
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
@@ -3177,7 +3180,8 @@ impl Follower {
                         // ballot. So its entries are held for
                         // installation, and reported, as an activated
                         // Sync's are; only the ballot is not taken up
-                        // (task-d30).
+                        // (task-d30). What an older Sync left pending is
+                        // superseded by this one, as at activation.
                         self.sync_pending.clear();
                         for (c, e) in &decision.entries {
                             if self.table.phase_of(c).is_none() {
