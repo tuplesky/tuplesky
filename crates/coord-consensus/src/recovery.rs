@@ -549,6 +549,12 @@ pub fn select_from(
 /// candidate. Anything else proves the member's path differs from the
 /// leader's, so no fast decision was possible and the command is
 /// re-proposed.
+///
+/// A command no ballot decided that `c`'s own dependencies reach is the
+/// exception (task-d33): the selection re-proposes it, after the recovered
+/// order, and `c` after it, so it may stand in `c`'s closure, and `c` is
+/// ordered after every adopted command that waits on no re-proposal. So is
+/// a command the member no longer holds, which it executed and retired.
 fn possible_fast_decisions(
     config: &BallotConfiguration,
     source_ballot: Ballot,
@@ -684,18 +690,111 @@ fn possible_fast_decisions(
                     .iter()
                     .any(|d| record(m, d).is_none() && selected.contains_key(d) && after(d, a))
         };
+    // The commands `deps` reach, followed through the selection and the
+    // candidates, that neither holds and a report holds undecided (or,
+    // with `member`, that member holds undecided): the ones the selection
+    // re-proposes.
+    let undecided_reached = |deps: &[CommandId],
+                             candidates: &BTreeMap<CommandId, (ReportEntry, usize)>,
+                             member: Option<&RecoveryReport>|
+     -> BTreeSet<CommandId> {
+        let mut seen = BTreeSet::new();
+        let mut found = BTreeSet::new();
+        let mut stack: Vec<CommandId> = deps.to_vec();
+        while let Some(d) = stack.pop() {
+            if !seen.insert(d) {
+                continue;
+            }
+            if let Some(e) = entries.get(&d) {
+                stack.extend(e.deps.iter().copied());
+            } else if let Some((e, _)) = candidates.get(&d) {
+                stack.extend(e.deps.iter().copied());
+            } else if match member {
+                Some(m) => record(m, &d).is_some_and(|r| r.phase < Phase::Commit),
+                None => reports
+                    .iter()
+                    .any(|r| record(r, &d).is_some_and(|r| r.phase < Phase::Commit)),
+            } {
+                found.insert(d);
+                if let Some(m) = member
+                    && let Some(r) = record(m, &d)
+                {
+                    stack.extend(r.deps.iter().copied());
+                }
+            }
+        }
+        found
+    };
+    // Each pass judges every candidate against the same set, and drops
+    // first the failing ones that follow no other failing candidate. A
+    // candidate that follows one judged against a set still holding it
+    // is judged again once that one is gone: dropped, it is a command the
+    // selection re-proposes, and a candidate after it may then pass
+    // (task-d33). Dropped in the order the identities sort, the result
+    // depended on which of the two came first.
     loop {
-        let before = candidates.len();
         let keys: Vec<CommandId> = candidates.keys().copied().collect();
+        let mut failing: BTreeSet<CommandId> = BTreeSet::new();
         for c in keys {
             let (entry, member) = candidates[&c].clone();
             let first = fast_reporters[member];
             let prefix = closure(first, &c);
+            // The commands no ballot decided that `c` follows, which this
+            // selection re-proposes: its own dependencies, followed
+            // through what the selection keeps, reach them. The
+            // re-proposals are chained after the recovered order and `c`
+            // after them (task-d34). Only the selection's dependencies
+            // count as a way in: an undecided command reached through the
+            // member's records alone orders nothing.
+            let awaited = undecided_reached(&entry.deps, &candidates, Some(first));
+            let awaits_reproposal = !awaited.is_empty();
+            // What `c`'s own dependencies reach through what the
+            // selection keeps.
+            let selected_before = {
+                let mut seen = BTreeSet::new();
+                let mut stack: Vec<CommandId> = entry.deps.clone();
+                while let Some(d) = stack.pop() {
+                    if !seen.insert(d) {
+                        continue;
+                    }
+                    if let Some(e) = entries.get(&d) {
+                        stack.extend(e.deps.iter().copied());
+                    } else if let Some((e, _)) = candidates.get(&d) {
+                        stack.extend(e.deps.iter().copied());
+                    }
+                }
+                seen
+            };
             let ordered_after_adopted = entries.values().all(|adopted| {
                 // Ordered after `c` by the selection itself: nothing it
                 // says constrains the member's order before `c`.
                 if after(&adopted.command, &c) {
                     return true;
+                }
+                // Before the re-proposals `c` follows, whatever the
+                // member's records of the undecided commands say: the
+                // command follows no re-proposal, so the chain goes on
+                // after it. Those records can be stale: the leader that
+                // decided `c` fast may have accepted such a command after
+                // this one, while the member kept its own pre-acceptance
+                // of it, and the member's closure then misses this command
+                // (task-d33, protocol_sim row 10, three voters, seed 31).
+                // An adopted command that waits on a re-proposal too is
+                // not ordered against `c` that way (row 2, seed 3).
+                if awaits_reproposal {
+                    if undecided_reached(&adopted.deps, &candidates, None).is_empty()
+                        || selected_before.contains(&adopted.command)
+                    {
+                        return true;
+                    }
+                    // It waits on a re-proposal too, and nothing the
+                    // selection keeps orders it before `c`. The member's
+                    // records do not either: the way they order the two
+                    // runs through an undecided command, which is
+                    // re-proposed under other dependencies (row 3, seed
+                    // 70). Only a command with no conflict is exempt.
+                    let keys: Vec<Vec<u8>> = adopted.paths.iter().map(|(k, _)| k.clone()).collect();
+                    return !keys.is_empty() && !conflicts(&entry.keys, &keys);
                 }
                 match record(first, &adopted.command) {
                     // Held by the member: before `c` in its order, or no
@@ -737,24 +836,68 @@ fn possible_fast_decisions(
                     }
                 }
             });
-            // A command a Sync demoted at the member is no evidence
-            // against `c` either (task-d33): that Sync re-proposed it, and
-            // the member pre-accepted `c` after it before any ballot
-            // decided it. The source leader proposed `c` after its
-            // re-proposal, so a fast decision of `c` can name it while it
-            // is still undecided; this selection re-proposes it, and
-            // `c` after it (task-d34).
+            // Nor is a dependency no ballot decided (task-d33). The
+            // leader proposes `c` with the dependencies it knows, decided
+            // or not, and a fast quorum decides `c` with them: a command
+            // the source leader re-proposed and a Sync demoted, or one
+            // only the leader accepted, can be named by a fast decision
+            // while it is still undecided. This selection re-proposes it
+            // and, when `c`'s dependencies reach it (`awaited`), orders
+            // `c` after it (task-d34). Requiring `c`'s whole closure to be
+            // decided dropped such a `c`, and re-proposed it under other
+            // dependencies than the ones it was learned with.
+            //
+            // Nor is one the member no longer holds (task-d33, row 12,
+            // three voters, seed 9). A member at the source ballot has
+            // released nothing -- only a later Sync releases -- and a
+            // pre-acceptance names only commands it held with a payload,
+            // so the member executed it and retired it past the window
+            // its report names. What it executed precedes `c`.
             let prefix_decided = prefix.iter().all(|d| {
                 entries.contains_key(d)
                     || candidates.contains_key(d)
-                    || record(first, d).is_some_and(|r| r.path == crate::graph::demoted_path())
+                    || awaited.contains(d)
+                    || record(first, d).is_none_or(|r| r.path == crate::graph::demoted_path())
             });
             if !ordered_after_adopted || !prefix_decided {
-                candidates.remove(&c);
+                failing.insert(c);
             }
         }
-        if candidates.len() == before {
+        if failing.is_empty() {
             break;
+        }
+        let follows_failing = |c: &CommandId| -> bool {
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<CommandId> = candidates[c].0.deps.clone();
+            while let Some(d) = stack.pop() {
+                if d == *c || !seen.insert(d) {
+                    continue;
+                }
+                if failing.contains(&d) {
+                    return true;
+                }
+                if let Some(e) = entries.get(&d) {
+                    stack.extend(e.deps.iter().copied());
+                } else if let Some((e, _)) = candidates.get(&d) {
+                    stack.extend(e.deps.iter().copied());
+                }
+            }
+            false
+        };
+        let settled: Vec<CommandId> = failing
+            .iter()
+            .copied()
+            .filter(|c| !follows_failing(c))
+            .collect();
+        // Failing candidates that all follow one another: a cycle, with
+        // none settled first. They go together.
+        let dropped: Vec<CommandId> = if settled.is_empty() {
+            failing.into_iter().collect()
+        } else {
+            settled
+        };
+        for c in dropped {
+            candidates.remove(&c);
         }
     }
     for (c, (e, _)) in candidates {

@@ -7197,7 +7197,7 @@ Seeds are `row, voters, seed` of `protocol_sim`.
 
 ### Safety: what a selection keeps as possibly learned fast
 
-Three of these were two dependency sets for one command: the frontend
+Five of these were two dependency sets for one command: the frontend
 learned it fast, and a later selection re-proposed it with other
 dependencies. One was `IncompatibleAccepted`.
 
@@ -7219,14 +7219,51 @@ dependencies. One was `IncompatibleAccepted`.
   covered such a command when the member no longer held it
   (`forgotten_before`, task-d34) now covers it held too.
   `a_candidate_is_kept_when_a_held_command_precedes_one_its_member_retired`.
-- **A dependency a Sync demoted** (4,3,85). The source leader re-proposed
-  f, and no quorum accepted it; x was then decided fast with f as its
-  dependency. The member holds f as the Sync demoted it, which is neither
-  adopted nor a candidate. The rule that every command of the candidate's
-  closure be decided dropped x. A demoted record is no evidence against
-  x: the selection re-proposes f and orders x after it (task-d34's
-  re-proposal chain).
+- **A dependency no ballot decided** (4,3,85; 10,3,31). The leader
+  proposes x with the dependencies it knows, decided or not, and a fast
+  quorum decides x with them. In 4,3,85 the source leader had re-proposed
+  f, and no quorum accepted it; in 10,3,31, d was accepted by the leader
+  alone. The rule that every command of the candidate's closure be
+  decided, from task-28, dropped x. An undecided command in that closure
+  no longer does, when x's own dependencies, followed through what the
+  selection keeps (and past an undecided command, through the member's
+  record of it), reach it: the selection re-proposes it and orders x
+  after it (task-d34's re-proposal chain).
   `a_candidate_is_kept_over_a_dependency_a_sync_demoted`.
+- **A member's stale record of an undecided command** (10,3,31). The
+  source leader accepted d after an adopted command a, while the member
+  kept its own pre-acceptance of d, which names nothing. Walked over the
+  member's records, x's closure missed a, and x was dropped. A candidate
+  that follows a command this selection re-proposes now counts as ordered
+  after an adopted command that follows no re-proposal itself: the
+  re-proposals are chained after the recovered order, and x after them.
+  An adopted command that waits on a re-proposal too counts only if x's
+  own dependencies, through what the selection keeps, reach it; else only
+  a command with no conflict passes. Counting every adopted command kept
+  a candidate that no ballot decided (2,3,3), and two conflicting commands
+  then followed the same re-proposal unordered. Reading the member's
+  records for such a command did the same (3,3,70; 1,5,14): the order
+  they give runs through the undecided command, which is re-proposed under
+  other dependencies.
+  `a_candidate_after_an_undecided_command_is_kept_over_the_members_stale_record`,
+  `a_candidate_is_not_ordered_after_an_adopted_command_that_waits_on_the_same_reproposal`.
+- **A dependency the member retired past its window** (12,3,9, once
+  retirement went in execution order, below). x was decided fast after
+  f, which the member had executed and retired longer ago than its report
+  names, so no report held f and the rule that x's closure be decided
+  dropped x. A member at the source ballot has released nothing (only a
+  later Sync releases) and pre-accepts only after commands it holds, so a
+  command in its closure that it no longer holds is history there, before
+  x. `a_candidate_after_a_command_its_member_retired_past_the_window_is_kept`.
+- **A candidate judged before the one it follows was dropped** (10,3,31,
+  in the other order). The rule dropped candidates one at a time, in the
+  order their identities sort. x, judged while d was still a candidate,
+  failed on the member's stale record of d and was dropped for good; d
+  was dropped after it, and x would then have passed. Each pass now
+  judges every candidate against the same set and drops first the
+  failing ones that follow no other failing candidate; a set of failing
+  candidates that all follow one another goes together. The test above
+  runs both orders.
 - **A report that overlaid its selection on a decision** (5,3,39). A voter
   synchronized at a selection holding x at ACCEPT then pulled x's decision
   of a later ballot, with other dependencies. Its report overlaid the
