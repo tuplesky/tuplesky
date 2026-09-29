@@ -4640,6 +4640,76 @@ fn a_follower_sent_a_sync_past_its_row_refuses_it_by_name() {
         )),
         "the refusal is named"
     );
+
+/// task-d34 (found by the protocol simulator): a deposed leader keeps the
+/// selection it led from for the entries it never proposed.
+///
+/// r1 won with a selection naming x, whose payload it never held, so it
+/// proposed nothing for x: `repropose` skips a placeholder. Deposed, it
+/// became a follower that did not carry its own Sync. Its reports under
+/// the synchronized ballot then omitted x, and when the payload came it
+/// pre-accepted x afresh and reported that at the source ballot, so the
+/// next selection re-proposed a command another voter had executed. The
+/// follower now resumes the leader's selection as a restart resumes the
+/// durable Sync row.
+#[test]
+fn a_deposed_leader_keeps_its_selection_for_what_it_never_proposed() {
+    let b1 = ballot(1, 1);
+    let b2 = ballot(2, 2);
+    let (x, _) = admission(2, 1);
+    // r1, synchronized to b1 and holding nothing of x.
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            genesis: ballot(0, 0),
+            quorum: quorum(b1),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: b1,
+            synced: b1,
+        }),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    f.step(boot_event(1));
+    // It leads b1 from a selection naming x at ACCEPT, whose payload it
+    // lacks: nothing is proposed for x.
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let (mut leader, _) = Leader::from_recovered(f.into_recovered(), quorum(b1), &decision);
+    assert!(leader.proposal(&x).is_none());
+    // Deposed by r2's campaign.
+    let promised = leader.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&promised) {
+        leader.step(e);
+    }
+    assert!(leader.deposed());
+    let q = leader.config_quorum();
+    let f = Follower::from_recovered(leader.into_recovered(), q);
+    assert_eq!(f.ballots().synced(), b1);
+    let report = f.report(b2);
+    let e = report
+        .entries
+        .iter()
+        .find(|e| e.command == x)
+        .unwrap_or_else(|| panic!("x is missing from the report: {:?}", report.entries));
+    assert_eq!((e.phase, e.deps.clone()), (Phase::Accept, vec![]), "{e:?}");
+    assert!(!e.payload_present, "{e:?}");
 }
 
 /// task-d28: with a page of every report to the candidate lost, the

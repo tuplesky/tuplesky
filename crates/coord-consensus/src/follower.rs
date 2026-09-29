@@ -658,6 +658,15 @@ impl Follower {
 
     /// A follower from state carried across a role change, under `quorum`.
     pub fn from_recovered(state: RecoveredState, quorum: BallotConfiguration) -> Self {
+        // The selection of the ballot this replica is synchronized to, as a
+        // restart reads it from the durable Sync row: a deposed leader's
+        // own, whose entries it may not have installed (task-d34). Without
+        // it, a selected command whose payload the leader lacked was
+        // pre-accepted afresh when the payload came, and reported so under
+        // the synchronized ballot.
+        let selection = state
+            .synced_selection
+            .filter(|d| d.ballot == state.ballots.synced());
         Follower {
             config: FollowerConfig {
                 identity: state.identity,
@@ -704,16 +713,17 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
-            resumed: None,
+            resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
-            synced_selection: None,
+            synced_selection: selection,
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
             catch_up: CatchUp::default(),
             diverged: None,
         }
+        .resume_sync()
     }
 
     /// Give up the role: everything durable or learned, nothing
@@ -736,6 +746,7 @@ impl Follower {
             report_cut: self.report_cut,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
+            synced_selection: self.synced_selection,
         }
     }
 
