@@ -2805,6 +2805,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let (this_turn, cursor) =
             coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
         self.settle_cursor = cursor;
+        let conflicts =
+            coord_daemon::settle::conflicts_for(self.backing.applier(), this_turn.iter().copied());
         let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
         // The release this collector holds and what this node executed
         // disagreeing is not an ordinary outcome: every replica executes
@@ -2829,6 +2831,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.counts.settled_from_record += settled;
                 for delivery in deliveries {
                     self.answer(delivery);
+                }
+                // A key this node's record binds to another command: the
+                // domain executed that one under it (task-d22).
+                for (command, bound) in conflicts {
+                    let dispatcher = self.frontend.frontend.dispatcher_mut();
+                    if let Ok(delivery) = dispatcher.settle_conflict_from_record(command, bound) {
+                        self.frontend.counts.settled_from_record += 1;
+                        if let Some(delivery) = delivery {
+                            self.answer(delivery);
+                        }
+                    }
                 }
                 None
             }

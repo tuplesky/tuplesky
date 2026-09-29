@@ -1200,27 +1200,13 @@ impl Collector {
             from: replica_hex(&sender),
             reason: reason.into(),
         });
-        if let SubmissionRefusal::OtherCommand { .. } = refusal {
-            let entry = self.pending.remove(&command).expect("present");
-            self.undelivered_bytes = self
-                .undelivered_bytes
-                .saturating_sub(entry.dissemination.reserved);
-            self.bindings.remove(&entry.retry_key);
-            let response = codes::error_response(
-                command,
-                codes::REQUEST_IDENTITY_CONFLICT,
-                "a voter holds the retry key bound to another request",
-            );
-            return Ok(Progress::Released(Release {
-                retry_key: entry.retry_key,
-                command,
-                session: entry.session,
-                response,
-                speculative: false,
-                fast: false,
-                attached: entry.attached,
-            }));
-        }
+        // One voter's word settles nothing, whichever refusal it is. A
+        // voter that bound the key to another request may be a minority
+        // that saw the other presentation first, while a quorum binds and
+        // executes this one (Codex review): only the domain's decided
+        // outcome, this node's durable record of the key, answers it
+        // ([`Collector::settle_from_record`] for this command's own
+        // record, [`Collector::settle_conflict_from_record`] for another's).
         let entry = self.pending.get_mut(&command).expect("present");
         entry.from_record = true;
         Ok(Progress::Held(HoldReason::AwaitingRecord))
@@ -1528,6 +1514,58 @@ impl Collector {
         });
         let response = self.answer_of(command, revision, response);
         Ok(self.finish(command, entry, (response, own), false, fast))
+    }
+
+    /// Settle `command` from this node's durable record of its retry key
+    /// naming `bound`, another command (task-d22).
+    ///
+    /// The record is the domain's decision about the key: `bound` was
+    /// executed under it, and a command presented under it with another
+    /// payload is rejected wherever it executes, with nothing mutated. So
+    /// the entry ends with `REQUEST_IDENTITY_CONFLICT`, as a retry of it
+    /// would have been answered before submission. Only an entry the
+    /// record may settle is ended: one a voter refused, or one asked for
+    /// again. The answer is not kept in the resolved window: a release of
+    /// the command, which reports its rejection at its own position, is
+    /// never compared with it.
+    pub fn settle_conflict_from_record(
+        &mut self,
+        command: CommandId,
+        bound: CommandId,
+    ) -> Result<Progress, SettleError> {
+        let Some(entry) = self.pending.get(&command) else {
+            return if self.is_resolved(&command) {
+                Ok(Progress::Settled)
+            } else {
+                Err(SettleError::NotPending)
+            };
+        };
+        if bound == command || !entry.from_record {
+            return Err(SettleError::Uncorroborated);
+        }
+        let entry = self.pending.remove(&command).expect("present");
+        self.undelivered_bytes = self
+            .undelivered_bytes
+            .saturating_sub(entry.dissemination.reserved);
+        self.bindings.remove(&entry.retry_key);
+        self.trace.push(CollectorEvent::SettledFromRecord {
+            command: command_hex(&command),
+            corroborated: "other-command".into(),
+        });
+        let response = codes::error_response(
+            command,
+            codes::REQUEST_IDENTITY_CONFLICT,
+            "the retry key is bound to another request",
+        );
+        Ok(Progress::Released(Release {
+            retry_key: entry.retry_key,
+            command,
+            session: entry.session,
+            response,
+            speculative: false,
+            fast: false,
+            attached: entry.attached,
+        }))
     }
 
     fn retain(&mut self, key: RetryKey, command: CommandId, response: ResponseV1, executed: Said) {
