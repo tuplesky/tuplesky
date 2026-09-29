@@ -6499,3 +6499,111 @@ never closed its gap.
   kept executions are capped below the window.
 - task-d08's eight catch-up tests pass unchanged, as do the protocol
   simulator and the `coord-daemon` suites.
+
+## Every collector entry the voters refuse ends
+
+task-d22, from the checklist review (items E1, E2, E4, R1, R3, R4, R5
+and A5). A voter answered three refusals with no effect at all:
+- a request under other admission facts than the ones it accepted
+  (`RequestFactsConflict`, and the table's `PayloadConflict`);
+- another payload under a retry key it holds bound
+  (`RequestIdentityConflict`);
+- a duplicate whose payload it no longer holds, because the command went
+  to history.
+
+The collector removes an entry only when it settles. So each such entry
+held one of the domain's pending slots for good, and a session could fill
+all 256 with retries that nothing ever answered. A ballot change voided
+the evidence the collector had counted, and nothing asked for it again. A
+command that had executed under the old ballot produced no evidence under
+the new one and never settled. Evidence addressed to a closed remote
+connection was dropped the same way.
+
+### What changed
+
+- **The voter says why.** The three refusals are answered with
+  `ProtocolMessage::Refused { ballot, command, refusal }`, sent to the
+  frontend that submitted, as any other evidence is.
+  - `SubmissionRefusal::OtherFacts { accepted }`, `OtherCommand { bound }`
+    and `Forgotten` name the three cases.
+  - `OtherCommand` is sent only once the bound command's payload is
+    durable here, since a binding a crash could still undo is no answer
+    about the key.
+  - Nothing is persisted for it. A collector that misses the reply asks
+    again.
+- **The collector settles on it** (`Collector::on_evidence`):
+  - `OtherCommand` ends the entry with `REQUEST_IDENTITY_CONFLICT`. The
+    caller named another request under a key that already has one, and
+    no waiting changes that. The answer is not kept in the resolved
+    window, so a later release of the command is never compared with it.
+    It is what this collector learned, not what the domain decided.
+  - `OtherFacts` and `Forgotten` hold the entry for its record
+    (`HoldReason::AwaitingRecord`). Only the command's durable record can
+    answer it, and this node's record, the same one that already answers
+    a caller's retry, settles it with nothing of the collector's own to
+    corroborate it (`SettledFromRecord { corroborated: "record" }`).
+  - A refusal from a replica that is not a voter is not counted
+    (`EvidenceError::NotAVoter`).
+- **An entry holding neither half is asked for again.** A pending entry
+  with neither the learning predicate nor the leader's release after
+  `SOLICIT_AFTER_MILLIS` (5 s) is submitted to every voter again
+  (`Collector::due_solicits`, woken for through `next_solicit`).
+  - A voter answers a submission it holds by publishing its evidence
+    again (task-c02's repair) or by saying why it refuses.
+  - From the second time on, the record may settle the entry.
+  - The entry keeps its submission until it settles for this. The
+    delivery obligation still lets go of its copy once every voter has
+    taken it.
+- **A ballot change asks for every entry again at once**, and lets the
+  record settle each (`Collector::reconfigure`). A command executed under
+  the old ballot is then answered from this node's record under the new
+  one.
+- **coordd** sends the solicitations with the re-offers, on the same
+  fan-out and the same offer report, counts them apart
+  (`counts.solicited`), and wakes for the next one. Its record pass
+  (`settle_from_records`) settles every entry the record may settle, as
+  it did for half-held ones.
+- **Unchanged.** What a voter accepts, and the evidence rules (review
+  boundary). A command the collector holds nothing for, that no voter
+  refused and that this node has not executed, is still asked for,
+  never answered from nothing.
+
+### Evidence
+
+- `refused_retries_free_every_pending_slot` (`coord-collector`, `refusal`):
+  256 retries fill every pending slot, and a new submission is refused
+  for backpressure. Each is refused, half as a bound key and half under
+  other facts, and settles. The domain then takes new work.
+- `a_key_bound_to_another_request_ends_the_entry_with_a_conflict`,
+  `other_facts_and_a_forgotten_duplicate_are_answered_from_the_record`,
+  `a_refusal_from_a_stranger_is_not_counted`,
+  `an_entry_holding_nothing_is_asked_for_again_then_settled_from_the_record`
+  and `a_ballot_change_asks_for_every_entry_again` (same file): each
+  refusal kind with its reply and settled entry, and the solicitation
+  schedule.
+- With real voters (`coord-daemon`, `repair`):
+  - `a_retry_under_other_facts_is_answered_from_the_record`: a restarted
+    frontend presents a command again under another receipt. Every
+    voter refuses it and says why, and the entry settles with the first
+    answer, with nothing executed twice.
+  - `another_request_under_a_bound_key_ends_with_a_conflict`.
+  - `a_command_executed_under_a_changed_ballot_settles_under_the_new_one`:
+    every frame to the collector is lost, the leader stops and a
+    follower wins. The entry is asked for again at once and settles from
+    the record under the new ballot.
+  - All three fail without the voters' replies or without the
+    ballot-change rule.
+- The voter-side tests that asserted "no effect" for these refusals
+  (`admission`, `follower`, `replay`) now assert the one reply, to the
+  frontend only. A duplicate with its evidence still replays it, and
+  nothing is replayed for other facts.
+
+### What this does not cover
+
+- Solicitation has its own budget of 16 destinations a turn, beside the
+  re-offers' 16. After a ballot change with 256 entries pending on three
+  voters, the entries are asked for again over about 48 turns, not in
+  one.
+- The frozen collector trace gains the two new events (`VoterRefused`,
+  `Solicited`), and the frozen fixture is unchanged: its scenario
+  produces neither.

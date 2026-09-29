@@ -301,6 +301,37 @@ pub enum ProtocolMessage {
         /// The pages wanted, by number.
         pages: Vec<u32>,
     },
+    /// A voter's answer to a submission it refused and can say nothing
+    /// else about (task-d22). Sent to the frontend that submitted, so the
+    /// collector's entry for `command` ends rather than waits for
+    /// evidence that is never coming from this voter.
+    Refused {
+        /// The ballot the voter was at.
+        ballot: Ballot,
+        /// The command the submission derives to.
+        command: CommandId,
+        /// Why.
+        refusal: SubmissionRefusal,
+    },
+}
+
+/// Why a voter refused a submission (task-d22).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubmissionRefusal {
+    /// The command is bound here under other admission facts, and this
+    /// voter never acknowledges it under these.
+    OtherFacts {
+        /// The admission digest it is bound under.
+        accepted: Digest32,
+    },
+    /// The retry key is bound here to another command.
+    OtherCommand {
+        /// That command.
+        bound: CommandId,
+    },
+    /// A duplicate this voter keeps no payload of any more: it went to
+    /// history, and what it did is in the durable record.
+    Forgotten,
 }
 
 impl ProtocolMessage {
@@ -322,7 +353,8 @@ impl ProtocolMessage {
             ProtocolMessage::Proposal(a) | ProtocolMessage::FastAck(a) => Some(a.command),
             ProtocolMessage::SlowAck(a) => Some(a.command),
             ProtocolMessage::LeaderReply { command, .. }
-            | ProtocolMessage::PayloadResponse { command, .. } => Some(*command),
+            | ProtocolMessage::PayloadResponse { command, .. }
+            | ProtocolMessage::Refused { command, .. } => Some(*command),
             ProtocolMessage::NewLeader { .. }
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::ReportPage(_)

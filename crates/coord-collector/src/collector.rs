@@ -41,7 +41,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use coord_consensus::{
-    BallotConfiguration, FastAck, Learned, ProtocolMessage, Vote, VoteError, VoteSet,
+    BallotConfiguration, FastAck, Learned, ProtocolMessage, SubmissionRefusal, Vote, VoteError,
+    VoteSet,
 };
 use coord_core::capability::{ReleasedResult, admission_digest};
 use coord_core::event::{AdmittedRequest, PeerProvenance};
@@ -277,6 +278,19 @@ const OFFER_FLOOR_MILLIS: u64 = 25;
 /// and the acknowledgement would be lost for good.
 pub const OFFER_CEILING_MILLIS: u64 = 1_000;
 
+/// How long a pending command may hold neither half of a release --
+/// neither the learning predicate nor the leader's release -- before it
+/// is submitted to every voter again, in milliseconds (task-d22).
+///
+/// A voter answers a submission it already holds by publishing its
+/// evidence again, or by saying why it refuses it, so asking again is how
+/// an entry whose evidence was lost, dropped with a closed connection or
+/// voided by a ballot change gets it back. Well past the offer ceiling,
+/// so an ordinary command whose evidence is on its way is never asked
+/// twice. From the second time on, the entry may also be settled from
+/// this node's durable record of the command, if it has one.
+pub const SOLICIT_AFTER_MILLIS: u64 = 5 * OFFER_CEILING_MILLIS;
+
 /// What a submission produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Submitted {
@@ -336,6 +350,12 @@ pub enum EvidenceError {
     NotEvidence,
     /// A second, different release for the command.
     ReleaseMismatch,
+    /// A refusal from a replica that is not a voter of the current
+    /// configuration (task-d22).
+    NotAVoter {
+        /// Sender.
+        sender: ReplicaId,
+    },
     /// The leader's release of a command this collector already answered
     /// says something else than the answer it gave (task-d12).
     ///
@@ -355,6 +375,11 @@ pub enum HoldReason {
     AwaitingVotes,
     /// The leader's release-gate result has not arrived.
     AwaitingRelease,
+    /// A voter refused the submission in a way only the command's
+    /// durable record can answer: it holds the command under other
+    /// admission facts, or executed it long ago and forgot its payload
+    /// (task-d22). The entry is settled from this node's record.
+    AwaitingRecord,
 }
 
 /// A released result for a caller.
@@ -587,6 +612,20 @@ struct Pending {
     /// is the rule that keeps a client deadline from silently becoming
     /// the lifetime of work the domain has accepted.
     dissemination: Dissemination,
+    /// The submission, kept until the command settles so it can be sent
+    /// again to ask for evidence (task-d22). `dissemination` lets go of
+    /// its copy once every voter has taken it; this is the same bytes.
+    frame: Arc<[u8]>,
+    /// When the entry is next submitted again if it still holds neither
+    /// half of a release (task-d22).
+    solicit_at: MonotonicMillis,
+    /// How many times it has been.
+    solicited: u32,
+    /// Whether this node's durable record of the command may settle it
+    /// with nothing of the collector's own to corroborate it: a voter
+    /// refused it in a way only the record answers, it was asked for
+    /// more than once, or a ballot change voided what it held (task-d22).
+    from_record: bool,
 }
 
 /// The collector of one domain.
@@ -753,6 +792,10 @@ impl Collector {
                 attached: true,
                 deadline: deadline(now, request.deadline_ms),
                 timed_out: false,
+                frame: Arc::clone(&frame),
+                solicit_at: now.plus(SOLICIT_AFTER_MILLIS),
+                solicited: 0,
+                from_record: false,
                 dissemination: Dissemination {
                     envelope: Some(Arc::clone(&frame)),
                     reserved: bytes,
@@ -910,6 +953,51 @@ impl Collector {
         out
     }
 
+    /// Commands that have held neither half of a release -- neither the
+    /// learning predicate nor the leader's release -- for
+    /// [`SOLICIT_AFTER_MILLIS`], submitted to every voter again, at most
+    /// `budget` destinations in total (task-d22).
+    ///
+    /// A voter answers a submission it holds by publishing its evidence
+    /// again or by saying why it refuses it, so this is how an entry whose
+    /// evidence was lost, dropped with a closed connection or voided by a
+    /// ballot change gets it back. It is not delivery: the offer schedule
+    /// ([`Collector::due_offers`]) is about a voter taking the frame at
+    /// all, and this is about what a voter that took it said. From the
+    /// second time on the entry may be settled from this node's durable
+    /// record ([`Collector::settle_from_record`]).
+    pub fn due_solicits(&mut self, now: MonotonicMillis, budget: usize) -> Vec<FanOut> {
+        let voters: Vec<ReplicaId> = self.config.quorum.voters().iter().copied().collect();
+        let mut out = Vec::new();
+        let mut spent = 0usize;
+        for (command, entry) in &mut self.pending {
+            if spent + voters.len() > budget {
+                break;
+            }
+            if entry.solicit_at > now || entry.released.is_some() || entry.votes.learned().is_some()
+            {
+                continue;
+            }
+            entry.solicit_at = now.plus(SOLICIT_AFTER_MILLIS);
+            entry.solicited = entry.solicited.saturating_add(1);
+            if entry.solicited >= 2 {
+                entry.from_record = true;
+            }
+            spent += voters.len();
+            self.trace.push(CollectorEvent::Solicited {
+                command: command_hex(command),
+                times: entry.solicited,
+            });
+            out.push(FanOut {
+                command: *command,
+                retry_key: entry.retry_key,
+                targets: voters.clone(),
+                frame: Arc::clone(&entry.frame),
+            });
+        }
+        out
+    }
+
     /// A destination's link has come back: what it is owed on the
     /// congestion schedule falls due at `now` rather than at its own next
     /// attempt (task-d03).
@@ -967,6 +1055,17 @@ impl Collector {
             .min()
     }
 
+    /// When the next command holding neither half of a release is due to
+    /// be asked for again ([`Collector::due_solicits`]), for the runtime
+    /// to wake on (task-d22).
+    pub fn next_solicit(&self) -> Option<MonotonicMillis> {
+        self.pending
+            .values()
+            .filter(|entry| entry.released.is_none() && entry.votes.learned().is_none())
+            .map(|entry| entry.solicit_at)
+            .min()
+    }
+
     /// Commands that still owe a destination an enqueue (diagnostic).
     pub fn undelivered(&self) -> usize {
         self.pending
@@ -1020,6 +1119,9 @@ impl Collector {
             ),
             ProtocolMessage::FastAck(ack) => ("fast-ack", Vote::Fast(ack)),
             ProtocolMessage::SlowAck(ack) => ("slow-ack", Vote::Slow(ack)),
+            ProtocolMessage::Refused {
+                command, refusal, ..
+            } => return self.on_refused(sender, command, refusal),
             _ => return Err(EvidenceError::NotEvidence),
         };
         let command = vote.command();
@@ -1052,6 +1154,76 @@ impl Collector {
                 Err(e)
             }
         }
+    }
+
+    /// A voter refused `command` and said why (task-d22).
+    ///
+    /// A retry key the voter holds bound to another command ends the
+    /// entry with a conflict: the caller named another request under a
+    /// key that already has one, which no amount of waiting changes. The
+    /// answer is not kept for the key, so a later release of the command
+    /// is never compared with it; it is what this collector learned, not
+    /// what the domain decided. A command the voter holds under other
+    /// admission facts, or executed so long ago it kept no payload, is
+    /// one only its durable record can answer: the entry is settled from
+    /// this node's record.
+    fn on_refused(
+        &mut self,
+        sender: ReplicaId,
+        command: CommandId,
+        refusal: SubmissionRefusal,
+    ) -> Result<Progress, EvidenceError> {
+        let reason = match refusal {
+            SubmissionRefusal::OtherCommand { .. } => "other-command",
+            SubmissionRefusal::OtherFacts { .. } => "other-facts",
+            SubmissionRefusal::Forgotten => "forgotten",
+        };
+        if !self.config.quorum.voters().contains(&sender) {
+            self.trace.push(evidence_event(
+                &command,
+                &sender,
+                "refused",
+                false,
+                Some("not a voter".into()),
+            ));
+            return Err(EvidenceError::NotAVoter { sender });
+        }
+        if !self.pending.contains_key(&command) {
+            return if self.is_resolved(&command) {
+                Ok(Progress::Settled)
+            } else {
+                Err(EvidenceError::UnknownCommand)
+            };
+        }
+        self.trace.push(CollectorEvent::VoterRefused {
+            command: command_hex(&command),
+            from: replica_hex(&sender),
+            reason: reason.into(),
+        });
+        if let SubmissionRefusal::OtherCommand { .. } = refusal {
+            let entry = self.pending.remove(&command).expect("present");
+            self.undelivered_bytes = self
+                .undelivered_bytes
+                .saturating_sub(entry.dissemination.reserved);
+            self.bindings.remove(&entry.retry_key);
+            let response = codes::error_response(
+                command,
+                codes::REQUEST_IDENTITY_CONFLICT,
+                "a voter holds the retry key bound to another request",
+            );
+            return Ok(Progress::Released(Release {
+                retry_key: entry.retry_key,
+                command,
+                session: entry.session,
+                response,
+                speculative: false,
+                fast: false,
+                attached: entry.attached,
+            }));
+        }
+        let entry = self.pending.get_mut(&command).expect("present");
+        entry.from_record = true;
+        Ok(Progress::Held(HoldReason::AwaitingRecord))
     }
 
     /// Take the leader's release-gate result.
@@ -1273,10 +1445,14 @@ impl Collector {
     /// are the ones something arrived for and something else did not,
     /// which is the shape a lost frontend delivery leaves behind, and the
     /// only shape the durable record is consulted for.
+    ///
+    /// Also every entry the record may settle alone (task-d22): one a
+    /// voter refused in a way only the record answers, one asked for
+    /// more than once, and every one a ballot change voided.
     pub fn half_established(&self) -> Vec<(CommandId, RetryKey)> {
         self.pending
             .iter()
-            .filter(|(_, e)| e.votes.learned().is_some() != e.released.is_some())
+            .filter(|(_, e)| e.from_record || e.votes.learned().is_some() != e.released.is_some())
             .map(|(c, e)| (*c, e.retry_key))
             .collect()
     }
@@ -1342,6 +1518,7 @@ impl Collector {
                 "release"
             }
             (None, true) => "votes",
+            (None, false) if entry.from_record => "record",
             (None, false) => return Err(SettleError::Uncorroborated),
         };
         let entry = self.pending.remove(&command).expect("present");
@@ -1437,6 +1614,13 @@ impl Collector {
         for (command, entry) in &mut self.pending {
             entry.votes = VoteSet::new(quorum.clone(), *command);
             entry.released = None;
+            // What it held is void and nothing sends it again by itself:
+            // a command that executed under the old ballot produces no
+            // evidence under the new one. So every entry is asked for
+            // again at once, and may be settled from this node's record
+            // (task-d22).
+            entry.solicit_at = MonotonicMillis::ZERO;
+            entry.from_record = true;
             // Delivery follows the committed configuration, the same as
             // evidence does. A replica that is no longer a voter is no
             // longer a destination and stops being owed anything; one

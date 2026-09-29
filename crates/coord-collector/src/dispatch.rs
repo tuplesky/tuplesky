@@ -454,6 +454,23 @@ impl Dispatcher {
         self.collector.due_offers(now, budget)
     }
 
+    /// Commands that have held neither half of a release long enough,
+    /// submitted to every voter again (task-d22); see
+    /// [`crate::Collector::due_solicits`].
+    pub fn due_solicits(
+        &mut self,
+        now: MonotonicMillis,
+        budget: usize,
+    ) -> Vec<crate::collector::FanOut> {
+        self.collector.due_solicits(now, budget)
+    }
+
+    /// When the next of those falls due; see
+    /// [`crate::Collector::next_solicit`].
+    pub fn next_solicit(&self) -> Option<MonotonicMillis> {
+        self.collector.next_solicit()
+    }
+
     /// A destination's link has come back; its re-offers fall due now
     /// (see [`crate::collector::Collector::reachable_again`]).
     pub fn reachable_again(
@@ -497,7 +514,8 @@ impl Dispatcher {
     }
 
     /// Pending commands the collector holds half of a release for
-    /// (task-c02): the ones a durable record is consulted for.
+    /// (task-c02), and those the record may settle alone (task-d22): the
+    /// ones a durable record is consulted for.
     pub fn half_established(&self) -> Vec<(CommandId, RetryKey)> {
         self.collector.half_established()
     }

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::ballot::{BallotState, ConfigurationIdentity, PromiseRejection, ReplicaRole};
 use crate::commands::{CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
-use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage};
+use crate::messages::{MAX_PAYLOAD_TRANSFER, PathAnchors, ProtocolMessage, SubmissionRefusal};
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryReport, SyncDecision};
@@ -1372,10 +1372,15 @@ impl Leader {
         // presenting it may never have received this leader's reply.
         match self.bindings.get(&request.retry_key) {
             Some(bound) if *bound != command => {
+                let bound = *bound;
                 self.rejections.push(Rejection::RequestIdentityConflict {
                     retry_key: request.retry_key,
-                    bound: *bound,
+                    bound,
                 });
+                // Said only once the binding is durable (task-d22).
+                if self.served_payloads.contains(&bound) {
+                    return self.refuse(command, SubmissionRefusal::OtherCommand { bound });
+                }
                 return Vec::new();
             }
             Some(_) => {
@@ -1391,11 +1396,11 @@ impl Leader {
                     Some(accepted) => {
                         self.rejections
                             .push(Rejection::RequestFactsConflict { command, accepted });
-                        Vec::new()
+                        self.refuse(command, SubmissionRefusal::OtherFacts { accepted })
                     }
                     None => {
                         self.rejections.push(Rejection::Duplicate(command));
-                        Vec::new()
+                        self.refuse(command, SubmissionRefusal::Forgotten)
                     }
                 };
             }
@@ -1424,7 +1429,12 @@ impl Leader {
             }
             Err(InitError::PayloadConflict) => {
                 self.rejections.push(Rejection::PayloadConflict(command));
-                return Vec::new();
+                return match self.table.record(&command).and_then(|r| r.payload) {
+                    Some(accepted) => {
+                        self.refuse(command, SubmissionRefusal::OtherFacts { accepted })
+                    }
+                    None => Vec::new(),
+                };
             }
         };
         self.bindings.insert(request.retry_key, command);
@@ -1746,6 +1756,33 @@ impl Leader {
             .map_or_else(Vec::new, |o| o.release(&promised))
     }
 
+    /// Tell the frontend that submitted `command` why this replica did
+    /// nothing with it (task-d22): a refusal with no effect left the
+    /// collector's entry pending for good. Not durable, and not needed to
+    /// be: a collector that misses it solicits again.
+    fn refuse(&mut self, command: CommandId, refusal: SubmissionRefusal) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let ballot = self.config.quorum.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let frame = ProtocolMessage::Refused {
+            ballot,
+            command,
+            refusal,
+        }
+        .encode();
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: self.config.frontend,
+                frame,
+            });
+        }
+        self.release()
+    }
+
     /// Offer the submitter the reply this leader already published for
     /// `command`, because a submission naming it arrived again.
     ///
@@ -1916,6 +1953,7 @@ impl Leader {
             | ProtocolMessage::Proposal(_)
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::LeaderReply { .. }
+            | ProtocolMessage::Refused { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }

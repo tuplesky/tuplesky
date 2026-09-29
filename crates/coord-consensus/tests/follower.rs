@@ -252,7 +252,14 @@ fn fast_votes_wait_for_durable_payload_dependencies_and_path() {
         "the same acknowledgement, not a new one: {:?}",
         again[0].1
     );
-    assert!(fast.step(admitted(1, 1, 7).0).is_empty());
+    // Answered, to the frontend only, with why (task-d22).
+    let refused = sends(&fast.step(admitted(1, 1, 7).0));
+    assert!(
+        matches!(refused.as_slice(), [(to, ProtocolMessage::Refused {
+            refusal: coord_consensus::SubmissionRefusal::OtherCommand { bound }, ..
+        })] if *to == FRONTEND.replica && *bound == c1),
+        "{refused:?}"
+    );
     let rejections = fast.take_rejections();
     assert_eq!(rejections[0], FollowerRejection::Duplicate(c1));
     assert!(matches!(
@@ -756,7 +763,15 @@ fn recovery_rebuilds_retry_key_bindings_from_durable_payloads() {
     // The same retry key with other bytes derives another command; without
     // the rebuilt binding it would be admitted as a second command.
     let other = admitted_with_key(1, 9, 9);
-    assert!(recovered.step(other.0).is_empty());
+    // Refused with the reason, since the binding is durable (task-d22).
+    let refused = recovered.step(other.0);
+    assert!(
+        refused.iter().all(|e| matches!(e, Effect::SendWhenDurable { to, frame, .. }
+            if *to == FRONTEND && matches!(ProtocolMessage::decode(frame),
+                Ok(ProtocolMessage::Refused { refusal: coord_consensus::SubmissionRefusal::OtherCommand { bound }, .. }) if bound == c1)))
+            && refused.len() == 1,
+        "{refused:?}"
+    );
     assert_eq!(
         recovered.take_rejections(),
         vec![FollowerRejection::RequestIdentityConflict {

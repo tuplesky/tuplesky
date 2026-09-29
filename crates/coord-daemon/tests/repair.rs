@@ -274,7 +274,13 @@ fn logical(sequence: u64) -> LogicalRequest {
 /// One admitted client request, as the collector's admission gate
 /// hands it to the collector.
 fn admitted(sequence: u64) -> AdmittedRequest {
-    let request = RequestV1::new(retry_key(sequence), &logical(sequence), 0, 0).unwrap();
+    admitted_as(sequence, &logical(sequence), 7)
+}
+
+/// `sequence`'s retry key over `logical`, under the admission receipt
+/// `receipt`.
+fn admitted_as(sequence: u64, logical: &LogicalRequest, receipt: u8) -> AdmittedRequest {
+    let request = RequestV1::new(retry_key(sequence), logical, 0, 0).unwrap();
     AdmittedRequest {
         receipt: AdmissionReceipt::submitting(
             VerifierToken::for_boundary(),
@@ -284,7 +290,7 @@ fn admitted(sequence: u64) -> AdmittedRequest {
                 session: SESSION,
                 rule_generation: 1,
                 scope_ceiling: u32::MAX,
-                receipt_id: Digest32([7; 32]),
+                receipt_id: Digest32([receipt; 32]),
                 admitted_at_ticks: 0,
             },
         ),
@@ -317,6 +323,9 @@ enum Lose {
     Nothing,
     /// Every release the leader publishes.
     Releases,
+    /// Every frame, evidence and releases alike: what a frontend whose
+    /// connections all closed would have missed.
+    Everything,
 }
 
 /// Three voters, the collector that submitted to them, and the frontend
@@ -439,6 +448,9 @@ impl Cluster {
     /// One frame reaches the collector under the voter's committed
     /// identity.
     fn hand_to_collector(&mut self, from: usize, f: &Frame) {
+        if self.lose == Lose::Everything {
+            return;
+        }
         let prov = self.voters[from].provenance();
         let result = match f.kind {
             KIND_EVIDENCE => self
@@ -1283,4 +1295,180 @@ fn a_leader_that_missed_the_election_authorizes_nothing() {
     w.settle();
     assert!(w.releases.iter().any(|r| r.command == command));
     assert_eq!(&w.executed()[1..], [2, 2]);
+}
+
+/// A command that executed under a ballot that changed before any of its
+/// evidence reached the collector settles under the new one (task-d22).
+///
+/// Everything the voters published for the command was lost, the leader
+/// stopped and a follower won the next ballot. The new ballot produces no
+/// evidence for a command already executed, and a duplicate of the
+/// submission replays none across the ballot change, so nothing was ever
+/// going to arrive. The ballot change asks for the entry again at once and
+/// lets this node's durable record settle it.
+#[test]
+fn a_command_executed_under_a_changed_ballot_settles_under_the_new_one() {
+    let mut w = Cluster::new(256);
+    w.lose = Lose::Everything;
+    let submit = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &submit);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1]);
+    assert!(w.collector.is_pending(&command));
+    assert!(w.collector.half_established().is_empty());
+
+    // The leader stops and a follower wins the next ballot.
+    w.down = Some(0);
+    let (campaigned, out) = w.voters[1]
+        .campaign()
+        .expect("stepped")
+        .expect("a follower campaigns");
+    w.carry(1, out);
+    w.settle();
+    assert!(w.voters[1].leads());
+    w.lose = Lose::Nothing;
+    w.collector.reconfigure(
+        BallotConfiguration::c2_default(epoch(), campaigned, (0..3).map(r).collect()).unwrap(),
+    );
+
+    // Asked for again at once: the survivors answer the duplicate, and
+    // nothing they can say settles it.
+    let asked = w.collector.due_solicits(MonotonicMillis::new(1), 16);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].command, command);
+    for i in 1..3 {
+        w.deliver_submission(i, &asked[0].frame);
+    }
+    w.settle();
+    assert!(w.collector.is_pending(&command));
+
+    // The record settles it, under the new ballot.
+    let half = w.collector.half_established();
+    assert_eq!(half, vec![(command, retry_key(1))]);
+    let records = records_for(w.voters[1].node().applier(), half);
+    let (_, record) = &records[0];
+    let progress = w
+        .collector
+        .settle_from_record(
+            command,
+            record.result_digest,
+            record.position,
+            record.revision,
+            &record.response,
+        )
+        .expect("settled");
+    assert!(matches!(progress, Progress::Released(_)), "{progress:?}");
+    assert!(!w.collector.is_pending(&command));
+}
+
+/// A retry under other admission facts, through a frontend that no longer
+/// holds the first answer: every voter refuses it and says so, and the
+/// entry is answered from the durable record of the command (task-d22).
+/// Before, the refusal produced nothing, and the entry held its slot for
+/// good.
+#[test]
+fn a_retry_under_other_facts_is_answered_from_the_record() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    let command = w.command(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+    }
+    w.settle();
+    assert_eq!(w.releases.len(), 1);
+
+    // A frontend that restarted: nothing of the first answer is left.
+    w.collector = Collector::new(CollectorConfig {
+        quorum: quorum(),
+        max_pending: 16,
+        max_resolved: 16,
+        max_undelivered_bytes: usize::MAX,
+    });
+    let Submitted::FanOut(retry) = w
+        .collector
+        .submit(MonotonicMillis::ZERO, &admitted_as(1, &logical(1), 8))
+        .expect("submitted")
+    else {
+        panic!("new work here");
+    };
+    assert_eq!(retry.command, command);
+    w.progress.clear();
+    for i in 0..3 {
+        w.deliver_submission(i, &retry.frame);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1], "nothing executed twice");
+    assert!(
+        w.progress
+            .iter()
+            .any(|(_, p)| *p == Progress::Held(HoldReason::AwaitingRecord)),
+        "no voter said why: {:?} {:?}",
+        w.progress,
+        w.rejected
+    );
+    let half = w.collector.half_established();
+    assert_eq!(half, vec![(command, retry_key(1))]);
+    let records = records_for(w.voters[0].node().applier(), half);
+    let (_, record) = &records[0];
+    let progress = w
+        .collector
+        .settle_from_record(
+            command,
+            record.result_digest,
+            record.position,
+            record.revision,
+            &record.response,
+        )
+        .expect("settled");
+    let Progress::Released(release) = progress else {
+        panic!("{progress:?}");
+    };
+    assert_eq!(release.response, w.releases[0].response, "the same answer");
+}
+
+/// Another request under a retry key the voters hold bound: every voter
+/// refuses it and says so, and the entry ends with a conflict rather than
+/// holding its slot (task-d22).
+#[test]
+fn another_request_under_a_bound_key_ends_with_a_conflict() {
+    let mut w = Cluster::new(256);
+    let first = w.submit(1);
+    for i in 0..3 {
+        w.deliver_submission(i, &first);
+    }
+    w.settle();
+    assert_eq!(w.releases.len(), 1);
+
+    w.collector = Collector::new(CollectorConfig {
+        quorum: quorum(),
+        max_pending: 16,
+        max_resolved: 16,
+        max_undelivered_bytes: usize::MAX,
+    });
+    // The same key over other bytes: another command.
+    let other = logical(2);
+    let Submitted::FanOut(retry) = w
+        .collector
+        .submit(MonotonicMillis::ZERO, &admitted_as(1, &other, 7))
+        .expect("submitted")
+    else {
+        panic!("new work here");
+    };
+    assert_ne!(retry.command, w.command(1));
+    w.releases.clear();
+    for i in 0..3 {
+        w.deliver_submission(i, &retry.frame);
+    }
+    w.settle();
+    assert_eq!(w.executed(), [1, 1, 1], "nothing executed");
+    assert_eq!(w.releases.len(), 1, "{:?} {:?}", w.progress, w.rejected);
+    assert!(matches!(
+        w.releases[0].response.outcome,
+        coord_types::wire_v1::OutcomeV1::Err { code, .. }
+            if code == coord_types::wire_v1::codes::REQUEST_IDENTITY_CONFLICT
+    ));
+    assert_eq!(w.collector.pending(), 0);
 }
