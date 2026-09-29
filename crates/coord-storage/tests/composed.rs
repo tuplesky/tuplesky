@@ -370,6 +370,70 @@ fn another_batchs_completion_never_completes_this_application() {
     );
 }
 
+/// A protocol batch queued ahead of a command is neither taken for the
+/// command nor lost by it.
+///
+/// The applier and the protocol machine allocate barriers for the same
+/// boot and hand them to the same store, and both counted from one. So
+/// the applier's barrier for a command could be a vote's that was still
+/// queued: one lowering takes one batch, the vote's `Materialized` named
+/// the command's barrier, and the command was reported applied while its
+/// own batch was still queued. And whatever the lowerings made durable
+/// for the vote was dropped, so the send waiting on it never went.
+#[test]
+fn a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost() {
+    use coord_core::event::StorageEvent;
+
+    let mut applier = journaled();
+    // The protocol machine's allocator for the same boot. The fixture's
+    // bootstrap took the first sequence, so the second is the one an
+    // applier counting from one issued next.
+    let mut protocol = BarrierAllocator::new(inc(), BOOT);
+    let _ = protocol.allocate();
+    let vote = protocol.allocate();
+    applier
+        .store_mut()
+        .submit(
+            PersistBatch {
+                barrier: vote,
+                base: None,
+                updates: vec![coord_core::effect::StoreUpdate {
+                    collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+                    key: b"vote".to_vec(),
+                    value: Some(b"accepted".to_vec()),
+                }],
+            },
+            TransitionKind::Protocol,
+        )
+        .expect("queued");
+    assert_eq!(applier.store().queued(), 1);
+
+    let (command, record) = payload(1, &put(b"k", b"v"));
+    let applied = applier.apply(command, &record).expect("applied");
+
+    // The command's own batch is readable, not still queued behind the
+    // vote.
+    assert_eq!(applier.store().queued(), 0, "the command's batch is queued");
+    assert_eq!(
+        Some(applier.kv_revision().unwrap()),
+        applied.revision,
+        "reported applied before its own batch was readable"
+    );
+
+    // What the lowering made of the vote is handed back, and only that.
+    let foreign = applier.take_foreign();
+    assert!(
+        foreign.iter().any(|e| matches!(e,
+            StorageEvent::JournalDurable { barrier_id, .. } if *barrier_id == vote)),
+        "the vote's durability was dropped: {foreign:?}"
+    );
+    assert!(
+        foreign.iter().all(|e| e.barrier() == Some(vote)),
+        "the applier handed back its own batch's facts: {foreign:?}"
+    );
+    assert!(applier.take_foreign().is_empty(), "handed back twice");
+}
+
 /// A command that has been applied is resolved from its retained result
 /// on a retry, never executed a second time.
 ///

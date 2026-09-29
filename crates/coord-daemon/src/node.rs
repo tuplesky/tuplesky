@@ -480,6 +480,9 @@ pub struct Node<P: Persistence> {
     order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
+    /// Storage facts reached the outbox outside a round, so it may hold
+    /// sends they released that no round has handed out yet.
+    unreleased: bool,
 }
 
 impl<P: Persistence> Node<P> {
@@ -501,6 +504,7 @@ impl<P: Persistence> Node<P> {
             won: None,
             order: None,
             pages_served: 0,
+            unreleased: false,
         }
     }
 
@@ -837,14 +841,19 @@ impl<P: Persistence> Node<P> {
     fn carry_out(&mut self, effects: Vec<Effect>, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let mut out = Outbound::default();
         let mut queue = effects;
+        self.absorb_foreign(&mut queue);
+        // A round releases what became durable, so one runs even with
+        // nothing to carry out when the facts arrived outside a round.
+        let mut release = core::mem::take(&mut self.unreleased);
         // A bound on rounds, not on work: every round must make progress
         // through storage, and a machine that answered its own storage
         // facts with more storage facts for ever would otherwise spin
         // here rather than be visible as a fault.
         for _ in 0..MAX_ROUNDS {
-            if queue.is_empty() {
+            if queue.is_empty() && !release {
                 return Ok(out);
             }
+            release = false;
             self.rounds += 1;
             let (round, next) = self.one_round(queue, ballot)?;
             out.absorb(round);
@@ -1036,20 +1045,52 @@ impl<P: Persistence> Node<P> {
     /// the machine; the machine's answers join `next`.
     fn lower_once(&mut self, next: &mut Vec<Effect>) -> Result<(), DriveError> {
         let store = self.applier.store_mut();
-        let outcome = Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
-            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+        let mut outcome =
+            Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
+                .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
         // Indeterminate is not "failed": the group's outcome is unknown,
-        // so the caller reconciles rather than assuming either answer. It
-        // surfaces as an engine failure here so it cannot be mistaken for
-        // a clean round.
+        // and what settles it is the store's own record, read back by a
+        // reconcile, never an assumption either way. It is settled here,
+        // as the applier settles its own. Left for later, the store
+        // refused every protocol batch after it as not ready, and the
+        // only reconcile that ran was the applier's, when a command next
+        // executed: on a replica whose next command waits on the very
+        // votes that batch carried, never.
         if outcome.indeterminate {
-            return Err(DriveError::Engine("group outcome indeterminate".into()));
+            let settled = self
+                .applier
+                .store_mut()
+                .reconcile()
+                .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+            outcome.events.extend(settled.events);
+            outcome.indeterminate = settled.indeterminate;
         }
         for event in outcome.events {
             self.outbox.observe(&event);
             next.extend(self.machine_mut().step(Event::Storage(event)));
         }
+        // Still unknown after a reconcile: an engine failure, so it
+        // cannot be mistaken for a clean round.
+        if outcome.indeterminate {
+            return Err(DriveError::Engine("group outcome indeterminate".into()));
+        }
         Ok(())
+    }
+
+    /// Hand the storage facts the applier met about other batches to the
+    /// outbox and the machine; the machine's answers join `next`.
+    ///
+    /// Applying a command lowers whatever the store had queued, and
+    /// reconciling settles whatever was uncertain, the protocol's
+    /// batches with the application's. The facts about those batches are
+    /// this node's to deliver, and the sends they release go out with
+    /// the next round.
+    fn absorb_foreign(&mut self, next: &mut Vec<Effect>) {
+        for event in self.applier.take_foreign() {
+            self.unreleased = true;
+            self.outbox.observe(&event);
+            next.extend(self.machine_mut().step(Event::Storage(event)));
+        }
     }
 
     /// Lower what is queued until the store has room for `batch`.
@@ -1141,7 +1182,11 @@ impl<P: Persistence> Node<P> {
             {
                 self.order = None;
             }
-            let effects = self.machine_mut().applied(command, &outcome)?;
+            // What the apply's lowerings made durable for other batches
+            // happened before the command's own outcome.
+            let mut effects = Vec::new();
+            self.absorb_foreign(&mut effects);
+            effects.extend(self.machine_mut().applied(command, &outcome)?);
             out.absorb(self.carry_out(effects, ballot)?);
         }
         Ok(out)

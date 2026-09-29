@@ -7504,3 +7504,41 @@ the campaigns of the faulty phase were superseded before the ceiling.
 - The seventeen seeds that failed on the way, under the oracles or as
   the recovery rule was narrowed, are kept in
   `fixtures/protocol_sim/seeds.json` and replayed by default.
+
+## The applier's lowerings and the protocol's barriers
+
+Found while planning task-d27, whose floor batches go through the same
+store as the protocol's and the application's.
+
+- **Two allocators, one sequence.** The protocol machine and the applier
+  each allocated barriers for the same boot, both from one, and a store
+  tells barriers apart only by that sequence. A lowering takes one batch
+  per domain. So when a vote was still queued under the sequence the
+  applier issued next, the vote's `Materialized` completed the command:
+  it was reported applied while its own batch was still queued. A
+  catch-up window, one protocol barrier for many commands, lets the
+  application's count reach the protocol's. The applier now takes the
+  upper half of the sequences (`APPLICATION_BARRIERS`), and a protocol
+  allocator stops short of it.
+- **What the applier lowered for others was dropped.** Completing a
+  command lowers whatever is queued, and reconciling settles whatever
+  was uncertain, the protocol's batches with the application's. Both
+  outcomes were thrown away, so a vote or promise made durable there
+  never released the send waiting on it, until a new ballot or a
+  restart. The applier now keeps those facts (`Applier::take_foreign`),
+  and the node hands them to the outbox and the machine before the
+  command's own outcome, then releases what they made durable.
+- **An uncertain append waited for a command.** The node surfaced an
+  indeterminate lowering as a failed round and never reconciled it. The
+  domain then refused every protocol batch as not ready, and only the
+  applier's reconcile, when a command next executed, cleared it: on a
+  follower whose next command waited on the very vote that append
+  carried, nothing did. The node now reconciles at once, as the applier
+  does, and fails the round only if the outcome is still unknown.
+- Tests: `a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost`
+  (coord-storage, `composed`) fails with the allocator shared ("the
+  command's batch is queued") and with the facts dropped ("the vote's
+  durability was dropped");
+  `a_vote_whose_append_ended_uncertain_is_reconciled_and_released`
+  (coord-daemon, `node`) fails without the node's reconcile ("group
+  outcome indeterminate").
