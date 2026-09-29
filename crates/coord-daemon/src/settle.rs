@@ -75,6 +75,25 @@ pub fn records_for<P: Persistence>(
         .collect()
 }
 
+/// The half-established commands whose retry key this node's store holds
+/// bound to another command, with that command (task-d22): the domain
+/// executed the other one under the key, and these are rejected wherever
+/// they execute. Read from one snapshot, as [`records_for`].
+pub fn conflicts_for<P: Persistence>(
+    applier: &Applier<P>,
+    half: impl IntoIterator<Item = (CommandId, RetryKey)>,
+) -> Vec<(CommandId, CommandId)> {
+    let Ok(gated) = applier.store().reader().snapshot() else {
+        return Vec::new();
+    };
+    half.into_iter()
+        .filter_map(|(command, key)| {
+            let record = coord_storage::retry::lookup(gated.view(), &key).ok()??;
+            (record.command_id != command).then_some((command, record.command_id))
+        })
+        .collect()
+}
+
 /// What one turn of settling from records sends, or the command that
 /// stopped it.
 #[derive(Debug, PartialEq, Eq)]

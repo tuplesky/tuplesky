@@ -48,7 +48,9 @@ use coord_core::outbox::BarrierAllocator;
 use coord_daemon::mailbox::{Ingress, IngressBudget};
 use coord_daemon::node::{Machine, Node, Outbound};
 use coord_daemon::parked::Parked;
-use coord_daemon::settle::{NEAR_POSITIONS, Settled, executed_near, offer, records_for};
+use coord_daemon::settle::{
+    NEAR_POSITIONS, Settled, conflicts_for, executed_near, offer, records_for,
+};
 use coord_daemon::voter::{Origin, Voter};
 use coord_membership::genesis::{GenesisManifest, VoterSeed};
 use coord_membership::membership::Membership;
@@ -1464,9 +1466,27 @@ fn another_request_under_a_bound_key_ends_with_a_conflict() {
     }
     w.settle();
     assert_eq!(w.executed(), [1, 1, 1], "nothing executed");
-    assert_eq!(w.releases.len(), 1, "{:?} {:?}", w.progress, w.rejected);
+    // Every voter refused it; one voter's word ends nothing (Codex
+    // review), so the entry waits for this node's record of the key.
+    assert!(w.releases.is_empty(), "{:?}", w.releases);
+    assert!(w.collector.is_pending(&retry.command));
+    let half = w.collector.half_established();
+    assert!(
+        records_for(w.voters[0].node().applier(), half.clone()).is_empty(),
+        "no record of this command"
+    );
+    let conflicts = conflicts_for(w.voters[0].node().applier(), half);
+    assert_eq!(conflicts, vec![(retry.command, w.command(1))]);
+    let (command, bound) = conflicts[0];
+    let Progress::Released(release) = w
+        .collector
+        .settle_conflict_from_record(command, bound)
+        .expect("settled")
+    else {
+        panic!("released");
+    };
     assert!(matches!(
-        w.releases[0].response.outcome,
+        release.response.outcome,
         coord_types::wire_v1::OutcomeV1::Err { code, .. }
             if code == coord_types::wire_v1::codes::REQUEST_IDENTITY_CONFLICT
     ));

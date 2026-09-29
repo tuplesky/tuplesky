@@ -543,6 +543,18 @@ impl Dispatcher {
         Ok(self.deliver(progress))
     }
 
+    /// [`crate::Collector::settle_conflict_from_record`], then account the
+    /// release as any other: the session slot is freed and the attached
+    /// caller answered.
+    pub fn settle_conflict_from_record(
+        &mut self,
+        command: CommandId,
+        bound: CommandId,
+    ) -> Result<Option<Delivery>, crate::collector::SettleError> {
+        let progress = self.collector.settle_conflict_from_record(command, bound)?;
+        Ok(self.deliver(progress))
+    }
+
     fn deliver(&mut self, progress: Progress) -> Option<Delivery> {
         let Progress::Released(release) = progress else {
             return None;

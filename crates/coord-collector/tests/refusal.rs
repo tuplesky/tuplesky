@@ -149,31 +149,24 @@ fn refused_retries_free_every_pending_slot() {
             }
         };
         let progress = c.on_evidence(from(1), refused(*command, refusal)).unwrap();
-        match refusal {
-            SubmissionRefusal::OtherCommand { .. } => {
-                let Progress::Released(release) = progress else {
-                    panic!("{progress:?}");
-                };
-                assert!(matches!(
-                    release.response.outcome,
-                    OutcomeV1::Err { code, .. } if code == codes::REQUEST_IDENTITY_CONFLICT
-                ));
+        assert_eq!(progress, Progress::Held(HoldReason::AwaitingRecord));
+        // This node's record of the key answers it: the other command it
+        // binds, or this command's execution.
+        let settled = match refusal {
+            SubmissionRefusal::OtherCommand { bound } => {
+                c.settle_conflict_from_record(*command, bound).unwrap()
             }
-            _ => {
-                assert_eq!(progress, Progress::Held(HoldReason::AwaitingRecord));
-                // This node's record of the execution answers it.
-                let settled = c
-                    .settle_from_record(
-                        *command,
-                        Digest32([1; 32]),
-                        ExecutionPosition::new(i as u64 + 1).unwrap(),
-                        None,
-                        b"done",
-                    )
-                    .unwrap();
-                assert!(matches!(settled, Progress::Released(_)), "{settled:?}");
-            }
-        }
+            _ => c
+                .settle_from_record(
+                    *command,
+                    Digest32([1; 32]),
+                    ExecutionPosition::new(i as u64 + 1).unwrap(),
+                    None,
+                    b"done",
+                )
+                .unwrap(),
+        };
+        assert!(matches!(settled, Progress::Released(_)), "{settled:?}");
     }
     assert_eq!(c.pending(), 0);
     assert!(matches!(
@@ -182,9 +175,10 @@ fn refused_retries_free_every_pending_slot() {
     ));
 }
 
-/// A retry key a voter holds bound to another request ends the entry
-/// with a conflict, and the answer is not kept for the key: a later
-/// release of the command is not compared with it.
+/// A retry key a voter holds bound to another request holds the entry
+/// for the record; this node's record of the key, bound to the other
+/// request, ends it with a conflict. The answer is not kept for the key:
+/// a later release of the command is not compared with it.
 #[test]
 fn a_key_bound_to_another_request_ends_the_entry_with_a_conflict() {
     let mut c = collector(4);
@@ -196,6 +190,10 @@ fn a_key_bound_to_another_request_ends_the_entry_with_a_conflict() {
             refused(command, SubmissionRefusal::OtherCommand { bound }),
         )
         .unwrap();
+    assert_eq!(progress, Progress::Held(HoldReason::AwaitingRecord));
+    // A record naming the command itself is not a conflict.
+    assert!(c.settle_conflict_from_record(command, command).is_err());
+    let progress = c.settle_conflict_from_record(command, bound).unwrap();
     let Progress::Released(release) = progress else {
         panic!("{progress:?}");
     };
@@ -218,6 +216,30 @@ fn a_key_bound_to_another_request_ends_the_entry_with_a_conflict() {
         e,
         CollectorEvent::VoterRefused { reason, .. } if reason == "other-command"
     )));
+}
+
+/// One voter's refusal is not the domain's decision (Codex review): a
+/// minority voter that saw another presentation of the key first refuses
+/// the command, while a quorum accepts and executes it. The entry is held,
+/// and settles from the votes and the leader's release as any other.
+#[test]
+fn a_minority_voter_bound_to_another_request_does_not_end_the_entry() {
+    let mut c = collector(4);
+    let command = submit(&mut c, 1);
+    let bound = CommandId(Digest32([9; 32]));
+    assert_eq!(
+        c.on_evidence(
+            from(2),
+            refused(command, SubmissionRefusal::OtherCommand { bound })
+        ),
+        Ok(Progress::Held(HoldReason::AwaitingRecord))
+    );
+    assert!(
+        c.is_pending(&command),
+        "the entry was ended on one voter's word"
+    );
+    // Nothing without a record settles it either.
+    assert!(c.half_established().iter().any(|(k, _)| *k == command));
 }
 
 /// A command a voter holds under other admission facts, or executed so

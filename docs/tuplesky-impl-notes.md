@@ -6532,16 +6532,25 @@ connection was dropped the same way.
   - Nothing is persisted for it. A collector that misses the reply asks
     again.
 - **The collector settles on it** (`Collector::on_evidence`):
-  - `OtherCommand` ends the entry with `REQUEST_IDENTITY_CONFLICT`. The
-    caller named another request under a key that already has one, and
-    no waiting changes that. The answer is not kept in the resolved
-    window, so a later release of the command is never compared with it.
-    It is what this collector learned, not what the domain decided.
-  - `OtherFacts` and `Forgotten` hold the entry for its record
-    (`HoldReason::AwaitingRecord`). Only the command's durable record can
-    answer it, and this node's record, the same one that already answers
+  - All three hold the entry for the record
+    (`HoldReason::AwaitingRecord`). One voter's refusal is not the
+    domain's decision: a minority voter that saw another presentation of
+    the key first refuses a command a quorum goes on to execute (Codex
+    review). The entry still settles from votes and a release as any
+    other.
+  - For `OtherFacts` and `Forgotten`, only the command's durable record
+    can answer it. This node's record, the same one that already answers
     a caller's retry, settles it with nothing of the collector's own to
     corroborate it (`SettledFromRecord { corroborated: "record" }`).
+  - For `OtherCommand`, the record that answers it is this node's record
+    of the retry key bound to another command
+    (`Collector::settle_conflict_from_record`, read in `coordd` through
+    `settle::conflicts_for`). The domain executed that command under the
+    key, and this one is rejected wherever it executes, with nothing
+    mutated. So the entry ends with `REQUEST_IDENTITY_CONFLICT`
+    (`corroborated: "other-command"`). The answer is not kept in the
+    resolved window, so the command's own release, a rejection at its
+    position, is never compared with it.
   - A refusal from a replica that is not a voter is not counted
     (`EvidenceError::NotAVoter`).
 - **An entry holding neither half is asked for again.** A pending entry
@@ -6577,7 +6586,8 @@ connection was dropped the same way.
 - `a_key_bound_to_another_request_ends_the_entry_with_a_conflict`,
   `other_facts_and_a_forgotten_duplicate_are_answered_from_the_record`,
   `a_refusal_from_a_stranger_is_not_counted`,
-  `an_entry_holding_nothing_is_asked_for_again_then_settled_from_the_record`
+  `an_entry_holding_nothing_is_asked_for_again_then_settled_from_the_record`,
+  `a_minority_voter_bound_to_another_request_does_not_end_the_entry`
   and `a_ballot_change_asks_for_every_entry_again` (same file): each
   refusal kind with its reply and settled entry, and the solicitation
   schedule.
@@ -6586,7 +6596,10 @@ connection was dropped the same way.
     frontend presents a command again under another receipt. Every
     voter refuses it and says why, and the entry settles with the first
     answer, with nothing executed twice.
-  - `another_request_under_a_bound_key_ends_with_a_conflict`.
+  - `another_request_under_a_bound_key_ends_with_a_conflict`: every
+    voter refuses another request under a bound key, the entry waits,
+    and this node's record of the key, bound to the first command, ends
+    it with a conflict.
   - `a_command_executed_under_a_changed_ballot_settles_under_the_new_one`:
     every frame to the collector is lost, the leader stops and a
     follower wins. The entry is asked for again at once and settles from
