@@ -6176,12 +6176,27 @@ Seeds that once failed are kept in
 
 ### What is left
 
-- At 100 seeds per row and size, 14 of 1,000 runs still fail. The
+- At 100 seeds per row and size, 14 of 1,000 runs still failed. The
   sampled traces show the design question recorded under task-d34 (a
   fast decision whose only reporting fast-set member recorded the
   leader's path for commands it had not adopted) and further
   stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
   seeds, not at every seed.
+- **With the leader's own adoption (#116, option 1) merged:**
+  - Default seeds: all 120 runs pass.
+  - 40 seeds: 2 of 400 runs fail, against 6 before.
+  - 100 seeds: 8 of 1,000 fail, against 14.
+  - Catch-up at the default seeds: 1 of 120 fails, against 3.
+  - Every remaining failure is row 10 (delayed old-ballot messages) at
+    three voters, a command executed with two dependency sets. The
+    fast-path gap below is gone.
+  - The merge moved one schedule onto a stale-Sync case:
+    `IncompatibleAccepted` at row 2, five voters, seed 0, now a kept
+    seed. A voter restarted with an older Sync still installing, took a
+    newer one, and `activate` added the newer entries beside the older
+    ones. The older entry then wrote the old ballot's ACCEPT back over
+    the demotion. `activate` now clears what an older Sync left pending,
+    the part of task-d20's `replace_sync_pending` this branch needs.
 - Budgets and progress after healing are task-d33's oracles.
 - **Catch-up.** With `PROTOCOL_SIM_CATCH_UP` set, a follower's timer asks
   its leader for executed history, as `coordd`'s pacer does, and the

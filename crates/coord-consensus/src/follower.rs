@@ -1205,6 +1205,13 @@ impl Follower {
         self.adopted.clear();
         self.leader_committed = None;
         self.named_facts = named_facts(&decision);
+        // What an earlier Sync left uninstalled is superseded: its entries
+        // are not this ballot's, and installing one would write an
+        // acceptance the new selection re-proposed or left out (a restart
+        // that resumed an older Sync, then took a newer one, wrote the old
+        // ballot's ACCEPT back over the demotion). task-d20 does this
+        // with its placeholders too.
+        self.sync_pending.clear();
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
                 let _ = self.table.expect(*c);
@@ -3128,6 +3135,7 @@ impl Follower {
                         // installation, and reported, as an activated
                         // Sync's are; only the ballot is not taken up
                         // (task-d30).
+                        self.sync_pending.clear();
                         for (c, e) in &decision.entries {
                             if self.table.phase_of(c).is_none() {
                                 let _ = self.table.expect(*c);
