@@ -4079,9 +4079,11 @@ fn retained_answer<P: Persistence>(
         // before its floor is read, and retirement deleted the rows it
         // covered. The floor row is still durable, and a sequence at or
         // below it was retired: that is known here, whatever the
-        // collector still remembers.
+        // collector still remembers. To a request as to a resolve: a
+        // sequence at or below the floor never executes again (`admit`
+        // answers it `TooOld`), and one that did executed with its row
+        // deleted, so `NOT_ADMITTED` could name a command that ran.
         let below_floor = matches!(resolved, Resolution::NoSession)
-            && resolving
             && !executed
             && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
                 .ok()
@@ -4102,9 +4104,9 @@ fn retained_answer<P: Persistence>(
             return withheld(command, "the session may no longer read this result");
         }
         // The session may no longer execute, and nothing says this
-        // command ran: a request is not admitted, and a resolve is
-        // answered retired when the floor covers it and is otherwise left
-        // to the collector's memory.
+        // command ran: at or below the floor it is retired, to a request
+        // and to a resolve; above it, a request is not admitted and a
+        // resolve is left to the collector's memory.
         Resolution::NoSession if below_floor => {
             return status(
                 command,
@@ -4160,6 +4162,10 @@ fn retained_answer<P: Persistence>(
 /// The request an invocation made, from this node's payload row for
 /// `command` (task-d23): only a row under the invocation's own retry key,
 /// whose request derives the command's identity again.
+///
+/// The row's `admission` is not consulted: re-deriving the identity from
+/// the key and the request binds the bytes, whichever admission carried
+/// them.
 fn requested<V: coord_store_api::OrderedRead>(
     view: &V,
     key: RetryKey,
@@ -4776,11 +4782,24 @@ mod tests {
             )),
             Some(coord_collector::codes::RESULT_RETIRED)
         );
-        // Above the floor, with no record, nothing is known here.
+        // And to a request re-sent at or below the floor, say by a client
+        // restored from before its acknowledgement: retired too. Not
+        // admitted would tell it a write that may have happened did not.
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key4))),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Above the floor, with no record, nothing is known here; a
+        // request there is not admitted, since the session may no longer
+        // execute.
         let (key6, command6) = invocation(6);
         assert_eq!(
             answer(&mut frontend, &store, &resolve_frame(key6, command6)),
             None
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key6))),
+            Some(coord_collector::codes::NOT_ADMITTED)
         );
     }
 
