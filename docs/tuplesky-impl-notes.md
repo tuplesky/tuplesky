@@ -6219,6 +6219,18 @@ Test: `reproposals_go_on_after_the_entries_that_follow_them`
 (`activation`). It requires every two of the commands to be ordered and
 none to be on a cycle, and it fails without the change.
 
+The selection that re-proposed 9a0f had a cause of its own. r2 held 9a0f
+and 65b2 at ACCEPT through b10's selection, and its b11 and b16 reports
+named them. Their payloads reached it while it campaigned for b17. Each
+then installed, which took it out of the pending set, and its row was
+not durable yet, so the durable ledger did not name it either. The
+report overlaid the synchronized selection only on commands the ledger
+named, so r2's own report left both out, and b17 re-proposed them. The
+report now overlays the whole synchronized selection; what the replica
+executed and forgot is still left out. Test:
+`a_selected_entry_installing_from_a_late_payload_is_reported`
+(`activation`), which fails without the change.
+
 ### A deposed leader's selection
 
 Found on #122's branch at 100 seeds (row 2, three voters, seed 45):

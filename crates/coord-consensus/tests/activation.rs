@@ -4244,6 +4244,55 @@ fn a_report_takes_the_selection_over_an_installation_still_in_flight() {
     assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
 }
 
+/// task-d34 (found by the protocol simulator, row 10, three voters, seed
+/// 58): a selected entry whose payload arrives after the Sync row is
+/// reported while its installation becomes durable.
+///
+/// The payload let the entry install, which took it out of the pending
+/// set; its row was not durable, so the ledger did not name it; and the
+/// synchronized selection was overlaid only on commands the ledger named.
+/// The report left the entry out altogether, and the candidate reading it
+/// re-proposed a command its own synchronized selection held at ACCEPT.
+#[test]
+fn a_selected_entry_installing_from_a_late_payload_is_reported() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    for e in durable_events(&marker) {
+        let installs = f.step(e);
+        for e in durable_events(&installs) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b1);
+    let before = f.report(ballot(2, 0));
+    assert!(
+        before.entries.iter().any(|e| e.command == z),
+        "pending entry reported"
+    );
+    // z's payload arrives; its installation is queued and not durable.
+    let installs = f.step(admit_z);
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "z's installation was queued: {installs:?}"
+    );
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == z);
+    assert_eq!(
+        entry.map(|e| (e.phase, e.deps.clone())),
+        Some((Phase::Accept, vec![x])),
+        "{:?}",
+        report.entries
+    );
+}
+
 /// task-d34: a Sync whose row lands after a higher promise's still has its
 /// selection reported, as the synchronized ballot's.
 ///
