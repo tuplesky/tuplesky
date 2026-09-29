@@ -7141,3 +7141,34 @@ no longer keeps is answered from the collector's memory, `Unknown` when
 that is gone too. The client's next step is the same either way:
 submitting the invocation again reaches the retained record with the
 request in hand.
+
+## The failure and obligation contract
+
+task-d29. Design Section 5.5 indexes, in one place, what may fail, what
+each of the eight transitions leaves owed, and who owes it. Each of the
+thirteen obligations has an owner, a trigger, an escalation, and named
+tests in which that owner acts after the fault the row covers. The
+section ends with the conditional argument for why the work completes.
+
+- **Checklist gaps it closes.** A1: the failure model. A3: the
+  transitions, and retirement for bindings and the collector window.
+  A5: an owner and escalation for every obligation, where task-d22 gave
+  refused entries theirs. B9: the argument. G1: retirement justified by
+  what can still ask, not by recency alone.
+- **Two rows are narrower than their obligation.**
+  - O10: a voter behind a floor that moved on is refused what it cannot
+    prove, and bringing it back is task-d32.
+  - O11: a failed barrier stopping a running voter is shown on the
+    journal, the engine and the composed node, not inside a domain.
+    Mixed-fault qualification covers it there.
+- **The harness refusal (G5).**
+  - The certification harness initialized any node directory without
+    state, so a voter whose disk was wiped came back as an empty voter
+    under its old identity. Section 5.4 forbids exactly that.
+  - `initialize_node` now writes an `initialized` marker next to the
+    state it created. A marker without state is `RunError::StateLost`,
+    and nothing is initialized. A directory with state and no marker
+    gets the marker, so directories created before this change keep
+    working.
+  - `a_voter_whose_state_is_gone_is_refused_not_initialized_again`
+    drives it with a stand-in `coordd`.
