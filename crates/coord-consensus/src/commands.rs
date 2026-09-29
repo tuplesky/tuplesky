@@ -576,9 +576,12 @@ impl CommandTable {
     /// middle of that order. The new leader anchors the recovered tail
     /// here, before its first fresh proposal (task-d06).
     ///
-    /// The path log is left as it is: it digests this replica's own
-    /// appends, and the leader's paths reach the followers in its
-    /// proposals, not through this.
+    /// The path log is re-anchored with it ([`PathLog::anchored`]). Left
+    /// as it was, it digested this replica's own appends, which need not
+    /// pass through the tails: the next command's path then named another
+    /// history than its dependencies, and a follower whose appends were
+    /// the same reached that path over a record the leader's order had
+    /// replaced (task-d34, F7: protocol_sim row 10, three voters, seed 52).
     pub fn anchor(&mut self, key: &[u8], command: CommandId) {
         self.anchor_all(key, &[command]);
     }
@@ -591,6 +594,7 @@ impl CommandTable {
         let state = self.keys.entry(key.to_vec()).or_default();
         state.last = tails.first().copied();
         state.also = tails.iter().skip(1).copied().collect();
+        state.log = PathLog::anchored(tails);
     }
 
     /// Adopt the leader's order and path evidence for a command
