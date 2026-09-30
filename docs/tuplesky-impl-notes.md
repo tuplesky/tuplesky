@@ -2528,6 +2528,29 @@ copies at a time on four cores, the test failed 8 runs of 28 at 64 and
 none of 20 at 8, and the runs finished in 73 to 87 seconds rather than 85
 to 104.
 
+Most of what kept that plane busy was the leader asking again for what
+it already had. `resend_unvoted` (task-d07) sent every voter its first
+16 unadopted proposals, with the leader's own adoption of each, on every
+call of `coordd`'s 250 ms timer, and a voter that is behind -- or whose
+adoptions are queued behind this leader's own work -- lacks the same 16
+on every call. Each came back as an adoption the leader refused as a
+duplicate: 4096 to 16383 of them in the leader's log in the runs that
+failed, in CI and locally, and a follower that had kept no evidence
+adopted the proposal again and wrote the row again. The leader's control
+lane to the voter that was behind filled, and what it dropped then was
+the fresh proposals and commits that would have let that voter catch up:
+a loop that feeds itself, which is why the test's time on CI is bimodal,
+44 to 62 seconds on four runs and 117 and 123 on two. The gap between
+two re-sends of one proposal to one voter now doubles, from one call to
+`RESEND_BACKOFF_CAP` (4), and the window is still the first 16 so that a
+proposal waiting out its gap does not hand its place to a later one. The
+first re-send is as prompt as before, and 4 calls is one second, which
+is `STILL_FOR`: a proposal that really was lost is sent again before its
+voter decides it is stuck and fetches a peer's executed history on the
+bulk lane. A cap of 16 did that once in 8 runs. Two copies of each build
+at a time on four cores, 8 runs each, the runs finished in 100 to 107
+seconds against 109 to 120 for the build without it, every round.
+
 On the same sequence of eleven rows against one standing domain:
 
 | | outcome |
@@ -4568,6 +4591,7 @@ Negative controls, each run and failing:
   current leader never proposed gets no answer to the ask, and waits for
   the next Sync. The ask keeps naming it, within its bound.
 - **Rate.** Repair is still task-d07's 16 proposals per voter per 250 ms,
+  each re-sent with a doubling gap of up to four calls since task-d33,
   and payloads 8 per ask from the leader alone. task-d10 makes both
   flow-controlled.
 - **A voter behind the leader's retention** has no path back without a
