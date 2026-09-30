@@ -188,6 +188,30 @@ and its behaviour under faults have something to be compared with:
 
 Its store is the `jepsen-store-etcd-append` artifact.
 
+A third job, `swiftpaxos-baseline`, runs
+[SwiftPaxos](https://github.com/imdea-software/swiftpaxos), the reference
+implementation of the protocol TupleSky's consensus follows, with the
+`jepsen.swiftpaxos` test in tuplesky/jepsen (tuplesky/jepsen#2), on the
+same kind of cluster:
+
+* **Same shape where SwiftPaxos allows it:** the same fault schedule
+  (`jepsen.tuplesky.nemesis`), time limit, rate, fault interval and
+  `--concurrency 2n`. The client is a Go shim over the upstream SwiftPaxos
+  client, speaking `coord-jepsen`'s JSON lines. SwiftPaxos's state machine
+  is registers with reads and writes, one key a command, so the workload
+  is Knossos linearizability over independent registers, not list-append.
+* **Faults:** the `swiftpaxos` input, `pause,partition` by default, `none`
+  for none, and `skip` skips the job. Not kill: SwiftPaxos keeps its state
+  in memory and does not recover a replica. On a three-node cluster, one
+  replica killed and restarted made the other two exit (`received unknown
+  client message 6`): they accept peer connections only while starting.
+* **What differs:** SwiftPaxos's master, which assigns replica ids and
+  replaces a leader it cannot ping, runs on the control node, outside the
+  faults. It pings without a timeout, so a paused leader is not replaced.
+
+Its store, with the master's and the clients' logs under `control/`, is
+the `jepsen-store-swiftpaxos-register` artifact.
+
 Each test runs under `timeout`, bounded at the time limit plus 20
 minutes. A test whose final phase hangs then fails in that time, instead
 of holding its job until the job's own timeout (90 or 120 minutes). The

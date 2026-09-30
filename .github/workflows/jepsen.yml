@@ -9,6 +9,11 @@
 # test (jepsen-io/etcd) against etcd on the same cluster, with the same
 # workload, faults, time limit, concurrency, rate and fault interval, so a
 # run's throughput and fault behaviour have a baseline to compare with.
+# `swiftpaxos-baseline` does the same for SwiftPaxos (imdea-software/swiftpaxos),
+# the reference implementation of the protocol TupleSky's consensus follows,
+# with the `jepsen.swiftpaxos` test from the same repository: linearizable
+# registers (SwiftPaxos has no transactions), and pause and partition only,
+# since a killed SwiftPaxos replica cannot rejoin.
 #
 # Like the Kubernetes certification, this is a qualification run and not
 # part of `CI`: it is dispatched, weekly, or run once for a pull request
@@ -37,6 +42,9 @@ on:
       etcd-version:
         description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it"
         default: latest
+      swiftpaxos:
+        description: "Faults for the SwiftPaxos baseline (pause, partition; kill ends its cluster), none, or skip to not run it"
+        default: pause,partition
   # A change to the Jepsen harness itself runs it once, on the pull
   # request, with the defaults. Not a required check.
   pull_request:
@@ -66,6 +74,7 @@ env:
   TIME_LIMIT: ${{ inputs.time-limit || '300' }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
+  SWIFTPAXOS_NEMESIS: ${{ inputs.swiftpaxos || 'pause,partition' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
   ETCD_TEST_REPO: jepsen-io/etcd
   ETCD_TEST_REF: b47cc401f27bfb7c28afd9ac088b5f0dca4501b8
@@ -419,6 +428,122 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: jepsen-store-etcd-${{ env.WORKLOAD }}
+          path: ${{ runner.temp }}/jepsen-store.tgz
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Take the cluster down
+        if: always()
+        run: jepsen/tuplesky/docker/down.sh --dir "$RUNNER_TEMP/cluster"
+
+  swiftpaxos-baseline:
+    name: SwiftPaxos baseline (docker cluster)
+    if: ${{ (inputs.swiftpaxos || 'pause,partition') != 'skip' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: tuplesky
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: tuplesky/jepsen
+          ref: ${{ env.JEPSEN_REF }}
+          path: jepsen
+          persist-credentials: false
+      - name: Check the harness has the SwiftPaxos test
+        run: |
+          if [ ! -d jepsen/swiftpaxos ]; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no swiftpaxos project (tuplesky/jepsen#2 adds it); dispatch with that branch as jepsen-ref, or swiftpaxos: skip"
+            exit 1
+          fi
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.lein/self-installs
+            ~/go/pkg/mod
+          key: jepsen-swiftpaxos-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/swiftpaxos/project.clj', 'jepsen/swiftpaxos/shim/go.sum') }}
+          restore-keys: jepsen-swiftpaxos-m2-
+      - name: Build SwiftPaxos and its Jepsen client
+        # The SwiftPaxos version is the one jepsen/swiftpaxos/shim/go.mod pins.
+        run: |
+          go version
+          jepsen/swiftpaxos/shim/build.sh "$RUNNER_TEMP/swiftpaxos-bin"
+          echo "SwiftPaxos baseline: $(grep imdea-software/swiftpaxos jepsen/swiftpaxos/shim/go.mod | xargs), faults $SWIFTPAXOS_NEMESIS" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Leiningen and this repository's Jepsen
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gnuplot-nox graphviz
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "JAVA_CMD=$JAVA_HOME_21_X64/bin/java" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          export JAVA_CMD=$JAVA_HOME_21_X64/bin/java
+          export PATH="$JAVA_HOME_21_X64/bin:$PATH"
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/lein" \
+            "https://raw.githubusercontent.com/technomancy/leiningen/$LEIN_VERSION/bin/lein"
+          echo "$LEIN_SHA256  $HOME/bin/lein" | sha256sum -c -
+          chmod +x "$HOME/bin/lein"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          (cd jepsen/jepsen && "$HOME/bin/lein" install)
+      - name: Run the Jepsen project's unit tests
+        working-directory: jepsen/swiftpaxos
+        run: lein test
+      - name: Stand the cluster up
+        run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
+      - name: Deploy SwiftPaxos on it and put a write and a read through every replica
+        run: |
+          jepsen/swiftpaxos/docker/smoke.sh --dir "$RUNNER_TEMP/cluster" \
+            --bin-dir "$RUNNER_TEMP/swiftpaxos-bin"
+      - name: Run the SwiftPaxos test
+        working-directory: jepsen/swiftpaxos
+        # The TupleSky test's time limit, fault interval, rate and
+        # concurrency, bounded the same way.
+        run: |
+          "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
+            $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
+            --nodes-file "$RUNNER_TEMP/cluster/nodes" \
+            --ssh-private-key "$RUNNER_TEMP/cluster/id_ed25519" \
+            --username root \
+            --bin-dir "$RUNNER_TEMP/swiftpaxos-bin" \
+            --nemesis "$SWIFTPAXOS_NEMESIS" \
+            --nemesis-interval 30 \
+            --rate 20 \
+            --time-limit "$TIME_LIMIT" \
+            --concurrency 2n
+      - name: Summarize the run
+        if: always()
+        run: |
+          if [ -d jepsen/swiftpaxos/store/latest ]; then
+            python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/swiftpaxos/store/latest \
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS"
+          else
+            echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Show each replica's log and the master's
+        if: always()
+        run: |
+          shopt -s nullglob
+          store=jepsen/swiftpaxos/store/latest
+          for log in "$store"/n*/replica.log "$store"/control/master.log; do
+            echo "::group::$log (last 200 lines)"
+            tail -n 200 "$log"
+            echo "::endgroup::"
+          done
+      - name: Pack the Jepsen store
+        if: always()
+        run: |
+          if [ -d jepsen/swiftpaxos/store ]; then
+            tar czf "$RUNNER_TEMP/jepsen-store.tgz" -C jepsen/swiftpaxos store
+          fi
+      - name: Upload the Jepsen store
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jepsen-store-swiftpaxos-register
           path: ${{ runner.temp }}/jepsen-store.tgz
           retention-days: 14
           if-no-files-found: warn
