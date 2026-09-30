@@ -1795,7 +1795,7 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 
 **Acceptance:** A long run keeps disk bounded by the floor's distance. A voter held down past the floor stops, naming the floor and its own frontier, and serves nothing. A crash at every step of a trim leaves either the old or the new floor, never less.
 
-**Review boundary:** Floor wiring, trim and reclamation. No change to the floor's certificate format.
+**Review boundary:** Floor wiring, trim and reclamation, and, first in their own PR, the runtime barrier space, the applier's delivery of other batches' facts and the node's reconcile. No change to the floor's certificate format.
 
 <a id="task-d28"></a>
 ### task-d28: Let a recovery report survive a lost page
