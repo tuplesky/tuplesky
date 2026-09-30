@@ -139,6 +139,10 @@ pub struct Counts {
     /// that had not taken it. Not second submissions: the same
     /// envelope, the same command identity.
     pub reoffered: u64,
+    /// Submissions of pending commands that held neither half of a
+    /// release, sent to every voter again to ask for their evidence
+    /// (task-d22).
+    pub solicited: u64,
     /// Submissions this node's own voter refused at its door.
     pub refused: u64,
     /// Results the collector released to a waiting caller.
@@ -259,6 +263,7 @@ impl Frontend {
                 // setting used to size the collector's undelivered bytes
                 // and bound nothing a caller sent.
                 max_request_bytes: config.limits.max_request_bytes,
+                max_admitted_per_second: Some(config.limits.max_admitted_per_second),
             },
         );
         let dispatcher =
@@ -882,6 +887,9 @@ pub struct Domain<P: Persistence> {
     /// When this leader last sent its voters the proposals they had not
     /// voted on (task-d07).
     resent: Option<std::time::Instant>,
+    /// When this voter's campaign last asked for the report pages it
+    /// lacks (task-d28).
+    pages_asked: Option<std::time::Instant>,
     /// Evidence this voter has produced for commands whose submitter it
     /// does not know yet, oldest first.
     parked: coord_daemon::parked::Parked,
@@ -897,6 +905,8 @@ pub struct Domain<P: Persistence> {
     /// A command this voter holds two decisions of (task-d14). The serve
     /// loop stops on it as it stops on a release-record mismatch.
     admission_halt: Option<CommandId>,
+    /// The entries of a selection no order keeps (task-d21).
+    cycle_halt: Option<Vec<CommandId>>,
     /// A command this voter pulled from a peer's executed history and
     /// executed otherwise than that peer (task-d08). The serve loop stops
     /// on it as it stops on a release-record mismatch.
@@ -950,6 +960,8 @@ pub struct Domain<P: Persistence> {
     role_said: Option<(coord_types::ids::Ballot, bool)>,
     /// How many fenced transitions this voter has said it refused.
     fenced_said: u64,
+    /// The floor's counts last reported (task-d27).
+    floor_said: coord_daemon::floor::FloorCounts,
     /// What a peer's frame or a collector's submission was refused by
     /// this voter's own fence for, where the refusal stops the voter
     /// (`DriveError::Fenced`). Those paths only log a `DriveError`, so the
@@ -1133,8 +1145,11 @@ struct Reoffers<'a> {
 
 impl Deadline for Reoffers<'_> {
     fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.dispatcher
-            .next_due()
+        // A re-offer, or a command due to be asked for again (task-d22).
+        [self.dispatcher.next_due(), self.dispatcher.next_solicit()]
+            .into_iter()
+            .flatten()
+            .min()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()))
     }
 }
@@ -1215,7 +1230,15 @@ const OFFERS_PER_TURN: usize = 16;
 /// recovery summary is not much more -- and low enough that a caller's
 /// request waits for a bounded number of peer frames rather than for
 /// the domain to go quiet.
-const PEER_BEFORE_API: u32 = 64;
+///
+/// Bounded is not enough: it is also the caller's plane's *share* when
+/// the peer plane never goes quiet, which is what a replica catching up
+/// does to it. At 64 a voter taking 200 to 400 peer events a second
+/// took 2 to 7 of its callers', and those include its collector's
+/// submissions from the other frontends and the evidence coming back to
+/// its own; a request then sat 36 seconds in the transport before this
+/// loop read it (task-d33).
+const PEER_BEFORE_API: u32 = 8;
 
 /// Whether the caller's plane is polled before the peer plane this
 /// turn, given how many peer events have been taken since the last
@@ -1327,10 +1350,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             expiry: None,
             asked: None,
             resent: None,
+            pages_asked: None,
             parked: coord_daemon::parked::Parked::new(PARKED_HOLD, PARKED_EVIDENCE),
             settle_cursor: 0,
             answered_otherwise: None,
             admission_halt: None,
+            cycle_halt: None,
             caught_up_otherwise: None,
             catch_up: coord_daemon::catch_up::Pacer::default(),
             catch_up_said: 0,
@@ -1344,6 +1369,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             election,
             role_said: None,
             fenced_said: 0,
+            floor_said: coord_daemon::floor::FloorCounts::default(),
             fenced_stop: None,
             peer_streak: 0,
             budgets,
@@ -1553,6 +1579,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
             // Two decisions of one command, found at a Sync or in this
             // voter's own selection (task-d14).
+            if let Some(cycle) = self.cycle_halt.take() {
+                say_recovery_cycle(&cycle);
+                return;
+            }
             if let Some(command) = self.admission_halt.take() {
                 say_two_decisions(&short_hex(&command));
                 return;
@@ -2105,8 +2135,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Backing::Voting(voter) if !voter.leads() => self.catch_up.next_deadline(),
             _ => None,
         };
+        // A campaign asks again for the report pages it lacks on the same
+        // interval, and a lost page or answer leaves nothing to arrive
+        // (task-d28, Codex review).
+        let pages = match &self.backing {
+            Backing::Voting(voter) if voter.node().machine().campaigning() => {
+                self.pages_asked.map(|at| at + RESEND_INTERVAL)
+            }
+            _ => None,
+        };
         [
-            expiry, parked, reoffer, redial, renewal, election, resend, catch_up,
+            expiry, parked, reoffer, redial, renewal, election, resend, catch_up, pages,
         ]
         .into_iter()
         .flatten()
@@ -2236,6 +2275,21 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         } else {
             self.resent = None;
         }
+        // A report page is published once, on a lane that drops when
+        // full: a campaign asks the voters that promised it for the pages
+        // that have not arrived, paced like the re-send (task-d28).
+        if voter.node().machine().campaigning() {
+            let now = std::time::Instant::now();
+            if self
+                .pages_asked
+                .is_none_or(|at| now.duration_since(at) >= RESEND_INTERVAL)
+            {
+                self.pages_asked = Some(now);
+                out.absorb(voter.request_report_pages()?);
+            }
+        } else {
+            self.pages_asked = None;
+        }
         // A voter that holds work it does not execute, and has not moved
         // for a while, asks a peer for the commands it executed after
         // this voter's frontier: the leader first, then the others
@@ -2280,6 +2334,32 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             );
             self.fenced_said = fenced;
         }
+        // A floor boundary refused is said with its reason, and a promise
+        // or an activation with where the floor stands (task-d27).
+        if let Some(floor) = voter.node().floor()
+            && floor.counts != self.floor_said
+        {
+            let counts = floor.counts;
+            if counts.refused > self.floor_said.refused
+                && let Some(refusal) = floor.last_refusal()
+            {
+                eprintln!("this voter refused a floor boundary: {refusal}");
+            }
+            if counts.promised > self.floor_said.promised
+                || counts.activated > self.floor_said.activated
+            {
+                eprintln!(
+                    "floor promised={} activated={} heard={} rejected={}",
+                    floor.promised().map_or(0, |p| p.get()),
+                    floor
+                        .activated()
+                        .map_or(0, |a| a.boundary.execution_position.get()),
+                    counts.heard,
+                    counts.rejected,
+                );
+            }
+            self.floor_said = counts;
+        }
         let role = (voter.ballot(), voter.leads());
         if self.role_said != Some(role) {
             self.role_said = Some(role);
@@ -2322,7 +2402,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // Two decisions of one command: the machine votes and executes
         // nothing more, and the serve loop stops rather than leave a node
         // up that answers nothing (task-d14).
-        if let Some(command) = voter.node().machine().halted() {
+        // A dependency cycle in a selection is an invariant violation, not
+        // a failed campaign (task-d21): it stops the node like two
+        // decisions do, and says which commands.
+        if let Some(cycle) = voter.node().machine().recovery_cycle() {
+            self.cycle_halt = Some(cycle.to_vec());
+        } else if let Some(command) = voter.node().machine().halted() {
             self.admission_halt = Some(command);
         }
         // A pulled command this voter executed otherwise than its donor:
@@ -2642,7 +2727,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .frontend
             .dispatcher_mut()
             .due_offers(now, OFFERS_PER_TURN);
-        for plan in due {
+        // And the commands that have held neither half of a release long
+        // enough, submitted to every voter again to ask for what they
+        // said (task-d22). The same fan-out and the same offer report: a
+        // voter that took the submission answers it again.
+        let solicits = self
+            .frontend
+            .frontend
+            .dispatcher_mut()
+            .due_solicits(now, OFFERS_PER_TURN);
+        let plans = due
+            .into_iter()
+            .map(|plan| (plan, false))
+            .chain(solicits.into_iter().map(|plan| (plan, true)));
+        for (plan, solicit) in plans {
             let command = plan.command;
             let out = fanout::dispatch(
                 &self.frontend.membership,
@@ -2653,12 +2751,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .map(|l| l as &dyn fanout::LocalIngress),
                 &plan,
             );
-            self.frontend.counts.reoffered += 1;
+            if solicit {
+                self.frontend.counts.solicited += 1;
+            } else {
+                self.frontend.counts.reoffered += 1;
+            }
             self.record_offer(command, &out);
             // Said, and said less as it goes on: a re-offer is delivery
             // backpressure being worked off, which an operator wants to
             // know is happening without a line per attempt.
-            if let Some(n) = self.recurring.seen("reoffered") {
+            if !solicit && let Some(n) = self.recurring.seen("reoffered") {
                 eprintln!(
                     "this collector offered a submission again to a voter that could not take it ({n} so far)"
                 );
@@ -2741,6 +2843,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let (this_turn, cursor) =
             coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
         self.settle_cursor = cursor;
+        let conflicts =
+            coord_daemon::settle::conflicts_for(self.backing.applier(), this_turn.iter().copied());
         let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
         // The release this collector holds and what this node executed
         // disagreeing is not an ordinary outcome: every replica executes
@@ -2765,6 +2869,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.counts.settled_from_record += settled;
                 for delivery in deliveries {
                     self.answer(delivery);
+                }
+                // A key this node's record binds to another command: the
+                // domain executed that one under it (task-d22).
+                for (command, bound) in conflicts {
+                    let dispatcher = self.frontend.frontend.dispatcher_mut();
+                    if let Ok(delivery) = dispatcher.settle_conflict_from_record(command, bound) {
+                        self.frontend.counts.settled_from_record += 1;
+                        if let Some(delivery) = delivery {
+                            self.answer(delivery);
+                        }
+                    }
                 }
                 None
             }
@@ -2882,6 +2997,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // and not what the parked frames or the records settle.
         if self.answered_otherwise.is_some()
             || self.admission_halt.is_some()
+            || self.cycle_halt.is_some()
             || self.caught_up_otherwise.is_some()
         {
             return;
@@ -3649,6 +3765,32 @@ fn digest_hex(digest: &coord_types::identity::Digest32) -> String {
 }
 
 /// Why a node stopped on two decisions of one command.
+fn say_recovery_cycle(commands: &[CommandId]) {
+    eprintln!("{}", describe_recovery_cycle(commands));
+}
+
+/// What a node that halts on a dependency cycle in a selection prints
+/// (task-d21): the prefix, how many entries no order keeps, and the first
+/// eight of them in full.
+fn describe_recovery_cycle(commands: &[CommandId]) -> String {
+    let first = commands.first().map_or_else(String::new, short_hex);
+    let named: Vec<String> = commands
+        .iter()
+        .take(8)
+        .map(|c| c.as_bytes().iter().map(|b| format!("{b:02x}")).collect())
+        .collect();
+    format!(
+        "this node stopped: recovery-cycle({first}): the selection it recovered holds a \
+         dependency cycle among its entries, which no quorum's order can produce. {} entr{} \
+         could not be ordered: {}{}. This node proposes, votes and executes nothing more; the \
+         reports it selected from are in its peers' stores",
+        commands.len(),
+        if commands.len() == 1 { "y" } else { "ies" },
+        named.join(", "),
+        if commands.len() > 8 { ", ..." } else { "" }
+    )
+}
+
 fn say_two_decisions(command: &str) {
     eprintln!(
         "this node stopped: incompatible-admission({command}): a selection names other \
@@ -3760,13 +3902,21 @@ fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
     Ok(frame)
 }
 
-/// A refusal of a retained result, in the shape the output gate refuses
-/// a live one it will not disclose.
+/// A refusal to admit a request the record says may not execute.
 fn refusal(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    status(command, coord_collector::codes::NOT_ADMITTED, detail)
+}
+
+/// An executed command's retained result withheld, in the shape the
+/// output gate withholds a live one (task-d23).
+fn withheld(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    status(command, coord_collector::codes::OUTPUT_WITHHELD, detail)
+}
+
+/// A response carrying one frozen code.
+fn status(command: coord_types::CommandId, code: u16, detail: &str) -> Option<Vec<u8>> {
     MessageV1::Response(coord_collector::codes::error_response(
-        command,
-        coord_collector::codes::NOT_ADMITTED,
-        detail,
+        command, code, detail,
     ))
     .encode()
     .ok()
@@ -3900,13 +4050,22 @@ impl core::fmt::Display for TransportError {
     }
 }
 
-/// What the durable record answers for a request, ahead of admission:
-/// the retained result, gated as a fresh one is, or a refusal from the
-/// record. `None` sends the request on to admission.
+/// What the durable record answers for a request or a resolve, ahead of
+/// admission and of the collector's memory: the retained result, gated
+/// as a fresh one is, or a status from the record. `None` sends the frame
+/// on: a request to admission, a resolve to the collector.
 ///
 /// [`Domain::retained`] with what it reads named: the frontend that holds
 /// the caller's binding and this node's store. Split out so it can be
 /// asked of a frontend bound on a node whose projection is behind.
+///
+/// A resolve is answered from the record too (task-d23). The collector
+/// remembers a bounded window of outcomes, and only those it collected
+/// itself, so an outcome evicted from it, or asked of a frontend that
+/// never saw the request, was `Unknown` while this node held the executed
+/// record. A resolve names no request, and a result is gated against the
+/// request it answers; this node's payload row says what the request was
+/// while it keeps one. Without it, only a retirement is answered here.
 fn retained_answer<P: Persistence>(
     frontend: &mut BoundFrontend,
     store: &P,
@@ -3916,10 +4075,15 @@ fn retained_answer<P: Persistence>(
 ) -> Option<Vec<u8>> {
     use coord_storage::retry::Resolution;
 
-    let MessageV1::Request(request) = decode(frame).ok()? else {
-        return None;
+    let (key, command, logical, resolving) = match decode(frame).ok()? {
+        MessageV1::Request(request) => {
+            let logical = request.logical().ok()?;
+            let command = coord_types::CommandId::derive(&request.retry_key, &logical).ok()?;
+            (request.retry_key, command, Some(logical), false)
+        }
+        MessageV1::ResolveRequest(resolve) => (resolve.retry_key, resolve.command_id, None, true),
+        _ => return None,
     };
-    let key = request.retry_key;
     // The connection must be bound, and bound to the session whose
     // invocation this is. A retained result belongs to a session,
     // and reading one is not something an unbound caller -- or a
@@ -3928,32 +4092,88 @@ fn retained_answer<P: Persistence>(
     if !binding.active(health) || binding.session != key.session_id {
         return None;
     }
-    let logical = request.logical().ok()?;
-    let command = coord_types::CommandId::derive(&key, &logical).ok()?;
-    let resolved = {
+    let (logical, resolved, executed, below_floor) = {
         let gated = store.reader().snapshot().ok()?;
-        resolve_retained(gated.view(), key, command, &logical).ok()??
+        let view = gated.view();
+        let logical = logical.or_else(|| requested(view, key, command));
+        let resolved = match &logical {
+            Some(logical) => resolve_retained(view, key, command, logical).ok()??,
+            // Nothing to gate a result against: whatever the record holds
+            // is not handed out, and only a retirement, which needs no
+            // request, is answered -- the floor's own, or one read below
+            // for a session that may no longer execute.
+            None => match resolve_retained_unread(view, key, command).ok()?? {
+                known @ (Resolution::Retired { .. } | Resolution::NoSession) => known,
+                _ => return None,
+            },
+        };
+        let executed = matches!(resolved, Resolution::NoSession)
+            && coord_storage::retry::lookup(view, &key)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.command_id == command);
+        // A session that may no longer execute is answered `NoSession`
+        // before its floor is read, and retirement deleted the rows it
+        // covered. The floor row is still durable, and a sequence at or
+        // below it was retired: that is known here, whatever the
+        // collector still remembers. To a request as to a resolve: a
+        // sequence at or below the floor never executes again (`admit`
+        // answers it `TooOld`), and one that did executed with its row
+        // deleted, so `NOT_ADMITTED` could name a command that ran.
+        let below_floor = matches!(resolved, Resolution::NoSession)
+            && !executed
+            && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
+                .ok()
+                .is_some_and(|floor| key.request_sequence <= floor.floor);
+        (logical, resolved, executed, below_floor)
     };
     let record = match resolved {
         Resolution::Result(record) => record,
         // The command executed, and this caller may not have what it
-        // produced -- or may not execute at all any more. The same
-        // refusal the output gate gives a live result it will not
-        // disclose; the command is not proposed a second time.
+        // produced -- or may not execute at all any more. The status the
+        // output gate gives a live result it will not disclose; the
+        // command is not proposed a second time, and it is not reported
+        // as never admitted (task-d23).
+        Resolution::Unauthorized => {
+            return withheld(command, "output not authorized by current policy");
+        }
+        Resolution::NoSession if executed => {
+            return withheld(command, "the session may no longer read this result");
+        }
+        // The session may no longer execute, and nothing says this
+        // command ran: at or below the floor it is retired, to a request
+        // and to a resolve; above it, a request is not admitted and a
+        // resolve is left to the collector's memory.
+        Resolution::NoSession if below_floor => {
+            return status(
+                command,
+                coord_collector::codes::RESULT_RETIRED,
+                "retired: the result is no longer kept",
+            );
+        }
+        Resolution::NoSession if resolving => return None,
         Resolution::NoSession => {
             return refusal(command, "the session may no longer execute");
         }
-        Resolution::Unauthorized => {
-            return refusal(command, "output not authorized by current policy");
+        // Retired below the floor: to a resolve, the outcome is no longer
+        // retrievable (task-d23). A request goes on to admission, which
+        // decides a retired sequence at the command's own position.
+        Resolution::Retired { .. } if resolving => {
+            return status(
+                command,
+                coord_collector::codes::RESULT_RETIRED,
+                "retired: the result is no longer kept",
+            );
         }
-        // Not executed, retired below the floor, or a retry key bound
-        // to another payload: replicated execution decides each of
-        // those at the command's own position, not this node from a
-        // record that is not this command's.
+        // Not executed, or a retry key bound to another payload:
+        // replicated execution, or the collector for a resolve, decides
+        // each of those, not this node from a record that is not this
+        // command's.
         Resolution::Pending | Resolution::Retired { .. } | Resolution::Conflict { .. } => {
             return None;
         }
     };
+    let logical = logical?;
     let response = coord_types::wire_v1::ResponseV1 {
         command_id: command,
         outcome: coord_types::wire_v1::OutcomeV1::Ok {
@@ -3974,6 +4194,62 @@ fn retained_answer<P: Persistence>(
         Delivered::Answer(delivery) => Some(delivery.frame),
         Delivered::Unbound { .. } => None,
     }
+}
+
+/// The request an invocation made, from this node's payload row for
+/// `command` (task-d23): only a row under the invocation's own retry key,
+/// whose request derives the command's identity again.
+///
+/// The row's `admission` is not consulted: re-deriving the identity from
+/// the key and the request binds the bytes, whichever admission carried
+/// them.
+fn requested<V: coord_store_api::OrderedRead>(
+    view: &V,
+    key: RetryKey,
+    command: CommandId,
+) -> Option<coord_types::logical_v1::LogicalRequest> {
+    let bytes = view
+        .get(
+            coord_store_api::Collection::PayloadV1.id(),
+            &coord_consensus::rows::payload_key(&command),
+        )
+        .ok()??;
+    let payload = coord_consensus::rows::decode_payload(&bytes).ok()?;
+    if payload.retry_key != key {
+        return None;
+    }
+    let logical: coord_types::logical_v1::LogicalRequest =
+        postcard::from_bytes(&payload.logical).ok()?;
+    (CommandId::derive(&key, &logical).ok()? == command).then_some(logical)
+}
+
+/// [`resolve_retained`] without the request: nothing is authorized, so a
+/// retained result reads as `Unauthorized` and is never handed out.
+fn resolve_retained_unread<V: coord_store_api::OrderedRead>(
+    view: &V,
+    key: RetryKey,
+    command: CommandId,
+) -> Result<Option<coord_storage::retry::Resolution>, coord_store_api::EngineError> {
+    use coord_storage::retry::RetryBinding;
+    if view
+        .get(
+            coord_store_api::Collection::SessionV1.id(),
+            &coord_storage::codecs::session_key(&key.session_id),
+        )?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    coord_storage::retry::resolve(
+        view,
+        &RetryBinding {
+            retry_key: key,
+            command_id: command,
+            retires: None,
+        },
+        |_| false,
+    )
+    .map(Some)
 }
 
 /// What this node's record says about the invocation `key` names, before
@@ -4375,6 +4651,193 @@ mod tests {
             "{:?}",
             response.outcome
         );
+
+        // task-d23: a resolve is answered from the record too.
+        let answer = |frontend: &mut BoundFrontend,
+                      store: &StoreWorker<ModelEngine>,
+                      frame: &Frame|
+         -> Option<OutcomeV1> {
+            let bytes = super::retained_answer(frontend, store, &health, CONNECTION, frame)?;
+            match decode_stream(&bytes).unwrap().as_slice() {
+                [MessageV1::Response(response)] => Some(response.outcome.clone()),
+                other => panic!("{other:?}"),
+            }
+        };
+        let code_of = |outcome: Option<OutcomeV1>| match outcome {
+            Some(OutcomeV1::Err { code, .. }) => Some(code),
+            other => panic!("{other:?}"),
+        };
+        let invocation = |sequence: u64| {
+            let key = RetryKey {
+                request_sequence: RequestSequence::new(sequence).unwrap(),
+                ..retry
+            };
+            (key, CommandId::derive(&key, &logical).unwrap())
+        };
+        let resolve_frame = |key: RetryKey, command: CommandId| {
+            frame_of(
+                &MessageV1::ResolveRequest(coord_types::wire_v1::ResolveRequestV1 {
+                    retry_key: key,
+                    command_id: command,
+                })
+                .encode()
+                .unwrap(),
+            )
+        };
+        let request_frame = |key: RetryKey| {
+            frame_of(
+                &MessageV1::Request(RequestV1::new(key, &logical, 0, 0).unwrap())
+                    .encode()
+                    .unwrap(),
+            )
+        };
+        let mut write = |store: &mut StoreWorker<ModelEngine>, updates| {
+            store
+                .submit(PersistBatch {
+                    barrier: barriers.allocate(),
+                    base: Some(store.application_base()),
+                    updates,
+                })
+                .unwrap();
+            assert_eq!(store.flush().unwrap().committed, 1);
+        };
+        // The executed record of an invocation this frontend never saw,
+        // and the payload row that says what it asked. The retained
+        // outcome is a denial, which any caller may have replayed.
+        let executed = |key: RetryKey, command: CommandId, payload: bool| {
+            let response = postcard::to_allocvec(&Response {
+                revision: KvRevision::new(3).unwrap(),
+                outcome: Outcome::ErrPermissionDenied,
+            })
+            .unwrap();
+            let mut updates = vec![coord_core::StoreUpdate {
+                collection: coord_store_api::Collection::RetryV1.id(),
+                key: coord_storage::codecs::retry_key(&key),
+                value: Some(
+                    coord_storage::codecs::encode_retry(&coord_storage::codecs::RetryRecordV1 {
+                        command_id: command,
+                        position: coord_types::ids::ExecutionPosition::new(3).unwrap(),
+                        revision: None,
+                        result_digest: coord_storage::retry::result_digest(&response),
+                        response,
+                    })
+                    .unwrap(),
+                ),
+            }];
+            if payload {
+                updates.push(
+                    coord_consensus::rows::payload_update(
+                        &command,
+                        &coord_consensus::PayloadRecordV1 {
+                            retry_key: key,
+                            logical: logical.canonical_bytes().unwrap(),
+                            admission: None,
+                            ack_through: 0,
+                        },
+                    )
+                    .unwrap(),
+                );
+            }
+            updates
+        };
+        write(
+            &mut store,
+            coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, true).unwrap(),
+        );
+        let (key2, command2) = invocation(2);
+        write(&mut store, executed(key2, command2, true));
+        // Asked of a frontend that never saw the request: the executed
+        // result, from the record, through the output gate.
+        let resolved = answer(&mut frontend, &store, &resolve_frame(key2, command2));
+        assert!(
+            matches!(&resolved, Some(OutcomeV1::Ok { .. })),
+            "{resolved:?}"
+        );
+        // Without the payload row nothing can be gated, and the collector
+        // answers from its memory.
+        let (key3, command3) = invocation(3);
+        write(&mut store, executed(key3, command3, false));
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key3, command3)),
+            None
+        );
+        // Past the retirement floor: retired, not unknown.
+        write(
+            &mut store,
+            vec![coord_core::StoreUpdate {
+                collection: coord_store_api::Collection::RetryFloorV1.id(),
+                key: coord_storage::codecs::retry_floor_key(&SESSION, &retry.client_instance_id),
+                value: Some(
+                    coord_storage::codecs::encode_retry_floor(
+                        &coord_storage::codecs::RetryFloorV1 {
+                            floor: RequestSequence::new(4).unwrap(),
+                            width: 4,
+                        },
+                    )
+                    .unwrap(),
+                ),
+            }],
+        );
+        let (key4, command4) = invocation(4);
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key4, command4)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Retired again, the session may not read what the command it
+        // executed produced: withheld, to a request and to a resolve,
+        // and never reported as not admitted.
+        write(
+            &mut store,
+            coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, false).unwrap(),
+        );
+        let (key5, command5) = invocation(5);
+        write(&mut store, executed(key5, command5, true));
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key5))),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key5, command5)
+            )),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        // A session that may no longer execute is refused before its
+        // floor is read, and retirement deleted the row: what the floor
+        // covers is still retired, not left to the collector's memory.
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key4, command4)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // And to a request re-sent at or below the floor, say by a client
+        // restored from before its acknowledgement: retired too. Not
+        // admitted would tell it a write that may have happened did not.
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key4))),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Above the floor, with no record, nothing is known here; a
+        // request there is not admitted, since the session may no longer
+        // execute.
+        let (key6, command6) = invocation(6);
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key6, command6)),
+            None
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key6))),
+            Some(coord_collector::codes::NOT_ADMITTED)
+        );
     }
 
     /// Held evidence registers when it is due to be let go.
@@ -4421,7 +4884,12 @@ mod tests {
         // recovery summary -- and small enough that a caller waits for
         // a bounded number of frames rather than for the domain to go
         // quiet.
-        assert!((8..=1024).contains(&PEER_BEFORE_API));
+        //
+        // And it is the caller's plane's share when the peer plane never
+        // goes quiet: one event in `PEER_BEFORE_API + 1`. At 64 a
+        // catching-up replica's callers got 2 to 7 events a second and
+        // waited out their deadlines on answers already on the wire.
+        assert!((8..=16).contains(&PEER_BEFORE_API));
     }
 
     /// A condition that keeps happening is said in full a few times and
@@ -5046,5 +5514,26 @@ mod tests {
             );
             assert!(said.contains("\n  differs: response\n"), "{said}");
         }
+    }
+
+    /// task-d21: a recovery-cycle stop names its prefix, how many entries
+    /// could not be ordered, and the first eight in full.
+    #[test]
+    fn a_recovery_cycle_stop_names_the_commands() {
+        let commands: Vec<super::CommandId> = (0..10u8)
+            .map(|i| super::CommandId(coord_types::identity::Digest32([0xc0 + i; 32])))
+            .collect();
+        let said = super::describe_recovery_cycle(&commands[..2]);
+        assert!(
+            said.starts_with("this node stopped: recovery-cycle(c0c0c0c0): "),
+            "{said}"
+        );
+        assert!(said.contains("2 entries could not be ordered"), "{said}");
+        assert!(said.contains(&"c1".repeat(32)), "{said}");
+        let said = super::describe_recovery_cycle(&commands);
+        assert!(said.contains("10 entries"), "{said}");
+        assert!(said.contains(&"c7".repeat(32)), "{said}");
+        assert!(!said.contains(&"c8".repeat(32)), "{said}");
+        assert!(said.contains(", ..."), "{said}");
     }
 }

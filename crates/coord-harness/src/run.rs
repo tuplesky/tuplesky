@@ -104,6 +104,28 @@ pub enum RunError {
         /// What it said, bounded to its own diagnostics.
         output: String,
     },
+    /// A voter that was initialized has no state any more (design
+    /// Section 5.4, task-d29). Initializing it again would start an
+    /// empty voter under the identity that made promises and cast votes
+    /// the domain may still count on; it comes back as a learner with a
+    /// new generation, through membership, or not at all.
+    StateLost {
+        /// The replica whose state is gone.
+        node: String,
+        /// Where its state was.
+        directory: PathBuf,
+    },
+    /// A voter was asked to resume and has no state: nothing here says
+    /// whether it never ran or ran and lost everything, its mark with it
+    /// (a bundle copied again from the provisioning host looks exactly
+    /// like a fresh one). Only the operator knows, and says so by
+    /// initializing it explicitly (task-d29, Codex review on #129).
+    NotInitialized {
+        /// The replica with no state.
+        node: String,
+        /// Where its state would be.
+        directory: PathBuf,
+    },
     /// A daemon never reached a serving state.
     NotServing {
         /// The replica that did not come up.
@@ -120,6 +142,19 @@ impl std::fmt::Display for RunError {
             RunError::Init { node, output } => {
                 write!(f, "node {node} could not initialize its store: {output}")
             }
+            RunError::StateLost { node, directory } => write!(
+                f,
+                "node {node} was initialized and its state under {} is gone; \
+refusing to initialize an empty voter under the same identity",
+                directory.display()
+            ),
+            RunError::NotInitialized { node, directory } => write!(
+                f,
+                "node {node} has no state under {}; initialize it explicitly only if \
+it has never run -- a voter that ran and lost its state comes back through \
+membership, not under the same identity",
+                directory.display()
+            ),
             RunError::NotServing { node, log } => write!(
                 f,
                 "node {node} did not reach a serving state; its output is {}",
@@ -150,15 +185,35 @@ pub fn initialize(coordd: &Path, provisioned: &Provisioned) -> Result<(), RunErr
     Ok(())
 }
 
+/// The file beside a node's state that says it was initialized
+/// (task-d29).
+pub const INITIALIZED: &str = "initialized";
+
 /// Create one node's first store generation, once.
+///
+/// Once: a node that was initialized and whose state is gone is refused
+/// ([`RunError::StateLost`]), never initialized again. The mark is kept
+/// beside the state directory, not in it, so losing the state does not
+/// lose the mark; a node initialized before the mark existed gets it the
+/// first time it is seen with its state.
 pub fn initialize_node(
     coordd: &Path,
     node: &str,
     config: &Path,
     directory: &Path,
 ) -> Result<(), RunError> {
+    let mark = directory.join(INITIALIZED);
     if directory.join("state").is_dir() {
+        if !mark.is_file() {
+            std::fs::write(&mark, format!("{node}\n"))?;
+        }
         return Ok(());
+    }
+    if mark.exists() {
+        return Err(RunError::StateLost {
+            node: node.to_owned(),
+            directory: directory.join("state"),
+        });
     }
     let output = coordd_in(coordd, config, directory)?.arg("init").output()?;
     if !output.status.success() {
@@ -167,7 +222,32 @@ pub fn initialize_node(
             output: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
+    std::fs::write(&mark, format!("{node}\n"))?;
     Ok(())
+}
+
+/// Resume one node that was initialized: refused, with nothing run, when
+/// it has no state ([`RunError::NotInitialized`]).
+///
+/// For a voter run on its own host from a copied bundle (`coord-harness
+/// start`). The mark [`initialize_node`] leaves lives in the bundle, and
+/// a bundle lost whole and copied again from the provisioning host has
+/// neither state nor mark, like one that never ran. Initializing on
+/// every start would give such a voter an empty store under the identity
+/// that promised and voted, so a start never initializes: the first one
+/// is asked for explicitly, and only then does [`initialize_node`] run.
+pub fn resume_node(node: &str, directory: &Path) -> Result<(), RunError> {
+    if directory.join("state").is_dir() {
+        let mark = directory.join(INITIALIZED);
+        if !mark.is_file() {
+            std::fs::write(&mark, format!("{node}\n"))?;
+        }
+        return Ok(());
+    }
+    Err(RunError::NotInitialized {
+        node: node.to_owned(),
+        directory: directory.join("state"),
+    })
 }
 
 /// `coordd --config <config>`, run where that configuration expects to
@@ -314,5 +394,92 @@ mod tests {
         // Five tolerate two.
         assert_eq!(standing(3, 5), Standing::Serving { alive: 3, of: 5 });
         assert_eq!(standing(2, 5), Standing::Lost { alive: 2, of: 5 });
+    }
+
+    /// The harness initializes a voter once, and refuses one whose state
+    /// is gone (design Section 5.4, task-d29): initializing it again
+    /// would start an empty voter under the identity whose promises and
+    /// votes the domain may still count on.
+    #[cfg(unix)]
+    #[test]
+    fn a_voter_whose_state_is_gone_is_refused_not_initialized_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::{INITIALIZED, RunError, initialize_node};
+
+        let run = tempfile::tempdir().unwrap();
+        // A stand-in for `coordd init`: it makes the state directory
+        // beside the configuration it is given, and counts its calls.
+        let coordd = run.path().join("coordd");
+        std::fs::write(
+            &coordd,
+            "#!/bin/sh\nd=$(dirname \"$2\")\nmkdir -p \"$d/state\"\necho x >> \"$d/inits\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&coordd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let node = run.path().join("n1");
+        std::fs::create_dir(&node).unwrap();
+        let config = node.join("coordd.toml");
+        std::fs::write(&config, "").unwrap();
+        let inits = || {
+            std::fs::read_to_string(node.join("inits"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        initialize_node(&coordd, "n1", &config, &node).unwrap();
+        assert_eq!(inits(), 1);
+        assert!(node.join(INITIALIZED).is_file());
+        // Initialized already: left exactly as it is.
+        initialize_node(&coordd, "n1", &config, &node).unwrap();
+        assert_eq!(inits(), 1);
+
+        // The state is gone: refused, and nothing is run.
+        std::fs::remove_dir_all(node.join("state")).unwrap();
+        match initialize_node(&coordd, "n1", &config, &node) {
+            Err(RunError::StateLost { node: n, .. }) => assert_eq!(n, "n1"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(inits(), 1);
+        assert!(!node.join("state").exists());
+
+        // A node initialized before the mark existed is marked the first
+        // time it is seen with its state, and refused once that is gone.
+        let old = run.path().join("n2");
+        std::fs::create_dir_all(old.join("state")).unwrap();
+        let old_config = old.join("coordd.toml");
+        std::fs::write(&old_config, "").unwrap();
+        initialize_node(&coordd, "n2", &old_config, &old).unwrap();
+        assert!(old.join(INITIALIZED).is_file());
+        std::fs::remove_dir_all(old.join("state")).unwrap();
+        assert!(matches!(
+            initialize_node(&coordd, "n2", &old_config, &old),
+            Err(RunError::StateLost { .. })
+        ));
+    }
+
+    /// A voter's bundle lost whole and copied again from the provisioning
+    /// host has neither its state nor its mark (Codex review on #129):
+    /// resuming it is refused and runs nothing, and so is resuming a
+    /// bundle that never ran. A voter with its state resumes, and is
+    /// marked if it was not.
+    #[test]
+    fn a_start_never_initializes_a_voter_without_state() {
+        use super::{INITIALIZED, RunError, resume_node};
+
+        let run = tempfile::tempdir().unwrap();
+        let copied = run.path().join("n1");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("coordd.toml"), "").unwrap();
+        match resume_node("n1", &copied) {
+            Err(RunError::NotInitialized { node, .. }) => assert_eq!(node, "n1"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!copied.join("state").exists());
+        assert!(!copied.join(INITIALIZED).exists());
+
+        std::fs::create_dir(copied.join("state")).unwrap();
+        resume_node("n1", &copied).unwrap();
+        assert!(copied.join(INITIALIZED).is_file());
     }
 }

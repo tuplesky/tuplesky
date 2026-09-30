@@ -145,7 +145,9 @@ pub use ballot::{
 };
 pub use campaign::Campaign;
 pub use catch_up::{CatchUpDivergence, DonorExecution, OwnExecution};
-pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
+pub use commands::{
+    CommandRecord, CommandTable, InitError, Initialized, RECOVERY_RESERVE_PARTS, RetireError,
+};
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
     FloorInstall, FloorLedger, Readiness, ReadinessError, ReadinessLedger, activate, discover,
@@ -154,8 +156,8 @@ pub use follower::{
     Follower, FollowerConfig, FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal,
 };
 pub use graph::{
-    Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, demoted_path,
-    empty_path,
+    Closure, ClosureCursor, ClosureProgress, PathLog, anchored_path, chain, combined_path,
+    demoted_path, empty_path, reordered_path,
 };
 pub use handoff::{
     ActivationCertificate, CancellationCertificate, Evidence, HandoffError, InstallRecord,
@@ -164,36 +166,37 @@ pub use handoff::{
 };
 pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal,
-    REPROPOSE_BATCH, RESEND_PER_VOTER, Rejection,
+    REPROPOSE_BATCH, RESEND_BACKOFF_CAP, RESEND_PER_VOTER, Rejection,
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{
     CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
-    MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, is_payload_transfer,
+    MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, SubmissionRefusal, is_payload_transfer,
 };
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
 pub use quorum::{BallotConfiguration, ConfigurationError, EpochVoters, FastQuorumClass};
 pub use recovery::{
-    RecoveryError, RecoveryReport, ReportEntry, SyncDecision, SyncEntry, select, select_with,
+    MAX_REPORT_ENTRIES, MAX_TABLE_CAPACITY, RecoveryError, RecoveryReport, ReportEntry,
+    SyncDecision, SyncEntry, entry_order, max_report_entries, select, select_from, select_with,
 };
 pub use replay::{MAX_EVIDENCE_REPAIRS, ReplayRefusal};
 pub use role::{PendingReport, RecoveredState};
 pub use rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,
-    SealRecordV1, SyncRecordV1, decode_dependency, decode_payload, decode_promise, decode_proposal,
-    decode_seal, decode_sync, dependency_delete, dependency_key, dependency_update,
-    encode_dependency, encode_payload, encode_promise, encode_proposal, encode_seal, encode_sync,
-    payload_key, payload_update, promise_key, promise_update, proposal_key, proposal_update,
-    seal_key, seal_update, sync_key, sync_update,
+    SealRecordV1, SyncRecordV1, bounded_sync_update, decode_dependency, decode_payload,
+    decode_promise, decode_proposal, decode_seal, decode_sync, dependency_delete, dependency_key,
+    dependency_update, encode_dependency, encode_payload, encode_promise, encode_proposal,
+    encode_seal, encode_sync, payload_delete, payload_key, payload_update, promise_key,
+    promise_update, proposal_key, proposal_update, seal_key, seal_update, sync_key, sync_update,
 };
 pub use speculation::{
     DEFAULT_SPECULATION_BOUND, ReleaseGate, Speculation, SpeculationMismatch, SpeculationRequest,
     TentativeOutcome,
 };
 pub use summary::{
-    DurableLedger, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler, ReportPage,
-    paginate,
+    DurableLedger, MAX_PAGE_ASK, MAX_PAGE_ENTRIES, MAX_REPORT_PAGES, PageError, ReportAssembler,
+    ReportPage, ServedReport, paginate,
 };
 pub use vote::{FastAck, Learned, SlowAck, Vote, VoteError, VoteSet};
 

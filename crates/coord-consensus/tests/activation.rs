@@ -136,6 +136,8 @@ struct Cluster {
     drop_acks: Vec<(u8, u8)>,
     /// (from, to) pairs whose proposals are dropped.
     drop_proposals: Vec<(u8, u8)>,
+    /// (from, to) pairs whose next report page is dropped, once each.
+    drop_pages: Vec<(u8, u8)>,
     /// The voters' table capacity.
     capacity: usize,
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
@@ -204,6 +206,7 @@ impl Cluster {
             seed,
             cut: Vec::new(),
             drop_sync: Vec::new(),
+            drop_pages: Vec::new(),
             no_fetch: Vec::new(),
             no_execute: Vec::new(),
             drop_acks: Vec::new(),
@@ -269,6 +272,15 @@ impl Cluster {
                             ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
                         )
                     {
+                        continue;
+                    }
+                    if let Some(at) = self.drop_pages.iter().position(|p| *p == (i as u8, dest))
+                        && matches!(
+                            ProtocolMessage::decode(&frame).unwrap(),
+                            ProtocolMessage::ReportPage(_)
+                        )
+                    {
+                        self.drop_pages.remove(at);
                         continue;
                     }
                     if self.drop_sync.contains(&(i as u8, dest))
@@ -1896,6 +1908,201 @@ fn reproposals_follow_the_recovered_order_not_identity_order() {
     );
 }
 
+/// task-d34 (found by the protocol simulator, row 10, three voters, seed
+/// 58): an acceptance the selection carries can name a dependency the
+/// selection re-proposes, and the re-proposals go on after it.
+///
+/// x was accepted after r at the source ballot; r was not, and is
+/// re-proposed, as is y. Chained after the recovered tail, x among it, r
+/// made a cycle with x. Chained after r alone, y and x both followed r:
+/// two branches of one key's order, which the voters executed in
+/// different orders. Every two of them must be ordered by the
+/// dependencies the new leader proposes and installs.
+#[test]
+fn reproposals_go_on_after_the_entries_that_follow_them() {
+    let mut c = Cluster::new(3);
+    c.no_execute = vec![2];
+    let a = c.admit(1, 1);
+    c.settle();
+    let (r, x, y) = (
+        c.admit_at(2, 2, &[2]),
+        c.admit_at(3, 3, &[2]),
+        c.admit_at(4, 4, &[2]),
+    );
+    let new = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([
+            (a, accepted_sync_entry(a, vec![])),
+            (x, accepted_sync_entry(x, vec![r])),
+        ]),
+        reproposed: [r, y].into_iter().collect(),
+    };
+    let (leader, _) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    assert_totally_ordered(&leader, &decision, &[a, r, x, y]);
+}
+
+/// The same, with the re-proposed command already executed at the new
+/// leader (task-d34 review): a reporter behind the source ballot
+/// re-proposed a command the at-source voters retired. It keeps the
+/// dependencies it was decided with, and the entries that follow it are
+/// still proposed, after it. Skipped along with it, they were proposed
+/// nowhere, and everything chained after them waited.
+#[test]
+fn entries_that_follow_a_reproposed_command_the_leader_executed_are_proposed() {
+    let mut c = Cluster::new(3);
+    let a = c.admit(1, 1);
+    let r = c.admit(2, 2);
+    c.settle();
+    c.no_execute = vec![2];
+    let (x, y) = (c.admit_at(3, 3, &[2]), c.admit_at(4, 4, &[2]));
+    let new = ballot(1, 2);
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([
+            (a, accepted_sync_entry(a, vec![])),
+            (x, accepted_sync_entry(x, vec![r])),
+        ]),
+        reproposed: [r, y].into_iter().collect(),
+    };
+    let (leader, _) = Leader::from_recovered(
+        c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+        quorum(new),
+        &decision,
+    );
+    assert!(leader.proposal(&r).is_none(), "r keeps its decided order");
+    let proposed = leader
+        .proposal(&x)
+        .expect("x, which follows r, is proposed");
+    assert_eq!(proposed.deps, vec![r]);
+    assert_totally_ordered(&leader, &decision, &[r, x, y]);
+}
+
+fn accepted_sync_entry(command: CommandId, deps: Vec<CommandId>) -> coord_consensus::SyncEntry {
+    coord_consensus::SyncEntry {
+        command,
+        phase: Phase::Accept,
+        deps,
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: None,
+    }
+}
+
+/// Every two of `commands` are ordered by the dependencies the selection
+/// installs or `leader` proposes, and none is on a cycle. A command with
+/// neither (decided before, and not proposed again) orders nothing
+/// further.
+fn assert_totally_ordered(leader: &Leader, decision: &SyncDecision, commands: &[CommandId]) {
+    let deps_of = |cmd: &CommandId| -> Vec<CommandId> {
+        match leader.proposal(cmd) {
+            Some(p) => p.deps.clone(),
+            None => decision
+                .entries
+                .get(cmd)
+                .map(|e| e.deps.clone())
+                .unwrap_or_default(),
+        }
+    };
+    let reaches = |from: &CommandId, to: &CommandId| -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = deps_of(from);
+        while let Some(d) = stack.pop() {
+            if d == *to {
+                return true;
+            }
+            if seen.insert(d) && commands.contains(&d) {
+                stack.extend(deps_of(&d));
+            }
+        }
+        false
+    };
+    for p in commands {
+        assert!(!reaches(p, p), "{p:?} is on a cycle");
+        for q in commands {
+            if p < q {
+                assert!(
+                    reaches(p, q) || reaches(q, p),
+                    "{p:?} ({:?}) and {q:?} ({:?}) are unordered",
+                    deps_of(p),
+                    deps_of(q)
+                );
+            }
+        }
+    }
+}
+
+/// task-d33 (found by the protocol simulator, row 4, three voters, seed
+/// 11): the selection re-proposes r, which the new leader has already
+/// committed, and carries x accepted after r.
+///
+/// A committed command is not proposed again, and x waited on r's
+/// re-proposal, so x was never proposed and nothing chained after it; y
+/// went on after r. x and y were two branches of one key's order, and a
+/// voter that joined the ballot late executed them the other way round.
+#[test]
+fn an_entry_after_a_command_the_leader_committed_is_in_the_chain() {
+    for executed in [false, true] {
+        let mut c = Cluster::new(3);
+        c.admit(1, 1);
+        c.settle();
+        if !executed {
+            c.no_execute = vec![2];
+        }
+        let r = c.admit(2, 2);
+        c.settle();
+        let (x, y) = (c.admit_at(3, 3, &[2]), c.admit_at(4, 4, &[2]));
+        let new = ballot(1, 2);
+        let decision = SyncDecision {
+            ballot: new,
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::from([(
+                x,
+                coord_consensus::SyncEntry {
+                    command: x,
+                    phase: Phase::Accept,
+                    deps: vec![r],
+                    path: coord_consensus::empty_path(),
+                    paths: Vec::new(),
+                    seqnum: 0,
+                    admission: None,
+                },
+            )]),
+            reproposed: [r, y].into_iter().collect(),
+        };
+        let (leader, _) = Leader::from_recovered(
+            c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+            quorum(new),
+            &decision,
+        );
+        assert!(
+            leader.proposal(&r).is_none(),
+            "executed {executed}: the committed r was proposed again"
+        );
+        let Some(px) = leader.proposal(&x) else {
+            panic!("executed {executed}: x was never proposed")
+        };
+        assert_eq!(
+            px.deps,
+            vec![r],
+            "x keeps the dependencies it was accepted with"
+        );
+        let py = leader.proposal(&y).expect("y re-proposed");
+        assert!(
+            py.deps.contains(&x),
+            "executed {executed}: y ({:?}) does not follow x: two branches after r",
+            py.deps
+        );
+    }
+}
+
 /// The role-independent state of whichever role a node holds.
 fn role_into_recovered(role: Role) -> coord_consensus::RecoveredState {
     match role {
@@ -2316,13 +2523,13 @@ fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
     deliver(&mut c, &report(r(4), vec![dead.clone()]));
     deliver(&mut c, &report(r(1), vec![]));
     assert_eq!(
-        c.try_select(|_, _| false),
+        c.try_select(usize::MAX, |_, _| false),
         Ok(None),
         "no majority without r4 yet: wait for the others rather than fail"
     );
     deliver(&mut c, &report(r(2), vec![]));
     let decision = c
-        .try_select(|_, _| false)
+        .try_select(usize::MAX, |_, _| false)
         .expect("selected without r4's report")
         .expect("a majority without r4");
     assert!(
@@ -2337,10 +2544,10 @@ fn a_campaign_selects_without_a_reporter_holding_a_payload_nobody_has() {
     for i in 1..4 {
         deliver(&mut own, &report(r(i), vec![]));
     }
-    assert_eq!(own.try_select(|_, _| false), Ok(None));
+    assert_eq!(own.try_select(usize::MAX, |_, _| false), Ok(None));
     deliver(&mut own, &report(r(4), vec![]));
     assert!(matches!(
-        own.try_select(|_, _| false),
+        own.try_select(usize::MAX, |_, _| false),
         Err(RecoveryError::HalfInitialized { replica, command })
             if replica == r(0) && command == x
     ));
@@ -2385,12 +2592,15 @@ fn a_campaign_supplies_what_its_candidate_executed() {
         c.page(page).unwrap();
     }
     assert_eq!(
-        c.try_select(|_, _| false),
+        c.try_select(usize::MAX, |_, _| false),
         Ok(None),
         "nobody supplies x and no majority remains without r2: wait"
     );
+    // The candidate comes to supply x, as a payload or an execution does
+    // (task-d33): the same reports are assembled again.
+    c.supply_moved();
     let decision = c
-        .try_select(|command, _| *command == x)
+        .try_select(usize::MAX, |command, _| *command == x)
         .expect("the candidate supplies x")
         .expect("selected");
     assert_eq!(decision.entries[&x].deps, vec![d]);
@@ -3548,4 +3758,2610 @@ fn a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting() {
         (Some(7), vec![(key, chosen)]),
         "the Sync entry installed with the rebind"
     );
+}
+
+/// Checklist D1/D4 probe: a Sync of the promised ballot, arriving while a
+/// higher promise is still being written, must not lower the durable
+/// promise below the one already sent.
+#[test]
+fn a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise() {
+    let mut cluster = Cluster::new(41);
+    let _c1 = cluster.admit(1, 1);
+    cluster.settle();
+    // r2 is elected at P1 = (1, 2); r1 promises it durably, but r2's Sync
+    // does not reach r1.
+    cluster.drop_sync.push((2, 1));
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    assert_eq!(
+        cluster.nodes[1].follower().ballots().promised(),
+        ballot(1, 2)
+    );
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), ballot(0, 0));
+    let sync = sync_rows(&cluster.nodes[2].storage)
+        .into_iter()
+        .find(|d| d.ballot == ballot(1, 2))
+        .expect("r2 bound its Sync");
+    // r0 campaigns at P3 = (3, 0): r1 accepts, and its promise row is
+    // queued but not yet durable.
+    let node = &mut cluster.nodes[1];
+    let promise_effects = node.step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(3, 0),
+            executed: ExecutionPosition::new(1).unwrap(),
+        },
+    ));
+    let mut batches = Vec::new();
+    for e in &promise_effects {
+        if let Effect::Persist(b) = e {
+            batches.push(b.clone());
+        }
+    }
+    assert_eq!(batches.len(), 1, "{promise_effects:?}");
+    // The delayed Sync of P1 arrives now.
+    let sync_effects = node.step(peer_event(r(2), ProtocolMessage::Sync(sync)));
+    for e in &sync_effects {
+        if let Effect::Persist(b) = e {
+            batches.push(b.clone());
+        }
+    }
+    // Every batch lands, in the order it was queued.
+    let mut released = Vec::new();
+    for b in batches {
+        let barrier = b.barrier;
+        node.storage.submit(b);
+        node.storage.complete(barrier).unwrap();
+        let more = node.step(Event::Storage(StorageEvent::JournalDurable {
+            barrier_id: barrier,
+            journal_seq: LocalJournalSeq::new(1).unwrap(),
+        }));
+        released.extend(more);
+    }
+    let promised_p3 = promise_effects.iter().chain(released.iter()).any(|e| {
+        matches!(e, Effect::SendWhenDurable { frame, .. }
+            if matches!(ProtocolMessage::decode(frame),
+                Ok(ProtocolMessage::Promise { ballot: b, .. }) if b == ballot(3, 0)))
+    });
+    assert!(promised_p3, "r1 sent its promise of P3");
+    node.storage.crash();
+    let row = promise_row(&node.storage).expect("promise row");
+    assert_eq!(
+        row.promised,
+        ballot(3, 0),
+        "the durable promise fell below the promise r1 sent: {row:?}"
+    );
+}
+
+/// One step of the promise-order model: a message delivered to the voter,
+/// or the oldest queued batch completing durably or failing.
+#[derive(Clone, Copy, Debug)]
+enum PromiseStep {
+    Deliver(usize),
+    Durable,
+    Fail,
+}
+
+/// What one run of the promise-order model saw.
+#[derive(Default)]
+struct PromiseRun {
+    /// Every `Promise` published so far.
+    published: Vec<Ballot>,
+    /// Queued batches, oldest first, with whether each carries P3's
+    /// promise row.
+    queue: VecDeque<(coord_core::effect::BarrierId, bool)>,
+    /// How P3's promise row ended: `Some(true)` durable, `Some(false)`
+    /// failed.
+    p3: Option<bool>,
+    p3_queued: bool,
+    /// Whether P1's Sync row was queued, and whether P3 had been accepted
+    /// without failing by then.
+    sync_queued: bool,
+    sync_behind_live_p3: bool,
+    delivered: Vec<bool>,
+}
+
+fn promise_model_messages() -> Vec<(ReplicaId, ProtocolMessage)> {
+    vec![
+        (
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(1, 2),
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+        (
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: ballot(3, 0),
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+        (
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: ballot(1, 2),
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::new(),
+                reproposed: BTreeSet::new(),
+            }),
+        ),
+    ]
+}
+
+/// Replay `path` against a fresh voter and check, after every step, that
+/// the durable promise is at least every ballot a `Promise` was published
+/// for. Returns the run and the voter's storage.
+fn replay_promise_model(path: &[PromiseStep]) -> (PromiseRun, Follower, StorageModel) {
+    let messages = promise_model_messages();
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let mut storage = StorageModel::default();
+    let mut run = PromiseRun {
+        delivered: vec![false; messages.len()],
+        ..PromiseRun::default()
+    };
+    let observe = |run: &mut PromiseRun, storage: &mut StorageModel, effects: Vec<Effect>| {
+        for e in effects {
+            match e {
+                Effect::Persist(b) => {
+                    let mut carries_p3 = false;
+                    for u in &b.updates {
+                        if u.collection == Collection::ProtocolV1.id() {
+                            let v = u.value.as_ref();
+                            if u.key.len() == 9
+                                && v.is_some_and(|v| {
+                                    decode_promise(v).unwrap().promised == ballot(3, 0)
+                                })
+                                && !run.p3_queued
+                            {
+                                carries_p3 = true;
+                            }
+                            if u.key.len() == 33 && u.key[8] == 0x03 {
+                                run.sync_queued = true;
+                                run.sync_behind_live_p3 |= run.p3_queued && run.p3 != Some(false);
+                            }
+                        }
+                    }
+                    if carries_p3 {
+                        run.p3_queued = true;
+                    }
+                    run.queue.push_back((b.barrier, carries_p3));
+                    storage.submit(b);
+                }
+                Effect::SendWhenDurable { frame, .. } => {
+                    if let Ok(ProtocolMessage::Promise { ballot: b, .. }) =
+                        ProtocolMessage::decode(&frame)
+                    {
+                        run.published.push(b);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    for step in path {
+        let effects = match *step {
+            PromiseStep::Deliver(i) => {
+                run.delivered[i] = true;
+                let (from, m) = messages[i].clone();
+                f.step(peer_event(from, m))
+            }
+            PromiseStep::Durable | PromiseStep::Fail => {
+                let (barrier, carries_p3) = run.queue.pop_front().expect("queued");
+                let event = if matches!(step, PromiseStep::Durable) {
+                    storage.complete(barrier).unwrap();
+                    StorageEvent::JournalDurable {
+                        barrier_id: barrier,
+                        journal_seq: LocalJournalSeq::new(storage.durable_seq()).unwrap(),
+                    }
+                } else {
+                    storage.fail(barrier, coord_core::event::StorageError::NoSpace);
+                    StorageEvent::Failed {
+                        barrier_id: barrier,
+                        error: coord_core::event::StorageError::NoSpace,
+                    }
+                };
+                if carries_p3 {
+                    run.p3 = Some(matches!(step, PromiseStep::Durable));
+                }
+                f.step(Event::Storage(event))
+            }
+        };
+        observe(&mut run, &mut storage, effects);
+        let durable = promise_row(&storage).map_or(ballot(0, 0), |p| p.promised);
+        for b in &run.published {
+            assert_ne!(
+                durable.compare_same_epoch(b),
+                Some(core::cmp::Ordering::Less),
+                "durable promise {durable:?} below the published {b:?} after {path:?}"
+            );
+        }
+    }
+    (run, f, storage)
+}
+
+/// task-d18's model: every order of `NewLeader` for P1 = (1, 2) and
+/// P3 = (3, 0), P1's Sync, and each queued row completing durably or
+/// failing. In no order is the durable promise below a ballot `Promise`
+/// was published for, and P1's Sync is installed behind P3's promise only
+/// once that promise's row failed.
+#[test]
+fn no_order_of_two_promises_and_a_sync_lowers_the_durable_promise() {
+    let mut stack: Vec<Vec<PromiseStep>> = vec![Vec::new()];
+    let (mut runs, mut installed_after_failure, mut held_then_dropped) = (0u32, 0u32, 0u32);
+    while let Some(path) = stack.pop() {
+        let (run, f, _) = replay_promise_model(&path);
+        assert!(
+            !run.sync_behind_live_p3,
+            "P1's Sync was installed behind P3's live promise: {path:?}"
+        );
+        let mut next = Vec::new();
+        for (i, done) in run.delivered.iter().enumerate() {
+            if !done {
+                next.push(PromiseStep::Deliver(i));
+            }
+        }
+        if !run.queue.is_empty() {
+            next.push(PromiseStep::Durable);
+            next.push(PromiseStep::Fail);
+        }
+        if next.is_empty() {
+            runs += 1;
+            // Delivered after P3 was accepted and installed after its row
+            // failed.
+            let sync_at = path
+                .iter()
+                .position(|s| matches!(s, PromiseStep::Deliver(2)));
+            let p3_at = path
+                .iter()
+                .position(|s| matches!(s, PromiseStep::Deliver(1)));
+            if run.sync_queued && run.p3 == Some(false) && sync_at > p3_at {
+                installed_after_failure += 1;
+            }
+            if run.p3 == Some(true) && f.ballots().promised() == ballot(3, 0) && !run.sync_queued {
+                held_then_dropped += 1;
+            }
+            continue;
+        }
+        for s in next {
+            let mut p = path.clone();
+            p.push(s);
+            stack.push(p);
+        }
+    }
+    assert!(runs >= 90, "{runs}");
+    assert!(
+        installed_after_failure > 0,
+        "no run installed the held Sync"
+    );
+    assert!(held_then_dropped > 0, "no run dropped the held Sync");
+}
+
+/// An ACCEPT entry at the source ballot, as a reporter would carry it.
+fn accepted_entry(c: CommandId, deps: &[CommandId]) -> coord_consensus::ReportEntry {
+    let path = Digest32([c.as_bytes()[0]; 32]);
+    coord_consensus::ReportEntry {
+        command: c,
+        phase: Phase::Accept,
+        deps: deps.to_vec(),
+        path,
+        paths: vec![(coord_consensus::CONSERVATIVE_KEY.to_vec(), path)],
+        seqnum: 1,
+        keys: vec![coord_consensus::CONSERVATIVE_KEY.to_vec()],
+        payload_present: true,
+        admission: None,
+    }
+}
+
+/// task-d21: a selection whose entries depend on each other in a cycle is
+/// an invariant violation. The candidate binds nothing, proposes nothing,
+/// halts naming the commands, and does not treat it as an ordinary failed
+/// campaign to retry.
+///
+/// No quorum's order produces such a selection (see the notes, "A
+/// recovery cycle is an invariant violation"), so the reports here are
+/// constructed: r0 reports a and b accepted at the genesis ballot, each
+/// depending on the other.
+#[test]
+fn a_selection_with_a_dependency_cycle_halts_the_candidate_naming_the_commands() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let new = ballot(1, 1);
+    let mut pending: VecDeque<Event> = VecDeque::new();
+    let mut bound_sync = false;
+    let mut proposed = false;
+    let mut observe = |effects: Vec<Effect>, pending: &mut VecDeque<Event>| {
+        for e in &effects {
+            if let Effect::Persist(batch) = e {
+                bound_sync |= batch
+                    .updates
+                    .iter()
+                    .any(|u| u.key.len() == 33 && u.key[8] == 0x03);
+            }
+            if let Effect::SendWhenDurable { frame, .. } = e {
+                proposed |= matches!(
+                    ProtocolMessage::decode(frame),
+                    Ok(ProtocolMessage::Proposal(_) | ProtocolMessage::Sync(_))
+                );
+            }
+        }
+        pending.extend(durable_events(&effects));
+    };
+    let effects = f.campaign(new);
+    observe(effects, &mut pending);
+    let report = RecoveryReport {
+        replica: r(0),
+        ballot: new,
+        committed_ballot: ballot(0, 0),
+        entries: vec![accepted_entry(a, &[b]), accepted_entry(b, &[a])],
+    };
+    pending.push_back(peer_event(
+        r(0),
+        ProtocolMessage::Promise {
+            ballot: new,
+            synced: ballot(0, 0),
+            replica: r(0),
+        },
+    ));
+    for page in coord_consensus::paginate(&report, 64) {
+        pending.push_back(peer_event(r(0), ProtocolMessage::ReportPage(page)));
+    }
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "the campaign did not settle");
+        let effects = f.step(event);
+        observe(effects, &mut pending);
+    }
+    let mut cycle = vec![a, b];
+    cycle.sort();
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some(), "the candidate did not halt");
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::RecoveryCycle { commands: cycle }),
+        "no recovery-cycle rejection"
+    );
+    assert!(!bound_sync, "a Sync with a cycle was bound");
+    assert!(!proposed, "something was proposed or published");
+    assert!(f.won().is_none());
+    assert!(f.campaign_state().is_none(), "the campaign is still open");
+}
+
+/// task-d21: a leader handed a selection with a cycle anyway (a Sync row
+/// bound before the candidate checked) proposes nothing and leads nothing.
+#[test]
+fn a_leader_handed_a_cyclic_selection_proposes_nothing() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let entry = |c: CommandId, dep: CommandId| coord_consensus::SyncEntry {
+        command: c,
+        phase: Phase::Accept,
+        deps: vec![dep],
+        path: Digest32([0; 32]),
+        paths: vec![],
+        seqnum: 1,
+        admission: None,
+    };
+    let decision = SyncDecision {
+        ballot: ballot(1, 1),
+        source_ballot: ballot(0, 0),
+        entries: [(a, entry(a, b)), (b, entry(b, a))].into_iter().collect(),
+        reproposed: BTreeSet::new(),
+    };
+    let mut cycle = vec![a, b];
+    cycle.sort();
+    assert_eq!(coord_consensus::entry_order(&decision), Err(cycle.clone()));
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let (leader, effects) =
+        Leader::from_recovered(f.into_recovered(), quorum(ballot(1, 1)), &decision);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(leader.recovery_cycle(), Some(&cycle[..]));
+    assert!(!leader.is_leading());
+}
+
+/// An admission of request `seq` on key `key`, and its command.
+fn admission(seq: u64, key: u8) -> (CommandId, Event) {
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![key],
+            value: vec![key],
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let rk = RetryKey {
+        cluster_id: ClusterId([1; 16]),
+        domain_id: DomainId([2; 16]),
+        session_id: SessionId([3; 16]),
+        client_instance_id: ClientInstanceId([4; 16]),
+        request_sequence: RequestSequence::new(seq).unwrap(),
+    };
+    let command = CommandId::derive(&rk, &request).unwrap();
+    let frame = MessageV1::Request(RequestV1::new(rk, &request, 0, 0).unwrap())
+        .encode()
+        .unwrap();
+    let receipt = AdmissionReceipt::submitting(
+        VerifierToken::for_boundary(),
+        AttestedAdmission {
+            cluster: ClusterId([1; 16]),
+            domain: DomainId([2; 16]),
+            session: SessionId([3; 16]),
+            rule_generation: 1,
+            scope_ceiling: u32::MAX,
+            receipt_id: Digest32([9; 32]),
+            admitted_at_ticks: 0,
+        },
+    );
+    (command, Event::Admitted(AdmittedRequest { receipt, frame }))
+}
+
+/// A Sync entry at ACCEPT with `deps`, naming no admission facts.
+fn selected(command: CommandId, deps: &[CommandId]) -> coord_consensus::SyncEntry {
+    coord_consensus::SyncEntry {
+        command,
+        phase: Phase::Accept,
+        deps: deps.to_vec(),
+        path: coord_consensus::empty_path(),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: None,
+    }
+}
+
+/// A standalone follower r1 that promised `b` durably, holding x at
+/// PRE-ACCEPT durably.
+fn follower_with_x_promised(b: Ballot) -> (Follower, CommandId) {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let (x, admit) = admission(1, 1);
+    let effects = f.step(admit);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    let effects = f.step(peer_event(
+        b.leader,
+        ProtocolMessage::NewLeader {
+            ballot: b,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    assert_eq!(f.ballots().promised(), b);
+    (f, x)
+}
+
+/// task-d34 (found by the protocol simulator): a Sync that carries a
+/// command this replica holds at ACCEPT of an earlier ballot, with other
+/// dependencies, demotes that acceptance in its own install batch.
+///
+/// task-d11 demoted only the acceptances a Sync leaves out. One it
+/// carries with other dependencies stayed at ACCEPT until the entry was
+/// installed, which waits for the entry's dependencies and payloads; a
+/// report taken meanwhile presented the earlier ballot's acceptance under
+/// the new synchronized ballot, beside the new ballot's copies, and every
+/// later selection failed as `IncompatibleAccepted`.
+#[test]
+fn a_sync_demotes_an_acceptance_it_carries_with_other_dependencies() {
+    let mut cluster = Cluster::new(47);
+    let a = cluster.admit(1, 1);
+    let x = cluster.admit(2, 1);
+    cluster.no_execute = vec![1];
+    cluster.settle();
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let before = cluster.nodes[1].follower().report(ballot(1, 0));
+    let entry = before.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!((entry.phase, entry.deps.clone()), (Phase::Accept, vec![a]));
+    let b1 = ballot(1, 0);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(1, effects);
+    // x is selected after a command r1 has never seen, so its
+    // installation waits.
+    let unseen = CommandId(Digest32([0x5c; 32]));
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[unseen]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), b1);
+    let check = |cluster: &Cluster| {
+        let report = cluster.nodes[1].follower().report(ballot(2, 0));
+        let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+        assert_eq!(
+            (entry.phase, entry.deps.clone()),
+            (Phase::Accept, vec![unseen]),
+            "ballot 0's acceptance of x is reported as ballot 1's"
+        );
+        let rows = dependency_rows(&cluster.nodes[1].storage);
+        let row = rows.iter().find(|(c, _)| *c == x).unwrap();
+        assert_ne!(
+            (row.1.phase, row.1.deps.clone()),
+            (Phase::Accept, vec![a]),
+            "the acceptance is still durable"
+        );
+    };
+    check(&cluster);
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    check(&cluster);
+}
+
+/// task-d34 (found by the protocol simulator): the report takes an entry
+/// of the synchronized selection over a durable record that is behind it,
+/// while its installation is still becoming durable.
+///
+/// Installing an entry took it out of the pending set as soon as its
+/// batch was queued, and the report is read from the durable ledger, so
+/// between the two it said the command was only pre-accepted, under the
+/// ballot whose selection had accepted it.
+#[test]
+fn a_report_takes_the_selection_over_an_installation_still_in_flight() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    // The Sync row lands; the installation it starts does not yet.
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    let mut installs = Vec::new();
+    for e in durable_events(&marker) {
+        installs.extend(f.step(e));
+    }
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "x's installation was queued: {installs:?}"
+    );
+    assert_eq!(f.ballots().synced(), b1);
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
+}
+
+/// task-d33 (found by the protocol simulator, row 2, three voters, seed
+/// 12): a command the selection committed is reported as committed while
+/// its installation becomes durable.
+///
+/// Installing it commits it in the table at once. The report left out of
+/// the overlay every command the table had committed, since one this
+/// replica pulled from a later ballot may be decided under other
+/// dependencies (row 5, seed 39); so it reported the durable record from
+/// before the Sync, a pre-acceptance, at the ballot the selection
+/// established. The next selection re-proposed a command already decided,
+/// under other dependencies.
+#[test]
+fn a_report_takes_a_committed_selection_over_an_installation_still_in_flight() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            x,
+            coord_consensus::SyncEntry {
+                phase: Phase::Commit,
+                ..selected(x, &[])
+            },
+        )]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    let mut installs = Vec::new();
+    for e in durable_events(&marker) {
+        installs.extend(f.step(e));
+    }
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "x's installation was queued: {installs:?}"
+    );
+    assert_eq!(f.ballots().synced(), b1);
+    assert!(f.table().phase_of(&x) >= Some(Phase::Commit));
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::Commit, "{entry:?}");
+}
+
+/// task-d34 (found by the protocol simulator, row 10, three voters, seed
+/// 58): a selected entry whose payload arrives after the Sync row is
+/// reported while its installation becomes durable.
+///
+/// The payload let the entry install, which took it out of the pending
+/// set; its row was not durable, so the ledger did not name it; and the
+/// synchronized selection was overlaid only on commands the ledger named.
+/// The report left the entry out altogether, and the candidate reading it
+/// re-proposed a command its own synchronized selection held at ACCEPT.
+#[test]
+fn a_selected_entry_installing_from_a_late_payload_is_reported() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    for e in durable_events(&marker) {
+        let installs = f.step(e);
+        for e in durable_events(&installs) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b1);
+    let before = f.report(ballot(2, 0));
+    // Once, though it is both pending and in the selection.
+    assert_eq!(
+        before.entries.iter().filter(|e| e.command == z).count(),
+        1,
+        "pending entry reported once: {:?}",
+        before.entries
+    );
+    // z's payload arrives; its installation is queued and not durable.
+    let installs = f.step(admit_z);
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "z's installation was queued: {installs:?}"
+    );
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == z);
+    assert_eq!(
+        entry.map(|e| (e.phase, e.deps.clone())),
+        Some((Phase::Accept, vec![x])),
+        "{:?}",
+        report.entries
+    );
+}
+
+/// task-d34 (moved here from the simulator PR, where row 2, five voters,
+/// seed 0 found it): what an older Sync left pending does not install
+/// once a newer one is activated.
+///
+/// b1's Sync left z pending, its payload not yet here: the state a
+/// restart that resumed b1's row leaves too. b2's Sync left z out. z's
+/// payload then arrived and installed z at ACCEPT from b1's entry, at the
+/// synchronized ballot b2, over the demotion: the next campaign read an
+/// acceptance no b2 selection made, and stopped on `IncompatibleAccepted`.
+#[test]
+fn an_older_syncs_pending_entry_does_not_install_after_a_newer_sync() {
+    let (b1, b2) = (ballot(1, 2), ballot(2, 0));
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let older = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    settle_follower(&mut f, peer_event(r(2), ProtocolMessage::Sync(older)));
+    assert_eq!(f.ballots().synced(), b1);
+    settle_follower(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b2,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let newer = SyncDecision {
+        ballot: b2,
+        source_ballot: b1,
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    settle_follower(&mut f, peer_event(r(0), ProtocolMessage::Sync(newer)));
+    assert_eq!(f.ballots().synced(), b2);
+    settle_follower(&mut f, admit_z);
+    let report = f.report(ballot(3, 0));
+    let entry = report.entries.iter().find(|e| e.command == z);
+    assert!(
+        entry.is_none_or(|e| e.phase < Phase::Accept),
+        "b1's entry installed at b2: {entry:?}"
+    );
+}
+
+/// The same when the newer Sync's row lands after a higher promise, so
+/// it is held for installation without being activated (task-d30).
+#[test]
+fn an_older_syncs_pending_entry_does_not_install_after_a_superseded_newer_sync() {
+    let (b1, b2, b3) = (ballot(1, 2), ballot(2, 0), ballot(3, 1));
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let older = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    settle_follower(&mut f, peer_event(r(2), ProtocolMessage::Sync(older)));
+    settle_follower(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b2,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let newer = SyncDecision {
+        ballot: b2,
+        source_ballot: b1,
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(0), ProtocolMessage::Sync(newer)));
+    let promise = f.step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: b3,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&promise) {
+        f.step(e);
+    }
+    for e in durable_events(&marker) {
+        f.step(e);
+    }
+    assert_eq!((f.ballots().promised(), f.ballots().synced()), (b3, b2));
+    settle_follower(&mut f, admit_z);
+    let report = f.report(ballot(4, 0));
+    let entry = report.entries.iter().find(|e| e.command == z);
+    assert!(
+        entry.is_none_or(|e| e.phase < Phase::Accept),
+        "b1's entry installed at b2: {entry:?}"
+    );
+}
+
+/// Step `event`, then everything it persisted as durable, until nothing
+/// more is persisted.
+fn settle_follower(f: &mut Follower, event: Event) {
+    let mut effects = f.step(event);
+    loop {
+        let events = durable_events(&effects);
+        if events.is_empty() {
+            return;
+        }
+        effects = events.into_iter().flat_map(|e| f.step(e)).collect();
+    }
+}
+
+/// task-d34: a Sync whose row lands after a higher promise's still has its
+/// selection reported, as the synchronized ballot's.
+///
+/// Rows may complete in any order. The Sync was then superseded and not
+/// activated, and its entries were neither installed nor reported, while
+/// the durable promise row said this replica was synchronized to it.
+#[test]
+fn a_superseded_sync_still_has_its_selection_reported() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    let b2 = ballot(2, 0);
+    let promise = f.step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    // The higher promise lands first, then the Sync row.
+    for e in durable_events(&promise) {
+        f.step(e);
+    }
+    for e in durable_events(&marker) {
+        f.step(e);
+    }
+    assert_eq!(f.ballots().promised(), b2);
+    assert_eq!(f.ballots().synced(), b1);
+    let report = f.report(b2);
+    assert_eq!(report.committed_ballot, b1);
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
+}
+
+/// Codex review of task-d34: the report takes the selected facts over a
+/// record the selection agrees with on phase and dependencies, and claims
+/// no payload under them while the one held is another presentation's.
+///
+/// The overlay replaced a record only when it was behind the selection or
+/// on other dependencies, so an acceptance under other facts kept its own
+/// admission beside the new synchronized ballot, and a report carrying the
+/// selection's facts made every later selection `IncompatibleAdmission`.
+/// Replaced, it kept `payload_present` from the record, so a selection
+/// could count this replica as a supplier of a payload it does not hold.
+#[test]
+fn a_report_names_the_selected_facts_and_no_payload_held_under_others() {
+    let mut cluster = Cluster::new(47);
+    let a = cluster.admit(1, 1);
+    let x = cluster.admit(2, 1);
+    cluster.no_execute = vec![1];
+    cluster.settle();
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let before = cluster.nodes[1].follower().report(ballot(1, 0));
+    let held = before.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!((held.phase, held.deps.clone()), (Phase::Accept, vec![a]));
+    assert!(held.payload_present);
+    let b1 = ballot(1, 0);
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(1, effects);
+    let other = Digest32([0x77; 32]);
+    assert_ne!(held.admission, Some(other));
+    let mut entry = selected(x, &[a]);
+    entry.admission = Some(other);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, entry)]),
+        reproposed: BTreeSet::new(),
+    };
+    let effects = cluster.nodes[1].step(peer_event(r(0), ProtocolMessage::Sync(decision)));
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().ballots().synced(), b1);
+    let report = cluster.nodes[1].follower().report(ballot(2, 0));
+    let e = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(e.admission, Some(other), "{e:?}");
+    assert!(!e.payload_present, "{e:?}");
+}
+
+/// task-d34 (found by the protocol simulator): a batch this replica staged
+/// while it led, completing after it became a follower, reaches its
+/// durable ledger.
+///
+/// The follower applied a completion to its ledger only for the batches
+/// it was waiting on itself. The leader's batch was left staged, the
+/// ledger kept the older record, and a later commit landed on dependencies
+/// the command was never decided with.
+#[test]
+fn a_batch_staged_as_leader_reaches_the_followers_ledger() {
+    let mut leader = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(ballot(0, 0)),
+            genesis: ballot(0, 0),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        None,
+        ExecutionPosition::ZERO,
+    );
+    leader.step(boot_event(1));
+    let (x, admit) = admission(1, 1);
+    let proposed = leader.step(admit);
+    let completions = durable_events(&proposed);
+    assert!(!completions.is_empty());
+    // Deposed before the proposal's batch lands.
+    let q = leader.config_quorum();
+    let mut f = Follower::from_recovered(leader.into_recovered(), q);
+    for e in completions {
+        f.step(e);
+    }
+    let report = f.report(ballot(1, 1));
+    assert!(
+        report.entries.iter().any(|e| e.command == x),
+        "the durable proposal is missing from the report: {:?}",
+        report.entries
+    );
+}
+
+/// A selection with a dependency cycle, as another build could bind it.
+fn cyclic_selection(a: CommandId, b: CommandId) -> SyncDecision {
+    let entry = |c: CommandId, dep: CommandId| coord_consensus::SyncEntry {
+        command: c,
+        phase: Phase::Accept,
+        deps: vec![dep],
+        path: Digest32([0; 32]),
+        paths: vec![],
+        seqnum: 1,
+        admission: None,
+    };
+    SyncDecision {
+        ballot: ballot(1, 1),
+        source_ballot: ballot(0, 0),
+        entries: [(a, entry(a, b)), (b, entry(b, a))].into_iter().collect(),
+        reproposed: BTreeSet::new(),
+    }
+}
+
+/// Codex review of task-d21: a Sync whose selection holds a cycle, bound
+/// by a leader of another build, reaches a follower of this one. It halts
+/// naming the commands, before any of the selection is made durable or
+/// installed, and stays at its old synchronized ballot.
+#[test]
+fn a_follower_sent_a_cyclic_sync_halts_before_installing_any_of_it() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut cycle = vec![a, b];
+    cycle.sort();
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(2),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(2));
+    let effects = f.step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 1),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    for event in durable_events(&effects) {
+        f.step(event);
+    }
+    assert_eq!(f.ballots().promised(), ballot(1, 1));
+    let effects = f.step(peer_event(
+        r(1),
+        ProtocolMessage::Sync(cyclic_selection(a, b)),
+    ));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "{effects:?}"
+    );
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some());
+    assert_eq!(f.ballots().synced(), ballot(0, 0));
+    assert!(
+        f.take_rejections().iter().any(
+            |x| matches!(x, FollowerRejection::RecoveryCycle { commands } if *commands == cycle)
+        )
+    );
+}
+
+/// The same selection read back from a Sync row at a restart: nothing of
+/// it is queued for installation, and the replica is halted.
+#[test]
+fn a_follower_restarting_from_a_cyclic_sync_row_stays_halted() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut cycle = [a, b];
+    cycle.sort();
+    let f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(2),
+            genesis: ballot(0, 0),
+            quorum: quorum(ballot(1, 1)),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: ballot(1, 1),
+            synced: ballot(1, 1),
+        }),
+        None,
+        Vec::new(),
+        Vec::new(),
+        [(ballot(1, 1), cyclic_selection(a, b))],
+        coord_types::ids::ExecutionPosition::ZERO,
+    );
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some());
+    assert!(f.table().phase_of(&a).is_none() && f.table().phase_of(&b).is_none());
+}
+
+/// task-d20: a report carrying more than the bound is set aside while a
+/// majority remains without it, and named when the campaign cannot go on:
+/// the candidate's own, or every voter reported and too few fit.
+#[test]
+fn a_campaign_sets_aside_a_report_past_its_bound_and_names_it() {
+    let config = quorum(ballot(1, 0));
+    let cmd = |n: u8| CommandId(Digest32([n; 32]));
+    let report = |replica, entries: Vec<coord_consensus::ReportEntry>| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries,
+    };
+    let entries = |from: u8, n: u8| {
+        (from..from + n)
+            .map(|c| accepted_entry(cmd(c), &[]))
+            .collect::<Vec<_>>()
+    };
+    let deliver = |c: &mut coord_consensus::Campaign, rep: &RecoveryReport| {
+        c.promise(rep.replica);
+        for page in coord_consensus::paginate(rep, 64) {
+            c.page(page).unwrap();
+        }
+    };
+    let limit = 3;
+
+    // r1's report is past the bound; r0 and r2 are a majority without it.
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(0), entries(0x10, 2)));
+    deliver(&mut c, &report(r(1), entries(0x20, limit as u8 + 1)));
+    assert_eq!(c.try_select(limit, |_, _| true), Ok(None));
+    deliver(&mut c, &report(r(2), entries(0x30, limit as u8)));
+    let decision = c
+        .try_select(limit, |_, _| true)
+        .expect("selected without r1's report")
+        .expect("a majority without it");
+    assert_eq!(decision.entries.len(), 2 + limit);
+    assert!(!decision.entries.contains_key(&cmd(0x20)));
+
+    // The candidate's own report is never set aside.
+    let mut own = coord_consensus::Campaign::new(config.clone());
+    own.own_report(report(r(0), entries(0x10, limit as u8 + 1)));
+    deliver(&mut own, &report(r(1), vec![]));
+    assert_eq!(
+        own.try_select(limit, |_, _| true),
+        Err(RecoveryError::ReportTooLarge {
+            replica: r(0),
+            entries: limit + 1,
+            limit,
+        })
+    );
+
+    // Every voter reported, and only the candidate's fits.
+    let mut all = coord_consensus::Campaign::new(config.clone());
+    all.own_report(report(r(0), vec![]));
+    deliver(&mut all, &report(r(1), entries(0x20, limit as u8 + 1)));
+    deliver(&mut all, &report(r(2), entries(0x30, limit as u8 + 2)));
+    assert_eq!(
+        all.try_select(limit, |_, _| true),
+        Err(RecoveryError::ReportTooLarge {
+            replica: r(1),
+            entries: limit + 1,
+            limit,
+        })
+    );
+}
+
+/// task-d20: a voter behind through three failed ballots reports no more
+/// than one ballot's worth. Each Sync's entries wait for payloads that
+/// never come; the earlier ones used to stay pending beside the later, and
+/// every report carried all of them.
+#[test]
+fn a_voter_behind_across_failed_ballots_reports_one_ballots_worth() {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let mut last = Vec::new();
+    for k in 1..=3u64 {
+        let b = ballot(k, 2);
+        let effects = f.step(peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ));
+        for e in durable_events(&effects) {
+            f.step(e);
+        }
+        assert_eq!(f.ballots().promised(), b);
+        last = (0..3u8)
+            .map(|i| CommandId(Digest32([0x40 + 0x10 * k as u8 + i; 32])))
+            .collect();
+        let decision = SyncDecision {
+            ballot: b,
+            source_ballot: ballot(0, 0),
+            entries: last.iter().map(|c| (*c, selected(*c, &[]))).collect(),
+            reproposed: BTreeSet::new(),
+        };
+        let effects = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+        for e in durable_events(&effects) {
+            f.step(e);
+        }
+        assert_eq!(f.ballots().synced(), b);
+    }
+    let report = f.report(ballot(4, 0));
+    let reported: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+    assert_eq!(reported, last.iter().copied().collect(), "{report:?}");
+    // The earlier Syncs' placeholders went with their entries: repeated
+    // failed ballots do not fill the table with slots nothing fills.
+    for k in 1..=2u64 {
+        for i in 0..3u8 {
+            let c = CommandId(Digest32([0x40 + 0x10 * k as u8 + i; 32]));
+            assert_eq!(
+                f.table().phase_of(&c),
+                None,
+                "ballot {k}'s {c:?} kept a slot"
+            );
+        }
+    }
+    assert_eq!(f.table().len(), last.len());
+}
+
+/// task-d20 (Codex review): the report bound is the domain's, not the
+/// candidate's own table. A voter with a small table legitimately reports
+/// more than twice it when a leader with a larger one ordered commands
+/// past its limit; the candidate takes such a report.
+#[test]
+fn a_report_past_twice_the_candidates_own_table_is_taken() {
+    let capacity = 32;
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity,
+    });
+    f.step(boot_event(1));
+    let b = ballot(1, 1);
+    let effects = f.campaign(b);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    let big = 2 * capacity + 10;
+    assert!(big <= coord_consensus::MAX_REPORT_ENTRIES);
+    let report = RecoveryReport {
+        replica: r(0),
+        ballot: b,
+        committed_ballot: ballot(0, 0),
+        entries: (0..big as u16)
+            .map(|n| {
+                let mut d = [0x33; 32];
+                d[..2].copy_from_slice(&n.to_be_bytes());
+                accepted_entry(CommandId(Digest32(d)), &[])
+            })
+            .collect(),
+    };
+    f.step(peer_event(
+        r(0),
+        ProtocolMessage::Promise {
+            ballot: b,
+            synced: ballot(0, 0),
+            replica: r(0),
+        },
+    ));
+    for page in coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES) {
+        f.step(peer_event(r(0), ProtocolMessage::ReportPage(page)));
+    }
+    assert!(
+        !f.take_rejections()
+            .iter()
+            .any(|x| matches!(x, FollowerRejection::Campaign(_))),
+        "the campaign failed"
+    );
+    let decision = f
+        .campaign_state()
+        .and_then(|c| c.decision())
+        .expect("selected over the large report");
+    assert_eq!(decision.entries.len(), big);
+}
+
+/// task-d20: a follower sent a Sync that does not fit its row refuses it
+/// by name before marking anything, rather than ending the process at the
+/// write.
+#[test]
+fn a_follower_sent_a_sync_past_its_row_refuses_it_by_name() {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let b = ballot(1, 2);
+    let effects = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+    let id = |n: u32| {
+        let mut d = [0xeeu8; 32];
+        d[..4].copy_from_slice(&n.to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    let decision = SyncDecision {
+        ballot: b,
+        source_ballot: ballot(0, 0),
+        entries: (0..16_000u32)
+            .map(|n| {
+                let mut e = selected(id(n), &[id(n + 20_000)]);
+                e.admission = Some(Digest32([0xee; 32]));
+                (id(n), e)
+            })
+            .collect(),
+        reproposed: BTreeSet::new(),
+    };
+    let effects = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "a Sync past its row was written"
+    );
+    assert_eq!(f.ballots().synced(), ballot(0, 0));
+    assert!(
+        f.take_rejections().iter().any(|x| matches!(
+            x,
+            FollowerRejection::SyncTooLarge { ballot: sb, bytes, limit } if *sb == b && bytes > limit
+        )),
+        "the refusal is named"
+    );
+}
+
+/// task-d34 (found by the protocol simulator): a deposed leader keeps the
+/// selection it led from for the entries it never proposed.
+///
+/// r1 won with a selection naming x, whose payload it never held, so it
+/// proposed nothing for x: `repropose` skips a placeholder. Deposed, it
+/// became a follower that did not carry its own Sync. Its reports under
+/// the synchronized ballot then omitted x, and when the payload came it
+/// pre-accepted x afresh and reported that at the source ballot, so the
+/// next selection re-proposed a command another voter had executed. The
+/// follower now resumes the leader's selection as a restart resumes the
+/// durable Sync row.
+#[test]
+fn a_deposed_leader_keeps_its_selection_for_what_it_never_proposed() {
+    let b1 = ballot(1, 1);
+    let b2 = ballot(2, 2);
+    let (x, _) = admission(2, 1);
+    // r1, synchronized to b1 and holding nothing of x.
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            genesis: ballot(0, 0),
+            quorum: quorum(b1),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: b1,
+            synced: b1,
+        }),
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    );
+    f.step(boot_event(1));
+    // It leads b1 from a selection naming x at ACCEPT, whose payload it
+    // lacks: nothing is proposed for x.
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let (mut leader, _) = Leader::from_recovered(f.into_recovered(), quorum(b1), &decision);
+    assert!(leader.proposal(&x).is_none());
+    // Its own report names x as selected, not as never accepted.
+    let own = leader.report(b2);
+    let e = own
+        .entries
+        .iter()
+        .find(|e| e.command == x)
+        .unwrap_or_else(|| panic!("x is missing from the leader's report: {:?}", own.entries));
+    assert_eq!((e.phase, e.deps.clone()), (Phase::Accept, vec![]), "{e:?}");
+    // Deposed by r2's campaign.
+    let promised = leader.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for e in durable_events(&promised) {
+        leader.step(e);
+    }
+    assert!(leader.deposed());
+    let q = leader.config_quorum();
+    let f = Follower::from_recovered(leader.into_recovered(), q);
+    assert_eq!(f.ballots().synced(), b1);
+    let report = f.report(b2);
+    let e = report
+        .entries
+        .iter()
+        .find(|e| e.command == x)
+        .unwrap_or_else(|| panic!("x is missing from the report: {:?}", report.entries));
+    assert_eq!((e.phase, e.deps.clone()), (Phase::Accept, vec![]), "{e:?}");
+    assert!(!e.payload_present, "{e:?}");
+}
+
+/// task-d28: with a page of every report to the candidate lost, the
+/// campaign completes in its ballot. A page is published once, on a lane
+/// that drops when full; the candidate asks the voters that promised it
+/// for the pages it lacks, and they answer from the report they sent,
+/// the leader's across its change of role included.
+#[test]
+fn a_campaign_completes_in_its_ballot_with_a_page_of_each_report_lost() {
+    let mut cluster = Cluster::new(53);
+    cluster.admit(1, 1);
+    cluster.admit(2, 1);
+    cluster.settle();
+    cluster.drop_pages = vec![(0, 2), (1, 2)];
+    let b = ballot(1, 2);
+    cluster.campaign(2, b);
+    cluster.settle();
+    assert!(cluster.drop_pages.is_empty(), "both pages were dropped");
+    assert!(
+        matches!(cluster.nodes[2].role, Some(Role::Follower(_))),
+        "the campaign completed without the lost pages"
+    );
+    let asked = cluster.nodes[2].follower_mut().request_report_pages();
+    assert!(!asked.is_empty());
+    cluster.handle(2, asked);
+    cluster.settle();
+    assert!(
+        matches!(&cluster.nodes[2].role, Some(Role::Leader(l)) if l.config_quorum().ballot() == b),
+        "r2 leads the ballot it campaigned for"
+    );
+}
+
+/// task-d28: interrupted campaigns leave the candidate holding one
+/// campaign's pages, however many there were; a report announcing more
+/// pages than the bound allows is refused.
+#[test]
+fn interrupted_campaigns_leave_the_candidates_memory_flat() {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let mut held = Vec::new();
+    for k in 1..=50u64 {
+        let b = ballot(k, 1);
+        let effects = f.campaign(b);
+        for e in durable_events(&effects) {
+            f.step(e);
+        }
+        // r0 promises and sends the first of its two pages; r2 promises
+        // and sends nothing.
+        for (replica, entries) in [(0u8, 300u16), (2, 0)] {
+            f.step(peer_event(
+                r(replica),
+                ProtocolMessage::Promise {
+                    ballot: b,
+                    synced: ballot(0, 0),
+                    replica: r(replica),
+                },
+            ));
+            let report = RecoveryReport {
+                replica: r(replica),
+                ballot: b,
+                committed_ballot: ballot(0, 0),
+                entries: (0..entries)
+                    .map(|c| {
+                        let mut d = [0x60; 32];
+                        d[..2].copy_from_slice(&c.to_be_bytes());
+                        accepted_entry(CommandId(Digest32(d)), &[])
+                    })
+                    .collect(),
+            };
+            let pages = coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES);
+            for page in pages.into_iter().take(1) {
+                if entries > 0 {
+                    f.step(peer_event(r(replica), ProtocolMessage::ReportPage(page)));
+                }
+            }
+        }
+        held.push(f.report_pages_held());
+    }
+    assert!(held.iter().all(|h| *h == held[0]), "{held:?}");
+    assert_eq!(held[0], 1);
+
+    // The bound: a report of `limit` entries takes at most one page more
+    // than its entries need; a total past that is refused.
+    let config = quorum(ballot(1, 0));
+    let mut c = coord_consensus::Campaign::new(config.clone()).bounded(1);
+    let report = RecoveryReport {
+        replica: r(1),
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries: (0..3u8)
+            .map(|n| accepted_entry(CommandId(Digest32([0x70 + n; 32])), &[]))
+            .collect(),
+    };
+    let pages = coord_consensus::paginate(&report, 1);
+    assert_eq!(pages.len(), 3);
+    assert_eq!(
+        c.page(pages[0].clone()),
+        Err(coord_consensus::PageError::OutOfBounds)
+    );
+    assert_eq!(c.pages_held(), 0);
+}
+
+fn standalone(id: u8, capacity: usize) -> Follower {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(id),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity,
+    });
+    f.step(boot_event(id));
+    f
+}
+
+fn step_durably(f: &mut Follower, event: Event) {
+    let effects = f.step(event);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+}
+
+/// task-d24: a voter whose table is full for new admission installs a
+/// Sync whose entries it lacks, and executes them. A placeholder refused
+/// under backpressure dropped the entry silently, and its payload was
+/// refused the same way, so only catch-up could bring it in.
+#[test]
+fn a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut donor = standalone(2, capacity);
+    let xs: Vec<CommandId> = (0..3u64)
+        .map(|i| {
+            let (c, e) = admission(900 + i, 9);
+            step_durably(&mut donor, e);
+            c
+        })
+        .collect();
+    let mut f = standalone(1, capacity);
+    let filled: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_durably(&mut f, e);
+            c
+        })
+        .collect();
+    let (_, over) = admission(999, 1);
+    f.step(over);
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new admission stops short of the reserved share"
+    );
+    assert_eq!(f.table().len(), full);
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let entries = xs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut e = selected(*c, if i == 0 { &[] } else { &xs[i - 1..i] });
+            e.phase = Phase::Commit;
+            e.admission = donor.payload(c).map(|p| p.admission_digest());
+            (*c, e)
+        })
+        .collect();
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            // What this voter holds is re-proposed, so none of it is
+            // released and the table stays full while the entries come in.
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries,
+                reproposed: filled.iter().copied().collect(),
+            }),
+        ),
+    );
+    for x in &xs {
+        step_durably(
+            &mut f,
+            peer_event(
+                r(2),
+                ProtocolMessage::PayloadResponse {
+                    command: *x,
+                    payload: donor.payload(x).unwrap().clone(),
+                },
+            ),
+        );
+    }
+    let mut executed = Vec::new();
+    while let Some(c) = f.next_executable() {
+        let position = f.executed_through().checked_next().unwrap();
+        let outcome = AppliedOutcome {
+            position,
+            revision: None,
+            result_digest: Digest32(c.0.0),
+            response: c.0.0.to_vec(),
+        };
+        f.applied(c, &outcome).unwrap();
+        executed.push(c);
+    }
+    assert_eq!(executed, xs);
+    for c in &filled {
+        assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+    }
+}
+
+/// task-d24: the records a Sync neither selected nor re-proposed, that
+/// this voter's report for the ballot named, are released with the Sync's
+/// install batch, payloads included; a selected one and a re-proposed one
+/// stay; new work is admitted again. (A record the new leader proposes
+/// after its Sync, reaching this voter first, is
+/// `a_proposal_refused_ahead_of_the_promise_is_sent_again`.)
+#[test]
+fn records_decided_nowhere_are_released_by_the_next_sync() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut f = standalone(1, capacity);
+    let held: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_durably(&mut f, e);
+            c
+        })
+        .collect();
+    let (_, over) = admission(999, 1);
+    f.step(over);
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure)
+    );
+    // The promise, and the report it owes, naming every record held.
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let (sel, rep) = (held[3], held[7]);
+    let mut entry = selected(sel, &[]);
+    entry.admission = f.table().record(&sel).and_then(|r| r.payload);
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::from([(sel, entry)]),
+                reproposed: BTreeSet::from([rep]),
+            }),
+        ),
+    );
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        if *c == sel || *c == rep {
+            assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+        } else {
+            assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+            assert!(f.payload(c).is_none(), "{c:?}'s payload was kept");
+        }
+    }
+    assert!(f.ledger().record(&held[0]).is_none());
+    let (_, again) = admission(1000, 1);
+    step_durably(&mut f, again);
+    assert!(
+        !f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new work is admitted after the release"
+    );
+}
+
+/// Step `f`, writing its batches to `storage` and making them durable.
+fn step_stored(f: &mut Follower, storage: &mut StorageModel, event: Event) {
+    let effects = f.step(event);
+    for e in &effects {
+        if let Effect::Persist(batch) = e {
+            let barrier = batch.barrier;
+            storage.submit(batch.clone());
+            storage.complete(barrier).unwrap();
+            let more = f.step(Event::Storage(StorageEvent::JournalDurable {
+                barrier_id: barrier,
+                journal_seq: LocalJournalSeq::new(1).unwrap(),
+            }));
+            for e in &more {
+                if let Effect::Persist(b) = e {
+                    storage.submit(b.clone());
+                    storage.complete(b.barrier).unwrap();
+                    f.step(Event::Storage(StorageEvent::JournalDurable {
+                        barrier_id: b.barrier,
+                        journal_seq: LocalJournalSeq::new(1).unwrap(),
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// A voter restarted between its report and the Sync still releases
+/// what the Sync leaves out (task-d24): the cut is rebuilt from the
+/// undecided durable records of a promise not yet synchronized, which
+/// after the promise's fence are the ones the report named. Without it
+/// the delayed Sync released nothing and the table stayed full.
+#[test]
+fn a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut storage = StorageModel::default();
+    let mut f = standalone(1, capacity);
+    let held: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_stored(&mut f, &mut storage, e);
+            c
+        })
+        .collect();
+    step_stored(
+        &mut f,
+        &mut storage,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    assert_eq!(f.ballots().promised(), b);
+    // Killed before the Sync arrives, and brought back from its rows.
+    storage.crash();
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            genesis: ballot(0, 0),
+            quorum: quorum(ballot(0, 0)),
+            frontend: FRONTEND,
+            capacity,
+        },
+        promise_row(&storage),
+        None,
+        dependency_rows(&storage),
+        payload_rows(&storage),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    )
+    .restore_execution(ExecutionPosition::ZERO, [])
+    .restore_payloads(payload_rows(&storage));
+    f.step(boot_event(9));
+    assert_eq!(f.ballots().promised(), b);
+    let (sel, rep) = (held[3], held[7]);
+    let mut entry = selected(sel, &[]);
+    entry.admission = f.table().record(&sel).and_then(|r| r.payload);
+    step_stored(
+        &mut f,
+        &mut storage,
+        peer_event(
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::from([(sel, entry)]),
+                reproposed: BTreeSet::from([rep]),
+            }),
+        ),
+    );
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        if *c == sel || *c == rep {
+            assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+        } else {
+            assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+        }
+    }
+    let (_, again) = admission(1000, 1);
+    step_stored(&mut f, &mut storage, again);
+    assert!(
+        !f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new work is admitted after the release"
+    );
+}
+
+/// A command outside the cluster's own admissions: its identity and the
+/// payload a peer would serve for it.
+fn outside_command(seq: u64) -> (CommandId, coord_consensus::PayloadRecordV1) {
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![7],
+            value: seq.to_be_bytes().to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let rk = RetryKey {
+        cluster_id: ClusterId([1; 16]),
+        domain_id: DomainId([2; 16]),
+        session_id: SessionId([9; 16]),
+        client_instance_id: ClientInstanceId([4; 16]),
+        request_sequence: RequestSequence::new(seq).unwrap(),
+    };
+    let command = CommandId::derive(&rk, &request).unwrap();
+    let payload = coord_consensus::PayloadRecordV1 {
+        retry_key: rk,
+        logical: postcard::to_allocvec(&request).unwrap(),
+        admission: None,
+        ack_through: 0,
+    };
+    (command, payload)
+}
+
+/// Installing a Sync costs time linear in its entries, however its
+/// payloads arrive (task-d26). Each payload used to rescan every pending
+/// entry, and each round of installation rescanned them again, so a
+/// chain whose payloads arrive last-first cost the square of its length.
+#[test]
+fn a_sync_installs_in_time_linear_in_its_entries() {
+    const N: u64 = 200;
+    let mut c = Cluster::new(3);
+    let new = ballot(1, 2);
+    let f = c.nodes[1].follower_mut();
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for event in durable_events(&promise) {
+        f.step(event);
+    }
+    // A chain r1 knows nothing of: each command depends on the one before.
+    let chain: Vec<_> = (1..=N).map(outside_command).collect();
+    let mut entries = BTreeMap::new();
+    for (i, (command, _)) in chain.iter().enumerate() {
+        let deps = if i == 0 { vec![] } else { vec![chain[i - 1].0] };
+        entries.insert(
+            *command,
+            coord_consensus::SyncEntry {
+                command: *command,
+                phase: Phase::Accept,
+                deps,
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: i as u64,
+                admission: None,
+            },
+        );
+    }
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries,
+        reproposed: Default::default(),
+    };
+    let bound = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    for event in durable_events(&bound) {
+        f.step(event);
+    }
+    // The payloads arrive last first: none installs until the first comes.
+    for (command, payload) in chain.iter().rev() {
+        let effects = f.step(peer_event(
+            r(2),
+            ProtocolMessage::PayloadResponse {
+                command: *command,
+                payload: payload.clone(),
+            },
+        ));
+        for event in durable_events(&effects) {
+            f.step(event);
+        }
+    }
+    for (command, _) in &chain {
+        assert!(
+            f.table().phase_of(command) >= Some(Phase::Accept),
+            "{command:?} was not installed"
+        );
+    }
+    let examined = f.sync_examinations();
+    assert!(
+        examined <= 4 * N,
+        "installing {N} entries examined an entry {examined} times"
+    );
+}
+
+/// A candidate assembles the reports it holds only once a majority of
+/// them could be complete (task-d26). It is asked on every page that
+/// arrives, and assembling copies every entry of every complete report,
+/// so at five voters each page of a third report copied the second whole.
+#[test]
+fn a_campaign_assembles_its_reports_once_a_majority_is_held() {
+    let config =
+        BallotConfiguration::c2_default(epoch(), ballot(1, 0), (0..5).map(r).collect()).unwrap();
+    let report = |replica, from: u8| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries: (from..from + 40)
+            .map(|c| accepted_entry(CommandId(Digest32([c; 32])), &[]))
+            .collect(),
+    };
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(0), 0x10));
+    c.promise(r(1));
+    c.promise(r(2));
+    let mut pages: Vec<_> = coord_consensus::paginate(&report(r(1), 0x40), 2);
+    pages.extend(coord_consensus::paginate(&report(r(2), 0x80), 2));
+    let total = pages.len();
+    let mut selected = None;
+    for (i, page) in pages.into_iter().enumerate() {
+        c.page(page).unwrap();
+        if c.try_select(usize::MAX, |_, _| true).unwrap().is_some() {
+            selected = Some(i);
+        }
+    }
+    assert_eq!(
+        selected,
+        Some(total - 1),
+        "selected once the last page came"
+    );
+    assert_eq!(
+        c.assemblies(),
+        1,
+        "the reports were assembled on pages that could not complete a majority"
+    );
+}
+
+/// A voter's retry-key bindings are bounded by what it still keeps of its
+/// commands, not by every key ever submitted, and a restart does not
+/// bring the others back (task-d26). A retry of a forgotten command is
+/// still refused, from the table's executed answer.
+#[test]
+fn bindings_are_bounded_by_the_commands_kept_not_by_history() {
+    let mut cluster = Cluster::new(17);
+    let mut first = None;
+    for n in 0..400u64 {
+        let c = cluster.admit(n + 1, (n % 200) as u8);
+        first.get_or_insert(c);
+        cluster.settle();
+    }
+    // Live, retired within the window, and those the ledger holds until
+    // its next sweep.
+    let bound = 32 * 6;
+    let leader = match cluster.nodes[0].role.as_ref().unwrap() {
+        Role::Leader(l) => l.bindings_held(),
+        Role::Follower(_) => panic!("r0 leads"),
+    };
+    assert!(leader <= bound, "the leader held {leader} bindings");
+    for i in 1..3 {
+        let held = cluster.nodes[i].follower().bindings_held();
+        assert!(held <= bound, "r{i} held {held} bindings");
+    }
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let held = cluster.nodes[1].follower().bindings_held();
+    assert!(held <= bound, "r1 held {held} bindings after a restart");
+    // The first command, retried, is not proposed again.
+    let executed = cluster.nodes[0].executed.len();
+    cluster.admit(1, 0);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed.len(), executed);
+    assert_eq!(cluster.nodes[0].executed[0], first.unwrap());
+}
+
+/// task-d33 (protocol_sim row 5, three voters, seed 3): a command a
+/// candidate takes in after it cut its own report -- the payload of a
+/// proposal it held arrives while it campaigns -- is in no selection of
+/// that campaign, and every retry finds it initialized and is answered as
+/// a duplicate. The leader the candidate becomes proposes it.
+#[test]
+fn a_command_a_candidate_took_in_after_its_report_is_proposed_when_it_leads() {
+    let mut cluster = Cluster::new(61);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // x reaches the leader alone; r1 holds its proposal without the
+    // payload, and r2 hears nothing of it.
+    cluster.no_fetch = vec![1];
+    cluster.cut = vec![(0, 2)];
+    let x = cluster.admit_at(2, 1, &[0]);
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].follower().table().phase_of(&x), None);
+    let payload = payload_rows(&cluster.nodes[0].storage)
+        .into_iter()
+        .find(|(c, _)| *c == x)
+        .map(|(_, p)| p)
+        .expect("r0 holds x's payload");
+    cluster.crash(0);
+    cluster.cut.clear();
+    cluster.no_fetch.clear();
+
+    // r1 campaigns, cutting its report, and then x's payload arrives.
+    cluster.campaign(1, ballot(1, 1));
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: x,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&x),
+        Some(Phase::PreAccept)
+    );
+    cluster.settle_resending(2);
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    // A retry, as the collector presents it again.
+    cluster.admit_at(2, 1, &[1, 2]);
+    cluster.settle_resending(2);
+    for i in [1usize, 2] {
+        assert_eq!(
+            cluster.nodes[i].executed,
+            vec![a, x],
+            "node {i} did not execute what the candidate took in"
+        );
+    }
+}
+
+/// task-d33 (protocol_sim row 14, three voters, seeds 3 and 5): a
+/// follower that took one presentation of an identity first adopts the
+/// leader's proposal of another under the same identity. First
+/// presentation wins at the leader; refused here as an identity conflict,
+/// the payload never arrived and nothing after the proposal executed.
+#[test]
+fn a_follower_takes_the_leaders_presentation_of_an_identity_it_bound_otherwise() {
+    let mut cluster = Cluster::new(67);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // One retry key, two requests: r2 takes the first, the leader the
+    // second.
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    assert_ne!(mine, theirs);
+    cluster.settle_resending(3);
+    let next = cluster.admit(6, 1);
+    cluster.settle_resending(3);
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, vec![a, theirs, next], "node {i}");
+    }
+}
+
+/// The binding the leader's presentation took over survives a restart
+/// (task-d33). Both payload rows stay under the one retry key, and a
+/// restart used to bind the key to whichever command sorted last: when
+/// that was the displaced one, exact retries of the leader's command
+/// were refused as another command's.
+#[test]
+fn a_binding_taken_over_for_the_leaders_presentation_survives_a_restart() {
+    let mut cluster = Cluster::new(67);
+    cluster.admit(1, 1);
+    cluster.settle();
+    cluster.no_execute = vec![2];
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    cluster.settle_resending(3);
+    assert!(
+        mine > theirs,
+        "the displaced presentation sorts last, as a restart used to bind"
+    );
+    assert!(
+        cluster.nodes[2]
+            .follower()
+            .table()
+            .phase_of(&theirs)
+            .is_some_and(|p| p >= Phase::Commit),
+        "r2 took the leader's presentation over"
+    );
+    cluster.crash(2);
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[2]);
+    cluster.settle();
+    let refused: Vec<_> = cluster
+        .frontend
+        .iter()
+        .filter(|(from, m)| {
+            *from == r(2)
+                && matches!(
+                    m,
+                    ProtocolMessage::Refused {
+                        refusal: coord_consensus::SubmissionRefusal::OtherCommand { .. },
+                        ..
+                    }
+                )
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "an exact retry of the leader's command was refused as another's: {refused:?}"
+    );
+}
+
+/// task-d33 (#131, protocol_sim row 14, three voters, seed 0): a voter
+/// that executed a command and retired it inside the window, its retry
+/// key left unbound, refuses a re-offer of it as history. The key was
+/// unbound because the restart found two executed presentations under it
+/// (the second executed as the identity refusal), and with no binding and
+/// no record the command was initialized again as new work, and decided a
+/// second time with other dependencies.
+#[test]
+fn an_executed_command_retired_with_its_key_unbound_is_not_taken_again() {
+    let mut cluster = Cluster::with_capacity(71, 8);
+    cluster.admit(1, 1);
+    cluster.settle();
+    // r2 takes one presentation under retry key 5, the leader another.
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    cluster.settle_resending(3);
+    // The leader dies; r2 leads and re-proposes its own presentation.
+    cluster.crash(0);
+    let b1 = ballot(1, 2);
+    cluster.campaign(2, b1);
+    cluster.settle_resending(4);
+    for c in [mine, theirs] {
+        assert!(cluster.nodes[1].executed.contains(&c), "r1 executed both");
+    }
+    // r1 restarts into a tie under the key, and executes more work.
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    cluster.settle_resending(2);
+    for n in 0..6u8 {
+        cluster.admit_at(20 + u64::from(n), 40 + n, &[1, 2]);
+        cluster.settle_resending(2);
+    }
+    let table = cluster.nodes[1].follower().table();
+    assert!(table.record(&theirs).is_none(), "r1 retired it");
+    assert!(!table.forgotten(&theirs), "inside the window");
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[1]);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&theirs)
+            .is_none(),
+        "r1 took an executed command again as new work"
+    );
+    assert!(
+        cluster.frontend.iter().any(|(from, m)| *from == r(1)
+            && matches!(
+                m,
+                ProtocolMessage::Refused {
+                    command,
+                    refusal: coord_consensus::SubmissionRefusal::Forgotten,
+                    ..
+                } if *command == theirs
+            )),
+        "{:?}",
+        cluster.frontend
+    );
+    // The same as the leader it becomes: the simulator found it there.
+    cluster.campaign(1, ballot(2, 1));
+    cluster.settle_resending(3);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    assert!(l.table().record(&theirs).is_none());
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[1]);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    assert!(
+        l.table().record(&theirs).is_none(),
+        "the leader proposed an executed command again"
+    );
+}
+
+/// task-d33 (protocol_sim row 4, five voters, seed 6): a Sync that
+/// releases a command whose row is still being written deletes that row
+/// too. The deletion used to follow only a durable row: the installation
+/// of an earlier Sync's entry, written after the release was decided,
+/// became durable beside the marker, and every later report named an
+/// acceptance the Sync had released, as a dependency no selection could
+/// satisfy.
+#[test]
+fn a_released_command_whose_row_was_in_flight_is_not_reported() {
+    let mut cluster = Cluster::new(73);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // x reaches r0 alone.
+    cluster.cut = vec![(0, 1), (0, 2)];
+    let x = cluster.admit_at(2, 1, &[0]);
+    cluster.settle();
+    cluster.cut.clear();
+    let payload = payload_rows(&cluster.nodes[0].storage)
+        .into_iter()
+        .find(|(c, _)| *c == x)
+        .map(|(_, p)| p)
+        .expect("r0 holds x's payload");
+    let step = |cluster: &mut Cluster, from: u8, message: ProtocolMessage| {
+        cluster.nodes[1].step(peer_event(r(from), message))
+    };
+
+    // r1 synchronizes ballot 1, whose selection holds x at ACCEPT; x's
+    // payload has not reached it.
+    let b1 = ballot(1, 0);
+    let effects = step(
+        &mut cluster,
+        0,
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: ExecutionPosition::ZERO,
+        },
+    );
+    cluster.handle(1, effects);
+    let entry = coord_consensus::SyncEntry {
+        command: x,
+        phase: Phase::Accept,
+        deps: vec![a],
+        path: Digest32([7; 32]),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: None,
+    };
+    let effects = step(
+        &mut cluster,
+        0,
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: b1,
+            source_ballot: ballot(0, 0),
+            entries: [(x, entry)].into_iter().collect(),
+            reproposed: BTreeSet::new(),
+        }),
+    );
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
+
+    // It reports x for ballot 2, whose selection leaves x out.
+    let b2 = ballot(2, 2);
+    let effects = step(
+        &mut cluster,
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed: ExecutionPosition::ZERO,
+        },
+    );
+    cluster.handle(1, effects);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .report(b2)
+            .entries
+            .iter()
+            .any(|e| e.command == x)
+    );
+    // x's payload arrives and ballot 1's entry installs; before its rows
+    // are durable, ballot 2's Sync releases x.
+    let installed = step(
+        &mut cluster,
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: x,
+            payload,
+        },
+    );
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&x),
+        Some(Phase::Accept)
+    );
+    let marker = step(
+        &mut cluster,
+        2,
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: b2,
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        }),
+    );
+    cluster.handle(1, installed);
+    cluster.handle(1, marker);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b2);
+
+    let report = cluster.nodes[1].follower().report(ballot(3, 1));
+    assert!(
+        !report
+            .entries
+            .iter()
+            .any(|e| e.command == x && e.phase >= Phase::Accept),
+        "a released acceptance is reported: {:?}",
+        report.entries.iter().find(|e| e.command == x)
+    );
+    assert!(
+        !dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, record)| *c == x && record.phase >= Phase::Accept),
+        "a released acceptance is durable"
+    );
+}
+
+/// task-d33: a voter the campaign missed -- cut off while it ran -- is
+/// asked to promise the new ballot by the leader's re-send, is answered
+/// with the Sync, and follows. Nothing else ever told it of the ballot:
+/// the leader's proposals are foreign to it, and a quiet domain sends it
+/// nothing at all.
+#[test]
+fn a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut = vec![(0, 2), (2, 0), (1, 2), (2, 1)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    cluster.cut.clear();
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
+/// task-d33: a voter the campaign missed, whose Sync from the leader was
+/// lost, is asked again and sent the Sync again. The leader used to count
+/// it as following once it promised: nothing asked it again, and it held
+/// every proposal of the ballot, promised and never synchronized.
+#[test]
+fn a_late_voter_whose_sync_was_lost_is_sent_it_again() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut = vec![(0, 2), (2, 0), (1, 2), (2, 1)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    cluster.cut.clear();
+    cluster.drop_sync = vec![(1, 2)];
+    cluster.settle_resending(2);
+    let ballots = cluster.nodes[2].follower().ballots();
+    assert_eq!(ballots.promised(), b1, "r2 promised the late ask");
+    assert_ne!(ballots.synced(), b1, "and its Sync was lost");
+    cluster.drop_sync.clear();
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
+/// task-d33: a voter that promised during the campaign, whose Sync was
+/// lost, is asked again and sent the Sync again. The leader used to seed
+/// its followers with every voter the campaign heard from: nothing asked
+/// this one again, and it held every proposal of the ballot, promised and
+/// never synchronized, until the next election. A voter that installed
+/// the Sync and has nothing to vote on yet ignores the ask, refusing
+/// nothing.
+#[test]
+fn a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.drop_sync = vec![(1, 2)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    let ballots = cluster.nodes[2].follower().ballots();
+    assert_eq!(ballots.promised(), b1, "r2 promised during the campaign");
+    assert_ne!(ballots.synced(), b1, "and its Sync was lost");
+    assert_eq!(cluster.nodes[0].follower().ballots().synced(), b1);
+    cluster.drop_sync.clear();
+    cluster.settle_resending(2);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    for i in [0, 2] {
+        let refused = cluster.nodes[i].follower_mut().take_rejections();
+        assert!(
+            !refused
+                .iter()
+                .any(|e| matches!(e, FollowerRejection::Promise(_))),
+            "r{i} refused the leader's ask: {refused:?}"
+        );
+    }
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
+/// task-d33: a voter's own campaign for a ballot it no longer holds is
+/// dropped when it promises another voter's higher one. Kept, it stood
+/// in for a campaign in progress, and a voter holding one takes no
+/// catch-up page.
+#[test]
+fn a_campaign_superseded_by_a_promise_is_dropped() {
+    let mut cluster = Cluster::new(89);
+    cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut = vec![(2, 0), (2, 1)];
+    cluster.campaign(2, ballot(1, 2));
+    assert!(cluster.nodes[2].follower().campaign_state().is_some());
+    let effects = cluster.nodes[2].step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(2, 1),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(2, effects);
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(2, 1)
+    );
+    assert!(cluster.nodes[2].follower().campaign_state().is_none());
+}
+
+/// task-d33: a voter that promises a leader which executed past it knows
+/// there is history to fetch, whether or not it holds any of it. It used
+/// to hold nothing, ask for nothing, and stay behind once the domain went
+/// quiet.
+#[test]
+fn a_promise_to_a_leader_ahead_leaves_history_to_fetch() {
+    let mut cluster = Cluster::new(97);
+    cluster.admit(1, 1);
+    cluster.settle();
+    assert!(!cluster.nodes[2].follower().holds_unexecuted());
+    let effects = cluster.nodes[2].step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 1),
+            executed: ExecutionPosition::new(5).unwrap(),
+        },
+    ));
+    cluster.handle(2, effects);
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(1, 1)
+    );
+    assert!(cluster.nodes[2].follower().holds_unexecuted());
+}
+
+/// task-d33: a waiting campaign assembles its reports again only when
+/// something it selects from moved -- another report completed, or a
+/// payload or an execution arrived. It is asked on every page, promise
+/// and payload, and assembled every time, the same reports gave the same
+/// wait at a cost that grew with them.
+#[test]
+fn a_waiting_campaign_assembles_again_only_when_something_moved() {
+    let config = quorum(ballot(4, 1));
+    let x = CommandId(Digest32([0x79; 32]));
+    let d = CommandId(Digest32([0x7a; 32]));
+    let report = |replica, entries| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(3, 0),
+        entries,
+    };
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(1), vec![]));
+    let behind = report(
+        r(2),
+        vec![coord_consensus::ReportEntry {
+            command: x,
+            phase: Phase::Accept,
+            deps: vec![d],
+            path: coord_consensus::empty_path(),
+            paths: Vec::new(),
+            seqnum: 1,
+            keys: Vec::new(),
+            payload_present: false,
+            admission: None,
+        }],
+    );
+    c.promise(r(2));
+    for page in coord_consensus::paginate(&behind, 64) {
+        c.page(page).unwrap();
+    }
+    for _ in 0..5 {
+        assert_eq!(c.try_select(usize::MAX, |_, _| false), Ok(None));
+    }
+    assert_eq!(c.assemblies(), 1, "nothing moved, nothing assembled");
+    c.supply_moved();
+    assert_eq!(c.try_select(usize::MAX, |_, _| false), Ok(None));
+    assert_eq!(c.assemblies(), 2);
+    assert_eq!(c.supply_moves(), 1);
+}
+
+/// task-d33: a candidate whose table is full takes in the payloads its
+/// own selection is waiting on. Refused for backpressure, the campaign
+/// waited on them for ever, and a domain whose voters all held full
+/// tables elected no one.
+#[test]
+fn a_candidate_with_a_full_table_takes_its_selections_payloads() {
+    let capacity = 4;
+    let mut cluster = Cluster::with_capacity(101, capacity);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // x is decided by r0 and r2 while r1 hears nothing of it...
+    cluster.cut = vec![(0, 1), (2, 1)];
+    let x = cluster.admit_at(2, 1, &[0, 2]);
+    cluster.settle();
+    cluster.cut.clear();
+    assert_eq!(cluster.nodes[2].executed, vec![a, x]);
+    // ... and r1's table fills with work only it holds.
+    for seq in 0..capacity as u64 {
+        cluster.cut = vec![(1, 0), (1, 2)];
+        cluster.admit_at(10 + seq, 2, &[1]);
+    }
+    cluster.cut.clear();
+    assert!(cluster.nodes[1].follower().table().len() >= capacity);
+    cluster.crash(0);
+    cluster.campaign(1, ballot(1, 1));
+    cluster.settle_resending(3);
+    assert!(
+        matches!(cluster.nodes[1].role, Some(Role::Leader(_))),
+        "the candidate never bound its selection"
+    );
+    assert_eq!(&cluster.nodes[1].executed[..2], &[a, x]);
+}
+
+/// task-d20 review: nothing installs while a newer Sync's marker is still
+/// becoming durable.
+///
+/// b1's Sync left z pending, its payload not here yet. b2's Sync leaves z
+/// out, and its marker's demotions were computed when it was issued. z's
+/// payload arrived before the marker was durable and installed z at
+/// ACCEPT from b1's entry, journaled after the marker and never demoted:
+/// the next report named it at ACCEPT at b2, which the acceptance guard
+/// keeps as decided.
+#[test]
+fn a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing() {
+    let (b1, b2) = (ballot(1, 2), ballot(2, 0));
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let older = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    drive_durable(&mut f, peer_event(r(2), ProtocolMessage::Sync(older)));
+    assert_eq!(f.ballots().synced(), b1);
+    drive_durable(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b2,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let newer = SyncDecision {
+        ballot: b2,
+        source_ballot: b1,
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(0), ProtocolMessage::Sync(newer)));
+    // z's payload arrives from a peer while the marker is in flight.
+    let installs = f.step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: z,
+            payload: payload_record(admit_z),
+        },
+    ));
+    for e in durable_events(&marker) {
+        let more = f.step(e);
+        for e in durable_events(&more) {
+            f.step(e);
+        }
+    }
+    for e in durable_events(&installs) {
+        let more = f.step(e);
+        for e in durable_events(&more) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b2);
+    let report = f.report(ballot(3, 0));
+    let entry = report.entries.iter().find(|e| e.command == z);
+    assert!(
+        entry.is_none_or(|e| e.phase < Phase::Accept),
+        "b1's entry installed at b2: {entry:?}"
+    );
+}
+
+/// The payload row a replica writes for the admission `admit`.
+fn payload_record(admit: Event) -> coord_consensus::PayloadRecordV1 {
+    let mut other = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    other.step(boot_event(1));
+    other
+        .step(admit)
+        .iter()
+        .find_map(|e| match e {
+            Effect::Persist(b) => b.updates.iter().find_map(|u| {
+                (u.collection == Collection::PayloadV1.id())
+                    .then(|| coord_consensus::decode_payload(u.value.as_ref()?).ok())
+                    .flatten()
+            }),
+            _ => None,
+        })
+        .expect("the admission writes its payload row")
+}
+
+/// Step `event`, then everything it persisted as durable, until nothing
+/// more is persisted.
+fn drive_durable(f: &mut Follower, event: Event) {
+    let mut effects = f.step(event);
+    loop {
+        let events = durable_events(&effects);
+        if events.is_empty() {
+            return;
+        }
+        effects = events.into_iter().flat_map(|e| f.step(e)).collect();
+    }
 }

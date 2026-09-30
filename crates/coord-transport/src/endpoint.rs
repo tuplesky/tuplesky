@@ -23,7 +23,7 @@ use tokio::time::{timeout, timeout_at};
 use crate::budget::{Budget, BudgetError, Opens};
 use crate::config::{ALPN_API, ALPN_PEER, Class, Limits, LocalIdentity, TlsProfile};
 use crate::frames::{
-    ControlStream, FrameError, KIND_PEER_EVIDENCE, PEER_EVIDENCE_VERSION, read_frame,
+    ControlStream, FrameError, KIND_PEER_EVIDENCE, PEER_EVIDENCE_VERSION, read_frame_within,
 };
 use crate::identity::{BoundIdentity, IdentityBinder, role_class};
 use crate::lane::{self, Lane, LaneLimits, lane_of_hello, role_lanes};
@@ -532,6 +532,8 @@ struct Shared {
     peers: Mutex<HashMap<ConnectionId, Arc<Peer>>>,
     links: Mutex<HashMap<LinkKey, Arc<Link>>>,
     node_budget: Arc<Budget>,
+    /// Bytes of frames being received, across every stream (task-d26).
+    receive_budget: Budget,
     next: AtomicU64,
     accept_permits: Arc<Semaphore>,
     /// What this endpoint presents, and what it needs in order to present
@@ -1141,6 +1143,7 @@ impl Transport {
                 limits.budget.node_bytes,
                 limits.budget.control_reserve,
             )),
+            receive_budget: Budget::new(limits.budget.receive_bytes, limits.budget.control_reserve),
             next: AtomicU64::new(1),
             accept_permits: Arc::new(Semaphore::new(limits.max_connections.max(1))),
             tls: Mutex::new(Tls {
@@ -1550,7 +1553,17 @@ impl Transport {
         .await
         .map_err(|_| RequestError::Timeout)??;
         let left = until.saturating_duration_since(tokio::time::Instant::now());
-        match read_frame(&mut recv, left, true).await {
+        // The answer is a frame being received like any other (Codex
+        // review): many small questions must not each hold a class-limit
+        // answer outside the receive budget.
+        match read_frame_within(
+            &mut recv,
+            left,
+            true,
+            Some((&self.shared.receive_budget, lane)),
+        )
+        .await
+        {
             Ok(answer) => Ok(answer),
             Err(FrameError::Timeout) => Err(RequestError::Timeout),
             Err(FrameError::Wire(e)) => Err(RequestError::Malformed(format!("{e:?}"))),
@@ -1598,6 +1611,14 @@ impl Transport {
     /// removed, so this does not grow with connection churn.
     pub fn links(&self) -> usize {
         self.shared.links.lock().unwrap().len()
+    }
+
+    /// Bytes of frames being received now, and the most ever (task-d26).
+    pub fn receive_budget(&self) -> (usize, usize) {
+        (
+            self.shared.receive_budget.in_flight(),
+            self.shared.receive_budget.peak(),
+        )
     }
 
     /// Bytes in flight across every destination now, and the most ever.
@@ -2061,7 +2082,14 @@ async fn read_uni(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _held = permit;
-    match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
+    match read_frame_within(
+        &mut recv,
+        shared.limits.frame_timeout,
+        true,
+        Some((&shared.receive_budget, peer.lane)),
+    )
+    .await
+    {
         Ok(frame) => {
             // The frame reader checks lengths and class limits, not what
             // the frame is. A peer stream carries peer evidence of a
@@ -2178,7 +2206,14 @@ async fn read_delivery(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _held = permit;
-    match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
+    match read_frame_within(
+        &mut recv,
+        shared.limits.frame_timeout,
+        true,
+        Some((&shared.receive_budget, peer.lane)),
+    )
+    .await
+    {
         Ok(frame) => {
             shared
                 .emit(TransportEvent::ApiDelivery {
@@ -2213,7 +2248,14 @@ async fn read_request(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _held = permit;
-    match read_frame(&mut recv, shared.limits.frame_timeout, true).await {
+    match read_frame_within(
+        &mut recv,
+        shared.limits.frame_timeout,
+        true,
+        Some((&shared.receive_budget, peer.lane)),
+    )
+    .await
+    {
         Ok(frame) => {
             // Decode here, at the boundary, and accept only what a client
             // may open a request stream with. Emitting an undecodable

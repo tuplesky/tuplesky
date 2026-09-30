@@ -352,8 +352,16 @@ fn other_facts_under_the_same_identity_are_a_conflict_and_replay_nothing() {
     let (c, _) = acknowledged(&mut f, 1);
     let accepted = f.payload(&c).expect("held").admission_digest();
 
+    // Nothing replayed: only the reason, to the frontend (task-d22).
     let effects = f.step(presented(1, 1, 1, 8).0);
-    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(
+        frontend_only(&effects),
+        vec![ProtocolMessage::Refused {
+            ballot: f.quorum().ballot(),
+            command: c,
+            refusal: coord_consensus::SubmissionRefusal::OtherFacts { accepted },
+        }]
+    );
     assert_eq!(
         f.take_rejections(),
         vec![FollowerRejection::RequestFactsConflict {
@@ -370,7 +378,17 @@ fn other_facts_under_the_same_identity_are_a_conflict_and_replay_nothing() {
         l.step(d);
     }
     l.take_rejections();
-    assert!(l.step(presented(1, 1, 1, 8).0).is_empty());
+    let answered = frontend_only(&l.step(presented(1, 1, 1, 8).0));
+    assert!(
+        matches!(
+            answered.as_slice(),
+            [ProtocolMessage::Refused {
+                refusal: coord_consensus::SubmissionRefusal::OtherFacts { .. },
+                ..
+            }]
+        ),
+        "{answered:?}"
+    );
     assert!(matches!(
         l.take_rejections().as_slice(),
         [Rejection::RequestFactsConflict { command, .. }] if *command == c
@@ -383,7 +401,13 @@ fn other_facts_under_the_same_identity_are_a_conflict_and_replay_nothing() {
 fn another_payload_under_the_same_key_is_still_an_identity_conflict() {
     let mut f = follower(1);
     let (c, _) = acknowledged(&mut f, 1);
-    assert!(f.step(admitted(1, 1, 7).0).is_empty());
+    let answered = frontend_only(&f.step(admitted(1, 1, 7).0));
+    assert!(
+        matches!(answered.as_slice(), [ProtocolMessage::Refused {
+            refusal: coord_consensus::SubmissionRefusal::OtherCommand { bound }, ..
+        }] if *bound == c),
+        "{answered:?}"
+    );
     assert!(matches!(
         f.take_rejections().as_slice(),
         [FollowerRejection::RequestIdentityConflict { bound, .. }] if *bound == c

@@ -88,10 +88,10 @@ enum Command {
         #[command(flatten)]
         provisioning: Provisioning,
     },
-    /// Initialize one voter if it has no store yet, start it from its
-    /// own directory, wait until it serves, and stay in the foreground
-    /// until it exits. This is how a voter of a multi-host domain is run
-    /// on its host.
+    /// Start one voter from its own directory, wait until it serves, and
+    /// stay in the foreground until it exits. This is how a voter of a
+    /// multi-host domain is run on its host. A voter with no store is
+    /// refused unless `--init` is given.
     Start {
         /// The directory holding the voter's `nN/` bundle: the run
         /// directory, or wherever the bundle was copied to.
@@ -103,6 +103,13 @@ enum Command {
         /// The `coordd` binary to run.
         #[arg(long)]
         coordd: PathBuf,
+        /// Create the voter's first store before starting it. Only for a
+        /// voter that has never run: a bundle copied again after its
+        /// host lost it looks the same, and initializing that would
+        /// start an empty voter under an identity that has voted. A
+        /// voter initialized once is refused it all the same.
+        #[arg(long)]
+        init: bool,
     },
     /// Run the credential endpoint alone, in the foreground.
     Issuer {
@@ -150,7 +157,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             coordd,
             provisioning,
         } => up(&dir, &coordd, provisioning),
-        Command::Start { dir, node, coordd } => start(&dir, node, &coordd),
+        Command::Start {
+            dir,
+            node,
+            coordd,
+            init,
+        } => start(&dir, node, &coordd, init),
         Command::Issuer { dir, listen } => {
             let endpoint = Arc::new(coord_harness::issuer::Endpoint::bind_on(&dir, listen)?);
             println!("issuer listening {}", endpoint.address()?);
@@ -186,6 +198,14 @@ fn provision(
     if voters == 0 {
         return Err("a domain with no voters has no quorum".into());
     }
+    // What the voters would refuse at start, said before anything is
+    // provisioned (task-d31).
+    if !coord_membership::membership::supported_voter_count(usize::from(voters)) {
+        return Err(format!(
+            "--voters {voters}: an epoch has three or five voters (one is the test profile)"
+        )
+        .into());
+    }
     Ok(coord_harness::provision(&Plan {
         hosts,
         listen_any: provisioning.listen_any,
@@ -208,6 +228,7 @@ fn start(
     dir: &std::path::Path,
     node: u8,
     coordd: &std::path::Path,
+    init: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = dir.join(format!("n{node}"));
     let config = directory.join("coordd.toml");
@@ -215,7 +236,11 @@ fn start(
         return Err(format!("{} is not a provisioned voter", config.display()).into());
     }
     let label = format!("n{node}");
-    coord_harness::run::initialize_node(coordd, &label, &config, &directory)?;
+    if init {
+        coord_harness::run::initialize_node(coordd, &label, &config, &directory)?;
+    } else {
+        coord_harness::run::resume_node(&label, &directory)?;
+    }
     let mut daemon = coord_harness::run::start_node(coordd, &label, &config, &directory)?;
     let pid = directory.join("coordd.pid");
     std::fs::write(&pid, format!("{}\n", daemon.pid()))?;

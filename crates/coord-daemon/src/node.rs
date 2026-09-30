@@ -157,6 +157,15 @@ impl Machine {
         }
     }
 
+    /// Ask the voters that promised this replica's campaign for the report
+    /// pages that have not arrived (task-d28). Only a follower campaigns.
+    pub fn request_report_pages(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.request_report_pages(),
+        }
+    }
+
     /// What this replica executed through.
     pub const fn executed_through(&self) -> coord_types::ids::ExecutionPosition {
         match self {
@@ -172,6 +181,17 @@ impl Machine {
         match self {
             Machine::Leader(_) => None,
             Machine::Follower(m) => m.halted(),
+        }
+    }
+
+    /// The selected entries no order keeps, when this replica's selection
+    /// held a dependency cycle (task-d21): an invariant violation it
+    /// halted on. A candidate finds it before binding; a leader handed
+    /// one anyway leads nothing.
+    pub fn recovery_cycle(&self) -> Option<&[CommandId]> {
+        match self {
+            Machine::Leader(m) => m.recovery_cycle(),
+            Machine::Follower(m) => m.recovery_cycle(),
         }
     }
 
@@ -232,6 +252,26 @@ impl Machine {
             Machine::Leader(m) => m.config_quorum().ballot() == *ballot,
             Machine::Follower(m) => {
                 m.quorum().ballot() == *ballot && m.ballots().synced() == *ballot
+            }
+        }
+    }
+
+    /// Whether this replica is synchronized at `ballot` or at a later
+    /// ballot of its epoch: what it executed then includes everything
+    /// decided at `ballot`, so it can serve a voter still there its
+    /// executed history (task-d33). A voter that promised a ballot of its
+    /// own the others never followed, and was refused as behind, asks at
+    /// the ballot it last synchronized; a donor answering only its own
+    /// ballot left it behind for good.
+    pub fn synchronized_at_or_after(&self, ballot: &Ballot) -> bool {
+        let at_or_after = |own: Ballot| {
+            own.compare_same_epoch(ballot)
+                .is_some_and(|o| o != core::cmp::Ordering::Less)
+        };
+        match self {
+            Machine::Leader(m) => at_or_after(m.config_quorum().ballot()),
+            Machine::Follower(m) => {
+                m.quorum().ballot() == m.ballots().synced() && at_or_after(m.ballots().synced())
             }
         }
     }
@@ -440,6 +480,12 @@ pub struct Node<P: Persistence> {
     order: Option<crate::catch_up::ExecutedOrder>,
     /// Catch-up pages this node served (diagnostic, task-d08).
     pub pages_served: u64,
+    /// Storage facts reached the outbox outside a round, so it may hold
+    /// sends they released that no round has handed out yet.
+    unreleased: bool,
+    /// The forgetting floor this voter agrees with its peers, when it
+    /// takes part (task-d27).
+    floor: Option<crate::floor::Floor>,
 }
 
 impl<P: Persistence> Node<P> {
@@ -461,7 +507,75 @@ impl<P: Persistence> Node<P> {
             won: None,
             order: None,
             pages_served: 0,
+            unreleased: false,
+            floor: None,
         }
+    }
+
+    /// Take part in agreeing a forgetting floor (task-d27).
+    pub fn keep_floor(&mut self, floor: crate::floor::Floor) {
+        self.floor = Some(floor);
+    }
+
+    /// The forgetting floor, when this voter takes part.
+    pub const fn floor(&self) -> Option<&crate::floor::Floor> {
+        self.floor.as_ref()
+    }
+
+    /// A peer's promise about a floor boundary, over its own link: its
+    /// row, and the floor it may activate, are journaled.
+    pub fn hear_floor(
+        &mut self,
+        from: coord_types::ids::ReplicaId,
+        readiness: &[u8],
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let Some(floor) = self.floor.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let Ok(gated) = self.applier.store().reader().snapshot() else {
+            return Ok(Outbound::default());
+        };
+        let Some(updates) = floor.hear(gated.view(), from, readiness) else {
+            return Ok(Outbound::default());
+        };
+        drop(gated);
+        let effects = floor_effects(floor, updates, None, ballot);
+        self.carry_out(effects, ballot)
+    }
+
+    /// Hand the floor what became of its batches, so it reclaims the
+    /// images superseded by one that is durable, and only then.
+    fn settle_floor(&mut self) {
+        if let Some(floor) = self.floor.as_mut() {
+            let outbox = &self.outbox;
+            floor.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b));
+        }
+    }
+
+    /// Export, keep and promise the checkpoint at the boundary this
+    /// node just applied.
+    fn floor_boundary(
+        &mut self,
+        position: coord_types::ids::ExecutionPosition,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let Some(floor) = self.floor.as_mut() else {
+            return Ok(Outbound::default());
+        };
+        let gated = match self.applier.store().reader().snapshot() {
+            Ok(gated) => gated,
+            Err(e) => {
+                floor.refuse(crate::floor::FloorRefusal::Export(format!("{e:?}")));
+                return Ok(Outbound::default());
+            }
+        };
+        let Some(promised) = floor.boundary(gated.view(), position) else {
+            return Ok(Outbound::default());
+        };
+        drop(gated);
+        let effects = floor_effects(floor, promised.updates, Some(promised.readiness), ballot);
+        self.carry_out(effects, ballot)
     }
 
     /// Record this node's journal and materialization work in
@@ -675,6 +789,13 @@ impl<P: Persistence> Node<P> {
         self.carry_out(effects, ballot)
     }
 
+    /// Ask the voters that promised this replica's campaign for the report
+    /// pages that have not arrived (task-d28).
+    pub fn request_report_pages(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().request_report_pages();
+        self.carry_out(effects, ballot)
+    }
+
     /// Ask `donor` for the commands it executed after this replica's
     /// frontier (task-d08).
     pub fn request_catch_up(
@@ -706,7 +827,7 @@ impl<P: Persistence> Node<P> {
         let identity = machine.identity();
         if from == identity.replica
             || !identity.voters.contains(&from)
-            || !machine.synchronized_at(&ballot)
+            || !machine.synchronized_at_or_after(&ballot)
             || machine.halted().is_some()
             || machine.catch_up_divergence().is_some()
         {
@@ -790,14 +911,20 @@ impl<P: Persistence> Node<P> {
     fn carry_out(&mut self, effects: Vec<Effect>, ballot: &Ballot) -> Result<Outbound, DriveError> {
         let mut out = Outbound::default();
         let mut queue = effects;
+        self.absorb_foreign(&mut queue);
+        // A round releases what became durable, so one runs even with
+        // nothing to carry out when the facts arrived outside a round.
+        let mut release = core::mem::take(&mut self.unreleased);
         // A bound on rounds, not on work: every round must make progress
         // through storage, and a machine that answered its own storage
         // facts with more storage facts for ever would otherwise spin
         // here rather than be visible as a fault.
         for _ in 0..MAX_ROUNDS {
-            if queue.is_empty() {
+            if queue.is_empty() && !release {
+                self.settle_floor();
                 return Ok(out);
             }
+            release = false;
             self.rounds += 1;
             let (round, next) = self.one_round(queue, ballot)?;
             out.absorb(round);
@@ -989,20 +1116,52 @@ impl<P: Persistence> Node<P> {
     /// the machine; the machine's answers join `next`.
     fn lower_once(&mut self, next: &mut Vec<Effect>) -> Result<(), DriveError> {
         let store = self.applier.store_mut();
-        let outcome = Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
-            .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+        let mut outcome =
+            Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
+                .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
         // Indeterminate is not "failed": the group's outcome is unknown,
-        // so the caller reconciles rather than assuming either answer. It
-        // surfaces as an engine failure here so it cannot be mistaken for
-        // a clean round.
+        // and what settles it is the store's own record, read back by a
+        // reconcile, never an assumption either way. It is settled here,
+        // as the applier settles its own. Left for later, the store
+        // refused every protocol batch after it as not ready, and the
+        // only reconcile that ran was the applier's, when a command next
+        // executed: on a replica whose next command waits on the very
+        // votes that batch carried, never.
         if outcome.indeterminate {
-            return Err(DriveError::Engine("group outcome indeterminate".into()));
+            let settled = self
+                .applier
+                .store_mut()
+                .reconcile()
+                .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+            outcome.events.extend(settled.events);
+            outcome.indeterminate = settled.indeterminate;
         }
         for event in outcome.events {
             self.outbox.observe(&event);
             next.extend(self.machine_mut().step(Event::Storage(event)));
         }
+        // Still unknown after a reconcile: an engine failure, so it
+        // cannot be mistaken for a clean round.
+        if outcome.indeterminate {
+            return Err(DriveError::Engine("group outcome indeterminate".into()));
+        }
         Ok(())
+    }
+
+    /// Hand the storage facts the applier met about other batches to the
+    /// outbox and the machine; the machine's answers join `next`.
+    ///
+    /// Applying a command lowers whatever the store had queued, and
+    /// reconciling settles whatever was uncertain, the protocol's
+    /// batches with the application's. The facts about those batches are
+    /// this node's to deliver, and the sends they release go out with
+    /// the next round.
+    fn absorb_foreign(&mut self, next: &mut Vec<Effect>) {
+        for event in self.applier.take_foreign() {
+            self.unreleased = true;
+            self.outbox.observe(&event);
+            next.extend(self.machine_mut().step(Event::Storage(event)));
+        }
     }
 
     /// Lower what is queued until the store has room for `batch`.
@@ -1094,8 +1253,25 @@ impl<P: Persistence> Node<P> {
             {
                 self.order = None;
             }
+            // What the apply's lowerings made durable for other batches
+            // is delivered by `carry_out`, after the command's own
+            // outcome. The machine takes the outcome first: delivered
+            // before it, under load a lagging voter's callers went
+            // unanswered (`a_replica_that_falls_behind_...`: 18 of 24
+            // runs four at a time on four cores, against 3 of 16 on the
+            // base and 4 of 24 delivered here).
             let effects = self.machine_mut().applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);
+            // At a floor boundary the view is exactly the command's: the
+            // apply returned once its batch was readable, and only a
+            // command moves the frontier (task-d27).
+            if self
+                .floor
+                .as_ref()
+                .is_some_and(|floor| floor.due(outcome.position))
+            {
+                out.absorb(self.floor_boundary(outcome.position, ballot)?);
+            }
         }
         Ok(out)
     }
@@ -1126,3 +1302,43 @@ impl<P: Persistence> Node<P> {
 /// How many times storage facts may produce further effects within one
 /// event before the driver calls it a fault.
 const MAX_ROUNDS: usize = 32;
+
+/// The batch that journals a floor's rows under its own barrier, and,
+/// for this voter's own promise, the sends to its peers that wait on it.
+fn floor_effects(
+    floor: &mut crate::floor::Floor,
+    updates: Vec<coord_core::effect::StoreUpdate>,
+    readiness: Option<Vec<u8>>,
+    ballot: &Ballot,
+) -> Vec<Effect> {
+    let barrier = floor.barrier();
+    let mut effects = vec![Effect::Persist(PersistBatch {
+        barrier,
+        base: None,
+        updates,
+    })];
+    if let Some(readiness) = readiness {
+        let (incarnation, boot_id) = floor.stamp();
+        let context = coord_core::effect::EffectContext {
+            domain: floor.origin().domain,
+            replica_incarnation: incarnation,
+            boot_id,
+            configuration: floor.voters().epoch(),
+            ballot: *ballot,
+            required_journal_seq: coord_types::ids::LocalJournalSeq::ZERO,
+        };
+        let frame = coord_consensus::ProtocolMessage::FloorReadiness { readiness }.encode();
+        for peer in floor.peers() {
+            effects.push(Effect::SendWhenDurable {
+                context,
+                requires: vec![barrier],
+                to: PeerId {
+                    replica: peer,
+                    incarnation: coord_types::ids::ReplicaIncarnation::ZERO,
+                },
+                frame: frame.clone(),
+            });
+        }
+    }
+    effects
+}

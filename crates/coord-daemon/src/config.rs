@@ -60,24 +60,53 @@ pub struct Limits {
     /// moves that cliff; it does not remove it.
     #[serde(default = "default_command_table_capacity")]
     pub command_table_capacity: usize,
+    /// New requests each frontend admits a second, with a second's worth
+    /// as a burst (task-d26). A retry of a request still outstanding is
+    /// not a new one.
+    ///
+    /// Bounded below the rate at which a voter catching up executes: a
+    /// page of up to 64 commands installed in one batch (task-d25). A
+    /// voter returning behind gains on the domain by the difference, so
+    /// the time it takes to close a gap is bounded by the gap; admitted
+    /// faster than it can execute, it never closes it. The bound is per
+    /// frontend: a domain served by several admits their sum.
+    #[serde(default = "default_max_admitted_per_second")]
+    pub max_admitted_per_second: u32,
 }
 
 const fn default_checkpoint_after() -> u64 {
     4096
 }
 
-/// The command table capacity a configuration that names none gets.
-pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = 1024;
+/// The admission rate a configuration that names none gets (task-d26):
+/// under a sixth of what catch-up executes at one 64-command window per
+/// durable batch of 10 ms, so one frontend at its bound leaves a
+/// returning voter most of its catch-up rate to gain with.
+pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
+
+const fn default_max_admitted_per_second() -> u32 {
+    DEFAULT_MAX_ADMITTED_PER_SECOND
+}
+
+/// The command table capacity a configuration that names none gets: the
+/// largest (task-d20).
+pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = MAX_COMMAND_TABLE_CAPACITY;
 /// The smallest command table capacity a voter is configured with. A
 /// table must hold a proposal's worth of in-flight commands and still
 /// reclaim, and the follower's held-proposal bound is a multiple of it.
 pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
-/// The largest. A Sync is selected from a majority of reports, and each
-/// report names up to about twice the table (its live records and its
-/// tombstones), so the table bounds the Sync -- which is written as one
-/// row and sent as one frame. At this capacity a worst-case Sync for five
-/// voters is about 1.6 MiB, inside the row's 2 MiB.
-pub const MAX_COMMAND_TABLE_CAPACITY: usize = 1536;
+/// The largest. A Sync is selected from up to five reports, and a report
+/// carries at most twice the table (its live records and its retirement
+/// window, `coord_consensus::max_report_entries`; a larger one is set
+/// aside), so the table bounds the Sync -- which is written as one row
+/// and sent as one frame. A worst-case entry, with its admission digest,
+/// one dependency and the largest sequence number, is 208 bytes, and the
+/// row takes 10,180 of them; five disjoint reports at this capacity are
+/// 10,000 (task-d20, measured by
+/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`). A
+/// selection with more dependencies per entry that still does not fit is
+/// refused by name, not written.
+pub const MAX_COMMAND_TABLE_CAPACITY: usize = coord_consensus::MAX_TABLE_CAPACITY;
 
 const fn default_command_table_capacity() -> usize {
     DEFAULT_COMMAND_TABLE_CAPACITY
@@ -92,6 +121,55 @@ impl Default for Limits {
             max_live_subscriptions: 4096,
             checkpoint_after_records: default_checkpoint_after(),
             command_table_capacity: default_command_table_capacity(),
+            max_admitted_per_second: default_max_admitted_per_second(),
+        }
+    }
+}
+
+/// Agreeing a forgetting floor (task-d27; design Section 5.3).
+///
+/// A voter that takes part exports the shared checkpoint at every floor
+/// boundary ([`crate::floor::FLOOR_INTERVAL`] executed positions), keeps
+/// the image, and promises its peers it holds it. A majority promising
+/// one checkpoint activates the floor. Nothing is forgotten below it
+/// yet: this is the agreement, and trimming comes after it.
+///
+/// Off by default. The interval is the schema's rather than this file's,
+/// so voters that take part agree on the boundaries without having to
+/// agree on a setting; one that does not take part simply promises
+/// nothing, and a floor then needs a majority of the others.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloorConfig {
+    /// Whether this voter exports and promises at floor boundaries.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory the promised images are kept in, relative to
+    /// `state_directory` unless absolute. Not the local checkpoints'
+    /// directory: that one reclaims every image but the selected one.
+    #[serde(default = "floor_images")]
+    pub images: String,
+    /// Free bytes the images' filesystem must keep beyond the image an
+    /// export would add. Short of it, the boundary is refused and said
+    /// so, and no promise is made.
+    #[serde(default = "floor_headroom_bytes")]
+    pub headroom_bytes: u64,
+}
+
+fn floor_images() -> String {
+    "floor-images".to_owned()
+}
+
+const fn floor_headroom_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+impl Default for FloorConfig {
+    fn default() -> Self {
+        FloorConfig {
+            enabled: false,
+            images: floor_images(),
+            headroom_bytes: floor_headroom_bytes(),
         }
     }
 }
@@ -516,6 +594,10 @@ pub struct Config {
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
+    /// Agreeing a forgetting floor with the other voters (task-d27).
+    /// Absent, it is off.
+    #[serde(default)]
+    pub floor: FloorConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).
@@ -599,6 +681,15 @@ pub enum ConfigError {
     /// A test-only switch set in a build without debug assertions. The
     /// field is named.
     TestOnlySwitch(&'static str),
+    /// Two stores that each reclaim what they do not keep given the same
+    /// directory, or one inside the other: each would take the other's
+    /// images for its own leftovers and remove them.
+    SharedDirectory {
+        /// The one setting.
+        first: &'static str,
+        /// The other.
+        second: &'static str,
+    },
 }
 
 /// Which build is validating: whether test-only switches may be set.
@@ -758,6 +849,13 @@ impl Config {
                 max: MAX_COMMAND_TABLE_CAPACITY as u64,
             });
         }
+        if self.limits.max_admitted_per_second == 0 {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.max_admitted_per_second",
+                min: 1,
+                max: u64::from(u32::MAX),
+            });
+        }
         // Durable state is opened under the name this build implements or
         // it is not opened at all. A name this build does not serve is a
         // different store, not a compatible one, and the manifest is what
@@ -823,8 +921,46 @@ impl Config {
                 return Err(ConfigError::EmptyPath(name));
             }
         }
+        // The floor's images and the local checkpoints are each reclaimed
+        // down to what their own store keeps, and both name an image by a
+        // 64-hex directory. Given one directory, or one inside the other,
+        // the local store would remove the images a floor promise names
+        // and the floor would remove the selected recovery checkpoint.
+        if self.floor.enabled {
+            if self.floor.images.trim().is_empty() {
+                return Err(ConfigError::EmptyPath("floor.images"));
+            }
+            let images = resolved(&self.state_directory, &self.floor.images);
+            let checkpoints = resolved(&self.state_directory, &self.state.checkpoints);
+            if images.starts_with(&checkpoints) || checkpoints.starts_with(&images) {
+                return Err(ConfigError::SharedDirectory {
+                    first: "floor.images",
+                    second: "state.checkpoints",
+                });
+            }
+        }
         Ok(())
     }
+}
+
+/// `path` under `state_directory` unless absolute, with `.` and `..`
+/// taken out lexically, so two spellings of one directory compare equal.
+/// Links are not followed here: the store compares the directories it
+/// opened as well (`coordd`'s `keep_floor`).
+pub fn resolved(state_directory: &str, path: &str) -> std::path::PathBuf {
+    use std::path::{Component, Path, PathBuf};
+    let joined = Path::new(state_directory).join(path);
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Refuse an engine or profile this build does not serve.
@@ -920,5 +1056,53 @@ allow_insecure_loopback = {allow}
         for build in [Build::Test, Build::Release] {
             assert_eq!(unset.validate_as(build), Err(ConfigError::InsecureIssuer));
         }
+    }
+
+    /// The floor is off unless a configuration turns it on, and turned on
+    /// it keeps its images apart from the local checkpoints (task-d27).
+    #[test]
+    fn the_forgetting_floor_is_off_unless_configured() {
+        use super::{FloorConfig, state_checkpoints};
+        assert_eq!(with_renewal(true).floor, FloorConfig::default());
+        assert!(!FloorConfig::default().enabled);
+        let on: FloorConfig = toml::from_str("enabled = true").expect("parses");
+        assert!(on.enabled);
+        assert_ne!(on.images, state_checkpoints());
+        assert!(toml::from_str::<FloorConfig>("interval = 8").is_err());
+    }
+
+    /// Turned on, the floor refuses a directory the local checkpoints
+    /// reclaim, however it is spelled: each store would remove the
+    /// other's images.
+    #[test]
+    fn the_floor_keeps_its_images_apart_from_the_local_checkpoints() {
+        let on = |images: &str, checkpoints: &str| {
+            let mut config = with_renewal(false);
+            config.renewal = None;
+            config.floor.enabled = true;
+            config.floor.images = images.to_owned();
+            config.state.checkpoints = checkpoints.to_owned();
+            config.validate_as(Build::Test)
+        };
+        let shared = Err(ConfigError::SharedDirectory {
+            first: "floor.images",
+            second: "state.checkpoints",
+        });
+        assert_eq!(on("floor-images", "checkpoints"), Ok(()));
+        assert_eq!(on("checkpoints", "checkpoints"), shared);
+        assert_eq!(on("./checkpoints/", "checkpoints"), shared);
+        assert_eq!(on("/var/lib/coord/a/checkpoints", "checkpoints"), shared);
+        assert_eq!(on("x/../checkpoints", "checkpoints"), shared);
+        assert_eq!(on("checkpoints/floor", "checkpoints"), shared);
+        assert_eq!(on(".", "checkpoints"), shared);
+        assert_eq!(
+            on("", "checkpoints"),
+            Err(ConfigError::EmptyPath("floor.images"))
+        );
+        // Off, the setting is not used and not checked.
+        let mut off = with_renewal(false);
+        off.renewal = None;
+        off.floor.images = "checkpoints".to_owned();
+        assert_eq!(off.validate_as(Build::Test), Ok(()));
     }
 }

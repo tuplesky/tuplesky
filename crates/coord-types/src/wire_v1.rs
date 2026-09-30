@@ -412,6 +412,18 @@ impl FrameReader {
         Ok(())
     }
 
+    /// The whole length of the frame whose header is buffered, once the
+    /// header is complete: what receiving that frame will hold.
+    pub fn pending_frame_len(&self) -> Option<Result<usize, WireError>> {
+        let avail = &self.buf[self.start..];
+        if avail.len() < HEADER_LEN {
+            return None;
+        }
+        let mut header = [0u8; HEADER_LEN];
+        header.copy_from_slice(&avail[..HEADER_LEN]);
+        Some(check_header(&header))
+    }
+
     /// Bytes buffered but not yet consumed as frames.
     pub fn pending(&self) -> usize {
         self.buf.len() - self.start
@@ -801,7 +813,10 @@ pub enum OutcomeV1 {
     },
     /// Outcome not yet resolvable; retry `ResolveRequest` later.
     Pending,
-    /// Outcome unknown to this endpoint (session retired or history lost).
+    /// Outcome unknown to this endpoint: neither its memory nor its
+    /// durable record says what came of the invocation. Submitting the
+    /// same invocation again, under the same identity, is how a client
+    /// learns more (task-d23).
     Unknown,
 }
 
@@ -1072,4 +1087,15 @@ pub mod codes {
     /// `max_request_bytes`); nothing was submitted, and the same request
     /// will be refused again.
     pub const REQUEST_TOO_LARGE: u16 = 0x0006;
+    /// The command executed, and its result is not disclosed to this
+    /// caller: the output gate withholds it under the current policy, or
+    /// the session may no longer read it (task-d23). The operation
+    /// happened; it is not submitted again, and it is not a refusal to
+    /// admit.
+    pub const OUTPUT_WITHHELD: u16 = 0x0007;
+    /// The outcome is retired: the invocation's sequence is at or below
+    /// its client instance's retirement floor, and no result is kept for
+    /// it (task-d23). Whether it happened is not retrievable any more,
+    /// here or anywhere.
+    pub const RESULT_RETIRED: u16 = 0x0008;
 }

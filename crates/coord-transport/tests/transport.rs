@@ -661,6 +661,7 @@ fn tight_limits() -> Limits {
         node_bytes: 96 * 1024,
         control_reserve: 16 * 1024,
         max_opens: 8,
+        ..BudgetLimits::default()
     };
     l
 }
@@ -2659,4 +2660,76 @@ async fn a_renewed_identity_is_presented_on_new_handshakes_and_open_ones_are_lef
         .expect("a dial after the renewal presented the old leaf");
     // The warm link is still the one it was.
     assert!(b.linked(r(0), inc(1), Lane::Control));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frames_being_received_hold_no_more_than_the_receive_budget() {
+    // Each stream's reader holds at most one frame of its class, but
+    // many streams at once each held one: partly arrived frames were
+    // bounded only by how many streams a peer may open (task-d26). A
+    // frame now takes its whole length from the receive budget once its
+    // header is in, and a stream waits for room before reading its
+    // payload; every frame still arrives once the ones ahead are read.
+    let f = fixture(&[PeerRole::Voter, PeerRole::Voter]);
+    let mut l = limits();
+    l.frame_timeout = Duration::from_secs(20);
+    l.budget.receive_bytes = 1024 * 1024;
+    l.budget.control_reserve = 0;
+    let mut acceptor = bind_with(&f, 0, l);
+    let (_client, conn, _control) = negotiated(
+        &f,
+        &f.ids[1],
+        ALPN_PEER,
+        &mut acceptor,
+        PeerRole::Voter,
+        &[],
+    )
+    .await;
+    const STREAMS: usize = 6;
+    const PAYLOAD: usize = 400 * 1024;
+    let (release, _) = tokio::sync::broadcast::channel::<()>(1);
+    let mut writers = Vec::new();
+    for i in 0..STREAMS {
+        let conn = conn.clone();
+        let mut go = release.subscribe();
+        writers.push(tokio::spawn(async move {
+            let frame = evidence_frame(&vec![i as u8; PAYLOAD]).unwrap();
+            let mut uni = conn.open_uni().await.unwrap();
+            // The header and half the payload, then nothing until told.
+            let half = frame.len() / 2;
+            uni.write_all(&frame[..half]).await.unwrap();
+            let _ = go.recv().await;
+            uni.write_all(&frame[half..]).await.unwrap();
+            uni.finish().unwrap();
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (held, _) = acceptor.receive_budget();
+    assert!(
+        held <= 1024 * 1024,
+        "{held} bytes of partly arrived frames held"
+    );
+    release.send(()).unwrap();
+    let mut arrived = 0;
+    while arrived < STREAMS {
+        match timeout(Duration::from_secs(20), event(&mut acceptor)).await {
+            Ok(TransportEvent::PeerFrame { payload, .. }) => {
+                assert_eq!(payload.len(), PAYLOAD);
+                arrived += 1;
+            }
+            Ok(TransportEvent::Closed { reason, .. }) => panic!("{reason:?}"),
+            Ok(_) => {}
+            Err(_) => panic!("{arrived} of {STREAMS} frames arrived"),
+        }
+    }
+    for w in writers {
+        w.await.unwrap();
+    }
+    let (held, peak) = acceptor.receive_budget();
+    assert_eq!(held, 0, "a frame read kept its budget");
+    assert!(
+        peak <= 1024 * 1024,
+        "the budget held {peak} bytes at its peak"
+    );
+    assert!(peak >= 2 * PAYLOAD, "frames were not received side by side");
 }

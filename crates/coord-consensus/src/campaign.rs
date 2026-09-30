@@ -18,7 +18,7 @@ use coord_types::ids::{Ballot, ReplicaId};
 
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
-use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select_with};
+use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select_from};
 use crate::summary::{PageError, ReportAssembler, ReportPage};
 
 /// The campaign for one ballot.
@@ -37,6 +37,19 @@ pub struct Campaign {
     /// the campaign must not wait forever on a live quorum that holds the
     /// payload.
     payloads_requested: BTreeSet<ReplicaId>,
+    /// How many times the complete reports were assembled (task-d26).
+    assemblies: u64,
+    /// The complete reports last assembled from, by count, and whether a
+    /// payload arrived since: a selection that waited is tried again only
+    /// when one of the two moved (task-d33).
+    assembled_from: Option<usize>,
+    supply_moved: bool,
+    /// How many times a payload or an execution arrived while the
+    /// campaign had not selected (diagnostic, task-d33).
+    supply_moves: u64,
+    /// Configurations of earlier ballots the candidate ran under, the
+    /// source ballot's among them if it is known (task-d31).
+    sources: Vec<BallotConfiguration>,
 }
 
 impl Campaign {
@@ -53,6 +66,11 @@ impl Campaign {
             durable: false,
             published: false,
             payloads_requested: BTreeSet::new(),
+            assemblies: 0,
+            assembled_from: None,
+            supply_moved: false,
+            supply_moves: 0,
+            sources: Vec::new(),
         }
     }
 
@@ -109,9 +127,87 @@ impl Campaign {
         self.own = Some(report);
     }
 
+    /// The candidate's own report, once taken.
+    pub const fn own(&self) -> Option<&RecoveryReport> {
+        self.own.as_ref()
+    }
+
     /// A report page from a voter.
     pub fn page(&mut self, page: ReportPage) -> Result<(), PageError> {
         self.assembler.accept(page)
+    }
+
+    /// The configuration an earlier ballot ran under (task-d31): if it is
+    /// the source ballot of the selection, the possible-fast rule is
+    /// applied to its fast set rather than the default one.
+    #[must_use]
+    pub fn knowing(mut self, source: BallotConfiguration) -> Self {
+        if source.ballot() != self.config.ballot() {
+            self.sources.push(source);
+        }
+        self
+    }
+
+    /// Hold no report larger than `report_limit` entries, and a page more
+    /// (task-d28; [`ReportAssembler::bound_entries`]).
+    #[must_use]
+    pub fn bounded(mut self, report_limit: usize) -> Self {
+        self.assembler.bound_entries(report_limit);
+        self
+    }
+
+    /// The report pages to ask each promising voter for again (task-d28):
+    /// those still missing from a report some page of which arrived, or
+    /// an empty list -- the first pages -- for one of which none did. The
+    /// candidate's own report is never asked for, and nothing is once
+    /// the selection is made.
+    pub fn missing_pages(&self) -> Vec<(ReplicaId, Vec<u32>)> {
+        if self.decision.is_some() {
+            return Vec::new();
+        }
+        let me = self.config.leader();
+        self.promised
+            .iter()
+            .filter(|r| **r != me)
+            .filter_map(|r| match self.assembler.missing(r) {
+                None => Some((*r, Vec::new())),
+                Some(missing) if missing.is_empty() => None,
+                Some(missing) => Some((
+                    *r,
+                    missing
+                        .into_iter()
+                        .take(crate::summary::MAX_PAGE_ASK)
+                        .collect(),
+                )),
+            })
+            .collect()
+    }
+
+    /// A payload arrived that the selection may have been waiting on: the
+    /// next [`Campaign::try_select`] assembles again (task-d33).
+    pub fn supply_moved(&mut self) {
+        self.supply_moved = true;
+        if self.decision.is_none() {
+            self.supply_moves += 1;
+        }
+    }
+
+    /// How many times something the selection may wait on arrived before
+    /// it was made: each may cost one more assembly (task-d33).
+    pub const fn supply_moves(&self) -> u64 {
+        self.supply_moves
+    }
+
+    /// How many times the complete reports were assembled for a selection
+    /// (task-d26): once per arrival from a majority on, never per page
+    /// before it.
+    pub const fn assemblies(&self) -> u64 {
+        self.assemblies
+    }
+
+    /// Report pages held (task-d28).
+    pub fn pages_held(&self) -> usize {
+        self.assembler.pages_held()
     }
 
     /// Complete reports from promising voters, own included.
@@ -162,20 +258,68 @@ impl Campaign {
     ///
     /// When neither applies, the campaign waits for the voters that have
     /// not reported, and fails only once every voter has.
+    ///
+    /// A report carrying more than `report_limit` entries is set aside the
+    /// same way (task-d20), so the Sync is selected from reports of a
+    /// bounded size; the candidate's own is never set aside, and the
+    /// campaign fails on it as [`RecoveryError::ReportTooLarge`].
     pub fn try_select(
         &mut self,
+        report_limit: usize,
         supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     ) -> Result<Option<&SyncDecision>, RecoveryError> {
         if self.decision.is_some() {
             return Ok(self.decision.as_ref());
         }
-        let mut reports = self.reports();
-        if reports.len() < self.config.slow_size() {
+        // Assembling copies every entry of every complete report, and a
+        // campaign is asked on every page and promise that arrives: until
+        // a majority could be complete nothing is assembled (task-d26).
+        let could_be_complete = self
+            .assembler
+            .all_pages_held()
+            .filter(|r| self.promised.contains(r))
+            .count()
+            + usize::from(self.own.is_some());
+        if could_be_complete < self.config.slow_size() {
             return Ok(None);
         }
+        // A campaign is asked again on every page, promise and payload
+        // that arrives. Nothing it selects from moved unless another
+        // report completed or a payload arrived: assembled again, the
+        // same reports gave the same wait (task-d33).
+        if self.assembled_from == Some(could_be_complete) && !self.supply_moved {
+            return Ok(None);
+        }
+        self.assembled_from = Some(could_be_complete);
+        self.supply_moved = false;
+        self.assemblies += 1;
+        let mut reports = self.reports();
         let everyone = reports.len() >= self.config.voters().len();
+        let oversize = |r: &RecoveryReport| RecoveryError::ReportTooLarge {
+            replica: r.replica,
+            entries: r.entries.len(),
+            limit: report_limit,
+        };
+        if let Some(own) = reports
+            .iter()
+            .find(|r| r.replica == self.config.leader() && r.entries.len() > report_limit)
+        {
+            return Err(oversize(own));
+        }
+        let first_oversize = reports
+            .iter()
+            .find(|r| r.entries.len() > report_limit)
+            .map(oversize);
+        reports.retain(|r| r.entries.len() <= report_limit);
+        if reports.len() < self.config.slow_size() {
+            return match first_oversize {
+                Some(e) if everyone => Err(e),
+                _ => Ok(None),
+            };
+        }
         let decision = loop {
-            match select_with(&self.config, &reports, &supplied) {
+            let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
+            match select_from(&self.config, &reports, &supplied, source) {
                 Ok(decision) => break decision,
                 Err(RecoveryError::HalfInitialized { replica, command }) => {
                     if replica != self.config.leader() && reports.len() > self.config.slow_size() {

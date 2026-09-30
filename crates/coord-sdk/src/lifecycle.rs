@@ -14,8 +14,13 @@
 //!   server `RequestIdentityConflict` is the same typed error.
 //! * A deadline reports the outcome as *unknown* (a completion the
 //!   application sees), keeps the invocation and resolves it by identity
-//!   with `ResolveRequest`; `Pending` keeps it unknown, `Unknown` from the
-//!   server is final.
+//!   with `ResolveRequest`; `Pending` keeps it unknown. `Unknown` from the
+//!   server ends the resolution, and `retry()` after it submits the same
+//!   invocation again under the same identity, whose answer is the
+//!   retained outcome where the domain keeps one (task-d23).
+//! * An executed command whose result the caller may not see is
+//!   `Withheld`, never a refusal to admit; one whose result is no longer
+//!   kept is `Retired`. Both are final.
 //! * Outstanding requests (queued, in flight, unknown) are bounded; the
 //!   pool bounds concurrent streams; a credential is presented once per
 //!   connection binding.
@@ -111,8 +116,17 @@ pub enum Outcome {
     /// Established error.
     Failed(RetryError),
     /// Unknown: the deadline passed or the endpoint lost the identity; the
-    /// operation may or may not have happened. Resolve by identity.
+    /// operation may or may not have happened. Resolve by identity, or
+    /// `retry()` to submit the same invocation again.
     Unknown,
+    /// The operation happened, and its result is withheld from this
+    /// caller under the current policy (task-d23). It is not submitted
+    /// again, and it is not a refusal to admit.
+    Withheld,
+    /// Retired, result unavailable: the invocation is at or below its
+    /// client instance's retirement floor and no result is kept for it
+    /// (task-d23). Whether it happened is not retrievable.
+    Retired,
 }
 
 /// Where a request is.
@@ -380,8 +394,12 @@ impl<P: CredentialProvider> Client<P> {
         {
             return Ok(id);
         }
+        // An unknown outcome is not an answer to replay: the same
+        // invocation goes out again, and the domain answers it from its
+        // record where it executed (task-d23).
         if let Some(e) = self.requests.get(&id)
             && let RequestState::Done(outcome) = &e.state
+            && *outcome != Outcome::Unknown
         {
             self.completions.push_back(Completion {
                 request: id,
@@ -530,6 +548,10 @@ impl<P: CredentialProvider> Client<P> {
                     self.credentials.invalidate();
                     Outcome::Failed(RetryError::NotAdmitted)
                 }
+                // The command executed: nothing about the binding is in
+                // question, and nothing is sent again (task-d23).
+                codes::OUTPUT_WITHHELD => Outcome::Withheld,
+                codes::RESULT_RETIRED => Outcome::Retired,
                 codes::MALFORMED_REQUEST => Outcome::Failed(RetryError::Malformed),
                 codes::RESULT_TOO_LARGE => Outcome::Failed(RetryError::ResultTooLarge),
                 codes::REQUEST_TOO_LARGE => Outcome::Failed(RetryError::RequestTooLarge),

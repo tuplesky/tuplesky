@@ -13,7 +13,7 @@ use crate::ballot::{BallotState, ConfigurationIdentity};
 use crate::commands::CommandTable;
 use crate::learner::Learner;
 use crate::rows::PayloadRecordV1;
-use crate::summary::DurableLedger;
+use crate::summary::{DurableLedger, ServedReport};
 
 /// A recovery report owed to a candidate; the replica's state
 /// independent of its role carries it across a role change.
@@ -57,8 +57,26 @@ pub struct RecoveredState {
     /// obligation survives a role change, since the candidate may need
     /// this replica for its majority.
     pub report_due: Option<PendingReport>,
+    /// The pages of the last report this replica sent a candidate, which
+    /// it answers a lost page from (task-d28).
+    pub served_report: Option<ServedReport>,
+    /// The ballot this replica last reported for and the commands its
+    /// report named: the only records a Sync of that ballot may release
+    /// (task-d24).
+    pub report_cut: Option<(Ballot, BTreeSet<CommandId>)>,
     /// Frontend.
     pub frontend: PeerId,
     /// Command table capacity.
     pub capacity: usize,
+    /// The selection of the synchronized ballot, when this replica holds
+    /// it: a deposed leader's own Sync, whose entries it may not have
+    /// installed (task-d34). Its follower resumes it as a restart resumes
+    /// the durable Sync row, so the entries install at the selected facts
+    /// and every report names them.
+    pub synced_selection: Option<crate::recovery::SyncDecision>,
+    /// Commands this replica took in after its campaign cut its own
+    /// report, still only pre-accepted here: no selection of that
+    /// campaign can name them, so the leader it becomes proposes them
+    /// (task-d33).
+    pub arrived: BTreeSet<CommandId>,
 }

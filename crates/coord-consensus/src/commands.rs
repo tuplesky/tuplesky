@@ -124,6 +124,12 @@ struct KeyState {
     log: PathLog,
 }
 
+/// A bounded table admits new work up to its capacity less one part in
+/// this many (task-d24). The rest is kept for the work that finishes or
+/// recovers admitted commands: a Sync's entries and the commands catch-up
+/// pulls, which enter a full table.
+pub const RECOVERY_RESERVE_PARTS: usize = 8;
+
 /// The command table of one replica in one domain.
 #[derive(Clone, Debug, Default)]
 pub struct CommandTable {
@@ -162,6 +168,15 @@ pub struct CommandTable {
     /// key, it is the tail of the order everything executed so far
     /// follows, which a new leader chains its first proposals after.
     last_executed: Option<CommandId>,
+    /// The executed records not retired yet, in the order they executed:
+    /// the order [`CommandTable::reclaim`] retires them in (task-d33).
+    unretired: VecDeque<CommandId>,
+    /// The commands whose record was created or moved since the owner
+    /// last took them, while it watches ([`CommandTable::watch_raises`]):
+    /// what a Sync entry waiting on one of them re-examines, instead of
+    /// every entry being rescanned each time anything moved (task-d26).
+    /// A set, so it holds at most the table's records and tombstones.
+    raised: Option<BTreeSet<CommandId>>,
 }
 
 impl CommandTable {
@@ -177,6 +192,8 @@ impl CommandTable {
             recent_set: BTreeSet::new(),
             capacity: None,
             last_executed: None,
+            unretired: VecDeque::new(),
+            raised: None,
         }
     }
 
@@ -192,6 +209,8 @@ impl CommandTable {
             recent_set: BTreeSet::new(),
             capacity: Some(capacity),
             last_executed: None,
+            unretired: VecDeque::new(),
+            raised: None,
         }
     }
 
@@ -214,6 +233,8 @@ impl CommandTable {
             recent_set: BTreeSet::new(),
             capacity,
             last_executed: None,
+            unretired: VecDeque::new(),
+            raised: None,
         };
         for (c, r) in records {
             table.records.insert(c, r);
@@ -253,13 +274,108 @@ impl CommandTable {
         table
     }
 
+    /// Start (`true`) or stop noting the commands whose record is created
+    /// or moves. Stopping forgets what was noted.
+    pub fn watch_raises(&mut self, on: bool) {
+        match (on, &self.raised) {
+            (true, None) => self.raised = Some(BTreeSet::new()),
+            (false, _) => self.raised = None,
+            (true, Some(_)) => {}
+        }
+    }
+
+    /// The commands noted since the last call, while watching.
+    pub fn take_raised(&mut self) -> BTreeSet<CommandId> {
+        self.raised
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn raise(&mut self, command: CommandId) {
+        if let Some(raised) = &mut self.raised {
+            raised.insert(command);
+        }
+    }
+
     /// Every initialized record.
     pub fn records(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
         self.records.iter().filter(|(_, r)| r.payload.is_some())
     }
 
+    /// Whether new admission has no room left: a bounded table admits new
+    /// work only up to its capacity less the share reserved for recovery
+    /// and catch-up ([`RECOVERY_RESERVE_PARTS`], task-d24).
     fn full(&self) -> bool {
-        self.capacity.is_some_and(|c| self.records.len() >= c)
+        self.capacity
+            .is_some_and(|c| self.records.len() >= c - c / RECOVERY_RESERVE_PARTS)
+    }
+
+    /// A placeholder for a command a Sync selected, let into a full table
+    /// as a pulled command is (task-d24): recovery work is what makes room
+    /// again, and a placeholder refused under backpressure dropped the
+    /// entry silently, so only catch-up could bring it in.
+    pub fn expect_beyond_capacity(&mut self, command: CommandId) {
+        self.raise(command);
+        self.records
+            .entry(command)
+            .or_insert_with(|| CommandRecord {
+                phase: Phase::Start,
+                deps: Vec::new(),
+                keys: Vec::new(),
+                payload: None,
+                paths: Vec::new(),
+                synced_seq: None,
+                path: crate::graph::empty_path(),
+            });
+    }
+
+    /// The commands this table holds undecided: in START, PRE-ACCEPT or
+    /// ACCEPT, placeholders included.
+    pub fn undecided(&self) -> impl Iterator<Item = &CommandId> {
+        self.records
+            .iter()
+            .filter(|(_, r)| r.phase < Phase::Commit)
+            .map(|(c, _)| c)
+    }
+
+    /// Release an undecided record from the table (task-d24), repairing
+    /// the conflict index: a key whose latest command it was takes the
+    /// released command's own dependencies in its place, those still
+    /// known here, so the next command on the key still follows what the
+    /// released one followed. It leaves each key's path log too, so no
+    /// later path is hashed through it. A decided record is never
+    /// released.
+    pub fn release(&mut self, command: &CommandId) -> bool {
+        match self.records.get(command) {
+            Some(r) if r.phase < Phase::Commit => {}
+            _ => return false,
+        }
+        let record = self.records.remove(command).expect("checked");
+        for key in &record.keys {
+            let Some(state) = self.keys.get_mut(key) else {
+                continue;
+            };
+            state.log.remove(command);
+            let tails: Vec<CommandId> =
+                state.last.into_iter().chain(state.also.drain(..)).collect();
+            let mut repaired: Vec<CommandId> = Vec::new();
+            for tail in tails {
+                if tail == *command {
+                    for dep in &record.deps {
+                        let known = self.records.contains_key(dep) || self.history.contains(dep);
+                        if known && !repaired.contains(dep) {
+                            repaired.push(*dep);
+                        }
+                    }
+                } else if !repaired.contains(&tail) {
+                    repaired.push(tail);
+                }
+            }
+            state.last = repaired.first().copied();
+            state.also = repaired.into_iter().skip(1).collect();
+        }
+        true
     }
 
     /// Retire every executed record, and say how many went.
@@ -273,19 +389,42 @@ impl CommandTable {
     /// executed through the tombstone [`CommandTable::retire`] leaves, and
     /// the tombstone goes with the last record that referenced it, so the
     /// bookkeeping stays bounded by the live set rather than by history.
+    ///
+    /// They go in the order they executed. The recency window a report
+    /// names ([`CommandTable::forgotten`]) counts retirements, and a
+    /// replica refuses a candidate only once it has executed a table's
+    /// capacity of commands past it: retired in identity order, a burst
+    /// of reclaimed records pushed a command executed a moment before out
+    /// of that window, a report left it out while a candidate still held
+    /// it undecided, and the candidate re-proposed a command this replica
+    /// had executed (task-d33, protocol_sim row 3, three voters, seed 22).
     pub fn reclaim(&mut self) -> usize {
-        let executed: Vec<CommandId> = self
-            .records
+        let records = &self.records;
+        let executed_now =
+            |c: &CommandId| records.get(c).is_some_and(|r| r.phase == Phase::Executed);
+        let mut executed: Vec<CommandId> = self
+            .unretired
             .iter()
-            .filter(|(_, r)| r.phase == Phase::Executed)
-            .map(|(c, _)| *c)
+            .copied()
+            .filter(|c| executed_now(c))
             .collect();
+        // A record restored as executed carries no order of its own; its
+        // rows are the only evidence left, and they go last.
+        let ordered: BTreeSet<CommandId> = executed.iter().copied().collect();
+        executed.extend(
+            records
+                .iter()
+                .filter(|(c, r)| r.phase == Phase::Executed && !ordered.contains(c))
+                .map(|(c, _)| *c),
+        );
         let mut retired = 0;
         for command in executed {
             if self.retire(&command).is_ok() {
                 retired += 1;
             }
         }
+        let records = &self.records;
+        self.unretired.retain(|c| records.contains_key(c));
         retired
     }
 
@@ -298,6 +437,18 @@ impl CommandTable {
         self.full()
     }
 
+    /// Drop the placeholder of `command`, if that is all the table holds
+    /// of it (task-d20): a record with a payload is never touched.
+    pub fn forget_placeholder(&mut self, command: &CommandId) -> bool {
+        match self.records.get(command) {
+            Some(r) if r.payload.is_none() && r.phase == Phase::Start => {
+                self.records.remove(command);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Create a placeholder for a command known by identity only (leader
     /// evidence arrived before the payload). Idempotent; never changes an
     /// initialized record. Refused under backpressure.
@@ -308,6 +459,7 @@ impl CommandTable {
         if self.full_after_reclaim() {
             return Err(InitError::Backpressure);
         }
+        self.raise(command);
         self.records.insert(
             command,
             CommandRecord {
@@ -387,6 +539,7 @@ impl CommandTable {
             paths.push((key.clone(), digest));
         }
         let path = combined_path(&paths);
+        self.raise(command);
         self.records.insert(
             command,
             CommandRecord {
@@ -429,6 +582,7 @@ impl CommandTable {
         match self.records.get_mut(command) {
             Some(record) if record.payload.is_some() && record.phase <= Phase::Accept => {
                 record.payload = Some(payload);
+                self.raise(*command);
                 true
             }
             _ => false,
@@ -548,6 +702,7 @@ impl CommandTable {
         let record = self.initialized_mut(&command)?;
         record.deps = deps;
         record.phase = Phase::Accept;
+        self.raise(command);
         Ok(())
     }
 
@@ -564,9 +719,12 @@ impl CommandTable {
     /// middle of that order. The new leader anchors the recovered tail
     /// here, before its first fresh proposal (task-d06).
     ///
-    /// The path log is left as it is: it digests this replica's own
-    /// appends, and the leader's paths reach the followers in its
-    /// proposals, not through this.
+    /// The path log is re-anchored with it ([`PathLog::anchored`]). Left
+    /// as it was, it digested this replica's own appends, which need not
+    /// pass through the tails: the next command's path then named another
+    /// history than its dependencies, and a follower whose appends were
+    /// the same reached that path over a record the leader's order had
+    /// replaced (task-d34, F7: protocol_sim row 10, three voters, seed 52).
     pub fn anchor(&mut self, key: &[u8], command: CommandId) {
         self.anchor_all(key, &[command]);
     }
@@ -579,6 +737,7 @@ impl CommandTable {
         let state = self.keys.entry(key.to_vec()).or_default();
         state.last = tails.first().copied();
         state.also = tails.iter().skip(1).copied().collect();
+        state.log = PathLog::anchored(tails);
     }
 
     /// Adopt the leader's order and path evidence for a command
@@ -611,6 +770,7 @@ impl CommandTable {
         let deps = record.deps.clone();
         guard_commit(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Commit;
+        self.raise(command);
         Ok(())
     }
 
@@ -625,6 +785,8 @@ impl CommandTable {
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
         self.last_executed = Some(command);
+        self.unretired.push_back(command);
+        self.raise(command);
         Ok(())
     }
 
@@ -670,8 +832,14 @@ impl CommandTable {
     /// to say about it.
     pub fn restore_executed(&mut self, command: &CommandId) {
         self.last_executed = Some(*command);
+        self.raise(*command);
         match self.records.get_mut(command) {
-            Some(r) if r.payload.is_some() => r.phase = Phase::Executed,
+            Some(r) if r.payload.is_some() => {
+                if r.phase != Phase::Executed {
+                    r.phase = Phase::Executed;
+                    self.unretired.push_back(*command);
+                }
+            }
             Some(_) => {}
             None => {
                 self.history.insert(*command);
@@ -728,6 +896,17 @@ impl CommandTable {
             Some(r) => r.keys.clone(),
         };
         self.records.remove(command);
+        // Reclaiming retires from the front and catch-up right after
+        // executing, from the back; anything else is a scan of records
+        // executed and not retired, which the table's capacity bounds.
+        if self.unretired.front() == Some(command) {
+            self.unretired.pop_front();
+        } else if self.unretired.back() == Some(command) {
+            self.unretired.pop_back();
+        } else if let Some(i) = self.unretired.iter().position(|c| c == command) {
+            self.unretired.remove(i);
+        }
+        self.raise(*command);
         for key in &keys {
             if let Some(state) = self.keys.get_mut(key) {
                 state.log.forget(command);
@@ -776,6 +955,15 @@ impl CommandTable {
     /// having executed.
     pub fn tombstones(&self) -> &BTreeSet<CommandId> {
         &self.executed
+    }
+
+    /// Whether this replica executed `command` and retired its record,
+    /// forgotten or still inside the window (task-d33). A command it
+    /// retired is history here whatever else it holds: a submission of it
+    /// again is a duplicate, never new work, even when no retry-key
+    /// binding says so any more.
+    pub fn retired(&self, command: &CommandId) -> bool {
+        !self.records.contains_key(command) && self.history.contains(command)
     }
 
     /// Whether this replica executed `command` and retired it longer ago

@@ -290,6 +290,60 @@ pub enum ProtocolMessage {
         /// The commands.
         entries: Vec<CatchUpEntry>,
     },
+    /// A candidate asks a voter that promised `ballot` for pages of its
+    /// report that never arrived (task-d28). The voter answers from the
+    /// report it sent, never a regenerated one: an empty list asks for
+    /// the first [`crate::summary::MAX_PAGE_ASK`] pages, and at most that
+    /// many are answered.
+    ReportPageRequest {
+        /// The ballot promised.
+        ballot: Ballot,
+        /// The pages wanted, by number.
+        pages: Vec<u32>,
+    },
+    /// A voter's answer to a submission it refused and can say nothing
+    /// else about (task-d22). Sent to the frontend that submitted, so the
+    /// collector's entry for `command` ends rather than waits for
+    /// evidence that is never coming from this voter.
+    Refused {
+        /// The ballot the voter was at.
+        ballot: Ballot,
+        /// The command the submission derives to.
+        command: CommandId,
+        /// Why.
+        refusal: SubmissionRefusal,
+    },
+    /// A voter's durable promise about the shared checkpoint it holds at a
+    /// forgetting-floor boundary (task-d27), sent for its peers to record
+    /// so a majority's promises can activate the floor.
+    ///
+    /// The bytes are an encoded `CheckpointReadinessV1`, which the
+    /// machines never read: the runtime that exports checkpoints and
+    /// holds the readiness rows does. A voter sends it only once its own
+    /// row is durable, since a promise that is not durable is not one.
+    FloorReadiness {
+        /// The encoded readiness.
+        readiness: Vec<u8>,
+    },
+}
+
+/// Why a voter refused a submission (task-d22).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubmissionRefusal {
+    /// The command is bound here under other admission facts, and this
+    /// voter never acknowledges it under these.
+    OtherFacts {
+        /// The admission digest it is bound under.
+        accepted: Digest32,
+    },
+    /// The retry key is bound here to another command.
+    OtherCommand {
+        /// That command.
+        bound: CommandId,
+    },
+    /// A duplicate this voter keeps no payload of any more: it went to
+    /// history, and what it did is in the durable record.
+    Forgotten,
 }
 
 impl ProtocolMessage {
@@ -311,10 +365,12 @@ impl ProtocolMessage {
             ProtocolMessage::Proposal(a) | ProtocolMessage::FastAck(a) => Some(a.command),
             ProtocolMessage::SlowAck(a) => Some(a.command),
             ProtocolMessage::LeaderReply { command, .. }
-            | ProtocolMessage::PayloadResponse { command, .. } => Some(*command),
+            | ProtocolMessage::PayloadResponse { command, .. }
+            | ProtocolMessage::Refused { command, .. } => Some(*command),
             ProtocolMessage::NewLeader { .. }
             | ProtocolMessage::Promise { .. }
             | ProtocolMessage::ReportPage(_)
+            | ProtocolMessage::ReportPageRequest { .. }
             | ProtocolMessage::PayloadRequest { .. }
             | ProtocolMessage::SealRequest { .. }
             | ProtocolMessage::Sealed { .. }
@@ -323,6 +379,7 @@ impl ProtocolMessage {
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }
             | ProtocolMessage::CatchUpPage { .. }
+            | ProtocolMessage::FloorReadiness { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }

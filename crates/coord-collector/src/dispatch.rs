@@ -181,13 +181,16 @@ impl Dispatcher {
         match message {
             MessageV1::Request(request) => {
                 let key = request.retry_key;
-                let admitted = match self.admission.admit(now_ticks, caller, &request) {
+                let admitted = match self.admission.admit_at(now_ticks, now, caller, &request) {
                     Ok(a) => a,
                     Err(refusal) => {
                         let (code, detail) = match refusal {
                             AdmissionRefusal::Malformed => (codes::MALFORMED_REQUEST, "malformed"),
                             AdmissionRefusal::SessionBusy { .. } => {
                                 (codes::BACKPRESSURE, "session busy")
+                            }
+                            AdmissionRefusal::RateLimited { .. } => {
+                                (codes::BACKPRESSURE, "admission rate")
                             }
                             AdmissionRefusal::RequestTooLarge { .. } => {
                                 (codes::REQUEST_TOO_LARGE, "request too large")
@@ -454,6 +457,23 @@ impl Dispatcher {
         self.collector.due_offers(now, budget)
     }
 
+    /// Commands that have held neither half of a release long enough,
+    /// submitted to every voter again (task-d22); see
+    /// [`crate::Collector::due_solicits`].
+    pub fn due_solicits(
+        &mut self,
+        now: MonotonicMillis,
+        budget: usize,
+    ) -> Vec<crate::collector::FanOut> {
+        self.collector.due_solicits(now, budget)
+    }
+
+    /// When the next of those falls due; see
+    /// [`crate::Collector::next_solicit`].
+    pub fn next_solicit(&self) -> Option<MonotonicMillis> {
+        self.collector.next_solicit()
+    }
+
     /// A destination's link has come back; its re-offers fall due now
     /// (see [`crate::collector::Collector::reachable_again`]).
     pub fn reachable_again(
@@ -497,7 +517,8 @@ impl Dispatcher {
     }
 
     /// Pending commands the collector holds half of a release for
-    /// (task-c02): the ones a durable record is consulted for.
+    /// (task-c02), and those the record may settle alone (task-d22): the
+    /// ones a durable record is consulted for.
     pub fn half_established(&self) -> Vec<(CommandId, RetryKey)> {
         self.collector.half_established()
     }
@@ -519,6 +540,18 @@ impl Dispatcher {
             revision,
             response,
         )?;
+        Ok(self.deliver(progress))
+    }
+
+    /// [`crate::Collector::settle_conflict_from_record`], then account the
+    /// release as any other: the session slot is freed and the attached
+    /// caller answered.
+    pub fn settle_conflict_from_record(
+        &mut self,
+        command: CommandId,
+        bound: CommandId,
+    ) -> Result<Option<Delivery>, crate::collector::SettleError> {
+        let progress = self.collector.settle_conflict_from_record(command, bound)?;
         Ok(self.deliver(progress))
     }
 

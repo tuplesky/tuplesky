@@ -734,7 +734,7 @@ fn boot_of(replica: ReplicaId, incarnation: ReplicaIncarnation) -> [u8; 16] {
     out
 }
 
-fn root_path(state_directory: &str, root: &str) -> PathBuf {
+pub(crate) fn root_path(state_directory: &str, root: &str) -> PathBuf {
     let path = Path::new(root);
     if path.is_absolute() {
         return path.to_path_buf();

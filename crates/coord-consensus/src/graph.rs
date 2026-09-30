@@ -44,6 +44,29 @@ pub fn demoted_path() -> Digest32 {
     HashDomain::DependencyPath.digest(&[b"demoted"])
 }
 
+/// The head of a log whose pending suffix holds a command reordered behind
+/// a synchronization ([`PathLog`]'s `reordered`): a digest of the anchor
+/// no leader path is. Its first part is not 32 bytes long, so it is no
+/// [`chain`] link, and every part is length-prefixed.
+pub fn reordered_path(anchor: &Digest32) -> Digest32 {
+    HashDomain::DependencyPath.digest(&[b"reordered", &anchor.0])
+}
+
+/// The head of a log re-anchored after `tails` ([`PathLog::anchored`]): a
+/// digest no [`chain`] link or follower log reaches except by synchronizing
+/// to a path chained from it.
+pub fn anchored_path(tails: &[CommandId]) -> Digest32 {
+    let mut sorted: Vec<&CommandId> = tails.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(sorted.len() + 1);
+    parts.push(b"anchored");
+    for tail in sorted {
+        parts.push(tail.as_bytes());
+    }
+    HashDomain::DependencyPath.digest(&parts)
+}
+
 /// One key's conflict log (prototype `HashLog`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathLog {
@@ -63,6 +86,16 @@ pub struct PathLog {
     /// synchronization is recognized instead of being taken for evidence
     /// about a command not appended yet.
     applied: BTreeSet<CommandId>,
+    /// Pending commands this replica appended before a command whose
+    /// synchronization was then applied (task-d34, F7). The log now places
+    /// each after that command, while its record still holds the
+    /// dependencies it was pre-accepted with, from before it. Until each is
+    /// synchronized itself, and its record takes the leader's order, or
+    /// leaves the log, the head is [`reordered_path`] of the true one: no
+    /// leader path equals it, so no fast acknowledgement claims a history
+    /// the replica's records do not hold.
+    #[serde(default)]
+    reordered: BTreeSet<CommandId>,
 }
 
 impl Default for PathLog {
@@ -82,6 +115,7 @@ impl PathLog {
             head: empty,
             early: BTreeMap::new(),
             applied: BTreeSet::new(),
+            reordered: BTreeSet::new(),
         }
     }
 
@@ -95,7 +129,18 @@ impl PathLog {
             head: digest,
             early: BTreeMap::new(),
             applied: BTreeSet::new(),
+            reordered: BTreeSet::new(),
         }
+    }
+
+    /// A log whose next command follows `tails` (task-d34, F7): a new
+    /// leader anchors its first fresh proposal after the recovered order's
+    /// tails, which its own appends need not have passed through, so its
+    /// head digests them rather than those appends. Its paths from here
+    /// are chained from [`anchored_path`], which a follower's log equals
+    /// only once it synchronized to one of them.
+    pub fn anchored(tails: &[CommandId]) -> Self {
+        PathLog::resumed(anchored_path(tails))
     }
 
     /// Digest of the whole log: the path evidence for the next command.
@@ -114,7 +159,11 @@ impl PathLog {
     }
 
     fn recompute(&mut self) {
-        let mut head = self.synced_hash;
+        let mut head = if self.reordered.is_empty() {
+            self.synced_hash
+        } else {
+            reordered_path(&self.synced_hash)
+        };
         for c in &self.pending {
             head = chain(&head, c);
         }
@@ -152,6 +201,18 @@ impl PathLog {
     }
 
     fn sync_known(&mut self, command: CommandId, seq: u64, hash: Digest32) {
+        // What this replica appended before the command now follows it in
+        // the log, and was pre-accepted without it (`reordered`). A
+        // command synchronized before it was appended here came after all
+        // of the suffix.
+        let before = self
+            .pending
+            .iter()
+            .position(|c| *c == command)
+            .unwrap_or(self.pending.len());
+        self.reordered
+            .extend(self.pending[..before].iter().copied());
+        self.reordered.remove(&command);
         self.pending.retain(|c| *c != command);
         self.applied.insert(command);
         if self.synced_seq.is_none_or(|s| seq > s) {
@@ -166,6 +227,28 @@ impl PathLog {
     pub fn forget(&mut self, command: &CommandId) {
         self.applied.remove(command);
         self.early.remove(command);
+        // Executed, its record holds a decided order: it no longer stands
+        // for a history the replica does not hold.
+        if self.reordered.remove(command) {
+            self.recompute();
+        }
+    }
+
+    /// Pending commands reordered behind a synchronization, which keep
+    /// the head off every leader path until they are synchronized.
+    pub fn reordered(&self) -> &BTreeSet<CommandId> {
+        &self.reordered
+    }
+
+    /// Take a released command out of the log (task-d24): it leaves the
+    /// pending suffix, and the head is recomputed without it, so the next
+    /// command's path is the one a replica that never held it computes.
+    pub fn remove(&mut self, command: &CommandId) {
+        self.pending.retain(|c| c != command);
+        self.applied.remove(command);
+        self.early.remove(command);
+        self.reordered.remove(command);
+        self.recompute();
     }
 
     /// Commands whose synchronization is applied and not yet forgotten.

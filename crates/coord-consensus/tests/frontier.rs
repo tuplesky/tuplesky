@@ -595,7 +595,10 @@ fn a_follower_whose_table_filled_while_it_could_not_learn_catches_up() {
 fn a_follower_asks_first_for_what_the_leader_committed_in_its_order() {
     let capacity = 32;
     let mut cluster = Cluster::new(19, capacity);
-    let commands: Vec<CommandId> = (1..=capacity as u64)
+    // As many as new admission takes: the capacity less the recovery
+    // reserve (task-d24).
+    let admitted = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let commands: Vec<CommandId> = (1..=admitted as u64)
         .map(|n| cluster.admit_to(n, &[0, 1, 2, 4], 9))
         .collect();
     // Only the leader's proposals reach r3, and nothing is settled, so it
@@ -777,14 +780,17 @@ fn a_follower_that_took_a_command_under_other_facts_before_its_proposal_rebinds(
 fn a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it() {
     let capacity = 8;
     let mut cluster = Cluster::new(53, capacity);
-    let later: Vec<CommandId> = (2..=(capacity as u64 + 1))
+    // A table full for new admission: the capacity less the recovery
+    // reserve (task-d24).
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let later: Vec<CommandId> = (2..=(full as u64 + 1))
         .map(|n| cluster.admit_to(n, &[2, 3, 4], 9))
         .collect();
     cluster.settle();
     let head = cluster.admit_to(1, &[0, 1], 9);
     cluster.settle_ticking(3);
     // The collector re-offers the later commands to the rest.
-    for n in 2..=(capacity as u64 + 1) {
+    for n in 2..=(full as u64 + 1) {
         cluster.admit_to(n, &[0, 1], 9);
     }
     cluster.settle_ticking(capacity * 2);
@@ -878,4 +884,88 @@ fn the_leaders_frontier_stops_at_the_first_command_it_has_not_committed() {
     for i in 0..VOTERS as usize {
         assert_eq!(cluster.nodes[i].executed, all, "node {i}");
     }
+}
+
+/// A proposal a voter has not adopted is re-sent to it at once, and
+/// then with a gap that doubles up to `RESEND_BACKOFF_CAP` calls, not on
+/// every call (task-d33).
+///
+/// r4 receives no proposals, so on every call of the re-send it lacks
+/// all of them. Re-sent on every call, a voter that is merely behind was
+/// sent the same proposals four times a second, each came back as a
+/// duplicate adoption, and the leader's lane to it filled with them.
+/// Once r4 can hear the leader, the next re-send due reaches it and the
+/// re-sends stop.
+#[test]
+fn a_proposal_a_voter_lacks_is_resent_with_a_growing_gap() {
+    let mut cluster = Cluster::new(11, 64);
+    cluster.unproposed = vec![4];
+    let commands: Vec<CommandId> = (1..=3).map(|n| cluster.admit(n)).collect();
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, commands);
+
+    // Which calls send r4 anything, over three cap-lengths of calls.
+    let calls = 3 * coord_consensus::RESEND_BACKOFF_CAP as usize;
+    let mut sent_on = Vec::new();
+    for call in 0..calls {
+        let Role::Leader(l) = &mut cluster.nodes[0].role else {
+            panic!("r0 leads")
+        };
+        let effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+        let to_r4 = effects
+            .iter()
+            .filter(|e| {
+                matches!(e, Effect::SendWhenDurable { to, frame, .. }
+                    if to.replica == r(4)
+                        && matches!(ProtocolMessage::decode(frame), Ok(ProtocolMessage::Proposal(_))))
+            })
+            .count();
+        if to_r4 > 0 {
+            assert_eq!(to_r4, commands.len(), "call {call} sent only some of them");
+            sent_on.push(call);
+        }
+    }
+    let cap = u64::from(coord_consensus::RESEND_BACKOFF_CAP);
+    let mut expected = Vec::new();
+    let (mut call, mut gap) = (0, 1);
+    while call < calls as u64 {
+        expected.push(call as usize);
+        call += gap;
+        gap = (gap * 2).min(cap);
+    }
+    assert_eq!(sent_on, expected);
+    assert!(
+        sent_on.len() < calls / 2,
+        "re-sent on {} calls of {calls}",
+        sent_on.len()
+    );
+
+    // r4 hears the leader again: the next re-send due is adopted, and
+    // nothing is sent it after that.
+    cluster.unproposed.clear();
+    let mut delivered = false;
+    for _ in 0..coord_consensus::RESEND_BACKOFF_CAP {
+        let Role::Leader(l) = &mut cluster.nodes[0].role else {
+            panic!("r0 leads")
+        };
+        let effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
+        delivered |= !effects.is_empty();
+        cluster.handle(0, effects);
+        cluster.settle();
+    }
+    assert!(delivered, "no re-send came due within the cap");
+    assert!(
+        commands.iter().all(|c| cluster.nodes[4]
+            .phase_of(c)
+            .is_some_and(|p| p >= Phase::Accept)),
+        "r4 did not adopt what was re-sent"
+    );
+    let Role::Leader(l) = &mut cluster.nodes[0].role else {
+        panic!("r0 leads")
+    };
+    assert!(
+        l.resend_unvoted(coord_consensus::RESEND_PER_VOTER)
+            .is_empty(),
+        "a proposal r4 adopted was sent again"
+    );
 }

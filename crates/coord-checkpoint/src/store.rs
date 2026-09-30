@@ -47,7 +47,11 @@ use coord_journal_api::record::RecordOrigin;
 use coord_types::identity::Digest32;
 
 use crate::local::{LocalCheckpointV1, LocalError, LocalManifestV1, verify_local};
-use crate::manifest::{ArtifactError, ChunkV1, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
+use crate::manifest::{
+    ArtifactError, ChunkV1, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, SharedCheckpointV1,
+    SharedManifestV1,
+};
+use crate::verify::verify_shared;
 
 /// Name of the manifest inside an image directory.
 const MANIFEST: &str = "manifest.bin";
@@ -65,7 +69,8 @@ pub enum StoreError {
     /// The artifact could not be encoded or decoded.
     Artifact(ArtifactError),
     /// The image the selected pointer names is damaged: missing, short,
-    /// long, or not what the pointer says it is.
+    /// long, or not what the pointer says it is. For a shared image, the
+    /// one a floor promise names ([`SharedImageStore::verify`]).
     ///
     /// This quarantines the scope. A node that published a pointer
     /// knows the image existed, so its absence is the loss of a durable
@@ -84,7 +89,7 @@ impl fmt::Display for StoreError {
             StoreError::Io(e) => write!(f, "checkpoint store: {e}"),
             StoreError::Artifact(e) => write!(f, "checkpoint artifact: {e}"),
             StoreError::Quarantine { reason } => {
-                write!(f, "the selected local checkpoint is damaged: {reason}")
+                write!(f, "the checkpoint image is damaged: {reason}")
             }
             StoreError::Invalid(e) => write!(f, "the selected local checkpoint is invalid: {e}"),
         }
@@ -316,6 +321,148 @@ impl LocalCheckpointStore {
         }
         out.sort_by_key(|d| d.0);
         Ok(out)
+    }
+}
+
+/// Where a voter keeps the shared checkpoints it promised a forgetting
+/// floor about (task-d27).
+///
+/// Its own directory, never a [`LocalCheckpointStore`]'s: that store
+/// reclaims every image but the selected one, and a shared image is
+/// selected by no pointer. It is kept because this voter's readiness
+/// says it holds these bytes, and a promise about bytes that were
+/// reclaimed is not one.
+///
+/// The same crash-safe order as a local image: a pending directory,
+/// every file synced, the directory synced, renamed into place, the root
+/// synced. A directory that exists is complete.
+#[derive(Clone, Debug)]
+pub struct SharedImageStore {
+    root: PathBuf,
+}
+
+impl SharedImageStore {
+    /// Open (creating) the directory `root`, syncing its creation.
+    pub fn open(root: &Path) -> Result<Self, StoreError> {
+        fs::create_dir_all(root)?;
+        if let Some(parent) = root.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(SharedImageStore {
+            root: root.to_path_buf(),
+        })
+    }
+
+    /// Where the images live.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Verify `checkpoint` and keep it durably, named by its root.
+    /// Returns the bytes written.
+    ///
+    /// Verified first, from the encoded chunks, so the root a readiness
+    /// promises about is one computed from the bytes on disk and not only
+    /// the one the exporter reported. Idempotent: an image already kept
+    /// under that root is left as it is.
+    pub fn keep(&self, checkpoint: &SharedCheckpointV1) -> Result<u64, StoreError> {
+        let chunks = checkpoint
+            .chunks
+            .iter()
+            .map(ChunkV1::encode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let root =
+            verify_shared(&checkpoint.manifest, &chunks).map_err(|_| StoreError::Quarantine {
+                reason: "an exported shared checkpoint does not verify",
+            })?;
+        let manifest = checkpoint.manifest.encode()?;
+        let bytes = chunks
+            .iter()
+            .map(|c| c.len() as u64)
+            .sum::<u64>()
+            .saturating_add(manifest.len() as u64);
+        let image = self.root.join(hex(&root));
+        if image.exists() {
+            return Ok(bytes);
+        }
+        let pending = self.root.join(format!("{PENDING}{}", hex(&root)));
+        if pending.exists() {
+            fs::remove_dir_all(&pending)?;
+        }
+        fs::create_dir(&pending)?;
+        for (chunk, encoded) in checkpoint.chunks.iter().zip(&chunks) {
+            write_synced(&pending.join(chunk_name(chunk.ordinal)), encoded)?;
+        }
+        write_synced(&pending.join(MANIFEST), &manifest)?;
+        sync_dir(&pending)?;
+        fs::rename(&pending, &image)?;
+        sync_dir(&self.root)?;
+        Ok(bytes)
+    }
+
+    /// Whether a complete image with `root` is kept here.
+    pub fn holds(&self, root: &Digest32) -> bool {
+        self.root.join(hex(root)).is_dir()
+    }
+
+    /// Read back the image kept under `root` and verify it: every chunk
+    /// its manifest names, and the root they compute.
+    ///
+    /// A voter that promised about this image said it holds these bytes,
+    /// so an image that is missing, short, long or computes another root
+    /// is [`StoreError::Quarantine`]: the loss of a promise, not an
+    /// absence to start over from.
+    pub fn verify(&self, root: &Digest32) -> Result<(), StoreError> {
+        let dir = self.root.join(hex(root));
+        if !dir.is_dir() {
+            return Err(StoreError::Quarantine {
+                reason: "the shared image a floor promise names is not present",
+            });
+        }
+        let manifest =
+            SharedManifestV1::decode(&read_bounded(&dir.join(MANIFEST), MAX_MANIFEST_BYTES)?)?;
+        let mut chunks = Vec::with_capacity(manifest.chunks.len());
+        for descriptor in &manifest.chunks {
+            chunks.push(read_bounded(
+                &dir.join(chunk_name(descriptor.ordinal)),
+                MAX_CHUNK_BYTES,
+            )?);
+        }
+        match verify_shared(&manifest, &chunks) {
+            Ok(computed) if computed == *root => Ok(()),
+            _ => Err(StoreError::Quarantine {
+                reason: "the shared image a floor promise names does not verify",
+            }),
+        }
+    }
+
+    /// Remove every image but those in `keep`, and any leftover pending
+    /// directory. Retryable and idempotent. Returns how many directories
+    /// were removed.
+    ///
+    /// A voter keeps what a standing promise names: its own latest one,
+    /// and the activated floor's. Its older promises were superseded by
+    /// higher ones, which is the only way a promise moves.
+    pub fn reclaim(&self, keep: &[Digest32]) -> Result<usize, StoreError> {
+        let survivors: Vec<String> = keep.iter().map(hex).collect();
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if survivors.iter().any(|s| s == name) || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if !name.starts_with(PENDING) && !is_image_name(name) {
+                continue;
+            }
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+        if removed > 0 {
+            sync_dir(&self.root)?;
+        }
+        Ok(removed)
     }
 }
 
