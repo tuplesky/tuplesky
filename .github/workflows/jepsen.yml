@@ -529,7 +529,9 @@ jobs:
         run: |
           shopt -s nullglob
           store=jepsen/swiftpaxos/store/latest
-          for log in "$store"/n*/replica.log "$store"/control/master.log; do
+          # The master's log is listed as a pattern too, so nullglob drops
+          # it when the test never started.
+          for log in "$store"/n*/replica.log "$store"/control/master.lo[g]; do
             echo "::group::$log (last 200 lines)"
             tail -n 200 "$log"
             echo "::endgroup::"
