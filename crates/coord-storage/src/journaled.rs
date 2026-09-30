@@ -113,9 +113,12 @@ pub const PROFILE: &str = "journaled-strict-v1";
 /// allocate this one and a lifecycle completion is never mistaken for a
 /// machine's barrier.
 const LIFECYCLE_SEQUENCE: u64 = 0;
-/// Barrier sequence of a checkpoint publication. Like the lifecycle
-/// sequence it is the runtime's own and completes no actor's barrier:
-/// nothing is waiting on it, and it must not collide with one that is.
+/// Barrier sequence of a checkpoint publication. Unlike the lifecycle
+/// sequence it is one a machine's allocator can also hand out, and that
+/// is harmless: [`JournaledStore::publish_checkpoint`] reserves and
+/// completes its head within the one call and records the publication
+/// with `barrier: None`, so no `StorageEvent` ever carries this barrier
+/// and nothing compares it with a machine's.
 const CHECKPOINT_SEQUENCE: u64 = 1;
 
 /// Bytes reserved for everything a record carries beside its updates:

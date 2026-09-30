@@ -490,7 +490,10 @@ pub struct Node<P: Persistence> {
 
 impl<P: Persistence> Node<P> {
     /// A node over `machine` and `applier`, publishing to `frontend`.
-    pub fn new(machine: Machine, applier: Applier<P>, frontend: PeerId) -> Self {
+    pub fn new(machine: Machine, mut applier: Applier<P>, frontend: PeerId) -> Self {
+        // The machine shares the applier's store: what the applier's
+        // lowerings make durable for the machine's batches is handed back.
+        applier.share_foreign();
         let boot = applier.store().boot();
         Node {
             machine: Some(machine),
@@ -1255,11 +1258,17 @@ impl<P: Persistence> Node<P> {
             }
             // What the apply's lowerings made durable for other batches
             // is delivered by `carry_out`, after the command's own
-            // outcome. The machine takes the outcome first: delivered
-            // before it, under load a lagging voter's callers went
-            // unanswered (`a_replica_that_falls_behind_...`: 18 of 24
-            // runs four at a time on four cores, against 3 of 16 on the
-            // base and 4 of 24 delivered here).
+            // outcome. This order is an observation, not a mechanism.
+            // `applied` depends on none of those facts, so taking the
+            // outcome first is safe. Delivered before it, under load a
+            // lagging voter's callers went unanswered
+            // (`a_replica_that_falls_behind_...`: 18 of 24 runs four at a
+            // time on four cores, against 3 of 16 on the base and 4 of 24
+            // delivered here), and why is not established. The likeliest
+            // loss is `Leader::applied`, which releases a result only
+            // while leading and never retries a release it skipped; that
+            // gap, and the base's 3 of 16, are open in the notes ("A
+            // result the leader executed while not leading").
             let effects = self.machine_mut().applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);
             // At a floor boundary the view is exactly the command's: the
