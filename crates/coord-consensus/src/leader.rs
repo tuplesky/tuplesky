@@ -214,6 +214,31 @@ pub const REPROPOSE_BATCH: usize = 32;
 /// voter at most (task-d07).
 pub const RESEND_PER_VOTER: usize = 16;
 
+/// The most calls of [`Leader::resend_unvoted`] a proposal a voter has
+/// not adopted waits between two of its re-sends to that voter.
+///
+/// A re-send is for a proposal that was lost: refused by a full lane, or
+/// sent before the voter was linked. It does not tell a lost proposal
+/// from one the voter is still working through, or from one whose
+/// adoption is queued behind this leader's own work, and on a busy
+/// domain it is almost always the second or the third. Sent again on
+/// every call, the same proposals went out four times a second to a
+/// voter that already held them, each came back as another adoption
+/// this leader refused as a duplicate -- over 8000 in two minutes on a
+/// three-voter domain -- and the leader's control lane to the voter
+/// that was behind filled, so what was dropped was the fresh proposals
+/// and commits that would have let it catch up (task-d33). So the gap
+/// between two re-sends of one proposal to one voter doubles, from one
+/// call to this many: the first re-send is as prompt as it was, and a
+/// voter that is merely behind is sent one at most this often.
+///
+/// Four calls of `coordd`'s 250 ms timer is one second, which is how long
+/// a voter holding work it cannot execute waits before it fetches a
+/// peer's executed history instead (`coord_daemon::catch_up::STILL_FOR`).
+/// A longer gap would turn a proposal that really was lost into a
+/// history fetch on the bulk lane.
+pub const RESEND_BACKOFF_CAP: u32 = 4;
+
 /// The leader machine of one domain.
 #[derive(Debug)]
 pub struct Leader {
@@ -283,6 +308,14 @@ pub struct Leader {
     /// installed it. One that installed it with nothing to vote on yet
     /// ignores the ask.
     joined: BTreeSet<ReplicaId>,
+    /// Calls of `resend_unvoted` so far: the clock its back-off is
+    /// counted on.
+    resend_calls: u64,
+    /// Per proposal and voter it was re-sent to: the call from which it
+    /// may be re-sent again, and the gap that was waited
+    /// (`RESEND_BACKOFF_CAP`). Kept only while the proposal is held and
+    /// the voter has not adopted it.
+    resent: BTreeMap<(CommandId, ReplicaId), (u64, u32)>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -354,6 +387,8 @@ impl Leader {
             selection: None,
             // Every voter of the genesis ballot is in it from the start.
             joined: config.identity.voters.iter().copied().collect(),
+            resend_calls: 0,
+            resent: BTreeMap::new(),
             config,
             boot: None,
             alloc: None,
@@ -479,6 +514,8 @@ impl Leader {
             // counted as joined it would never be asked again if that
             // frame were lost (task-d33). A vote at this ballot joins it.
             joined: BTreeSet::from([identity.replica]),
+            resend_calls: 0,
+            resent: BTreeMap::new(),
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -859,13 +896,25 @@ impl Leader {
     ///
     /// Paced by the caller, which calls it on a timer rather than per
     /// event; bounded per voter per call, so a voter that is gone costs
-    /// at most `per_voter` frames each time.
+    /// at most `per_voter` frames each time. The window is the voter's
+    /// first `per_voter` unadopted proposals, and one of them re-sent
+    /// lately waits out its back-off (`RESEND_BACKOFF_CAP`) rather than
+    /// giving its place to a later one.
     pub fn resend_unvoted(&mut self, per_voter: usize) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
         };
         if !self.is_leading() || per_voter == 0 {
             return Vec::new();
+        }
+        let call = self.resend_calls;
+        self.resend_calls += 1;
+        {
+            let (proposals, votes) = (&self.proposals, &self.votes);
+            self.resent.retain(|(command, voter), _| {
+                proposals.contains_key(command)
+                    && !votes.get(command).is_some_and(|v| v.adopted_by(voter))
+            });
         }
         let mut order: Vec<(u64, CommandId)> = self
             .proposals
@@ -888,7 +937,7 @@ impl Leader {
                 .filter(|(_, c)| voted(c))
                 .map(|(s, _)| *s)
                 .max();
-            for (_, command) in order
+            let window: Vec<CommandId> = order
                 .iter()
                 .filter(|(s, c)| {
                     !voted(c)
@@ -899,7 +948,16 @@ impl Leader {
                                 .is_none_or(|phase| phase < Phase::Commit))
                 })
                 .take(per_voter)
-            {
+                .map(|(_, c)| *c)
+                .collect();
+            for command in &window {
+                let gap = match self.resent.get(&(*command, *voter)) {
+                    Some(&(from, _)) if call < from => continue,
+                    Some(&(_, gap)) => gap.saturating_mul(2).min(RESEND_BACKOFF_CAP),
+                    None => 1,
+                };
+                self.resent
+                    .insert((*command, *voter), (call + u64::from(gap), gap));
                 let p = &self.proposals[command];
                 let frame = self.proposal_frame(p);
                 let to = PeerId {
