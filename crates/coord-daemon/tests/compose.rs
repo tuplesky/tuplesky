@@ -1092,14 +1092,18 @@ fn a_sync_past_its_row_refuses_the_campaign_by_name() {
         }) => {
             assert_eq!(n, entries);
             assert!(bytes > limit, "{bytes} <= {limit}");
-            // The size named is the frame's, counted without encoding it
-            // (task-d26).
+            // The frame fits and the row does not, so the size named is
+            // the row's (task-d20 review): the selection's own encoding,
+            // counted once (task-d26), which the frame carries after the
+            // message's tag.
+            let frame = coord_consensus::ProtocolMessage::Sync(decision.clone())
+                .encode()
+                .len();
             assert_eq!(
                 bytes,
-                coord_consensus::ProtocolMessage::Sync(decision.clone())
-                    .encode()
-                    .len()
+                postcard::to_allocvec(&decision).expect("encodes").len()
             );
+            assert!(bytes < frame, "{bytes} >= {frame}");
         }
         other => panic!("{other:?}"),
     }
