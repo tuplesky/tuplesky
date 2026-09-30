@@ -504,13 +504,16 @@ pub fn bounded_sync_update(
     if frame > frame_limit {
         return Err(too_large(frame));
     }
+    // A row that does not fit is reported with the row's own size, not
+    // the frame's that fitted.
+    let row = body.len();
     let value = StoreEnvelopeV1 {
         record_kind: SYNC_KIND,
         schema_version: SYNC_SCHEMA_VERSION,
         payload: body,
     }
     .encode()
-    .map_err(|_| too_large(frame))?;
+    .map_err(|_| too_large(row))?;
     Ok(StoreUpdate {
         collection: Collection::ProtocolV1.id(),
         key: sync_key(epoch, &decision.ballot),
