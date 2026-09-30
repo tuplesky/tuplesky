@@ -777,8 +777,9 @@ impl Sim {
                     )
                 });
             }
-            self.stats.learned += 1;
-            self.learned.insert(command);
+            if self.learned.insert(command) {
+                self.stats.learned += 1;
+            }
             self.decide(command, &deps, &format!("learned at the frontend in {b:?}"));
         }
     }
@@ -2389,10 +2390,17 @@ fn run_row(row: u8) {
     std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let mut totals = Stats::default();
+    // Runs that learned nothing, and runs that did, at three and five.
+    let (mut idle, mut busy) = ([0u32; 2], [0u32; 2]);
     for n in [3u8, 5] {
         for seed in 0..seeds() {
             match run_one(n, row, seed) {
                 Ok(s) => {
+                    if s.learned == 0 {
+                        idle[usize::from(n == 5)] += 1;
+                    } else {
+                        busy[usize::from(n == 5)] += 1;
+                    }
                     totals.executed += s.executed;
                     totals.learned += s.learned;
                     totals.campaigns += s.campaigns;
@@ -2415,7 +2423,7 @@ fn run_row(row: u8) {
         }
     }
     std::panic::set_hook(hook);
-    println!("row {row}: {totals:?}");
+    println!("row {row}: {totals:?}; runs that learned nothing (3, 5 voters): {idle:?}");
     // Said here as well as in the assertion: rows run side by side, and
     // another row's silenced hook may be the one installed when this one
     // panics.
@@ -2434,6 +2442,15 @@ fn run_row(row: u8) {
         totals.executed > 0 && totals.campaigns > 0,
         "row {row} ran idle: {totals:?}"
     );
+    // At each size, most runs learned something: the frontend's oracles
+    // (one dependency set, every learned decision executed) are not
+    // vacuous there.
+    for (size, (i, b)) in ["three", "five"].iter().zip(idle.iter().zip(busy)) {
+        assert!(
+            b > *i,
+            "row {row} at {size} voters: {i} runs learned nothing, {b} did"
+        );
+    }
     // Row 1 is defined by a leader failing: a schedule that never took
     // the crash branch against a leader has lost its coverage.
     if row == 1 {
