@@ -161,12 +161,27 @@ impl Outbox {
                 self.dropped.push((send, ReleaseError::ObsoleteBallot));
                 continue;
             }
-            if let Some(err) = send.requires.iter().find_map(|b| self.failed.get(b)) {
-                let err = *err;
+            // A send can require every batch submitted before its own (a
+            // leader's acknowledgement does), so a new leader re-proposing
+            // a selection of thousands holds sends requiring thousands of
+            // barriers, and this runs at every completion. Nothing failed
+            // is the usual case, checked once; and the newest barrier, the
+            // one least likely durable yet, is checked first, so a send
+            // still waiting costs one lookup rather than a walk over the
+            // durable prefix of its list.
+            let failed = if self.failed.is_empty() {
+                None
+            } else {
+                send.requires
+                    .iter()
+                    .find_map(|b| self.failed.get(b))
+                    .copied()
+            };
+            if let Some(err) = failed {
                 self.dropped.push((send, ReleaseError::BarrierFailed(err)));
                 continue;
             }
-            let barriers_durable = send.requires.iter().all(|b| self.durable.contains(b));
+            let barriers_durable = send.requires.iter().rev().all(|b| self.durable.contains(b));
             let cut_durable = send.context.required_journal_seq <= self.durable_through;
             if barriers_durable && cut_durable {
                 released.push(Effect::SendWhenDurable {
