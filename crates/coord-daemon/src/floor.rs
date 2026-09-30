@@ -155,6 +155,16 @@ pub struct FloorSettings {
     pub me: ReplicaId,
 }
 
+/// A batch of the floor's rows not yet durable: the images its rows name,
+/// and this voter's promise and the activated floor once it is.
+#[derive(Debug)]
+struct Unsettled {
+    barrier: BarrierId,
+    roots: Vec<Digest32>,
+    own: Option<CheckpointReadinessV1>,
+    activated: Option<ActivatedFloorV1>,
+}
+
 /// One voter's side of the floor agreement.
 #[derive(Debug)]
 pub struct Floor {
@@ -169,12 +179,21 @@ pub struct Floor {
     /// journal is not in the view yet.
     heard: BTreeMap<ReplicaId, CheckpointReadinessV1>,
     activated: Option<ActivatedFloorV1>,
+    /// This voter's latest promise and the activated floor as the durable
+    /// rows hold them: what a failed batch rolls `heard` and `activated`
+    /// back to.
+    durable_own: Option<CheckpointReadinessV1>,
+    durable_activated: Option<ActivatedFloorV1>,
+    /// This voter's own promise is not durable yet: made, and waiting for
+    /// its batch's barrier (`None`) or for that batch to settle. Until it
+    /// is durable, no activation a later batch journals counts it: its
+    /// row may never exist.
+    own_pending: Option<Option<BarrierId>>,
     /// The images the durable rows name: this voter's latest durable
     /// promise and the latest durable activation.
     standing: Vec<Digest32>,
-    /// Batches of this floor's rows not yet durable, oldest first, each
-    /// with the images its rows name.
-    unsettled: Vec<(BarrierId, Vec<Digest32>)>,
+    /// Batches of this floor's rows not yet durable, oldest first.
+    unsettled: Vec<Unsettled>,
     /// A batch of this boot failed: what the durable rows name is no
     /// longer what any later batch held, so nothing is reclaimed until a
     /// restart reads the rows back.
@@ -234,6 +253,8 @@ impl Floor {
             })?;
         }
         let standing = roots(heard.get(&settings.me), activated.as_ref());
+        let durable_own = heard.get(&settings.me).copied();
+        let durable_activated = activated.clone();
         Ok(Floor {
             interval: settings.interval,
             images,
@@ -243,6 +264,9 @@ impl Floor {
             me: settings.me,
             heard,
             activated,
+            durable_own,
+            durable_activated,
+            own_pending: None,
             standing,
             unsettled: Vec::new(),
             diverged: false,
@@ -255,9 +279,13 @@ impl Floor {
         })
     }
 
-    /// Whether `position` is a boundary this voter has still to promise.
-    pub fn due(&self, position: ExecutionPosition) -> bool {
-        position.get() > 0
+    /// Whether `position` is a boundary this voter has still to promise,
+    /// with the execution frontier at `frontier`. A retry answered from
+    /// the record reports the original command's position, which the
+    /// frontier is past: its export would be refused as moved.
+    pub fn due(&self, position: ExecutionPosition, frontier: ExecutionPosition) -> bool {
+        position == frontier
+            && position.get() > 0
             && position.get().is_multiple_of(self.interval)
             && self
                 .heard
@@ -319,8 +347,11 @@ impl Floor {
             .encode()
             .map_err(|e| FloorRefusal::Promise(e.to_string()))?;
         self.heard.insert(self.me, readiness);
+        self.own_pending = Some(None);
         let mut updates = vec![row];
-        updates.extend(self.activation());
+        // In the promise's own batch its row and the activation it
+        // completes are durable together or not at all.
+        updates.extend(self.activation(true));
         Ok(Promised {
             updates,
             readiness: encoded,
@@ -369,7 +400,7 @@ impl Floor {
         self.heard.insert(from, record);
         self.counts.heard += 1;
         let mut updates = vec![row];
-        updates.extend(self.activation());
+        updates.extend(self.activation(false));
         Some(updates)
     }
 
@@ -383,38 +414,76 @@ impl Floor {
     /// rows name: from then on nothing is reclaimed until a restart reads
     /// the rows back. A failure to remove costs space, not a promise, so
     /// it is counted rather than refused.
+    ///
+    /// Once this voter's own promise is durable it counts: the rows to
+    /// journal when the promises heard while it was in flight activate a
+    /// floor with it.
     pub fn settle(
         &mut self,
         durable: impl Fn(&BarrierId) -> bool,
         failed: impl Fn(&BarrierId) -> bool,
-    ) {
+    ) -> Option<Vec<StoreUpdate>> {
         if self.unsettled.is_empty() {
-            return;
+            return None;
         }
-        if self.unsettled.iter().any(|(b, _)| failed(b)) {
+        let own_failed = self.own_pending.flatten().is_some_and(|b| failed(&b));
+        let own_durable = self.own_pending.flatten().is_some_and(|b| durable(&b));
+        let any_failed = self.unsettled.iter().any(|u| failed(&u.barrier));
+        if any_failed {
             self.diverged = true;
         }
         // The journal makes batches durable in order, so the last durable
         // one names what recovery would read, and any before it are
         // superseded whatever became of them.
         let mut moved = false;
-        if let Some(last) = self.unsettled.iter().rposition(|(b, _)| durable(b)) {
-            let (_, roots) = self
+        if let Some(last) = self.unsettled.iter().rposition(|u| durable(&u.barrier)) {
+            let batch = self
                 .unsettled
                 .drain(..=last)
                 .next_back()
                 .expect("one at least");
-            self.standing = roots;
+            self.standing = batch.roots;
+            if !own_failed {
+                self.durable_own = batch.own;
+            }
+            if !any_failed {
+                self.durable_activated = batch.activated;
+            }
             moved = true;
         }
-        self.unsettled.retain(|(b, _)| !failed(b));
-        if !moved || self.diverged {
-            return;
+        self.unsettled.retain(|u| !failed(&u.barrier));
+        if own_durable {
+            self.own_pending = None;
         }
+        // What a failed batch wrote is not there: this voter's promise
+        // and the activation go back to what the durable rows hold, and
+        // the next boundary is promised afresh.
+        if own_failed {
+            self.own_pending = None;
+            match self.durable_own {
+                Some(own) => self.heard.insert(self.me, own),
+                None => self.heard.remove(&self.me),
+            };
+        }
+        if any_failed {
+            self.activated = self.durable_activated.clone();
+        }
+        if moved && !self.diverged {
+            self.reclaim();
+        }
+        if own_durable && !own_failed {
+            return self.activation(false).map(|update| vec![update]);
+        }
+        None
+    }
+
+    /// Remove the images no durable row, unsettled batch or current
+    /// promise names.
+    fn reclaim(&mut self) {
         let keep: Vec<Digest32> = self
             .standing
             .iter()
-            .chain(self.unsettled.iter().flat_map(|(_, roots)| roots))
+            .chain(self.unsettled.iter().flat_map(|u| &u.roots))
             .copied()
             .chain(roots(self.heard.get(&self.me), self.activated.as_ref()))
             .collect();
@@ -425,8 +494,17 @@ impl Floor {
 
     /// The certificate update, when the promises held now activate a
     /// floor above the one activated.
-    fn activation(&mut self) -> Option<StoreUpdate> {
-        let rows: Vec<CheckpointReadinessV1> = self.heard.values().copied().collect();
+    ///
+    /// This voter's own promise counts only when it is durable, or when
+    /// it is journaled in the same batch (`with_own`).
+    fn activation(&mut self, with_own: bool) -> Option<StoreUpdate> {
+        let own_counts = with_own || self.own_pending.is_none();
+        let rows: Vec<CheckpointReadinessV1> = self
+            .heard
+            .iter()
+            .filter(|(voter, _)| own_counts || **voter != self.me)
+            .map(|(_, row)| *row)
+            .collect();
         let certified =
             activate_floor(&rows, &self.voters, self.origin.cluster, self.origin.domain).ok()?;
         if self
@@ -448,7 +526,15 @@ impl Floor {
     pub fn barrier(&mut self) -> BarrierId {
         let barrier = self.barriers.allocate();
         let named = roots(self.heard.get(&self.me), self.activated.as_ref());
-        self.unsettled.push((barrier, named));
+        if self.own_pending == Some(None) {
+            self.own_pending = Some(Some(barrier));
+        }
+        self.unsettled.push(Unsettled {
+            barrier,
+            roots: named,
+            own: self.heard.get(&self.me).copied(),
+            activated: self.activated.clone(),
+        });
         barrier
     }
 

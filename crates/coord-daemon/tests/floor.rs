@@ -466,7 +466,10 @@ fn a_restarted_voter_reads_back_its_promise_and_its_floor() {
     let reopened = open_floor(&cluster.voters[1], settings(1, cluster.images(), 0));
     assert_eq!(reopened.promised(), promised);
     assert_eq!(reopened.activated().cloned(), activated);
-    assert!(!reopened.due(promised.unwrap()), "it would promise again");
+    assert!(
+        !reopened.due(promised.unwrap(), promised.unwrap()),
+        "it would promise again"
+    );
 }
 
 /// A voter short of disk headroom promises nothing, and says why; the
@@ -566,7 +569,7 @@ fn a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable() {
     let gated = applier.store().reader().snapshot().expect("snapshot");
     let view = gated.view();
     let position = coord_types::ids::ExecutionPosition::new(2 * INTERVAL).unwrap();
-    assert!(floor.due(position));
+    assert!(floor.due(position, position));
     floor.boundary(view, position).expect("promised");
     let promised = floor.barrier();
     // Voter 1's promise at the same boundary activates the floor there.
@@ -575,22 +578,37 @@ fn a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable() {
         .into_iter()
         .find(|x| x.voter == r(1) && x.boundary.execution_position == position)
         .expect("voter 1 promised");
+    // Heard while this voter's own promise is in flight, it activates
+    // nothing yet: the own promise's row may never exist.
     floor
         .hear(view, r(1), &theirs.encode().unwrap())
         .expect("recorded");
+    let heard = floor.barrier();
+    assert_eq!(floor.activated().expect("activated").root, first);
+
+    // Neither batch durable: nothing moves, both images stay.
+    assert!(floor.settle(|_| false, |_| false).is_none());
+    assert_eq!(kept(&alone), 2);
+    // The promise durable: with voter 1's it activates the floor at the
+    // boundary, in a batch of its own. The rows still name the first
+    // image as the floor until that batch is durable.
+    let updates = floor
+        .settle(|b| *b == promised || *b == heard, |_| false)
+        .expect("the floor activates");
+    assert_eq!(updates.len(), 1);
     let activated = floor.barrier();
     let second = floor.activated().expect("activated").root;
     assert_ne!(first, second);
-
-    // Neither batch durable: both images stay.
-    floor.settle(|_| false, |_| false);
     assert_eq!(kept(&alone), 2);
-    // The promise durable, the activation not: the rows still name the
-    // first image as the floor.
-    floor.settle(|b| *b == promised, |_| false);
-    assert_eq!(kept(&alone), 2);
-    // Both durable: nothing names the first image any more.
-    floor.settle(|b| *b == promised || *b == activated, |_| false);
+    // All durable: nothing names the first image any more.
+    assert!(
+        floor
+            .settle(
+                |b| *b == promised || *b == heard || *b == activated,
+                |_| false
+            )
+            .is_none()
+    );
     assert_eq!(kept(&alone), 1);
     let store = coord_checkpoint::SharedImageStore::open(&alone).expect("images");
     assert!(store.holds(&second) && !store.holds(&first));
@@ -623,6 +641,59 @@ fn a_failed_batch_reclaims_nothing() {
     let later = floor.barrier();
     floor.settle(|b| *b == later, |_| false);
     assert_eq!(kept(&alone), 2);
+}
+
+/// A promise whose batch failed was never written: it activates nothing
+/// with the promises heard afterwards, and the voter promises again at
+/// its next boundary.
+#[test]
+fn an_own_promise_whose_batch_failed_counts_for_nothing() {
+    let mut cluster = Cluster::new([0; 3]);
+    cluster.run(3);
+    let alone = cluster.images().join("alone");
+    copy_images(&cluster.images().join("voter-0"), &alone);
+    let mut floor = open_floor(&cluster.voters[0], {
+        let mut s = settings(0, cluster.images(), 0);
+        s.images = alone.clone();
+        s
+    });
+    let first = floor.activated().expect("activated").boundary;
+    cluster.run(4);
+    let applier = cluster.voters[0].node().applier();
+    let gated = applier.store().reader().snapshot().expect("snapshot");
+    let view = gated.view();
+    let position = coord_types::ids::ExecutionPosition::new(2 * INTERVAL).unwrap();
+    floor.boundary(view, position).expect("promised");
+    let promised = floor.barrier();
+    assert!(floor.settle(|_| false, |b| *b == promised).is_none());
+    // Rolled back to the promise the rows hold, and due again.
+    assert_eq!(floor.promised().map(|p| p.get()), Some(INTERVAL));
+    assert!(floor.due(position, position), "the failed promise stands");
+
+    // Voter 1's promise at that boundary now activates nothing: with the
+    // failed promise counted it would have made a majority.
+    let theirs = coord_checkpoint::read_readiness(view, &coord_checkpoint::TrimLimits::default())
+        .expect("read")
+        .into_iter()
+        .find(|x| x.voter == r(1) && x.boundary.execution_position == position)
+        .expect("voter 1 promised");
+    let rows = floor
+        .hear(view, r(1), &theirs.encode().unwrap())
+        .expect("recorded");
+    assert_eq!(rows.len(), 1, "an activation counting the failed promise");
+    assert_eq!(floor.activated().expect("activated").boundary, first);
+}
+
+/// A retry answered from the record reports its original position, which
+/// the frontier is past: it is no boundary, and nothing is exported.
+#[test]
+fn a_position_behind_the_frontier_is_no_boundary() {
+    let cluster = Cluster::new([0; 3]);
+    let floor = cluster.floor(0);
+    let boundary = coord_types::ids::ExecutionPosition::new(INTERVAL).unwrap();
+    let past = coord_types::ids::ExecutionPosition::new(INTERVAL + 1).unwrap();
+    assert!(floor.due(boundary, boundary));
+    assert!(!floor.due(boundary, past));
 }
 
 /// A voter whose promised image is gone or damaged does not reopen its
