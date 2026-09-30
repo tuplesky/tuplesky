@@ -486,6 +486,11 @@ pub struct Follower {
     /// The undecided records the marker in flight releases (task-d24):
     /// released from the table once that batch is durable.
     sync_released: Vec<CommandId>,
+    /// A ballot whose marker batch failed (task-d24 review): synchronized
+    /// in memory, with nothing of it durable, so a Sync of it sent again
+    /// installs again, marker, demotions and releases, rather than
+    /// activating over rows that were never written.
+    sync_unwritten: Option<Ballot>,
     won: Option<SyncDecision>,
     /// Voting messages of the promised ballot that arrived before its Sync
     /// (delivery is not ordered across peers); replayed once synchronized.
@@ -665,6 +670,7 @@ impl Follower {
             sync_barrier: None,
             sync_demoted: Vec::new(),
             sync_released: Vec::new(),
+            sync_unwritten: None,
             boot: None,
             alloc: None,
             outbox: None,
@@ -881,6 +887,7 @@ impl Follower {
             sync_barrier: None,
             sync_demoted: Vec::new(),
             sync_released: Vec::new(),
+            sync_unwritten: None,
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
@@ -1430,7 +1437,8 @@ impl Follower {
             self.sync_behind_promise = Some((from, decision));
             return Vec::new();
         }
-        let already_synced = self.ballots.synced() == decision.ballot;
+        let already_synced = self.ballots.synced() == decision.ballot
+            && self.sync_unwritten != Some(decision.ballot);
         if already_synced && self.config.quorum.ballot() == decision.ballot {
             // Duplicate Sync of the active ballot: converges without change.
             return Vec::new();
@@ -1521,11 +1529,14 @@ impl Follower {
             // a command the new leader proposes after its Sync can reach
             // this voter, as a payload, before the Sync does, and it is
             // no record the selection could speak for.
+            // Kept until the marker's batch is durable (review): taken
+            // here, a failed batch lost it, and the Sync sent again
+            // released nothing for the rest of the boot.
             let cut = self
                 .report_cut
-                .take()
+                .as_ref()
                 .filter(|(b, _)| *b == decision.ballot)
-                .map(|(_, cut)| cut)
+                .map(|(_, cut)| cut.clone())
                 .unwrap_or_default();
             let released: Vec<CommandId> = self
                 .table
@@ -3898,6 +3909,16 @@ impl Follower {
                     if self.ballots.synced() == decision.ballot {
                         self.synced_selection = Some(decision.clone());
                     }
+                    if self
+                        .report_cut
+                        .as_ref()
+                        .is_some_and(|(b, _)| *b == decision.ballot)
+                    {
+                        self.report_cut = None;
+                    }
+                    if self.sync_unwritten == Some(decision.ballot) {
+                        self.sync_unwritten = None;
+                    }
                     for command in core::mem::take(&mut self.sync_demoted) {
                         self.table.demote(&command);
                     }
@@ -3929,6 +3950,7 @@ impl Follower {
                     self.ledger.failed(barrier);
                     self.sync_demoted.clear();
                     self.sync_released.clear();
+                    self.sync_unwritten = Some(decision.ballot);
                     self.rejections
                         .push(FollowerRejection::SyncNotDurable(decision.ballot));
                     Vec::new()
