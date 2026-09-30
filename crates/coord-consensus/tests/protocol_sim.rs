@@ -1280,10 +1280,15 @@ impl Sim {
                     .filter(|i| !self.nodes[usize::from(*i)].journal.is_empty())
                     .collect();
                 let runnable: Vec<u8> = (0..self.n).filter(|i| self.executable(*i)).collect();
-                if !self.net.is_empty() {
-                    self.deliver();
-                } else if let Some(i) = journals.first() {
+                // The disk keeps up: a queued batch completes before the
+                // next delivery. Two leaders of different ballots can
+                // re-send faster than one delivery a step drains, and a
+                // network that never empties would otherwise leave every
+                // batch, a campaign's promise among them, never durable.
+                if let Some(i) = journals.first() {
                     self.complete(*i);
+                } else if !self.net.is_empty() {
+                    self.deliver();
                 } else if let Some(i) = runnable.first() {
                     self.execute(*i);
                 } else {
