@@ -784,8 +784,7 @@ fn common_state_over_the_inline_cap_refuses_the_floor_at_start() {
     let images = tempfile::tempdir().unwrap();
     let view = engine.reader().snapshot().unwrap();
     let refused = Floor::open(settings(0, images.path(), 0), &view, inc(), BootId([9; 16]))
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(refused.contains("[floor] enabled = false"), "{refused}");
     // Nothing was created for a floor that does not start.
     assert!(!images.path().join("voter-0").exists());

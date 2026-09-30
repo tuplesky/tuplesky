@@ -235,6 +235,9 @@ fn check_ordered_access<H: ConformanceHarness>(h: &mut H) -> Check {
     Ok(())
 }
 
+/// A scan direction, its cursor, and the keys the page must hold.
+type CursorCase = (Direction, &'static [u8], &'static [&'static [u8]]);
+
 /// A cursor outside the interval: one short of it changes nothing, one
 /// at or past its far end leaves nothing to return, in either direction.
 fn check_cursor_bounds<H: ConformanceHarness>(h: &mut H) -> Check {
@@ -248,7 +251,7 @@ fn check_cursor_bounds<H: ConformanceHarness>(h: &mut H) -> Check {
         ],
     )?;
     let view = h.engine().reader().snapshot().map_err(|e| e.to_string())?;
-    let cases: [(Direction, &[u8], &[&[u8]]); 8] = [
+    let cases: [CursorCase; 8] = [
         (Direction::Forward, b"r0", &[b"r2", b"r3"]),
         (Direction::Forward, b"r2", &[b"r3"]),
         (Direction::Forward, b"r3", &[]),
