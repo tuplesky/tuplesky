@@ -6644,7 +6644,92 @@ finishes or recovers admitted commands could be refused by a full table.
   - a voter restarted between its report and the Sync rebuilds the cut
     from its undecided durable records while its promise is ahead of its
     synchronized ballot. Nothing is admitted or adopted after a promise,
-    so those are the records the report named.
+    so those are the records the report named;
+  - the cut is kept until the marker's batch is durable (review). It was
+    taken when the release set was computed, so a failed batch lost it.
+    The Sync sent again then found the ballot already synchronized in
+    memory, activated over rows that were never written, and released
+    nothing, so the table stayed full for the boot. A ballot whose marker
+    failed now installs again when its Sync comes again: marker,
+    demotions and releases;
+  - it covers what a Sync left out for size (below) as it covers
+    anything else the Sync neither selects nor re-proposes. Such a
+    command was to be re-proposed, so it was decided nowhere, and the
+    collector offers it again (O1).
+- **A Sync within the bound** (review of task-d20, decided on #120). A
+  report is bounded at `MAX_REPORT_ENTRIES`, twice the largest table, and
+  a report overlays the synchronized selection. The selection's
+  re-proposals were not bounded, though: five disjoint reports gave a
+  legal Sync of five reports' worth. Every voter that took its
+  re-proposals reported past the bound until they executed. If the new
+  leader crashed first, every later campaign failed on its own report,
+  at every ballot, with no exit.
+  - A Sync now carries at most `MAX_REPORT_ENTRIES` commands
+    (`within_bound`, applied by `select_with`): every kept entry, then
+    re-proposals in the selection's order, which is identity order, until
+    the bound.
+  - A re-proposal a kept entry depends on goes first, wherever it falls
+    in that order. The new leader re-proposes such an entry right after
+    it, so leaving it out would leave the entry waiting for a proposal
+    nobody makes.
+  - What does not fit is released at installation by the rule above and
+    offered again by the collector.
+  - Why the kept entries fit within twice the table. A kept entry is an
+    acceptance or commit at the source ballot, a commit below it, or a
+    possible fast decision of the source ballot. Each is in the source
+    leader's order:
+    - its acceptances and fast candidates are its own proposals;
+    - a commit of an earlier ballot was carried into it by the Sync it
+      was selected with, since a decision is kept by every later
+      selection.
+  - A reporter names such a command until it executed it and the
+    command left its retirement window. So the kept entries are the
+    source leader's live records and its window, twice its table, plus
+    what a reporter behind that window still holds.
+  - The last is a voter far behind, task-d08's and task-d32's case.
+    Kept entries are never cut, since one may be decided: a selection
+    whose kept entries alone pass the bound carries them all, and its
+    row bound (`SyncTooLarge`) still applies.
+  - A voter that takes a capped Sync's re-proposals holds only what the
+    Sync names, having released the rest of what it reported, so its
+    report for the next ballot is within the bound.
+- **A report past the page bound is named** (review of task-d28). A
+  report announcing more pages than `MAX_REPORT_ENTRIES` entries take,
+  plus one, had each page refused as `OutOfBounds`. Its voter counted as
+  not yet reported, and the campaign waited for the election's ceiling.
+  With the Sync capped, such a report is a defect.
+  - A verified page of one now records its reporter as past the bound
+    (`PageError::PastBound`), and nothing of it is held or asked for
+    again.
+  - The campaign sets it aside as it sets aside a report too large.
+  - Once every voter has answered and too few fit, the campaign fails
+    as `RecoveryError::ReportPastPages`, naming the reporter, its pages
+    and the limit.
+  - A page that does not verify says nothing about its reporter and is
+    still `OutOfBounds`.
+- **Recovering a capped Sync** (review). The test of a leader crashing
+  right after such a Sync found three defects that stopped recovery at
+  that size; none is the cap's, and each stops a smaller selection more
+  slowly.
+  - A candidate at its admission limit refused the payloads its own
+    selection needed. A fetched payload enters the table as an admitted
+    request does, and only a Sync's installed entries were let past the
+    limit. The candidate asked again for ever and never bound. A command
+    its own campaign selected now enters a full table as a Sync's entry
+    does (`on_request`), since it finishes admitted work.
+  - The outbox rescanned every send's requirements at every completion.
+    A leader's own acknowledgement requires every batch submitted before
+    its own, so a new leader re-proposing 2,000 commands held sends
+    requiring up to 2,000 barriers each, and each completion walked their
+    durable prefixes: cubic in the selection. The failed-barrier scan is
+    skipped when nothing failed, and the newest barrier is checked first,
+    so a send still waiting costs one lookup (`Outbox::release`). Which
+    sends are released, and when, is unchanged.
+  - `entry_order` placed entries by repeated scans, one per dependency
+    level, and a candidate asks it again at each step of its payload
+    fetches. It is one walk of the dependency graph now, with the same
+    order and the same commands on a cycle
+    (`entry_order_is_the_order_of_placing_by_passes`).
 - **The path log.** A released command left its keys' path logs too
   (Codex review). Kept, the next command's path was hashed through it,
   so this voter's fast acknowledgements disagreed with the other voters'
@@ -6730,6 +6815,57 @@ finishes or recovers admitted commands could be refused by a full table.
 - `releasing_the_latest_command_hands_the_key_back_to_its_predecessor`
   (`graph`): the next command on the key depends on the released one's
   predecessor, and a committed record is not released.
+- `a_voter_whose_report_came_after_the_selection_drains_its_table`
+  (`activation`): the acceptance's reachable shape.
+  - Five voters. r1's table is full of commands only it pre-accepted.
+  - The old leader goes for good, and r1's report page is lost on its
+    way to r2. So r2 selects from r2, r3 and r4.
+  - r1 installs the Sync, releases every record, and takes and executes
+    new work without `Backpressure`.
+  - With three voters and one gone, the two left are a majority, both
+    reports are used, and nothing is released. That is why the plan's
+    earlier wording, "with one voter permanently absent", named a shape
+    that releases nothing.
+- `five_disjoint_full_reports_give_a_sync_within_the_bound`
+  (`activation`): five disjoint reports of `MAX_REPORT_ENTRIES` entries
+  select a Sync of exactly that many commands, which fits its row.
+  - A kept entry that depends on the last command in identity order
+    keeps that re-proposal.
+  - The rest are the first in identity order.
+  - Without the cap the Sync names 10,000.
+- `a_leader_crash_right_after_a_capped_sync_is_followed_by_a_campaign_that_completes`
+  (`activation`):
+  - Five voters at the largest table. Four each pre-accepted 875
+    commands no other voter holds, so any majority re-proposes at least
+    2,625.
+  - r1's Sync is capped at `MAX_REPORT_ENTRIES`, and r1 holds no more.
+  - Its re-proposals are decided at the runtime's re-send pace and
+    executed nowhere, and then r1 crashes. Each survivor installed the
+    Sync, released some of what it held, and reports within the bound
+    for the next ballot.
+  - r2's campaign completes. The recovered order executes, and new work
+    submitted after it does too.
+  - Without the cap, r1 holds 2,625, every survivor reports 2,625, and
+    r2's campaign fails on its own report as `ReportTooLarge`, the
+    review's failure. Without the candidate's full-table admission, r1's
+    campaign never binds.
+  - The harness's payload timer asks only when nothing is in flight.
+    Asked at every step, as it was, a voter lacking a thousand payloads
+    sent an ask per message delivered, and the answers never caught up.
+    An ask that reaches no live voter is no progress.
+- `a_report_announcing_more_pages_than_the_bound_fails_the_campaign_by_name`
+  (`activation`) covers three cases:
+  - with one voter's report past the page bound, the campaign waits for
+    the rest and does not ask for that report again;
+  - with every voter answered, it fails as `ReportPastPages` naming the
+    first;
+  - with another report in bounds, it selects from the majority without
+    it.
+- `a_sync_sent_again_after_its_marker_failed_still_releases`
+  (`activation`): the marker's batch fails, and the Sync sent again
+  releases what it leaves out. It fails when the cut is taken before the
+  batch is durable, and when a ballot whose marker failed is treated as
+  installed.
 - Existing tests that filled a table to its capacity by admission fill it
   to the admission limit instead (`follower.rs`, `frontier.rs`), and
   the two payload-transfer tests of `recovery.rs` use a 32-slot table
