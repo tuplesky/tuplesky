@@ -467,7 +467,7 @@ jobs:
           key: jepsen-swiftpaxos-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/swiftpaxos/project.clj', 'jepsen/swiftpaxos/build.sh') }}
           restore-keys: jepsen-swiftpaxos-m2-
       - name: Build SwiftPaxos and its Jepsen client
-        # From the agentsky/swiftpaxos fork (upstream plus the client, in
+        # From the tuplesky/swiftpaxos fork (upstream plus the client, in
         # cmd/swiftpaxos-jepsen), at the commit jepsen/swiftpaxos/build.sh pins.
         run: |
           go version
