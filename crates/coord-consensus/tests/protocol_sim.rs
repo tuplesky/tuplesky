@@ -25,6 +25,13 @@
 //! 4. **No halt.** No replica stops on two decisions of one command, a
 //!    recovery cycle, or incompatible accepted copies.
 //!
+//! And once the fault schedule ends (every node back, nothing lost or
+//! crashed any more, an election whenever execution stops):
+//!
+//! 5. **Every learned decision executes.** What the frontend learned is
+//!    in the one order. A domain stalled on full tables is counted, not
+//!    failed: that gap is task-d24's.
+//!
 //! Scenarios are the checklist's failure-test matrix rows 1 to 4 and 10, at
 //! three and five voters, with table capacity 32. Seeds that once failed
 //! are kept in `fixtures/protocol_sim/seeds.json` and replayed on every
@@ -284,6 +291,12 @@ struct Sim {
     decided: BTreeMap<CommandId, (BTreeSet<CommandId>, String)>,
     /// The one execution order.
     order: Vec<CommandId>,
+    /// Commands the frontend learned.
+    learned: BTreeSet<CommandId>,
+    /// After the fault schedule: no more loss, duplication or crashes.
+    draining: bool,
+    /// The last step a follower refused work because its table was full.
+    last_backpressure: Option<u32>,
     step: u32,
     /// Counters for the report.
     stats: Stats,
@@ -303,6 +316,8 @@ struct Stats {
     catch_up_pages: u32,
     caught_up: u64,
     ballots: u64,
+    /// Runs whose drain stalled on full tables (task-d24's gap).
+    full_table_stalls: u32,
 }
 
 impl Sim {
@@ -365,6 +380,9 @@ impl Sim {
             catch_up: std::env::var_os("PROTOCOL_SIM_NO_CATCH_UP").is_none(),
             decided: BTreeMap::new(),
             order: Vec::new(),
+            learned: BTreeSet::new(),
+            draining: false,
+            last_backpressure: None,
             step: 0,
             stats: Stats::default(),
             trace: std::env::var_os("PROTOCOL_SIM_TRACE").map(|_| VecDeque::new()),
@@ -523,7 +541,9 @@ impl Sim {
                     )
                 });
             }
-            self.stats.learned += 1;
+            if self.learned.insert(command) {
+                self.stats.learned += 1;
+            }
             self.decide(command, &deps, &format!("learned at the frontend in {b:?}"));
         }
     }
@@ -734,7 +754,7 @@ impl Sim {
 
     fn deliver(&mut self) {
         let k = self.below("pick", self.net.len());
-        let msg = if self.chance("dup", self.knobs.dup) {
+        let msg = if !self.draining && self.chance("dup", self.knobs.dup) {
             let m = &self.net[k];
             Msg {
                 from: m.from,
@@ -744,7 +764,9 @@ impl Sim {
         } else {
             self.net.swap_remove(k)
         };
-        if self.chance("loss", self.knobs.loss) || !self.nodes[usize::from(msg.to)].alive() {
+        if (!self.draining && self.chance("loss", self.knobs.loss))
+            || !self.nodes[usize::from(msg.to)].alive()
+        {
             return;
         }
         if self.trace.is_some() {
@@ -952,6 +974,12 @@ impl Sim {
             let why = match node.role.as_mut() {
                 Some(Role::Follower(f)) => {
                     let rejections = f.take_rejections();
+                    if rejections
+                        .iter()
+                        .any(|r| matches!(r, FollowerRejection::Backpressure))
+                    {
+                        self.last_backpressure = Some(self.step);
+                    }
                     if let Some(t) = self.trace.as_mut() {
                         for r in &rejections {
                             let text = format!("{r:?}");
@@ -1176,10 +1204,105 @@ impl Sim {
             }
             self.check_halts();
         }
+        // Oracle 5: every decision the frontend learned is executed, once
+        // the faults stop. A decision learned from a durable majority,
+        // dropped by the next selection and never re-proposed passes the
+        // other four: `decided` is compared only when a replica executes.
+        if !self.drain() && self.stalled_on_a_full_table() {
+            // Not a lost decision: every follower's table is full and
+            // nothing retires, so nothing more is proposed or executed.
+            // Keeping table room for recovery is task-d24's (#122), above
+            // this branch; counted, and strict from there.
+            self.stats.full_table_stalls += 1;
+        } else if !self.learned_executed() {
+            let lost: Vec<String> = self
+                .learned
+                .iter()
+                .filter(|c| !self.order.contains(c))
+                .map(short)
+                .collect();
+            self.fail(&format!(
+                "learned but never executed after the faults stopped: {}",
+                lost.join(",")
+            ));
+        }
         self.stats.ballots = self.highest_ballot;
         self.stats
     }
+
+    /// Whether the drain ended refusing work for a full table.
+    fn stalled_on_a_full_table(&self) -> bool {
+        self.last_backpressure
+            .is_some_and(|at| self.step.saturating_sub(at) < DRAIN_QUIET)
+    }
+
+    /// Whether every command the frontend learned has executed.
+    fn learned_executed(&self) -> bool {
+        self.learned.iter().all(|c| self.order.contains(c))
+    }
+
+    /// After the fault schedule: every node back, and no more loss,
+    /// duplication, crashes or admissions, until what the frontend
+    /// learned has executed. A domain that stops executing gets an
+    /// election, as `coordd`'s does when its leader goes quiet.
+    fn drain(&mut self) -> bool {
+        self.draining = true;
+        for i in 0..self.n {
+            if !self.nodes[usize::from(i)].alive() {
+                self.restart(i);
+            }
+        }
+        let mut executed = self.order.len();
+        let mut quiet = 0u32;
+        for step in 0..DRAIN_STEPS {
+            if self.learned_executed() {
+                return true;
+            }
+            self.step = self.knobs.steps.saturating_add(step);
+            if self.order.len() > executed {
+                executed = self.order.len();
+                quiet = 0;
+            }
+            quiet += 1;
+            if quiet >= DRAIN_QUIET {
+                let followers: Vec<u8> = (0..self.n)
+                    .filter(|i| matches!(self.nodes[usize::from(*i)].role, Some(Role::Follower(_))))
+                    .collect();
+                if !followers.is_empty() {
+                    let who = followers[self.below("drain candidate", followers.len())];
+                    self.campaign(who);
+                }
+                quiet = 0;
+            } else if step % DRAIN_TIMERS == 0 {
+                self.timers();
+            } else {
+                let journals: Vec<u8> = (0..self.n)
+                    .filter(|i| !self.nodes[usize::from(*i)].journal.is_empty())
+                    .collect();
+                let runnable: Vec<u8> = (0..self.n).filter(|i| self.executable(*i)).collect();
+                if !self.net.is_empty() {
+                    self.deliver();
+                } else if let Some(i) = journals.first() {
+                    self.complete(*i);
+                } else if let Some(i) = runnable.first() {
+                    self.execute(*i);
+                } else {
+                    self.timers();
+                }
+            }
+            self.check_halts();
+        }
+        self.learned_executed()
+    }
 }
+
+/// Steps the drain may take before a learned decision that has not
+/// executed is called lost.
+const DRAIN_STEPS: u32 = 60_000;
+/// Steps without an execution before the drain holds an election.
+const DRAIN_QUIET: u32 = 6_000;
+/// Steps between timer rounds while draining.
+const DRAIN_TIMERS: u32 = 250;
 
 fn short(c: &CommandId) -> String {
     format!("{:02x}{:02x}", c.0.0[0], c.0.0[1])
@@ -1344,10 +1467,17 @@ fn run_row(row: u8) {
     std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let mut totals = Stats::default();
+    // Runs that learned nothing, and runs that did, at three and five.
+    let (mut idle, mut busy) = ([0u32; 2], [0u32; 2]);
     for n in [3u8, 5] {
         for seed in 0..seeds() {
             match run_one(n, row, seed) {
                 Ok(s) => {
+                    if s.learned == 0 {
+                        idle[usize::from(n == 5)] += 1;
+                    } else {
+                        busy[usize::from(n == 5)] += 1;
+                    }
                     totals.executed += s.executed;
                     totals.learned += s.learned;
                     totals.campaigns += s.campaigns;
@@ -1356,13 +1486,14 @@ fn run_row(row: u8) {
                     totals.catch_up_pages += s.catch_up_pages;
                     totals.caught_up += s.caught_up;
                     totals.ballots += s.ballots;
+                    totals.full_table_stalls += s.full_table_stalls;
                 }
                 Err(e) => failures.push(e),
             }
         }
     }
     std::panic::set_hook(hook);
-    println!("row {row}: {totals:?}");
+    println!("row {row}: {totals:?}; runs that learned nothing (3, 5 voters): {idle:?}");
     assert!(
         failures.is_empty(),
         "{} failing seeds:\n{}",
@@ -1375,6 +1506,15 @@ fn run_row(row: u8) {
         totals.executed > 0 && totals.campaigns > 0,
         "row {row} ran idle: {totals:?}"
     );
+    // At each size, most runs learned something: the frontend's oracles
+    // (one dependency set, every learned decision executed) are not
+    // vacuous there.
+    for (size, (i, b)) in ["three", "five"].iter().zip(idle.iter().zip(busy)) {
+        assert!(
+            b > *i,
+            "row {row} at {size} voters: {i} runs learned nothing, {b} did"
+        );
+    }
     // Row 1 is defined by a leader failing: a schedule that never took
     // the crash branch against a leader has lost its coverage.
     if row == 1 {
