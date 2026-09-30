@@ -258,7 +258,7 @@ pub(crate) fn overlay_selected<'a>(
     report: &mut RecoveryReport,
     entries: impl Iterator<Item = (&'a CommandId, &'a SyncEntry)>,
 ) {
-    let known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+    let mut known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
     for (command, entry) in entries {
         if known.contains(command) {
             // Known here at or below the selection, or with another
@@ -308,6 +308,9 @@ pub(crate) fn overlay_selected<'a>(
             // has to be the one under them (task-d14).
             admission: entry.admission,
         });
+        // A selected entry still pending comes twice, from the pending
+        // set and from the selection: reported once.
+        known.insert(*command);
     }
 }
 
@@ -1489,6 +1492,13 @@ impl Follower {
     /// (task-d11). Kept, the earlier entries went into every report after
     /// it, so a voter behind across failed ballots reported more each
     /// time, and the Sync selected from its report grew with them.
+    ///
+    /// What an earlier Sync left uninstalled is not this ballot's, and
+    /// installing one of its entries would write an acceptance the new
+    /// selection re-proposed or left out, back over the demotion
+    /// (task-d34: a restart resumed an older Sync, took a newer one, and
+    /// the older entry's ACCEPT came back at the new synchronized
+    /// ballot).
     fn replace_sync_pending(&mut self, decision: &SyncDecision) {
         // The placeholders the superseded entries made go with them,
         // unless a proposal held here is waiting on the command: kept,
@@ -1518,11 +1528,19 @@ impl Follower {
     fn advance_sync(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         loop {
+            // Nothing installs while a Sync's marker is not durable. Its
+            // demotions were computed when the marker was issued, so an
+            // older Sync's entry installed now, from a payload arriving
+            // in the window, would be journaled after the marker and
+            // undemoted: an acceptance the next report names at the new
+            // ballot, which the guard keeps as decided (task-d20 review).
+            // Activation replaces what is pending anyway.
             let ready: Vec<CommandId> = self
                 .sync_pending
                 .iter()
                 .filter(|(c, e)| {
-                    self.table.phase_of(c).is_some()
+                    self.sync_barrier.is_none()
+                        && self.table.phase_of(c).is_some()
                         && !self.awaits_selected_facts(c)
                         && crate::phase::guard_accept(&e.deps, |d| self.table.phase_of(d)).is_ok()
                 })
@@ -3400,7 +3418,8 @@ impl Follower {
                         // ballot. So its entries are held for
                         // installation, and reported, as an activated
                         // Sync's are; only the ballot is not taken up
-                        // (task-d30).
+                        // (task-d30). What an older Sync left pending is
+                        // superseded by this one, as at activation.
                         self.replace_sync_pending(&decision);
                         self.rejections
                             .push(FollowerRejection::SyncSuperseded(decision.ballot));
