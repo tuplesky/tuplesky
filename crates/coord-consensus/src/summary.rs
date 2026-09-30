@@ -309,6 +309,10 @@ pub enum PageError {
     Inconsistent,
     /// Page for another ballot.
     WrongBallot,
+    /// A verified page of a report announcing more pages than the bound
+    /// (task-d24 review): its reporter is recorded as past the bound, and
+    /// nothing of it is held.
+    PastBound,
 }
 
 /// Split a report into verified pages.
@@ -354,6 +358,9 @@ pub struct ReportAssembler {
     pages: BTreeMap<ReplicaId, BTreeMap<u32, ReportPage>>,
     /// Per replica: page total, synchronized ballot and report digest.
     totals: BTreeMap<ReplicaId, (u32, Ballot, Digest32)>,
+    /// Replicas whose report announced more than `max_pages` pages, with
+    /// the total announced (task-d24 review).
+    past_bound: BTreeMap<ReplicaId, u32>,
 }
 
 impl ReportAssembler {
@@ -364,6 +371,7 @@ impl ReportAssembler {
             max_pages: MAX_REPORT_PAGES,
             pages: BTreeMap::new(),
             totals: BTreeMap::new(),
+            past_bound: BTreeMap::new(),
         }
     }
 
@@ -388,6 +396,17 @@ impl ReportAssembler {
         )
     }
 
+    /// The replicas whose report announced more pages than the bound, and
+    /// the total each announced.
+    pub const fn past_bound(&self) -> &BTreeMap<ReplicaId, u32> {
+        &self.past_bound
+    }
+
+    /// The most pages a report may announce.
+    pub const fn max_pages(&self) -> u32 {
+        self.max_pages
+    }
+
     /// Pages held, across every replica.
     pub fn pages_held(&self) -> usize {
         self.pages.values().map(BTreeMap::len).sum()
@@ -398,10 +417,7 @@ impl ReportAssembler {
         if page.ballot != self.ballot {
             return Err(PageError::WrongBallot);
         }
-        if page.total == 0 || page.total > self.max_pages || page.page >= page.total {
-            return Err(PageError::OutOfBounds);
-        }
-        if page.entries.len() > MAX_PAGE_ENTRIES {
+        if page.total == 0 || page.page >= page.total || page.entries.len() > MAX_PAGE_ENTRIES {
             return Err(PageError::OutOfBounds);
         }
         let expected = page_digest(
@@ -413,6 +429,17 @@ impl ReportAssembler {
             &page.snapshot,
             &page.entries,
         );
+        if page.total > self.max_pages {
+            // A report past the bound however its pages come out: named,
+            // so the campaign sets it aside or fails on it rather than
+            // waiting for pages it will never hold. A page that does not
+            // verify says nothing about its reporter.
+            if expected != page.digest {
+                return Err(PageError::OutOfBounds);
+            }
+            self.past_bound.insert(page.replica, page.total);
+            return Err(PageError::PastBound);
+        }
         if expected != page.digest {
             return Err(PageError::Corrupt);
         }
