@@ -591,7 +591,18 @@ impl Leader {
             // would give it other dependencies than the ones it was
             // decided with, and anchoring the next proposal after it
             // would fork the order at a command executed long ago.
+            //
+            // The entries that follow it are still this ballot's to
+            // propose: they were held out of the first pass, and leaving
+            // them here left them proposed nowhere, installed at ACCEPT
+            // with nothing to vote on, and everything chained after them
+            // waiting (task-d34 review). They name it among their
+            // dependencies, so they order after it everywhere.
             if leader.table.phase_of(c) >= Some(Phase::Commit) {
+                effects.extend(leader.repropose_entries(decision, &ready, &mut published));
+                if !ready.is_empty() {
+                    last = ready_tails(decision, &last, &ready);
+                }
                 continue;
             }
             let deps = core::mem::replace(&mut last, alloc::vec![*c]);
