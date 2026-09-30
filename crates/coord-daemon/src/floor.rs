@@ -45,8 +45,8 @@ use std::path::Path;
 use coord_checkpoint::floor::published_activation;
 use coord_checkpoint::{
     ActivatedFloorV1, CheckpointOrigin, CheckpointReadinessV1, ExportLimits, SharedImageStore,
-    TrimLimits, activate_floor, export_shared, publish_activation, read_readiness,
-    record_readiness,
+    TrimLimits, activate_floor, common_state_bytes, export_shared, publish_activation,
+    read_readiness, record_readiness,
 };
 use coord_consensus::quorum::EpochVoters;
 use coord_core::effect::{BarrierId, BootId, StoreUpdate};
@@ -54,6 +54,20 @@ use coord_core::outbox::BarrierAllocator;
 use coord_store_api::engine::OrderedRead;
 use coord_types::identity::Digest32;
 use coord_types::ids::{ExecutionPosition, ReplicaId, ReplicaIncarnation};
+
+/// Most common state, in key and value bytes, a floor exports.
+///
+/// The export and the image's write run inline, on the domain's serving
+/// loop, so their time is time the domain neither serves nor answers a
+/// peer: they cost O(common state) in reads, memory and written bytes,
+/// and an fsync per 1 MiB chunk. Measured with redb at coordd's default
+/// cache, release build, one 4-core container: 16 MiB 0.16 s, 32 MiB
+/// 0.29 s, 48 MiB 0.49 s, 64 MiB 0.69 s, 128 MiB 1.6 s, 384 MiB 11 s
+/// (`measure_the_inline_boundary` in coord-checkpoint's export tests).
+/// 32 MiB keeps one boundary under a third of the election's 1 s
+/// patience on that machine. The cap goes when the export moves off the
+/// serving loop onto a pinned snapshot (task-d27's second part).
+pub const INLINE_EXPORT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Executed positions between floor boundaries.
 ///
@@ -106,6 +120,12 @@ pub enum FloorRefusal {
     Image(String),
     /// The promise rules refused this voter's own readiness.
     Promise(String),
+    /// The last image was over [`INLINE_EXPORT_CAP_BYTES`]: exporting
+    /// again would hold the serving loop longer than the cap allows.
+    OverCap {
+        /// Bytes of the last image.
+        image: u64,
+    },
 }
 
 impl core::fmt::Display for FloorRefusal {
@@ -124,6 +144,11 @@ impl core::fmt::Display for FloorRefusal {
             ),
             FloorRefusal::Image(e) => write!(f, "the image was not kept: {e}"),
             FloorRefusal::Promise(e) => write!(f, "the promise was refused: {e}"),
+            FloorRefusal::OverCap { image } => write!(
+                f,
+                "the last image was {image} bytes, over the inline export's cap of \
+                 {INLINE_EXPORT_CAP_BYTES}"
+            ),
         }
     }
 }
@@ -219,6 +244,16 @@ impl Floor {
         if settings.interval == 0 {
             return Err("a floor interval of zero names no boundary".into());
         }
+        // Counted before anything else is read, and only as far as the
+        // cap: past it the answer is the same however large the state.
+        let common = common_state_bytes(view, INLINE_EXPORT_CAP_BYTES, &ExportLimits::default())
+            .map_err(|e| format!("the common state's size: {e}"))?;
+        if common > INLINE_EXPORT_CAP_BYTES {
+            return Err(format!(
+                "the floor exports inline on the serving loop, and this store's common state \
+                 is over its cap of {INLINE_EXPORT_CAP_BYTES} bytes; set [floor] enabled = false"
+            ));
+        }
         let images = SharedImageStore::open(&settings.images)
             .map_err(|e| format!("the floor images' directory: {e}"))?;
         // The epoch a floor is agreed in is the one its checkpoints name:
@@ -246,8 +281,9 @@ impl Floor {
         // image missing now was lost after the promise was made.
         if let Some(own) = heard.get(&settings.me) {
             images.verify(&own.root).map_err(|e| {
+                let root: String = own.root.0.iter().map(|b| format!("{b:02x}")).collect();
                 format!(
-                    "the image this voter promised at {} cannot be read back: {e}",
+                    "the image {root} this voter promised at {} cannot be read back: {e}",
                     own.boundary.execution_position.get()
                 )
             })?;
@@ -270,7 +306,9 @@ impl Floor {
             standing,
             unsettled: Vec::new(),
             diverged: false,
-            last_image_bytes: 0,
+            // No image written yet: the count stands in for its size, and
+            // is at least what the first export will carry.
+            last_image_bytes: common,
             barriers: BarrierAllocator::new(incarnation, boot).for_runtime(),
             incarnation,
             boot,
@@ -320,6 +358,11 @@ impl Floor {
         view: &V,
         position: ExecutionPosition,
     ) -> Result<Promised, FloorRefusal> {
+        if self.last_image_bytes > INLINE_EXPORT_CAP_BYTES {
+            return Err(FloorRefusal::OverCap {
+                image: self.last_image_bytes,
+            });
+        }
         let free = available(self.images.root()).map_err(|e| FloorRefusal::Disk(e.to_string()))?;
         let need = self.headroom.saturating_add(self.last_image_bytes);
         if free < need {

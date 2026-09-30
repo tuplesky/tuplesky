@@ -7850,6 +7850,56 @@ default (`[floor] enabled = false`).
   promise names is read back and verified
   (`SharedImageStore::verify`). Missing or damaged, the voter does not
   start: it would advertise a promise it cannot keep.
+- **This voter's promise counts once it is durable.** A promise is held
+  in memory from the turn it is made, so a peer's promise is checked
+  against it, but an activation counts it only once the promise's batch
+  is durable (`Floor::settle`), and the activation it completes is
+  journaled then. A failed batch rolls this voter's promise and the
+  activated floor back to the durable rows. A boundary is due only at
+  the execution frontier: a retry answered from the record carries its
+  original position, which the frontier is past, and exports nothing.
+- **Inline, and capped.** The export (`export_shared`: every row of the
+  common collections, every chunk in memory), the image's write
+  (`SharedImageStore::keep`: re-encode, verify, an fsync per 1 MiB
+  chunk, a rename) and the readiness row all run synchronously in
+  `Domain::turn`, the task that also drains peer frames, timers and
+  requests. That is O(common state) in reads, memory and written bytes
+  at every boundary, on every voter at the same position; while it runs
+  the domain neither serves nor answers a peer, and past the election's
+  1 s patience a new ballot fences the floor's batches. Measured with
+  redb at the default 64 MiB cache, release build, on one 4-core
+  container (`measure_the_inline_boundary`, coord-checkpoint's export
+  tests, ignored): 16 MiB of common state 0.16 s, 32 MiB 0.29 s, 48 MiB
+  0.49 s, 64 MiB 0.69 s, 128 MiB 1.6 s, 384 MiB 11 s (the export about
+  10 ms per MiB, the fsynced write the rest). 1 GiB did not fit the
+  container's disk beside its image; linear from 384 MiB it is about
+  30 s. So a floor refuses to start over `INLINE_EXPORT_CAP_BYTES`,
+  32 MiB of key and value bytes in the collections an export reads,
+  counted at `Floor::open` and only as far as the cap. A domain that
+  grows past it while running stops promising once an image is over the
+  cap (`FloorRefusal::OverCap`), and the next start refuses. The cap
+  goes when the export moves off the serving loop (task-d27's second
+  part). Measuring found the redb adapter's paged scan quadratic: each
+  page started at the interval's edge and skipped to the cursor, so
+  once the rows outgrew the cache 384 MiB took 152 s to export. The
+  cursor now narrows the range itself, and a conformance check holds
+  every adapter to a cursor outside the interval.
+- **When a voter's floor does not reopen.** `coordd` does not start,
+  and says why. Over the cap: set `[floor] enabled = false`; the voter
+  serves, and its promises and any activated floor stay in its store,
+  read back when the floor is enabled again. The image this voter
+  promised is missing or damaged: the refusal names its root. A peer
+  whose latest promise is the same boundary holds the same image under
+  the same 64-hex name (equal common state exports equal bytes), so
+  with `coordd` stopped, copy that directory from the peer's images
+  directory into this voter's; the reopening verifies it again before
+  it is trusted. If no peer holds it, disabling the floor leaves a
+  durable promise this voter no longer backs. That is harmless while
+  nothing trims (this part: nothing reads a peer's image or forgets
+  below a floor), and it is not once trimming lands: then the way back
+  is replacing the voter through membership (task-d41) with a fresh
+  store. Never delete the readiness or activation rows by hand; they
+  are in the common hash.
 - **Its own directory.** The floor's images and the local checkpoints
   each reclaim every 64-hex directory their own store does not keep. A
   configuration that gives both one directory, or puts one inside the
@@ -7871,6 +7921,12 @@ default (`[floor] enabled = false`).
     fails when images are reclaimed as the rows are made.
   - `a_failed_batch_reclaims_nothing`.
   - `a_voter_whose_promised_image_is_lost_does_not_reopen_its_floor`
-    fails without the read-back verification.
+    fails without the read-back verification; it also reopens from the
+    image copied from a peer, named by the refusal.
+  - `an_own_promise_whose_batch_failed_counts_for_nothing` fails
+    without the rollback; `a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable`
+    fails when the own promise counts before its batch is durable.
+  - `a_position_behind_the_frontier_is_no_boundary`.
+  - `common_state_over_the_inline_cap_refuses_the_floor_at_start`.
   - `the_floor_keeps_its_images_apart_from_the_local_checkpoints`
     (config).

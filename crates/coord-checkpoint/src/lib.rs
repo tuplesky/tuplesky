@@ -76,7 +76,7 @@ pub mod store;
 pub mod trim;
 pub mod verify;
 
-pub use export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
+pub use export::{CheckpointOrigin, ExportError, ExportLimits, common_state_bytes, export_shared};
 pub use local::{
     InstallLocalError, InstallLocalLimits, LocalCheckpointV1, LocalError, LocalLimits,
     LocalManifestV1, LocalPin, export_local, install_local, verify_local,

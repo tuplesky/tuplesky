@@ -713,6 +713,23 @@ fn a_voter_whose_promised_image_is_lost_does_not_reopen_its_floor() {
         .expect_err("opened without its image");
     assert!(refused.contains("cannot be read back"), "{refused}");
     assert!(refused.contains(&promised.get().to_string()), "{refused}");
+    // The operator's way back: the refusal names the image, and a peer
+    // that promised the same boundary keeps it under the same name.
+    let root = refused
+        .strip_prefix("the image ")
+        .and_then(|rest| rest.split(' ').next())
+        .expect("the refusal names the image");
+    assert_eq!(cluster.floor(0).promised(), Some(promised));
+    let restored = cluster.images().join("restored");
+    std::fs::create_dir_all(&restored).expect("created");
+    copy_images(
+        &cluster.images().join("voter-0").join(root),
+        &restored.join(root),
+    );
+    let mut from_peer = settings(1, cluster.images(), 0);
+    from_peer.images = restored;
+    Floor::open(from_peer, gated.view(), inc(), applier.store().boot())
+        .expect("reopened with the peer's copy");
 
     // Damaged: a chunk cut short.
     let damaged = cluster.images().join("damaged");
@@ -743,4 +760,33 @@ fn a_voter_whose_promised_image_is_lost_does_not_reopen_its_floor() {
 
     // Intact, it reopens.
     open_floor(&cluster.voters[1], settings(1, cluster.images(), 0));
+}
+
+#[test]
+fn common_state_over_the_inline_cap_refuses_the_floor_at_start() {
+    use coord_daemon::floor::INLINE_EXPORT_CAP_BYTES;
+    use coord_store_api::engine::{LocalEngine, SnapshotSource, WriteTxn};
+    use coord_store_api::registry::Collection;
+
+    let mut engine = ModelEngine::new();
+    let value = vec![b'v'; 64 * 1024];
+    let rows = INLINE_EXPORT_CAP_BYTES as usize / value.len() + 1;
+    let mut tx = engine.begin_write().unwrap();
+    for i in 0..rows {
+        tx.put(
+            Collection::KvCurrentV1.id(),
+            format!("key-{i:06}").as_bytes(),
+            &value,
+        )
+        .unwrap();
+    }
+    tx.commit_durable().unwrap();
+    let images = tempfile::tempdir().unwrap();
+    let view = engine.reader().snapshot().unwrap();
+    let refused = Floor::open(settings(0, images.path(), 0), &view, inc(), BootId([9; 16]))
+        .err()
+        .expect("refused");
+    assert!(refused.contains("[floor] enabled = false"), "{refused}");
+    // Nothing was created for a floor that does not start.
+    assert!(!images.path().join("voter-0").exists());
 }
