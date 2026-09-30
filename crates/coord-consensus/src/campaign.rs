@@ -244,10 +244,14 @@ impl Campaign {
         }
         // Assembling copies every entry of every complete report, and a
         // campaign is asked on every page and promise that arrives: until
-        // a majority could be complete nothing is assembled (task-d26).
+        // a majority could be complete nothing is assembled (task-d26). A
+        // voter whose report is past the page bound answered too, and
+        // counts: with too few in bounds the campaign fails on it by name
+        // (task-d24) rather than waiting for pages it will never hold.
         let could_be_complete = self
             .assembler
             .all_pages_held()
+            .chain(self.assembler.past_bound().keys())
             .filter(|r| self.promised.contains(r))
             .count()
             + usize::from(self.own.is_some());
