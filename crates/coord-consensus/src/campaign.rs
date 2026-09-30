@@ -152,7 +152,7 @@ impl Campaign {
         let me = self.config.leader();
         self.promised
             .iter()
-            .filter(|r| **r != me)
+            .filter(|r| **r != me && !self.assembler.past_bound().contains_key(r))
             .filter_map(|r| match self.assembler.missing(r) {
                 None => Some((*r, Vec::new())),
                 Some(missing) if missing.is_empty() => None,
@@ -231,7 +231,9 @@ impl Campaign {
     /// A report carrying more than `report_limit` entries is set aside the
     /// same way (task-d20), so the Sync is selected from reports of a
     /// bounded size; the candidate's own is never set aside, and the
-    /// campaign fails on it as [`RecoveryError::ReportTooLarge`].
+    /// campaign fails on it as [`RecoveryError::ReportTooLarge`]. A report
+    /// that announced more pages than the bound counts as one too large
+    /// ([`RecoveryError::ReportPastPages`]).
     pub fn try_select(
         &mut self,
         report_limit: usize,
@@ -254,7 +256,20 @@ impl Campaign {
         }
         self.assemblies += 1;
         let mut reports = self.reports();
-        let everyone = reports.len() >= self.config.voters().len();
+        // A voter whose report announced more pages than the bound
+        // answered too: its report is past the bound, as one too large is.
+        let past_pages: Vec<RecoveryError> = self
+            .assembler
+            .past_bound()
+            .iter()
+            .filter(|(r, _)| self.promised.contains(r) && !reports.iter().any(|x| x.replica == **r))
+            .map(|(r, pages)| RecoveryError::ReportPastPages {
+                replica: *r,
+                pages: *pages,
+                limit: self.assembler.max_pages(),
+            })
+            .collect();
+        let everyone = reports.len() + past_pages.len() >= self.config.voters().len();
         let oversize = |r: &RecoveryReport| RecoveryError::ReportTooLarge {
             replica: r.replica,
             entries: r.entries.len(),
@@ -269,7 +284,8 @@ impl Campaign {
         let first_oversize = reports
             .iter()
             .find(|r| r.entries.len() > report_limit)
-            .map(oversize);
+            .map(oversize)
+            .or_else(|| past_pages.into_iter().next());
         reports.retain(|r| r.entries.len() <= report_limit);
         if reports.len() < self.config.slow_size() {
             return match first_oversize {
