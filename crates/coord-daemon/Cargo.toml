@@ -30,6 +30,7 @@ toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+postcard.workspace = true
 coord-journal-api.workspace = true
 coord-state.workspace = true
 rcgen.workspace = true
