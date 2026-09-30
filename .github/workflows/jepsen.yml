@@ -464,14 +464,15 @@ jobs:
             ~/.m2/repository
             ~/.lein/self-installs
             ~/go/pkg/mod
-          key: jepsen-swiftpaxos-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/swiftpaxos/project.clj', 'jepsen/swiftpaxos/shim/go.sum') }}
+          key: jepsen-swiftpaxos-m2-${{ hashFiles('jepsen/jepsen/project.clj', 'jepsen/swiftpaxos/project.clj', 'jepsen/swiftpaxos/build.sh') }}
           restore-keys: jepsen-swiftpaxos-m2-
       - name: Build SwiftPaxos and its Jepsen client
-        # The SwiftPaxos version is the one jepsen/swiftpaxos/shim/go.mod pins.
+        # From the agentsky/swiftpaxos fork (upstream plus the client, in
+        # cmd/swiftpaxos-jepsen), at the commit jepsen/swiftpaxos/build.sh pins.
         run: |
           go version
-          jepsen/swiftpaxos/shim/build.sh "$RUNNER_TEMP/swiftpaxos-bin"
-          echo "SwiftPaxos baseline: $(grep imdea-software/swiftpaxos jepsen/swiftpaxos/shim/go.mod | xargs), faults $SWIFTPAXOS_NEMESIS" >> "$GITHUB_STEP_SUMMARY"
+          jepsen/swiftpaxos/build.sh "$RUNNER_TEMP/swiftpaxos-bin" | tee "$RUNNER_TEMP/swiftpaxos-build.txt"
+          echo "SwiftPaxos baseline: $(tail -n 1 "$RUNNER_TEMP/swiftpaxos-build.txt" | sed 's/.* from //'), faults $SWIFTPAXOS_NEMESIS" >> "$GITHUB_STEP_SUMMARY"
       - name: Install Leiningen and this repository's Jepsen
         run: |
           sudo apt-get update -qq

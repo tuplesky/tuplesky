@@ -196,8 +196,10 @@ same kind of cluster:
 
 * **Same shape where SwiftPaxos allows it:** the same fault schedule
   (`jepsen.tuplesky.nemesis`), time limit, rate, fault interval and
-  `--concurrency 2n`. The client is a Go shim over the upstream SwiftPaxos
-  client, speaking `coord-jepsen`'s JSON lines. SwiftPaxos's state machine
+  `--concurrency 2n`. The client, `swiftpaxos-jepsen`, is a Go shim over
+  the upstream SwiftPaxos client, speaking `coord-jepsen`'s JSON lines; it
+  lives in the agentsky/swiftpaxos fork (agentsky/swiftpaxos#1), which the
+  job builds from at a pinned commit. SwiftPaxos's state machine
   is registers with reads and writes, one key a command, so the workload
   is Knossos linearizability over independent registers, not list-append.
 * **Faults:** the `swiftpaxos` input, `pause,partition` by default, `none`
