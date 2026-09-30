@@ -7176,7 +7176,10 @@ contract needed and a test for each.
   copies every entry of every complete report and digests it again. At
   five voters, each page of the third report copied the second one whole.
   It now returns early, with nothing copied, until enough promising
-  voters have every page of their report.
+  voters have every page of their report. A voter whose report announced
+  more pages than the bound counts as having answered: otherwise the
+  early return held a campaign whose voters were all past the bound
+  short of failing on them by name (task-d24's `ReportPastPages`).
 - **A Sync is encoded once.** `bounded_sync_update` cloned the selection
   to encode the message and again to encode the row. It now encodes the
   selection once. The frame's size is that encoding plus the Sync's tag,
