@@ -500,13 +500,14 @@ pub fn bounded_sync_update(
     if frame > frame_limit {
         return Err(too_large(frame));
     }
-    sync_update(
-        epoch,
-        &SyncRecordV1 {
-            decision: decision.clone(),
-        },
-    )
-    .map_err(|_| too_large(frame))
+    let record = SyncRecordV1 {
+        decision: decision.clone(),
+    };
+    // A row that does not fit is reported with the row's own size, not
+    // the frame's that fitted.
+    sync_update(epoch, &record).map_err(|_| {
+        too_large(postcard::to_allocvec(&record).map_or(usize::MAX, |bytes| bytes.len()))
+    })
 }
 
 /// The update persisting a bound Sync selection.
