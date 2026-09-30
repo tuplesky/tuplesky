@@ -73,16 +73,48 @@ fn scan<T: ReadableTable<&'static [u8], &'static [u8]>>(
     table: &T,
     request: &ScanRequest,
 ) -> Result<RowPage, EngineError> {
-    let lower: Bound<&[u8]> = match &request.lower {
+    let mut lower: Bound<&[u8]> = match &request.lower {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(b) => Bound::Included(b.as_slice()),
         Bound::Excluded(b) => Bound::Excluded(b.as_slice()),
     };
-    let upper: Bound<&[u8]> = match &request.upper {
+    let mut upper: Bound<&[u8]> = match &request.upper {
         Bound::Unbounded => Bound::Unbounded,
         Bound::Included(b) => Bound::Included(b.as_slice()),
         Bound::Excluded(b) => Bound::Excluded(b.as_slice()),
     };
+    // The cursor narrows the range itself: starting every page at the
+    // interval's edge and skipping to the cursor walks the rows before it
+    // again, which makes a whole scan quadratic in its rows.
+    if let Some(cursor) = request.resume_after.as_deref() {
+        let (near, far) = match request.direction {
+            Direction::Forward => (&mut lower, upper),
+            Direction::Reverse => (&mut upper, lower),
+        };
+        let inside = match *near {
+            Bound::Unbounded => true,
+            Bound::Included(b) | Bound::Excluded(b) => match request.direction {
+                Direction::Forward => cursor >= b,
+                Direction::Reverse => cursor <= b,
+            },
+        };
+        if inside {
+            *near = Bound::Excluded(cursor);
+        }
+        let past_far = match far {
+            Bound::Unbounded => false,
+            Bound::Included(b) | Bound::Excluded(b) => match request.direction {
+                Direction::Forward => cursor >= b,
+                Direction::Reverse => cursor <= b,
+            },
+        };
+        if past_far {
+            return Ok(RowPage {
+                rows: Vec::new(),
+                exhausted: true,
+            });
+        }
+    }
     let iter = table
         .range::<&[u8]>((lower, upper))
         .map_err(storage_error)?;

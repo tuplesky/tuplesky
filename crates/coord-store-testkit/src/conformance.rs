@@ -235,6 +235,50 @@ fn check_ordered_access<H: ConformanceHarness>(h: &mut H) -> Check {
     Ok(())
 }
 
+/// A cursor outside the interval: one short of it changes nothing, one
+/// at or past its far end leaves nothing to return, in either direction.
+fn check_cursor_bounds<H: ConformanceHarness>(h: &mut H) -> Check {
+    commit(
+        h.engine(),
+        &[
+            (KV, b"r1", Some(b"1")),
+            (KV, b"r2", Some(b"2")),
+            (KV, b"r3", Some(b"3")),
+            (KV, b"r4", Some(b"4")),
+        ],
+    )?;
+    let view = h.engine().reader().snapshot().map_err(|e| e.to_string())?;
+    let cases: [(Direction, &[u8], &[&[u8]]); 8] = [
+        (Direction::Forward, b"r0", &[b"r2", b"r3"]),
+        (Direction::Forward, b"r2", &[b"r3"]),
+        (Direction::Forward, b"r3", &[]),
+        (Direction::Forward, b"r9", &[]),
+        (Direction::Reverse, b"r9", &[b"r3", b"r2"]),
+        (Direction::Reverse, b"r3", &[b"r2"]),
+        (Direction::Reverse, b"r2", &[]),
+        (Direction::Reverse, b"r0", &[]),
+    ];
+    for (direction, cursor, want) in cases {
+        let mut r = req(
+            Bound::Included(b"r2"),
+            Bound::Included(b"r3"),
+            direction,
+            10,
+            1 << 20,
+        );
+        r.resume_after = Some(cursor.to_vec());
+        let page = view.scan_page(KV, &r).map_err(|e| e.to_string())?;
+        let got: Vec<&[u8]> = page.rows.iter().map(|x| x.key.as_slice()).collect();
+        if got != want || !page.exhausted {
+            return Err(format!(
+                "{direction:?} after {cursor:?}: {got:?}, exhausted={}",
+                page.exhausted
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_bounded_progress<H: ConformanceHarness>(h: &mut H) -> Check {
     let big = vec![7u8; 500];
     commit(
@@ -638,6 +682,7 @@ pub fn run_all<H: ConformanceHarness>(h: &mut H) -> ConformanceReport {
     let mut report = ConformanceReport::default();
     record(&mut report, "ordered_access", check_ordered_access(h));
     record(&mut report, "bounded_progress", check_bounded_progress(h));
+    record(&mut report, "cursor_bounds", check_cursor_bounds(h));
     match check_iterator_errors(h) {
         Ok(r) => report.results.push(("iterator_errors", r)),
         Err(e) => report
