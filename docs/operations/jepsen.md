@@ -209,7 +209,15 @@ same kind of cluster:
   client message 6`): they accept peer connections only while starting.
 * **What differs:** SwiftPaxos's master, which assigns replica ids and
   replaces a leader it cannot ping, runs on the control node, outside the
-  faults. It pings without a timeout, so a paused leader is not replaced.
+  faults. It pings without a timeout, in a sequential loop, so a paused or
+  partitioned leader is not replaced.
+* **Reading its `ok` counts under a partition:** a SwiftPaxos replica
+  flushes its peers' sockets under one global lock with no write
+  deadline, so once the send buffer toward a cut peer fills (tens of
+  seconds at 20 requests a second), the whole replica waits on TCP's
+  retransmit timer, leader and majority up or not; run 36779344078's
+  +120 to +150 s is that stall. Those gaps measure TCP's timers, not the
+  protocol, and TupleSky's counts are not to be read against them.
 
 Its store, with the master's and the clients' logs under `control/`, is
 the `jepsen-store-swiftpaxos-register` artifact.
