@@ -385,6 +385,7 @@ fn a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost()
     use coord_core::event::StorageEvent;
 
     let mut applier = journaled();
+    applier.share_foreign();
     // The protocol machine's allocator for the same boot. The fixture's
     // bootstrap took the first sequence, so the second is the one an
     // applier counting from one issued next.
@@ -432,6 +433,45 @@ fn a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost()
         "the applier handed back its own batch's facts: {foreign:?}"
     );
     assert!(applier.take_foreign().is_empty(), "handed back twice");
+}
+
+/// An applier no machine shares its store with keeps none of the facts it
+/// meets about other batches: nothing would ever take them, and a tool
+/// or a test that applies for its whole life would hold every one.
+#[test]
+fn an_applier_standing_alone_keeps_no_other_batchs_facts() {
+    let mut applier = journaled();
+    let mut other = BarrierAllocator::new(inc(), BOOT);
+    let _ = other.allocate();
+    let batch = other.allocate();
+    applier
+        .store_mut()
+        .submit(
+            PersistBatch {
+                barrier: batch,
+                base: None,
+                updates: vec![coord_core::effect::StoreUpdate {
+                    collection: coord_store_api::registry::Collection::ProtocolV1.id(),
+                    key: b"vote".to_vec(),
+                    value: Some(b"accepted".to_vec()),
+                }],
+            },
+            TransitionKind::Protocol,
+        )
+        .expect("queued");
+
+    let (command, record) = payload(1, &put(b"k", b"v"));
+    applier.apply(command, &record).expect("applied");
+
+    assert_eq!(
+        applier.store().queued(),
+        0,
+        "the other batch was not lowered"
+    );
+    assert!(
+        applier.take_foreign().is_empty(),
+        "a standalone applier kept another batch's facts"
+    );
 }
 
 /// A command that has been applied is resolved from its retained result

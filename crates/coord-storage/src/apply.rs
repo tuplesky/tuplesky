@@ -134,7 +134,9 @@ pub struct Applier<P: Persistence> {
     hub: WatchHub,
     /// Storage facts about batches that were not this applier's, met
     /// while it lowered or reconciled its own ([`Applier::take_foreign`]).
+    /// Kept only once [`Applier::share_foreign`] says someone takes them.
     foreign: Vec<coord_core::event::StorageEvent>,
+    sharing: bool,
 }
 
 impl<P: Persistence> Applier<P> {
@@ -160,7 +162,16 @@ impl<P: Persistence> Applier<P> {
             alloc: alloc.for_application(),
             hub: WatchHub::new(published, floor),
             foreign: Vec::new(),
+            sharing: false,
         })
+    }
+
+    /// Keep the storage facts about other batches for
+    /// [`Applier::take_foreign`]. A node whose protocol machine shares
+    /// this store calls it; an applier that stands alone (a tool, a
+    /// test) does not, and keeps nothing it would never hand back.
+    pub fn share_foreign(&mut self) {
+        self.sharing = true;
     }
 
     /// The storage facts about other batches -- the protocol's votes,
@@ -185,7 +196,9 @@ impl<P: Persistence> Applier<P> {
     /// Reconcile the store, keeping what it settles for other batches.
     fn reconcile(&mut self) -> Result<(), EngineError> {
         let settled = self.store.reconcile()?;
-        self.foreign.extend(settled.events);
+        if self.sharing {
+            self.foreign.extend(settled.events);
+        }
         Ok(())
     }
 
@@ -433,7 +446,7 @@ impl<P: Persistence> Applier<P> {
                 namespace,
                 &planned,
                 Some(binding),
-                Some(&mut self.foreign),
+                self.sharing.then_some(&mut self.foreign),
             )? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
@@ -479,7 +492,7 @@ impl<P: Persistence> Applier<P> {
                 namespace,
                 &planned,
                 &command,
-                Some(&mut self.foreign),
+                self.sharing.then_some(&mut self.foreign),
             )? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
@@ -590,7 +603,7 @@ impl<P: Persistence> Applier<P> {
                         namespace,
                         &planned,
                         &binding.command_id,
-                        Some(&mut self.foreign),
+                        self.sharing.then_some(&mut self.foreign),
                     )? {
                         ApplyOutcome::Applied(_) => {
                             let response = postcard::to_allocvec(&planned.response)
@@ -653,7 +666,7 @@ impl<P: Persistence> Applier<P> {
                 namespace,
                 &planned,
                 Some(binding),
-                Some(&mut self.foreign),
+                self.sharing.then_some(&mut self.foreign),
             )? {
                 ApplyOutcome::Applied(_) => {
                     if let Some(revision) = planned.revision {
