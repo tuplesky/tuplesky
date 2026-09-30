@@ -490,7 +490,10 @@ pub struct Node<P: Persistence> {
 
 impl<P: Persistence> Node<P> {
     /// A node over `machine` and `applier`, publishing to `frontend`.
-    pub fn new(machine: Machine, applier: Applier<P>, frontend: PeerId) -> Self {
+    pub fn new(machine: Machine, mut applier: Applier<P>, frontend: PeerId) -> Self {
+        // The machine shares the applier's store: what the applier's
+        // lowerings make durable for the machine's batches is handed back.
+        applier.share_foreign();
         let boot = applier.store().boot();
         Node {
             machine: Some(machine),
@@ -546,10 +549,16 @@ impl<P: Persistence> Node<P> {
 
     /// Hand the floor what became of its batches, so it reclaims the
     /// images superseded by one that is durable, and only then.
-    fn settle_floor(&mut self) {
-        if let Some(floor) = self.floor.as_mut() {
-            let outbox = &self.outbox;
-            floor.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b));
+    /// The batch to journal when this voter's own promise, now durable,
+    /// activates a floor with the promises heard while it was in flight.
+    fn settle_floor(&mut self, ballot: &Ballot) -> Vec<Effect> {
+        let Some(floor) = self.floor.as_mut() else {
+            return Vec::new();
+        };
+        let outbox = &self.outbox;
+        match floor.settle(|b| outbox.is_durable(b), |b| outbox.is_failed(b)) {
+            Some(updates) => floor_effects(floor, updates, None, ballot),
+            None => Vec::new(),
         }
     }
 
@@ -921,8 +930,11 @@ impl<P: Persistence> Node<P> {
         // here rather than be visible as a fault.
         for _ in 0..MAX_ROUNDS {
             if queue.is_empty() && !release {
-                self.settle_floor();
-                return Ok(out);
+                queue = self.settle_floor(ballot);
+                if queue.is_empty() {
+                    return Ok(out);
+                }
+                continue;
             }
             release = false;
             self.rounds += 1;
@@ -1255,20 +1267,29 @@ impl<P: Persistence> Node<P> {
             }
             // What the apply's lowerings made durable for other batches
             // is delivered by `carry_out`, after the command's own
-            // outcome. The machine takes the outcome first: delivered
-            // before it, under load a lagging voter's callers went
-            // unanswered (`a_replica_that_falls_behind_...`: 18 of 24
-            // runs four at a time on four cores, against 3 of 16 on the
-            // base and 4 of 24 delivered here).
+            // outcome. This order is an observation, not a mechanism.
+            // `applied` depends on none of those facts, so taking the
+            // outcome first is safe. Delivered before it, under load a
+            // lagging voter's callers went unanswered
+            // (`a_replica_that_falls_behind_...`: 18 of 24 runs four at a
+            // time on four cores, against 3 of 16 on the base and 4 of 24
+            // delivered here), and why is not established. The likeliest
+            // loss is `Leader::applied`, which releases a result only
+            // while leading and never retries a release it skipped; that
+            // gap, and the base's 3 of 16, are open in the notes ("A
+            // result the leader executed while not leading").
             let effects = self.machine_mut().applied(command, &outcome)?;
             out.absorb(self.carry_out(effects, ballot)?);
             // At a floor boundary the view is exactly the command's: the
             // apply returned once its batch was readable, and only a
-            // command moves the frontier (task-d27).
+            // command moves the frontier (task-d27). A retry answered from
+            // the record carries its original position, behind the
+            // frontier, and is no boundary.
+            let frontier = self.machine().executed_through();
             if self
                 .floor
                 .as_ref()
-                .is_some_and(|floor| floor.due(outcome.position))
+                .is_some_and(|floor| floor.due(outcome.position, frontier))
             {
                 out.absorb(self.floor_boundary(outcome.position, ballot)?);
             }
