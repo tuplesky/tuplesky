@@ -232,7 +232,10 @@ from this caller, by the output gate under the current policy or because
 the session may no longer read it; `0x0004` never answers a command that
 executed. `0x0008`: the invocation's sequence is at or below its client
 instance's retirement floor and no result is kept, so whether it
-happened is not retrievable. Both are final; neither is retried.
+happened is not retrievable. Both are final; neither is retried. A
+retired sequence reaches a client as `0x0008` on a `Resolve`, and on a
+`Request` under a session that may no longer execute; on a `Request`
+under a live session, admission refuses it as `Rejected(RetryTooOld)`.
 `Unknown` means only that the endpoint, its memory and its durable
 record, holds nothing about the invocation; the client learns more by
 sending the identical `Request` again under the same retry key, which a

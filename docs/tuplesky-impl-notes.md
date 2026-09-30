@@ -6163,7 +6163,11 @@ voters, without catch-up (seeds 52 and 86):
 - Cost: after a leader change, a follower's fast acknowledgements match
   again only once it has adopted one fresh proposal. A pre-accepted
   command reordered behind a synchronization holds its replica's head
-  off the leader's until its own order arrives.
+  off the leader's until its own order arrives. A command retired while
+  still in a log's pending suffix stays there: `PathLog::forget` clears
+  only its reordered mark, so the next `sync_known` marks it reordered
+  again, and that key's head stays off the leader's until a restart
+  rebuilds the log.
 
 ### Item 5: a member that forgot an at-source command
 
@@ -6191,7 +6195,10 @@ drop for a command the forgotten one says nothing about.
 
 Residual: a retired ancestor the selection no longer carries, because
 every reporter forgot it, reaches nothing further. A candidate behind it
-can still be dropped.
+can still be dropped. That drop does not depend on the new rule:
+`prefix_decided` (`recovery.rs`) already drops a candidate whose
+member's prefix names a command that is neither selected nor a
+candidate, whatever the rule above decides.
 
 ### Re-proposals after the entries that follow them
 
@@ -6219,6 +6226,17 @@ Test: `reproposals_go_on_after_the_entries_that_follow_them`
 (`activation`). It requires every two of the commands to be ordered and
 none to be on a cycle, and it fails without the change.
 
+A re-proposed command this leader already holds at or past COMMIT keeps
+the dependencies it was decided with and is not proposed again. The
+entries that follow it are still proposed, right after it, and the chain
+goes on after them. Skipped along with it, as they first were, they were
+proposed nowhere: followers installed them at ACCEPT with nothing to vote
+on, the leader never committed them, and everything chained after them
+waited. The reachable case is a reporter behind the source ballot
+re-proposing a command the at-source voters retired. Test:
+`entries_that_follow_a_reproposed_command_the_leader_executed_are_proposed`
+(`activation`), which fails without the change.
+
 The selection that re-proposed 9a0f had a cause of its own. r2 held 9a0f
 and 65b2 at ACCEPT through b10's selection, and its b11 and b16 reports
 named them. Their payloads reached it while it campaigned for b17. Each
@@ -6229,7 +6247,24 @@ named, so r2's own report left both out, and b17 re-proposed them. The
 report now overlays the whole synchronized selection; what the replica
 executed and forgot is still left out. Test:
 `a_selected_entry_installing_from_a_late_payload_is_reported`
-(`activation`), which fails without the change.
+(`activation`), which fails without the change. An entry both pending
+and selected is reported once; it was pushed twice.
+
+### An older Sync's pending entries
+
+Found by task-d30's simulator (row 2, five voters, seed 0) once the
+leader's own adoption (#116) was merged. A voter restarted with an older
+Sync still installing, took a newer one, and activation added the newer
+entries beside the older ones. The older entry's payload then arrived,
+and it installed at ACCEPT from the older selection, at the newer
+synchronized ballot and over the demotion. The next campaign stopped on
+`IncompatibleAccepted`. A Sync's activation, and a Sync held for
+installation because a higher promise overtook its row, now clear what
+an older one left pending. task-d20's `replace_sync_pending` supersedes
+this where it lands. Tests (`activation`), each failing without the
+change:
+- `an_older_syncs_pending_entry_does_not_install_after_a_newer_sync`;
+- `an_older_syncs_pending_entry_does_not_install_after_a_superseded_newer_sync`.
 
 ### A deposed leader's selection
 
@@ -6282,7 +6317,10 @@ every step.
   - Delivers in any order, loses and duplicates, and holds some frames
     back until a later campaign (old-ballot messages).
   - Each frame is its own stream of a connection, so a crash ends what
-    was in flight to or from the crashed node.
+    was in flight to or from the crashed node. That includes frames
+    already delivered to a peer's buffer and not yet read, which is
+    stronger than a real crash: a stale frame from a dead node arriving
+    after its death is under-tested.
 - **Storage:**
   - Each node's journal completes its batches in submission order at
     times of the schedule's choosing. A crash loses what is not durable.
@@ -6291,7 +6329,9 @@ every step.
 - **Scenarios:** the checklist's failure-test matrix rows 1 (fill
   capacity, fail the leader), 2 (different tentative sets), 3 (dense
   conflicts, early missing dependency), 4 (acknowledgement before
-  payload, repeated) and 10 (delayed old-ballot messages), as knob
+  payload, repeated; the checklist's "hold expires" has no machine timer
+  to fire here, so the row is the acknowledgement before the payload,
+  presented again) and 10 (delayed old-ballot messages), as knob
   presets. Each is run for 12 seeds at each size by default;
   `PROTOCOL_SIM_SEEDS` raises that.
 - **Replay:** `PROTOCOL_SIM_ONE=row,voters,seed` with
@@ -6311,6 +6351,24 @@ every step.
    collector does, not under whichever acknowledgement came first.
 4. **No halt.** No replica stops on two decisions, a recovery cycle or
    `IncompatibleAccepted`.
+5. **Every learned decision executes.** After the fault schedule every
+   node comes back and loss, duplication, crashes and admissions stop.
+   The domain then runs, with an election whenever nothing executes for
+   6,000 steps, until what the frontend learned has executed, for at most
+   60,000 steps. Oracle 3 compares a decision only when a replica
+   executes it, so a decision learned from a durable majority, dropped by
+   the next selection and never re-proposed, passed the other four.
+   - One stall is counted rather than failed: every follower's table is
+     full and refuses work (`Backpressure`), so nothing more is proposed
+     or executed. That is task-d24's gap (table room for recovery, #122,
+     above this branch), and the exemption goes when it is merged up. At
+     the default seeds, 6 of 120 runs end that way; at 40 seeds, 32 of
+     400. No run fails the oracle otherwise.
+- **Coverage.** Each row checks, at each size, that more runs learned a
+  decision than learned none, or the frontend's oracles are vacuous.
+  Row 3 at five voters learns nothing in 4 of 12 runs, and rows 1 and 2
+  in 1 and 4: admissions there reach too few voters for a quorum before
+  the schedule ends. A per-run minimum would fail those rows as defined.
 
 Seeds that once failed are kept in
 `fixtures/protocol_sim/seeds.json` and replayed on every run.
@@ -6347,7 +6405,9 @@ Seeds that once failed are kept in
     newer one, and `activate` added the newer entries beside the older
     ones. The older entry then wrote the old ballot's ACCEPT back over
     the demotion. `activate` now clears what an older Sync left pending,
-    the part of task-d20's `replace_sync_pending` this branch needs.
+    the part of task-d20's `replace_sync_pending` this branch needs. The
+    fix is task-d34's, with its tests ("An older Sync's pending
+    entries"); this branch keeps the seed.
 - **With #118's F7 decision merged as well** (path logs aligned only at
   adoption and a Sync's installation):
   - Catch-up is on by default (`PROTOCOL_SIM_NO_CATCH_UP` turns it off),
@@ -6447,6 +6507,18 @@ ended the process in the middle of an election.
   - A follower sent such a Sync refuses it as
     `FollowerRejection::SyncTooLarge` before marking anything. A
     candidate of this build never binds one.
+  - A Sync that fits its frame but not its row is reported with the
+    row's size.
+- **Nothing installs while a marker is in flight** (review). Between a
+  Sync's marker being issued, with the demotions computed then, and its
+  durability, a payload for an older Sync's entry that the new one left
+  out installed that entry at ACCEPT, journaled after the marker and
+  never demoted. The next report named it at ACCEPT at the new ballot,
+  and the acceptance guard kept it as decided. `advance_sync` now
+  installs nothing while `sync_barrier` is set; activation replaces what
+  is pending, so nothing is lost. Test:
+  `a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing`
+  (`activation`), which fails without the change.
 
 Nothing changes in what is selected, or in the Sync format.
 
