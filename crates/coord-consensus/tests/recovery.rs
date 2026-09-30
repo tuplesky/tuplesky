@@ -912,3 +912,98 @@ fn payload_transfer_is_recognized_from_the_encoded_discriminant() {
         );
     }
 }
+
+/// The order a Sync's entries are re-proposed in, as it was first
+/// written: one scan of the entries left, in identity order, per pass,
+/// placing each whose entry dependencies are placed.
+fn entry_order_by_passes(
+    decision: &coord_consensus::SyncDecision,
+) -> Result<Vec<CommandId>, Vec<CommandId>> {
+    let mut order = Vec::new();
+    let mut placed = BTreeSet::new();
+    let mut remaining: Vec<CommandId> = decision.entries.keys().copied().collect();
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        remaining.retain(|c| {
+            let ready = decision.entries[c]
+                .deps
+                .iter()
+                .all(|d| !decision.entries.contains_key(d) || placed.contains(d));
+            if ready {
+                order.push(*c);
+                placed.insert(*c);
+            }
+            !ready
+        });
+        if remaining.len() == before {
+            return Err(remaining);
+        }
+    }
+    Ok(order)
+}
+
+/// task-d24 review: `entry_order` walks the dependency graph once instead
+/// of scanning every entry per pass, and gives the same order, and the
+/// same commands on a cycle, as the scan did: over random graphs with
+/// dependencies on both sides of identity order, outside the entries,
+/// repeated, on the entry itself, and in cycles.
+#[test]
+fn entry_order_is_the_order_of_placing_by_passes() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rand = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let id = |n: u64| {
+        let mut d = [0u8; 32];
+        d[..8].copy_from_slice(&n.to_be_bytes());
+        CommandId(Digest32(d))
+    };
+    for round in 0..500 {
+        let n = 1 + rand() % 40;
+        let cyclic = round % 4 == 0;
+        let mut entries = std::collections::BTreeMap::new();
+        for i in 0..n {
+            let mut deps = Vec::new();
+            for _ in 0..rand() % 4 {
+                // Mostly earlier commands, so most rounds are acyclic;
+                // outside the entries (n..2n) now and then.
+                let d = match rand() % 8 {
+                    0 => n + rand() % n,
+                    1 if cyclic => rand() % n,
+                    _ if i > 0 => rand() % i,
+                    _ => n,
+                };
+                deps.push(if d < n { id(d * 7919 % n) } else { id(d) });
+            }
+            // Identity order is not dependency order: the command's
+            // identity is a permutation of its creation index.
+            let c = id(i * 7919 % n);
+            entries.insert(
+                c,
+                coord_consensus::SyncEntry {
+                    command: c,
+                    phase: Phase::Accept,
+                    deps,
+                    path: Digest32([0; 32]),
+                    paths: vec![],
+                    seqnum: 1,
+                    admission: None,
+                },
+            );
+        }
+        let decision = coord_consensus::SyncDecision {
+            ballot: ballot(1, 1),
+            source_ballot: ballot(0, 0),
+            entries,
+            reproposed: BTreeSet::new(),
+        };
+        assert_eq!(
+            coord_consensus::entry_order(&decision),
+            entry_order_by_passes(&decision),
+            "round {round}"
+        );
+    }
+}
