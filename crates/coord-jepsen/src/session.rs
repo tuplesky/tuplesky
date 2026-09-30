@@ -470,26 +470,35 @@ impl Session {
         // A completion is final. Retire the identity, so the session's
         // acknowledged floor keeps moving.
         self.client.forget(id);
-        Some(match done.outcome {
-            Outcome::Established { result, .. } => {
-                match postcard::from_bytes::<Response>(&result) {
-                    Ok(response) => Answer::Established(response),
-                    Err(e) => Answer::Unknown(format!("undecodable result: {e}")),
-                }
-            }
-            Outcome::Failed(error) => match error {
-                RetryError::Malformed => Answer::NotSubmitted("malformed".into()),
-                RetryError::RequestTooLarge => Answer::NotSubmitted("request-too-large".into()),
-                RetryError::PayloadConflict { .. } => {
-                    Answer::NotSubmitted("payload-conflict".into())
-                }
-                // Refused at the frontend, but a refusal of a disclosure
-                // is also `NotAdmitted` and says nothing about whether the
-                // command ran; the result bound says it did run.
-                other => Answer::Unknown(format!("{other:?}").to_lowercase()),
-            },
-            Outcome::Unknown => unreachable!("filtered above"),
-        })
+        Some(answer(done.outcome))
+    }
+}
+
+/// What a final SDK outcome comes to for Jepsen. `Unknown` is `info` for a
+/// write and `fail` for a read: anything that does not rule out execution
+/// maps there, never to `NotSubmitted`.
+fn answer(outcome: Outcome) -> Answer {
+    match outcome {
+        Outcome::Established { result, .. } => match postcard::from_bytes::<Response>(&result) {
+            Ok(response) => Answer::Established(response),
+            Err(e) => Answer::Unknown(format!("undecodable result: {e}")),
+        },
+        Outcome::Failed(error) => match error {
+            RetryError::Malformed => Answer::NotSubmitted("malformed".into()),
+            RetryError::RequestTooLarge => Answer::NotSubmitted("request-too-large".into()),
+            RetryError::PayloadConflict { .. } => Answer::NotSubmitted("payload-conflict".into()),
+            // Refused at the frontend, but a refusal of a disclosure
+            // is also `NotAdmitted` and says nothing about whether the
+            // command ran; the result bound says it did run.
+            other => Answer::Unknown(format!("{other:?}").to_lowercase()),
+        },
+        // The command executed, but its result is not ours to see: a
+        // guarded write may still have had no effect (task-d23).
+        Outcome::Withheld => Answer::Unknown("output-withheld".into()),
+        // Below the instance's retirement floor: whether it ran is not
+        // retrievable (task-d23).
+        Outcome::Retired => Answer::Unknown("result-retired".into()),
+        Outcome::Unknown => Answer::Unknown("unknown".into()),
     }
 }
 
@@ -532,4 +541,28 @@ fn load_roots(path: &Path) -> Result<rustls::RootCertStore, OpenError> {
             .map_err(|e| material("trust bundle", e))?;
     }
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::{Verdict, read_verdict, write_verdict};
+
+    /// A command that executed with its result withheld, or whose result
+    /// was retired, is never reported as having had no effect.
+    #[test]
+    fn withheld_and_retired_are_unknown_never_fail_for_a_write() {
+        for outcome in [Outcome::Withheld, Outcome::Retired] {
+            let got = answer(outcome.clone());
+            assert!(
+                matches!(got, Answer::Unknown(_)),
+                "{outcome:?} gave {got:?}"
+            );
+            let write = write_verdict(got.clone(), |_| Ok(None));
+            assert!(matches!(write, Verdict::Info(_)), "{outcome:?}: {write:?}");
+            // A read has no effect either way: it did not complete.
+            let read = read_verdict(got, |_| Ok(serde_json::Value::Null));
+            assert!(matches!(read, Verdict::Fail(_)), "{outcome:?}: {read:?}");
+        }
+    }
 }
