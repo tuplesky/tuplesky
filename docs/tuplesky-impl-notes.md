@@ -8562,3 +8562,65 @@ assertion is counted here rather than analyzed again.
   each adoption costs that suffix. The digest is the path evidence
   voters compare, so its definition stays; only a follower that is
   behind pays it.
+
+## Where a command's time goes after task-d46
+
+A profile of each voter's domain thread at #136's head (2d9a1d1), taken
+to decide what the throughput tasks after task-d46 must include. Three
+voters on loopback; `coord-wan-bench`, closed loop, the gate's mix
+without scans.
+
+**Stores on tmpfs, ten callers.** `perf record -e cpu-clock --call-graph
+dwarf` on each voter for 12 s of a 15,000-operation run, 602 completed a
+second under the profiler. The domain thread is the process's main
+thread and took 68 to 70% of the process's CPU samples; the four
+transport workers took the rest. Its busy time is about 1.15 ms a
+command. Attributed by the outermost frame of each part (7,365 samples
+over three voters):
+
+| part | share of the domain thread | about, per command |
+| --- | --- | --- |
+| projection: redb write transaction | 36.0% | 0.41 ms |
+| of which the commit (`commit_durable`) | 23.8% | 0.27 ms |
+| `Learner::established` (leader and follower) | 24.5% | 0.28 ms |
+| the rest of consensus | 11.0% | 0.13 ms |
+| storage around the projection (`apply_bound`, lowering) | 7.2% | 0.08 ms |
+| journal (`append_group`, sealing records) | 5.8% | 0.07 ms |
+| the loop itself, transport sends, collector, codec, other | 15.5% | 0.18 ms |
+
+- **`Learner::established`** walks the executed command's whole
+  dependency closure (`closure_step`), through every executed record
+  still in the table, and `EstablishedResult::establish` then checks the
+  result for duplicates pairwise and drops it. The table holds up to its
+  capacity (1,000) of executed records, so the walk is hundreds of
+  records per execution, and the check quadratic in them; the
+  closure is read by nothing else. It probably also accounts for an
+  unchanged 2,600-command run's ratio of 1.1 to 1.2 in task-d45's gate,
+  since the table fills over the first thousand commands; task-d53's
+  runs will say. task-d53.
+- **The projection's commit** costs the same per transaction whatever it
+  carries (flushing pages, the page cache, the allocator), so task-d47's
+  groups divide it.
+
+**Stores on a disk.** The same bench with the stores on the container's
+disk (0.3 to 0.4 ms per `fdatasync`), one run each at 1, 10 and 50
+callers: 159, 165 and 171 completed a second, flat, at 5.4 to 5.9 ms of
+busy time per command and 76 to 78% busy. From the stage counters: two
+journal writes per command, 1.5 ms each; one materialization, 1.8 ms;
+0.65 to 0.9 ms for everything else. Three syncs per command in series on
+the domain thread, at every concurrency.
+
+**What follows.**
+- After task-d47 and task-d48 a group still costs the domain thread its
+  journal sync, then its projection commit and sync, then every
+  command's execution, in series. With about 2.5 ms a sync on the
+  Jepsen runner's disk and 0.6 ms of CPU a command left on the thread, a
+  group of k commands takes 5 + 0.6k ms: about 1,400 commands a second
+  at k = 50, which is etcd's rate on that runner, with fifty clients'
+  worth of grouping needed to get there. With execution and the
+  projection on an applier thread, the domain thread's share is
+  2.5 + 0.4k ms, past 1,500 a second from about k = 10. So the pipelined
+  applier is the fifth task: task-d52.
+- task-d53 takes the closure walk out first; it is a quarter of the CPU
+  and independent of the storage work.
+
