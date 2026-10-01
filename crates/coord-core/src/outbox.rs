@@ -209,16 +209,34 @@ impl Outbox {
     }
 }
 
+/// The first sequence of the application's barriers.
+///
+/// A replica's protocol machine and its applier each allocate barriers
+/// for the same boot and hand them to the same store, and a barrier is
+/// told apart from another only by its sequence. Both counting from one
+/// made them the same barrier: the applier took a protocol batch's
+/// `Materialized` as its own command's, and reported the command applied
+/// while its own batch was still queued. So the sequences are split in
+/// two, and the upper half is the applier's.
+pub const APPLICATION_BARRIERS: u64 = 1 << 63;
+
+/// Whether `barrier` was allocated by an applier ([`BarrierAllocator::for_application`]).
+pub const fn is_application(barrier: &BarrierId) -> bool {
+    barrier.sequence >= APPLICATION_BARRIERS
+}
+
 /// Allocator of per-boot barrier sequences.
 #[derive(Debug)]
 pub struct BarrierAllocator {
     node_generation: coord_types::ids::ReplicaIncarnation,
     boot_id: BootId,
     next: u64,
+    /// The first sequence this allocator may not issue.
+    end: u64,
 }
 
 impl BarrierAllocator {
-    /// New allocator for this boot.
+    /// New allocator for this boot, below [`APPLICATION_BARRIERS`].
     pub const fn new(
         node_generation: coord_types::ids::ReplicaIncarnation,
         boot_id: BootId,
@@ -227,12 +245,25 @@ impl BarrierAllocator {
             node_generation,
             boot_id,
             next: 1,
+            end: APPLICATION_BARRIERS,
         }
+    }
+
+    /// The same allocator moved to the application's half of the
+    /// sequences, which no protocol allocator of the boot reaches.
+    #[must_use]
+    pub const fn for_application(mut self) -> Self {
+        if self.next < APPLICATION_BARRIERS {
+            self.next = APPLICATION_BARRIERS;
+        }
+        self.end = u64::MAX;
+        self
     }
 
     /// Next barrier; sequences never repeat within a boot.
     pub fn allocate(&mut self) -> BarrierId {
         let sequence = self.next;
+        assert!(sequence < self.end, "barrier sequence exhausted");
         self.next = self
             .next
             .checked_add(1)

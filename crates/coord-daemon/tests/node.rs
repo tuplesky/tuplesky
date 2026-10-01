@@ -537,6 +537,46 @@ fn a_vote_rests_on_the_record_being_durable_not_on_the_projection() {
     );
 }
 
+/// A vote whose append ended uncertain is settled by a reconcile and
+/// goes out, rather than waiting for a command to execute.
+///
+/// An uncertain append leaves the domain refusing every later batch as
+/// not ready until something reconciles it. Only the applier did, when a
+/// command next executed, and it kept what the reconcile settled to
+/// itself: the vote waited for a new ballot or a restart, and so did
+/// the command that needed it.
+#[test]
+fn a_vote_whose_append_ended_uncertain_is_reconciled_and_released() {
+    let boot = BootId([8; 16]);
+    let mut follower = journaled_follower(boot);
+    follower
+        .on_event(
+            Event::Boot {
+                boot_id: boot,
+                incarnation: inc(),
+            },
+            &ballot(),
+        )
+        .expect("boot");
+
+    // The next append reaches the log, and says it may not have.
+    follower
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .journal_mut()
+        .script_append(coord_store_testkit::journal::AppendScript::Indeterminate { applied: true });
+
+    let out = follower
+        .on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("an uncertain append is reconciled, not a failed round");
+    assert!(
+        !out.frontend.is_empty(),
+        "the vote was not released once its record was known durable"
+    );
+    assert_eq!(follower.held(), 0, "a send is still waiting");
+}
+
 /// A voter that serves a write records the journal and materialization
 /// work it did (task-61), and the snapshot built from that recorder
 /// reports those stages with non-zero counts rather than zeroes.

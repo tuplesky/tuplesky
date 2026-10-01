@@ -8049,3 +8049,77 @@ fix, `CommandTable::retired`, is in the findings change.
 - The seventeen seeds that failed on the way, under the oracles or as
   the recovery rule was narrowed, are kept in
   `fixtures/protocol_sim/seeds.json` and replayed by default.
+
+## The applier's lowerings and the protocol's barriers
+
+Found while planning task-d27, whose floor batches go through the same
+store as the protocol's and the application's.
+
+- **Two allocators, one sequence.** The protocol machine and the applier
+  each allocated barriers for the same boot, both from one, and a store
+  tells barriers apart only by that sequence. A lowering takes one batch
+  per domain. So when a vote was still queued under the sequence the
+  applier issued next, the vote's `Materialized` completed the command:
+  it was reported applied while its own batch was still queued. A
+  catch-up window, one protocol barrier for many commands, lets the
+  application's count reach the protocol's. The applier now takes the
+  upper half of the sequences (`APPLICATION_BARRIERS`), and a protocol
+  allocator stops short of it.
+- **What the applier lowered for others was dropped.** Completing a
+  command lowers whatever is queued, and reconciling settles whatever
+  was uncertain, the protocol's batches with the application's. Both
+  outcomes were thrown away, so a vote or promise made durable there
+  never released the send waiting on it, until a new ballot or a
+  restart. The applier now keeps those facts (`Applier::take_foreign`),
+  and the node hands them to the outbox and the machine right after the
+  command's own outcome, then releases what they made durable. After,
+  not before, and that is an observation, not a mechanism: `applied`
+  depends on none of those facts, so the order is safe, but delivered
+  ahead of the outcome, under load a lagging voter's callers went
+  unanswered in
+  `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+  (18 of 24 runs, four at a time on four cores, against 3 of 16 on the
+  base and 4 of 24 with them delivered after), and why is not
+  established. See the open item below.
+- **Only a shared applier keeps them.** A node calls
+  `Applier::share_foreign`; an applier that stands alone (coordctl,
+  coord-login, coord-sts, the kine tests) keeps none of those facts,
+  since nothing would ever take them and it would hold every one for
+  its whole life. `an_applier_standing_alone_keeps_no_other_batchs_facts`
+  (coord-storage, `composed`) fails with them kept.
+- **An uncertain append waited for a command.** The node surfaced an
+  indeterminate lowering as a failed round and never reconciled it. The
+  domain then refused every protocol batch as not ready, and only the
+  applier's reconcile, when a command next executed, cleared it: on a
+  follower whose next command waited on the very vote that append
+  carried, nothing did. The node now reconciles at once, as the applier
+  does, and fails the round only if the outcome is still unknown.
+- Tests: `a_protocol_batch_lowered_by_an_application_is_neither_taken_for_it_nor_lost`
+  (coord-storage, `composed`) fails with the allocator shared ("the
+  command's batch is queued") and with the facts dropped ("the vote's
+  durability was dropped");
+  `a_vote_whose_append_ended_uncertain_is_reconciled_and_released`
+  (coord-daemon, `node`) fails without the node's reconcile ("group
+  outcome indeterminate").
+
+### Open: a result the leader executed while not leading
+
+`Leader::applied` releases a result only `if self.is_leading() &&
+!released`, and nothing retries a release it skipped. A command that
+executes while the leader's promise row is in flight is then never
+answered by this node: the collector's re-solicitation re-publishes the
+voters' evidence, not the leader's release, so its caller waits out its
+timeout. This is the likeliest reason the delivery order above matters,
+and the likeliest cause of the base's own 3 of 16 loaded failures of
+`a_replica_that_falls_behind_...`, which are a liveness gap independent
+of the barrier change, not an accepted flake. Before the order is
+written down as a mechanism: count, per apply, the facts delivered and
+the results `applied` did not release because the leader was not
+leading, reproduce the loaded failures with those counts, and root-cause
+them.
+
+Also open, pre-existing and now leaned on: after `JournalUncertain →
+Present`, a record sits in `pending` unmaterialized until the next
+flush, and the applier's loop can meet `StaleBase → Replan` up to eight
+times and return `Diverged` (`apply.rs`). Trimming under task-d27 relies
+on the reconcile, so this is settled before the trim lands.

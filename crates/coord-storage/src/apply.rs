@@ -25,7 +25,7 @@ use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest};
 use coord_types::{CommandId, RetryKey};
 
-use crate::materialize::{ApplyOutcome, apply_plan, apply_refused_plan};
+use crate::materialize::{ApplyOutcome, apply_plan_sharing, apply_refused_plan_sharing};
 use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
 use crate::view::ViewError;
@@ -132,11 +132,21 @@ pub struct Applier<P: Persistence> {
     store: P,
     alloc: BarrierAllocator,
     hub: WatchHub,
+    /// Storage facts about batches that were not this applier's, met
+    /// while it lowered or reconciled its own ([`Applier::take_foreign`]).
+    /// Kept only once [`Applier::share_foreign`] says someone takes them.
+    foreign: Vec<coord_core::event::StorageEvent>,
+    sharing: bool,
 }
 
 impl<P: Persistence> Applier<P> {
     /// An applier over an opened store; the watch hub starts at the
     /// durable KV revision.
+    ///
+    /// `alloc` is moved to the application's half of the barrier
+    /// sequences ([`BarrierAllocator::for_application`]), so no barrier
+    /// of this applier's is also one of the protocol machine's that
+    /// shares its store and its boot.
     pub fn new(store: P, alloc: BarrierAllocator) -> Result<Self, EngineError> {
         let (published, floor) = {
             let gated = store.reader().snapshot().map_err(|_| {
@@ -149,9 +159,47 @@ impl<P: Persistence> Applier<P> {
         };
         Ok(Applier {
             store,
-            alloc,
+            alloc: alloc.for_application(),
             hub: WatchHub::new(published, floor),
+            foreign: Vec::new(),
+            sharing: false,
         })
+    }
+
+    /// Keep the storage facts about other batches for
+    /// [`Applier::take_foreign`]. A node whose protocol machine shares
+    /// this store calls it; an applier that stands alone (a tool, a
+    /// test) does not, and keeps nothing it would never hand back.
+    pub fn share_foreign(&mut self) {
+        self.sharing = true;
+    }
+
+    /// The storage facts about other batches -- the protocol's votes,
+    /// promises and adoptions -- that the store produced while this
+    /// applier lowered or reconciled its own, in the order they came.
+    ///
+    /// Every one of them is owed to whoever submitted that batch. A
+    /// lowering takes whatever is queued, and a reconcile settles
+    /// whatever was uncertain, so the protocol's barriers become durable
+    /// here as often as anywhere, and a send waiting on one that nobody
+    /// was told of waits until a new ballot or a restart.
+    pub fn take_foreign(&mut self) -> Vec<coord_core::event::StorageEvent> {
+        let mut foreign = core::mem::take(&mut self.foreign);
+        foreign.retain(|event| {
+            !event
+                .barrier()
+                .is_some_and(|barrier| coord_core::outbox::is_application(&barrier))
+        });
+        foreign
+    }
+
+    /// Reconcile the store, keeping what it settles for other batches.
+    fn reconcile(&mut self) -> Result<(), EngineError> {
+        let settled = self.store.reconcile()?;
+        if self.sharing {
+            self.foreign.extend(settled.events);
+        }
+        Ok(())
     }
 
     /// The watch hub fed by this applier.
@@ -392,7 +440,14 @@ impl<P: Persistence> Applier<P> {
             // command changed -- a session row and a consumed receipt,
             // an authority epoch, a deleted key -- so the outcome is
             // recoverable exactly when the change is.
-            match apply_plan(&mut self.store, barrier, namespace, &planned, Some(binding))? {
+            match apply_plan_sharing(
+                &mut self.store,
+                barrier,
+                namespace,
+                &planned,
+                Some(binding),
+                self.sharing.then_some(&mut self.foreign),
+            )? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -405,7 +460,7 @@ impl<P: Persistence> Applier<P> {
                 }
                 ApplyOutcome::Replan => continue,
                 ApplyOutcome::Indeterminate => {
-                    self.store.reconcile()?;
+                    self.reconcile()?;
                 }
             }
         }
@@ -431,7 +486,14 @@ impl<P: Persistence> Applier<P> {
             .map_err(ApplyError::Plan)?;
             drop(gated);
             let barrier = self.alloc.allocate();
-            match apply_refused_plan(&mut self.store, barrier, namespace, &planned, &command)? {
+            match apply_refused_plan_sharing(
+                &mut self.store,
+                barrier,
+                namespace,
+                &planned,
+                &command,
+                self.sharing.then_some(&mut self.foreign),
+            )? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -444,7 +506,7 @@ impl<P: Persistence> Applier<P> {
                 }
                 ApplyOutcome::Replan => continue,
                 ApplyOutcome::Indeterminate => {
-                    self.store.reconcile()?;
+                    self.reconcile()?;
                 }
             }
         }
@@ -535,12 +597,13 @@ impl<P: Persistence> Applier<P> {
                     .map_err(ApplyError::Plan)?;
                     drop(gated);
                     let barrier = self.alloc.allocate();
-                    match apply_refused_plan(
+                    match apply_refused_plan_sharing(
                         &mut self.store,
                         barrier,
                         namespace,
                         &planned,
                         &binding.command_id,
+                        self.sharing.then_some(&mut self.foreign),
                     )? {
                         ApplyOutcome::Applied(_) => {
                             let response = postcard::to_allocvec(&planned.response)
@@ -554,7 +617,7 @@ impl<P: Persistence> Applier<P> {
                         }
                         ApplyOutcome::Replan => continue,
                         ApplyOutcome::Indeterminate => {
-                            self.store.reconcile()?;
+                            self.reconcile()?;
                             continue;
                         }
                     }
@@ -597,7 +660,14 @@ impl<P: Persistence> Applier<P> {
             };
             drop(gated);
             let barrier = self.alloc.allocate();
-            match apply_plan(&mut self.store, barrier, namespace, &planned, Some(binding))? {
+            match apply_plan_sharing(
+                &mut self.store,
+                barrier,
+                namespace,
+                &planned,
+                Some(binding),
+                self.sharing.then_some(&mut self.foreign),
+            )? {
                 ApplyOutcome::Applied(_) => {
                     if let Some(revision) = planned.revision {
                         // Irrevocable now: the revision's complete event set
@@ -625,7 +695,7 @@ impl<P: Persistence> Applier<P> {
                 }
                 ApplyOutcome::Replan => continue,
                 ApplyOutcome::Indeterminate => {
-                    self.store.reconcile()?;
+                    self.reconcile()?;
                 }
             }
         }
