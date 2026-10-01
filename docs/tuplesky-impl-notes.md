@@ -8309,8 +8309,8 @@ print one more after the load ends. `scripts/ci/command_cost.py` reduces
 each voter's snapshots to per-command readings and `gate` compares the
 busiest voter's with `scripts/ci/command-cost-baseline.json`: busy time
 per command over the run and over the last quarter of the commands the
-voter executed, and journal syncs per command. Completed commands a
-second are reported and never gated. The `command cost` job in
+voter executed, the ratio of the two, and journal syncs per command.
+Completed commands a second are reported and never gated. The `command cost` job in
 `build-test.yml` runs it on every change that is not docs-only.
 
 - **A fixed number of operations, not 60 s.** The cost of a command
@@ -8353,16 +8353,24 @@ second are reported and never gated. The `command cost` job in
   and the gate compares the median.
 - **The baseline** holds, per caller count, the largest reading seen
   in the job's own runs on its runner, with margins of 25% (busy over
-  the run), 50% (busy over the last quarter) and 10% (syncs). Before
+  the run), 30% (busy over the last quarter and the ratio of the two)
+  and 10% (syncs). Before
   task-d46, on the `ubuntu-24.04` runner one voter fell behind in every
   repeat (1,098 to 1,749 of 2,602 commands executed, 12.6 to 17.1 ms
   per command). task-d46 moved it down, from that job's run on its own
   head: 1.35 and 1.65 ms at one caller, 1.47 and 1.67 ms at ten, 3.00
-  syncs per command. The last quarter's margin went from 30% to 50%
-  then: it is a reading over some 650 commands, and an unchanged run on
-  this container read 2.35 ms at ten callers against the runner's 1.67,
-  while the control above reads more than three times the baseline.
-  A change that moves it says why.
+  syncs per command.
+- **The ratio** of the last quarter to the whole run is what grows
+  when the cost of a command grows with history, and it needs no
+  machine to compare with: a faster runner moves both readings, not
+  their ratio. The baseline is 1.22 at one caller and 1.15 at ten; the
+  control above reads 1.69 at both and fails it. An unchanged run on
+  this container once read 2.35 ms over the last quarter at ten callers
+  against the runner's 1.67, and a re-run read within the baseline. No
+  local checkpoint falls in that window (each run's exports land
+  between executed 900 and 1,340, and the last quarter starts past
+  1,950), so that reading was the container's load, not a growth; the
+  margins stay at 30% and a change that moves them says why.
 
 ## Per-event work that does not grow with history
 
@@ -8377,7 +8385,10 @@ maps change, read for what changed.
   left lazily) instead of every vote set, executed history included,
   and finds the next command to execute among the committed records
   (`in_commit`) instead of every record. `commit_through_leader` reads
-  the same set.
+  the same set. `in_commit` keeps only records with a payload, as
+  `records()` did, so the candidates are the same commands in the same
+  order. `missing_payloads` chains its sets in any order: it sorts and
+  deduplicates what they yield.
 - **A follower's missing payloads** are three sets kept with the maps:
   adopted and held commands with no payload (`adopted_lacking`,
   `held_lacking`), and held commands that may await a rebind
@@ -8390,7 +8401,8 @@ maps change, read for what changed.
   follower every command whose record is created or moves
   (`watch_moves`). `advance_pending` examines the proposals held since
   its last call and those waiting on a noted command, where it read
-  every held proposal on every proposal, payload and storage event.
+  every held proposal on every submission, proposal and rebind (its
+  callers: `on_request`, `on_proposal` and `rebind`).
 - **The leader's proposals** are indexed by barrier (`on_storage` found
   one by a linear scan) and by what is unsettled, not both durable and
   executed (`unexecuted_in_order`, `committed_through`,
@@ -8446,12 +8458,14 @@ leader's busy samples are in `export_local`. Off, the run meets the
 acceptance; on, it does not, and a voter falls 9,000 commands behind.
 
 That is outside this task's boundary (the consensus machines and the
-loop's call sites, no change to what is durable). Two ways out, either
-a task of its own: export from a read snapshot off the domain thread,
-so the loop only selects the image and reclaims; or pace exports by the
-projection's size rather than a fixed record count, so the export cost
-per command stays constant, at the price of a journal (and a restart's
-replay) that grows with the state.
+loop's call sites, no change to what is durable), so task-d46's
+acceptance is measured with local checkpoints off and the export is
+task-d51's: export from task-d37's read snapshot off the domain thread,
+so the loop only selects the image, trims and reclaims. Pacing exports
+by the projection's size instead would keep the export cost per command
+constant, at the price of a journal (and a restart's replay) that grows
+with the state, so the plan does not take it. Until task-d51, task-62's
+throughput rows run with `checkpoint_after_records = 0` and say so.
 
 ### Open: a voter that stops executing
 

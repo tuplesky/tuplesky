@@ -2,11 +2,12 @@
   "recorded": "ubuntu-24.04 runner, build-test run 36877291869 (0c2b7ff, task-d46): the largest of three repeats per caller count",
   "margins": {
     "busy_ms_per_command": 0.25,
-    "tail_busy_ms_per_command": 0.50,
+    "tail_busy_ms_per_command": 0.30,
+    "tail_ratio": 0.30,
     "journal_syncs_per_command": 0.10
   },
   "runs": [
-    {"callers": 1, "busy_ms_per_command": 1.35, "tail_busy_ms_per_command": 1.65, "journal_syncs_per_command": 3.00},
-    {"callers": 10, "busy_ms_per_command": 1.47, "tail_busy_ms_per_command": 1.67, "journal_syncs_per_command": 3.00}
+    {"callers": 1, "busy_ms_per_command": 1.35, "tail_busy_ms_per_command": 1.65, "tail_ratio": 1.22, "journal_syncs_per_command": 3.00},
+    {"callers": 10, "busy_ms_per_command": 1.47, "tail_busy_ms_per_command": 1.67, "tail_ratio": 1.15, "journal_syncs_per_command": 3.00}
   ]
 }

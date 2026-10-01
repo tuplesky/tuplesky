@@ -19,8 +19,10 @@ that ran while the history was short.
 
 `gate` fails when, at any caller count the baseline records, the
 busiest voter's busy time per command, over the run or over its last
-quarter, or its journal syncs per command exceed the baseline by more
-than the baseline's stated margin. Each caller count is run more than
+quarter, the second over the first, or its journal syncs per command
+exceed the baseline by more than the baseline's stated margin. The
+ratio is where work that grows with history shows first, whatever the
+machine's speed: a uniform slowdown moves both readings and leaves it. Each caller count is run more than
 once and the median of the repeats is what is compared: one run on a
 shared runner can be a third off the next, and a regression worth
 catching moves every repeat. It reports completed commands a
@@ -163,7 +165,20 @@ def median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2
 
 
-GATED = ("busy_ms_per_command", "tail_busy_ms_per_command", "journal_syncs_per_command")
+GATED = (
+    "busy_ms_per_command",
+    "tail_busy_ms_per_command",
+    "tail_ratio",
+    "journal_syncs_per_command",
+)
+
+
+def reading(run: dict, field: str) -> float:
+    """A run's gated reading: the busiest voter's, or for `tail_ratio`
+    the busiest voter's last quarter over its whole run."""
+    if field == "tail_ratio":
+        return busiest(run, "tail_busy_ms_per_command") / busiest(run, "busy_ms_per_command")
+    return busiest(run, field)
 
 
 def gate(baseline: dict, result: dict) -> list[str]:
@@ -181,7 +196,7 @@ def gate(baseline: dict, result: dict) -> list[str]:
             continue
         for field in GATED:
             limit = expected[field] * (1 + margins[field])
-            seen = median([busiest(run, field) for run in runs])
+            seen = median([reading(run, field) for run in runs])
             if seen > limit:
                 failures.append(
                     f"{callers} callers: {field} {seen:.3f} (median of {len(runs)}) "

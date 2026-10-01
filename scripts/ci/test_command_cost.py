@@ -45,12 +45,12 @@ def run(callers, busy_ms, syncs, tail_ms=(1.0, 1.0)):
 
 BASELINE = {
     "margins": {"busy_ms_per_command": 0.25, "tail_busy_ms_per_command": 0.25,
-                "journal_syncs_per_command": 0.10},
+                "tail_ratio": 0.30, "journal_syncs_per_command": 0.10},
     "runs": [
         {"callers": 1, "busy_ms_per_command": 10.0, "tail_busy_ms_per_command": 1.0,
-         "journal_syncs_per_command": 5.0},
+         "tail_ratio": 0.1, "journal_syncs_per_command": 5.0},
         {"callers": 10, "busy_ms_per_command": 8.0, "tail_busy_ms_per_command": 1.0,
-         "journal_syncs_per_command": 4.0},
+         "tail_ratio": 0.125, "journal_syncs_per_command": 4.0},
     ],
 }
 
@@ -121,6 +121,15 @@ class GateTests(unittest.TestCase):
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
         self.assertIn("tail_busy_ms_per_command", failures[0])
+
+    def test_a_last_quarter_grown_past_the_run_fails_on_any_machine(self):
+        # A faster machine: both readings under the baseline's, but the
+        # last quarter has grown against the run past the ratio's margin.
+        result = {"runs": [run(1, (7.0, 7.0), (5.0, 5.0), tail_ms=(1.0, 1.0)),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
+        failures = cost.gate(BASELINE, result)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("tail_ratio", failures[0])
 
     def test_syncs_past_the_margin_fail(self):
         result = {"runs": [run(1, (10.0, 10.0), (5.6, 5.0)), run(10, (8.0, 8.0), (4.0, 4.0))]}
