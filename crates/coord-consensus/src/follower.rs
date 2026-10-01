@@ -1330,9 +1330,10 @@ impl Follower {
     /// it executed and retired it past its window. An earlier entry the
     /// later selection leaves out was therefore never decided, or was
     /// executed by a reporter and retired, which catch-up serves; its
-    /// acceptance, if any, was demoted with the later marker (task-d11). Kept, the earlier entries went into every report after
-    /// it, so a voter behind across failed ballots reported more each
-    /// time, and the Sync selected from its report grew with them.
+    /// acceptance, if any, was demoted with the later marker (task-d11).
+    /// Kept, the earlier entries went into every report after it, so a
+    /// voter behind across failed ballots reported more each time, and
+    /// the Sync selected from its report grew with them.
     ///
     /// What an earlier Sync left uninstalled is not this ballot's, and
     /// installing one of its entries would write an acceptance the new
