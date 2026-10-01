@@ -516,14 +516,14 @@ jobs:
             --ops-per-key 100 \
             --rate "$ETCD_RATE" \
             --time-limit "$TIME_LIMIT" \
-            --concurrency "$ETCD_CONCURRENCY" \
+            --concurrency "$CONCURRENCY" \
             ${wan[@]+"${wan[@]}"}
       - name: Summarize the run
         if: always()
         run: |
           if [ -d etcd-test/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$ETCD_TITLE_SUFFIX"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi

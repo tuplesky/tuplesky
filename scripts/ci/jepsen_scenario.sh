@@ -10,7 +10,7 @@
 #   IN_TIME_LIMIT  seconds of workload; empty for the scenario's
 #   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
 #                  empty for the scenario's
-#   NODES          the cluster's nodes (5), for etcd's minimum clients
+#   NODES          the cluster's nodes (5), for the register minimum
 #   IN_WAN         the network: none, regions, or one-way milliseconds;
 #                  empty for the scenario's
 #
@@ -62,20 +62,19 @@ wan=${IN_WAN:-$wan}
 # concurrency here.
 etcd_rate=$rate
 if [ "$rate" = 0 ]; then etcd_rate=100000; fi
-# The etcd test's register workload runs each key on 2 clients a node and
-# refuses fewer clients than that; this harness's tests run a key on
-# fewer when there are fewer. So etcd gets at least that many, and its
-# summary's title says so.
+# Every register workload here (TupleSky's, etcd's, SwiftPaxos's) runs
+# each key on 2 clients a node, and Jepsen refuses a test with fewer
+# clients than that. Below it, the run takes that minimum and its
+# summaries' titles say so.
 nodes=${NODES:-5}
 case $concurrency in
   *n) clients=$(( ${concurrency%n} * nodes )) ;;
   *)  clients=$concurrency ;;
 esac
-etcd_concurrency=$concurrency
-etcd_note=""
+raised=""
 if [ "$workload" = register ] && [ "$clients" -lt $(( 2 * nodes )) ]; then
-  etcd_concurrency=$(( 2 * nodes ))
-  etcd_note=" (etcd at its minimum, $etcd_concurrency clients)"
+  raised=" (raised from $concurrency to the register workload's minimum)"
+  concurrency=2n
 fi
 # The TupleSky test waits after the final heal for killed peers to rejoin;
 # with no faults there is nothing to wait for.
@@ -85,9 +84,9 @@ if [ "$nemesis" = none ]; then recovery_time=0; fi
 # Appended to each job summary's title, after the system, workload and faults.
 suffix=""
 if [ "$rate" = 0 ]; then
-  suffix+=", unthrottled at $concurrency"
+  suffix+=", unthrottled at $concurrency$raised"
 elif [ -n "${IN_CONCURRENCY:-}" ]; then
-  suffix+=", $concurrency clients"
+  suffix+=", $concurrency clients$raised"
 fi
 if [ "$wan" != none ]; then suffix+=", wan $wan"; fi
 
@@ -101,9 +100,7 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "RATE=$rate"
   echo "ETCD_RATE=$etcd_rate"
   echo "CONCURRENCY=$concurrency"
-  echo "ETCD_CONCURRENCY=$etcd_concurrency"
   echo "WAN=$wan"
   echo "RECOVERY_TIME=$recovery_time"
   echo "TITLE_SUFFIX=$suffix"
-  echo "ETCD_TITLE_SUFFIX=$suffix$etcd_note"
 } >> "$out"

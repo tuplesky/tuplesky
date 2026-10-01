@@ -158,10 +158,9 @@ three jobs (`scripts/ci/jepsen_scenario.sh`); a non-empty `workload`,
 `nemesis`, `swiftpaxos`, `wan`, `time-limit` or `concurrency` input
 overrides its value. `concurrency` is Jepsen's: a number of clients, or a
 multiple of the nodes such as `5n`; a throughput sweep is one run a value.
-The etcd test's register workload runs each key on 2 clients a node and
-refuses fewer, so below that etcd gets 2 a node, and its summary's title
-says so; the TupleSky and SwiftPaxos tests run a key on as many clients as
-there are.
+Every register workload here runs each key on 2 clients a node, and
+Jepsen refuses a test with fewer clients than that, so below it a
+register run takes `2n` and its summaries' titles say so.
 
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |
