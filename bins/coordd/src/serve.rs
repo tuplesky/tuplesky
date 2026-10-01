@@ -1234,7 +1234,15 @@ const OFFERS_PER_TURN: usize = 16;
 /// recovery summary is not much more -- and low enough that a caller's
 /// request waits for a bounded number of peer frames rather than for
 /// the domain to go quiet.
-const PEER_BEFORE_API: u32 = 64;
+///
+/// Bounded is not enough: it is also the caller's plane's *share* when
+/// the peer plane never goes quiet, which is what a replica catching up
+/// does to it. At 64 a voter taking 200 to 400 peer events a second
+/// took 2 to 7 of its callers', and those include its collector's
+/// submissions from the other frontends and the evidence coming back to
+/// its own; a request then sat 36 seconds in the transport before this
+/// loop read it (task-d33).
+const PEER_BEFORE_API: u32 = 8;
 
 /// Whether the caller's plane is polled before the peer plane this
 /// turn, given how many peer events have been taken since the last
@@ -4853,7 +4861,12 @@ mod tests {
         // recovery summary -- and small enough that a caller waits for
         // a bounded number of frames rather than for the domain to go
         // quiet.
-        assert!((8..=1024).contains(&PEER_BEFORE_API));
+        //
+        // And it is the caller's plane's share when the peer plane never
+        // goes quiet: one event in `PEER_BEFORE_API + 1`. At 64 a
+        // catching-up replica's callers got 2 to 7 events a second and
+        // waited out their deadlines on answers already on the wire.
+        assert!((8..=16).contains(&PEER_BEFORE_API));
     }
 
     /// A condition that keeps happening is said in full a few times and
