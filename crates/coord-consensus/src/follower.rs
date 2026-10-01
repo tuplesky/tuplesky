@@ -48,10 +48,10 @@ use crate::quorum::BallotConfiguration;
 use crate::recovery::{RecoveryError, SyncDecision, SyncEntry};
 use crate::recovery::{RecoveryReport, ReportEntry};
 use crate::role::RecoveredState;
+use crate::rows::promise_update;
 use crate::rows::{
     PayloadRecordV1, PromiseRecordV1, dependency_delete, dependency_update, payload_update,
 };
-use crate::rows::{SyncRecordV1, promise_update, sync_update};
 use crate::summary::DurableLedger;
 use crate::summary::{MAX_PAGE_ENTRIES, PageError, paginate};
 use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
@@ -123,6 +123,16 @@ pub enum FollowerRejection {
     /// A higher ballot was promised before the synchronized row became
     /// durable; that cut supersedes this Sync.
     SyncSuperseded(Ballot),
+    /// A Sync that does not fit the row it would be written in (task-d20):
+    /// refused before anything of it was marked.
+    SyncTooLarge {
+        /// Its ballot.
+        ballot: Ballot,
+        /// Its encoded size.
+        bytes: usize,
+        /// The smaller of the row and frame limits.
+        limit: usize,
+    },
     /// A selection held a dependency cycle among its entries, an
     /// invariant violation (task-d21): this replica's own, before binding
     /// it, or one it was sent or restarted from, before installing any of
@@ -968,7 +978,7 @@ impl Follower {
                 }
                 None => table.phase_of(c).is_some(),
             };
-            match campaign.try_select(supplied) {
+            match campaign.try_select(crate::recovery::MAX_REPORT_ENTRIES, supplied) {
                 Ok(None) => return Vec::new(),
                 Ok(Some(_)) => {}
                 Err(e) => {
@@ -1042,10 +1052,20 @@ impl Follower {
                 _ => None,
             });
             let decision = campaign.decision().expect("selected").clone();
+            // A selection whose Sync does not fit its row or its frame
+            // refuses the campaign, named, rather than ending the process
+            // at the write (task-d20).
+            let update =
+                match crate::rows::bounded_sync_update(self.config.identity.epoch, &decision) {
+                    Ok(update) => update,
+                    Err(e) => {
+                        self.rejections.push(FollowerRejection::Campaign(e));
+                        self.campaign = None;
+                        return Vec::new();
+                    }
+                };
             let barrier = self.alloc.as_mut().expect("booted").allocate();
             campaign.bound(barrier);
-            let update = sync_update(self.config.identity.epoch, &SyncRecordV1 { decision })
-                .expect("bounded");
             return alloc::vec![Effect::Persist(PersistBatch {
                 barrier,
                 base: None,
@@ -1179,6 +1199,22 @@ impl Follower {
             return Vec::new();
         }
         if !already_synced {
+            // A Sync that does not fit its row is refused before anything
+            // of it is marked (task-d20). A candidate of this build never
+            // binds one; installing it ended the process at the write.
+            let sync_row =
+                match crate::rows::bounded_sync_update(self.config.identity.epoch, &decision) {
+                    Ok(update) => update,
+                    Err(RecoveryError::SyncTooLarge { bytes, limit, .. }) => {
+                        self.rejections.push(FollowerRejection::SyncTooLarge {
+                            ballot: decision.ballot,
+                            bytes,
+                            limit,
+                        });
+                        return Vec::new();
+                    }
+                    Err(_) => return Vec::new(),
+                };
             // The synchronized ballot becomes a fact before anything of the
             // new ballot happens: activating first would let adoption rows
             // and acknowledgements of the new ballot become durable while
@@ -1202,13 +1238,7 @@ impl Follower {
             // accepted state. Either both rows are durable or neither is,
             // and a restart resumes the installation from the row.
             let mut updates = alloc::vec![
-                sync_update(
-                    self.config.identity.epoch,
-                    &SyncRecordV1 {
-                        decision: decision.clone(),
-                    },
-                )
-                .expect("bounded"),
+                sync_row,
                 promise_update(self.config.identity.epoch, &record).expect("bounded"),
             ];
             // An acceptance of an earlier ballot that the selection does
@@ -1284,12 +1314,48 @@ impl Follower {
         self.adopted.clear();
         self.leader_committed = None;
         self.named_facts = named_facts(&decision);
-        // What an earlier Sync left uninstalled is superseded: its entries
-        // are not this ballot's, and installing one would write an
-        // acceptance the new selection re-proposed or left out, back over
-        // the demotion (task-d34: a restart resumed an older Sync, took a
-        // newer one, and the older entry's ACCEPT came back at the new
-        // synchronized ballot).
+        self.replace_sync_pending(&decision);
+        effects.extend(self.advance_sync());
+        effects.extend(self.replay_awaiting());
+        effects
+    }
+
+    /// Hold `decision`'s entries for installation, in place of whatever an
+    /// earlier Sync left pending (task-d20).
+    ///
+    /// The Sync whose row is durable is the synchronized ballot's
+    /// selection, and it supersedes every earlier one: a decision of an
+    /// earlier ballot was accepted by a majority there, which the later
+    /// selection's reports intersect, so a voter there reports it unless
+    /// it executed and retired it past its window. An earlier entry the
+    /// later selection leaves out was therefore never decided, or was
+    /// executed by a reporter and retired, which catch-up serves; its
+    /// acceptance, if any, was demoted with the later marker (task-d11).
+    /// Kept, the earlier entries went into every report after it, so a
+    /// voter behind across failed ballots reported more each time, and
+    /// the Sync selected from its report grew with them.
+    ///
+    /// What an earlier Sync left uninstalled is not this ballot's, and
+    /// installing one of its entries would write an acceptance the new
+    /// selection re-proposed or left out, back over the demotion
+    /// (task-d34: a restart resumed an older Sync, took a newer one, and
+    /// the older entry's ACCEPT came back at the new synchronized
+    /// ballot).
+    fn replace_sync_pending(&mut self, decision: &SyncDecision) {
+        // The placeholders the superseded entries made go with them,
+        // unless a proposal held here is waiting on the command: kept,
+        // repeated failed ballots with entries whose payloads never came
+        // filled the table with slots nothing would ever fill (Codex
+        // review).
+        let superseded: Vec<CommandId> = self
+            .sync_pending
+            .keys()
+            .filter(|c| !decision.entries.contains_key(c) && !self.held.contains_key(c))
+            .copied()
+            .collect();
+        for command in superseded {
+            self.table.forget_placeholder(&command);
+        }
         self.sync_pending.clear();
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
@@ -1297,9 +1363,6 @@ impl Follower {
             }
             self.sync_pending.insert(*c, e.clone());
         }
-        effects.extend(self.advance_sync());
-        effects.extend(self.replay_awaiting());
-        effects
     }
 
     /// Install every Sync entry whose payload is known and whose
@@ -1307,11 +1370,19 @@ impl Follower {
     fn advance_sync(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         loop {
+            // Nothing installs while a Sync's marker is not durable. Its
+            // demotions were computed when the marker was issued, so an
+            // older Sync's entry installed now, from a payload arriving
+            // in the window, would be journaled after the marker and
+            // undemoted: an acceptance the next report names at the new
+            // ballot, which the guard keeps as decided (task-d20 review).
+            // Activation replaces what is pending anyway.
             let ready: Vec<CommandId> = self
                 .sync_pending
                 .iter()
                 .filter(|(c, e)| {
-                    self.table.phase_of(c).is_some()
+                    self.sync_barrier.is_none()
+                        && self.table.phase_of(c).is_some()
                         && !self.awaits_selected_facts(c)
                         && crate::phase::guard_accept(&e.deps, |d| self.table.phase_of(d)).is_ok()
                 })
@@ -3184,13 +3255,7 @@ impl Follower {
                         // Sync's are; only the ballot is not taken up
                         // (task-d30). What an older Sync left pending is
                         // superseded by this one, as at activation.
-                        self.sync_pending.clear();
-                        for (c, e) in &decision.entries {
-                            if self.table.phase_of(c).is_none() {
-                                let _ = self.table.expect(*c);
-                            }
-                            self.sync_pending.insert(*c, e.clone());
-                        }
+                        self.replace_sync_pending(&decision);
                         self.rejections
                             .push(FollowerRejection::SyncSuperseded(decision.ballot));
                         Vec::new()

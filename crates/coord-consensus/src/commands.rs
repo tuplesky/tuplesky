@@ -298,6 +298,18 @@ impl CommandTable {
         self.full()
     }
 
+    /// Drop the placeholder of `command`, if that is all the table holds
+    /// of it (task-d20): a record with a payload is never touched.
+    pub fn forget_placeholder(&mut self, command: &CommandId) -> bool {
+        match self.records.get(command) {
+            Some(r) if r.payload.is_none() && r.phase == Phase::Start => {
+                self.records.remove(command);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Create a placeholder for a command known by identity only (leader
     /// evidence arrived before the payload). Idempotent; never changes an
     /// initialized record. Refused under backpressure.

@@ -162,18 +162,43 @@ impl Campaign {
     ///
     /// When neither applies, the campaign waits for the voters that have
     /// not reported, and fails only once every voter has.
+    ///
+    /// A report carrying more than `report_limit` entries is set aside the
+    /// same way (task-d20), so the Sync is selected from reports of a
+    /// bounded size; the candidate's own is never set aside, and the
+    /// campaign fails on it as [`RecoveryError::ReportTooLarge`].
     pub fn try_select(
         &mut self,
+        report_limit: usize,
         supplied: impl Fn(&CommandId, Option<Digest32>) -> bool,
     ) -> Result<Option<&SyncDecision>, RecoveryError> {
         if self.decision.is_some() {
             return Ok(self.decision.as_ref());
         }
         let mut reports = self.reports();
-        if reports.len() < self.config.slow_size() {
-            return Ok(None);
-        }
         let everyone = reports.len() >= self.config.voters().len();
+        let oversize = |r: &RecoveryReport| RecoveryError::ReportTooLarge {
+            replica: r.replica,
+            entries: r.entries.len(),
+            limit: report_limit,
+        };
+        if let Some(own) = reports
+            .iter()
+            .find(|r| r.replica == self.config.leader() && r.entries.len() > report_limit)
+        {
+            return Err(oversize(own));
+        }
+        let first_oversize = reports
+            .iter()
+            .find(|r| r.entries.len() > report_limit)
+            .map(oversize);
+        reports.retain(|r| r.entries.len() <= report_limit);
+        if reports.len() < self.config.slow_size() {
+            return match first_oversize {
+                Some(e) if everyone => Err(e),
+                _ => Ok(None),
+            };
+        }
         let decision = loop {
             match select_with(&self.config, &reports, &supplied) {
                 Ok(decision) => break decision,
