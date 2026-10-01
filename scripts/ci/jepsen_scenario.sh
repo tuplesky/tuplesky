@@ -63,18 +63,21 @@ wan=${IN_WAN:-$wan}
 etcd_rate=$rate
 if [ "$rate" = 0 ]; then etcd_rate=100000; fi
 # Every register workload here (TupleSky's, etcd's, SwiftPaxos's) runs
-# each key on 2 clients a node, and Jepsen refuses a test with fewer
-# clients than that. Below it, the run takes that minimum and its
-# summaries' titles say so.
+# each key on 2 clients a node, and Jepsen refuses a test whose clients do
+# not split evenly into such groups. A register run's count goes up to the
+# next multiple of 2n, and its summaries' titles say so.
 nodes=${NODES:-5}
 case $concurrency in
   *n) clients=$(( ${concurrency%n} * nodes )) ;;
   *)  clients=$concurrency ;;
 esac
 raised=""
-if [ "$workload" = register ] && [ "$clients" -lt $(( 2 * nodes )) ]; then
-  raised=" (raised from $concurrency to the register workload's minimum)"
-  concurrency=2n
+group=$(( 2 * nodes ))
+if [ "$workload" = register ] && [ $(( clients % group )) -ne 0 -o "$clients" -eq 0 ]; then
+  groups=$(( (clients + group - 1) / group ))
+  if [ "$groups" -lt 1 ]; then groups=1; fi
+  raised=" (raised from $concurrency to a multiple of the register workload's 2n)"
+  concurrency=$(( 2 * groups ))n
 fi
 # The TupleSky test waits after the final heal for killed peers to rejoin;
 # with no faults there is nothing to wait for.

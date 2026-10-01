@@ -159,8 +159,9 @@ three jobs (`scripts/ci/jepsen_scenario.sh`); a non-empty `workload`,
 overrides its value. `concurrency` is Jepsen's: a number of clients, or a
 multiple of the nodes such as `5n`; a throughput sweep is one run a value.
 Every register workload here runs each key on 2 clients a node, and
-Jepsen refuses a test with fewer clients than that, so below it a
-register run takes `2n` and its summaries' titles say so.
+Jepsen refuses a test whose clients do not split evenly into such groups,
+so a register run's count goes up to the next multiple of `2n` (`1n` runs
+as `2n`, `5n` as `6n`) and its summaries' titles say so.
 
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |
