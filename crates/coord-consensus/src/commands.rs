@@ -187,6 +187,12 @@ pub struct CommandTable {
     /// every entry being rescanned each time anything moved (task-d26).
     /// A set, so it holds at most the table's records and tombstones.
     raised: Option<BTreeSet<CommandId>>,
+    /// The same changes, for a follower's held proposals
+    /// ([`CommandTable::watch_moves`], task-d46): a proposal that cannot
+    /// be adopted yet waits on one command, and a change noted here for
+    /// that command is what brings it back. Kept apart from `raised`,
+    /// which a Sync stops watching once it has installed everything.
+    moved: Option<BTreeSet<CommandId>>,
     /// Every command whose record is at ACCEPT, and possibly some that
     /// have moved on since (task-d46): what the learner examines,
     /// instead of every vote set it holds, executed history included.
@@ -217,6 +223,7 @@ impl CommandTable {
             last_executed: None,
             unretired: VecDeque::new(),
             raised: None,
+            moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
         }
@@ -236,6 +243,7 @@ impl CommandTable {
             last_executed: None,
             unretired: VecDeque::new(),
             raised: None,
+            moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
         }
@@ -262,6 +270,7 @@ impl CommandTable {
             last_executed: None,
             unretired: VecDeque::new(),
             raised: None,
+            moved: None,
             accepted: BTreeSet::new(),
             committed: BTreeSet::new(),
         };
@@ -327,9 +336,31 @@ impl CommandTable {
             .unwrap_or_default()
     }
 
+    /// Start (`true`) or stop noting, for held proposals, the commands
+    /// whose record is created or moves (task-d46). Stopping forgets what
+    /// was noted.
+    pub fn watch_moves(&mut self, on: bool) {
+        match (on, &self.moved) {
+            (true, None) => self.moved = Some(BTreeSet::new()),
+            (false, _) => self.moved = None,
+            (true, Some(_)) => {}
+        }
+    }
+
+    /// The commands noted for held proposals since the last call.
+    pub fn take_moved(&mut self) -> BTreeSet<CommandId> {
+        self.moved
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
+    }
+
     fn raise(&mut self, command: CommandId) {
         if let Some(raised) = &mut self.raised {
             raised.insert(command);
+        }
+        if let Some(moved) = &mut self.moved {
+            moved.insert(command);
         }
     }
 

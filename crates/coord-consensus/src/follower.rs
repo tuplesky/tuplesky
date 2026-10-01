@@ -420,6 +420,18 @@ pub struct Follower {
     /// stops when it is rebound, released, adopted or committed, which
     /// is why the set is filtered when it is read.
     rebinds: alloc::collections::BTreeSet<CommandId>,
+    /// The held proposals to examine at the next `advance_pending`: the
+    /// ones held since, and the ones whose blocker the table noted a
+    /// change for (task-d46). Every held proposal that can be adopted is
+    /// here or in `held_waiters` under a command whose change is noted.
+    held_check: alloc::collections::BTreeSet<CommandId>,
+    /// The held proposals that cannot be adopted yet, under the one
+    /// command each waits on first (`held_blocker`), as task-d26 keeps
+    /// pending Sync entries: adopting no longer reads every held proposal
+    /// on every event, which kept a replica that had fallen behind there.
+    /// An entry may name a proposal no longer held; it is dropped when
+    /// read, and at the history sweep.
+    held_waiters: BTreeMap<CommandId, alloc::collections::BTreeSet<CommandId>>,
     pending: BTreeMap<BarrierId, Pending>,
     deferred: BTreeMap<BarrierId, DeferredVote>,
     votes: BTreeMap<CommandId, VoteSet>,
@@ -708,6 +720,8 @@ impl Follower {
             adopted_lacking,
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
+            held_check: alloc::collections::BTreeSet::new(),
+            held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             deferred: BTreeMap::new(),
             votes: BTreeMap::new(),
@@ -890,6 +904,8 @@ impl Follower {
             adopted_lacking: alloc::collections::BTreeSet::new(),
             held_lacking: alloc::collections::BTreeSet::new(),
             rebinds: alloc::collections::BTreeSet::new(),
+            held_check: alloc::collections::BTreeSet::new(),
+            held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             votes: BTreeMap::new(),
             payloads: state.payloads,
@@ -939,7 +955,10 @@ impl Follower {
 
     /// Give up the role: everything durable or learned, nothing
     /// ballot-scoped.
-    pub fn into_recovered(self) -> RecoveredState {
+    pub fn into_recovered(mut self) -> RecoveredState {
+        // Held proposals are ballot-scoped and stay here; what the table
+        // noted for them would only grow under the next role.
+        self.table.watch_moves(false);
         // Taken in after the campaign cut its own report: pre-accepted
         // here and fenced from any acknowledgement (`on_admitted`), so no
         // ballot decided them and no selection of this campaign names
@@ -1654,6 +1673,8 @@ impl Follower {
         self.held.clear();
         self.held_lacking.clear();
         self.rebinds.clear();
+        self.held_check.clear();
+        self.held_waiters.clear();
         self.adopted.clear();
         self.adopted_lacking.clear();
         self.leader_committed = None;
@@ -2828,6 +2849,11 @@ impl Follower {
         self.bindings.retain(|_, c| !table.forgotten(c));
         self.adopted_lacking = lacking(self.adopted.keys(), &self.payloads);
         self.held_lacking = lacking(self.held.keys(), &self.payloads);
+        let held = &self.held;
+        self.held_waiters.retain(|_, waiting| {
+            waiting.retain(|c| held.contains_key(c));
+            !waiting.is_empty()
+        });
     }
 
     /// Re-read whether `command` is adopted or held here with no
@@ -3703,6 +3729,10 @@ impl Follower {
             }
         }
         self.held.insert(command, HeldProposal { proposal });
+        // Nothing is held before this, so nothing waits on a change the
+        // table did not note.
+        self.table.watch_moves(true);
+        self.held_check.insert(command);
         self.note_lacking(command);
         self.advance_pending()
     }
@@ -3802,6 +3832,63 @@ impl Follower {
         self.release()
     }
 
+    /// What a held proposal waits on before it can be adopted, or `None`
+    /// if it can be adopted now: the command itself while its record is
+    /// not initialized or awaits a rebind, else its first dependency
+    /// below ACCEPT.
+    ///
+    /// Initialized, not merely known. A proposal that arrived before the
+    /// payload leaves a placeholder, and a placeholder cannot be
+    /// accepted: there is nothing to accept an order *for* yet. It stays
+    /// held until the payload arrives -- from the submission, or from the
+    /// leader that proposed it. Nor under other facts than the
+    /// proposal's: that one waits for the leader's payload to be bound.
+    fn held_blocker(&self, command: &CommandId, held: &HeldProposal) -> Option<CommandId> {
+        if !self.table.is_initialized(command) || self.awaits_rebind(command) {
+            return Some(*command);
+        }
+        match crate::phase::guard_accept(&held.proposal.deps, |d| self.table.phase_of(d)) {
+            Ok(()) => None,
+            Err(
+                crate::phase::GuardViolation::DependencyUnknown { dep }
+                | crate::phase::GuardViolation::DependencyNotAccepted { dep }
+                | crate::phase::GuardViolation::DependencyNotCommitted { dep }
+                | crate::phase::GuardViolation::DependencyNotExecuted { dep },
+            ) => Some(dep),
+        }
+    }
+
+    /// The held proposals that can be adopted now, in identity order
+    /// (task-d46): of the ones held since the last call and the ones
+    /// waiting on a command the table noted a change for. Each that
+    /// cannot waits again, under what it waits on now.
+    fn held_ready(&mut self) -> Vec<CommandId> {
+        for command in self.table.take_moved() {
+            if let Some(waiting) = self.held_waiters.remove(&command) {
+                self.held_check.extend(waiting);
+            }
+            if self.held.contains_key(&command) {
+                self.held_check.insert(command);
+            }
+        }
+        let mut ready = Vec::new();
+        for command in core::mem::take(&mut self.held_check) {
+            let Some(held) = self.held.get(&command) else {
+                continue;
+            };
+            match self.held_blocker(&command, held) {
+                None => ready.push(command),
+                Some(blocker) => {
+                    self.held_waiters
+                        .entry(blocker)
+                        .or_default()
+                        .insert(command);
+                }
+            }
+        }
+        ready
+    }
+
     /// Adopt every held proposal whose payload is initialized and whose
     /// dependencies are all at least ACCEPT; repeat while progress is made.
     fn advance_pending(&mut self) -> Vec<Effect> {
@@ -3826,26 +3913,14 @@ impl Follower {
             return effects;
         }
         loop {
-            let ready: Vec<CommandId> = self
-                .held
-                .iter()
-                .filter(|(c, h)| {
-                    // Initialized, not merely known. A proposal that
-                    // arrived before the payload leaves a placeholder,
-                    // and a placeholder cannot be accepted: there is
-                    // nothing to accept an order *for* yet. It stays
-                    // held until the payload arrives -- from the
-                    // submission, or from the leader that proposed it.
-                    // Nor under other facts than the proposal's: that
-                    // one waits for the leader's payload to be bound.
-                    self.table.is_initialized(c)
-                        && !self.awaits_rebind(c)
-                        && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
-                            .is_ok()
-                })
-                .map(|(c, _)| *c)
-                .collect();
+            let ready = self.held_ready();
             if ready.is_empty() {
+                debug_assert!(
+                    self.held
+                        .iter()
+                        .all(|(c, h)| self.held_blocker(c, h).is_some()),
+                    "a held proposal that can be adopted was not examined"
+                );
                 self.learn();
                 return effects;
             }
