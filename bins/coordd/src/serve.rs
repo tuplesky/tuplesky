@@ -936,6 +936,8 @@ pub struct Domain<P: Persistence> {
     /// Peer events taken since the last caller's event, so the peer
     /// plane's priority cannot become the caller plane's starvation.
     peer_streak: u32,
+    /// Events taken since the voter last flushed (task-d47).
+    since_flush: u32,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -1291,6 +1293,14 @@ const OFFERS_PER_TURN: usize = 16;
 /// loop read it (task-d33).
 const PEER_BEFORE_API: u32 = 8;
 
+/// Queued batches at which the loop lowers before it takes another event
+/// (task-d47): a full journal group (`GroupLimits::DEFAULT`).
+const FLUSH_QUEUED: usize = 64;
+
+/// Events the loop takes before it flushes what they left owed, however
+/// many more are ready (task-d47).
+const FLUSH_EVENTS: u32 = 64;
+
 /// Whether the caller's plane is polled before the peer plane this
 /// turn, given how many peer events have been taken since the last
 /// caller's event.
@@ -1423,6 +1433,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             floor_said: coord_daemon::floor::FloorCounts::default(),
             fenced_stop: None,
             peer_streak: 0,
+            since_flush: 0,
             budgets,
             recorder,
             pacing: Pacing::default(),
@@ -1668,6 +1679,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 say_fenced_stop(&what);
                 return;
             }
+            // A full journal group's worth queued is lowered now, whatever
+            // else is ready, and so is whatever a run of events left owed:
+            // events that queue nothing -- votes the leader counts, a
+            // busy follower's acknowledgements -- would otherwise keep a
+            // command that is ready from executing for as long as they
+            // kept arriving (task-d47).
+            let owed = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            if (self.queued() >= FLUSH_QUEUED || (owed && self.since_flush >= FLUSH_EVENTS))
+                && self.stops_on_flush(transport)
+            {
+                return;
+            }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
                 Err(coord_daemon::DriveError::Fenced(what)) => {
@@ -1777,6 +1800,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // share without giving up the ordering that makes the
             // domain progress.
             let api_first = poll_api_first(self.peer_streak);
+            let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
             // Waiting from here: the select below returns at once when
             // there is work, and otherwise this is the loop's idle time.
             self.pacing.wait();
@@ -1792,6 +1816,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     event = transport.next_event() => event.map(Arrived::Api),
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                    // No event is ready: what the events so far queued is
+                    // lowered as one group before the loop waits (task-d47).
+                    () = std::future::ready(()), if owes_flush => {
+                        // Work, not waiting: it is counted as busy.
+                        self.pacing.woke();
+                        if self.stops_on_flush(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
                         self.dialled(done);
                         continue;
@@ -1813,6 +1847,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                     event = transport.next_event() => event.map(Arrived::Api),
+                    () = std::future::ready(()), if owes_flush => {
+                        // Work, not waiting: it is counted as busy.
+                        self.pacing.woke();
+                        if self.stops_on_flush(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
                         self.dialled(done);
                         continue;
@@ -1832,10 +1874,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             match arrived {
                 Some(Arrived::Api(event)) => {
                     self.peer_streak = 0;
+                    self.since_flush = self.since_flush.saturating_add(1);
                     self.on_transport(transport, event, &clock).await;
                 }
                 Some(Arrived::Peer(event)) => {
                     self.peer_streak = self.peer_streak.saturating_add(1);
+                    self.since_flush = self.since_flush.saturating_add(1);
                     self.on_peer_plane(transport, event);
                 }
                 None => return,
@@ -2295,6 +2339,40 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .map_or((0, 0, 0), |e| (e.done.0, e.done.1, e.armed()))
     }
 
+    /// Batches the voter's rounds left queued for a flush (task-d47).
+    fn queued(&self) -> usize {
+        match &self.backing {
+            Backing::Voting(voter) => voter.queued(),
+            Backing::Serving(_) => 0,
+        }
+    }
+
+    /// Lower what the voter's rounds left queued as one group and send
+    /// what that released (task-d47). Returns whether the voter must
+    /// stop: it cannot make its transitions durable, or it is fenced.
+    fn stops_on_flush(&mut self, api: &Transport) -> bool {
+        self.since_flush = 0;
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        match voter.flush() {
+            Ok(out) => {
+                let provenance = voter.provenance();
+                self.frontend.follow(voter.node().machine().active());
+                self.carry(api, out, provenance);
+                false
+            }
+            Err(DriveError::Fenced(what)) => {
+                say_fenced_stop(&what);
+                true
+            }
+            Err(e) => {
+                eprintln!("this voter cannot make its transitions durable: {e}");
+                true
+            }
+        }
+    }
+
     /// Give the voter its turn: the local submissions it is owed, then
     /// whatever applying those produced.
     ///
@@ -2348,7 +2426,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         out.absorb(voter.follow_machine()?);
-        out.absorb(voter.execute()?);
+        // Lowering in groups, commands are applied when the loop flushes,
+        // with whatever else became executable by then (task-d47).
+        if !voter.node().lowers_in_groups() {
+            out.absorb(voter.execute()?);
+        }
         // A command whose identity this replica learned from evidence
         // and whose content nobody sent it. Execution stops at it
         // rather than going past it, so what unblocks the domain is

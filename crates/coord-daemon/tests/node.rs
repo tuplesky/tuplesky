@@ -166,10 +166,29 @@ fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
 /// serving profile, where a record reaches the journal before the
 /// projection.
 fn journaled_follower(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
+    let applier = journaled_applier(boot, r(1));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(),
+        genesis: ballot(),
+        frontend: FRONTEND,
+        capacity: 64,
+    })
+    .restore_execution(bootstrapped, []);
+    machine.set_learning(LearningMode::Full);
+    Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND)
+}
+
+/// A bootstrapped journal-first store for replica `me`.
+fn journaled_applier(
+    boot: BootId,
+    me: ReplicaId,
+) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
     let mut store = JournaledStore::open(
         ModelJournal::new(),
         CLUSTER,
-        r(1),
+        me,
         inc(),
         boot,
         JournalLimits::default(),
@@ -215,18 +234,39 @@ fn journaled_follower(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelE
         },
     )
     .expect("attached");
-    let applier = Applier::new(domain, alloc).unwrap();
+    Applier::new(domain, alloc).unwrap()
+}
+
+/// A leader that is its domain's only voter, persisting through the
+/// journal: its own record is the quorum, so what it proposes it also
+/// executes.
+fn journaled_lone_leader(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
+    let applier = journaled_applier(boot, r(0));
     let bootstrapped = applier.store().application_base().execution_position;
-    let mut machine = Follower::new(FollowerConfig {
-        identity: identity(1),
-        quorum: quorum(),
-        genesis: ballot(),
-        frontend: FRONTEND,
-        capacity: 64,
-    })
-    .restore_execution(bootstrapped, []);
+    let alone = ConfigurationIdentity {
+        voters: vec![r(0)].into_iter().collect(),
+        ..identity(0)
+    };
+    let quorum = BallotConfiguration::c2(
+        epoch(),
+        ballot(),
+        [r(0)].into_iter().collect(),
+        [r(0)].into_iter().collect(),
+    )
+    .unwrap();
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: alone,
+            quorum,
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
     machine.set_learning(LearningMode::Full);
-    Node::new(Machine::Follower(Box::new(machine)), applier, FRONTEND)
+    Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND)
 }
 
 fn follower(boot: BootId) -> Node<StoreWorker<ModelEngine>> {
@@ -661,4 +701,156 @@ fn a_voter_that_served_a_write_reports_the_stages_it_passed_through() {
         .find(|r| r.stage == Stage::FanOut)
         .expect("every stage is reported");
     assert_eq!(fan_out.metrics.why(), Some(Unavailable::NotInstrumented));
+}
+
+/// Lowering in groups, a vote waits for the flush that journals it, and
+/// one flush journals every vote the events before it made, in one
+/// append (task-d47).
+///
+/// The events are carried out at once; only the lowering waits. What the
+/// votes justify is sent once their own barriers are journal-durable, as
+/// before, which is now at the flush.
+#[test]
+fn lowering_in_groups_a_vote_waits_for_the_flush_that_journals_it() {
+    let boot = BootId([8; 16]);
+    let mut follower = journaled_follower(boot);
+    follower
+        .on_event(
+            Event::Boot {
+                boot_id: boot,
+                incarnation: inc(),
+            },
+            &ballot(),
+        )
+        .expect("boot");
+    follower.lower_in_groups();
+    let appends = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().store().journal().appends()
+    };
+    let before = appends(&follower);
+
+    for sequence in 1..=3 {
+        let out = follower
+            .on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+        assert!(
+            out.frontend.is_empty() && out.peer.is_empty(),
+            "a vote went out before the flush that journals it"
+        );
+    }
+    assert_eq!(appends(&follower), before, "nothing was journaled yet");
+    // Each submission's records wait in the queue: the evidence for them
+    // is described once they are durable, so none of it exists yet.
+    assert_eq!(follower.applier().store().queued(), 3);
+
+    let out = follower.flush(&ballot()).expect("flushed");
+    assert_eq!(appends(&follower) - before, 1, "one append for every vote");
+    assert_eq!(follower.applier().store().queued(), 0);
+    assert_eq!(follower.held(), 0, "every vote was released by the flush");
+    assert!(!out.frontend.is_empty(), "the votes went to the collector");
+    // Nothing is ready to execute, so the flush also caught the
+    // projection up: it does not wait on execution that is not coming.
+    assert!(!follower.can_execute());
+    assert_eq!(follower.applier().store().unmaterialized(), 0);
+}
+
+/// Lowering in groups, the commands whose turn has come are applied as
+/// one group: one journal append and one projection commit for all of
+/// them, and their results go to the collector only once the group has
+/// materialized (task-d47).
+#[test]
+fn lowering_in_groups_the_commands_ready_together_execute_as_one_group() {
+    let boot = BootId([9; 16]);
+    let mut node = journaled_lone_leader(boot);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    for sequence in 1..=5 {
+        node.on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+    }
+    node.flush(&ballot()).expect("flushed");
+    assert!(
+        node.can_execute(),
+        "the lone voter's records decide its proposals"
+    );
+
+    let cost = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().cost().expect("counted").lowering
+    };
+    let before = cost(&node);
+    let revision_before = node.applier().kv_revision().unwrap();
+    let out = node.execute(&ballot()).expect("executed");
+    let after = cost(&node);
+    assert_eq!(node.executed, 5);
+    assert_eq!(after.appends - before.appends, 1, "one journal append");
+    assert_eq!(after.commits - before.commits, 1, "one projection commit");
+    assert!(!node.applier().in_group());
+    assert!(node.applier().kv_revision().unwrap() > revision_before);
+    assert!(
+        !out.frontend.is_empty(),
+        "the results went to the collector"
+    );
+}
+
+/// Lowering in groups, a proposal goes to the voters only once the flush
+/// has made its own record journal-durable (task-d47).
+///
+/// Nothing before the flush may send it: the record is only queued. A
+/// driver that reported the record durable before journaling it -- a
+/// release moved ahead of its sync -- fails here.
+#[test]
+fn lowering_in_groups_a_proposal_is_held_until_the_flush_that_journals_it() {
+    let boot = BootId([7; 16]);
+    let applier = journaled_applier(boot, r(0));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+
+    for sequence in 1..=2 {
+        let out = node
+            .on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+        assert!(
+            out.peer.is_empty(),
+            "a proposal went out before its own record was journaled"
+        );
+    }
+    // The records wait in the queue, and nothing they justify has been
+    // sent.
+    assert_eq!(node.applier().store().queued(), 2);
+
+    let out = node.flush(&ballot()).expect("flushed");
+    assert_eq!(node.held(), 0, "the flush released every proposal");
+    let to: Vec<ReplicaId> = out.peer.iter().map(|(p, _)| p.replica).collect();
+    assert!(
+        to.contains(&r(1)) && to.contains(&r(2)),
+        "the proposals did not reach the voters: {to:?}"
+    );
 }

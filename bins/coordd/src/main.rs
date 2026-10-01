@@ -1542,6 +1542,10 @@ fn voter(
     voter
         .boot(boot, placed.incarnation)
         .map_err(|e| format!("this voter cannot record its own boot: {e}"))?;
+    // From here a round's batches wait for the loop's flush, and are
+    // lowered with the events after it as one group (task-d47). The boot
+    // record above was lowered on its own.
+    voter.node_mut().lower_in_groups();
     // A campaign that bound its selection and then stopped is not taken
     // up: taking it up would make this replica the proposer of that
     // ballot again, with the same memory loss as above if it had led it

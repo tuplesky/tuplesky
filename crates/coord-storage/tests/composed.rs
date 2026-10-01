@@ -1160,3 +1160,167 @@ fn a_transition_stamped_below_the_fence_is_refused_as_fenced() {
         "{refused:?}"
     );
 }
+
+/// The workload the group tests run: overwrites of three keys, and a
+/// retry of an earlier command, which must resolve from the retained
+/// result whether that command is still in the open group or not.
+fn group_workload() -> Vec<(CommandId, PayloadRecordV1)> {
+    let mut commands: Vec<_> = (1..=10u64)
+        .map(|seq| payload(seq, &put(format!("k{}", seq % 3).as_bytes(), b"v")))
+        .collect();
+    commands.insert(6, commands[2].clone());
+    commands
+}
+
+/// A group of commands applied together gives each the outcome it gets
+/// applied alone, and costs one journal append and one projection
+/// commit (task-d47).
+///
+/// Within the group each command is planned over what the ones before it
+/// wrote, which the projection does not hold yet; nothing of the group
+/// is readable, and nothing is published to watches, until it has
+/// materialized.
+#[test]
+fn a_group_of_commands_lowers_once_and_matches_applying_them_one_at_a_time() {
+    let mut alone = journaled();
+    let one_at_a_time: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| alone.apply(*command, record).expect("applied"))
+        .collect();
+
+    let mut grouped = journaled();
+    let revision_before = grouped.kv_revision().unwrap();
+    let published_before = grouped.hub().published();
+    let cost_before = grouped.store().cost().expect("counted").lowering;
+    assert!(grouped.begin_group());
+    let together: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| grouped.apply(*command, record).expect("applied"))
+        .collect();
+    assert_eq!(grouped.grouped(), 10, "the retry adds no batch");
+    // Decided, and not yet readable.
+    assert_eq!(grouped.kv_revision().unwrap(), revision_before);
+    assert_eq!(grouped.hub().published(), published_before);
+    assert_eq!(
+        grouped.store().cost().expect("counted").lowering,
+        cost_before
+    );
+
+    grouped.finish_group().expect("the group materializes");
+    assert!(!grouped.in_group());
+    let cost = grouped.store().cost().expect("counted").lowering;
+    assert_eq!(cost.appends - cost_before.appends, 1, "one journal append");
+    assert_eq!(
+        cost.commits - cost_before.commits,
+        1,
+        "one projection commit"
+    );
+
+    assert_eq!(together, one_at_a_time);
+    assert_eq!(grouped.kv_revision().unwrap(), alone.kv_revision().unwrap());
+    assert_eq!(grouped.hub().published(), alone.hub().published());
+    assert_eq!(grouped.store().unmaterialized(), 0);
+}
+
+/// A group whose records reached the journal and whose projection commit
+/// never happened is recovered whole from the journal by the next boot:
+/// each command executed once, at the position it took (task-d47).
+#[test]
+fn a_boot_that_ends_between_a_groups_journal_sync_and_its_projection_commit_recovers_the_group() {
+    let mut applier = journaled();
+    assert!(applier.begin_group());
+    let outcomes: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| applier.apply(*command, record).expect("applied"))
+        .collect();
+    let appended = applier
+        .store_mut()
+        .store_mut()
+        .append_pending()
+        .expect("the group reaches the journal");
+    assert_eq!(appended.appends, 1);
+    assert_eq!(appended.journaled, 10, "the whole group in one append");
+    assert_eq!(applier.store().store().unmaterialized(DOMAIN), 10);
+
+    // The boot ends here: the group durable, the projection behind it.
+    let (journal, mut engines): (ModelJournal, Vec<(DomainId, ModelEngine)>) =
+        applier.into_store().into_store().into_parts();
+    let engine = engines.pop().expect("one domain").1;
+    let mut next = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        BootId([0x88; 16]),
+        JournalLimits::default(),
+    )
+    .expect("reopened");
+    next.attach(DOMAIN, ShardId::new(0).unwrap(), engine)
+        .expect("attached");
+    assert_eq!(next.unmaterialized(DOMAIN), 0, "the replay took the group");
+    let base = next.application_base(DOMAIN).expect("attached");
+    let domain = JournaledDomain::new(
+        next,
+        DOMAIN,
+        Ballot {
+            epoch: base.configuration,
+            number: 0,
+            leader: REPLICA,
+        },
+    )
+    .expect("attached");
+    let mut applier =
+        Applier::new(domain, BarrierAllocator::new(inc(), BootId([0x88; 16]))).expect("applier");
+    let revision = applier.kv_revision().unwrap();
+
+    // Every command of the group is there, with the outcome it was
+    // reported with, and presenting it again executes nothing.
+    for ((command, record), outcome) in group_workload().iter().zip(&outcomes) {
+        assert_eq!(&applier.apply(*command, record).expect("retried"), outcome);
+    }
+    assert_eq!(applier.kv_revision().unwrap(), revision);
+    assert_eq!(
+        Some(revision),
+        outcomes.iter().filter_map(|o| o.revision).max()
+    );
+}
+
+/// A projection that refuses a group's commit owes the group, and the
+/// group still finishes: refused is not lost, and no command is planned
+/// again (task-d47).
+#[test]
+fn a_refused_projection_commit_of_a_group_is_redone_not_replanned() {
+    let mut alone = journaled();
+    let one_at_a_time: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| alone.apply(*command, record).expect("applied"))
+        .collect();
+
+    let mut applier = journaled();
+    assert!(applier.begin_group());
+    let together: Vec<_> = group_workload()
+        .iter()
+        .map(|(command, record)| applier.apply(*command, record).expect("applied"))
+        .collect();
+    applier
+        .store_mut()
+        .store_mut()
+        .projection(DOMAIN)
+        .unwrap()
+        .script_commit(CommitScript::DefinitelyNotCommitted);
+    applier
+        .finish_group()
+        .expect("the group materializes after all");
+    assert_eq!(together, one_at_a_time);
+    assert_eq!(applier.kv_revision().unwrap(), alone.kv_revision().unwrap());
+    assert_eq!(applier.store().unmaterialized(), 0);
+}
+
+/// The reference worker's base is its projection's own frontier, so it
+/// does not group: every command lowers as it is applied.
+#[test]
+fn the_reference_worker_applies_one_command_at_a_time() {
+    let mut applier = reference();
+    assert!(!applier.begin_group());
+    assert!(!applier.in_group());
+}

@@ -377,6 +377,11 @@ impl<P: Persistence> Voter<P> {
     /// transitions it refused, so no barrier waits for ever on work the
     /// old ballot can no longer make durable.
     fn fence(&mut self) -> Result<Outbound, DriveError> {
+        // What is queued is lowered first, under the ballot it was made
+        // under, as a node lowering each round would have (task-d47):
+        // the fence refuses only the work of a ballot left behind, and
+        // work this voter made before it promised was not.
+        let mut out = self.node.flush(&self.ballot)?;
         let refused = self
             .node
             .applier_mut()
@@ -387,7 +392,6 @@ impl<P: Persistence> Voter<P> {
             self.fenced_at
                 .map_or(self.ballot, |fence| highest(fence, self.ballot)),
         );
-        let mut out = Outbound::default();
         for event in refused {
             self.fenced += 1;
             out.absorb(self.node.on_storage(event, &self.ballot)?);
@@ -648,6 +652,32 @@ impl<P: Persistence> Voter<P> {
     /// Whether this replica currently leads its ballot.
     pub fn leads(&self) -> bool {
         self.node.machine().leads()
+    }
+
+    /// Lower what this voter's rounds left queued, then apply every
+    /// command whose turn has come, and hand out what that released
+    /// (task-d47, [`Node::flush`]). A runtime lowering in groups calls
+    /// this rather than [`Voter::execute`], once it has no more events
+    /// ready, so the commands that executed in the meantime are one group
+    /// and the protocol's batches lowered beside them.
+    pub fn flush(&mut self) -> Result<Outbound, DriveError> {
+        // The protocol's batches first, so the votes they carry go out
+        // after one journal sync, and not after the execution group's
+        // projection commit as well.
+        let mut out = self.node.flush(&self.ballot)?;
+        out.absorb(self.node.execute(&self.ballot)?);
+        Ok(out)
+    }
+
+    /// Whether [`Voter::flush`] has anything to do: batches queued, or a
+    /// command to apply.
+    pub fn owes_flush(&self) -> bool {
+        self.queued() > 0 || self.node.can_execute()
+    }
+
+    /// Batches this voter submitted and has not lowered yet.
+    pub fn queued(&self) -> usize {
+        self.node.applier().store().queued()
     }
 
     /// Apply every command whose turn has come.
