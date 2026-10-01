@@ -375,6 +375,17 @@ pub struct Follower {
     /// that ballot for ever. Kept, it is installed the moment the promise
     /// is made, which is the order the protocol meant (task-d05).
     early_sync: Option<(ReplicaId, SyncDecision)>,
+    /// A Sync of the promised ballot that arrived while a higher promise
+    /// was still in flight, held until that promise resolves (task-d18).
+    ///
+    /// Installing it then would queue the promise row `{promised: P1,
+    /// synced: P1}` behind the in-flight row `{P3}`; the journal applies
+    /// rows in order, so the durable promise would fall back to P1 after
+    /// this replica told P3's candidate it votes in nothing below P3, and
+    /// a crash would bring it back willing to vote in P1. Held, it is
+    /// installed only if every higher promise's row fails, and dropped
+    /// once one of them is durable.
+    sync_behind_promise: Option<(ReplicaId, SyncDecision)>,
     /// The commit frontier the leader of the current ballot announced:
     /// every proposal of the ballot up to this sequence number is
     /// committed there (task-d09). Reset with the ballot.
@@ -507,6 +518,7 @@ impl Follower {
             rejections: Vec::new(),
             resumed,
             early_sync: None,
+            sync_behind_promise: None,
             leader_committed: None,
             proposal_cursor: 0,
         }
@@ -634,6 +646,7 @@ impl Follower {
             rejections: Vec::new(),
             resumed: None,
             early_sync: None,
+            sync_behind_promise: None,
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
@@ -1027,7 +1040,16 @@ impl Follower {
         }
         let already_synced = self.ballots.synced() == decision.ballot;
         if already_synced && self.config.quorum.ballot() == decision.ballot {
-            // Duplicate Sync of the active ballot: converges without change.
+            // Duplicate Sync of the active ballot: converges without change,
+            // and is not held behind a promise in flight, which would only
+            // report it superseded later.
+            return Vec::new();
+        }
+        if self.ballots.promises_in_flight().iter().any(|p| {
+            p.ballot.compare_same_epoch(&decision.ballot) == Some(core::cmp::Ordering::Greater)
+        }) {
+            // Behind a promise in flight: held, not installed (task-d18).
+            self.sync_behind_promise = Some((from, decision));
             return Vec::new();
         }
         if !already_synced {
@@ -2923,6 +2945,24 @@ impl Follower {
             self.early_sync.take_if(|(_, kept)| kept.ballot == promised)
         {
             out.extend(self.on_sync(leader, decision));
+        }
+        // A Sync held behind a promise in flight: dropped once a higher
+        // promise is durable, installed once every higher one failed.
+        if let Some((_, held)) = &self.sync_behind_promise {
+            let ballot = held.ballot;
+            if promised != ballot {
+                self.sync_behind_promise = None;
+                self.rejections
+                    .push(FollowerRejection::SyncSuperseded(ballot));
+            } else if !self
+                .ballots
+                .promises_in_flight()
+                .iter()
+                .any(|p| p.ballot.compare_same_epoch(&ballot) == Some(core::cmp::Ordering::Greater))
+            {
+                let (leader, decision) = self.sync_behind_promise.take().expect("held");
+                out.extend(self.on_sync(leader, decision));
+            }
         }
         out
     }

@@ -693,8 +693,28 @@ impl BallotState {
         }
         self.synced = ballot;
         Ok(PromiseRecordV1 {
-            promised: self.promised,
+            promised: self.highest_queued(),
             synced: self.synced,
         })
+    }
+
+    /// The highest promise already queued for disk: the durable promise or
+    /// the highest promise in flight, whichever is higher.
+    ///
+    /// Every write of the promise row carries it (task-d18). The journal
+    /// applies rows in the order they were queued, so a row carrying less
+    /// than a row queued before it would lower the durable promise below
+    /// one this replica may already have published. A promise row from
+    /// [`BallotState::on_new_leader`] carries a ballot above this bound by
+    /// construction; a Sync's row carries this bound, so it can never fall
+    /// below a promise in flight. (The seal writes its own row, not this
+    /// one.)
+    pub fn highest_queued(&self) -> Ballot {
+        let bound = self.bound();
+        if bound.compare_same_epoch(&self.promised) == Some(core::cmp::Ordering::Greater) {
+            bound
+        } else {
+            self.promised
+        }
     }
 }
