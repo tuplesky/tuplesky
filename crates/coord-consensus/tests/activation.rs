@@ -2074,6 +2074,70 @@ fn assert_totally_ordered(leader: &Leader, decision: &SyncDecision, commands: &[
     }
 }
 
+/// task-d33 (found by the protocol simulator, row 4, three voters, seed
+/// 11): the selection re-proposes r, which the new leader has already
+/// committed, and carries x accepted after r.
+///
+/// A committed command is not proposed again, and x waited on r's
+/// re-proposal, so x was never proposed and nothing chained after it; y
+/// went on after r. x and y were two branches of one key's order, and a
+/// voter that joined the ballot late executed them the other way round.
+#[test]
+fn an_entry_after_a_command_the_leader_committed_is_in_the_chain() {
+    for executed in [false, true] {
+        let mut c = Cluster::new(3);
+        c.admit(1, 1);
+        c.settle();
+        if !executed {
+            c.no_execute = vec![2];
+        }
+        let r = c.admit(2, 2);
+        c.settle();
+        let (x, y) = (c.admit_at(3, 3, &[2]), c.admit_at(4, 4, &[2]));
+        let new = ballot(1, 2);
+        let decision = SyncDecision {
+            ballot: new,
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::from([(
+                x,
+                coord_consensus::SyncEntry {
+                    command: x,
+                    phase: Phase::Accept,
+                    deps: vec![r],
+                    path: coord_consensus::empty_path(),
+                    paths: Vec::new(),
+                    seqnum: 0,
+                    admission: None,
+                },
+            )]),
+            reproposed: [r, y].into_iter().collect(),
+        };
+        let (leader, _) = Leader::from_recovered(
+            c.nodes[2].role.take().map(role_into_recovered).unwrap(),
+            quorum(new),
+            &decision,
+        );
+        assert!(
+            leader.proposal(&r).is_none(),
+            "executed {executed}: the committed r was proposed again"
+        );
+        let Some(px) = leader.proposal(&x) else {
+            panic!("executed {executed}: x was never proposed")
+        };
+        assert_eq!(
+            px.deps,
+            vec![r],
+            "x keeps the dependencies it was accepted with"
+        );
+        let py = leader.proposal(&y).expect("y re-proposed");
+        assert!(
+            py.deps.contains(&x),
+            "executed {executed}: y ({:?}) does not follow x: two branches after r",
+            py.deps
+        );
+    }
+}
+
 /// The role-independent state of whichever role a node holds.
 fn role_into_recovered(role: Role) -> coord_consensus::RecoveredState {
     match role {
@@ -2567,6 +2631,9 @@ fn a_campaign_supplies_what_its_candidate_executed() {
         Ok(None),
         "nobody supplies x and no majority remains without r2: wait"
     );
+    // The candidate comes to supply x, as a payload or an execution does
+    // (task-d33): the same reports are assembled again.
+    c.supply_moved();
     let decision = c
         .try_select(usize::MAX, |command, _| *command == x)
         .expect("the candidate supplies x")
@@ -4412,6 +4479,49 @@ fn a_report_takes_the_selection_over_an_installation_still_in_flight() {
     assert_eq!(entry.phase, Phase::Accept, "{entry:?}");
 }
 
+/// task-d33 (found by the protocol simulator, row 2, three voters, seed
+/// 12): a command the selection committed is reported as committed while
+/// its installation becomes durable.
+///
+/// Installing it commits it in the table at once. The report left out of
+/// the overlay every command the table had committed, since one this
+/// replica pulled from a later ballot may be decided under other
+/// dependencies (row 5, seed 39); so it reported the durable record from
+/// before the Sync, a pre-acceptance, at the ballot the selection
+/// established. The next selection re-proposed a command already decided,
+/// under other dependencies.
+#[test]
+fn a_report_takes_a_committed_selection_over_an_installation_still_in_flight() {
+    let b1 = ballot(1, 2);
+    let (mut f, x) = follower_with_x_promised(b1);
+    let decision = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(
+            x,
+            coord_consensus::SyncEntry {
+                phase: Phase::Commit,
+                ..selected(x, &[])
+            },
+        )]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    let mut installs = Vec::new();
+    for e in durable_events(&marker) {
+        installs.extend(f.step(e));
+    }
+    assert!(
+        installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "x's installation was queued: {installs:?}"
+    );
+    assert_eq!(f.ballots().synced(), b1);
+    assert!(f.table().phase_of(&x) >= Some(Phase::Commit));
+    let report = f.report(ballot(2, 0));
+    let entry = report.entries.iter().find(|e| e.command == x).unwrap();
+    assert_eq!(entry.phase, Phase::Commit, "{entry:?}");
+}
+
 /// task-d34 (found by the protocol simulator, row 10, three voters, seed
 /// 58): a selected entry whose payload arrives after the Sync row is
 /// reported while its installation becomes durable.
@@ -5716,6 +5826,566 @@ fn bindings_are_bounded_by_the_commands_kept_not_by_history() {
     cluster.settle();
     assert_eq!(cluster.nodes[0].executed.len(), executed);
     assert_eq!(cluster.nodes[0].executed[0], first.unwrap());
+}
+
+/// task-d33 (protocol_sim row 5, three voters, seed 3): a command a
+/// candidate takes in after it cut its own report -- the payload of a
+/// proposal it held arrives while it campaigns -- is in no selection of
+/// that campaign, and every retry finds it initialized and is answered as
+/// a duplicate. The leader the candidate becomes proposes it.
+#[test]
+fn a_command_a_candidate_took_in_after_its_report_is_proposed_when_it_leads() {
+    let mut cluster = Cluster::new(61);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // x reaches the leader alone; r1 holds its proposal without the
+    // payload, and r2 hears nothing of it.
+    cluster.no_fetch = vec![1];
+    cluster.cut = vec![(0, 2)];
+    let x = cluster.admit_at(2, 1, &[0]);
+    cluster.settle();
+    assert_eq!(cluster.nodes[1].follower().table().phase_of(&x), None);
+    let payload = payload_rows(&cluster.nodes[0].storage)
+        .into_iter()
+        .find(|(c, _)| *c == x)
+        .map(|(_, p)| p)
+        .expect("r0 holds x's payload");
+    cluster.crash(0);
+    cluster.cut.clear();
+    cluster.no_fetch.clear();
+
+    // r1 campaigns, cutting its report, and then x's payload arrives.
+    cluster.campaign(1, ballot(1, 1));
+    let effects = cluster.nodes[1].step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: x,
+            payload,
+        },
+    ));
+    cluster.handle(1, effects);
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&x),
+        Some(Phase::PreAccept)
+    );
+    cluster.settle_resending(2);
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    // A retry, as the collector presents it again.
+    cluster.admit_at(2, 1, &[1, 2]);
+    cluster.settle_resending(2);
+    for i in [1usize, 2] {
+        assert_eq!(
+            cluster.nodes[i].executed,
+            vec![a, x],
+            "node {i} did not execute what the candidate took in"
+        );
+    }
+}
+
+/// task-d33 (protocol_sim row 14, three voters, seeds 3 and 5): a
+/// follower that took one presentation of an identity first adopts the
+/// leader's proposal of another under the same identity. First
+/// presentation wins at the leader; refused here as an identity conflict,
+/// the payload never arrived and nothing after the proposal executed.
+#[test]
+fn a_follower_takes_the_leaders_presentation_of_an_identity_it_bound_otherwise() {
+    let mut cluster = Cluster::new(67);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // One retry key, two requests: r2 takes the first, the leader the
+    // second.
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    assert_ne!(mine, theirs);
+    cluster.settle_resending(3);
+    let next = cluster.admit(6, 1);
+    cluster.settle_resending(3);
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, vec![a, theirs, next], "node {i}");
+    }
+}
+
+/// The binding the leader's presentation took over survives a restart
+/// (task-d33). Both payload rows stay under the one retry key, and a
+/// restart used to bind the key to whichever command sorted last: when
+/// that was the displaced one, exact retries of the leader's command
+/// were refused as another command's.
+#[test]
+fn a_binding_taken_over_for_the_leaders_presentation_survives_a_restart() {
+    let mut cluster = Cluster::new(67);
+    cluster.admit(1, 1);
+    cluster.settle();
+    cluster.no_execute = vec![2];
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    cluster.settle_resending(3);
+    assert!(
+        mine > theirs,
+        "the displaced presentation sorts last, as a restart used to bind"
+    );
+    assert!(
+        cluster.nodes[2]
+            .follower()
+            .table()
+            .phase_of(&theirs)
+            .is_some_and(|p| p >= Phase::Commit),
+        "r2 took the leader's presentation over"
+    );
+    cluster.crash(2);
+    cluster.revive(2, quorum(ballot(0, 0)));
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[2]);
+    cluster.settle();
+    let refused: Vec<_> = cluster
+        .frontend
+        .iter()
+        .filter(|(from, m)| {
+            *from == r(2)
+                && matches!(
+                    m,
+                    ProtocolMessage::Refused {
+                        refusal: coord_consensus::SubmissionRefusal::OtherCommand { .. },
+                        ..
+                    }
+                )
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "an exact retry of the leader's command was refused as another's: {refused:?}"
+    );
+}
+
+/// task-d33 (#131, protocol_sim row 14, three voters, seed 0): a voter
+/// that executed a command and retired it inside the window, its retry
+/// key left unbound, refuses a re-offer of it as history. The key was
+/// unbound because the restart found two executed presentations under it
+/// (the second executed as the identity refusal), and with no binding and
+/// no record the command was initialized again as new work, and decided a
+/// second time with other dependencies.
+#[test]
+fn an_executed_command_retired_with_its_key_unbound_is_not_taken_again() {
+    let mut cluster = Cluster::with_capacity(71, 8);
+    cluster.admit(1, 1);
+    cluster.settle();
+    // r2 takes one presentation under retry key 5, the leader another.
+    let mine = cluster.admit_at(5, 2, &[2]);
+    let theirs = cluster.admit_at(5, 3, &[0]);
+    cluster.settle_resending(3);
+    // The leader dies; r2 leads and re-proposes its own presentation.
+    cluster.crash(0);
+    let b1 = ballot(1, 2);
+    cluster.campaign(2, b1);
+    cluster.settle_resending(4);
+    for c in [mine, theirs] {
+        assert!(cluster.nodes[1].executed.contains(&c), "r1 executed both");
+    }
+    // r1 restarts into a tie under the key, and executes more work.
+    cluster.crash(1);
+    cluster.revive(1, quorum(b1));
+    cluster.settle_resending(2);
+    for n in 0..6u8 {
+        cluster.admit_at(20 + u64::from(n), 40 + n, &[1, 2]);
+        cluster.settle_resending(2);
+    }
+    let table = cluster.nodes[1].follower().table();
+    assert!(table.record(&theirs).is_none(), "r1 retired it");
+    assert!(!table.forgotten(&theirs), "inside the window");
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[1]);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .table()
+            .record(&theirs)
+            .is_none(),
+        "r1 took an executed command again as new work"
+    );
+    assert!(
+        cluster.frontend.iter().any(|(from, m)| *from == r(1)
+            && matches!(
+                m,
+                ProtocolMessage::Refused {
+                    command,
+                    refusal: coord_consensus::SubmissionRefusal::Forgotten,
+                    ..
+                } if *command == theirs
+            )),
+        "{:?}",
+        cluster.frontend
+    );
+    // The same as the leader it becomes: the simulator found it there.
+    cluster.campaign(1, ballot(2, 1));
+    cluster.settle_resending(3);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    assert!(l.table().record(&theirs).is_none());
+    cluster.frontend.clear();
+    cluster.admit_at(5, 3, &[1]);
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_ref() else {
+        panic!("r1 did not lead");
+    };
+    assert!(
+        l.table().record(&theirs).is_none(),
+        "the leader proposed an executed command again"
+    );
+    // Its own rejection, so a trace tells the refusal from an evidence
+    // repair (review).
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_mut() else {
+        panic!("r1 did not lead");
+    };
+    let rejections = l.take_rejections();
+    assert!(
+        rejections.contains(&coord_consensus::Rejection::Forgotten(theirs)),
+        "{rejections:?}"
+    );
+    assert!(
+        !rejections.contains(&coord_consensus::Rejection::Duplicate(theirs)),
+        "{rejections:?}"
+    );
+}
+
+/// task-d33 (protocol_sim row 4, five voters, seed 6): a Sync that
+/// releases a command whose row is still being written deletes that row
+/// too. The deletion used to follow only a durable row: the installation
+/// of an earlier Sync's entry, written after the release was decided,
+/// became durable beside the marker, and every later report named an
+/// acceptance the Sync had released, as a dependency no selection could
+/// satisfy.
+#[test]
+fn a_released_command_whose_row_was_in_flight_is_not_reported() {
+    let mut cluster = Cluster::new(73);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // x reaches r0 alone.
+    cluster.cut = vec![(0, 1), (0, 2)];
+    let x = cluster.admit_at(2, 1, &[0]);
+    cluster.settle();
+    cluster.cut.clear();
+    let payload = payload_rows(&cluster.nodes[0].storage)
+        .into_iter()
+        .find(|(c, _)| *c == x)
+        .map(|(_, p)| p)
+        .expect("r0 holds x's payload");
+    let step = |cluster: &mut Cluster, from: u8, message: ProtocolMessage| {
+        cluster.nodes[1].step(peer_event(r(from), message))
+    };
+
+    // r1 synchronizes ballot 1, whose selection holds x at ACCEPT; x's
+    // payload has not reached it.
+    let b1 = ballot(1, 0);
+    let effects = step(
+        &mut cluster,
+        0,
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: ExecutionPosition::ZERO,
+        },
+    );
+    cluster.handle(1, effects);
+    let entry = coord_consensus::SyncEntry {
+        command: x,
+        phase: Phase::Accept,
+        deps: vec![a],
+        path: Digest32([7; 32]),
+        paths: Vec::new(),
+        seqnum: 0,
+        admission: None,
+    };
+    let effects = step(
+        &mut cluster,
+        0,
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: b1,
+            source_ballot: ballot(0, 0),
+            entries: [(x, entry)].into_iter().collect(),
+            reproposed: BTreeSet::new(),
+        }),
+    );
+    cluster.handle(1, effects);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b1);
+
+    // It reports x for ballot 2, whose selection leaves x out.
+    let b2 = ballot(2, 2);
+    let effects = step(
+        &mut cluster,
+        2,
+        ProtocolMessage::NewLeader {
+            ballot: b2,
+            executed: ExecutionPosition::ZERO,
+        },
+    );
+    cluster.handle(1, effects);
+    assert!(
+        cluster.nodes[1]
+            .follower()
+            .report(b2)
+            .entries
+            .iter()
+            .any(|e| e.command == x)
+    );
+    // x's payload arrives and ballot 1's entry installs; before its rows
+    // are durable, ballot 2's Sync releases x.
+    let installed = step(
+        &mut cluster,
+        0,
+        ProtocolMessage::PayloadResponse {
+            command: x,
+            payload,
+        },
+    );
+    assert_eq!(
+        cluster.nodes[1].follower().table().phase_of(&x),
+        Some(Phase::Accept)
+    );
+    let marker = step(
+        &mut cluster,
+        2,
+        ProtocolMessage::Sync(SyncDecision {
+            ballot: b2,
+            source_ballot: ballot(0, 0),
+            entries: BTreeMap::new(),
+            reproposed: BTreeSet::new(),
+        }),
+    );
+    cluster.handle(1, installed);
+    cluster.handle(1, marker);
+    assert_eq!(cluster.nodes[1].follower().quorum().ballot(), b2);
+
+    let report = cluster.nodes[1].follower().report(ballot(3, 1));
+    assert!(
+        !report
+            .entries
+            .iter()
+            .any(|e| e.command == x && e.phase >= Phase::Accept),
+        "a released acceptance is reported: {:?}",
+        report.entries.iter().find(|e| e.command == x)
+    );
+    assert!(
+        !dependency_rows(&cluster.nodes[1].storage)
+            .iter()
+            .any(|(c, record)| *c == x && record.phase >= Phase::Accept),
+        "a released acceptance is durable"
+    );
+}
+
+/// task-d33: a voter the campaign missed -- cut off while it ran -- is
+/// asked to promise the new ballot by the leader's re-send, is answered
+/// with the Sync, and follows. Nothing else ever told it of the ballot:
+/// the leader's proposals are foreign to it, and a quiet domain sends it
+/// nothing at all.
+#[test]
+fn a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut = vec![(0, 2), (2, 0), (1, 2), (2, 1)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    cluster.cut.clear();
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
+/// task-d33: a voter the campaign missed, whose Sync from the leader was
+/// lost, is asked again and sent the Sync again. The leader used to count
+/// it as following once it promised: nothing asked it again, and it held
+/// every proposal of the ballot, promised and never synchronized.
+#[test]
+fn a_late_voter_whose_sync_was_lost_is_sent_it_again() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut = vec![(0, 2), (2, 0), (1, 2), (2, 1)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    cluster.cut.clear();
+    cluster.drop_sync = vec![(1, 2)];
+    cluster.settle_resending(2);
+    let ballots = cluster.nodes[2].follower().ballots();
+    assert_eq!(ballots.promised(), b1, "r2 promised the late ask");
+    assert_ne!(ballots.synced(), b1, "and its Sync was lost");
+    cluster.drop_sync.clear();
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
+/// task-d33: a voter that promised during the campaign, whose Sync was
+/// lost, is asked again and sent the Sync again. The leader used to seed
+/// its followers with every voter the campaign heard from: nothing asked
+/// this one again, and it held every proposal of the ballot, promised and
+/// never synchronized, until the next election. A voter that installed
+/// the Sync and has nothing to vote on yet ignores the ask, refusing
+/// nothing.
+#[test]
+fn a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again() {
+    let mut cluster = Cluster::new(83);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.drop_sync = vec![(1, 2)];
+    let b1 = ballot(1, 1);
+    cluster.campaign(1, b1);
+    cluster.settle();
+    assert!(matches!(cluster.nodes[1].role, Some(Role::Leader(_))));
+    let ballots = cluster.nodes[2].follower().ballots();
+    assert_eq!(ballots.promised(), b1, "r2 promised during the campaign");
+    assert_ne!(ballots.synced(), b1, "and its Sync was lost");
+    assert_eq!(cluster.nodes[0].follower().ballots().synced(), b1);
+    cluster.drop_sync.clear();
+    cluster.settle_resending(2);
+    assert_eq!(cluster.nodes[2].follower().ballots().synced(), b1);
+    for i in [0, 2] {
+        let refused = cluster.nodes[i].follower_mut().take_rejections();
+        assert!(
+            !refused
+                .iter()
+                .any(|e| matches!(e, FollowerRejection::Promise(_))),
+            "r{i} refused the leader's ask: {refused:?}"
+        );
+    }
+    let y = cluster.admit(2, 1);
+    cluster.settle_resending(4);
+    assert_eq!(cluster.nodes[2].executed, vec![a, y]);
+}
+
+/// task-d33: a voter's own campaign for a ballot it no longer holds is
+/// dropped when it promises another voter's higher one. Kept, it stood
+/// in for a campaign in progress, and a voter holding one takes no
+/// catch-up page.
+#[test]
+fn a_campaign_superseded_by_a_promise_is_dropped() {
+    let mut cluster = Cluster::new(89);
+    cluster.admit(1, 1);
+    cluster.settle();
+    cluster.cut = vec![(2, 0), (2, 1)];
+    cluster.campaign(2, ballot(1, 2));
+    assert!(cluster.nodes[2].follower().campaign_state().is_some());
+    let effects = cluster.nodes[2].step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(2, 1),
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    cluster.handle(2, effects);
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(2, 1)
+    );
+    assert!(cluster.nodes[2].follower().campaign_state().is_none());
+}
+
+/// task-d33: a voter that promises a leader which executed past it knows
+/// there is history to fetch, whether or not it holds any of it. It used
+/// to hold nothing, ask for nothing, and stay behind once the domain went
+/// quiet.
+#[test]
+fn a_promise_to_a_leader_ahead_leaves_history_to_fetch() {
+    let mut cluster = Cluster::new(97);
+    cluster.admit(1, 1);
+    cluster.settle();
+    assert!(!cluster.nodes[2].follower().holds_unexecuted());
+    let effects = cluster.nodes[2].step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 1),
+            executed: ExecutionPosition::new(5).unwrap(),
+        },
+    ));
+    cluster.handle(2, effects);
+    assert_eq!(
+        cluster.nodes[2].follower().ballots().promised(),
+        ballot(1, 1)
+    );
+    assert!(cluster.nodes[2].follower().holds_unexecuted());
+}
+
+/// task-d33: a waiting campaign assembles its reports again only when
+/// something it selects from moved -- another report completed, or a
+/// payload or an execution arrived. It is asked on every page, promise
+/// and payload, and assembled every time, the same reports gave the same
+/// wait at a cost that grew with them.
+#[test]
+fn a_waiting_campaign_assembles_again_only_when_something_moved() {
+    let config = quorum(ballot(4, 1));
+    let x = CommandId(Digest32([0x79; 32]));
+    let d = CommandId(Digest32([0x7a; 32]));
+    let report = |replica, entries| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(3, 0),
+        entries,
+    };
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(1), vec![]));
+    let behind = report(
+        r(2),
+        vec![coord_consensus::ReportEntry {
+            command: x,
+            phase: Phase::Accept,
+            deps: vec![d],
+            path: coord_consensus::empty_path(),
+            paths: Vec::new(),
+            seqnum: 1,
+            keys: Vec::new(),
+            payload_present: false,
+            admission: None,
+        }],
+    );
+    c.promise(r(2));
+    for page in coord_consensus::paginate(&behind, 64) {
+        c.page(page).unwrap();
+    }
+    for _ in 0..5 {
+        assert_eq!(c.try_select(usize::MAX, |_, _| false), Ok(None));
+    }
+    assert_eq!(c.assemblies(), 1, "nothing moved, nothing assembled");
+    c.supply_moved();
+    assert_eq!(c.try_select(usize::MAX, |_, _| false), Ok(None));
+    assert_eq!(c.assemblies(), 2);
+    assert_eq!(c.supply_moves(), 1);
+}
+
+/// task-d33: a candidate whose table is full takes in the payloads its
+/// own selection is waiting on. Refused for backpressure, the campaign
+/// waited on them for ever, and a domain whose voters all held full
+/// tables elected no one.
+#[test]
+fn a_candidate_with_a_full_table_takes_its_selections_payloads() {
+    let capacity = 4;
+    let mut cluster = Cluster::with_capacity(101, capacity);
+    let a = cluster.admit(1, 1);
+    cluster.settle();
+    // x is decided by r0 and r2 while r1 hears nothing of it...
+    cluster.cut = vec![(0, 1), (2, 1)];
+    let x = cluster.admit_at(2, 1, &[0, 2]);
+    cluster.settle();
+    cluster.cut.clear();
+    assert_eq!(cluster.nodes[2].executed, vec![a, x]);
+    // ... and r1's table fills with work only it holds.
+    for seq in 0..capacity as u64 {
+        cluster.cut = vec![(1, 0), (1, 2)];
+        cluster.admit_at(10 + seq, 2, &[1]);
+    }
+    cluster.cut.clear();
+    assert!(cluster.nodes[1].follower().table().len() >= capacity);
+    cluster.crash(0);
+    cluster.campaign(1, ballot(1, 1));
+    cluster.settle_resending(3);
+    assert!(
+        matches!(cluster.nodes[1].role, Some(Role::Leader(_))),
+        "the candidate never bound its selection"
+    );
+    assert_eq!(&cluster.nodes[1].executed[..2], &[a, x]);
 }
 
 /// task-d20 review: nothing installs while a newer Sync's marker is still

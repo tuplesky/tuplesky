@@ -176,6 +176,16 @@ impl DurableLedger {
         self.records.get(command)
     }
 
+    /// Whether `command` has a durable record or one in a batch still in
+    /// flight: a deletion has to follow either (task-d33).
+    pub fn written(&self, command: &CommandId) -> bool {
+        self.records.contains_key(command)
+            || self
+                .staged
+                .values()
+                .any(|batch| batch.iter().any(|(c, _)| c == command))
+    }
+
     /// Every durable record.
     pub fn records(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
         self.records.iter()

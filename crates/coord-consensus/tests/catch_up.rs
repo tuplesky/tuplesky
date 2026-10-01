@@ -1145,3 +1145,83 @@ fn every_restored_commit_is_compared_however_many_pages_it_takes() {
         &cluster.catch_up_asks[asked..]
     );
 }
+
+/// task-d33 (protocol_sim row 5, three voters, seed 39): a voter whose
+/// synchronized selection held x at ACCEPT, and which then pulled x's
+/// decision with other dependencies, reports the decision. With the
+/// selection overlaid on it, the report presented the selection's
+/// acceptance as this voter's commit, and the next selection found two
+/// decisions of x.
+#[test]
+fn a_pulled_decision_is_reported_over_the_selection_the_voter_held() {
+    let mut cluster = Cluster::new(71, 32);
+    cluster.down = vec![4];
+    let a = cluster.admit(1);
+    let x = cluster.admit(2);
+    cluster.settle();
+    cluster.down.clear();
+    let decided = cluster
+        .dependency_rows(0)
+        .into_iter()
+        .find(|(c, _)| *c == x)
+        .map(|(_, record)| record.deps)
+        .expect("r0 decided x");
+    assert!(!decided.is_empty());
+
+    // r4 synchronizes a ballot whose selection holds x at ACCEPT with no
+    // dependencies.
+    let b1 = Ballot {
+        number: 1,
+        ..ballot0()
+    };
+    cluster.deliver(
+        4,
+        r(0),
+        ProtocolMessage::NewLeader {
+            ballot: b1,
+            executed: ExecutionPosition::ZERO,
+        }
+        .encode(),
+    );
+    let decision = coord_consensus::SyncDecision {
+        ballot: b1,
+        source_ballot: ballot0(),
+        entries: [(
+            x,
+            coord_consensus::SyncEntry {
+                command: x,
+                phase: Phase::Accept,
+                deps: Vec::new(),
+                path: Digest32([7; 32]),
+                paths: Vec::new(),
+                seqnum: 0,
+                admission: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        reproposed: Default::default(),
+    };
+    cluster.deliver(4, r(0), ProtocolMessage::Sync(decision).encode());
+    assert_eq!(cluster.follower(4).quorum().ballot(), b1);
+
+    // It pulls x's decision and executes it.
+    let page = cluster.page(0, b1, ExecutionPosition::ZERO);
+    cluster.deliver_page(4, 0, &page);
+    cluster.execute_at_most(4, 2);
+    assert_eq!(cluster.nodes[4].executed, vec![a, x]);
+    let report = cluster.follower(4).report(Ballot {
+        number: 2,
+        ..ballot0()
+    });
+    let entry = report
+        .entries
+        .iter()
+        .find(|e| e.command == x)
+        .expect("x is reported");
+    assert!(entry.phase >= Phase::Commit);
+    assert_eq!(
+        entry.deps, decided,
+        "the selection's acceptance was reported"
+    );
+}

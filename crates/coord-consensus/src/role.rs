@@ -74,4 +74,9 @@ pub struct RecoveredState {
     /// the durable Sync row, so the entries install at the selected facts
     /// and every report names them.
     pub synced_selection: Option<crate::recovery::SyncDecision>,
+    /// Commands this replica took in after its campaign cut its own
+    /// report, still only pre-accepted here: no selection of that
+    /// campaign can name them, so the leader it becomes proposes them
+    /// (task-d33).
+    pub arrived: BTreeSet<CommandId>,
 }

@@ -2506,11 +2506,50 @@ outside it looked exactly like a domain that had stopped accepting
 sessions, which is why it took a counter to see.
 
 The bias is a budget now: after `PEER_BEFORE_API` consecutive peer
-events the caller's plane is polled first for one turn. 64 is high
+events the caller's plane is polled first for one turn. 8 is high
 enough that the ordering still holds for the case it is for -- a burst
 of votes for one command, a recovery summary -- and low enough that a
 caller waits for a bounded number of frames rather than for the domain
 to go quiet.
+
+It was 64 until task-d33, and a bound is not the only thing the number
+sets: it is also the caller's plane's *share* while the peer plane never
+goes quiet, one event in `PEER_BEFORE_API + 1`. A replica catching up
+keeps it busy for a minute at a time. Counted per second in
+`a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+under load, one voter took 200 to 400 peer events a second and 2 to 7 of
+its callers', where the other two took 40 to 80. That plane carries more
+than callers: it is where the other frontends' collectors submit and
+where the evidence for this node's own collector comes back. So a
+caller's request sat 36 seconds in the transport before the loop read it,
+and evidence the other voters sent in 150 ms reached the collector 28
+seconds later; the answer came just after the caller's 45 seconds. Four
+copies at a time on four cores, the test failed 8 runs of 28 at 64 and
+none of 20 at 8, and the runs finished in 73 to 87 seconds rather than 85
+to 104.
+
+Most of what kept that plane busy was the leader asking again for what
+it already had. `resend_unvoted` (task-d07) sent every voter its first
+16 unadopted proposals, with the leader's own adoption of each, on every
+call of `coordd`'s 250 ms timer, and a voter that is behind -- or whose
+adoptions are queued behind this leader's own work -- lacks the same 16
+on every call. Each came back as an adoption the leader refused as a
+duplicate: 4096 to 16383 of them in the leader's log in the runs that
+failed, in CI and locally, and a follower that had kept no evidence
+adopted the proposal again and wrote the row again. The leader's control
+lane to the voter that was behind filled, and what it dropped then was
+the fresh proposals and commits that would have let that voter catch up:
+a loop that feeds itself, which is why the test's time on CI is bimodal,
+44 to 62 seconds on four runs and 117 and 123 on two. The gap between
+two re-sends of one proposal to one voter now doubles, from one call to
+`RESEND_BACKOFF_CAP` (4), and the window is still the first 16 so that a
+proposal waiting out its gap does not hand its place to a later one. The
+first re-send is as prompt as before, and 4 calls is one second, which
+is `STILL_FOR`: a proposal that really was lost is sent again before its
+voter decides it is stuck and fetches a peer's executed history on the
+bulk lane. A cap of 16 did that once in 8 runs. Two copies of each build
+at a time on four cores, 8 runs each, the runs finished in 100 to 107
+seconds against 109 to 120 for the build without it, every round.
 
 On the same sequence of eleven rows against one standing domain:
 
@@ -4552,6 +4591,7 @@ Negative controls, each run and failing:
   current leader never proposed gets no answer to the ask, and waits for
   the next Sync. The ask keeps naming it, within its bound.
 - **Rate.** Repair is still task-d07's 16 proposals per voter per 250 ms,
+  each re-sent with a doubling gap of up to four calls since task-d33,
   and payloads 8 per ask from the leader alone. task-d10 makes both
   flow-controlled.
 - **A voter behind the leader's retention** has no path back without a
@@ -7586,3 +7626,277 @@ section ends with the conditional argument for why the work completes.
   stop surviving restart; the rest of that is task-d13's. O10's two
   owed halves are named: task-d27's second part for the stop, task-d32
   for the return.
+
+## What the simulator's budget and progress oracles found
+
+task-d33 gives the protocol simulator two new oracles. One checks each
+node's resource budgets every step. The other stops the faults and gives
+the domain a bounded number of synchronous rounds to settle everything it
+admitted. Built as the plan asked, with no production change beyond hooks,
+they failed on the tree as it stood. The fixes are here, each with a unit
+test that fails without it; the oracles and the new rows follow on top.
+Seeds are `row, voters, seed` of `protocol_sim`.
+
+### Safety: what a selection keeps as possibly learned fast
+
+Five of these were two dependency sets for one command: the frontend
+learned it fast, and a later selection re-proposed it with other
+dependencies. One was `IncompatibleAccepted`.
+
+- **An ancestor pre-accepted on the member's own path** (14,3,10). The
+  candidate check dropped a command whose member held an adopted ancestor
+  under another path than the leader's. A leader synchronization re-bases
+  the member's log after that ancestor, while its record keeps the path it
+  was pre-accepted with. So a member whose path for the candidate is the
+  leader's can hold an ancestor under another path, and that is no
+  evidence either way. Only the order counts: the ancestor is in the
+  member's closure.
+  `a_candidate_is_kept_when_its_member_pre_accepted_an_ancestor_on_its_own_path`.
+- **A held command before one the member retired** (14,3,79; also 12,3,9).
+  The member's closure of the candidate stops at a command it executed and
+  retired. A conflicting command it still holds, which the selection orders
+  before the retired one, was in neither the closure nor after the
+  candidate, so the candidate was dropped. That command was executed there
+  before the retired one, so before the candidate. The rule that already
+  covered such a command when the member no longer held it
+  (`forgotten_before`, task-d34) now covers it held too.
+  `a_candidate_is_kept_when_a_held_command_precedes_one_its_member_retired`.
+- **A dependency no ballot decided** (4,3,85; 10,3,31). The leader
+  proposes x with the dependencies it knows, decided or not, and a fast
+  quorum decides x with them. In 4,3,85 the source leader had re-proposed
+  f, and no quorum accepted it; in 10,3,31, d was accepted by the leader
+  alone. The rule that every command of the candidate's closure be
+  decided, from task-28, dropped x. An undecided command in that closure
+  no longer does, when x's own dependencies, followed through what the
+  selection keeps (and past an undecided command, through the member's
+  record of it), reach it: the selection re-proposes it and orders x
+  after it (task-d34's re-proposal chain).
+  `a_candidate_is_kept_over_a_dependency_a_sync_demoted`.
+- **A member's stale record of an undecided command** (10,3,31). The
+  source leader accepted d after an adopted command a, while the member
+  kept its own pre-acceptance of d, which names nothing. Walked over the
+  member's records, x's closure missed a, and x was dropped. A candidate
+  that follows a command this selection re-proposes now counts as ordered
+  after an adopted command that follows no re-proposal itself: the
+  re-proposals are chained after the recovered order, and x after them.
+  An adopted command that waits on a re-proposal too counts only if x's
+  own dependencies, through what the selection keeps, reach it; else only
+  a command with no conflict passes. Counting every adopted command kept
+  a candidate that no ballot decided (2,3,3), and two conflicting commands
+  then followed the same re-proposal unordered. Reading the member's
+  records for such a command did the same (3,3,70; 1,5,14): the order
+  they give runs through the undecided command, which is re-proposed under
+  other dependencies.
+  `a_candidate_after_an_undecided_command_is_kept_over_the_members_stale_record`,
+  `a_candidate_is_not_ordered_after_an_adopted_command_that_waits_on_the_same_reproposal`.
+- **A dependency the member retired past its window** (12,3,9, once
+  retirement went in execution order, below). x was decided fast after
+  f, which the member had executed and retired longer ago than its report
+  names, so no report held f and the rule that x's closure be decided
+  dropped x. A member at the source ballot has released nothing (only a
+  later Sync releases) and pre-accepts only after commands it holds, so a
+  command in its closure that it no longer holds is history there, before
+  x. `a_candidate_after_a_command_its_member_retired_past_the_window_is_kept`.
+- **A candidate judged before the one it follows was dropped** (10,3,31,
+  in the other order). The rule dropped candidates one at a time, in the
+  order their identities sort. x, judged while d was still a candidate,
+  failed on the member's stale record of d and was dropped for good; d
+  was dropped after it, and x would then have passed. Each pass now
+  judges every candidate against the same set and drops first the
+  failing ones that follow no other failing candidate; a set of failing
+  candidates that all follow one another goes together. The test above
+  runs both orders.
+- **An adopted command ordered after a candidate through another
+  candidate** (#130 review). With x a candidate after w, y a candidate
+  after x and a adopted after y, the rule asked whether the selection
+  orders a after x through the adopted entries alone. It stopped at y and
+  judged x against a as if a came first, and x was dropped with y after
+  it. It now follows the dependencies of the candidates still kept too: a
+  kept candidate is selected with the dependencies it was reported with,
+  and each pass judges every candidate against the candidates that pass
+  keeps, so the order read through one is the order the selection ends
+  with. `a_command_adopted_after_a_candidate_follows_what_that_candidate_follows`.
+- **A member's order read through its stale record of a decided
+  command** (10,5,67, found under #131's oracles). The member had
+  pre-accepted d after a, and c after d; the selection committed d after
+  w and adopted a after d. Over the member's records, c's closure reached
+  a through d, so a passed as ordered before c. But d executes after w,
+  not after a: the selection kept c after d beside a after d, two
+  commands of one key that neither orders, and two voters executed them
+  in different orders. Whether an adopted command precedes the candidate
+  is now read over the member's records except through a command the
+  selection holds, which is followed by the selection's dependencies. The
+  member's own closure stays the evidence of its path, for the rule that
+  the candidate's closure be decided: a stale record there still shows
+  that the member's path is not the leader's.
+  `a_candidate_is_not_ordered_after_an_adopted_command_through_a_stale_record`.
+- **A report that overlaid its selection on a decision** (5,3,39). A voter
+  synchronized at a selection holding x at ACCEPT then pulled x's decision
+  of a later ballot, with other dependencies. Its report overlaid the
+  selection on the record and, since x was executed, reported the
+  selection's acceptance as its commit. The next selection found two
+  decisions of x. The overlay now leaves out a command the replica has
+  committed under other dependencies than the selection's.
+  `a_pulled_decision_is_reported_over_the_selection_the_voter_held`
+  (`catch_up`).
+- **A report that left out a commit its own selection made** (2,3,12).
+  Leaving out every committed command was too wide. Installing a
+  selection commits its committed entries in the table at once. The
+  ledger keeps the record from before the Sync until the installation's
+  row is durable. A deposed candidate promised the next ballot in that
+  window and reported the pre-acceptance at the ballot its own selection
+  had established. The next selection re-proposed two commands it had
+  committed, and chained a third after one of them: two decisions at one
+  position. A command committed under the selection's own dependencies is
+  overlaid again.
+  `a_report_takes_a_committed_selection_over_an_installation_still_in_flight`.
+
+### Safety: an executed command taken again as new work
+
+- **A retired command under an unbound key** (14,3,0, found once the
+  progress oracle re-offered what its collector could not yet answer,
+  #131 review). A voter that executed two presentations under one retry
+  key, the second as the identity refusal, restarted into a tie and left
+  the key unbound. A reclaim then retired the command inside the window.
+  A re-offer of it found no binding, no record and a command not yet
+  `forgotten`, so the leader initialized it as new work and proposed it:
+  the frontend learned it a second time, after other dependencies.
+  Admission now refuses every command the table retired, forgotten or
+  inside the window (`CommandTable::retired`), as `Forgotten`, on the
+  leader and the follower alike.
+  `an_executed_command_retired_with_its_key_unbound_is_not_taken_again`,
+  which fails on either path with its guard reverted.
+
+### Safety: an order the new leader forked
+
+- **An entry after a command the leader committed** (4,3,11 of task-d30's
+  row 4; it showed only once a voter the campaign missed could join the
+  ballot). The selection re-proposed r, which the new leader had already
+  committed, and carried x accepted after r. An entry after a re-proposed
+  command waits for that command's re-proposal (task-d34), but a
+  committed command is not proposed again. So x was never proposed, and
+  the re-proposals chained after r without it: two branches of one key's
+  order. The voters that held both commits executed them in one order.
+  The late voter had only one of them committed, and executed it first.
+  An entry now waits only on a re-proposed command the leader has not
+  committed. `an_entry_after_a_command_the_leader_committed_is_in_the_chain`.
+
+### Safety: a report that left out what its replica had just executed
+
+- **Retirement in identity order** (3,3,22). A deposed leader reclaimed
+  more executed records at once than the window its report names: records
+  let in past the table's capacity, and a recovery's reserve, make that
+  possible. They retired in the order their identities sort, so a command
+  it had executed a moment before went into the window and out of it in
+  the same reclaim, and its report left it out as history. The candidate,
+  far behind, still held it pre-accepted, re-proposed it, and the voters
+  executed two decisions of one command. A replica refuses a candidate
+  behind it only once it has executed a table's capacity of commands
+  past it (task-d10), and the window has to count the same thing: a
+  reclaim now retires in the order the commands executed.
+  `a_reclaim_retires_in_the_order_commands_executed` (`graph`).
+
+### Progress: work admitted and never finished
+
+- **A command a candidate took in after cutting its report** (5,3,3; also
+  5,3,9, 4,3,3 and 12,3,7). A proposal's payload arrived while its holder
+  campaigned. It was pre-accepted and fenced from any acknowledgement, and
+  it is in no selection of that campaign. Every retry then found it
+  initialized and was answered as a duplicate, so nothing ever proposed
+  it. The leader the candidate becomes now proposes what arrived after its
+  own report (`RecoveredState::arrived`) after the recovered order.
+  `a_command_a_candidate_took_in_after_its_report_is_proposed_when_it_leads`.
+- **An identity bound to another presentation** (14,3,5 and 14,3,3; also
+  14,5,3 and 14,5,4). A follower that took one request under a retry key
+  first refused, as an identity conflict, the payload of the leader's
+  proposal of another request under the same key. The proposal, and
+  everything after it, waited for ever. The same happened to a campaign's
+  own selection. First presentation wins at the leader: a payload fetched
+  for a proposal, a Sync entry or the campaign's selection now takes the
+  binding over. `a_follower_takes_the_leaders_presentation_of_an_identity_it_bound_otherwise`.
+  Both payload rows stay under the key, so a restart binds the key to the
+  command the table holds furthest along, and leaves a tie unbound for
+  the next exact presentation to bind; it used to bind whichever command
+  sorted last.
+  `a_binding_taken_over_for_the_leaders_presentation_survives_a_restart`.
+  A takeover removes a binding whatever phase its command is at, so
+  consensus can decide a second presentation under a key whose first
+  already executed: at three voters, A took d first, the leader's c
+  displaced it and executed, the leader died, A's report re-proposed d,
+  and C's takeover displaced k→c for d's payload. What keeps "at most the
+  first presentation" is the retry row at execution: `retry::admit`
+  finds the key's record naming c and answers `Conflict`, so d executes
+  as the identity refusal (`RetryConflict`, the outcome task-d22
+  settles on). The cost is a decided-then-refused command. Displacing
+  only a binding whose command is below COMMIT, and skipping such a
+  re-proposal, would save that round and is left for later: the refusal
+  at execution is the guarantee either way. A tie left unbound after a
+  restart likewise admits a third payload under the key as a new command
+  (it used to be refused as `OtherCommand`), which the retry row refuses
+  at execution the same way. It must not admit either executed
+  presentation again, which the next section's guard ensures.
+- **A release that missed a row in flight** (4,5,6). A Sync deleted the
+  row of a command it released only if the row was already durable. The
+  installation of an earlier Sync's entry, written after the release was
+  decided, became durable beside the marker. Every later report named that
+  acceptance, as a dependency no selection carried, and every campaign
+  stopped as `Behind`. The deletion now follows a row still in flight
+  (`DurableLedger::written`). That the deletion lands after the write it
+  follows rests on journal sequence numbers following submission order:
+  the journaled store queues a domain's submissions first in, first out
+  and numbers their records in that order.
+  `a_released_command_whose_row_was_in_flight_is_not_reported`.
+- **A candidate with a full table.** It refused, for backpressure, the
+  payloads its own selection waited on. A domain whose voters all held
+  full tables elected no one. Those payloads enter a full table, as a
+  Sync's entries do (task-d24), while the selection is unbound. The
+  review of task-d24 found the same refusal and fixed it there first
+  ("Recovering a capped Sync"); this is the condition kept.
+  `a_candidate_with_a_full_table_takes_its_selections_payloads`.
+- **A campaign superseded by a promise.** A voter's own campaign for a
+  lower ballot went on standing in for a campaign in progress after it
+  promised another voter's, and a voter holding one takes no catch-up
+  page. It is dropped. `a_campaign_superseded_by_a_promise_is_dropped`.
+- **History to fetch after a promise.** A voter that promised a leader
+  ahead of it held nothing unexecuted and asked for nothing. It now
+  counts the leader's frontier as history to fetch.
+  `a_promise_to_a_leader_ahead_leaves_history_to_fetch`.
+- **A voter the campaign missed.** A voter cut off while the campaign ran
+  never heard of the new ballot. The leader's proposals were foreign to
+  it, and a quiet domain sent it nothing at all. The leader's re-send now
+  asks every voter that has not voted in its ballot, and answers a late
+  promise with its Sync. A voter that promised and has not synchronized
+  answers the ask with its promise again, so a lost Sync is sent again.
+  A voter the campaign heard from is not counted either (#130 review):
+  its Sync is one unacknowledged frame, and counted as following at the
+  campaign it was never asked again if that frame was lost. The leader
+  counts only itself until a voter votes in its ballot. A voter that
+  installed the Sync with nothing to vote on yet ignores the ask instead
+  of refusing it, so a quiet domain costs one `NewLeader` per idle voter
+  per re-send tick until the first command. A promise is not repeated
+  while a higher one is in flight: that promise voids it. (A Sync that
+  answers a repeated promise is already held behind a higher promise in
+  flight, `on_sync`, task-d18.)
+  `a_voter_the_campaign_missed_is_prepared_by_the_leader_and_follows`,
+  `a_late_voter_whose_sync_was_lost_is_sent_it_again`,
+  `a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again`,
+  `a_promise_is_not_repeated_below_one_in_flight` (`ballot`).
+- **A donor that served only its own ballot.** A voter refused as behind
+  asks for history at the ballot it last synchronized. Donors answered only
+  at their own, so it stayed behind. `coordd` now serves any ballot of the
+  epoch at or before the donor's own (`Machine::synchronized_at_or_after`).
+  `a_donor_serves_a_voter_at_an_earlier_ballot` (`coord-daemon`).
+- **A campaign that assembled on every message.** It re-assembled every
+  complete report on every page, promise and payload, and got the same
+  wait at a cost that grew with the reports. It now assembles again only
+  when another report completed or something it waits on arrived.
+  `a_waiting_campaign_assembles_again_only_when_something_moved`.
+
+### Evidence
+
+- Each test above fails with its fix reverted and passes with it.
+- `cargo test --workspace`, clippy with `-D warnings`, `cargo fmt` and the
+  docs check are clean.
+- The oracles and rows that found these are the next change (task-d33).
+  With every fix here, its rows 1 to 14 run clean at 100 seeds per row
+  and size, three and five voters (2,000 runs).
