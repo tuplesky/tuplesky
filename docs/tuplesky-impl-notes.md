@@ -8330,9 +8330,16 @@ Completed commands a second are reported and never gated. The `command cost` job
   runner today.
 - **The last quarter.** A whole-run average spreads work that grows
   with history over commands that ran while it was short; the last
-  quarter is read at the largest history the run reaches, between the
-  first snapshot past three quarters of a voter's final count and the
-  first at it.
+  quarter is read at the largest history the run reaches, from three
+  quarters of a voter's final count to the first snapshot at it. A
+  snapshot rarely lands on three quarters, so the busy time there is
+  interpolated between the snapshots on either side, as if each command
+  between them cost the same. Opening the window at the first snapshot
+  past three quarters instead, as the gate first did, made the window
+  anywhere from 7% to 46% of the run at a second between snapshots, and
+  on a runner past about 650 commands a second at one caller the
+  quarter fell between two snapshots and the reading was absent (#98's
+  carry of 6a8dd83, three of three repeats).
 - **Negative control.** A third `missing_payloads` call per pass of the
   domain loop (`coordd` already makes two; it chains every key of
   `held`, `sync_pending` and `adopted` and sorts them). Three repeats
@@ -8377,21 +8384,20 @@ Completed commands a second are reported and never gated. The `command cost` job
     growing linearly from c to 2c reads 1.25 against it and 1.36
     against the first three, and `test_command_cost.py` pins the
     second.
-- **What an unchanged run's ratio is.** On the runner it reads 1.37 to
-  1.48 at one caller and 1.26 to 1.32 at ten, not the 1.1 to 1.2 of the
-  long runs, and taking the scans out did not change that on this
-  container (1.16 to 1.41 with them out). Nor do the local checkpoints:
-  with them off it read 1.29 to 1.34. Every voter's last quarter costs
-  about 30% more than its first three, because a 2,600-command run never
-  reaches a history sweep: the table's capacity is 1,000 and the maps
-  are swept past 4,000, so they grow for the whole run. That is the
-  amortized retirement under "Not done here" below; a run of 100,000
-  averages over the sweeps, which is why the long runs read flat. A
-  warm-up of 5,000 commands, past the first sweep, read 1.12 to 1.30.
-  So the gate's ratio carries the pre-sweep growth in its baseline, and
-  a 30% margin over it still sits below the learner revert at both
-  caller counts (1.97 against limits of 1.92 and 1.72). A linear
-  doubling on top of today's 1.48 would read about 2.0 and fail.
+- **What an unchanged run's ratio is.** With the interpolated window,
+  unchanged code on this container reads 1.09 to 1.20 at one caller and
+  1.13 to 1.20 at ten, every voter alike, and 1.16 to 1.24 with local
+  checkpoints off: about the 1.1 to 1.2 of the long runs. Read from the
+  first snapshot past three quarters, the same logs read 1.14 to 1.41,
+  and the high ones were the narrow windows: the last second of a run
+  costs about 1.5 ms a command against 1.2 before it, and a window of 7%
+  of the run is mostly that second. An earlier account here put the
+  1.3 to 1.5 down to a short run never reaching a history sweep; the
+  warm-up that was to show it, 5,000 commands past the first sweep,
+  reads 1.07 to 1.29 interpolated, no lower than without it, so that
+  account was wrong. The learner revert reads 1.77 to 2.04 on the same
+  window (medians of the largest voter 1.96 at one caller and 1.98 at
+  ten).
 - **Noise.** An unchanged run on this container once read 2.35 ms over
   the last quarter at ten callers against the runner's 1.67, and a
   re-run read within the baseline. No local checkpoint falls in that

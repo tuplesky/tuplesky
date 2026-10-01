@@ -87,16 +87,30 @@ class ReduceTests(unittest.TestCase):
     def test_the_last_quarter_is_read_between_the_snapshots_that_bracket_it(self):
         text = log(
             snapshot(executed=50, busy=1.0),
-            snapshot(executed=80, busy=2.0),
-            snapshot(executed=100, busy=4.0),
+            snapshot(executed=75, busy=1.875),
+            snapshot(executed=100, busy=4.375),
             # After the load: idle, and not in the window.
-            snapshot(executed=100, busy=4.5),
+            snapshot(executed=100, busy=4.875),
         )
-        # From 80 executed to 100: two seconds over twenty commands.
+        # From 75 executed to 100: two and a half seconds over 25 commands.
         self.assertAlmostEqual(cost.tail_busy("n1", text), 100.0)
-        # Before it: two seconds over the first eighty.
+        # Before it: 1.875 seconds over the first 75.
         head, _ = cost.head_and_tail_busy("n1", text)
         self.assertAlmostEqual(head, 25.0)
+
+    def test_a_last_quarter_inside_one_snapshot_interval_is_interpolated(self):
+        # A run fast enough that a quarter of it passes between two
+        # snapshots a second apart. Between 40 and 100 executed every
+        # command cost 25 ms, so three quarters falls at 1.875 s busy.
+        text = log(
+            snapshot(executed=0, busy=0.5),
+            snapshot(executed=40, busy=1.0),
+            snapshot(executed=100, busy=2.5),
+            snapshot(executed=100, busy=3.0),
+        )
+        head, tail = cost.head_and_tail_busy("n1", text)
+        self.assertAlmostEqual(head, 25.0)
+        self.assertAlmostEqual(tail, 25.0)
 
     def test_a_cost_that_doubles_linearly_reads_past_the_margin(self):
         # A command's cost grows from 1 ms to 2 ms over 1,000 commands,
@@ -109,14 +123,23 @@ class ReduceTests(unittest.TestCase):
                 snaps.append(snapshot(executed=executed, busy=busy))
         head, tail = cost.head_and_tail_busy("n1", log(*snaps))
         self.assertAlmostEqual(tail / head, 1.36, places=2)
+        # With a snapshot only every 200, as a second apart is on a fast
+        # runner's short run, and none on three quarters, it still reads
+        # within 0.02 of that.
+        coarse = [s for s in snaps if s["cost"]["Observed"]["executed"] % 200 == 0]
+        head, tail = cost.head_and_tail_busy("n1", log(*coarse))
+        self.assertAlmostEqual(tail / head, 1.36, delta=0.02)
 
     def test_a_last_quarter_no_two_snapshots_bracket_is_absent(self):
+        # No snapshot was taken before three quarters had executed.
         with self.assertRaises(cost.Absent):
-            cost.tail_busy("n1", log(snapshot(executed=10), snapshot(executed=100)))
+            cost.tail_busy("n1", log(snapshot(executed=80), snapshot(executed=100)))
+        with self.assertRaises(cost.Absent):
+            cost.tail_busy("n1", log(snapshot(executed=0), snapshot(executed=0)))
 
     def test_reduce_reports_throughput_without_gating_on_it(self):
         bench = {"achieved": {"completed": 600, "wall_ns": 60 * 10**9}}
-        two = log(snapshot(executed=90, busy=1.8), snapshot())
+        two = log(snapshot(executed=0, busy=0.2), snapshot(executed=90, busy=1.8), snapshot())
         result = cost.reduce(1, 61.0, bench, {"n1": two, "n2": two})
         self.assertAlmostEqual(result["completed_per_second"], 10.0)
         self.assertEqual([v["node"] for v in result["voters"]], ["n1", "n2"])
