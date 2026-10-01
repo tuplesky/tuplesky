@@ -349,10 +349,7 @@ impl CommandTable {
 
     /// The commands noted for held proposals since the last call.
     pub fn take_moved(&mut self) -> BTreeSet<CommandId> {
-        self.moved
-            .as_mut()
-            .map(core::mem::take)
-            .unwrap_or_default()
+        self.moved.as_mut().map(core::mem::take).unwrap_or_default()
     }
 
     fn raise(&mut self, command: CommandId) {

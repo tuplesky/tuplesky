@@ -595,7 +595,10 @@ fn lacking<'a>(
     known: impl Iterator<Item = &'a CommandId>,
     payloads: &BTreeMap<CommandId, PayloadRecordV1>,
 ) -> alloc::collections::BTreeSet<CommandId> {
-    known.filter(|c| !payloads.contains_key(c)).copied().collect()
+    known
+        .filter(|c| !payloads.contains_key(c))
+        .copied()
+        .collect()
 }
 
 fn restored_bindings<'a>(
