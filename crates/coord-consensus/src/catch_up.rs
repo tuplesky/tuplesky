@@ -21,8 +21,17 @@
 //! trust the voter already gives that ballot's Sync. A donor that itself
 //! executed out of order is not caught here; its own divergence stops are
 //! what catch that.
+//!
+//! A page is installed a window at a time (task-d25): as many of its
+//! commands as follow one another in one batch, rather than one batch and
+//! one execution per command, which left a voter pulling about a hundred
+//! commands a second and never closing its gap under a domain admitting
+//! more. The window executes in the donor's positions, and after a
+//! restart the first ask starts at the frontier read at boot, so what the
+//! voter executed since then -- a window installed before the crash
+//! included -- is compared with the donor's too ([`SinceBoot`]).
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use coord_core::effect::BarrierId;
 use coord_types::CommandId;
@@ -74,33 +83,40 @@ pub struct CatchUpDivergence {
     pub own: Option<OwnExecution>,
 }
 
-/// The pulled command installed and waiting for the executor.
+/// A pulled command installed and waiting for the executor.
 #[derive(Clone, Debug)]
 pub(crate) struct Running {
     /// The command.
     pub(crate) command: CommandId,
     /// What the donor executed it as.
     pub(crate) donor: DonorExecution,
-    /// The batch that made its installation durable.
+    /// The batch that made its window durable: one for the window.
     pub(crate) barrier: BarrierId,
     /// Whether that batch is durable: a pulled command executes only once
     /// its decision is on disk here, as any other commit's is.
     pub(crate) durable: bool,
-    /// The page entry it came from, put back at the head of the page if
-    /// that batch fails, so it is installed again rather than left
-    /// waiting on a batch that will never be durable.
+    /// The page entry it came from, put back at the head of the page with
+    /// the rest of its window if that batch fails, so it is installed
+    /// again rather than left waiting on a batch that will never be
+    /// durable.
     pub(crate) entry: CatchUpEntry,
 }
 
-/// The catch-up this follower has in hand: at most one page, and the one
-/// command of it that is installed and not yet executed.
+/// The catch-up this follower has in hand: at most one page, and the
+/// window of it that is installed and not yet executed.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CatchUp {
     /// The page's commands not yet installed, in position order, with
     /// the donor and ballot they came from.
     pub(crate) queue: VecDeque<(ReplicaId, Ballot, CatchUpEntry)>,
-    /// The pulled command installed and waiting for the executor.
-    pub(crate) running: Option<Running>,
+    /// The window: pulled commands installed in one batch and not yet
+    /// executed, in position order (task-d25). Only its first executes,
+    /// so the window runs in the donor's positions whatever else the
+    /// table holds.
+    pub(crate) running: VecDeque<Running>,
+    /// What this replica executed since it booted and no donor has
+    /// confirmed yet (task-d25).
+    pub(crate) since_boot: SinceBoot,
     /// The donor the last page came from, and whether that page was full:
     /// a full page is followed by the next ask as soon as it is executed,
     /// rather than on the caller's timer.
@@ -114,6 +130,63 @@ pub(crate) struct CatchUp {
 impl CatchUp {
     /// Whether a page is in hand.
     pub(crate) fn busy(&self) -> bool {
-        self.running.is_some() || !self.queue.is_empty()
+        !self.running.is_empty() || !self.queue.is_empty()
+    }
+}
+
+/// What a replica executed after the frontier it booted at that a donor
+/// has not confirmed yet (task-d25).
+///
+/// A window's batch makes every command of it a durable commit, and a
+/// replica that crashes in the middle of the window executes the rest
+/// after its restart through the ordinary learner, with the page and the
+/// donor's word gone. So the commits restored at boot and not executed
+/// are expected: each one's execution is kept, by position, and the
+/// first ask after a boot starts at the frontier read at boot rather than
+/// at the current one. Each command of a page at a kept position is
+/// compared with what this replica executed there, and asks go on from
+/// where the last page stopped until nothing expected or kept is left.
+/// Bounded by the restored commits, which the table bounds: an execution
+/// of anything else was never pulled, and the protocol decided it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SinceBoot {
+    /// Where the next ask starts while something waits for a donor: the
+    /// boot frontier, then the last position a page covered. `None` once
+    /// nothing does.
+    pub(crate) from: Option<ExecutionPosition>,
+    /// Commits restored at boot and not executed yet.
+    pub(crate) expected: BTreeSet<CommandId>,
+    /// Executions of those, by position, not yet compared.
+    pub(crate) outcomes: BTreeMap<ExecutionPosition, (CommandId, OwnExecution)>,
+}
+
+impl SinceBoot {
+    /// Compare the executions of `expected` after `frontier`, the one
+    /// read at boot.
+    pub(crate) fn at(frontier: ExecutionPosition, expected: BTreeSet<CommandId>) -> Self {
+        SinceBoot {
+            from: (!expected.is_empty()).then_some(frontier),
+            expected,
+            outcomes: BTreeMap::new(),
+        }
+    }
+
+    /// Keep this execution if it is one of the restored commits.
+    pub(crate) fn note(&mut self, command: CommandId, own: OwnExecution) {
+        if self.from.is_some() && self.expected.remove(&command) {
+            self.outcomes.insert(own.position, (command, own));
+        }
+    }
+
+    /// Whether anything still waits for a donor.
+    pub(crate) fn waiting(&self) -> bool {
+        !self.expected.is_empty() || !self.outcomes.is_empty()
+    }
+
+    /// Nothing more to compare.
+    pub(crate) fn done(&mut self) {
+        self.from = None;
+        self.expected = BTreeSet::new();
+        self.outcomes = BTreeMap::new();
     }
 }
