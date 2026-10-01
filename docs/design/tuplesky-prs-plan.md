@@ -201,9 +201,9 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d43](#task-d43) | Recover the terminal closure after the seal | task-55, task-56, task-d05, task-d11, task-d14, task-d44 |
 | [task-d44](#task-d44) | Serve executed history across a transition | task-d08, task-d35, task-d39, task-d42 |
 | [task-d45](#task-d45) | Measure a command's cost on every node, and gate on it | task-61, task-j08 |
-| [task-d46](#task-d46) | Keep per-turn and per-event work independent of history | task-d06, task-d45 |
-| [task-d47](#task-d47) | Lower a turn's transitions as durable groups | task-j03, task-j08, task-d45 |
-| [task-d48](#task-d48) | Settle the projection's durability under the journal | task-53, task-j04, task-d47 |
+| [task-d46](#task-d46) | Keep per-turn and per-event work independent of history | task-d06, task-d24, task-d30, task-d45 |
+| [task-d47](#task-d47) | Lower a turn's transitions as durable groups | task-j03, task-j05, task-j08, task-d24, task-d30, task-d45, task-d46 |
+| [task-d48](#task-d48) | Settle the projection's durability under the journal | task-53, task-59, task-j04, task-j05, task-d47 |
 | [task-d49](#task-d49) | Re-send a proposal only once its answer is due | task-d07, task-d15, task-d45 |
 | [task-d50](#task-d50) | Serve reads and the fast path without waiting on the slow path | task-28, task-29, task-d46, task-d47, task-d49 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49 |
@@ -2193,7 +2193,7 @@ Require the named 2-2-1 region-loss schedules and privileged API-server/Kine edg
 <a id="task-d46"></a>
 ### task-d46: Keep per-turn and per-event work independent of history
 
-**Prerequisites:** task-d06, task-d45.  
+**Prerequisites:** task-d06, task-d24, task-d30, task-d45.  
 **Design:** Sections 4.6, 4.7.
 
 **Implement:** With one client, on loopback and on tmpfs, throughput fell from 101 to 36 commands a second over 90 s. Over the same 90 s a follower's domain thread went from 50% to 99% busy, about 5 ms to about 27 ms of CPU per command; the leader's stayed near 50%. Stack samples of that thread put it in four places:
@@ -2216,14 +2216,14 @@ Make each of them O(change) or O(log n):
 - In task-d45's run, a follower's busy time per command at 280 s is within 20% of its value at 20 s, at one client and at ten (today it grows four- to five-fold).
 - Completed commands per 30 s over a 300 s run show no downward trend beyond the run-to-run spread.
 - The tmpfs ceiling at ten clients at least doubles.
-- The deterministic cluster tests, task-d30's protocol simulator at its 100-seed setting and task-d24's crash tests pass unchanged, and the simulator's decisions match the current code's on the same seeds.
+- The deterministic cluster tests, task-d30's protocol simulator at its 100-seed setting and task-d24's crash tests (a leader that crashes right after a capped Sync, and the campaign after it that completes at the largest table) pass unchanged, and the simulator's decisions match the current code's on the same seeds.
 
 **Review boundary:** Data structures and call sites in the consensus machines and `coordd`'s loop. No decision, dependency or execution order changes.
 
 <a id="task-d47"></a>
 ### task-d47: Lower a turn's transitions as durable groups
 
-**Prerequisites:** task-j03, task-j08, task-d45.  
+**Prerequisites:** task-j03, task-j05, task-j08, task-d24, task-d30, task-d45, task-d46.  
 **Design:** Sections 17.3, 17.3.3 (already requiring this).
 
 **Implement:** Section 17.3.3 asks for bounded group writes, initially 64 transitions or 256 KiB with no idle timer. `coordd` lowers one domain's queued batches one at a time instead (`node.rs`, `journaled.rs`). Each batch costs:
@@ -2244,14 +2244,14 @@ The application batch of an executed command is lowered on its own as well. Meas
 - **Crash safety:**
   - a crash between a group's journal sync and its projection commit recovers every batch in the group from the journal (task-j05's fault points);
   - moving a release ahead of its batch's sync fails the barrier tests (negative control).
-- **Regression:** task-d24's crash tests and task-d30's simulator pass.
+- **Regression:** task-d24's crash tests (as in task-d46) and task-d30's simulator pass.
 
 **Review boundary:** The lowering loop, the journal group, the projection transaction and when frames are released. No change to what is durable before which message.
 
 <a id="task-d48"></a>
 ### task-d48: Settle the projection's durability under the journal
 
-**Prerequisites:** task-53, task-j04, task-d47.  
+**Prerequisites:** task-53, task-59, task-j04, task-j05, task-d47.  
 **Design:** Sections 17.3, 17.4 (amended by this task).
 
 **Implement:** In `coordd`'s composition the journal is the durable record (task-j03). The projection can be rebuilt from it above `journaled_through`, yet every materialization commits redb with `Durability::Immediate` and two-phase commit. Section 17.4 already lets strict mode select projection durability.
