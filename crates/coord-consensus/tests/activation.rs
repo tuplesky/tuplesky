@@ -136,6 +136,8 @@ struct Cluster {
     drop_acks: Vec<(u8, u8)>,
     /// (from, to) pairs whose proposals are dropped.
     drop_proposals: Vec<(u8, u8)>,
+    /// (from, to) pairs whose next report page is dropped, once each.
+    drop_pages: Vec<(u8, u8)>,
     /// The voters' table capacity.
     capacity: usize,
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
@@ -204,6 +206,7 @@ impl Cluster {
             seed,
             cut: Vec::new(),
             drop_sync: Vec::new(),
+            drop_pages: Vec::new(),
             no_fetch: Vec::new(),
             no_execute: Vec::new(),
             drop_acks: Vec::new(),
@@ -269,6 +272,15 @@ impl Cluster {
                             ProtocolMessage::FastAck(_) | ProtocolMessage::SlowAck(_)
                         )
                     {
+                        continue;
+                    }
+                    if let Some(at) = self.drop_pages.iter().position(|p| *p == (i as u8, dest))
+                        && matches!(
+                            ProtocolMessage::decode(&frame).unwrap(),
+                            ProtocolMessage::ReportPage(_)
+                        )
+                    {
+                        self.drop_pages.remove(at);
                         continue;
                     }
                     if self.drop_sync.contains(&(i as u8, dest))
@@ -5084,6 +5096,112 @@ fn a_deposed_leader_keeps_its_selection_for_what_it_never_proposed() {
         .unwrap_or_else(|| panic!("x is missing from the report: {:?}", report.entries));
     assert_eq!((e.phase, e.deps.clone()), (Phase::Accept, vec![]), "{e:?}");
     assert!(!e.payload_present, "{e:?}");
+}
+
+/// task-d28: with a page of every report to the candidate lost, the
+/// campaign completes in its ballot. A page is published once, on a lane
+/// that drops when full; the candidate asks the voters that promised it
+/// for the pages it lacks, and they answer from the report they sent,
+/// the leader's across its change of role included.
+#[test]
+fn a_campaign_completes_in_its_ballot_with_a_page_of_each_report_lost() {
+    let mut cluster = Cluster::new(53);
+    cluster.admit(1, 1);
+    cluster.admit(2, 1);
+    cluster.settle();
+    cluster.drop_pages = vec![(0, 2), (1, 2)];
+    let b = ballot(1, 2);
+    cluster.campaign(2, b);
+    cluster.settle();
+    assert!(cluster.drop_pages.is_empty(), "both pages were dropped");
+    assert!(
+        matches!(cluster.nodes[2].role, Some(Role::Follower(_))),
+        "the campaign completed without the lost pages"
+    );
+    let asked = cluster.nodes[2].follower_mut().request_report_pages();
+    assert!(!asked.is_empty());
+    cluster.handle(2, asked);
+    cluster.settle();
+    assert!(
+        matches!(&cluster.nodes[2].role, Some(Role::Leader(l)) if l.config_quorum().ballot() == b),
+        "r2 leads the ballot it campaigned for"
+    );
+}
+
+/// task-d28: interrupted campaigns leave the candidate holding one
+/// campaign's pages, however many there were; a report announcing more
+/// pages than the bound allows is refused.
+#[test]
+fn interrupted_campaigns_leave_the_candidates_memory_flat() {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let mut held = Vec::new();
+    for k in 1..=50u64 {
+        let b = ballot(k, 1);
+        let effects = f.campaign(b);
+        for e in durable_events(&effects) {
+            f.step(e);
+        }
+        // r0 promises and sends the first of its two pages; r2 promises
+        // and sends nothing.
+        for (replica, entries) in [(0u8, 300u16), (2, 0)] {
+            f.step(peer_event(
+                r(replica),
+                ProtocolMessage::Promise {
+                    ballot: b,
+                    synced: ballot(0, 0),
+                    replica: r(replica),
+                },
+            ));
+            let report = RecoveryReport {
+                replica: r(replica),
+                ballot: b,
+                committed_ballot: ballot(0, 0),
+                entries: (0..entries)
+                    .map(|c| {
+                        let mut d = [0x60; 32];
+                        d[..2].copy_from_slice(&c.to_be_bytes());
+                        accepted_entry(CommandId(Digest32(d)), &[])
+                    })
+                    .collect(),
+            };
+            let pages = coord_consensus::paginate(&report, coord_consensus::MAX_PAGE_ENTRIES);
+            for page in pages.into_iter().take(1) {
+                if entries > 0 {
+                    f.step(peer_event(r(replica), ProtocolMessage::ReportPage(page)));
+                }
+            }
+        }
+        held.push(f.report_pages_held());
+    }
+    assert!(held.iter().all(|h| *h == held[0]), "{held:?}");
+    assert_eq!(held[0], 1);
+
+    // The bound: a report of `limit` entries takes at most one page more
+    // than its entries need; a total past that is refused.
+    let config = quorum(ballot(1, 0));
+    let mut c = coord_consensus::Campaign::new(config.clone()).bounded(1);
+    let report = RecoveryReport {
+        replica: r(1),
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries: (0..3u8)
+            .map(|n| accepted_entry(CommandId(Digest32([0x70 + n; 32])), &[]))
+            .collect(),
+    };
+    let pages = coord_consensus::paginate(&report, 1);
+    assert_eq!(pages.len(), 3);
+    assert_eq!(
+        c.page(pages[0].clone()),
+        Err(coord_consensus::PageError::OutOfBounds)
+    );
+    assert_eq!(c.pages_held(), 0);
 }
 
 /// task-d20 review: nothing installs while a newer Sync's marker is still

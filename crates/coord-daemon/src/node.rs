@@ -157,6 +157,15 @@ impl Machine {
         }
     }
 
+    /// Ask the voters that promised this replica's campaign for the report
+    /// pages that have not arrived (task-d28). Only a follower campaigns.
+    pub fn request_report_pages(&mut self) -> Vec<Effect> {
+        match self {
+            Machine::Leader(_) => Vec::new(),
+            Machine::Follower(m) => m.request_report_pages(),
+        }
+    }
+
     /// What this replica executed through.
     pub const fn executed_through(&self) -> coord_types::ids::ExecutionPosition {
         match self {
@@ -683,6 +692,13 @@ impl<P: Persistence> Node<P> {
         ballot: &Ballot,
     ) -> Result<Outbound, DriveError> {
         let effects = self.machine_mut().request_payloads(from);
+        self.carry_out(effects, ballot)
+    }
+
+    /// Ask the voters that promised this replica's campaign for the report
+    /// pages that have not arrived (task-d28).
+    pub fn request_report_pages(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let effects = self.machine_mut().request_report_pages();
         self.carry_out(effects, ballot)
     }
 

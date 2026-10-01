@@ -53,7 +53,7 @@ use crate::rows::{
     PayloadRecordV1, PromiseRecordV1, dependency_delete, dependency_update, payload_update,
 };
 use crate::summary::DurableLedger;
-use crate::summary::{MAX_PAGE_ENTRIES, PageError, paginate};
+use crate::summary::PageError;
 use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
 
 /// Static configuration of a follower.
@@ -425,6 +425,9 @@ pub struct Follower {
     /// far. Not durable; a restart campaigns and is refused again.
     behind_voters: Option<ExecutionPosition>,
     report_due: Option<ReportDue>,
+    /// The pages of the last report sent a candidate, which a lost page
+    /// is answered from (task-d28).
+    served_report: Option<crate::summary::ServedReport>,
     sync_pending: BTreeMap<CommandId, SyncEntry>,
     /// The admission digest the synchronized selection named for each of
     /// its entries (task-d14). Kept past installation: a payload that
@@ -605,6 +608,7 @@ impl Follower {
             behind: None,
             behind_voters: None,
             report_due: None,
+            served_report: None,
             sync_pending: BTreeMap::new(),
             named_facts: BTreeMap::new(),
             halted: None,
@@ -749,6 +753,7 @@ impl Follower {
             // not of the role it held when the request arrived: dropping it
             // would stall a candidate that needs this replica's majority.
             report_due: state.report_due,
+            served_report: state.served_report,
             sync_pending: BTreeMap::new(),
             named_facts: BTreeMap::new(),
             halted: None,
@@ -787,6 +792,7 @@ impl Follower {
             alloc: self.alloc,
             outbox: self.outbox,
             report_due: self.report_due,
+            served_report: self.served_report,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
             synced_selection: self.synced_selection,
@@ -889,10 +895,47 @@ impl Follower {
                 .encode(),
             });
         }
-        self.campaign = Some(Campaign::new(config));
+        self.campaign = Some(Campaign::new(config).bounded(crate::recovery::MAX_REPORT_ENTRIES));
         let mut out = alloc::vec![effects.persist];
         out.extend(self.release());
         out
+    }
+
+    /// Ask the voters that promised this replica's campaign for the report
+    /// pages that have not arrived (task-d28): a page is published once,
+    /// on a lane that drops when full, and one lost page used to cost the
+    /// whole ballot. Driven on an interval while the campaign selects;
+    /// nothing is asked once the selection is made.
+    pub fn request_report_pages(&mut self) -> Vec<Effect> {
+        let (Some(campaign), Some(boot)) = (self.campaign.as_ref(), self.boot) else {
+            return Vec::new();
+        };
+        let asks = campaign.missing_pages();
+        if asks.is_empty() {
+            return Vec::new();
+        }
+        let ballot = campaign.ballot();
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut().expect("booted");
+        for (voter, pages) in asks {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: PeerId {
+                    replica: voter,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                frame: ProtocolMessage::ReportPageRequest { ballot, pages }.encode(),
+            });
+        }
+        self.release()
+    }
+
+    /// Report pages this replica holds: its campaign's, and those of the
+    /// report it last sent a candidate (task-d28).
+    pub fn report_pages_held(&self) -> usize {
+        self.campaign.as_ref().map_or(0, Campaign::pages_held)
+            + self.served_report.as_ref().map_or(0, |s| s.pages.len())
     }
 
     /// Resume a campaign whose selection was durably bound before a crash:
@@ -914,6 +957,35 @@ impl Follower {
         };
         self.campaign = Some(Campaign::resumed(config, decision));
         self.advance_campaign()
+    }
+
+    /// Send `from` again the pages of the report this replica sent it
+    /// for `ballot` that it asks for (task-d28), from the same version.
+    fn answer_report_pages(
+        &mut self,
+        from: ReplicaId,
+        ballot: Ballot,
+        asked: &[u32],
+    ) -> Vec<Effect> {
+        let (Some(served), Some(boot)) = (self.served_report.as_ref(), self.boot) else {
+            return Vec::new();
+        };
+        let pages = served.answer(from, ballot, asked);
+        if pages.is_empty() {
+            return Vec::new();
+        }
+        let to = served.to;
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut().expect("booted");
+        for page in pages {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to,
+                frame: ProtocolMessage::ReportPage(page).encode(),
+            });
+        }
+        self.release()
     }
 
     /// Deliver a report once every batch before its cut is durable: pages
@@ -946,14 +1018,18 @@ impl Follower {
             .ballots
             .context(boot, due.ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut().expect("booted");
-        for page in paginate(&report, MAX_PAGE_ENTRIES) {
+        // The pages are kept: one that is lost is asked for again, and
+        // answered from this version, never a regenerated one (task-d28).
+        let served = crate::summary::ServedReport::new(due.to, &report);
+        for page in &served.pages {
             outbox.publish(PendingSend {
                 context,
                 requires: Vec::new(),
                 to: due.to,
-                frame: ProtocolMessage::ReportPage(page).encode(),
+                frame: ProtocolMessage::ReportPage(page.clone()).encode(),
             });
         }
+        self.served_report = Some(served);
         self.release()
     }
 
@@ -3504,6 +3580,9 @@ impl Follower {
                     c.promise(replica);
                 }
                 self.advance_campaign()
+            }
+            ProtocolMessage::ReportPageRequest { ballot, pages } => {
+                self.answer_report_pages(from.replica, ballot, &pages)
             }
             ProtocolMessage::ReportPage(page) => {
                 if let Some(c) = self.campaign.as_mut()

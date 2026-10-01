@@ -46,7 +46,6 @@ use crate::rows::{
 };
 use crate::speculation::{ReleaseGate, Speculation, SpeculationRequest, TentativeOutcome};
 use crate::summary::DurableLedger;
-use crate::summary::{MAX_PAGE_ENTRIES, paginate};
 use crate::vote::{FastAck, SlowAck, Vote, VoteError, VoteSet};
 
 /// The single conservative conflict key: every command in a domain
@@ -245,6 +244,9 @@ pub struct Leader {
     learner: Learner,
     seqnum: u64,
     report_due: Option<ReportDue>,
+    /// The pages of the last report sent a candidate, which a lost page
+    /// is answered from (task-d28).
+    served_report: Option<crate::summary::ServedReport>,
     pending_sync: Option<(ReplicaId, SyncDecision)>,
     speculation: Speculation,
     rejections: Vec<Rejection>,
@@ -352,6 +354,7 @@ impl Leader {
             learner: Learner::new(executed_through),
             seqnum: 0,
             report_due: None,
+            served_report: None,
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
@@ -383,6 +386,7 @@ impl Leader {
     pub fn into_recovered(self) -> RecoveredState {
         RecoveredState {
             report_due: self.report_due,
+            served_report: self.served_report,
             identity: self.config.identity,
             ballots: self.ballots,
             table: self.table,
@@ -441,6 +445,7 @@ impl Leader {
             learner: state.learner,
             seqnum: 0,
             report_due: state.report_due,
+            served_report: state.served_report,
             pending_sync: None,
             speculation: Speculation::new(),
             rejections: Vec::new(),
@@ -1026,6 +1031,35 @@ impl Leader {
         self.release()
     }
 
+    /// Send `from` again the pages of the report this replica sent it
+    /// for `ballot` that it asks for (task-d28), from the same version.
+    fn answer_report_pages(
+        &mut self,
+        from: ReplicaId,
+        ballot: Ballot,
+        asked: &[u32],
+    ) -> Vec<Effect> {
+        let (Some(served), Some(boot)) = (self.served_report.as_ref(), self.boot) else {
+            return Vec::new();
+        };
+        let pages = served.answer(from, ballot, asked);
+        if pages.is_empty() {
+            return Vec::new();
+        }
+        let to = served.to;
+        let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
+        let outbox = self.outbox.as_mut().expect("booted");
+        for page in pages {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to,
+                frame: ProtocolMessage::ReportPage(page).encode(),
+            });
+        }
+        self.release()
+    }
+
     /// Deliver the report owed to a candidate once every batch before the
     /// cut is durable.
     fn deliver_due_report(&mut self) -> Vec<Effect> {
@@ -1048,14 +1082,18 @@ impl Leader {
             .ballots
             .context(boot, due.ballot, LocalJournalSeq::ZERO);
         let outbox = self.outbox.as_mut().expect("booted");
-        for page in paginate(&report, MAX_PAGE_ENTRIES) {
+        // The pages are kept: one that is lost is asked for again, and
+        // answered from this version, never a regenerated one (task-d28).
+        let served = crate::summary::ServedReport::new(due.to, &report);
+        for page in &served.pages {
             outbox.publish(PendingSend {
                 context,
                 requires: Vec::new(),
                 to: due.to,
-                frame: ProtocolMessage::ReportPage(page).encode(),
+                frame: ProtocolMessage::ReportPage(page.clone()).encode(),
             });
         }
+        self.served_report = Some(served);
         self.release()
     }
 
@@ -2162,6 +2200,9 @@ impl Leader {
             }
             ProtocolMessage::ProposalRequest { ballot, commands } => {
                 self.serve_proposals(from.replica, ballot, &commands)
+            }
+            ProtocolMessage::ReportPageRequest { ballot, pages } => {
+                self.answer_report_pages(from.replica, ballot, &pages)
             }
             ProtocolMessage::Sealed { .. }
             | ProtocolMessage::Committed { .. }

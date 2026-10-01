@@ -1101,8 +1101,9 @@ impl Sim {
 
     /// The periodic work of `coordd`'s timers: the leader re-sends what
     /// voters have not voted on, a follower asks its leader for payloads
-    /// it lacks, and one that holds work it does not execute asks for the
-    /// leader's executed history (task-d08's pacer).
+    /// it lacks, a campaign asks for the report pages that have not
+    /// arrived (task-d28), and one that holds work it does not execute
+    /// asks for the leader's executed history (task-d08's pacer).
     fn timers(&mut self) {
         for i in 0..self.n {
             let executable = self.executable(i);
@@ -1110,7 +1111,7 @@ impl Sim {
                 Some(Role::Leader(l)) => l.resend_unvoted(coord_consensus::RESEND_PER_VOTER),
                 Some(Role::Follower(f)) => {
                     let leader = f.quorum().leader();
-                    let mut effects = Vec::new();
+                    let mut effects = f.request_report_pages();
                     if !f.missing_payloads().is_empty() {
                         effects.extend(f.request_payloads(leader));
                     }
@@ -1119,7 +1120,7 @@ impl Sim {
                     }
                     effects
                 }
-                _ => Vec::new(),
+                None => Vec::new(),
             };
             self.handle(i, effects);
             self.convert(i);

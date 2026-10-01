@@ -603,6 +603,12 @@ impl<P: Persistence> Voter<P> {
         self.node.request_payloads(leader, &self.ballot)
     }
 
+    /// Ask the voters that promised this voter's campaign for the report
+    /// pages that have not arrived (task-d28).
+    pub fn request_report_pages(&mut self) -> Result<Outbound, DriveError> {
+        self.node.request_report_pages(&self.ballot)
+    }
+
     /// Ask a peer for the commands it executed after this voter's
     /// frontier, when `pacer` says it is time (task-d08): the leader
     /// first, then the other voters in turn.
