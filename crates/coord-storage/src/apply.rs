@@ -102,6 +102,11 @@ pub enum ApplyError {
     /// in it were reported applied (task-d47). Nothing of the group was
     /// released; the replica restarts from its journal.
     GroupLost,
+    /// Within a group, the store has no room for the command's batch
+    /// beside what is already queued (task-d47). Nothing was submitted or
+    /// changed: the caller lowers the group and the queue, and applies the
+    /// same command again.
+    GroupFull,
 }
 
 impl From<EngineError> for ApplyError {
@@ -423,10 +428,10 @@ impl<P: Persistence> Applier<P> {
         plan: &coord_state::ApplyPlan,
         binding: Option<&RetryBinding>,
         refused: Option<&CommandId>,
-    ) -> Result<ApplyOutcome, EngineError> {
+    ) -> Result<ApplyOutcome, ApplyError> {
         if self.group.is_none() {
             let others = self.sharing.then_some(&mut self.foreign);
-            return match refused {
+            return Ok(match refused {
                 Some(command) => apply_refused_plan_sharing(
                     &mut self.store,
                     barrier,
@@ -438,7 +443,7 @@ impl<P: Persistence> Applier<P> {
                 None => {
                     apply_plan_sharing(&mut self.store, barrier, namespace, plan, binding, others)
                 }
-            };
+            }?);
         }
         let (mut batch, kind, pending) = prepare(barrier, namespace, plan, binding)?;
         if let Some(command) = refused {
@@ -448,6 +453,17 @@ impl<P: Persistence> Applier<P> {
                 plan.revision,
                 pending.result_digest,
             )?);
+        }
+        // A group's batches stay queued until it is lowered, so the queue
+        // can fill -- in bytes as well as in batches -- before the group's
+        // count does. Refused as full, the batch would fail the voter; the
+        // caller lowers instead and comes back. With nothing queued and
+        // nothing grouped, lowering would free nothing, and the submission
+        // below reports what is wrong.
+        let lowerable =
+            self.group.as_ref().is_some_and(|g| g.last.is_some()) || self.store.queued() > 0;
+        if lowerable && !self.store.has_room(&batch) {
+            return Err(ApplyError::GroupFull);
         }
         let updates = batch.updates.clone();
         match crate::materialize::submit(&mut self.store, batch, kind)? {

@@ -1428,10 +1428,21 @@ impl<P: Persistence> Node<P> {
             }
             let grouping = self.grouped && self.applier.begin_group();
             let applier = &mut self.applier;
-            let outcome = Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
-                applier.apply(command, &payload)
-            })
-            .map_err(|e| Self::apply_error(&command, &e))?;
+            let outcome =
+                match Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
+                    applier.apply(command, &payload)
+                }) {
+                    // The group and the protocol's queued batches leave no
+                    // room for this command's batch: lower them, and apply
+                    // the same command again (task-d47). Nothing of it was
+                    // submitted.
+                    Err(coord_storage::ApplyError::GroupFull) => {
+                        out.absorb(self.close_group(&mut held, ballot)?);
+                        out.absorb(self.flush(ballot)?);
+                        continue;
+                    }
+                    applied => applied.map_err(|e| Self::apply_error(&command, &e))?,
+                };
             self.executed += 1;
             if let Some(order) = self.order.as_mut()
                 && !order.note(outcome.position, command)
