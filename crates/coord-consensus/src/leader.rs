@@ -260,6 +260,15 @@ pub struct Leader {
     table: CommandTable,
     bindings: BTreeMap<RetryKey, CommandId>,
     proposals: BTreeMap<CommandId, Proposal>,
+    /// The proposals not yet both durable and executed, by sequence
+    /// number (task-d46): what the per-vote and per-event passes read,
+    /// instead of every proposal, which `proposals` keeps until the
+    /// history sweep. Kept exact by [`Leader::put_proposal`],
+    /// [`Leader::settle`] and the sweep.
+    unsettled: BTreeSet<(u64, CommandId)>,
+    /// Each proposal's current batch (task-d46): what a storage event is
+    /// matched with, instead of a pass over every proposal.
+    by_barrier: BTreeMap<BarrierId, CommandId>,
     votes: BTreeMap<CommandId, VoteSet>,
     /// Acknowledgements that reached this leader before it had proposed
     /// the command they are about, held until it does.
@@ -407,6 +416,8 @@ impl Leader {
             table,
             bindings: BTreeMap::new(),
             proposals: BTreeMap::new(),
+            unsettled: BTreeSet::new(),
+            by_barrier: BTreeMap::new(),
             votes: BTreeMap::new(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
@@ -500,6 +511,8 @@ impl Leader {
             table: state.table,
             bindings: state.bindings,
             proposals: BTreeMap::new(),
+            unsettled: BTreeSet::new(),
+            by_barrier: BTreeMap::new(),
             votes: BTreeMap::new(),
             early_votes: BTreeMap::new(),
             early_order: VecDeque::new(),
@@ -743,6 +756,9 @@ impl Leader {
         self.payloads.retain(|c, _| !table.forgotten(c));
         self.served_payloads.retain(|c| !table.forgotten(c));
         self.proposals.retain(|c, _| !table.forgotten(c));
+        let proposals = &self.proposals;
+        self.unsettled.retain(|(_, c)| proposals.contains_key(c));
+        self.by_barrier.retain(|_, c| proposals.contains_key(c));
         self.votes.retain(|c, _| !table.forgotten(c));
         // A retry of a forgotten command is refused from the table's
         // executed answer (`propose`), so its binding is not needed for
@@ -859,23 +875,20 @@ impl Leader {
         set.add(Vote::Fast(proposal)).expect("leader proposal");
         self.votes.insert(command, set);
         self.adopt_early_votes(command);
-        self.proposals.insert(
+        self.put_proposal(Proposal {
             command,
-            Proposal {
-                command,
-                barrier,
-                seqnum,
-                deps,
-                path: record.path,
-                paths: record.paths.clone(),
-                admission,
-                durable: false,
-                updates: updates.clone(),
-                attempts: 1,
-                accepts: true,
-                executed: false,
-            },
-        );
+            barrier,
+            seqnum,
+            deps,
+            path: record.path,
+            paths: record.paths.clone(),
+            admission,
+            durable: false,
+            updates: updates.clone(),
+            attempts: 1,
+            accepts: true,
+            executed: false,
+        });
         // The row is ACCEPT at this ballot (or a decision): once it is
         // durable, it is this leader's adoption of its own order.
         self.adopt_own(command, barrier);
@@ -1154,9 +1167,13 @@ impl Leader {
     /// just before the lowest proposal that is either not durable or not
     /// committed.
     pub fn committed_through(&self) -> Option<u64> {
+        debug_assert!(self.indexes_agree());
+        // A settled proposal is durable and executed, so the first open
+        // one is unsettled (task-d46).
         let open = self
-            .proposals
-            .values()
+            .unsettled
+            .iter()
+            .map(|(_, c)| &self.proposals[c])
             .filter(|p| {
                 !(p.durable
                     && (p.executed || self.table.phase_of(&p.command) >= Some(Phase::Commit)))
@@ -1380,6 +1397,7 @@ impl Leader {
         if let Some(proposal) = self.proposals.get_mut(&command) {
             proposal.executed = true;
         }
+        self.settle(command);
         let mut effects = alloc::vec![Effect::Established(result.clone())];
         if self.is_leading() && !released {
             effects.push(Effect::Released(ReleasedResult::from_gate(
@@ -1398,14 +1416,60 @@ impl Leader {
 
     /// Unexecuted proposals in the leader's order.
     fn unexecuted_in_order(&self) -> Vec<CommandId> {
-        let mut ordered: Vec<(u64, CommandId)> = self
+        debug_assert!(self.indexes_agree());
+        // An unexecuted proposal is unsettled, and the set is in sequence
+        // order already (task-d46).
+        self.unsettled
+            .iter()
+            .filter(|(_, c)| {
+                !self.proposals[c].executed && self.table.phase_of(c) < Some(Phase::Executed)
+            })
+            .map(|(_, c)| *c)
+            .collect()
+    }
+
+    /// Enter `proposal`, keeping the indexes over proposals exact: a
+    /// proposal replacing one of the same command takes its place in
+    /// them (task-d46).
+    fn put_proposal(&mut self, proposal: Proposal) {
+        let command = proposal.command;
+        if let Some(old) = self.proposals.get(&command) {
+            self.unsettled.remove(&(old.seqnum, command));
+            self.by_barrier.remove(&old.barrier);
+        }
+        if !(proposal.durable && proposal.executed) {
+            self.unsettled.insert((proposal.seqnum, command));
+        }
+        self.by_barrier.insert(proposal.barrier, command);
+        self.proposals.insert(command, proposal);
+    }
+
+    /// Leave the unsettled set once `command`'s proposal is both durable
+    /// and executed (task-d46).
+    fn settle(&mut self, command: CommandId) {
+        if let Some(p) = self.proposals.get(&command)
+            && p.durable
+            && p.executed
+        {
+            self.unsettled.remove(&(p.seqnum, command));
+        }
+    }
+
+    /// Whether the indexes over proposals say what a pass over every
+    /// proposal would; checked in debug builds.
+    fn indexes_agree(&self) -> bool {
+        let unsettled: BTreeSet<(u64, CommandId)> = self
             .proposals
             .values()
-            .filter(|p| !p.executed && self.table.phase_of(&p.command) < Some(Phase::Executed))
+            .filter(|p| !(p.durable && p.executed))
             .map(|p| (p.seqnum, p.command))
             .collect();
-        ordered.sort();
-        ordered.into_iter().map(|(_, c)| c).collect()
+        let by_barrier: BTreeMap<BarrierId, CommandId> = self
+            .proposals
+            .values()
+            .map(|p| (p.barrier, p.command))
+            .collect();
+        unsettled == self.unsettled && by_barrier == self.by_barrier
     }
 
     /// The next proposal to speculate (task-29), if the bound allows and
@@ -1906,23 +1970,20 @@ impl Leader {
         set.add(Vote::Fast(proposal)).expect("leader proposal");
         self.votes.insert(command, set);
         self.adopt_early_votes(command);
-        self.proposals.insert(
+        self.put_proposal(Proposal {
             command,
-            Proposal {
-                command,
-                barrier,
-                seqnum,
-                deps: init.deps,
-                path: init.path,
-                paths: init.paths,
-                admission: init.payload,
-                durable: false,
-                updates,
-                attempts: 1,
-                accepts: false,
-                executed: false,
-            },
-        );
+            barrier,
+            seqnum,
+            deps: init.deps,
+            path: init.path,
+            paths: init.paths,
+            admission: init.payload,
+            durable: false,
+            updates,
+            attempts: 1,
+            accepts: false,
+            executed: false,
+        });
         alloc::vec![persist]
     }
 
@@ -1970,17 +2031,14 @@ impl Leader {
             }
         }
         if let Some(barrier) = event.barrier()
-            && let Some(command) = self
-                .proposals
-                .values()
-                .find(|p| p.barrier == barrier)
-                .map(|p| p.command)
+            && let Some(command) = self.by_barrier.get(&barrier).copied()
         {
             match event {
                 StorageEvent::JournalDurable { .. } => {
                     if let Some(p) = self.proposals.get_mut(&command) {
                         p.durable = true;
                     }
+                    self.settle(command);
                 }
                 // Only a definite rejection proves the rows are absent; the
                 // same batch is then presented again unchanged, keeping the
@@ -2034,6 +2092,8 @@ impl Leader {
             .and_then(|r| r.payload)
             .unwrap_or_else(|| admission_digest(None, 0));
         let proposal = self.proposals.get_mut(&command).expect("checked above");
+        self.by_barrier.remove(&proposal.barrier);
+        self.by_barrier.insert(barrier, command);
         proposal.barrier = barrier;
         proposal.attempts += 1;
         let batch = PersistBatch {
@@ -2140,8 +2200,9 @@ impl Leader {
         // Batches may complete in any order: the acknowledgement waits on
         // every batch submitted before its own, not on its own alone.
         let requires: Vec<BarrierId> = self
-            .proposals
-            .values()
+            .unsettled
+            .iter()
+            .map(|(_, c)| &self.proposals[c])
             .filter(|p| !p.durable)
             .map(|p| p.barrier)
             .chain(self.own_adoptions.keys().copied())
@@ -2209,12 +2270,17 @@ impl Leader {
         }
         loop {
             let mut progressed = false;
-            let candidates: Vec<(CommandId, Vec<CommandId>)> = self
-                .proposals
-                .values()
+            // A proposal at PRE-ACCEPT is unexecuted, so unsettled; in
+            // identity order, as a pass over every proposal took them
+            // (task-d46).
+            let mut candidates: Vec<(CommandId, Vec<CommandId>)> = self
+                .unsettled
+                .iter()
+                .map(|(_, c)| &self.proposals[c])
                 .filter(|p| p.durable && self.table.phase_of(&p.command) == Some(Phase::PreAccept))
                 .map(|p| (p.command, p.deps.clone()))
                 .collect();
+            candidates.sort_unstable_by_key(|(c, _)| *c);
             for (command, deps) in candidates {
                 if self.table.accept(command, deps).is_ok() {
                     progressed = true;
