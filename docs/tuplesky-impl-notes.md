@@ -8330,20 +8330,27 @@ second are reported and never gated. The `command cost` job in
   first at it.
 - **Negative control.** A third `missing_payloads` call per pass of the
   domain loop (`coordd` already makes two; it chains every key of
-  `held`, `sync_pending` and `adopted` and sorts them). The busiest
-  voter fell behind, and its last-quarter busy time per command rose
-  from 11.0-15.0 ms in four runs without it to 24.0 ms at one caller,
-  and from 11.2-14.7 ms to 23.5 ms at ten: the gate fails on both. Its
-  whole-run figure rose by about a fifth, inside that reading's margin.
-  A scan of every record of the command table per pass instead raised
-  the whole-run readings by 11% and 3%: that table is bounded by its
-  capacity, and a scan of it is cheap beside a turn.
+  `held`, `sync_pending` and `adopted` and sorts them). Three repeats
+  per caller count on this container: the busiest voter fell behind,
+  and the medians of its readings were 9.5 ms (whole run) and 28.7 ms
+  (last quarter) at one caller, and 11.6 and 31.9 ms at ten, with 3.40
+  syncs per command there -- against at most 7.6, 15.0, 8.0 and
+  14.7 ms, and 3.08 syncs, in four runs without it. Gated against
+  those four runs' largest readings, the control fails 9 of the 10
+  readings and three repeats without it pass. A scan of every record of the
+  command table per pass instead raised the whole-run readings by only
+  11% and 3%: that table is bounded by its capacity, and a scan of it
+  is cheap beside a turn.
 - **Repeats.** Without a change, the busiest voter's readings moved by
   up to 19% over the whole run and 37% over the last quarter between
   four runs on this container. So each caller count runs three times
   and the gate compares the median.
 - **The baseline** holds, per caller count, the largest reading seen
-  across runs, with margins of 25% (busy over the run), 30% (busy over
-  the last quarter) and 10% (syncs). It was first recorded from those four runs on this
-  container (4 vCPU) and is re-recorded from the job's own runner.
+  in the job's own runs on its runner, with margins of 25% (busy over
+  the run), 30% (busy over the last quarter) and 10% (syncs). On the
+  `ubuntu-24.04` runner one voter falls behind in every repeat at
+  today's cost (1,098 to 1,749 of 2,602 commands executed, 12.6 to
+  17.1 ms per command), where on this container every voter kept up;
+  the baseline is that runner's. task-d46, which removes the work that
+  makes the voter fall behind, moves it down.
   A change that moves it says why.
