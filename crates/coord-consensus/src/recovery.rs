@@ -587,7 +587,9 @@ pub fn select_from(
 /// A re-proposal a kept entry depends on goes first, whatever its place:
 /// the new leader re-proposes such an entry right after it, and left out
 /// the entry would wait for a proposal nobody makes. The rest follow in
-/// the selection's order, which is identity order. What does not fit was
+/// identity order (the order of the re-proposed set), which is
+/// deterministic, not the order the leader proposes them in. What does
+/// not fit was
 /// decided nowhere, as every re-proposal was not: the installers release
 /// it, as they release any record the Sync neither selects nor
 /// re-proposes, and the collector offers it again.

@@ -5682,7 +5682,13 @@ happens at any cluster size.
   the promise is held in `early_sync`. After every storage event it is
   dropped (`SyncSuperseded`) once a higher promise is durable, and
   installed once no higher promise is in flight, which means every higher
-  promise's row failed.
+  promise's row failed. On `coordd` that last branch is effectively dead:
+  after a higher promise's row fails, the store fence stays at that
+  promise, so the released Sync's batch is refused and surfaces as
+  `SyncNotDurable`. It is kept for a store without that fence.
+- A duplicate Sync of the ballot already synchronized and active
+  converges without change before the hold, so it is not held behind a
+  promise and reported superseded later (from review).
 - Every write of the promise row carries the highest promise already
   queued for disk (`BallotState::highest_queued`). A promise from
   `on_new_leader` carries a ballot above it by construction. A Sync's row
@@ -5691,6 +5697,18 @@ happens at any cluster size.
   own row, not the promise row.
 - Nothing changes in the commit rule, the Sync's selection or any row
   format.
+- The promise row written from `on_new_leader` and the in-memory
+  `synced` rest on the ordered-journal contract: rows land in the order
+  they were queued, and a batch fails only when the store fence refuses
+  it. On `coordd` the fence is the only source of a failed batch, so a
+  Sync batch cannot fail while a later promise row lands. A store where
+  batches fail independently is task-d29's failure model, and carrying a
+  durable `synced` instead would move `synced` backwards on the common
+  path.
+- The held Sync is not persisted. A crash while it is held loses it, as
+  the path before this change lost the Sync row queued behind the P3 row;
+  the recovered promise is then P1 with nothing sent for P3 (`Promise` is
+  `SendWhenDurable`), and task-d10's ceiling bounds the wait.
 
 ### Evidence
 
@@ -5698,6 +5716,11 @@ happens at any cluster size.
   (`coord-consensus`, `activation`): the checklist review's probe. At
   `d4bd28c` the durable row reads `promised: (1, 2)` after `Promise(3,
   0)` was published. It passes now.
+- `a_duplicate_sync_of_the_active_ballot_is_not_held_behind_a_promise`
+  (`activation`): a Sync of the active ballot repeated while a higher
+  promise is in flight writes nothing and is not reported superseded.
+  With the duplicate check back after the hold it fails, naming the
+  `SyncSuperseded` rejection.
 - `no_order_of_two_promises_and_a_sync_lowers_the_durable_promise`
   (`activation`): a model of every order of `NewLeader` for P1 and P3,
   P1's Sync, and each queued row completing durably or failing, in
@@ -5711,6 +5734,12 @@ happens at any cluster size.
 
 - The protocol oracle of task-d30 checks the same property on the real
   machines under a simulated network.
+- A voter that promised a ballot but never received its Sync is not
+  re-Synced by the leader: the leader re-asks only voters not in
+  `joined` (task-d33), and task-d20 did not change that. It waits for
+  task-d10's ceiling and a new campaign. Re-sending the Sync to a
+  promised but unsynchronized voter is a liveness follow-up of its own,
+  not task-d20's (from review).
 
 ## Only adoptions count toward the slow majority
 
@@ -5936,6 +5965,17 @@ So a cycle would have to cross between kinds, and every crossing is ruled
 out above: edges go from candidates to (A) or (C), from (A) to (A) or
 (C), and from (C) only to (C). The graph is acyclic.
 
+Fact 2 needs one more thing, which the code gives: one dependency set
+per command per ballot. The slow-path re-send reuses the proposal's
+dependencies, and a reporter's ACCEPT copy comes from adoption or from
+Sync installation under `guard_accept`, both carrying the leader's
+dependencies. The soft spot is fact 3: the (C) cases assume that
+committed dependencies agree, which is the safety property itself. So
+the argument proves that a cycle implies a guard bypassed or an earlier
+safety violation, not that a cycle is impossible. That is the reason to
+halt, and the halt is the same class of stop as task-d14's two decisions
+for one command (from review).
+
 ### The rule
 
 - `recovery::entry_order` is the one ordering, and `Leader::from_recovered`
@@ -5956,6 +5996,16 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
   or a corrupt peer can; installing the acyclic part would execute what
   the rest of the domain may never (Codex review).
 - Nothing changes in what is selected.
+- Halting is the right strength. Any resolution drops an edge that some
+  reporter accepted under its guard (fact 1), so resolving would choose
+  which invariant to break. Two consequences follow and are accepted for
+  an invariant violation:
+  - The candidate closes its campaign only after its promise row is
+    durable, so the next campaign after task-d10's ceiling selects the
+    same reports and halts too. The domain stops one node per campaign
+    until an operator acts.
+  - The check in `on_sync` lets one Sync from a foreign build halt every
+    follower that receives it.
 
 ### Evidence
 
@@ -5974,7 +6024,12 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
   from the row, it queues neither entry and is halted. Both fail without
   the check.
 - `a_recovery_cycle_stop_names_the_commands` (`coordd`): the stop's
-  prefix, the count, and the first eight entries in full.
+  prefix, the count, and the first eight entries in full. The serve
+  loop's stop itself (`serve.rs`) is exercised only through
+  `describe_recovery_cycle`, as task-d14's two-decisions stop it copies
+  is. `halt_on_cycle` sets the generic stop flag, and both `coordd` and
+  the simulator's oracle check `recovery_cycle()` first, so a cycle is
+  not reported as an incompatible admission.
 - Before this change, the candidate bound such a Sync, and the new leader
   proposed nothing of the cycle and everything else.
 
@@ -6584,12 +6639,24 @@ snapshots from one replica as inconsistent.
   - The voter answers only the candidate its report went to, for that
     ballot, from the same version.
 - **Bounded assembler.** A campaign refuses a report announcing more
-  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The
-  extra page lets a report one entry past the bound still assemble, so
-  task-d20 names it. The pages held are one campaign's, since a new
-  campaign replaces the old one, plus the one report the voter serves.
+  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The extra page
+  is slack: 8 pages of 256 already hold 2,048 entries, so a report just
+  past the bound assembles without it. What the bound admits is up to
+  2,304 entries, and the campaign refuses what is past the bound by name
+  (task-d20). The pages held are one campaign's, since a new campaign
+  replaces the old one, plus the one report the voter serves (from
+  review).
+- **Pacing.** The first ask goes out one re-send interval after the
+  campaign starts, which gives the published pages 250 ms to arrive. The
+  worst case is `MAX_PAGE_ASK` duplicate pages per voter per interval,
+  idempotent at the assembler, and shares no budget with the leader's
+  proposal re-send. Report pages and their requests ride the control
+  lane, the lane that dropped the original page, so a 16-page answer can
+  drop again; the retry converges, and a smaller ask would be gentler.
 
-The report format is unchanged.
+The report format is unchanged. A build that paginates smaller would
+announce more pages and be refused `OutOfBounds`, as an older build that
+ignores the request is left to the ballot's time-out.
 
 ### Evidence
 
@@ -6628,12 +6695,26 @@ finishes or recovers admitted commands could be refused by a full table.
   and pulled commands enter a full table: a Sync's placeholders through
   `expect_beyond_capacity`, and its payloads as a command whose turn has
   come does.
+  - What one eighth is sized for (review): recovery work ignores the
+    bound, so the reserve is what lets a voter admitted to seven eighths
+    hold one catch-up window (`MAX_CATCH_UP_COMMANDS`, 64) or its
+    placeholders and still report within twice the table: 875 + 125 +
+    1,000 retired = 2,000 at the largest table. Below a table of 512
+    the reserve is smaller than a window and the beyond-capacity path
+    carries the rest; at the smallest table, 32, it is 4. A Sync's
+    entries are made to fit by the release rule and the Sync's cap, not
+    by the reserve.
 - **Release of records decided nowhere.** In the Sync's own install
   batch, as task-d11 puts its demotions there, some undecided records are
   released:
   - which: those this voter's report for the ballot named, that the
     Sync neither selected nor re-proposed, and that no selected entry
-    depends on;
+    depends on. The last clause is redundant and kept as a guard: a
+    record a kept entry depends on is itself kept, a followed
+    re-proposal, or executed and retired, which needs catch-up whatever
+    happens to the local record. It changes no outcome, but keeps a
+    selection-completeness bug (the open task-d19 item) from becoming a
+    lost payload (review);
   - their dependency rows and payload rows are deleted;
   - the table releases them and repairs the key index once the batch is
     durable. A key whose latest command was released takes that
@@ -6666,8 +6747,9 @@ finishes or recovers admitted commands could be refused by a full table.
   at every ballot, with no exit.
   - A Sync now carries at most `MAX_REPORT_ENTRIES` commands
     (`within_bound`, applied by `select_with`): every kept entry, then
-    re-proposals in the selection's order, which is identity order, until
-    the bound.
+    re-proposals in identity order, the re-proposed set's order, which is
+    deterministic and is not the order the leader proposes them in,
+    until the bound.
   - A re-proposal a kept entry depends on goes first, wherever it falls
     in that order. The new leader re-proposes such an entry right after
     it, so leaving it out would leave the entry waiting for a proposal
@@ -6689,7 +6771,11 @@ finishes or recovers admitted commands could be refused by a full table.
   - The last is a voter far behind, task-d08's and task-d32's case.
     Kept entries are never cut, since one may be decided: a selection
     whose kept entries alone pass the bound carries them all, and its
-    row bound (`SyncTooLarge`) still applies.
+    row bound (`SyncTooLarge`) still applies. A Sync refused that way on
+    its kept entries alone fails every election by construction, since
+    every later campaign keeps the same entries. It is reachable only
+    above about 27 dependencies per entry on average over 2,000 entries;
+    its owner is task-d32 (review of task-d20).
   - A voter that takes a capped Sync's re-proposals holds only what the
     Sync names, having released the rest of what it reported, so its
     report for the next ballot is within the bound.
@@ -6790,6 +6876,30 @@ finishes or recovers admitted commands could be refused by a full table.
   voter is as if it never held the command, and the proposal fetches the
   payload as any missing one, before and after a restart.
 
+Both are justified (review). The selection can speak only for what the
+promising majority reported, and admission is fenced from the promise,
+so the cut is exactly what a selection could have covered; the restart
+rebuild (`undecided()` while promised and synchronized differ) is a
+superset only by records nothing could have added. In the c2 example, c2
+is in the late voter's report, so it is released there too, and it
+comes back through the re-sent proposal and a payload fetch, which is
+what the second departure makes work: `missing_payloads` keys on absent
+payloads, so a kept payload row would never be fetched again.
+
+### A late payload for a command the Sync releases
+
+A payload answer reaches `on_request` without the promise fence. One for
+an entry an older Sync left pending, which the newer Sync omits, could
+arrive between the newer marker's issue and its durability: the command
+was still pending, so it was initialized beyond capacity, and its payload
+and dependency rows landed after the batch that deletes them. At
+durability the table and the payloads dropped it, but the ledger and the
+disk kept it. No acceptance leaked, since a voter does not vote while
+its promise and active ballot differ, but the slot came back at the next
+restart until the next Sync released it again. A payload for a command
+the in-flight marker releases is now not taken (`on_payload`); a later
+selection that names it asks for it again (review).
+
 ### Evidence
 
 - `a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them`
@@ -6833,6 +6943,12 @@ finishes or recovers admitted commands could be refused by a full table.
     keeps that re-proposal.
   - The rest are the first in identity order.
   - Without the cap the Sync names 10,000.
+- `a_payload_for_a_command_the_sync_in_flight_releases_writes_nothing`
+  (`activation`): b1's Sync leaves z pending, b2's omits it, and z's
+  payload arrives while b2's marker is in flight. Nothing is written for
+  it, and after durability neither the table, the payloads nor the
+  ledger hold z. Without the gate z's payload and dependency rows are
+  queued after the marker.
 - `a_leader_crash_right_after_a_capped_sync_is_followed_by_a_campaign_that_completes`
   (`activation`):
   - Five voters at the largest table. Four each pre-accepted 875
@@ -6946,6 +7062,19 @@ never closed its gap.
   (the materializer's row written, the comparison not yet run) is at or
   below the boot frontier, so the first ask does not cover it. That gap
   was task-d08's before this task and is unchanged.
+- Both of these lose detection, not order: order within a window is
+  forced by the predecessor rule, and the first member's position by
+  the dependency closure. Both are carried under task-d08's residual in
+  the plan (review).
+- `taken == 0` calls `done()`, which also fires when the donor simply has
+  nothing newer, so pending comparisons of restored but unexecuted
+  commits are dropped: again a loss of detection, not of order.
+- The window rule and the comparison by position both assume a total
+  order, which holds only while every command carries the conservative
+  key. Relaxing keys would split windows at commands that do not
+  conflict and could raise a false `CatchUpDivergence` on restored
+  ordinary commits. Whoever relaxes the key model owns this: task-d50
+  now (review).
 - The unthrottled `follower-out` run (about 113 appends a second, a
   follower 3400 behind at its restart), with catch-up's rate reported
   beside the domain's, is not run here: this environment has neither the
@@ -7098,8 +7227,17 @@ connection was dropped the same way.
 
 - Solicitation has its own budget of 16 destinations a turn, beside the
   re-offers' 16. After a ballot change with 256 entries pending on three
-  voters, the entries are asked for again over about 48 turns, not in
-  one.
+  voters, the entries are asked for again over 48 turns (256 × 3 / 16),
+  not in one. That is negligible in wall-clock: after `reconfigure` every
+  entry is due at once, the loop's deadline is already past, and the
+  turns run back to back. It is a burst of up to 768 submission frames
+  (review).
+- The budget asks for an entry's voters all at once or not at all, so a
+  configuration of more than 16 voters would never solicit. Moot at three
+  or five voters (task-d31), and said beside the constant.
+- `Pending.frame` now keeps every pending submission until it settles,
+  bounded by `max_pending` × (`max_request` + 128 KiB): the same formula
+  as `undelivered_budget`, so it is within the existing memory budget.
 - The frozen collector trace gains the two new events (`VoterRefused`,
   `Solicited`), and the frozen fixture is unchanged: its scenario
   produces neither.
@@ -7179,17 +7317,33 @@ contract needed and a test for each.
   - Catch-up executes up to 64 commands per durable batch (task-d25), so
     the default leaves a returning voter most of its rate to gain on the
     domain with. The time it needs is then bounded by its gap.
+  - The default is a design target and a ceiling, not a proved bound
+    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    task-d33's budget oracle is its check. It gates only client
+    requests, after the session-busy check and before the pending
+    insert; resolves, watches and held retries bypass it, and one bucket
+    per frontend is shared by every session. At the 35 to 100 commands a
+    second a domain sustains today it never binds.
 
 ### What this does not cover
 
-- **The executed-history set.** It holds one identity per command
-  executed, which a Sync and a restart's guards ask about. Bounding it
-  needs the quorum-safe floor below which no recovery can name a
-  command, and that is task-d27's. So are the tombstones kept for keys no
-  longer written, every durable row of an executed command, and disk
-  headroom. The task's long run, memory flat in history once admission
-  stops, therefore waits on task-d27: every other structure here is flat
-  in history already.
+- **The executed-history set and the tombstones.** The set holds one
+  identity per command executed, which a Sync and a restart's guards ask
+  about; `CommandTable.history` is inserted into at two sites and never
+  removed from. Bounding it needs the quorum-safe floor below which no
+  recovery can name a command. The plan now names the owners (review):
+  task-d46 retires the in-memory history above the floor continuously,
+  this set and the per-key tombstones with it; task-d27 owns every
+  durable row of an executed command below the floor and disk headroom
+  (#133). The task's long run, memory flat in history once admission
+  stops, therefore waits on those two: every other structure here is
+  flat in history already.
+- **The callers' plane carries more than admissions** (review of
+  task-d33). It carries this node's collector evidence too, so a fixed
+  share of the loop for that plane (`PEER_BEFORE_API`) throttles answers
+  along with new requests. Two shapes of fix: evidence to the collector
+  on a lane with the peer plane's priority, or a per-turn budget that
+  drains both planes. A follow-up of this contract, not yet owned.
 - **`limits.max_response_bytes` is not wired to the planner.** The
   planner's response limit decides a replicated result, so it is schema,
   8 MiB on every replica; the setting is what this node buffers, and the
