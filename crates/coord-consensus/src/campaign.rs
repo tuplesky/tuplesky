@@ -37,6 +37,8 @@ pub struct Campaign {
     /// the campaign must not wait forever on a live quorum that holds the
     /// payload.
     payloads_requested: BTreeSet<ReplicaId>,
+    /// How many times the complete reports were assembled (task-d26).
+    assemblies: u64,
 }
 
 impl Campaign {
@@ -53,6 +55,7 @@ impl Campaign {
             durable: false,
             published: false,
             payloads_requested: BTreeSet::new(),
+            assemblies: 0,
         }
     }
 
@@ -149,6 +152,13 @@ impl Campaign {
             .collect()
     }
 
+    /// How many times the complete reports were assembled for a selection
+    /// (task-d26): once per arrival from a majority on, never per page
+    /// before it.
+    pub const fn assemblies(&self) -> u64 {
+        self.assemblies
+    }
+
     /// Report pages held (task-d28).
     pub fn pages_held(&self) -> usize {
         self.assembler.pages_held()
@@ -217,6 +227,23 @@ impl Campaign {
         if self.decision.is_some() {
             return Ok(self.decision.as_ref());
         }
+        // Assembling copies every entry of every complete report, and a
+        // campaign is asked on every page and promise that arrives: until
+        // a majority could be complete nothing is assembled (task-d26). A
+        // voter whose report is past the page bound answered too, and
+        // counts: with too few in bounds the campaign fails on it by name
+        // (task-d24) rather than waiting for pages it will never hold.
+        let could_be_complete = self
+            .assembler
+            .all_pages_held()
+            .chain(self.assembler.past_bound().keys())
+            .filter(|r| self.promised.contains(r))
+            .count()
+            + usize::from(self.own.is_some());
+        if could_be_complete < self.config.slow_size() {
+            return Ok(None);
+        }
+        self.assemblies += 1;
         let mut reports = self.reports();
         // A voter whose report announced more pages than the bound
         // answered too: its report is past the bound, as one too large is.

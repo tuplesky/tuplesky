@@ -263,6 +263,7 @@ impl Frontend {
                 // setting used to size the collector's undelivered bytes
                 // and bound nothing a caller sent.
                 max_request_bytes: config.limits.max_request_bytes,
+                max_admitted_per_second: Some(config.limits.max_admitted_per_second),
             },
         );
         let dispatcher =

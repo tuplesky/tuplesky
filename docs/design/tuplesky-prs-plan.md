@@ -1790,7 +1790,7 @@ Count only adoption acknowledgements toward the slow majority, leaving the fast 
 
 **Acceptance:** Each limit has a test that drives it and fails when it is exceeded. A long run shows memory flat in history once admission stops.
 
-**Review boundary:** The contract text, the accounting and the bounds it adds. No change to protocol messages or rows.
+**Review boundary:** The contract text, the accounting and the bounds it adds. No change to protocol messages or rows. The executed-history set (`CommandTable.history`) and the per-key tombstones in memory are not bounded here: their owner is task-d46, which retires in-memory history above the floor continuously; the durable rows below the floor are task-d27's.
 
 <a id="task-d27"></a>
 ### task-d27: Wire quorum-safe forgetting into coordd
@@ -2236,7 +2236,7 @@ Make each of them O(change) or O(log n):
 - index proposals by barrier and keep `advance_pending` incremental;
 - skip `unexecuted_in_order` while speculation is off, and keep the order when it is on;
 - keep proposals awaiting a re-send in order of their last send;
-- retire executed history continuously, a bounded amount per execution, inside the retirement window task-d27 activates. This is the in-memory history only: the `ledger`, `votes`, `proposals`, `held` and `adopted` entries above the floor. A durable row is never retired here; trimming those below the floor stays task-d27's. An undecided record keeps its slot (task-d24), and task-d06's chain stays total across retirement.
+- retire executed history continuously, a bounded amount per execution, inside the retirement window task-d27 activates. This is the in-memory history only: the `ledger`, `votes`, `proposals`, `held` and `adopted` entries above the floor, and the executed-history set and per-key tombstones task-d26 leaves unbounded. A durable row is never retired here; trimming those below the floor stays task-d27's. An undecided record keeps its slot (task-d24), and task-d06's chain stays total across retirement.
 
 **Acceptance:**
 - In task-d45's run, a follower's busy time per command at 280 s is within 20% of its value at 20 s, at one client and at ten (today it grows four- to five-fold).

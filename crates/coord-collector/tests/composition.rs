@@ -1603,6 +1603,52 @@ fn a_retry_of_an_unresolved_request_takes_no_second_admission_slot() {
     assert_eq!(gate.pending(&SESSION), 1);
 }
 
+/// New requests are admitted at no more than the configured rate, with a
+/// second's worth as a burst (task-d26); a retry of an outstanding request
+/// is not a new one, and the rate refills with time.
+#[test]
+fn admission_is_bounded_by_its_rate_and_a_retry_takes_nothing() {
+    let mut gate = Admission::new(
+        CLUSTER,
+        DOMAIN,
+        AdmissionLimits {
+            max_admitted_per_second: Some(4),
+            ..AdmissionLimits::default()
+        },
+    );
+    let at = MonotonicMillis::new;
+    let mut admitted = Vec::new();
+    for n in 1..=4u64 {
+        let (_, req) = request(n, put(b"a", b"1"), 0);
+        gate.admit_at(0, at(0), &caller(), &req)
+            .expect("within the burst");
+        admitted.push(req);
+    }
+    let (_, fifth) = request(5, put(b"a", b"1"), 0);
+    assert_eq!(
+        gate.admit_at(0, at(0), &caller(), &fifth).err(),
+        Some(AdmissionRefusal::RateLimited { per_second: 4 })
+    );
+    // A retry of an outstanding request goes through, and takes nothing.
+    gate.admit_at(0, at(0), &caller(), &admitted[0])
+        .expect("a retry is the same request");
+    // A quarter of a second is one more admission; the rate held since
+    // is none.
+    assert!(gate.admit_at(0, at(200), &caller(), &fifth).is_err());
+    gate.admit_at(0, at(250), &caller(), &fifth)
+        .expect("one refilled");
+    let (_, sixth) = request(6, put(b"a", b"1"), 0);
+    assert!(gate.admit_at(0, at(250), &caller(), &sixth).is_err());
+    // Idle for longer than a second refills a second's worth, no more.
+    for n in 6..=9u64 {
+        let (_, req) = request(n, put(b"a", b"1"), 0);
+        gate.admit_at(0, at(60_000), &caller(), &req)
+            .expect("a second's worth");
+    }
+    let (_, tenth) = request(10, put(b"a", b"1"), 0);
+    assert!(gate.admit_at(0, at(60_000), &caller(), &tenth).is_err());
+}
+
 #[test]
 fn a_request_retried_on_a_new_connection_survives_the_old_one_closing() {
     // A retry can arrive on a new connection. Leaving the key in the old
@@ -1722,6 +1768,7 @@ fn a_request_larger_than_the_frontend_admits_is_refused_before_it_takes_a_slot()
         AdmissionLimits {
             max_pending_per_session: 1,
             max_request_bytes: 1024,
+            max_admitted_per_second: None,
         },
     );
     // The bound is what the protocol counts, the bytes of the key and

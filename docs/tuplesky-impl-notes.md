@@ -7250,3 +7250,135 @@ connection was dropped the same way.
 - The frozen collector trace gains the two new events (`VoterRefused`,
   `Solicited`), and the frozen fixture is unchanged: its scenario
   produces neither.
+
+## The resource contract
+
+task-d26, from the checklist review (items A2, B2, B6 and E5). The
+configuration named limits for a request, a response, a session's
+outstanding requests, the table and checkpoints, and nothing more. Several
+structures grew with what arrived or with history rather than with a
+stated bound, and several peaks were never counted. Design Section 13.1
+now states the contract: a limit for each class of resource (memory,
+durable protocol data, application data, a single message, each queue,
+temporary files) and the admission rate. This change adds the bounds the
+contract needed and a test for each.
+
+### What changed
+
+- **Installing a Sync is linear in its entries.** `advance_sync`
+  rescanned every pending entry on each round of installation and again
+  on every payload that arrived. A chain of 200 entries whose payloads
+  arrived last-first took 60,100 examinations.
+  - Each entry that cannot be installed now waits under the one command
+    it waits on first: its own record or facts, or a dependency below
+    ACCEPT.
+  - The table notes every command whose record is created or moves
+    while a Sync is pending (`CommandTable::watch_raises`,
+    `take_raised`). Only the entries waiting on a noted command are
+    examined again, whichever path moved it: a payload, a rebinding, an
+    adoption, a commit, catch-up.
+  - A Sync replaced or restored at boot is examined whole once.
+- **A candidate assembles reports once a majority could be complete.**
+  `Campaign::try_select` runs on every page and promise. Assembling
+  copies every entry of every complete report and digests it again. At
+  five voters, each page of the third report copied the second one whole.
+  It now returns early, with nothing copied, until enough promising
+  voters have every page of their report. A voter whose report announced
+  more pages than the bound counts as having answered: otherwise the
+  early return held a campaign whose voters were all past the bound
+  short of failing on them by name (task-d24's `ReportPastPages`).
+- **A Sync is encoded once.** `bounded_sync_update` cloned the selection
+  to encode the message and again to encode the row. It now encodes the
+  selection once. The frame's size is that encoding plus the Sync's tag,
+  and the row carries the same bytes, because a record of one field
+  encodes as that field.
+- **Retry-key bindings go with their command.** Neither the leader nor
+  the follower ever dropped a binding, and a boot rebuilt one for every
+  payload row there was.
+  - The history sweep now drops the bindings of forgotten commands, and
+    a boot restores none for them.
+  - A retry of a forgotten command is refused as `Forgotten` from the
+    table's executed answer, as it was from its binding, and is never
+    proposed again.
+- **Frames being received have a node budget.** Each stream's reader was
+  bounded by one frame of its class. Many streams at once each held one,
+  so partly arrived frames were bounded only by how many streams a peer
+  may open: 256 control streams of 4 MiB each.
+  - `BudgetLimits::receive_bytes` (64 MiB, with the control reserve)
+    now bounds them across every stream and connection.
+  - A frame takes its whole length once its header is in, and waits for
+    room before its payload is read. A stream therefore never holds part
+    of a frame while waiting for the rest, and QUIC flow control holds
+    the sender back meanwhile.
+  - The wait counts against the frame deadline.
+- **A historical read streams stored versions.** Building a view
+  collected every stored version of every key in a historical range
+  before choosing the one at the revision read. That is every obsolete
+  version garbage collection had not reached yet.
+  - Pages are now folded as they are read. A key's version is final, and
+    charged to the view budget, when the scan moves to the next key.
+  - The charge is the same as before, one row per key read, so the
+    outcome is the same on every replica whatever each has collected.
+- **Admission has a rate.** `limits.max_admitted_per_second`, default
+  1,000, is enforced per frontend as a token bucket with a second's
+  burst. A retry of an outstanding request takes nothing, and a refused
+  request is answered `BACKPRESSURE` ("admission rate").
+  - Catch-up executes up to 64 commands per durable batch (task-d25), so
+    the default leaves a returning voter most of its rate to gain on the
+    domain with. The time it needs is then bounded by its gap.
+  - The default is a design target and a ceiling, not a proved bound
+    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    task-d33's budget oracle is its check. It gates only client
+    requests, after the session-busy check and before the pending
+    insert; resolves, watches and held retries bypass it, and one bucket
+    per frontend is shared by every session. At the 35 to 100 commands a
+    second a domain sustains today it never binds.
+
+### What this does not cover
+
+- **The executed-history set and the tombstones.** The set holds one
+  identity per command executed, which a Sync and a restart's guards ask
+  about; `CommandTable.history` is inserted into at two sites and never
+  removed from. Bounding it needs the quorum-safe floor below which no
+  recovery can name a command. The plan now names the owners (review):
+  task-d46 retires the in-memory history above the floor continuously,
+  this set and the per-key tombstones with it; task-d27 owns every
+  durable row of an executed command below the floor and disk headroom
+  (#133). The task's long run, memory flat in history once admission
+  stops, therefore waits on those two: every other structure here is
+  flat in history already.
+- **The callers' plane carries more than admissions** (review of
+  task-d33). It carries this node's collector evidence too, so a fixed
+  share of the loop for that plane (`PEER_BEFORE_API`) throttles answers
+  along with new requests. Two shapes of fix: evidence to the collector
+  on a lane with the peer plane's priority, or a per-turn budget that
+  drains both planes. A follow-up of this contract, not yet owned.
+- **`limits.max_response_bytes` is not wired to the planner.** The
+  planner's response limit decides a replicated result, so it is schema,
+  8 MiB on every replica; the setting is what this node buffers, and the
+  capability check requires it to cover that.
+- **Measured catch-up rate.** The admission default is set against the
+  catch-up design rather than a measurement on the test host. task-d33's
+  budget and progress oracles are where the two are held against each
+  other.
+
+### Evidence
+
+- `a_sync_installs_in_time_linear_in_its_entries`: 200 chained entries,
+  payloads last-first, at most 4 examinations an entry. The old scan
+  fails it at 60,100.
+- `a_campaign_assembles_its_reports_once_a_majority_is_held`: five
+  voters, two reports paged two entries a page, one assembly.
+- `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame` and
+  `a_sync_past_its_row_refuses_the_campaign_by_name` now also check that
+  the row is the record's and that the size named is the frame's.
+- `bindings_are_bounded_by_the_commands_kept_not_by_history`: 400
+  commands through a table of 32, bindings at most 192 on every voter
+  and after a restart, and a retry of the first command not proposed
+  again. Without the sweep, the leader held 400.
+- `frames_being_received_hold_no_more_than_the_receive_budget`: six
+  400 KiB frames half sent under a 1 MiB budget. At most 1 MiB is held,
+  at least two frames are received side by side, and all six arrive.
+- `admission_is_bounded_by_its_rate_and_a_retry_takes_nothing`: the
+  burst, the refusal, a retry passing, the refill, and the cap on the
+  refill.

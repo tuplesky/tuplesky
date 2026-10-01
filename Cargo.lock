@@ -675,6 +675,7 @@ dependencies = [
  "coord-transport",
  "coord-transport-testkit",
  "coord-types",
+ "postcard",
  "rcgen",
  "rustls",
  "rustls-pki-types",

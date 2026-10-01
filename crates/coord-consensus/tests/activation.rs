@@ -5536,6 +5536,188 @@ fn a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out() {
     );
 }
 
+/// A command outside the cluster's own admissions: its identity and the
+/// payload a peer would serve for it.
+fn outside_command(seq: u64) -> (CommandId, coord_consensus::PayloadRecordV1) {
+    let request = LogicalRequest::new(
+        NamespaceId([5; 16]),
+        CanonicalOperation::Put(PutOp {
+            key: vec![7],
+            value: seq.to_be_bytes().to_vec(),
+            lease: None,
+            prev_kv: false,
+        }),
+    );
+    let rk = RetryKey {
+        cluster_id: ClusterId([1; 16]),
+        domain_id: DomainId([2; 16]),
+        session_id: SessionId([9; 16]),
+        client_instance_id: ClientInstanceId([4; 16]),
+        request_sequence: RequestSequence::new(seq).unwrap(),
+    };
+    let command = CommandId::derive(&rk, &request).unwrap();
+    let payload = coord_consensus::PayloadRecordV1 {
+        retry_key: rk,
+        logical: postcard::to_allocvec(&request).unwrap(),
+        admission: None,
+        ack_through: 0,
+    };
+    (command, payload)
+}
+
+/// Installing a Sync costs time linear in its entries, however its
+/// payloads arrive (task-d26). Each payload used to rescan every pending
+/// entry, and each round of installation rescanned them again, so a
+/// chain whose payloads arrive last-first cost the square of its length.
+#[test]
+fn a_sync_installs_in_time_linear_in_its_entries() {
+    const N: u64 = 200;
+    let mut c = Cluster::new(3);
+    let new = ballot(1, 2);
+    let f = c.nodes[1].follower_mut();
+    let promise = f.step(peer_event(
+        r(2),
+        ProtocolMessage::NewLeader {
+            ballot: new,
+            executed: ExecutionPosition::ZERO,
+        },
+    ));
+    for event in durable_events(&promise) {
+        f.step(event);
+    }
+    // A chain r1 knows nothing of: each command depends on the one before.
+    let chain: Vec<_> = (1..=N).map(outside_command).collect();
+    let mut entries = BTreeMap::new();
+    for (i, (command, _)) in chain.iter().enumerate() {
+        let deps = if i == 0 { vec![] } else { vec![chain[i - 1].0] };
+        entries.insert(
+            *command,
+            coord_consensus::SyncEntry {
+                command: *command,
+                phase: Phase::Accept,
+                deps,
+                path: coord_consensus::empty_path(),
+                paths: Vec::new(),
+                seqnum: i as u64,
+                admission: None,
+            },
+        );
+    }
+    let decision = SyncDecision {
+        ballot: new,
+        source_ballot: ballot(0, 0),
+        entries,
+        reproposed: Default::default(),
+    };
+    let bound = f.step(peer_event(r(2), ProtocolMessage::Sync(decision)));
+    for event in durable_events(&bound) {
+        f.step(event);
+    }
+    // The payloads arrive last first: none installs until the first comes.
+    for (command, payload) in chain.iter().rev() {
+        let effects = f.step(peer_event(
+            r(2),
+            ProtocolMessage::PayloadResponse {
+                command: *command,
+                payload: payload.clone(),
+            },
+        ));
+        for event in durable_events(&effects) {
+            f.step(event);
+        }
+    }
+    for (command, _) in &chain {
+        assert!(
+            f.table().phase_of(command) >= Some(Phase::Accept),
+            "{command:?} was not installed"
+        );
+    }
+    let examined = f.sync_examinations();
+    assert!(
+        examined <= 4 * N,
+        "installing {N} entries examined an entry {examined} times"
+    );
+}
+
+/// A candidate assembles the reports it holds only once a majority of
+/// them could be complete (task-d26). It is asked on every page that
+/// arrives, and assembling copies every entry of every complete report,
+/// so at five voters each page of a third report copied the second whole.
+#[test]
+fn a_campaign_assembles_its_reports_once_a_majority_is_held() {
+    let config =
+        BallotConfiguration::c2_default(epoch(), ballot(1, 0), (0..5).map(r).collect()).unwrap();
+    let report = |replica, from: u8| RecoveryReport {
+        replica,
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries: (from..from + 40)
+            .map(|c| accepted_entry(CommandId(Digest32([c; 32])), &[]))
+            .collect(),
+    };
+    let mut c = coord_consensus::Campaign::new(config.clone());
+    c.own_report(report(r(0), 0x10));
+    c.promise(r(1));
+    c.promise(r(2));
+    let mut pages: Vec<_> = coord_consensus::paginate(&report(r(1), 0x40), 2);
+    pages.extend(coord_consensus::paginate(&report(r(2), 0x80), 2));
+    let total = pages.len();
+    let mut selected = None;
+    for (i, page) in pages.into_iter().enumerate() {
+        c.page(page).unwrap();
+        if c.try_select(usize::MAX, |_, _| true).unwrap().is_some() {
+            selected = Some(i);
+        }
+    }
+    assert_eq!(
+        selected,
+        Some(total - 1),
+        "selected once the last page came"
+    );
+    assert_eq!(
+        c.assemblies(),
+        1,
+        "the reports were assembled on pages that could not complete a majority"
+    );
+}
+
+/// A voter's retry-key bindings are bounded by what it still keeps of its
+/// commands, not by every key ever submitted, and a restart does not
+/// bring the others back (task-d26). A retry of a forgotten command is
+/// still refused, from the table's executed answer.
+#[test]
+fn bindings_are_bounded_by_the_commands_kept_not_by_history() {
+    let mut cluster = Cluster::new(17);
+    let mut first = None;
+    for n in 0..400u64 {
+        let c = cluster.admit(n + 1, (n % 200) as u8);
+        first.get_or_insert(c);
+        cluster.settle();
+    }
+    // Live, retired within the window, and those the ledger holds until
+    // its next sweep.
+    let bound = 32 * 6;
+    let leader = match cluster.nodes[0].role.as_ref().unwrap() {
+        Role::Leader(l) => l.bindings_held(),
+        Role::Follower(_) => panic!("r0 leads"),
+    };
+    assert!(leader <= bound, "the leader held {leader} bindings");
+    for i in 1..3 {
+        let held = cluster.nodes[i].follower().bindings_held();
+        assert!(held <= bound, "r{i} held {held} bindings");
+    }
+    cluster.crash(1);
+    cluster.revive(1, quorum(ballot(0, 0)));
+    let held = cluster.nodes[1].follower().bindings_held();
+    assert!(held <= bound, "r1 held {held} bindings after a restart");
+    // The first command, retried, is not proposed again.
+    let executed = cluster.nodes[0].executed.len();
+    cluster.admit(1, 0);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed.len(), executed);
+    assert_eq!(cluster.nodes[0].executed[0], first.unwrap());
+}
+
 /// task-d20 review: nothing installs while a newer Sync's marker is still
 /// becoming durable.
 ///

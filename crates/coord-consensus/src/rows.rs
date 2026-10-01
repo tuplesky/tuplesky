@@ -494,20 +494,43 @@ pub fn bounded_sync_update(
         bytes,
         limit,
     };
-    let frame = crate::messages::ProtocolMessage::Sync(decision.clone())
-        .encode()
-        .len();
+    // Encoded once (task-d26): the frame is the Sync's tag before these
+    // bytes, and the row's payload is these bytes, a record of one field
+    // encoding as that field. Encoding the message and the record apart
+    // held two copies of the largest structure an election builds beside
+    // their two encodings.
+    let body = postcard::to_allocvec(decision).map_err(|_| too_large(usize::MAX))?;
+    let frame = sync_frame_overhead(decision.ballot) + body.len();
     if frame > frame_limit {
         return Err(too_large(frame));
     }
-    let record = SyncRecordV1 {
-        decision: decision.clone(),
-    };
     // A row that does not fit is reported with the row's own size, not
     // the frame's that fitted.
-    sync_update(epoch, &record).map_err(|_| {
-        too_large(postcard::to_allocvec(&record).map_or(usize::MAX, |bytes| bytes.len()))
+    let row = body.len();
+    let value = StoreEnvelopeV1 {
+        record_kind: SYNC_KIND,
+        schema_version: SYNC_SCHEMA_VERSION,
+        payload: body,
+    }
+    .encode()
+    .map_err(|_| too_large(row))?;
+    Ok(StoreUpdate {
+        collection: Collection::ProtocolV1.id(),
+        key: sync_key(epoch, &decision.ballot),
+        value: Some(value),
     })
+}
+
+/// The bytes a Sync frame carries before its selection's encoding.
+fn sync_frame_overhead(ballot: Ballot) -> usize {
+    let empty = crate::recovery::SyncDecision {
+        ballot,
+        source_ballot: ballot,
+        entries: alloc::collections::BTreeMap::new(),
+        reproposed: alloc::collections::BTreeSet::new(),
+    };
+    let body = postcard::to_allocvec(&empty).map_or(0, |b| b.len());
+    crate::messages::ProtocolMessage::Sync(empty).encode().len() - body
 }
 
 /// The update persisting a bound Sync selection.

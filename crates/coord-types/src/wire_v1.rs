@@ -412,6 +412,18 @@ impl FrameReader {
         Ok(())
     }
 
+    /// The whole length of the frame whose header is buffered, once the
+    /// header is complete: what receiving that frame will hold.
+    pub fn pending_frame_len(&self) -> Option<Result<usize, WireError>> {
+        let avail = &self.buf[self.start..];
+        if avail.len() < HEADER_LEN {
+            return None;
+        }
+        let mut header = [0u8; HEADER_LEN];
+        header.copy_from_slice(&avail[..HEADER_LEN]);
+        Some(check_header(&header))
+    }
+
     /// Bytes buffered but not yet consumed as frames.
     pub fn pending(&self) -> usize {
         self.buf.len() - self.start

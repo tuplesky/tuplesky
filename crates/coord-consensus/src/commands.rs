@@ -178,6 +178,12 @@ pub struct CommandTable {
     /// key, it is the tail of the order everything executed so far
     /// follows, which a new leader chains its first proposals after.
     last_executed: Option<CommandId>,
+    /// The commands whose record was created or moved since the owner
+    /// last took them, while it watches ([`CommandTable::watch_raises`]):
+    /// what a Sync entry waiting on one of them re-examines, instead of
+    /// every entry being rescanned each time anything moved (task-d26).
+    /// A set, so it holds at most the table's records and tombstones.
+    raised: Option<BTreeSet<CommandId>>,
 }
 
 impl CommandTable {
@@ -193,6 +199,7 @@ impl CommandTable {
             recent_set: BTreeSet::new(),
             capacity: None,
             last_executed: None,
+            raised: None,
         }
     }
 
@@ -208,6 +215,7 @@ impl CommandTable {
             recent_set: BTreeSet::new(),
             capacity: Some(capacity),
             last_executed: None,
+            raised: None,
         }
     }
 
@@ -230,6 +238,7 @@ impl CommandTable {
             recent_set: BTreeSet::new(),
             capacity,
             last_executed: None,
+            raised: None,
         };
         for (c, r) in records {
             table.records.insert(c, r);
@@ -269,6 +278,30 @@ impl CommandTable {
         table
     }
 
+    /// Start (`true`) or stop noting the commands whose record is created
+    /// or moves. Stopping forgets what was noted.
+    pub fn watch_raises(&mut self, on: bool) {
+        match (on, &self.raised) {
+            (true, None) => self.raised = Some(BTreeSet::new()),
+            (false, _) => self.raised = None,
+            (true, Some(_)) => {}
+        }
+    }
+
+    /// The commands noted since the last call, while watching.
+    pub fn take_raised(&mut self) -> BTreeSet<CommandId> {
+        self.raised
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn raise(&mut self, command: CommandId) {
+        if let Some(raised) = &mut self.raised {
+            raised.insert(command);
+        }
+    }
+
     /// Every initialized record.
     pub fn records(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
         self.records.iter().filter(|(_, r)| r.payload.is_some())
@@ -287,6 +320,7 @@ impl CommandTable {
     /// again, and a placeholder refused under backpressure dropped the
     /// entry silently, so only catch-up could bring it in.
     pub fn expect_beyond_capacity(&mut self, command: CommandId) {
+        self.raise(command);
         self.records
             .entry(command)
             .or_insert_with(|| CommandRecord {
@@ -406,6 +440,7 @@ impl CommandTable {
         if self.full_after_reclaim() {
             return Err(InitError::Backpressure);
         }
+        self.raise(command);
         self.records.insert(
             command,
             CommandRecord {
@@ -485,6 +520,7 @@ impl CommandTable {
             paths.push((key.clone(), digest));
         }
         let path = combined_path(&paths);
+        self.raise(command);
         self.records.insert(
             command,
             CommandRecord {
@@ -527,6 +563,7 @@ impl CommandTable {
         match self.records.get_mut(command) {
             Some(record) if record.payload.is_some() && record.phase <= Phase::Accept => {
                 record.payload = Some(payload);
+                self.raise(*command);
                 true
             }
             _ => false,
@@ -646,6 +683,7 @@ impl CommandTable {
         let record = self.initialized_mut(&command)?;
         record.deps = deps;
         record.phase = Phase::Accept;
+        self.raise(command);
         Ok(())
     }
 
@@ -713,6 +751,7 @@ impl CommandTable {
         let deps = record.deps.clone();
         guard_commit(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Commit;
+        self.raise(command);
         Ok(())
     }
 
@@ -727,6 +766,7 @@ impl CommandTable {
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
         self.last_executed = Some(command);
+        self.raise(command);
         Ok(())
     }
 
@@ -772,6 +812,7 @@ impl CommandTable {
     /// to say about it.
     pub fn restore_executed(&mut self, command: &CommandId) {
         self.last_executed = Some(*command);
+        self.raise(*command);
         match self.records.get_mut(command) {
             Some(r) if r.payload.is_some() => r.phase = Phase::Executed,
             Some(_) => {}
@@ -830,6 +871,7 @@ impl CommandTable {
             Some(r) => r.keys.clone(),
         };
         self.records.remove(command);
+        self.raise(*command);
         for key in &keys {
             if let Some(state) = self.keys.get_mut(key) {
                 state.log.forget(command);
