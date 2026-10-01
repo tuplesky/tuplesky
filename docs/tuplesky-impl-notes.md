@@ -7900,3 +7900,152 @@ dependencies. One was `IncompatibleAccepted`.
 - The oracles and rows that found these are the next change (task-d33).
   With every fix here, its rows 1 to 14 run clean at 100 seeds per row
   and size, three and five voters (2,000 runs).
+
+## Budgets and progress after healing, in the simulator
+
+task-d33 adds two oracles to task-d30's simulator: a budget oracle and a
+progress oracle. It also adds the failure-test matrix rows that exercise
+them. What the oracles found on the tree as it stood is fixed in the change
+below this one ("What the simulator's budget and progress oracles found").
+
+### The budget oracle
+
+After every step, every limit of the resource contract (design Section
+13.1) that the machines hold is checked at its peak. Capacity is 32, and
+`max_report_entries` is the report bound of task-d20.
+
+- **Table.**
+  - Records never exceed capacity plus the most entries (and
+    re-proposals) of any one Sync the node was given, its own selection
+    included, plus the most commands of any one catch-up page it was
+    given: both enter a full table. The most is kept across restarts:
+    the table reloads the rows earlier recovery work wrote, while the
+    Sync row that brought them may have gone. The bound used to be five reports' worth of
+    entries, eleven times the capacity, which caught nothing short of a
+    runaway (#131 review).
+  - A fresh admission never lands past the reserve.
+  - Tombstones never exceed capacity plus the conservative keys.
+- **Ledger and bindings.** Durable records and retry-key bindings never
+  exceed six tables. The history sweep (task-d26) runs once they pass
+  four; the peak is those four, the live table, and the retirement
+  window the sweep goes down to.
+- **Held proposals.** Never more than `HELD_PROPOSAL_SLACK` tables.
+- **Campaigns.**
+  - Report pages held never exceed what the promising voters' reports
+    fill.
+  - Assemblies never exceed the promises that could complete a majority,
+    plus the payloads and executions that arrived while the selection
+    waited (`Campaign::supply_moves`).
+- **Syncs.**
+  - A Sync never carries more than five reports' worth of entries.
+  - The entries examined while installing one never exceed four times the
+    Sync's size (task-d26).
+- **Frames and journal records.** A frame is at most 4 MiB. A journal
+  record is at most 4,096 updates and 4 MiB, counted as the journal
+  admits a batch: sixteen bytes more per update, 64 per batch and 512 for
+  the record's header. At capacity 32 with one-byte keys neither bound is
+  approached: both checks are vacuous at this scale, and there for a
+  larger one.
+
+### The progress oracle
+
+After the fault schedule, the faults stop and admission pauses:
+- every node restarts, the live ones too, so what the domain settles
+  from there it settles from durable rows, not from tables and journal
+  writes a restart would discard;
+- nothing is lost, duplicated or held back;
+- campaigns happen only as `coordd`'s election makes them, with per-voter
+  backoff and jitter;
+- the donor rule and pacer of catch-up are `coordd`'s.
+
+The domain then runs in synchronous rounds, and has 400 of them to reach a
+leader, with every admitted command settled, every decision the frontend
+learned or a voter executed in the one order, and every voter at the same
+execution position with nothing left it could execute. A decision learned
+from a durable majority that the next selection dropped fails the second.
+- **Settled** is what the collector can answer, from what it received:
+  - the decision, learned from the evidence; or
+  - the record of its own node, once the entry is one only the record
+    answers. It becomes one when the collector asks for it again, or a
+    voter refuses it as `Forgotten` or as bound to another command, as
+    `Collector::half_established` has it. `coordd` then settles it from
+    its node's executed rows, or as a conflict when those rows bind the key
+    to another command that executed.
+  Each command's collector is on the node that took the caller's request.
+  What the simulator knows another node executed answers nothing (#131
+  review: it used to count, so a voter that ignored or wrongly refused a
+  re-offer would have passed).
+- **Re-offers.** Every eight rounds the frontend offers what has not
+  settled again (Section 5.5, O1).
+- **Campaigns.** A campaign that a majority holds, whose promisers
+  neither restarted nor promised another ballot, must complete within 48
+  rounds (task-d28's re-ask).
+
+### The rows
+
+- **Row 5.** Client or collector dies mid-dissemination.
+  - Admissions reach a few nodes.
+  - The collector restarts and forgets what it counted.
+  - The client presents the command again to a few more.
+- **Row 9.** Repeated interrupted elections.
+  - Frequent campaigns, and a candidate crashed while it campaigns.
+  - History long enough to pass the sweeps, so a budget that grows with
+    ballots or with history shows.
+  - While healing, each voter's first report page to each campaign is
+    lost once. The faults have stopped otherwise, so a campaign completes
+    within the ceiling only if it asks for a lost page again.
+- **Row 12.** Loss beyond the repair-cache window. Most evidence to the
+  frontend is lost, so a command settles from the record of its execution
+  or not at all.
+- **Row 14.** Lost responses and retries under one identity.
+  - Evidence to the frontend is lost.
+  - Commands are presented again, some with another payload under the
+    same retry key.
+
+Each runs at three and five voters, beside task-d30's rows 1 to 4 and 10.
+
+Healing restarts every node; a leader it takes down is not counted as a
+leader crash of the schedule's, so row 1's check that its schedule
+crashed a leader still means something.
+
+### What the oracles catch
+
+Each of the four earlier fixes the task names was taken out, and the rows
+run at their default seeds:
+
+| Taken out | Caught by |
+| --- | --- |
+| task-d22: refusals said to the frontend | Row 14, every seed at three voters: not healed, the retries under a bound key never settled. |
+| task-d28: a lost report page asked for again | Row 9, most seeds at three and five voters: a campaign a majority held did not complete within the ceiling. |
+| task-d24: the table's recovery reserve | Row 14, every seed: a fresh admission landed in the reserve. |
+| task-d26: the history sweep | Row 9, every seed: the ledger and the bindings went past their budget. |
+
+Before the page loss while healing, taking out task-d28's re-ask was
+caught by no row: healing starts no campaign that has lost a page, and
+the campaigns of the faulty phase were superseded before the ceiling.
+
+Counting only what the collector received also found a safety bug. Once
+executed commands it had not answered were re-offered, row 14 at three
+voters, seed 0, had a leader take one of them again as new work. The
+leader had retired it inside the window with its key left unbound. The
+fix, `CommandTable::retired`, is in the findings change.
+
+### Diagnostics
+
+- `PROTOCOL_SIM_WATCH=<4 hex digits>` traces one command.
+  - What each report said of it when a campaign decided, and whether the
+    selection kept it.
+  - The same when a campaign ended without deciding.
+  - With `PROTOCOL_SIM_WATCH_ALL=1`, every report and the selection.
+- `PROTOCOL_SIM_WATCH_PHASE=<4 hex digits>` traces every change of one
+  command's phase or dependencies at each node.
+- `PROTOCOL_SIM_TRACE_LINES` sizes the trace kept (4,000 lines by default).
+- A heal failure names each unsettled command's phase at every node.
+
+### Evidence
+
+- Every row passes 100 seeds at three and five voters
+  (`PROTOCOL_SIM_SEEDS=100`, about 17 minutes); 12 seeds by default.
+- The seventeen seeds that failed on the way, under the oracles or as
+  the recovery rule was narrowed, are kept in
+  `fixtures/protocol_sim/seeds.json` and replayed by default.

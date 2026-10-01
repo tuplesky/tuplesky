@@ -24,18 +24,25 @@
 //!    the one every replica executed it with.
 //! 4. **No halt.** No replica stops on two decisions of one command, a
 //!    recovery cycle, or incompatible accepted copies.
+//! 5. **Budgets** (task-d33). Every limit of the resource contract (design
+//!    Section 13.1) the machines hold, checked at its peak after every
+//!    step: table records and tombstones, held proposals, the ledger and
+//!    retry-key bindings, report pages and assemblies, the work of
+//!    installing a Sync, the size of a Sync, a frame and a journal record.
+//! 6. **Progress after healing** (task-d33). Once the faults stop and
+//!    admission pauses -- every node restarted, the live ones too, no loss, no duplication,
+//!    nothing held back, campaigns only as `coordd`'s election makes them --
+//!    every admitted command settles and every voter executes as far as
+//!    the others, within a budget of steps. A command settles as the
+//!    collector settles it: learned from the evidence, answered from a
+//!    record of its execution, or refused for another command bound under
+//!    its retry key that executed. The frontend offers what has not
+//!    settled again, as the collector re-offers (design Section 5.5, O1).
 //!
-//! And once the fault schedule ends (every node back, nothing lost or
-//! crashed any more, an election whenever execution stops):
-//!
-//! 5. **Every learned decision executes.** What the frontend learned is
-//!    in the one order. A domain stalled on full tables is counted, not
-//!    failed: that gap is task-d24's.
-//!
-//! Scenarios are the checklist's failure-test matrix rows 1 to 4 and 10, at
-//! three and five voters, with table capacity 32. Seeds that once failed
-//! are kept in `fixtures/protocol_sim/seeds.json` and replayed on every
-//! run. Budgets and progress after healing are task-d33's oracles.
+//! Scenarios are the checklist's failure-test matrix rows 1 to 5, 9, 10,
+//! 12 and 14, at three and five voters, with table capacity 32. Seeds that
+//! once failed are kept in `fixtures/protocol_sim/seeds.json` and replayed
+//! on every run.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -133,6 +140,21 @@ struct Knobs {
     crash_leader: bool,
     /// Every command writes one key.
     one_key: bool,
+    /// Chance each node is given a retry (the rest are left out, as by a
+    /// client or collector that died part way through).
+    retry_reach: u32,
+    /// Chance a retry carries another payload under the same retry key.
+    new_payload: u32,
+    /// Loss of evidence on its way to the frontend.
+    frontend_loss: u32,
+    /// Chance per step the collector restarts, losing what it counted.
+    collector_crash: u32,
+    /// Crash a node while it campaigns, when one does.
+    crash_candidate: bool,
+    /// While healing, lose each voter's first report page to each
+    /// campaign, once: a campaign completes only if it asks for a lost
+    /// page again (task-d28).
+    heal_page_loss: bool,
 }
 
 impl Knobs {
@@ -153,9 +175,15 @@ impl Knobs {
         campaign: 2_000,
         crash_leader: false,
         one_key: false,
+        retry_reach: 1_000_000,
+        new_payload: 0,
+        frontend_loss: 0,
+        collector_crash: 0,
+        crash_candidate: false,
+        heal_page_loss: false,
     };
 
-    /// The checklist's matrix rows 1 to 4 and 10.
+    /// The checklist's matrix rows 1 to 5, 9, 10, 12 and 14.
     fn row(row: u8) -> Knobs {
         let base = Knobs { row, ..Knobs::BASE };
         match row {
@@ -203,7 +231,53 @@ impl Knobs {
                 crash: 2_500,
                 ..base
             },
-            _ => unreachable!("not a scenario of task-d30: row {row}"),
+            // Client or collector dies mid-dissemination: admissions reach
+            // a few nodes, the collector restarts and forgets what it
+            // counted, and the client presents the command again to a
+            // few nodes more (task-d33).
+            5 => Knobs {
+                reach: 450_000,
+                retry: 600_000,
+                retry_reach: 400_000,
+                collector_crash: 3_000,
+                crash: 2_000,
+                ..base
+            },
+            // Repeated interrupted elections: frequent campaigns, a
+            // candidate crashed while it campaigns, and history long
+            // enough to pass the sweeps, so a budget that grows with
+            // ballots or with history shows (task-d33).
+            9 => Knobs {
+                steps: 9_000,
+                commands: 260,
+                admit: 80_000,
+                campaign: 12_000,
+                crash: 3_000,
+                restart: 30_000,
+                crash_candidate: true,
+                heal_page_loss: true,
+                ..base
+            },
+            // Loss beyond the repair-cache window: most evidence to the
+            // frontend is lost, so a command settles from the record of
+            // its execution or not at all (task-d33).
+            12 => Knobs {
+                frontend_loss: 700_000,
+                loss: 40_000,
+                crash: 2_500,
+                ..base
+            },
+            // Lost response, same-identity and new-payload retries: evidence
+            // to the frontend lost, commands presented again, some with
+            // another payload under the same retry key (task-d33).
+            14 => Knobs {
+                frontend_loss: 300_000,
+                retry: 400_000,
+                new_payload: 350_000,
+                dup: 40_000,
+                ..base
+            },
+            _ => unreachable!("not a scenario of the simulator: row {row}"),
         }
     }
 }
@@ -261,8 +335,41 @@ struct Retry {
     at_step: u32,
     seq: u64,
     key: u8,
+    /// 0 for the payload first presented, 1 for another under its key.
+    variant: u8,
     nodes: Vec<u8>,
 }
+
+/// What a command was presented as, to present it again.
+#[derive(Clone, Copy)]
+struct Offer {
+    seq: u64,
+    key: u8,
+    variant: u8,
+    /// The node whose frontend took the caller's request: its collector
+    /// holds the entry and answers it from that node's own durable
+    /// record once the entry is one only the record answers.
+    host: u8,
+}
+
+/// Commands a key may be the latest of: the most tombstones a table keeps
+/// beyond its capacity (design Section 13.1).
+const KEYS: usize = 4;
+
+/// Rounds the domain has, once the faults stop, to settle what it
+/// admitted (oracle 6). In a round every message in flight is delivered,
+/// every journal completes, and every node executes what it can.
+const HEAL_BUDGET: u32 = 400;
+/// Rounds between the frontend's offers of what has not settled.
+const OFFER_EVERY: u32 = 8;
+/// Rounds between the runtime's timers while healing.
+const TIMER_EVERY: u32 = 2;
+/// Rounds a voter without a leader waits before it campaigns, while
+/// healing (`coordd`'s election patience).
+const PATIENCE: u32 = 6;
+/// Rounds a promise, or a campaign of its own, is given to synchronize,
+/// and the longest wait between campaigns (the election's ceiling).
+const CEILING: u32 = 48;
 
 struct Sim {
     n: u8,
@@ -291,17 +398,59 @@ struct Sim {
     decided: BTreeMap<CommandId, (BTreeSet<CommandId>, String)>,
     /// The one execution order.
     order: Vec<CommandId>,
-    /// Commands the frontend learned.
-    learned: BTreeSet<CommandId>,
-    /// After the fault schedule: no more loss, duplication or crashes.
-    draining: bool,
-    /// The last step a follower refused work because its table was full.
-    last_backpressure: Option<u32>,
     step: u32,
     /// Counters for the report.
     stats: Stats,
     /// Recent actions, kept when `PROTOCOL_SIM_TRACE` is set.
     trace: Option<VecDeque<String>>,
+    /// Every command admitted, as it was presented (oracle 6).
+    offers: BTreeMap<CommandId, Offer>,
+    /// Commands the frontend learned from evidence.
+    learned: BTreeSet<CommandId>,
+    /// Commands a voter refused for another bound under their retry key.
+    refused_for: BTreeMap<CommandId, CommandId>,
+    /// Commands a voter told the frontend it keeps no payload of any
+    /// more (`Refused { Forgotten }`): the collector answers them from
+    /// the durable record of their execution.
+    forgotten: BTreeSet<CommandId>,
+    /// Commands the collector presented again after the faults stopped.
+    reoffered: BTreeSet<CommandId>,
+    /// Commands executed anywhere: each has a record that answers it.
+    executed_anywhere: BTreeSet<CommandId>,
+    /// Faults have stopped.
+    healing: bool,
+    /// Entries and edges of the Syncs each node's current machine was
+    /// given to install (oracle 5).
+    sync_work: Vec<u64>,
+    /// The most entries of any one Sync each node was given, its own
+    /// selection included: how far recovery work may take its table past
+    /// the capacity.
+    sync_entries: Vec<usize>,
+    /// The most commands of any one catch-up page each node was given:
+    /// pulled commands enter a full table too (task-d24).
+    pulled_entries: Vec<usize>,
+    /// When each node last restarted, and when it last began a campaign.
+    booted_at: Vec<u32>,
+    campaign_at: Vec<u32>,
+    /// Each voter's election, as `coordd` keeps one (task-d01, task-d10):
+    /// since when it has had no leader, its wait before the next campaign,
+    /// and the promised ballot not yet synchronized with since when.
+    leaderless_since: Vec<Option<u32>>,
+    backoff: Vec<u32>,
+    unsynced: Vec<Option<(Ballot, u32)>>,
+    /// The first round after the faults stopped.
+    heal_start: u32,
+    /// Report pages lost while healing: (from, to, ballot number, page).
+    pages_lost: BTreeSet<(u8, u8, u64, u32)>,
+    /// The ballot of each node's campaign selection last counted as Sync
+    /// work: a candidate installs its own selection as a Sync.
+    selection_counted: Vec<Option<Ballot>>,
+    /// Each node's catch-up pacer, as `coordd` keeps one (task-d08):
+    /// whether it has asked since it started, and the frontier at its last
+    /// ask with the asks gone unanswered since.
+    probed: Vec<bool>,
+    asked_at: Vec<Option<usize>>,
+    unanswered: Vec<usize>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -316,8 +465,18 @@ struct Stats {
     catch_up_pages: u32,
     caught_up: u64,
     ballots: u64,
-    /// Runs whose drain stalled on full tables (task-d24's gap).
-    full_table_stalls: u32,
+    /// Steps healing took (the largest, in a total).
+    heal_steps: u32,
+    /// Commands settled as refused for another under their key.
+    conflicts: usize,
+    /// Peaks of oracle 5, over every node.
+    peak_records: usize,
+    peak_ledger: usize,
+    peak_bindings: usize,
+    peak_held: usize,
+    /// Largest ratio of Sync examinations to the Sync work given, in
+    /// hundredths.
+    peak_examinations_pct: u64,
 }
 
 impl Sim {
@@ -380,12 +539,30 @@ impl Sim {
             catch_up: std::env::var_os("PROTOCOL_SIM_NO_CATCH_UP").is_none(),
             decided: BTreeMap::new(),
             order: Vec::new(),
-            learned: BTreeSet::new(),
-            draining: false,
-            last_backpressure: None,
             step: 0,
             stats: Stats::default(),
             trace: std::env::var_os("PROTOCOL_SIM_TRACE").map(|_| VecDeque::new()),
+            offers: BTreeMap::new(),
+            learned: BTreeSet::new(),
+            refused_for: BTreeMap::new(),
+            forgotten: BTreeSet::new(),
+            reoffered: BTreeSet::new(),
+            executed_anywhere: BTreeSet::new(),
+            healing: false,
+            sync_work: vec![0; usize::from(n)],
+            sync_entries: vec![0; usize::from(n)],
+            pulled_entries: vec![0; usize::from(n)],
+            booted_at: vec![0; usize::from(n)],
+            campaign_at: vec![0; usize::from(n)],
+            leaderless_since: vec![None; usize::from(n)],
+            backoff: vec![PATIENCE; usize::from(n)],
+            unsynced: vec![None; usize::from(n)],
+            heal_start: 0,
+            pages_lost: BTreeSet::new(),
+            selection_counted: vec![None; usize::from(n)],
+            probed: vec![false; usize::from(n)],
+            asked_at: vec![None; usize::from(n)],
+            unanswered: vec![0; usize::from(n)],
         };
         for i in 0..n {
             let effects = sim.nodes[usize::from(i)].step(boot_event(1));
@@ -396,7 +573,7 @@ impl Sim {
 
     fn note(&mut self, what: impl FnOnce() -> String) {
         if let Some(t) = self.trace.as_mut() {
-            if t.len() >= 4000 {
+            if t.len() >= trace_lines() {
                 t.pop_front();
             }
             t.push_back(format!("{:>5} {}", self.step, what()));
@@ -434,12 +611,48 @@ impl Sim {
         for e in effects {
             match e {
                 Effect::Persist(batch) => {
+                    // Oracle 5: one journal record (design Section 13.1),
+                    // counted as the journal admits it: `batch_bytes` of
+                    // coord-storage (sixteen bytes per update and 64 per
+                    // batch) plus the record header's allowance of 512,
+                    // against `MAX_RECORD_BYTES` and `MAX_RECORD_UPDATES`
+                    // of coord-journal-api. A batch past it is refused as
+                    // `TooLarge` before it is queued. At capacity 32 with
+                    // one-byte keys no batch comes near it: the check is
+                    // vacuous at this scale, and there for a larger one.
+                    let bytes: usize = batch
+                        .updates
+                        .iter()
+                        .map(|u| u.key.len() + u.value.as_ref().map_or(0, Vec::len) + 16)
+                        .sum::<usize>()
+                        + 64
+                        + 512;
+                    if batch.updates.len() > 4_096 || bytes > 4 << 20 {
+                        self.fail(&format!(
+                            "node {i} wrote a journal record of {} updates and {bytes} bytes",
+                            batch.updates.len()
+                        ));
+                    }
                     let node = &mut self.nodes[usize::from(i)];
                     node.journal.push_back(batch.barrier);
                     node.storage.submit(batch);
                 }
                 Effect::SendWhenDurable { to, frame, .. } => {
+                    // Oracle 5: a protocol frame, and a Sync's entries. The
+                    // frame bound, like the journal record's, is vacuous
+                    // at this scale.
+                    if frame.len() > 4 << 20 {
+                        self.fail(&format!("node {i} sent a frame of {} bytes", frame.len()));
+                    }
                     let message = ProtocolMessage::decode(&frame);
+                    if let Ok(ProtocolMessage::Sync(d)) = &message
+                        && d.entries.len() > 5 * coord_consensus::max_report_entries(CAPACITY)
+                    {
+                        self.fail(&format!(
+                            "node {i} sent a Sync of {} entries",
+                            d.entries.len()
+                        ));
+                    }
                     if let Ok(ProtocolMessage::Promise { ballot: b, .. }) = &message {
                         let node = &mut self.nodes[usize::from(i)];
                         if node
@@ -450,6 +663,9 @@ impl Sim {
                         }
                     }
                     if to == FRONTEND {
+                        if !self.healing && self.chance("frontend-loss", self.knobs.frontend_loss) {
+                            continue;
+                        }
                         if let Ok(m) = message {
                             self.at_frontend(i, m);
                         }
@@ -457,7 +673,8 @@ impl Sim {
                     }
                     let to = to.replica.0[0];
                     let msg = Msg { from: i, to, frame };
-                    if self.chance("hold", self.knobs.hold) {
+                    // Faults stop while healing: nothing is held back.
+                    if !self.healing && self.chance("hold", self.knobs.hold) {
                         self.held.push(msg);
                     } else {
                         self.net.push(msg);
@@ -477,6 +694,25 @@ impl Sim {
             ProtocolMessage::LeaderReply {
                 ballot: b, command, ..
             } => (*b, *command),
+            // Another command is bound under this one's retry key: the
+            // collector settles it as a conflict from the record of that
+            // command (task-d22).
+            ProtocolMessage::Refused {
+                command,
+                refusal: coord_consensus::SubmissionRefusal::OtherCommand { bound },
+                ..
+            } => {
+                self.refused_for.insert(*command, *bound);
+                return;
+            }
+            ProtocolMessage::Refused {
+                command,
+                refusal: coord_consensus::SubmissionRefusal::Forgotten,
+                ..
+            } => {
+                self.forgotten.insert(*command);
+                return;
+            }
             _ => return,
         };
         let n = self.n;
@@ -569,8 +805,17 @@ impl Sim {
                 let q = l.config_quorum();
                 let pending = l.pending_sync().cloned();
                 let mut f = Follower::from_recovered(l.into_recovered(), q);
+                // A new machine: its examinations count from here, against
+                // what it is given from here, its own carried selection
+                // included (task-d34), bounded by the table.
+                self.sync_work[usize::from(i)] = 2 * CAPACITY as u64;
                 let effects = match pending {
-                    Some((from, d)) => f.on_sync(from, d),
+                    Some((from, d)) => {
+                        self.sync_work[usize::from(i)] += sync_size(&d);
+                        let most = &mut self.sync_entries[usize::from(i)];
+                        *most = (*most).max(sync_entries(&d));
+                        f.on_sync(from, d)
+                    }
                     None => Vec::new(),
                 };
                 node.role = Some(Role::Follower(f));
@@ -584,6 +829,18 @@ impl Sim {
                 if let Some(t) = self.trace.as_mut()
                     && let Some(c) = f.campaign_state()
                 {
+                    if let Ok(w) = std::env::var("PROTOCOL_SIM_WATCH") {
+                        for r in c.reports() {
+                            for e in r.entries.iter().filter(|e| short(&e.command) == w) {
+                                t.push_back(format!(
+                                    "{:>5} report of {} for {}: {e:?}",
+                                    self.step,
+                                    r.replica.0[0],
+                                    bn(&r.ballot)
+                                ));
+                            }
+                        }
+                    }
                     for r in c.reports() {
                         t.push_back(format!(
                             "{:>5} node {i} selected from {} synced {} [{}]",
@@ -625,17 +882,148 @@ impl Sim {
     }
 
     fn step_node(&mut self, i: u8, event: Event) {
+        let decided_before = match &self.nodes[usize::from(i)].role {
+            Some(Role::Follower(f)) => f.campaign_state().and_then(|c| c.decision()).is_some(),
+            _ => true,
+        };
+        let watched_reports = match &self.nodes[usize::from(i)].role {
+            Some(Role::Follower(f)) if std::env::var_os("PROTOCOL_SIM_WATCH").is_some() => {
+                f.campaign_state().map(|c| c.reports().to_vec())
+            }
+            _ => None,
+        };
+        let phase_watch: Option<(CommandId, Option<coord_consensus::Phase>, Vec<CommandId>)> =
+            std::env::var("PROTOCOL_SIM_WATCH_PHASE")
+                .ok()
+                .and_then(|w| {
+                    let c = self
+                        .order
+                        .iter()
+                        .chain(self.offers.keys())
+                        .find(|c| short(c) == w)
+                        .copied()?;
+                    let deps = match &self.nodes[usize::from(i)].role {
+                        Some(Role::Leader(l)) => l.table().record(&c).map(|r| r.deps.clone()),
+                        Some(Role::Follower(f)) => f.table().record(&c).map(|r| r.deps.clone()),
+                        None => None,
+                    };
+                    Some((c, self.phase(i, &c), deps.unwrap_or_default()))
+                });
         let effects = self.nodes[usize::from(i)].step(event);
+        let mut watch_notes: Vec<String> = Vec::new();
+        if let Some((c, before, deps_before)) = phase_watch {
+            let deps = match &self.nodes[usize::from(i)].role {
+                Some(Role::Leader(l)) => l.table().record(&c).map(|r| r.deps.clone()),
+                Some(Role::Follower(f)) => f.table().record(&c).map(|r| r.deps.clone()),
+                None => None,
+            }
+            .unwrap_or_default();
+            let after = self.phase(i, &c);
+            if after != before || deps != deps_before {
+                watch_notes.push(format!(
+                    "node {i} {} {before:?}<{}> -> {after:?}<{}>",
+                    short(&c),
+                    shorts(&deps_before),
+                    shorts(&deps)
+                ));
+            }
+        }
+        if let Some(reports) = watched_reports
+            && let Ok(w) = std::env::var("PROTOCOL_SIM_WATCH")
+            && let Some(Role::Follower(f)) = &self.nodes[usize::from(i)].role
+            && f.campaign_state().is_none()
+        {
+            for r in &reports {
+                let e = r.entries.iter().find(|e| short(&e.command) == w);
+                let after: Vec<String> = r
+                    .entries
+                    .iter()
+                    .filter(|e| e.deps.iter().any(|d| short(d) == w))
+                    .map(|e| format!("{}:{:?}", short(&e.command), e.phase))
+                    .collect();
+                watch_notes.push(format!(
+                    "node {i} campaign ended; report {} synced {} {:?} named by [{}]",
+                    r.replica.0[0],
+                    bn(&r.committed_ballot),
+                    e.map(|e| (e.phase, shorts(&e.deps), e.seqnum)),
+                    after.join(" ")
+                ));
+            }
+        }
+        if !decided_before
+            && let Ok(w) = std::env::var("PROTOCOL_SIM_WATCH")
+            && let Some(Role::Follower(f)) = &self.nodes[usize::from(i)].role
+            && let Some(c) = f.campaign_state()
+            && let Some(d) = c.decision()
+        {
+            let lines: Vec<String> = c
+                .reports()
+                .iter()
+                .map(|r| {
+                    let e = r.entries.iter().find(|e| short(&e.command) == w);
+                    format!(
+                        "  from {} synced {} {:?}",
+                        r.replica.0[0],
+                        bn(&r.committed_ballot),
+                        e.map(|e| (e.phase, shorts(&e.deps), e.seqnum))
+                    )
+                })
+                .collect();
+            if std::env::var_os("PROTOCOL_SIM_WATCH_ALL").is_some() {
+                for r in c.reports() {
+                    let all: Vec<String> = r
+                        .entries
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{}:{:?}<{}>s{}p{:02x}",
+                                short(&e.command),
+                                e.phase,
+                                shorts(&e.deps),
+                                e.seqnum,
+                                e.path.0[0]
+                            )
+                        })
+                        .collect();
+                    let text = format!("  report {} [{}]", r.replica.0[0], all.join(" "));
+                    watch_notes.push(text);
+                }
+                let sel: Vec<String> = d
+                    .entries
+                    .values()
+                    .map(|e| format!("{}:{:?}<{}>", short(&e.command), e.phase, shorts(&e.deps)))
+                    .collect();
+                watch_notes.push(format!("  selection [{}]", sel.join(" ")));
+            }
+            let fate = if d.entries.keys().any(|c| short(c) == w) {
+                "selected"
+            } else if d.reproposed.iter().any(|c| short(c) == w) {
+                "re-proposed"
+            } else {
+                "absent"
+            };
+            let text = format!(
+                "node {i} decided {} with {w} {fate}:\n{}",
+                bn(&d.ballot),
+                lines.join("\n")
+            );
+            watch_notes.push(text);
+        }
+        for text in watch_notes {
+            self.note(|| text);
+        }
         self.handle(i, effects);
         self.convert(i);
     }
 
-    fn admit(&mut self, seq: u64, key: u8, at: &[u8]) {
+    fn admit(&mut self, seq: u64, key: u8, variant: u8, at: &[u8]) {
+        let mut value = seq.to_be_bytes().to_vec();
+        value.push(variant);
         let request = LogicalRequest::new(
             NamespaceId([5; 16]),
             CanonicalOperation::Put(PutOp {
                 key: vec![key],
-                value: seq.to_be_bytes().to_vec(),
+                value,
                 lease: None,
                 prev_kv: false,
             }),
@@ -651,7 +1039,14 @@ impl Sim {
             .encode()
             .unwrap();
         let command = CommandId::derive(&rk, &request).unwrap();
-        self.note(|| format!("admit {} seq {seq} at {at:?}", short(&command)));
+        let host = at.first().copied().unwrap_or(0);
+        self.offers.entry(command).or_insert(Offer {
+            seq,
+            key,
+            variant,
+            host,
+        });
+        self.note(|| format!("admit {} seq {seq}/{variant} at {at:?}", short(&command)));
         for &i in at {
             if !self.nodes[usize::from(i)].alive() {
                 continue;
@@ -672,6 +1067,7 @@ impl Sim {
                 command,
                 coord_core::capability::admission_digest(Some(&receipt.facts()), 0),
             );
+            let known = self.holds(i, &command);
             self.step_node(
                 i,
                 Event::Admitted(AdmittedRequest {
@@ -679,6 +1075,20 @@ impl Sim {
                     frame: frame.clone(),
                 }),
             );
+            // Oracle 5: new work is admitted only into the table's
+            // unreserved part (task-d24). Work that finishes a decision
+            // -- a command a Sync or a campaign selected, or whose turn
+            // has come -- takes the reserve and does not stay in
+            // PRE-ACCEPT.
+            if !known && self.phase(i, &command) == Some(coord_consensus::Phase::PreAccept) {
+                let records = self.table_len(i);
+                if records > CAPACITY - CAPACITY / coord_consensus::RECOVERY_RESERVE_PARTS {
+                    self.fail(&format!(
+                        "node {i} admitted {} into the reserve: {records} records",
+                        short(&command)
+                    ));
+                }
+            }
         }
     }
 
@@ -712,14 +1122,23 @@ impl Sim {
                 let later = self.step + 1 + self.below("owed", 200) as u32;
                 self.owed_to_leader.push((later, seq, key));
             }
-            self.admit(seq, key, &at);
+            self.admit(seq, key, 0, &at);
             if self.chance("retry", self.knobs.retry) {
                 let later = self.step + 1 + self.below("retry-at", 400) as u32;
-                let nodes: Vec<u8> = (0..self.n).collect();
+                let mut nodes: Vec<u8> = Vec::new();
+                for i in 0..self.n {
+                    if self.knobs.retry_reach >= 1_000_000
+                        || self.chance("retry-reach", self.knobs.retry_reach)
+                    {
+                        nodes.push(i);
+                    }
+                }
+                let variant = u8::from(self.chance("new-payload", self.knobs.new_payload));
                 self.retries.push(Retry {
                     at_step: later,
                     seq,
                     key,
+                    variant,
                     nodes,
                 });
             }
@@ -737,7 +1156,7 @@ impl Sim {
         self.owed_to_leader.retain(|o| o.0 > now);
         for (_, seq, key) in owed {
             if let Some(l) = self.leader_index() {
-                self.admit(seq, key, &[l]);
+                self.admit(seq, key, 0, &[l]);
             }
         }
         let due: Vec<Retry> = {
@@ -748,13 +1167,13 @@ impl Sim {
             due
         };
         for retry in due {
-            self.admit(retry.seq, retry.key, &retry.nodes);
+            self.admit(retry.seq, retry.key, retry.variant, &retry.nodes);
         }
     }
 
     fn deliver(&mut self) {
         let k = self.below("pick", self.net.len());
-        let msg = if !self.draining && self.chance("dup", self.knobs.dup) {
+        let msg = if self.chance("dup", self.knobs.dup) {
             let m = &self.net[k];
             Msg {
                 from: m.from,
@@ -764,9 +1183,15 @@ impl Sim {
         } else {
             self.net.swap_remove(k)
         };
-        if (!self.draining && self.chance("loss", self.knobs.loss))
-            || !self.nodes[usize::from(msg.to)].alive()
-        {
+        if self.chance("loss", self.knobs.loss) {
+            return;
+        }
+        self.deliver_msg(msg);
+    }
+
+    /// Hand one message to its node.
+    fn deliver_msg(&mut self, msg: Msg) {
+        if !self.nodes[usize::from(msg.to)].alive() {
             return;
         }
         if self.trace.is_some() {
@@ -780,6 +1205,20 @@ impl Sim {
         if let Ok(ProtocolMessage::CatchUpRequest { ballot: b, after }) =
             ProtocolMessage::decode(&msg.frame)
         {
+            // `coordd`'s donor answers only while it is synchronized at
+            // that ballot or a later one of the epoch
+            // (`Node::serve_catch_up`).
+            let at_or_after = |own: Ballot| own.compare_same_epoch(&b).is_some_and(|o| o.is_ge());
+            let synchronized = match &self.nodes[usize::from(msg.to)].role {
+                Some(Role::Leader(l)) => at_or_after(l.config_quorum().ballot()),
+                Some(Role::Follower(f)) => {
+                    f.quorum().ballot() == f.ballots().synced() && at_or_after(f.ballots().synced())
+                }
+                None => false,
+            };
+            if !synchronized {
+                return;
+            }
             let page = self.page(msg.to, b, after);
             self.stats.catch_up_pages += 1;
             self.net.push(Msg {
@@ -788,6 +1227,21 @@ impl Sim {
                 frame: page.encode(),
             });
             return;
+        }
+        if let Ok(ProtocolMessage::Sync(d)) = ProtocolMessage::decode(&msg.frame)
+            && matches!(
+                self.nodes[usize::from(msg.to)].role,
+                Some(Role::Follower(_))
+            )
+        {
+            self.sync_work[usize::from(msg.to)] += sync_size(&d);
+            self.given_sync(msg.to, &d);
+        }
+        if let Ok(ProtocolMessage::CatchUpPage { entries, .. }) =
+            ProtocolMessage::decode(&msg.frame)
+        {
+            let most = &mut self.pulled_entries[usize::from(msg.to)];
+            *most = (*most).max(entries.len());
         }
         let event = Event::Peer(AuthenticatedPeerMessage::new(
             PeerProvenance::from_transport(r(msg.from), ReplicaIncarnation::new(1).unwrap(), 1),
@@ -926,7 +1380,10 @@ impl Sim {
                 k + 1
             )),
             Some(_) => {}
-            None => self.order.push(c),
+            None => {
+                self.order.push(c);
+                self.executed_anywhere.insert(c);
+            }
         }
         // Oracle 3: the dependencies it was executed with.
         if let Some(deps) = deps {
@@ -974,12 +1431,6 @@ impl Sim {
             let why = match node.role.as_mut() {
                 Some(Role::Follower(f)) => {
                     let rejections = f.take_rejections();
-                    if rejections
-                        .iter()
-                        .any(|r| matches!(r, FollowerRejection::Backpressure))
-                    {
-                        self.last_backpressure = Some(self.step);
-                    }
                     if let Some(t) = self.trace.as_mut() {
                         for r in &rejections {
                             let text = format!("{r:?}");
@@ -1019,13 +1470,22 @@ impl Sim {
         }
     }
 
+    /// Node `i` was given the Sync `d`: its table may hold that many
+    /// commands past the capacity.
+    fn given_sync(&mut self, i: u8, d: &SyncDecision) {
+        let most = &mut self.sync_entries[usize::from(i)];
+        *most = (*most).max(sync_entries(d));
+    }
+
     fn crash(&mut self, i: u8) {
         // Every frame travels on its own stream of a connection the crash
         // ends: what was in flight to or from this node is gone with it.
         // (Within a live connection frames are delayed, reordered and
         // lost at will.)
         self.note(|| format!("crash node {i}"));
-        if self.leader_index() == Some(i) {
+        // Healing restarts every node; a leader it takes down is no
+        // fault of the schedule's.
+        if !self.healing && self.leader_index() == Some(i) {
             self.stats.leader_crashes += 1;
         }
         self.net.retain(|m| m.from != i && m.to != i);
@@ -1057,6 +1517,21 @@ impl Sim {
             .into_iter()
             .map(|d| (d.ballot, d))
             .collect();
+        self.sync_work[usize::from(i)] = syncs.iter().map(|(_, d)| sync_size(d)).sum();
+        // The table reloads the rows earlier recovery work wrote, and a
+        // Sync row may have gone since: the most this node was ever given
+        // stands.
+        let rows = syncs
+            .iter()
+            .map(|(_, d)| sync_entries(d))
+            .max()
+            .unwrap_or(0);
+        let most = &mut self.sync_entries[usize::from(i)];
+        *most = (*most).max(rows);
+        self.booted_at[usize::from(i)] = self.step;
+        self.probed[usize::from(i)] = false;
+        self.asked_at[usize::from(i)] = None;
+        self.unanswered[usize::from(i)] = 0;
         let executed = ExecutionPosition::new(node.executed.len() as u64).unwrap();
         let mut f = Follower::recover_with_syncs(
             FollowerConfig {
@@ -1088,6 +1563,7 @@ impl Sim {
         self.stats.campaigns += 1;
         let b = ballot(self.highest_ballot, i);
         self.note(|| format!("campaign node {i} {}", bn(&b)));
+        self.campaign_at[usize::from(i)] = self.step;
         // Whatever was held back arrives from here on: messages of the
         // ballots before this one.
         self.net.append(&mut self.held);
@@ -1107,6 +1583,8 @@ impl Sim {
     fn timers(&mut self) {
         for i in 0..self.n {
             let executable = self.executable(i);
+            let at = self.nodes[usize::from(i)].executed.len();
+            let donor = self.catch_up_donor(i);
             let effects = match self.nodes[usize::from(i)].role.as_mut() {
                 Some(Role::Leader(l)) => l.resend_unvoted(coord_consensus::RESEND_PER_VOTER),
                 Some(Role::Follower(f)) => {
@@ -1115,8 +1593,21 @@ impl Sim {
                     if !f.missing_payloads().is_empty() {
                         effects.extend(f.request_payloads(leader));
                     }
-                    if self.catch_up && !executable && f.holds_unexecuted() && !f.catching_up() {
-                        effects.extend(f.request_catch_up(leader));
+                    // `coordd`'s pacer (task-d08): a voter that holds work
+                    // it cannot execute asks, and so does one that has not
+                    // asked since it started, whatever it holds; the
+                    // leader first, then the other voters in turn.
+                    let holds = f.holds_unexecuted() || !self.probed[usize::from(i)];
+                    if self.catch_up && !executable && holds && !f.catching_up() {
+                        let k = usize::from(i);
+                        self.probed[k] = true;
+                        if self.asked_at[k] == Some(at) {
+                            self.unanswered[k] += 1;
+                        } else {
+                            self.unanswered[k] = 0;
+                        }
+                        self.asked_at[k] = Some(at);
+                        effects.extend(f.request_catch_up(r(donor)));
                     }
                     effects
                 }
@@ -1125,6 +1616,21 @@ impl Sim {
             self.handle(i, effects);
             self.convert(i);
         }
+    }
+
+    /// Whom node `i`'s pacer asks next: the leader for its first two
+    /// asks at one frontier, then the other voters in turn.
+    fn catch_up_donor(&self, i: u8) -> u8 {
+        let leader = match &self.nodes[usize::from(i)].role {
+            Some(Role::Follower(f)) => f.quorum().leader().0[0],
+            _ => return i,
+        };
+        let unanswered = self.unanswered[usize::from(i)];
+        if unanswered < 2 && leader != i {
+            return leader;
+        }
+        let others: Vec<u8> = (0..self.n).filter(|v| *v != i).collect();
+        others[(unanswered.saturating_sub(2)) % others.len()]
     }
 
     fn executable(&self, i: u8) -> bool {
@@ -1143,6 +1649,13 @@ impl Sim {
             if self.chance("admit", self.knobs.admit) {
                 self.admit_next();
             }
+            if self.chance("collector-crash", self.knobs.collector_crash) {
+                // What the collector counted is gone; what reached the
+                // voters is not.
+                self.note(|| "collector restarts".to_owned());
+                self.shadow.clear();
+                self.submitted.clear();
+            }
             let alive: Vec<u8> = (0..self.n)
                 .filter(|i| self.nodes[usize::from(*i)].alive())
                 .collect();
@@ -1150,7 +1663,14 @@ impl Sim {
                 .filter(|i| !self.nodes[usize::from(*i)].alive())
                 .collect();
             if alive.len() > majority && self.chance("crash", self.knobs.crash) {
-                let victim = if self.knobs.crash_leader
+                let candidates: Vec<u8> = alive
+                    .iter()
+                    .copied()
+                    .filter(|i| self.campaigning(*i))
+                    .collect();
+                let victim = if self.knobs.crash_candidate && !candidates.is_empty() {
+                    candidates[self.below("candidate-victim", candidates.len())]
+                } else if self.knobs.crash_leader
                     && let Some(l) = self.leader_index()
                 {
                     l
@@ -1176,138 +1696,517 @@ impl Sim {
             } else if self.chance("timers", 30_000) {
                 self.timers();
             } else {
-                // One unit of ordinary work: a delivery, a journal
-                // completion or an execution.
-                let journals: Vec<u8> = (0..self.n)
-                    .filter(|i| !self.nodes[usize::from(*i)].journal.is_empty())
-                    .collect();
-                let runnable: Vec<u8> = (0..self.n).filter(|i| self.executable(*i)).collect();
-                let kinds = [
-                    !self.net.is_empty(),
-                    !journals.is_empty(),
-                    !runnable.is_empty(),
-                ];
-                let choices: Vec<usize> = (0..3).filter(|k| kinds[*k]).collect();
-                if !choices.is_empty() {
-                    match choices[self.below("work", choices.len())] {
-                        0 => self.deliver(),
-                        1 => {
-                            let i = journals[self.below("journal", journals.len())];
-                            self.complete(i);
-                        }
-                        _ => {
-                            let i = runnable[self.below("run", runnable.len())];
-                            self.execute(i);
-                        }
-                    }
-                }
+                self.work();
             }
             self.check_halts();
+            self.check_budgets();
         }
-        // Oracle 5: every decision the frontend learned is executed, once
-        // the faults stop. A decision learned from a durable majority,
-        // dropped by the next selection and never re-proposed passes the
-        // other four: `decided` is compared only when a replica executes.
-        if !self.drain() && self.stalled_on_a_full_table() {
-            // Not a lost decision: every follower's table is full and
-            // nothing retires, so nothing more is proposed or executed.
-            // Keeping table room for recovery is task-d24's (#122), above
-            // this branch; counted, and strict from there.
-            self.stats.full_table_stalls += 1;
-        } else if !self.learned_executed() {
-            let lost: Vec<String> = self
-                .learned
-                .iter()
-                .filter(|c| !self.order.contains(c))
-                .map(short)
-                .collect();
-            self.fail(&format!(
-                "learned but never executed after the faults stopped: {}",
-                lost.join(",")
-            ));
-        }
+        self.heal();
         self.stats.ballots = self.highest_ballot;
         self.stats
     }
 
-    /// Whether the drain ended refusing work for a full table.
-    fn stalled_on_a_full_table(&self) -> bool {
-        self.last_backpressure
-            .is_some_and(|at| self.step.saturating_sub(at) < DRAIN_QUIET)
-    }
-
-    /// Whether every command the frontend learned has executed.
-    fn learned_executed(&self) -> bool {
-        self.learned.iter().all(|c| self.order.contains(c))
-    }
-
-    /// After the fault schedule: every node back, and no more loss,
-    /// duplication, crashes or admissions, until what the frontend
-    /// learned has executed. A domain that stops executing gets an
-    /// election, as `coordd`'s does when its leader goes quiet.
-    fn drain(&mut self) -> bool {
-        self.draining = true;
-        for i in 0..self.n {
-            if !self.nodes[usize::from(i)].alive() {
-                self.restart(i);
+    /// One unit of ordinary work: a delivery, a journal completion or an
+    /// execution.
+    fn work(&mut self) {
+        let journals: Vec<u8> = (0..self.n)
+            .filter(|i| !self.nodes[usize::from(*i)].journal.is_empty())
+            .collect();
+        let runnable: Vec<u8> = (0..self.n).filter(|i| self.executable(*i)).collect();
+        let kinds = [
+            !self.net.is_empty(),
+            !journals.is_empty(),
+            !runnable.is_empty(),
+        ];
+        let choices: Vec<usize> = (0..3).filter(|k| kinds[*k]).collect();
+        if !choices.is_empty() {
+            match choices[self.below("work", choices.len())] {
+                0 => self.deliver(),
+                1 => {
+                    let i = journals[self.below("journal", journals.len())];
+                    self.complete(i);
+                }
+                _ => {
+                    let i = runnable[self.below("run", runnable.len())];
+                    self.execute(i);
+                }
             }
         }
-        let mut executed = self.order.len();
-        let mut quiet = 0u32;
-        for step in 0..DRAIN_STEPS {
-            if self.learned_executed() {
-                return true;
-            }
-            self.step = self.knobs.steps.saturating_add(step);
-            if self.order.len() > executed {
-                executed = self.order.len();
-                quiet = 0;
-            }
-            quiet += 1;
-            if quiet >= DRAIN_QUIET {
-                let followers: Vec<u8> = (0..self.n)
-                    .filter(|i| matches!(self.nodes[usize::from(*i)].role, Some(Role::Follower(_))))
-                    .collect();
-                if !followers.is_empty() {
-                    let who = followers[self.below("drain candidate", followers.len())];
-                    self.campaign(who);
+    }
+
+    /// Each node's role, for a report: `L` leads, `l` holds the leader
+    /// role without leading, `C` campaigns, `F` follows, `-` is down; with
+    /// its promised ballot's number and table size.
+    fn roles(&self) -> String {
+        (0..self.n)
+            .map(|i| match &self.nodes[usize::from(i)].role {
+                Some(Role::Leader(l)) => format!(
+                    "{}b{}t{}",
+                    if l.is_leading() { "L" } else { "l" },
+                    l.config_quorum().ballot().number,
+                    l.table().len()
+                ),
+                Some(Role::Follower(f)) => format!(
+                    "{}b{}t{}",
+                    if self.campaigning(i) { "C" } else { "F" },
+                    f.quorum().ballot().number,
+                    f.table().len()
+                ),
+                None => "-".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn holds(&self, i: u8, command: &CommandId) -> bool {
+        match &self.nodes[usize::from(i)].role {
+            Some(Role::Leader(l)) => l.table().record(command).is_some(),
+            Some(Role::Follower(f)) => f.table().record(command).is_some(),
+            None => false,
+        }
+    }
+
+    fn phase(&self, i: u8, command: &CommandId) -> Option<coord_consensus::Phase> {
+        match &self.nodes[usize::from(i)].role {
+            Some(Role::Leader(l)) => l.table().phase_of(command),
+            Some(Role::Follower(f)) => f.table().phase_of(command),
+            None => None,
+        }
+    }
+
+    fn table_len(&self, i: u8) -> usize {
+        match &self.nodes[usize::from(i)].role {
+            Some(Role::Leader(l)) => l.table().len(),
+            Some(Role::Follower(f)) => f.table().len(),
+            None => 0,
+        }
+    }
+
+    fn campaigning(&self, i: u8) -> bool {
+        matches!(
+            &self.nodes[usize::from(i)].role,
+            Some(Role::Follower(f)) if f.campaign_state().is_some() && f.won().is_none()
+        )
+    }
+
+    /// Oracle 5: every limit of the resource contract the machines hold
+    /// (design Section 13.1), at its peak.
+    fn check_budgets(&mut self) {
+        let n = usize::from(self.n);
+        let majority = n / 2 + 1;
+        // A report's pages: its live records and its retirement window,
+        // at most one page past what they take (task-d28).
+        let report_pages = (2 * CAPACITY).div_ceil(coord_consensus::MAX_PAGE_ENTRIES) + 1;
+        // The ledger, payloads, votes and bindings: the live and recently
+        // retired commands, swept once they pass four tables; the peak is
+        // those four, the live table and the retirement window the sweep
+        // goes down to, six tables in all.
+        let kept = 6 * CAPACITY;
+        for i in 0..self.n {
+            let node = &self.nodes[usize::from(i)];
+            let Some(role) = node.role.as_ref() else {
+                continue;
+            };
+            let (table, ledger, bindings) = match role {
+                Role::Leader(l) => (l.table(), l.ledger().len(), l.bindings_held()),
+                Role::Follower(f) => (f.table(), f.ledger().len(), f.bindings_held()),
+            };
+            let mut over = Vec::new();
+            let records = table.len();
+            // Admitted work stops an eighth short of the capacity; recovery
+            // work (a Sync's entries, a candidate's selection, pulled
+            // commands, a command whose turn has come) may pass it, bounded
+            // by the largest Sync and the largest catch-up page this node
+            // was given, and nothing executed is kept past it (task-d24,
+            // design Section 13.1).
+            let (sync, pulled) = (
+                self.sync_entries[usize::from(i)],
+                self.pulled_entries[usize::from(i)],
+            );
+            if records > CAPACITY + sync + pulled {
+                let mut phases: BTreeMap<String, usize> = BTreeMap::new();
+                for (_, r) in table.records() {
+                    *phases.entry(format!("{:?}", r.phase)).or_default() += 1;
                 }
-                quiet = 0;
-            } else if step % DRAIN_TIMERS == 0 {
+                let placeholders = records - phases.values().sum::<usize>();
+                let kind = matches!(role, Role::Leader(_));
+                over.push(format!(
+                    "{records} table records, capacity {CAPACITY}, largest Sync {sync}, \
+                     largest catch-up page {pulled}, leader {kind}: {phases:?}, \
+                     {placeholders} placeholders"
+                ));
+            }
+            let tombstones = table.tombstones().len();
+            if tombstones > CAPACITY + KEYS {
+                over.push(format!("{tombstones} tombstones"));
+            }
+            if ledger > kept {
+                over.push(format!("{ledger} ledger records"));
+            }
+            if bindings > kept {
+                over.push(format!("{bindings} retry-key bindings"));
+            }
+            let mut held = 0;
+            let mut examinations_pct = 0;
+            if let Role::Follower(f) = role {
+                held = f.held().len();
+                if held > coord_consensus::HELD_PROPOSAL_SLACK * CAPACITY {
+                    over.push(format!("{held} held proposals"));
+                }
+                if let Some(c) = f.campaign_state() {
+                    if c.pages_held() > n * report_pages {
+                        over.push(format!("{} candidate report pages", c.pages_held()));
+                    }
+                    // Once a majority could be complete, then once per
+                    // report that completes and once per payload or
+                    // execution the selection may have waited on.
+                    if c.assemblies() > (n - majority + 1) as u64 + c.supply_moves() {
+                        over.push(format!(
+                            "{} report assemblies, {} supplies",
+                            c.assemblies(),
+                            c.supply_moves()
+                        ));
+                    }
+                }
+                let served =
+                    f.report_pages_held() - f.campaign_state().map_or(0, |c| c.pages_held());
+                if served > report_pages {
+                    over.push(format!("{served} served report pages"));
+                }
+                // Installing a Sync examines an entry once per change to
+                // what it waits on: linear in its entries and edges
+                // (task-d26). A candidate's own selection is installed as
+                // one.
+                if let Some(d) = f.campaign_state().and_then(|c| c.decision())
+                    && self.selection_counted[usize::from(i)] != Some(d.ballot)
+                {
+                    self.selection_counted[usize::from(i)] = Some(d.ballot);
+                    self.sync_work[usize::from(i)] += sync_size(d);
+                    let entries = sync_entries(d);
+                    let most = &mut self.sync_entries[usize::from(i)];
+                    *most = (*most).max(entries);
+                }
+                let work = self.sync_work[usize::from(i)];
+                let examinations = f.sync_examinations();
+                if examinations > 4 * work {
+                    over.push(format!(
+                        "{examinations} Sync examinations for {work} entries and edges"
+                    ));
+                }
+                examinations_pct = (examinations * 100).checked_div(work).unwrap_or(0);
+            }
+            let s = &mut self.stats;
+            s.peak_records = s.peak_records.max(records);
+            s.peak_ledger = s.peak_ledger.max(ledger);
+            s.peak_bindings = s.peak_bindings.max(bindings);
+            s.peak_held = s.peak_held.max(held);
+            s.peak_examinations_pct = s.peak_examinations_pct.max(examinations_pct);
+            if !over.is_empty() {
+                self.fail(&format!("node {i} over its budget: {}", over.join("; ")));
+            }
+        }
+    }
+
+    /// Whether `command` has an answer its collector can give, as
+    /// `coordd`'s does: it learned the decision, or the entry is one only
+    /// the durable record answers and the record of the node that hosts
+    /// the collector holds it. An entry becomes one when the collector
+    /// asks for it again, or a voter refuses it as `Forgotten` or bound to
+    /// another command (`Collector::half_established`, task-d22), and
+    /// `coordd` then settles it from its own node's executed rows
+    /// (`settle_from_record`), or as a conflict when that node's record
+    /// binds the key to the other command and executed it
+    /// (`settle_conflict_from_record`). What the simulator knows some
+    /// other node executed is not an answer.
+    fn settled(&self, command: &CommandId) -> bool {
+        if self.learned.contains(command) {
+            return true;
+        }
+        let from_record = self.reoffered.contains(command)
+            || self.forgotten.contains(command)
+            || self.refused_for.contains_key(command);
+        if !from_record {
+            return false;
+        }
+        let host = &self.nodes[usize::from(self.offers[command].host)];
+        host.executed.contains(command)
+            || self
+                .refused_for
+                .get(command)
+                .is_some_and(|bound| host.executed.contains(bound))
+    }
+
+    fn unsettled(&self) -> Vec<CommandId> {
+        self.offers
+            .keys()
+            .filter(|c| !self.settled(c))
+            .copied()
+            .collect()
+    }
+
+    /// Every admitted command settled, every decision the frontend
+    /// learned or a voter executed is in the one order, and every voter
+    /// executed as far as the others and has nothing left it could
+    /// execute. A decision learned from a durable majority that the next
+    /// selection dropped would otherwise pass as settled.
+    fn healed(&self) -> bool {
+        self.leader_index().is_some()
+            && (0..self.n).all(|i| {
+                self.nodes[usize::from(i)].executed.len() == self.order.len() && !self.executable(i)
+            })
+            && self.learned.is_subset(&self.executed_anywhere)
+            && self
+                .decided
+                .keys()
+                .all(|c| self.executed_anywhere.contains(c))
+            && self.unsettled().is_empty()
+    }
+
+    /// Oracle 6: stop the faults and admission, and give the domain a
+    /// budget of steps to settle everything it admitted.
+    fn heal(&mut self) {
+        self.healing = true;
+        self.note(|| "faults stop".to_owned());
+        self.net.append(&mut self.held);
+        self.retries.clear();
+        self.owed_to_leader.clear();
+        // Every node restarts, the live ones too: what the domain settles
+        // from here it settles from durable rows, as after a restart of
+        // the whole domain, not from volatile tables and journal writes a
+        // restart would discard.
+        for i in 0..self.n {
+            if self.nodes[usize::from(i)].alive() {
+                self.crash(i);
+            }
+            self.restart(i);
+        }
+        let start = self.step + 1;
+        self.heal_start = start;
+        for k in 0..HEAL_BUDGET {
+            self.step = start + k;
+            if k % OFFER_EVERY == 0 && self.leader_index().is_some() {
+                self.offer_unsettled();
+            }
+            if k % TIMER_EVERY == 0 {
                 self.timers();
-            } else {
-                let journals: Vec<u8> = (0..self.n)
-                    .filter(|i| !self.nodes[usize::from(*i)].journal.is_empty())
-                    .collect();
-                let runnable: Vec<u8> = (0..self.n).filter(|i| self.executable(*i)).collect();
-                // The disk keeps up: a queued batch completes before the
-                // next delivery. Two leaders of different ballots can
-                // re-send faster than one delivery a step drains, and a
-                // network that never empties would otherwise leave every
-                // batch, a campaign's promise among them, never durable.
-                if let Some(i) = journals.first() {
-                    self.complete(*i);
-                } else if !self.net.is_empty() {
-                    self.deliver();
-                } else if let Some(i) = runnable.first() {
-                    self.execute(*i);
-                } else {
-                    self.timers();
+            }
+            self.heal_election();
+            // One round: what is in flight arrives, in the order sent.
+            for msg in core::mem::take(&mut self.net) {
+                if self.lose_page(&msg) {
+                    continue;
+                }
+                self.deliver_msg(msg);
+                self.check_halts();
+            }
+            for i in 0..self.n {
+                while !self.nodes[usize::from(i)].journal.is_empty() {
+                    self.complete(i);
+                }
+                while self.executable(i) {
+                    self.execute(i);
                 }
             }
             self.check_halts();
+            self.check_budgets();
+            if self.healed() {
+                self.stats.heal_steps = k;
+                self.stats.conflicts = self
+                    .offers
+                    .keys()
+                    .filter(|c| !self.learned.contains(c) && !self.executed_anywhere.contains(c))
+                    .count();
+                return;
+            }
         }
-        self.learned_executed()
+        let unsettled = self.unsettled();
+        let executed: Vec<usize> = self.nodes.iter().map(|n| n.executed.len()).collect();
+        let phases: Vec<String> = unsettled
+            .iter()
+            .take(4)
+            .map(|c| {
+                let at: Vec<String> = (0..self.n)
+                    .map(|i| format!("{:?}", self.phase(i, c)))
+                    .collect();
+                format!("{} {}", short(c), at.join("/"))
+            })
+            .collect();
+        let lost: Vec<CommandId> = self
+            .decided
+            .keys()
+            .filter(|c| !self.executed_anywhere.contains(c))
+            .copied()
+            .collect();
+        self.fail(&format!(
+            "not healed {HEAL_BUDGET} rounds after the faults stopped: roles {}, \
+             executed {executed:?} of {}, {} unsettled [{}]; phases {}; \
+             {} decided and never executed [{}]",
+            self.roles(),
+            self.order.len(),
+            unsettled.len(),
+            shorts(&unsettled),
+            phases.join(", "),
+            lost.len(),
+            shorts(&lost)
+        ));
+    }
+
+    /// Whether a report page is lost while healing: each voter's first
+    /// page of its report to each campaign, once (`heal_page_loss`). The
+    /// faults have stopped otherwise, so a campaign that did not ask for
+    /// a lost page again (task-d28) is one the ceiling catches.
+    fn lose_page(&mut self, msg: &Msg) -> bool {
+        if !self.knobs.heal_page_loss {
+            return false;
+        }
+        let Ok(ProtocolMessage::ReportPage(p)) = ProtocolMessage::decode(&msg.frame) else {
+            return false;
+        };
+        if p.page != 0
+            || !self
+                .pages_lost
+                .insert((msg.from, msg.to, p.ballot.number, p.page))
+        {
+            return false;
+        }
+        let (f, t, b) = (msg.from, msg.to, bn(&p.ballot));
+        self.note(|| format!("lose {f}->{t} report page 0 for {b}"));
+        true
+    }
+
+    /// The collector presents what has not settled again, to every node
+    /// (design Section 5.5, O1).
+    fn offer_unsettled(&mut self) {
+        let all: Vec<u8> = (0..self.n).collect();
+        for c in self.unsettled() {
+            self.reoffered.insert(c);
+            let o = self.offers[&c];
+            self.admit(o.seq, o.key, o.variant, &all);
+        }
+    }
+
+    /// Whether voter `i` has a leader, as `coordd`'s election decides
+    /// it: it leads, or holds the leader role on its way to leading; or
+    /// the ballot it promised names another voter that is up, and has
+    /// synchronized here or is still within the ceiling to; or it is
+    /// campaigning and its campaign is within the ceiling.
+    fn led(&mut self, i: u8) -> bool {
+        let now = self.step;
+        let k = usize::from(i);
+        match &self.nodes[k].role {
+            Some(Role::Leader(_)) => true,
+            Some(Role::Follower(f)) => {
+                let promised = f.ballots().promised();
+                if promised.leader == r(i) {
+                    return f.campaign_state().is_some()
+                        && now - self.campaign_at[k].max(self.heal_start) < CEILING;
+                }
+                if !self.nodes[usize::from(promised.leader.0[0])].alive() {
+                    return false;
+                }
+                if f.quorum().ballot() == promised {
+                    self.unsynced[k] = None;
+                    return true;
+                }
+                let since = match self.unsynced[k] {
+                    Some((b, since)) if b == promised => since,
+                    _ => {
+                        self.unsynced[k] = Some((promised, now));
+                        now
+                    }
+                };
+                now - since < CEILING
+            }
+            None => false,
+        }
+    }
+
+    /// Elections once the faults stop, as `coordd` makes them: a voter
+    /// without a leader campaigns after its patience, jittered, and waits
+    /// twice as long after each campaign that did not produce one, up to
+    /// the ceiling.
+    ///
+    /// And task-d28's property: a campaign whose promises a majority
+    /// still holds, none of them restarted since, completes in its own
+    /// ballot within the ceiling. A lost report page is asked for again.
+    fn heal_election(&mut self) {
+        let now = self.step;
+        let majority = usize::from(self.n) / 2 + 1;
+        for i in 0..self.n {
+            let k = usize::from(i);
+            let Some(Role::Follower(f)) = &self.nodes[k].role else {
+                continue;
+            };
+            let Some(c) = f.campaign_state() else {
+                continue;
+            };
+            let live = f.won().is_none()
+                && c.promised().len() >= majority
+                && c.promised().iter().all(|p| {
+                    let v = usize::from(p.0[0]);
+                    self.booted_at[v] <= self.campaign_at[k]
+                        && match &self.nodes[v].role {
+                            Some(Role::Leader(l)) => l.ballots().promised() == c.ballot(),
+                            Some(Role::Follower(g)) => g.ballots().promised() == c.ballot(),
+                            None => false,
+                        }
+                });
+            // A campaign from before the faults stopped is timed from
+            // when they did.
+            if live && now - self.campaign_at[k].max(self.heal_start) >= CEILING {
+                let b = c.ballot();
+                let missing = c.missing_pages();
+                self.fail(&format!(
+                    "node {i}'s campaign for {} held by a majority did not complete in \
+                     {CEILING} rounds; pages missing {missing:?}",
+                    bn(&b)
+                ));
+            }
+        }
+        for i in 0..self.n {
+            let k = usize::from(i);
+            if !self.nodes[k].alive() {
+                continue;
+            }
+            if self.led(i) {
+                self.leaderless_since[k] = None;
+                self.backoff[k] = PATIENCE;
+                continue;
+            }
+            let since = *self.leaderless_since[k].get_or_insert(now);
+            if now - since < self.backoff[k] + u32::from(i) {
+                continue;
+            }
+            if matches!(self.nodes[k].role, Some(Role::Follower(_))) {
+                self.backoff[k] = (self.backoff[k] * 2).min(CEILING);
+                self.leaderless_since[k] = Some(now);
+                self.campaign(i);
+            }
+        }
     }
 }
 
-/// Steps the drain may take before a learned decision that has not
-/// executed is called lost.
-const DRAIN_STEPS: u32 = 60_000;
-/// Steps without an execution before the drain holds an election.
-const DRAIN_QUIET: u32 = 6_000;
-/// Steps between timer rounds while draining.
-const DRAIN_TIMERS: u32 = 250;
+/// The entries and edges a Sync gives a follower to install.
+/// The commands a Sync puts in a table: its entries and its re-proposals.
+fn sync_entries(d: &SyncDecision) -> usize {
+    d.entries.len() + d.reproposed.len()
+}
+
+fn sync_size(d: &SyncDecision) -> u64 {
+    d.entries
+        .values()
+        .map(|e| 1 + e.deps.len() as u64)
+        .sum::<u64>()
+        + d.reproposed.len() as u64
+}
+
+/// Trace lines kept: `PROTOCOL_SIM_TRACE_LINES`, or 4,000.
+fn trace_lines() -> usize {
+    std::env::var("PROTOCOL_SIM_TRACE_LINES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4_000)
+}
 
 fn short(c: &CommandId) -> String {
     format!("{:02x}{:02x}", c.0.0[0], c.0.0[1])
@@ -1382,6 +2281,25 @@ fn describe(m: &ProtocolMessage) -> String {
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
+        ProtocolMessage::CatchUpPage {
+            ballot,
+            after,
+            through,
+            entries,
+        } => format!(
+            "CatchUpPage {} after {} through {} [{}]",
+            bn(ballot),
+            after.get(),
+            through.get(),
+            entries
+                .iter()
+                .map(|e| short(&e.command))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        ProtocolMessage::CatchUpRequest { ballot, after } => {
+            format!("CatchUpRequest {} after {}", bn(ballot), after.get())
+        }
         other => {
             let t = format!("{other:?}");
             t.chars().take(120).collect()
@@ -1491,7 +2409,14 @@ fn run_row(row: u8) {
                     totals.catch_up_pages += s.catch_up_pages;
                     totals.caught_up += s.caught_up;
                     totals.ballots += s.ballots;
-                    totals.full_table_stalls += s.full_table_stalls;
+                    totals.heal_steps = totals.heal_steps.max(s.heal_steps);
+                    totals.conflicts += s.conflicts;
+                    totals.peak_records = totals.peak_records.max(s.peak_records);
+                    totals.peak_ledger = totals.peak_ledger.max(s.peak_ledger);
+                    totals.peak_bindings = totals.peak_bindings.max(s.peak_bindings);
+                    totals.peak_held = totals.peak_held.max(s.peak_held);
+                    totals.peak_examinations_pct =
+                        totals.peak_examinations_pct.max(s.peak_examinations_pct);
                 }
                 Err(e) => failures.push(e),
             }
@@ -1499,6 +2424,12 @@ fn run_row(row: u8) {
     }
     std::panic::set_hook(hook);
     println!("row {row}: {totals:?}; runs that learned nothing (3, 5 voters): {idle:?}");
+    // Said here as well as in the assertion: rows run side by side, and
+    // another row's silenced hook may be the one installed when this one
+    // panics.
+    for f in &failures {
+        eprintln!("FAILED {f}");
+    }
     assert!(
         failures.is_empty(),
         "{} failing seeds:\n{}",
@@ -1551,8 +2482,28 @@ fn row_4_acknowledgement_before_payload_repeated() {
 }
 
 #[test]
+fn row_5_client_or_collector_dies_mid_dissemination() {
+    run_row(5);
+}
+
+#[test]
+fn row_9_repeated_interrupted_elections() {
+    run_row(9);
+}
+
+#[test]
 fn row_10_delayed_old_ballot_messages() {
     run_row(10);
+}
+
+#[test]
+fn row_12_loss_beyond_the_repair_cache_window() {
+    run_row(12);
+}
+
+#[test]
+fn row_14_lost_responses_and_retries_under_one_identity() {
+    run_row(14);
 }
 
 /// A seed kept because it once failed.
