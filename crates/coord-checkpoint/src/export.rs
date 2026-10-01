@@ -200,6 +200,41 @@ fn beyond(collection: Collection) -> ExportError {
     }
 }
 
+/// The key and value bytes of every row in the collections an export
+/// reads, counted until they pass `stop_above`: a result above it is how
+/// far the count got, not the whole.
+///
+/// Every row counts, a payload not yet executed as well, so the count is
+/// never less than what an export of the same view would carry; stopping
+/// early bounds its cost by `stop_above` rather than by the state.
+pub fn common_state_bytes<V: OrderedRead>(
+    view: &V,
+    stop_above: u64,
+    limits: &ExportLimits,
+) -> Result<u64, ExportError> {
+    let mut bytes = 0u64;
+    for collection in Collection::ALL {
+        if !collection.in_common_hash() {
+            continue;
+        }
+        let mut request = ScanRequest::all(limits.page_rows, limits.page_bytes);
+        loop {
+            let page = view.scan_page(collection.id(), &request)?;
+            for row in &page.rows {
+                bytes += (row.key.len() + row.value.len()) as u64;
+            }
+            if bytes > stop_above {
+                return Ok(bytes);
+            }
+            match page.rows.last() {
+                Some(last) if !page.exhausted => request.resume_after = Some(last.key.clone()),
+                _ => break,
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 /// Export the common state of `view` at its closed boundary.
 pub fn export_shared<V: OrderedRead>(
     view: &V,

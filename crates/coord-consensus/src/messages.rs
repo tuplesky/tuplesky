@@ -313,6 +313,18 @@ pub enum ProtocolMessage {
         /// Why.
         refusal: SubmissionRefusal,
     },
+    /// A voter's durable promise about the shared checkpoint it holds at a
+    /// forgetting-floor boundary (task-d27), sent for its peers to record
+    /// so a majority's promises can activate the floor.
+    ///
+    /// The bytes are an encoded `CheckpointReadinessV1`, which the
+    /// machines never read: the runtime that exports checkpoints and
+    /// holds the readiness rows does. A voter sends it only once its own
+    /// row is durable, since a promise that is not durable is not one.
+    FloorReadiness {
+        /// The encoded readiness.
+        readiness: Vec<u8>,
+    },
 }
 
 /// Why a voter refused a submission (task-d22).
@@ -367,6 +379,7 @@ impl ProtocolMessage {
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }
             | ProtocolMessage::CatchUpPage { .. }
+            | ProtocolMessage::FloorReadiness { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }

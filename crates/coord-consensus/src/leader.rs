@@ -2453,6 +2453,7 @@ impl Leader {
             | ProtocolMessage::Proposal(_)
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::Refused { .. }
+            | ProtocolMessage::FloorReadiness { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }

@@ -4301,7 +4301,10 @@ impl Follower {
                 }
                 out
             }
-            ProtocolMessage::LeaderReply { .. } | ProtocolMessage::Refused { .. } => Vec::new(),
+            // The runtime's to record, not the machine's (task-d27).
+            ProtocolMessage::LeaderReply { .. }
+            | ProtocolMessage::Refused { .. }
+            | ProtocolMessage::FloorReadiness { .. } => Vec::new(),
         }
     }
 

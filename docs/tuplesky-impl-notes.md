@@ -8123,3 +8123,142 @@ Present`, a record sits in `pending` unmaterialized until the next
 flush, and the applier's loop can meet `StaleBase → Replan` up to eight
 times and return `Diverged` (`apply.rs`). Trimming under task-d27 relies
 on the reconcile, so this is settled before the trim lands.
+
+## Agreeing a forgetting floor in coordd
+
+task-d27's first part: the voters agree a floor, and nothing is
+forgotten below it yet. Trimming, the behind-floor stop and reclaiming
+sessions and retry records by an executed command come after it. Off by
+default (`[floor] enabled = false`).
+
+- **A common boundary.** A floor needs a majority promising the same
+  checkpoint, so every voter exports at the same positions: every
+  `FLOOR_INTERVAL` (4,096) executed positions, right after the command
+  at that position is applied. `Applier::apply` returns only once the
+  command's own batch is readable, and nothing but a command moves the
+  execution frontier, so the export is at exactly that position. Voters
+  that executed the same commands produce the same root; in the
+  three-voter test all three do. The interval is the schema's, not a
+  setting: a boundary derived from each voter's own setting would agree
+  only by coincidence. It moves into replicated policy with the
+  intervals.
+- **Durable before told.** The image is kept first (`SharedImageStore`:
+  verified from its encoded chunks, written to a pending directory,
+  synced, renamed into place). Then the readiness row is journaled
+  through `record_readiness`, which refuses a promise that goes back or
+  competes. The `FloorReadiness` message waits in the outbox on that
+  row's barrier, like any vote. The floor's batches take barriers from a
+  third sequence space (`RUNTIME_BARRIERS`), so the applier hands their
+  facts on rather than keeping them as its own.
+- **A peer's promise is its own.** A readiness is taken only from the
+  voter it names, over that voter's authenticated link, and recorded
+  through the same rules. It is also checked against the promise held
+  in memory, because the row that would refuse it may still be in the
+  journal and not yet in the view.
+- **Activation.** When a majority's promises name one checkpoint, the
+  certificate (`ActivatedFloorV1`) is journaled on each voter that holds
+  them. `TrimmedFloorV1`, the fence before deletions, is not published:
+  nothing is deleted yet. A restart reads back the promises and the
+  certificate, so a voter neither promises below itself nor forgets a
+  floor.
+- **The epoch a floor is agreed in** is the one its checkpoints name:
+  the configuration the store's frontier was reached under. Until a
+  reconfiguration executes, that is the initial one, whatever the
+  membership's epoch, as it is for every record the journal stamps
+  (`Persistence::follow_ballot`). Agreed in the membership's epoch, every
+  promise was refused as an origin mismatch.
+- **Disk.** Before an export, the images' filesystem must have
+  `headroom_bytes` free (1 GiB by default) beyond the last image's size,
+  read with `rustix::fs::statvfs`. Short of it, the boundary is refused
+  and said so, and no promise is made. Only images a standing promise
+  names are kept: this voter's latest, and the activated floor's.
+- **An image outlives the rows that name it.** A new promise or
+  activation supersedes older images, but until its batch is durable
+  the older rows are what a crash leaves. So superseded images are
+  reclaimed only once the outbox reports the superseding batch durable
+  (`Floor::settle`, at the end of each `carry_out`). After a batch
+  fails, nothing is reclaimed until a restart reads the rows back: a
+  later batch's images are no longer what the rows name. On reopening, the image this voter's latest durable
+  promise names is read back and verified
+  (`SharedImageStore::verify`). Missing or damaged, the voter does not
+  start: it would advertise a promise it cannot keep.
+- **This voter's promise counts once it is durable.** A promise is held
+  in memory from the turn it is made, so a peer's promise is checked
+  against it, but an activation counts it only once the promise's batch
+  is durable (`Floor::settle`), and the activation it completes is
+  journaled then. A failed batch rolls this voter's promise and the
+  activated floor back to the durable rows. A boundary is due only at
+  the execution frontier: a retry answered from the record carries its
+  original position, which the frontier is past, and exports nothing.
+- **Inline, and capped.** The export (`export_shared`: every row of the
+  common collections, every chunk in memory), the image's write
+  (`SharedImageStore::keep`: re-encode, verify, an fsync per 1 MiB
+  chunk, a rename) and the readiness row all run synchronously in
+  `Domain::turn`, the task that also drains peer frames, timers and
+  requests. That is O(common state) in reads, memory and written bytes
+  at every boundary, on every voter at the same position; while it runs
+  the domain neither serves nor answers a peer, and past the election's
+  1 s patience a new ballot fences the floor's batches. Measured with
+  redb at the default 64 MiB cache, release build, on one 4-core
+  container (`measure_the_inline_boundary`, coord-checkpoint's export
+  tests, ignored): 16 MiB of common state 0.16 s, 32 MiB 0.29 s, 48 MiB
+  0.49 s, 64 MiB 0.69 s, 128 MiB 1.6 s, 384 MiB 11 s (the export about
+  10 ms per MiB, the fsynced write the rest). 1 GiB did not fit the
+  container's disk beside its image; linear from 384 MiB it is about
+  30 s. So a floor refuses to start over `INLINE_EXPORT_CAP_BYTES`,
+  32 MiB of key and value bytes in the collections an export reads,
+  counted at `Floor::open` and only as far as the cap. A domain that
+  grows past it while running stops promising once an image is over the
+  cap (`FloorRefusal::OverCap`), and the next start refuses. The cap
+  goes when the export moves off the serving loop (task-d27's second
+  part). Measuring found the redb adapter's paged scan quadratic: each
+  page started at the interval's edge and skipped to the cursor, so
+  once the rows outgrew the cache 384 MiB took 152 s to export. The
+  cursor now narrows the range itself, and a conformance check holds
+  every adapter to a cursor outside the interval.
+- **When a voter's floor does not reopen.** `coordd` does not start,
+  and says why. Over the cap: set `[floor] enabled = false`; the voter
+  serves, and its promises and any activated floor stay in its store,
+  read back when the floor is enabled again. The image this voter
+  promised is missing or damaged: the refusal names its root. A peer
+  whose latest promise is the same boundary holds the same image under
+  the same 64-hex name (equal common state exports equal bytes), so
+  with `coordd` stopped, copy that directory from the peer's images
+  directory into this voter's; the reopening verifies it again before
+  it is trusted. If no peer holds it, disabling the floor leaves a
+  durable promise this voter no longer backs. That is harmless while
+  nothing trims (this part: nothing reads a peer's image or forgets
+  below a floor), and it is not once trimming lands: then the way back
+  is replacing the voter through membership (task-d41) with a fresh
+  store. Never delete the readiness or activation rows by hand; they
+  are in the common hash.
+- **Its own directory.** The floor's images and the local checkpoints
+  each reclaim every 64-hex directory their own store does not keep. A
+  configuration that gives both one directory, or puts one inside the
+  other, is refused (`ConfigError::SharedDirectory`). `coordd` compares
+  the canonical paths again at start, so a link cannot join them.
+- **Not yet.** A promise sent while the voter's ballot changes is
+  dropped with the other sends of the old ballot. A voter that missed a
+  peer's promise activates from the next boundary's. Neither blocks
+  anything, because nothing depends on the floor until trimming does.
+- Tests (coord-daemon, `floor`):
+  - `three_voters_agree_a_floor_at_each_boundary` fails without the
+    voter recording its peers' promises.
+  - `a_promise_is_taken_only_from_the_voter_it_names` fails without the
+    sender check.
+  - `a_restarted_voter_reads_back_its_promise_and_its_floor` fails
+    without the read-back.
+  - `a_voter_short_of_headroom_promises_nothing_and_two_still_activate`.
+  - `a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable`
+    fails when images are reclaimed as the rows are made.
+  - `a_failed_batch_reclaims_nothing`.
+  - `a_voter_whose_promised_image_is_lost_does_not_reopen_its_floor`
+    fails without the read-back verification; it also reopens from the
+    image copied from a peer, named by the refusal.
+  - `an_own_promise_whose_batch_failed_counts_for_nothing` fails
+    without the rollback; `a_superseded_image_is_kept_until_the_batch_that_supersedes_it_is_durable`
+    fails when the own promise counts before its batch is durable.
+  - `a_position_behind_the_frontier_is_no_boundary`.
+  - `common_state_over_the_inline_cap_refuses_the_floor_at_start`.
+  - `the_floor_keeps_its_images_apart_from_the_local_checkpoints`
+    (config).

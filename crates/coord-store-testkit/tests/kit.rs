@@ -38,7 +38,7 @@ fn honest_model_passes_every_check() {
     let mut h = ModelHarness(ModelEngine::new());
     let report = run_all(&mut h);
     assert!(report.all_passed(), "{report:?}");
-    assert_eq!(report.results.len(), 7);
+    assert_eq!(report.results.len(), 8);
     assert!(report.skipped().is_empty());
 }
 
