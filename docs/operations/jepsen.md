@@ -215,6 +215,31 @@ The other scenarios need a `jepsen-ref` with `jepsen.tuplesky.wan`; the
 jobs say so and stop on one without it, and the `faults` scenario still
 runs on one from before.
 
+The first runs, on `e96f03e` with tuplesky/jepsen#4 at `0d4c1308`, were
+`:valid? true` for all three systems in every scenario. The
+`throughput` row is from the run before, on `4bf8ea1`
+([36805572484](https://github.com/tuplesky/tuplesky/actions/runs/36805572484));
+the `wan` rows are from
+[36807788525](https://github.com/tuplesky/tuplesky/actions/runs/36807788525)
+and [36807790521](https://github.com/tuplesky/tuplesky/actions/runs/36807790521).
+`ok` a second, with the median latency:
+
+| Scenario | TupleSky | etcd 3.7.2 | SwiftPaxos |
+| --- | --- | --- | --- |
+| `throughput` (register, 10 clients a node) | 23.8 (reads 636 ms) | 1252.7 (reads 9 ms) | 1670.3 (reads 8 ms) |
+| `wan-throughput` | 25.3 (reads 800 ms) | 233.3 (reads 71 ms) | 508.1 (reads 75 ms) |
+| `wan` (20/s, packet faults; TupleSky and etcd append, SwiftPaxos register) | 10.9 (txn 170 ms) | 10.3 (txn 300 ms) | 20.0 (75 ms) |
+
+Every measured round trip was within 0.2 ms of the profile. TupleSky's
+unthrottled throughput is two orders of magnitude below both baselines on
+the runner's bridge and one under the WAN, with a median latency of 600 to
+800 ms either way, and it falls over the run (1222, 721, 580 and 462 `ok`
+per 30 s on the bridge) while every voter executes to the same position
+with no refusal or stop. That is a finding about the domain, not the
+harness. SwiftPaxos's 75 ms under the WAN is its client's round trip to
+the farthest replica it waits for (`n3`, 74 ms), with the clients beside
+`n1`.
+
 Beside it, on a runner of its own, the `etcd-baseline` job runs Jepsen's
 own etcd test ([jepsen-io/etcd](https://github.com/jepsen-io/etcd),
 pinned) against etcd on the same kind of cluster, so a run's throughput
