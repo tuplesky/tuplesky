@@ -5682,7 +5682,13 @@ happens at any cluster size.
   the promise is held in `early_sync`. After every storage event it is
   dropped (`SyncSuperseded`) once a higher promise is durable, and
   installed once no higher promise is in flight, which means every higher
-  promise's row failed.
+  promise's row failed. On `coordd` that last branch is effectively dead:
+  after a higher promise's row fails, the store fence stays at that
+  promise, so the released Sync's batch is refused and surfaces as
+  `SyncNotDurable`. It is kept for a store without that fence.
+- A duplicate Sync of the ballot already synchronized and active
+  converges without change before the hold, so it is not held behind a
+  promise and reported superseded later (from review).
 - Every write of the promise row carries the highest promise already
   queued for disk (`BallotState::highest_queued`). A promise from
   `on_new_leader` carries a ballot above it by construction. A Sync's row
@@ -5691,6 +5697,18 @@ happens at any cluster size.
   own row, not the promise row.
 - Nothing changes in the commit rule, the Sync's selection or any row
   format.
+- The promise row written from `on_new_leader` and the in-memory
+  `synced` rest on the ordered-journal contract: rows land in the order
+  they were queued, and a batch fails only when the store fence refuses
+  it. On `coordd` the fence is the only source of a failed batch, so a
+  Sync batch cannot fail while a later promise row lands. A store where
+  batches fail independently is task-d29's failure model, and carrying a
+  durable `synced` instead would move `synced` backwards on the common
+  path.
+- The held Sync is not persisted. A crash while it is held loses it, as
+  the path before this change lost the Sync row queued behind the P3 row;
+  the recovered promise is then P1 with nothing sent for P3 (`Promise` is
+  `SendWhenDurable`), and task-d10's ceiling bounds the wait.
 
 ### Evidence
 
@@ -5698,6 +5716,11 @@ happens at any cluster size.
   (`coord-consensus`, `activation`): the checklist review's probe. At
   `d4bd28c` the durable row reads `promised: (1, 2)` after `Promise(3,
   0)` was published. It passes now.
+- `a_duplicate_sync_of_the_active_ballot_is_not_held_behind_a_promise`
+  (`activation`): a Sync of the active ballot repeated while a higher
+  promise is in flight writes nothing and is not reported superseded.
+  With the duplicate check back after the hold it fails, naming the
+  `SyncSuperseded` rejection.
 - `no_order_of_two_promises_and_a_sync_lowers_the_durable_promise`
   (`activation`): a model of every order of `NewLeader` for P1 and P3,
   P1's Sync, and each queued row completing durably or failing, in
@@ -5711,6 +5734,12 @@ happens at any cluster size.
 
 - The protocol oracle of task-d30 checks the same property on the real
   machines under a simulated network.
+- A voter that promised a ballot but never received its Sync is not
+  re-Synced by the leader: the leader re-asks only voters not in
+  `joined` (task-d33), and task-d20 did not change that. It waits for
+  task-d10's ceiling and a new campaign. Re-sending the Sync to a
+  promised but unsynchronized voter is a liveness follow-up of its own,
+  not task-d20's (from review).
 
 ## Only adoptions count toward the slow majority
 
