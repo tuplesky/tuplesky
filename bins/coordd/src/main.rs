@@ -22,6 +22,7 @@ mod genesis;
 mod leases;
 mod membership;
 mod peers;
+mod redial;
 mod serve;
 mod store;
 

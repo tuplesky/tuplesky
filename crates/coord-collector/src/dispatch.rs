@@ -440,6 +440,16 @@ impl Dispatcher {
         self.collector.due_offers(now, budget)
     }
 
+    /// A destination's link has come back; its re-offers fall due now
+    /// (see [`crate::collector::Collector::reachable_again`]).
+    pub fn reachable_again(
+        &mut self,
+        replica: &coord_types::ids::ReplicaId,
+        now: MonotonicMillis,
+    ) -> usize {
+        self.collector.reachable_again(replica, now)
+    }
+
     /// When the next re-offer falls due, on the clock `due_offers` is
     /// given; see [`crate::Collector::next_due`].
     pub fn next_due(&self) -> Option<MonotonicMillis> {

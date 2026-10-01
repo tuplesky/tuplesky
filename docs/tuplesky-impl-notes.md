@@ -2855,3 +2855,94 @@ physical link, competing traffic or a route change. The script prints the
 `--impairment` line for the run that follows rather than letting the
 benchmark infer one, and a run that states no impairment says exactly
 that instead of implying there was none.
+
+## A mesh that is dialled once heals only by restarting it
+
+task-d03. Both planes were dialled when the serving loop started and
+never again: a closed connection only refreshed the `peers connected=`
+line. The transport ends every connection at its age cap (twelve hours
+by default) or when it goes idle, so a dropped link stayed down for the
+survivors, a restarted voter was dialled again by nobody, and half a day
+after start the whole domain went quiet.
+
+`bins/coordd/src/redial.rs` is the schedule that keeps dialling, one
+entry per voter of one plane, handed time so it is tested without a
+clock. A voter whose link is held costs nothing. A voter whose link was
+just lost is dialled at the floor (250 ms). A voter that stays away is
+dialled at a rate that halves on every failure down to one attempt per
+ceiling (10 s), and never stops. Every wait is jittered per voter and
+per attempt, so the survivors of one event do not dial in step. A
+failed dial to a voter whose link is held schedules nothing, because in
+a full mesh one of each pair's two connections is closed when they meet
+and the loser's error is not an unreachable voter. In practice the rule
+that decides is "held at the next look wins": the accepting end writes
+`HelloAck` before it registers the connection, so a collision loser's
+dial usually returns `Ok`. It schedules a floor dial, which the next
+pass cancels when it sees the link held.
+
+On the peer plane "held" means both lanes, control and bulk. Payload
+catch-up travels on the bulk lane, so a voter whose bulk lane alone
+closed, or whose bulk dial failed after its control dial succeeded, is
+dialled again for that lane. A dial counts as reaching the voter only
+if every lane it dialled did. An ended dial is taken at the top of every
+pass, not only by the loop's select, because that arm is polled after
+the voter's own work and both planes' sockets. On a busy domain it might
+never be reached, and a dial whose end is never taken leaves its voter
+in flight and never dialled again.
+
+The loop drives it through the `Deadline` mechanism it already had. It
+looks at which voters a connection is holding, starts the dials that are
+due, and wakes when the next one falls due. A dial runs as a task of its
+own, in a `JoinSet` that the domain drops with it. The loop does not
+wait on it, because an absent voter costs a whole handshake timeout.
+That needed `coord_transport::Dialer`, the part of a `Transport` that
+opens connections without owning its event queue. `Transport::connect`
+is now that code.
+
+Two consequences were not in the plan entry:
+
+- **Serving no longer waits for the first dials.** The startup dial was
+  awaited before the loop served anything, with the control and bulk
+  lanes dialled one after the other. A voter restarted while another was
+  down sat about ten seconds deaf to its domain, two handshake timeouts
+  on the absent peer. The first dials are now the schedule's, due at
+  once, and go out on the loop's first pass. A submission that arrives
+  first was always correct: an unreachable voter contributes nothing and
+  the quorum rule decides.
+- **A returning link brings its re-offers forward.** When a voter's
+  submission link returns, `Collector::reachable_again` makes what it is
+  owed due now rather than at the backed-off time its schedule had
+  reached.
+
+The acceptance tests run real daemons:
+
+- `links_the_age_cap_ends_are_dialled_again_on_both_planes` shortens the
+  age cap to three seconds, through a debug-build-only
+  `COORDD_TEST_CONNECTION_AGE_MS`. Every voter loses and regains every
+  link on both planes, then establishes a request.
+- `a_restarted_voter_is_dialled_again_by_the_survivors` shows the
+  survivors' collector links return. A restarted voter's own dials never
+  restore those, because an inbound collector connection carries no
+  replica identity.
+- `a_submission_made_while_its_voters_were_away_is_delivered_when_they_return`
+  leaves voter 1 alone with a pending put and restarts voter 2. The
+  answer arrives without a retry.
+
+With the schedule reduced to dial-once, all three fail. A killed voter
+closes nothing, so the survivors only see its links go at the
+transport's thirty-second idle timeout. That is a detection delay, not a
+healing one, and it is left as it is.
+
+It has one consequence for a restart. A peer link is kept by the
+connection the lower replica identity dialled, which both ends compute
+the same way. A survivor with the lower identity still holds the link it
+dialled to the killed voter until that link idles out, and every dial
+from the restarted voter loses the collision to it and is closed. A
+voter restarted inside the idle timeout therefore rejoins the peer plane
+only when the stale link ends: up to thirty seconds late, not never. The
+handshake carries no boot identity that would let the survivor tell a
+restarted peer from a live one. Telling them apart needs one, or an
+age rule that is safe against the initial dial race, and that is left
+for later. The third test waits for voter 1 to see both planes' links
+go before voter 2 is restarted. Restarting sooner made it fail about one
+run in ten, when the answer arrived after its forty-five-second bound.
