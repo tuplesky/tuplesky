@@ -8354,3 +8354,125 @@ second are reported and never gated. The `command cost` job in
   the baseline is that runner's. task-d46, which removes the work that
   makes the voter fall behind, moves it down.
   A change that moves it says why.
+
+## Per-event work that does not grow with history
+
+task-d46. The consensus machines kept executed entries in their maps
+until the history sweep (capacity × `HISTORY_SWEEP`), and several of
+them read every entry on each turn or event, so a command cost more the
+more had run before it. Each such read is now an index kept as the
+maps change, read for what changed.
+
+- **The learner** examines the records at ACCEPT
+  (`CommandTable::in_accept`, entered where a record reaches ACCEPT and
+  left lazily) instead of every vote set, executed history included,
+  and finds the next command to execute among the committed records
+  (`in_commit`) instead of every record. `commit_through_leader` reads
+  the same set.
+- **A follower's missing payloads** are three sets kept with the maps:
+  adopted and held commands with no payload (`adopted_lacking`,
+  `held_lacking`), and held commands that may await a rebind
+  (`rebinds`, filtered when read). `coordd` asks twice per pass; a
+  follower that had fallen behind spent 29 of 40 stack samples there,
+  over up to `HELD_PROPOSAL_SLACK` tables of held proposals.
+- **A follower's adoptions** are driven by what changed. A held proposal
+  that cannot be adopted waits under the one command it waits on first,
+  as task-d26 keeps pending Sync entries, and the table notes for the
+  follower every command whose record is created or moves
+  (`watch_moves`). `advance_pending` examines the proposals held since
+  its last call and those waiting on a noted command, where it read
+  every held proposal on every proposal, payload and storage event.
+- **The leader's proposals** are indexed by barrier (`on_storage` found
+  one by a linear scan) and by what is unsettled, not both durable and
+  executed (`unexecuted_in_order`, `committed_through`,
+  `advance_pending` and `adopt_own` read every proposal).
+- **Decisions unchanged.** The protocol simulator folds each node's
+  executed order and each decided command's dependencies into a digest
+  (`Stats.decisions`). At `PROTOCOL_SIM_SEEDS=100` every row's digest is
+  the same as before task-d46, after each change. Debug assertions
+  compare each index with the scan it replaces in every test.
+
+### Measured
+
+On tmpfs on this container, three voters, the `command cost` bench
+(2,500 operations, the default mix):
+
+| callers | completed/s before | after | busiest voter's busy ms/cmd before | after | its last quarter before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 145-147 | 413-443 | 6.4-7.6 | 1.42-1.52 | 10.8-15.0 | 1.71-2.09 |
+| 10 | 128-150 | 603-628 | 7.2-7.5 | 1.47-1.52 | 11.2-14.6 | 1.90-2.48 |
+
+Three runs each, before and after. The ceiling at ten callers rose about
+four-fold.
+
+Over a long run (100,000 operations at one caller and 150,000 at ten,
+the default mix without its scans: a scan reads from a random key to
+the end of the key space, so it costs more as the puts fill it, which
+is the application's state and not this task's), each follower's busy
+time per command over the 15 s up to 20 s and up to 280 s:
+
+| callers | local checkpoints | at 20 s | at 280 s | ratio | completed per 30 s |
+| --- | --- | --- | --- | --- | --- |
+| 1 | off | 1.52, 1.47 | 1.77, 1.77 | 1.16, 1.20 | 9,388 to 11,178, no trend |
+| 10 | off | 1.41, 1.41 | 1.60, 1.54 | 1.14, 1.10 | 14,449 to 17,436, no trend |
+| 1 | every 4,096 records (the default) | 1.47, 1.46 | 2.76, 3.00 | 1.88, 2.05 | 10,702 falling to 6,812 |
+| 10 | every 4,096 records | 1.44, 1.42 | 3.29, 2.80 | 2.28, 1.97 | 15,404 falling to 9,223 |
+
+Before task-d46, the plan's measurement of the same thread grew four- to
+five-fold over 90 s at one caller.
+
+### Open: the local checkpoint on the domain thread
+
+With local checkpoints at their default (`checkpoint_after_records =
+4096`), the cost per command still grows, and the growth is task-j04's
+local checkpoint. `Domain::maintain` publishes one each time the
+journal runs 4,096 records past the last, on the domain thread, and
+`export_local` traverses the whole projection to write it. The
+projection grows with every executed command (its MVCC revisions,
+`executed_v1` and payload rows), so each export costs more than the
+last: 1.1 to 1.3 s of the domain thread's busy time on average over the
+run above, about 2.5 s near its end, at 365,000 projection records,
+during which the voter takes no event. Late in the run a third of a
+leader's busy samples are in `export_local`. Off, the run meets the
+acceptance; on, it does not, and a voter falls 9,000 commands behind.
+
+That is outside this task's boundary (the consensus machines and the
+loop's call sites, no change to what is durable). Two ways out, either
+a task of its own: export from a read snapshot off the domain thread,
+so the loop only selects the image and reclaims; or pace exports by the
+projection's size rather than a fixed record count, so the export cost
+per command stays constant, at the price of a journal (and a restart's
+replay) that grows with the state.
+
+### Open: a voter that stops executing
+
+Under ten callers, before the held-proposal indexes and on task-d45's
+base alike, one voter stopped executing for good while the other two
+went on: executed 43,923 at 93 s and nothing after, at 99% busy,
+refusing as backpressure, while both peers logged its control lane
+full. On task-d45's base, at one caller, the same at 2,334 commands.
+Its samples were in `missing_payloads`: a voter that falls behind holds
+many proposals, and reading them all on every pass kept it from
+draining its peers' frames, which were dropped, re-sent and dropped
+again. With the indexes it no longer stops, in the runs above; with
+the local checkpoint on, a voter still falls behind (the 2.5 s stalls)
+and catches up slowly. What lets a voter that has fallen behind catch
+up, rather than only not stop, is task-d49's: a re-send window full of
+proposals the voter already acknowledged starves the one it lost.
+
+### Not done here
+
+- **Continuous retirement.** The maps are still swept when the ledger
+  passes capacity × `HISTORY_SWEEP`, which is one O(n) pass every few
+  thousand executions; amortized constant, not bounded per execution.
+  The executed-history set and per-key tombstones stay unbounded, and
+  `CommandTable::retire` still reads every key's state for each
+  tombstone it evicts.
+- **The leader's re-send** (`resend_unvoted`, `committed_through` in
+  `announce_committed`) still sorts every durable proposal each tick.
+  task-d49 rewrites that window.
+- **A follower behind on a contended key.** `PathLog::sync_known`
+  re-chains the digest over the key's whole unsynchronized suffix, so
+  each adoption costs that suffix. The digest is the path evidence
+  voters compare, so its definition stays; only a follower that is
+  behind pays it.
