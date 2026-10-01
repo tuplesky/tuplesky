@@ -7227,8 +7227,17 @@ connection was dropped the same way.
 
 - Solicitation has its own budget of 16 destinations a turn, beside the
   re-offers' 16. After a ballot change with 256 entries pending on three
-  voters, the entries are asked for again over about 48 turns, not in
-  one.
+  voters, the entries are asked for again over 48 turns (256 × 3 / 16),
+  not in one. That is negligible in wall-clock: after `reconfigure` every
+  entry is due at once, the loop's deadline is already past, and the
+  turns run back to back. It is a burst of up to 768 submission frames
+  (review).
+- The budget asks for an entry's voters all at once or not at all, so a
+  configuration of more than 16 voters would never solicit. Moot at three
+  or five voters (task-d31), and said beside the constant.
+- `Pending.frame` now keeps every pending submission until it settles,
+  bounded by `max_pending` × (`max_request` + 128 KiB): the same formula
+  as `undelivered_budget`, so it is within the existing memory budget.
 - The frozen collector trace gains the two new events (`VoterRefused`,
   `Solicited`), and the frozen fixture is unchanged: its scenario
   produces neither.

@@ -1217,6 +1217,12 @@ const UNDELIVERABLE_SAID_AT: u64 = 64;
 /// crowd out the work it exists to enable. This is the whole of what a
 /// turn spends on it; what is still owed after that is owed on the next
 /// turn, on the collector's schedule.
+///
+/// Solicitation spends the same number of destinations a turn on its own
+/// (`due_solicits`), an entry's voters all at once or not at all: a
+/// configuration of more than 16 voters would never solicit. Voter counts
+/// are three or five (task-d31), so this is moot today, and has to change
+/// with this bound if that does.
 const OFFERS_PER_TURN: usize = 16;
 
 /// How many peer events in a row are taken before the caller's plane is
