@@ -249,6 +249,10 @@ pub struct Leader {
     speculation: Speculation,
     rejections: Vec<Rejection>,
     fenced: Option<FenceReason>,
+    /// Entries of the selection this leader was handed that no order
+    /// keeps: a dependency cycle, which is an invariant violation
+    /// (task-d21). A leader holding one proposes and leads nothing.
+    recovery_cycle: Option<Vec<CommandId>>,
     /// The reply this leader published to the frontend for each command
     /// it still remembers, kept so an exact duplicate submission can
     /// offer it to the submitter again (task-c02). Never recovered: the
@@ -327,6 +331,7 @@ impl Leader {
             speculation: Speculation::new(),
             rejections: Vec::new(),
             fenced: None,
+            recovery_cycle: None,
             own_adoptions: BTreeMap::new(),
         }
     }
@@ -414,33 +419,23 @@ impl Leader {
             speculation: Speculation::new(),
             rejections: Vec::new(),
             fenced: None,
+            recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
         };
         let _ = identity;
         // Dependency order among the entries: a command follows every
-        // dependency that is itself an entry.
-        let mut order: Vec<CommandId> = Vec::new();
-        let mut remaining: Vec<CommandId> = decision.entries.keys().copied().collect();
-        while !remaining.is_empty() {
-            let before = remaining.len();
-            remaining.retain(|c| {
-                let deps = &decision.entries[c].deps;
-                if deps
-                    .iter()
-                    .all(|d| !decision.entries.contains_key(d) || order.contains(d))
-                {
-                    order.push(*c);
-                    false
-                } else {
-                    true
-                }
-            });
-            if remaining.len() == before {
-                // A cycle among entries cannot come from one leader's order;
-                // stop rather than guess.
-                break;
+        // dependency that is itself an entry. A cycle is an invariant
+        // violation (task-d21): the candidate halts before binding such a
+        // selection, and a leader handed one anyway proposes nothing and
+        // leads no further, rather than propose part of it and wait on the
+        // rest for ever.
+        let order = match crate::recovery::entry_order(decision) {
+            Ok(order) => order,
+            Err(cycle) => {
+                leader.recovery_cycle = Some(cycle);
+                return (leader, Vec::new());
             }
-        }
+        };
         let mut effects = Vec::new();
         // The tail of the recovered order, not the largest identity: a
         // command identifier says nothing about execution order, and
@@ -1136,6 +1131,7 @@ impl Leader {
         let identity = &self.config.identity;
         let quorum = &self.config.quorum;
         self.fenced.is_none()
+            && self.recovery_cycle.is_none()
             && !self.ballots.is_fenced()
             && identity.role == ReplicaRole::Voter
             && identity.epoch == quorum.epoch()
@@ -1144,6 +1140,12 @@ impl Leader {
             && self.ballots.promised() == quorum.ballot()
             && quorum.ballot().leader == identity.replica
             && self.ballots.in_flight().is_none()
+    }
+
+    /// The entries of this leader's selection that no order keeps, if
+    /// the selection held a dependency cycle (task-d21).
+    pub fn recovery_cycle(&self) -> Option<&[CommandId]> {
+        self.recovery_cycle.as_deref()
     }
 
     /// Why the leader stopped leading, if it did.

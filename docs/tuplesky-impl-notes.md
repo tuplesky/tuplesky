@@ -5900,3 +5900,149 @@ Evidence:
 - Still to measure: the d30 simulator rows (#119) with this change
   merged, and the slow-path latency on the stress driver at three voters
   with the next carry.
+
+## A recovery cycle is an invariant violation
+
+task-d21, from the checklist review. When the entries a new leader
+re-proposes depended on each other in a cycle, the ordering loop in
+`Leader::from_recovered` stopped without an error and left the rest
+unproposed, so the ballot waited on commands no one would propose. Every
+later campaign sees the same reports, so a named error that failed the
+campaign would only have made the stall loud. The question was whether
+such a cycle can be reached.
+
+### The argument
+
+A Sync's entries come from three sources (`recovery::select`):
+- **(A) At-source acceptances:** ACCEPT or COMMIT copies from reports at
+  the source ballot S.
+- **(C) Below-source commits (task-d12):** COMMIT copies from reports
+  below S.
+- **(F) Possible-fast candidates:** PRE-ACCEPT copies that every
+  reporting fast-set member holds with one path. They are added only
+  when the source leader is not among the reporters, and only for
+  commands not already an entry.
+
+Edges run from a command to each of its dependencies that is itself an
+entry. The argument rests on four facts:
+1. **Guards at every reporter.** `guard_accept` admits ACCEPT only when
+   every dependency is at least ACCEPT locally. `guard_commit` admits
+   COMMIT only when every dependency is committed. A report is one
+   replica's table at one cut, so a reporter holding c at ACCEPT holds
+   each of c's dependencies at ACCEPT or above, and a reporter holding c
+   at COMMIT holds each at COMMIT or above.
+2. **One order per ballot.** Every ACCEPT copy at S carries dependencies
+   that S's leader proposed:
+   - an adoption copies the leader's proposal;
+   - an entry installed from S's own Sync carries the selected
+     dependencies, which S's leader re-proposes unchanged;
+   - an acceptance left from an earlier ballot and not carried by the
+     Sync is demoted at installation (task-d11).
+
+   S's leader proposes Sync entries in `entry_order`, the re-proposed
+   commands as a chain after the recovered tails, and fresh commands
+   after those. So every edge among its proposals points from a later
+   proposal to an earlier one, provided S's own Sync was acyclic. The
+   base case, the genesis ballot, has no Sync. That gives induction on
+   ballots.
+3. **Agreement of earlier decisions.** A command committed in an earlier
+   ballot has one dependency set wherever it is committed. This is the
+   safety property itself, taken as the induction hypothesis.
+4. **One local order per replica.** A PRE-ACCEPT's dependencies are the
+   commands before it in that replica's log.
+
+The cases:
+- **No edge leaves the COMMIT entries for a non-COMMIT one.** By fact 1,
+  a COMMIT copy's dependencies are committed at the same reporter, so
+  they are COMMIT entries or not entries at all.
+- **No cycle among COMMIT entries.** By fact 3, each command's
+  dependencies are the same wherever it is committed. By fact 1, at one
+  reporter a dependency is committed before its dependent, so a cycle
+  would need a command committed before itself.
+- **No edge from an at-source ACCEPT entry to a possible-fast
+  candidate.** By fact 1, an ACCEPT copy's dependencies are at ACCEPT
+  or above at the same reporter, so they are entries of kind (A) or
+  (C), never candidates.
+- **No cycle among (A) entries.** By fact 2, all their dependencies come
+  from one leader's order.
+- **No cycle among candidates.** All candidates are held by every
+  reporting fast-set member, and there is at least one such member. By
+  fact 4, that member's log orders them all.
+
+So a cycle would have to cross between kinds, and every crossing is ruled
+out above: edges go from candidates to (A) or (C), from (A) to (A) or
+(C), and from (C) only to (C). The graph is acyclic.
+
+Fact 2 needs one more thing, which the code gives: one dependency set
+per command per ballot. The slow-path re-send reuses the proposal's
+dependencies, and a reporter's ACCEPT copy comes from adoption or from
+Sync installation under `guard_accept`, both carrying the leader's
+dependencies. The soft spot is fact 3: the (C) cases assume that
+committed dependencies agree, which is the safety property itself. So
+the argument proves that a cycle implies a guard bypassed or an earlier
+safety violation, not that a cycle is impossible. That is the reason to
+halt, and the halt is the same class of stop as task-d14's two decisions
+for one command (from review).
+
+### The rule
+
+- `recovery::entry_order` is the one ordering, and `Leader::from_recovered`
+  uses it.
+- A cycle is an invariant violation, not a failed campaign. The candidate
+  checks its selection before binding the Sync. On a cycle it binds
+  nothing, proposes nothing, records `RecoveryCycle` with every entry no
+  order keeps, and halts. `coordd` stops with `this node stopped:
+  recovery-cycle(<8 hex>)`, the number of such entries, and the first
+  eight in full.
+- A leader handed a cyclic selection anyway, from a Sync row bound before
+  this check existed, proposes nothing and is not leading.
+- A follower checks every selection it would keep or install the same
+  way: a Sync it is sent, before anything of it is held, persisted or
+  installed, and the Sync row it restarts from, before any entry is
+  queued. On a cycle it halts naming the commands, and `coordd` stops as
+  above. A leader of this build never sends one, so only another build
+  or a corrupt peer can; installing the acyclic part would execute what
+  the rest of the domain may never (Codex review).
+- Nothing changes in what is selected.
+- Halting is the right strength. Any resolution drops an edge that some
+  reporter accepted under its guard (fact 1), so resolving would choose
+  which invariant to break. Two consequences follow and are accepted for
+  an invariant violation:
+  - The candidate closes its campaign only after its promise row is
+    durable, so the next campaign after task-d10's ceiling selects the
+    same reports and halts too. The domain stops one node per campaign
+    until an operator acts.
+  - The check in `on_sync` lets one Sync from a foreign build halt every
+    follower that receives it.
+
+### Evidence
+
+- `a_selection_with_a_dependency_cycle_halts_the_candidate_naming_the_commands`
+  (`coord-consensus`, `activation`): a candidate that receives a
+  constructed report, with a and b accepted at genesis and each depending
+  on the other, binds no Sync, publishes nothing and halts with both
+  named. The campaign is closed, not retried.
+- `a_leader_handed_a_cyclic_selection_proposes_nothing` (`activation`):
+  `entry_order` returns the cycle, and `from_recovered` emits no effects
+  and is not leading.
+- `a_follower_sent_a_cyclic_sync_halts_before_installing_any_of_it`
+  and `a_follower_restarting_from_a_cyclic_sync_row_stays_halted`
+  (`activation`): a promised follower sent such a Sync persists nothing,
+  stays at its synchronized ballot and halts with both named; restarted
+  from the row, it queues neither entry and is halted. Both fail without
+  the check.
+- `a_recovery_cycle_stop_names_the_commands` (`coordd`): the stop's
+  prefix, the count, and the first eight entries in full. The serve
+  loop's stop itself (`serve.rs`) is exercised only through
+  `describe_recovery_cycle`, as task-d14's two-decisions stop it copies
+  is. `halt_on_cycle` sets the generic stop flag, and both `coordd` and
+  the simulator's oracle check `recovery_cycle()` first, so a cycle is
+  not reported as an incompatible admission.
+- Before this change, the candidate bound such a Sync, and the new leader
+  proposed nothing of the cycle and everything else.
+
+### What is left
+
+- The argument is on paper. task-d30's protocol oracle runs the real
+  machines under faults at three and five voters, and any cycle there
+  stops a node by this rule and fails the run.

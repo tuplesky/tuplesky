@@ -3912,3 +3912,246 @@ fn no_order_of_two_promises_and_a_sync_lowers_the_durable_promise() {
     );
     assert!(held_then_dropped > 0, "no run dropped the held Sync");
 }
+
+/// An ACCEPT entry at the source ballot, as a reporter would carry it.
+fn accepted_entry(c: CommandId, deps: &[CommandId]) -> coord_consensus::ReportEntry {
+    let path = Digest32([c.as_bytes()[0]; 32]);
+    coord_consensus::ReportEntry {
+        command: c,
+        phase: Phase::Accept,
+        deps: deps.to_vec(),
+        path,
+        paths: vec![(coord_consensus::CONSERVATIVE_KEY.to_vec(), path)],
+        seqnum: 1,
+        keys: vec![coord_consensus::CONSERVATIVE_KEY.to_vec()],
+        payload_present: true,
+        admission: None,
+    }
+}
+
+/// task-d21: a selection whose entries depend on each other in a cycle is
+/// an invariant violation. The candidate binds nothing, proposes nothing,
+/// halts naming the commands, and does not treat it as an ordinary failed
+/// campaign to retry.
+///
+/// No quorum's order produces such a selection (see the notes, "A
+/// recovery cycle is an invariant violation"), so the reports here are
+/// constructed: r0 reports a and b accepted at the genesis ballot, each
+/// depending on the other.
+#[test]
+fn a_selection_with_a_dependency_cycle_halts_the_candidate_naming_the_commands() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let new = ballot(1, 1);
+    let mut pending: VecDeque<Event> = VecDeque::new();
+    let mut bound_sync = false;
+    let mut proposed = false;
+    let mut observe = |effects: Vec<Effect>, pending: &mut VecDeque<Event>| {
+        for e in &effects {
+            if let Effect::Persist(batch) = e {
+                bound_sync |= batch
+                    .updates
+                    .iter()
+                    .any(|u| u.key.len() == 33 && u.key[8] == 0x03);
+            }
+            if let Effect::SendWhenDurable { frame, .. } = e {
+                proposed |= matches!(
+                    ProtocolMessage::decode(frame),
+                    Ok(ProtocolMessage::Proposal(_) | ProtocolMessage::Sync(_))
+                );
+            }
+        }
+        pending.extend(durable_events(&effects));
+    };
+    let effects = f.campaign(new);
+    observe(effects, &mut pending);
+    let report = RecoveryReport {
+        replica: r(0),
+        ballot: new,
+        committed_ballot: ballot(0, 0),
+        entries: vec![accepted_entry(a, &[b]), accepted_entry(b, &[a])],
+    };
+    pending.push_back(peer_event(
+        r(0),
+        ProtocolMessage::Promise {
+            ballot: new,
+            synced: ballot(0, 0),
+            replica: r(0),
+        },
+    ));
+    for page in coord_consensus::paginate(&report, 64) {
+        pending.push_back(peer_event(r(0), ProtocolMessage::ReportPage(page)));
+    }
+    let mut steps = 0;
+    while let Some(event) = pending.pop_front() {
+        steps += 1;
+        assert!(steps < 1000, "the campaign did not settle");
+        let effects = f.step(event);
+        observe(effects, &mut pending);
+    }
+    let mut cycle = vec![a, b];
+    cycle.sort();
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some(), "the candidate did not halt");
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::RecoveryCycle { commands: cycle }),
+        "no recovery-cycle rejection"
+    );
+    assert!(!bound_sync, "a Sync with a cycle was bound");
+    assert!(!proposed, "something was proposed or published");
+    assert!(f.won().is_none());
+    assert!(f.campaign_state().is_none(), "the campaign is still open");
+}
+
+/// task-d21: a leader handed a selection with a cycle anyway (a Sync row
+/// bound before the candidate checked) proposes nothing and leads nothing.
+#[test]
+fn a_leader_handed_a_cyclic_selection_proposes_nothing() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let entry = |c: CommandId, dep: CommandId| coord_consensus::SyncEntry {
+        command: c,
+        phase: Phase::Accept,
+        deps: vec![dep],
+        path: Digest32([0; 32]),
+        paths: vec![],
+        seqnum: 1,
+        admission: None,
+    };
+    let decision = SyncDecision {
+        ballot: ballot(1, 1),
+        source_ballot: ballot(0, 0),
+        entries: [(a, entry(a, b)), (b, entry(b, a))].into_iter().collect(),
+        reproposed: BTreeSet::new(),
+    };
+    let mut cycle = vec![a, b];
+    cycle.sort();
+    assert_eq!(coord_consensus::entry_order(&decision), Err(cycle.clone()));
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let (leader, effects) =
+        Leader::from_recovered(f.into_recovered(), quorum(ballot(1, 1)), &decision);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(leader.recovery_cycle(), Some(&cycle[..]));
+    assert!(!leader.is_leading());
+}
+
+/// A selection with a dependency cycle, as another build could bind it.
+fn cyclic_selection(a: CommandId, b: CommandId) -> SyncDecision {
+    let entry = |c: CommandId, dep: CommandId| coord_consensus::SyncEntry {
+        command: c,
+        phase: Phase::Accept,
+        deps: vec![dep],
+        path: Digest32([0; 32]),
+        paths: vec![],
+        seqnum: 1,
+        admission: None,
+    };
+    SyncDecision {
+        ballot: ballot(1, 1),
+        source_ballot: ballot(0, 0),
+        entries: [(a, entry(a, b)), (b, entry(b, a))].into_iter().collect(),
+        reproposed: BTreeSet::new(),
+    }
+}
+
+/// Codex review of task-d21: a Sync whose selection holds a cycle, bound
+/// by a leader of another build, reaches a follower of this one. It halts
+/// naming the commands, before any of the selection is made durable or
+/// installed, and stays at its old synchronized ballot.
+#[test]
+fn a_follower_sent_a_cyclic_sync_halts_before_installing_any_of_it() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut cycle = vec![a, b];
+    cycle.sort();
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(2),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(2));
+    let effects = f.step(peer_event(
+        r(1),
+        ProtocolMessage::NewLeader {
+            ballot: ballot(1, 1),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
+        },
+    ));
+    for event in durable_events(&effects) {
+        f.step(event);
+    }
+    assert_eq!(f.ballots().promised(), ballot(1, 1));
+    let effects = f.step(peer_event(
+        r(1),
+        ProtocolMessage::Sync(cyclic_selection(a, b)),
+    ));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "{effects:?}"
+    );
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some());
+    assert_eq!(f.ballots().synced(), ballot(0, 0));
+    assert!(
+        f.take_rejections().iter().any(
+            |x| matches!(x, FollowerRejection::RecoveryCycle { commands } if *commands == cycle)
+        )
+    );
+}
+
+/// The same selection read back from a Sync row at a restart: nothing of
+/// it is queued for installation, and the replica is halted.
+#[test]
+fn a_follower_restarting_from_a_cyclic_sync_row_stays_halted() {
+    let (a, b) = (
+        CommandId(Digest32([0xa1; 32])),
+        CommandId(Digest32([0xb2; 32])),
+    );
+    let mut cycle = [a, b];
+    cycle.sort();
+    let f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(2),
+            genesis: ballot(0, 0),
+            quorum: quorum(ballot(1, 1)),
+            frontend: FRONTEND,
+            capacity: 32,
+        },
+        Some(coord_consensus::PromiseRecordV1 {
+            promised: ballot(1, 1),
+            synced: ballot(1, 1),
+        }),
+        None,
+        Vec::new(),
+        Vec::new(),
+        [(ballot(1, 1), cyclic_selection(a, b))],
+        coord_types::ids::ExecutionPosition::ZERO,
+    );
+    assert_eq!(f.recovery_cycle(), Some(&cycle[..]));
+    assert!(f.halted().is_some());
+    assert!(f.table().phase_of(&a).is_none() && f.table().phase_of(&b).is_none());
+}

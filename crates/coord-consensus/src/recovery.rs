@@ -188,6 +188,44 @@ pub enum RecoveryError {
     },
 }
 
+/// The order a new leader re-proposes a selection's entries in: each
+/// command after every dependency that is itself an entry (task-d21).
+///
+/// A cycle among the entries is not reachable (see
+/// `docs/tuplesky-impl-notes.md`, "A recovery cycle is an invariant
+/// violation"): every entry is an acceptance or commit whose dependencies
+/// were at least accepted where it was, a commit's only at commit, and
+/// every acceptance at the source ballot carries its leader's order. So a
+/// cycle means an invariant the protocol rests on was broken, and it is
+/// returned as `Err` with every entry that could not be ordered, the
+/// cycle and whatever depends on it, in identity order. Nothing is
+/// guessed: no order of a cycle keeps every member's dependencies.
+pub fn entry_order(decision: &SyncDecision) -> Result<Vec<CommandId>, Vec<CommandId>> {
+    let mut order: Vec<CommandId> = Vec::new();
+    let mut placed: BTreeSet<CommandId> = BTreeSet::new();
+    let mut remaining: Vec<CommandId> = decision.entries.keys().copied().collect();
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        remaining.retain(|c| {
+            let deps = &decision.entries[c].deps;
+            if deps
+                .iter()
+                .all(|d| !decision.entries.contains_key(d) || placed.contains(d))
+            {
+                order.push(*c);
+                placed.insert(*c);
+                false
+            } else {
+                true
+            }
+        });
+        if remaining.len() == before {
+            return Err(remaining);
+        }
+    }
+    Ok(order)
+}
+
 /// Select the Sync result from `reports` for the ballot of `config`.
 pub fn select(
     config: &BallotConfiguration,

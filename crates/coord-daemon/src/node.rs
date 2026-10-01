@@ -175,6 +175,17 @@ impl Machine {
         }
     }
 
+    /// The selected entries no order keeps, when this replica's selection
+    /// held a dependency cycle (task-d21): an invariant violation it
+    /// halted on. A candidate finds it before binding; a leader handed
+    /// one anyway leads nothing.
+    pub fn recovery_cycle(&self) -> Option<&[CommandId]> {
+        match self {
+            Machine::Leader(m) => m.recovery_cycle(),
+            Machine::Follower(m) => m.recovery_cycle(),
+        }
+    }
+
     /// A pulled command whose execution here disagreed with its donor's
     /// (task-d08). Only a follower catches up.
     pub fn catch_up_divergence(&self) -> Option<&coord_consensus::CatchUpDivergence> {
