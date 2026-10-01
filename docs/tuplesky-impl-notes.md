@@ -7062,6 +7062,19 @@ never closed its gap.
   (the materializer's row written, the comparison not yet run) is at or
   below the boot frontier, so the first ask does not cover it. That gap
   was task-d08's before this task and is unchanged.
+- Both of these lose detection, not order: order within a window is
+  forced by the predecessor rule, and the first member's position by
+  the dependency closure. Both are carried under task-d08's residual in
+  the plan (review).
+- `taken == 0` calls `done()`, which also fires when the donor simply has
+  nothing newer, so pending comparisons of restored but unexecuted
+  commits are dropped: again a loss of detection, not of order.
+- The window rule and the comparison by position both assume a total
+  order, which holds only while every command carries the conservative
+  key. Relaxing keys would split windows at commands that do not
+  conflict and could raise a false `CatchUpDivergence` on restored
+  ordinary commits. Whoever relaxes the key model owns this: task-d50
+  now (review).
 - The unthrottled `follower-out` run (about 113 appends a second, a
   follower 3400 behind at its restart), with catch-up's rate reported
   beside the domain's, is not run here: this environment has neither the
