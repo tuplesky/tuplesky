@@ -233,21 +233,25 @@ def table(result: dict) -> str:
     """The readings as a Markdown table, one row per voter per run."""
     lines = [
         "| callers | completed/s | node | executed | lowerings/cmd | syncs/cmd "
-        "| appends/cmd | commits/cmd | busy ms/cmd | last quarter | busy |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| appends/cmd | commits/cmd | busy ms/cmd | first three quarters "
+        "| last quarter | ratio | busy |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for run in result["runs"]:
         rate = run.get("completed_per_second")
         rate = "--" if rate is None else f"{rate:.1f}"
         for v in run["voters"]:
             busy = "--" if v["busy_fraction"] is None else f"{v['busy_fraction']:.0%}"
+            head = v.get("head_busy_ms_per_command")
+            ratio = "--" if not head else f"{v['tail_busy_ms_per_command'] / head:.2f}"
+            head = "--" if head is None else f"{head:.2f}"
             lines.append(
                 f"| {run['callers']} | {rate} | {v['node']} | {v['executed']} "
                 f"| {v['lowerings_per_command']:.2f} | {v['journal_syncs_per_command']:.2f} "
                 f"| {v['journal_appends_per_command']:.2f} "
                 f"| {v['projection_commits_per_command']:.2f} "
-                f"| {v['busy_ms_per_command']:.2f} | {v['tail_busy_ms_per_command']:.2f} "
-                f"| {busy} |"
+                f"| {v['busy_ms_per_command']:.2f} | {head} "
+                f"| {v['tail_busy_ms_per_command']:.2f} | {ratio} | {busy} |"
             )
     return "\n".join(lines)
 
