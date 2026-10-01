@@ -15,7 +15,7 @@ This document integrates the original protocol, API, identity, lease and storage
 | Area | Sections |
 |---|---|
 | Goals, domains, roles and trust | [1](#s1), [2](#s2), [3](#s3) |
-| SwiftPaxos, publication and recovery safeguards | [4](#s4), [5](#s5), [18](#s18) |
+| SwiftPaxos, publication and recovery safeguards | [4](#s4), [5](#s5), [5.5 failure and obligation contract](#s5-5), [18](#s18) |
 | KV, Kine, finalized streams, observers and watches | [6](#s6), [19](#s19) |
 | Leases, human/workload identity and membership | [7](#s7), [8](#s8), [9](#s9), [10](#s10), [20](#s20) |
 | Stack, journal, state materialization and checkpoints | [11](#s11), [16](#s16), [17](#s17) |
@@ -337,7 +337,7 @@ Previously authorized old evidence can arrive late; never relabel it or combine 
 <a id="s4-9"></a>
 ### 4.9 Recovery selection and stable publication
 
-One leader selects the recovery Sync result and followers adopt it. Different local progress phases are not themselves divergent committed dependencies. Follow source ballot selection and possible-fast-decision recovery, not a generic highest-phase-wins merge. Validate command/dependency equivalence where eligible accepted candidates must agree. Unexpected incompatible accepted candidates stop recovery with diagnostic evidence; normal preaccept disagreement remains valid input. [S1, X2, X3]
+One leader selects the recovery Sync result and followers adopt it. Different local progress phases are not themselves divergent committed dependencies. Follow source ballot selection and possible-fast-decision recovery, not a generic highest-phase-wins merge; reports below the source ballot supply their commits. Validate command/dependency equivalence where eligible accepted candidates must agree. Unexpected incompatible accepted candidates stop recovery with diagnostic evidence; normal preaccept disagreement remains valid input. [S1, X2, X3]
 
 Canonical deterministic choice aids reproducibility wherever the protocol allows choice, but does not prove it safe. Durably bind the selected result to epoch/ballot before publishing Sync. After crash, reuse it or enter a valid new ballot; do not publish incompatible results under one identity.
 
@@ -395,6 +395,149 @@ Copying a snapshot to a majority is not the activation proof. Check intersection
 Lost/rolled-back voter storage cannot restart as an empty voter under the same identity. Reintroduce it as a learner with a new authorized generation through membership. Renewed WIF/certificates erase no voting obligations.
 
 Ordinary recovery preserves identity and acknowledged outcomes within the stated budget. Backup restore is a separate workflow: new cluster/restore identity, invalidated old sessions, revoked restored leases, watch resynchronization, explicit external fencing transition and an RPO determined by backup. Do not expose rewound revisions as the same live history. Losing old quorum authority does not authorize observers to self-promote.
+
+<a id="s5-5"></a>
+### 5.5 Failure and obligation contract
+
+task-d29. One place for what may fail, what each state transition leaves
+someone owing, who owes it, and why the outstanding work finishes.
+Sections 1.2, 4.8 and 5.1 to 5.4 remain the detailed contracts; this
+section indexes them.
+
+**Tolerated failures.**
+
+| Failure | Tolerated as | What restores progress |
+|---|---|---|
+| Voter process crash or kill | Crash-recovery: the voter restarts from its durable state under the same identity | Restart rebuilds the role from durable rows (Section 5.2); a quorum of voters up and communicating |
+| Message loss, delay, duplication, reordering, delivery across ballots | Asynchronous network, eventually synchronous for progress | Re-sends and re-offers by the owners below; old-ballot traffic is fenced by the promise |
+| Leader crash or partition | A new ballot: campaign, recovery reports from a majority, one Sync | Election by timeout; the Sync keeps every command a quorum may have decided |
+| Frontend or collector restart | The collector's memory is lost | Callers resolve or re-submit by identity; the durable retry record answers (Section 6.5) |
+| Storage barrier failure | Fail closed: the batch and everything after it are not durable | The voter stops rather than publish what is not durable; restart from the last durable state |
+| Detected corruption, or storage that loses what it acknowledged | Outside ordinary failure: quarantine | Operator action; the voter does not restart as an empty voter (Section 5.4) |
+| Loss of a voter's state | Outside ordinary failure | Reintroduction as a learner with a new generation through membership; the harness refuses to initialize the old identity again |
+| Loss of a majority, or of every copy of a decision | Outside the model | Backup restore under a new cluster identity (Section 5.4) |
+
+**Restart semantics.** A restarted voter keeps its identity, reads its
+promise, dependency, Sync, payload and execution rows, and resumes. It
+repeats no vote it cannot prove durable, and it publishes again what
+durable state allows (Section 5.1). Clocks, timers, connections,
+held votes and speculative overlays are rebuilt, never restored.
+
+**The eight transitions.** Each is a step a command takes; the second
+column says whether it leaves an obligation behind.
+
+| Transition | Obligation created |
+|---|---|
+| Receipt: a frontend accepts a caller's request | Yes: the collector owes the caller an answer |
+| Admission: a voter initializes the payload and votes | Yes: the voter owes a durable vote, published once durable |
+| Durable protocol state: promise, vote, acceptance, Sync rows | Yes: the voter owes them to every recovery report at its cut |
+| Evidence publication: acknowledgements to leader and collector | Yes: the publisher owes them again to a peer that lost them |
+| Decision: a command learned fast or slow | Yes: every voter owes its execution, in the decided order |
+| Application: execution and its atomic retry record | Yes: the record owes the caller its retained result |
+| Response: the collector answers the caller | No: the caller holds the answer; retries are answered from the record |
+| Retirement: a retry floor or a forgetting floor advances | No new obligation: it discharges the ones below the floor |
+
+Retirement discharges only what nothing can still ask for. The command
+table retires executed commands only, never unresolved acceptance, and
+keeps a tombstone while the command may still be a key's latest; a
+command is history once a replica executed it longer ago than its last
+`capacity` retirements, and a voter still behind it catches up by pages,
+not by recovery (Section 5.3, task-d05, task-d08). A retry floor retires
+an invocation's rows and leaves the floor row, so a resolve at or below
+it is answered `ResultRetired`, never `Unknown` (task-d23). A binding
+ends with its credential or its session; the collector's window of
+resolved outcomes is bounded by count and evicts the oldest, after which
+the durable record answers. A checkpoint floor forgets only what a
+majority of promises certifies (Section 5.3).
+
+**Storage and corruption.** A barrier is durable or it is not published:
+a failed sync makes the whole batch indeterminate, the journal fail-stops
+until it is reopened, and nothing the batch held is published (Section
+5.1). Corruption found in the durable prefix quarantines the engine; it is
+never repaired in place, and a quarantined node stops serving. A node
+whose manifest, journal or identity does not match what it was
+initialized with quarantines rather than initializing again. A voter
+whose state is gone is not a voter that restarted: it may have voted, and
+an empty voter under the same identity could vote otherwise. It comes
+back only through Section 5.4, and the certification harness refuses to
+initialize over it: a node directory it initialized carries a marker, and
+a marker without state is `StateLost`, not a fresh node. A voter run from a
+copied bundle is never initialized by a start: a bundle copied again after
+its host lost it has neither state nor marker, so only the operator's
+explicit `--init` for a voter that never ran initializes one.
+
+**Obligations.** Each has one owner, the event that makes the owner act,
+and what the owner does when acting does not discharge it. The last
+column names tests in which the owner acts after the fault the row
+covers.
+
+| # | Obligation | Owner | Trigger | Escalation | Tests |
+|---|---|---|---|---|---|
+| O1 | Offer an admitted submission to every voter until each has voted, refused or the ballot changed | Collector | Admission; a full queue; a re-dial; a ballot change | A bounded re-offer budget per destination; a refusal ends the entry with the refusal's status; a ballot change asks for every entry again | `a_full_queue_costs_that_destination_and_is_offered_again_by_itself`, `a_returning_link_brings_its_reoffers_forward`, `a_callers_deadline_does_not_discard_the_delivery_obligation`, `refused_retries_free_every_pending_slot`, `a_ballot_change_asks_for_every_entry_again`, `another_request_under_a_bound_key_ends_with_a_conflict` |
+| O2 | Answer the caller with the decided outcome | Collector, then the durable record | A release; a caller's resolve | A lost or refused release is settled from the executed record; an entry holding nothing is asked for again; past the window the record answers (Section 6.5) | `a_lost_release_is_settled_from_the_durable_record`, `a_refused_repair_falls_back_to_the_durable_record`, `an_entry_holding_nothing_is_asked_for_again_then_settled_from_the_record` |
+| O3 | Publish a vote once, and only once, it is durable | Voter | Its barrier completing; a restart | After a restart, the voter acknowledges again from the durable row on the next resend | `a_lost_acknowledgement_is_published_again_after_the_voter_restarts`, `a_restored_adoption_is_acknowledged_again_on_a_resend`, `follower_restarts_at_every_persist_boundary_reproduce_the_acknowledged_outcomes` |
+| O4 | Resend a proposal until every voter voted | Leader | A timer while acknowledgements are missing | A voter linked late learns it from the resend; a lost acknowledgement behind a counted one is asked for again | `a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend`, `a_lost_acknowledgement_is_published_again_on_a_resend`, `a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again` |
+| O5 | Report durable protocol state at a promise's cut | Voter | A promise request | The report is read from durable rows, never from phases in memory; a Sync or promise in flight never lowers the durable promise | `reports_come_from_durable_state_at_the_cut_not_in_memory_phases`, `a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise`, `no_order_of_two_promises_and_a_sync_lowers_the_durable_promise` |
+| O6 | Carry every possibly decided command into the next ballot | New leader | Election after a leader fault | Recovery selects every learned decision from any majority's reports; a failed campaign is retried under a higher ballot; a selected payload a peer never sends is asked for again, and a late or duplicated answer does not count as the answer | `every_learned_decision_is_selected_by_every_recovering_majority`, `a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row`, `possible_fast_decisions_are_recovered_from_the_fixed_fast_set`, `a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting`, `a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask` |
+| O7 | Execute every committed command, in the decided order | Every voter | A commit, a Sync, or the leader's frontier | A follower that heard only the leader executes what it commits; the frontier stops at the first command not committed | `a_follower_that_hears_only_the_leader_executes_what_it_commits`, `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`, `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed` |
+| O8 | Bring a voter that fell behind back into service | The lagging voter, served by its peers | A full table; a dependency it does not hold; a heal | Paged catch-up, resumable across restarts | `a_voter_past_a_full_table_catches_up_and_its_table_drains`, `a_restart_in_the_middle_of_a_page_resumes_without_executing_twice`, `a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal` |
+| O9 | Keep an executed invocation's result for its retries | The durable retry record | Execution, atomically with the result | A retry or resolve is answered from the record after any restart, or withheld when the caller may not read it | `a_read_retried_after_a_restart_gets_its_retained_result`, `the_same_invocation_is_answered_the_same_way_after_a_restart`, `a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`, `a_retry_after_unknown_submits_the_same_invocation_again` |
+| O10 | Retire only what nothing can still ask for | Retry floor; checkpoint floor | A floor advancing | A stale retirement never lowers a floor; a floor is certified by a majority of promises and fences what it covers | `a_stale_retirement_never_lowers_the_floor`, `retired_or_unknown_sessions_and_retired_sequences_never_execute`, `a_majority_of_promises_certifies_the_floor_a_missing_voter_would_have_blocked`, `a_delayed_message_cannot_revive_state_below_the_published_floor`, `a_proposal_that_acknowledges_a_different_floor_is_refused` |
+| O11 | Publish nothing that is not durable | Storage coordinator | A failed sync or reopen | Fail-stop until a reopen succeeds; corruption quarantines and never recovers in place | `sync_failure_inside_a_write_panics_and_fail_stops_until_reopen`, `sync_error_is_indeterminate_and_the_crash_image_is_all_or_nothing`, `failed_reopen_quarantines_the_engine_until_a_reopen_succeeds`, `disk_quarantine_stops_serving_and_never_recovers_in_place` |
+| O12 | Never hold two decisions for one command | Every voter | Facts that contradict what it committed, executed or answered | The voter stops and says what it compared | `a_voter_handed_other_facts_for_a_command_it_committed_stops`, `a_voter_handed_other_facts_for_a_command_it_retired_stops`, `a_pulled_command_executed_otherwise_stops_the_voter`, `a_late_release_that_contradicts_the_answer_is_refused`, `a_follower_restarting_from_a_cyclic_sync_row_stays_halted` |
+| O13 | Never vote again under an identity whose state is gone | Operator, enforced by the harness and startup | A node directory without its state | Refused; reintroduction through membership (Section 5.4) | `a_voter_whose_state_is_gone_is_refused_not_initialized_again`, `another_manifest_quarantines_rather_than_reinitializing`, `a_pinned_node_without_its_journal_quarantines` |
+| O14 | Establish a leader | Each voter's election schedule; the leader's re-ask for a lost Sync | No link to the leader it promised, no leader, or a Sync lost to a voter that promised | A jittered wait per voter before campaigning, doubled to a ceiling while campaigns produce no leader; a promise counts as a leader only until the ceiling; a campaign still under way at the ceiling is replaced. A voter that promised but has not voted is sent `NewLeader` each re-send tick, repeats its promise while unsynchronized, and is answered with the Sync | `two_survivors_of_one_failure_do_not_campaign_at_the_same_instant`, `campaigns_that_produce_no_leader_back_off_to_the_ceiling`, `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling`, `a_late_voter_whose_sync_was_lost_is_sent_it_again`, `a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again` |
+
+Three rows are narrower than their obligation. O10 covers a voter behind
+a floor only up to refusing what it cannot prove, and has two halves
+still owed: stopping at the floor needs the durable rows below it
+trimmed, which is task-d27's second part (the first trims nothing yet),
+and bringing that voter back from behind a floor that has moved on is
+task-d32. O12's stop is shown surviving a restart only for a recovery
+cycle; for the other stops that is task-d13's. O11 is shown on
+the journal, the engine and the composed node; a failed barrier
+stopping a voter inside a running domain is exercised by the mixed-fault
+qualification (task-64), not by a unit test.
+
+**What makes the outstanding work finish.** The argument is conditional.
+Suppose that from some point on faults stop -- no crash, no partition,
+messages between up nodes delivered within a bound -- a majority of
+voters is up with its state, and admission pauses. Then:
+
+1. The outstanding work is finite. Admission is paused, the collector
+   bounds its pending entries, and each voter's table is bounded by its
+   capacity; retirement and catch-up only shrink it.
+2. A leader is established (O14). Election waits are jittered per voter
+   and bounded, doubling to the ceiling, and start only without a live
+   leader; a voter linked to its leader never campaigns. With messages
+   timely, one campaign completes its recovery reports from a majority
+   and installs one Sync (O5, O6); a Sync lost to a voter that promised
+   is sent again on its repeated promise (O14). Two conditions in the code carry
+   this step. A promise counts as a leader only until the ceiling, so
+   stability needs the candidate to bind its Sync within it, which the
+   bounds on reports and Syncs give (task-d05, task-d20). And a campaign
+   still under way at the ceiling is replaced, which frees one whose
+   reports or payload answers never come. Then a voter linked and
+   synchronized is led, and a led voter does not campaign.
+3. Every admitted command is decided. The leader resends each proposal
+   until every up voter voted (O4); votes are published once durable
+   (O3); the collector re-offers what the leader has not seen (O1). A
+   decision needs only a majority, which is up.
+4. Every decided command executes everywhere up. A committed prefix
+   executes in the decided order (O7); a voter missing a dependency or
+   past its table is brought back by catch-up (O8).
+5. Every caller gets an answer. The collector answers from the release,
+   or from the durable record when the release is lost (O2, O9); a
+   caller that lost its collector resolves from the record, and a
+   retired sequence is answered retired (O10).
+
+Each step discharges finitely many obligations with a bounded number of
+retries once faults stop, so the whole completes. Nothing here holds
+while faults continue: an adversary that keeps deposing leaders can keep
+every ballot from completing, as for any consensus protocol. The
+simulator's progress oracle (task-d33) turns this into a check: a
+budget, after the faults stop, within which the outstanding work must
+finish.
 
 <a id="s6"></a>
 ## 6. KV, transactions, Kine, observers and watches
@@ -1086,6 +1229,39 @@ Multi-domain hosting applies aggregate node budgets as well as per-domain quotas
 Audit accepted/rejected policy, session, enrollment, membership, compaction and recovery actions with principal/decision/configuration/command but no bearer secrets. Ship audits externally; host-local logs are not tamper-proof against host compromise.
 
 At-rest encrypted volumes and scoped access protect files/checkpoints/backups. Voters, collectors and observers see role-required data; no operator-blind encryption claim. A domain's scalar revision can disclose aggregate activity across namespaces; independent domains avoid a fleet-wide counter side channel. Protocol/data feature activation is replicated after compatible binaries; unsupported versions fail explicitly. Upgrades retain recovery and rollback rules.
+
+<a id="s13-1"></a>
+### 13.1 Resource contract
+
+Every resource a node holds for a domain has a stated limit, and the limit belongs to one class: memory, durable protocol data, application data, a single message, a queue, or temporary files. The configuration names the operator-set ones (`limits.*`); the rest are build constants, and those that decide a replicated result are schema. Limits hold at the peak, not in the steady state: a structure built from another counts at its size beside it while both exist. The contract below is what a test drives past its limit (task-d26); what is not yet bounded is named at the end.
+
+| Class | Resource | Limit |
+|---|---|---|
+| Memory | Command table | `limits.command_table_capacity` records (32 to 1,000), an eighth of them reserved for recovery and catch-up; retired tombstones up to the capacity plus each key's latest command |
+| Memory | Held proposals (follower) | 8 × capacity |
+| Memory | Ledger, payloads, votes, adoptions, retry-key bindings | the live and recently retired commands, swept once they pass 4 × capacity; a binding goes with its command, and a boot restores none for a forgotten one |
+| Memory | Sync being installed | the Sync's entries, at most 5 × `max_report_entries(capacity)`; installation examines an entry once per change to what it waits on, so it costs time linear in entries and edges |
+| Memory | Candidate reports | per reporter, `ceil(2 × capacity / 256) + 1` pages of 256 entries; the complete reports are assembled, a copy of every entry, only once a majority could be complete, so at most `voters - majority + 1` times per campaign |
+| Memory | Sync binding | the selection and one encoding of it; the frame size is counted from that encoding |
+| Memory | Catch-up window | one page: 64 commands and 1 MiB |
+| Memory | Collector | `limits.max_outstanding_per_session` entries per session, and undelivered bytes of that many requests of `limits.max_request_bytes` plus 128 KiB each |
+| Memory | Transport send | 16 MiB in flight per destination and 64 MiB per node, 2 MiB of each reserved for the control lane |
+| Memory | Transport receive | 64 MiB of frames being received per node, the same control reserve; a frame takes its whole length once its header is in and waits for room before its payload is read |
+| Memory | Executor working set | the view budget (schema: 10,000 rows, 16 MiB of what the command reads) plus one page of stored history (256 rows, 16 MiB) at a time; plan limits (schema): 8 MiB response, 4,096 events per revision, 4,096 deleted keys, 128 lease attachments; speculation 64 commands and 4 MiB |
+| Durable protocol | One row | the store envelope, 2 MiB and 20 KiB; a Sync fits one row and one frame or the campaign is refused by name |
+| Durable protocol | Journal record | 4 MiB and 4,096 updates |
+| Application | Request | `limits.max_request_bytes` (at most 2 MiB); keys 8 KiB, values 1 MiB, 128 transaction operations |
+| Application | Response | 8 MiB (schema); `limits.max_response_bytes` is what this node buffers per subscription and must cover it |
+| Application | Stored history | the revisions above the replicated compaction floor (task-14) |
+| Single message | Frame | per class: API 3 MiB, protocol evidence 4 MiB, watch, observer and collector evidence 8 MiB and 64 KiB, snapshot 1 MiB and 64 KiB, configuration 256 KiB, negotiation and read fence 64 KiB |
+| Queue | Transport lanes | per lane and group: control 256, unary 64, bulk 64, watch 16 frames; 1,024 events per lane to the runtime |
+| Queue | Storage writer | one batch of at most 8 MiB |
+| Temporary files | Checkpoint images | one image being written beside the published one, under a pending name; a crash's leftovers and every superseded image are removed at the next reclaim |
+| Rate | Admission | `limits.max_admitted_per_second` new requests per frontend, a second's worth as a burst; a retry of an outstanding request takes nothing |
+
+The admission rate is meant to stay below the rate at which a voter catching up executes: a window of up to 64 commands per durable batch (task-d25). A voter returning behind a domain gains on it by the difference, so the time it needs is bounded by its gap divided by that difference; admitted faster than it executes, it never closes the gap. The default of 1,000 a second is a design target and a ceiling, not a proved bound: the catch-up rate it is set under (64 commands per 10 ms batch) has not been measured, and task-d33's budget oracle is its check. It gates only client requests in the dispatcher; resolves, watches and held retries bypass it, and one bucket per frontend is shared by every session. The bound is per frontend, and a domain served by several admits their sum.
+
+Not yet bounded, and owned: the executed-history set (one identity per command executed, which recovery asks about), the tombstones kept for keys no longer written, and every durable row of an executed command grow with history until quorum-safe forgetting trims below its floor (task-d27); disk headroom before a checkpoint is task-d27's too.
 
 <a id="s14"></a>
 ## 14. Evaluation and architectural milestones

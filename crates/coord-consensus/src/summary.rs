@@ -319,6 +319,10 @@ pub enum PageError {
     Inconsistent,
     /// Page for another ballot.
     WrongBallot,
+    /// A verified page of a report announcing more pages than the bound
+    /// (task-d24 review): its reporter is recorded as past the bound, and
+    /// nothing of it is held.
+    PastBound,
 }
 
 /// Split a report into verified pages.
@@ -364,6 +368,9 @@ pub struct ReportAssembler {
     pages: BTreeMap<ReplicaId, BTreeMap<u32, ReportPage>>,
     /// Per replica: page total, synchronized ballot and report digest.
     totals: BTreeMap<ReplicaId, (u32, Ballot, Digest32)>,
+    /// Replicas whose report announced more than `max_pages` pages, with
+    /// the total announced (task-d24 review).
+    past_bound: BTreeMap<ReplicaId, u32>,
 }
 
 impl ReportAssembler {
@@ -374,13 +381,17 @@ impl ReportAssembler {
             max_pages: MAX_REPORT_PAGES,
             pages: BTreeMap::new(),
             totals: BTreeMap::new(),
+            past_bound: BTreeMap::new(),
         }
     }
 
     /// Refuse a report announcing more than the pages `entries` entries
-    /// take, and one page more (task-d28): one past the bound still
-    /// assembles, so the campaign names it (task-d20), and nothing larger
-    /// is held.
+    /// take, and one page more (task-d28). The page more is slack, not
+    /// what lets a report just past the bound assemble: at 2,000 entries
+    /// and 256 a page, 8 pages already hold 2,048. What the bound admits
+    /// is up to one full page past the pages `entries` take, 2,304
+    /// entries at the default, and the campaign then refuses what is past
+    /// `entries` by name (task-d20); nothing larger is held.
     pub fn bound_entries(&mut self, entries: usize) {
         let pages = entries.div_ceil(MAX_PAGE_ENTRIES).saturating_add(1);
         self.max_pages = u32::try_from(pages).map_or(MAX_REPORT_PAGES, |p| p.min(MAX_REPORT_PAGES));
@@ -398,6 +409,17 @@ impl ReportAssembler {
         )
     }
 
+    /// The replicas whose report announced more pages than the bound, and
+    /// the total each announced.
+    pub const fn past_bound(&self) -> &BTreeMap<ReplicaId, u32> {
+        &self.past_bound
+    }
+
+    /// The most pages a report may announce.
+    pub const fn max_pages(&self) -> u32 {
+        self.max_pages
+    }
+
     /// Pages held, across every replica.
     pub fn pages_held(&self) -> usize {
         self.pages.values().map(BTreeMap::len).sum()
@@ -408,10 +430,7 @@ impl ReportAssembler {
         if page.ballot != self.ballot {
             return Err(PageError::WrongBallot);
         }
-        if page.total == 0 || page.total > self.max_pages || page.page >= page.total {
-            return Err(PageError::OutOfBounds);
-        }
-        if page.entries.len() > MAX_PAGE_ENTRIES {
+        if page.total == 0 || page.page >= page.total || page.entries.len() > MAX_PAGE_ENTRIES {
             return Err(PageError::OutOfBounds);
         }
         let expected = page_digest(
@@ -423,6 +442,17 @@ impl ReportAssembler {
             &page.snapshot,
             &page.entries,
         );
+        if page.total > self.max_pages {
+            // A report past the bound however its pages come out: named,
+            // so the campaign sets it aside or fails on it rather than
+            // waiting for pages it will never hold. A page that does not
+            // verify says nothing about its reporter.
+            if expected != page.digest {
+                return Err(PageError::OutOfBounds);
+            }
+            self.past_bound.insert(page.replica, page.total);
+            return Err(PageError::PastBound);
+        }
         if expected != page.digest {
             return Err(PageError::Corrupt);
         }

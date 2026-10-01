@@ -941,6 +941,9 @@ pub struct Domain<P: Persistence> {
     /// node so the journal and materialization points record into the
     /// same cells the snapshot reads.
     recorder: std::sync::Arc<coord_daemon::metrics::Recorder>,
+    /// How long this loop has waited, and when it next prints a
+    /// snapshot (task-d45).
+    pacing: Pacing,
     /// Dials out after the first ones, one task each (task-d03). A dial is
     /// mostly waiting -- an absent voter costs a whole handshake timeout
     /// -- so it runs beside the loop rather than inside it, and ends with
@@ -1086,6 +1089,48 @@ impl Deadline for coord_daemon::parked::Parked {
     }
 }
 
+/// The domain loop's own accounting (task-d45): how long it has waited
+/// for something to do, and when it next prints a snapshot.
+///
+/// Busy time is the loop's running time less its waits, which is what a
+/// voter's domain thread is doing: its work and the syncs it waits on.
+/// Measured as waits rather than as work because the waits are the one
+/// place the loop yields, so no path through a pass can be missed.
+#[derive(Default)]
+struct Pacing {
+    /// Time spent waiting for an event since the loop started.
+    idle: std::time::Duration,
+    /// When the current wait began, while the loop is waiting.
+    waiting_since: Option<std::time::Instant>,
+    /// Between printed snapshots, and the roles they are printed for.
+    every: Option<(std::time::Duration, coord_daemon::role::RoleSet)>,
+    /// When the next snapshot is due.
+    due: Option<std::time::Instant>,
+    /// The last printed snapshot's instant, busy time and executed
+    /// count: where the current interval began.
+    last: Option<(std::time::Instant, std::time::Duration, u64)>,
+}
+
+impl Pacing {
+    /// The loop is about to wait.
+    fn wait(&mut self) {
+        self.waiting_since = Some(std::time::Instant::now());
+    }
+
+    /// The loop is working again; a wait that was running ends here.
+    fn woke(&mut self) {
+        if let Some(since) = self.waiting_since.take() {
+            self.idle += since.elapsed();
+        }
+    }
+
+    /// Time spent working between `started` and `now`.
+    fn busy(&self, started: std::time::Instant, now: std::time::Instant) -> std::time::Duration {
+        now.saturating_duration_since(started)
+            .saturating_sub(self.idle)
+    }
+}
+
 /// How often a node repeats a request for a payload it is waiting on.
 ///
 /// Bounded by time rather than by events for the same reason the ask
@@ -1220,6 +1265,12 @@ const UNDELIVERABLE_SAID_AT: u64 = 64;
 /// crowd out the work it exists to enable. This is the whole of what a
 /// turn spends on it; what is still owed after that is owed on the next
 /// turn, on the collector's schedule.
+///
+/// Solicitation spends the same number of destinations a turn on its own
+/// (`due_solicits`), an entry's voters all at once or not at all: a
+/// configuration of more than 16 voters would never solicit. Voter counts
+/// are three or five (task-d31), so this is moot today, and has to change
+/// with this bound if that does.
 const OFFERS_PER_TURN: usize = 16;
 
 /// How many peer events in a row are taken before the caller's plane is
@@ -1374,7 +1425,78 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             peer_streak: 0,
             budgets,
             recorder,
+            pacing: Pacing::default(),
         }
+    }
+
+    /// Print a snapshot every `every` while serving, for `roles`
+    /// (task-d45). Without it the only snapshots are the ones at start
+    /// and at a clean end, and a killed daemon's log has neither.
+    pub fn report_every(&mut self, every: std::time::Duration, roles: coord_daemon::role::RoleSet) {
+        let now = std::time::Instant::now();
+        self.pacing.every = Some((every, roles));
+        self.pacing.due = Some(now + every);
+    }
+
+    /// What this voter's work has cost since the loop started, with the
+    /// interval since the last printed snapshot (task-d45).
+    fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
+        use coord_daemon::metrics::{Cost, Interval, Measure, Unavailable};
+        let Backing::Voting(voter) = &self.backing else {
+            // A process without a voter applies what it serves, but the
+            // cost this reports is a voter's: per command it executed in
+            // the domain's order.
+            return Measure::Unavailable(Unavailable::NotThisRole);
+        };
+        let Some(storage) = self.backing.applier().store().cost() else {
+            return Measure::Unavailable(Unavailable::NotInstrumented);
+        };
+        let now = std::time::Instant::now();
+        let executed = voter.node().executed;
+        let busy = self.pacing.busy(self.started, now);
+        let recent = match self.pacing.last {
+            Some((at, busy_then, executed_then)) => Measure::Observed(Interval {
+                span: now.saturating_duration_since(at),
+                busy: busy.saturating_sub(busy_then),
+                executed: executed.saturating_sub(executed_then),
+            }),
+            None => Measure::Unavailable(Unavailable::NoSamples),
+        };
+        Measure::Observed(Cost {
+            executed,
+            lowerings: storage.lowering.lowerings,
+            journal_appends: storage.lowering.appends,
+            journal_syncs: storage.journal_syncs.map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                Measure::Observed,
+            ),
+            projection_commits: storage.lowering.commits,
+            busy,
+            uptime: now.saturating_duration_since(self.started),
+            recent,
+        })
+    }
+
+    /// Print a snapshot if one is due, and start the next interval.
+    fn report_if_due(&mut self) {
+        let now = std::time::Instant::now();
+        let Some((every, roles)) = self.pacing.every.clone() else {
+            return;
+        };
+        if self.pacing.due.is_some_and(|due| now < due) {
+            return;
+        }
+        let snapshot = self.metrics(&roles);
+        match serde_json::to_string(&snapshot) {
+            Ok(rendered) => eprintln!("metrics {rendered}"),
+            Err(e) => eprintln!("the metrics snapshot could not be rendered: {e}"),
+        }
+        let executed = match &self.backing {
+            Backing::Voting(voter) => voter.node().executed,
+            Backing::Serving(_) => 0,
+        };
+        self.pacing.last = Some((now, self.pacing.busy(self.started, now), executed));
+        self.pacing.due = Some(now + every);
     }
 
     /// A bounded, secret-free metrics snapshot of this node (task-61).
@@ -1444,6 +1566,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             frontiers,
             view_age: Measure::Unavailable(Unavailable::NotInstrumented),
             engine_pressure: Measure::Unavailable(Unavailable::NoBound),
+            cost: self.cost(),
         }
     }
 
@@ -1528,6 +1651,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             None
         };
         loop {
+            // Whatever woke the loop, it is working again; and a snapshot
+            // due goes out before the work, so a pass that never ends
+            // does not take the interval's counters with it.
+            self.pacing.woke();
+            self.report_if_due();
             // The leaf this node presents first, every pass: a node whose
             // leaf has expired serves nothing more on it, however much
             // work is queued (task-d02).
@@ -1649,6 +1777,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // share without giving up the ordering that makes the
             // domain progress.
             let api_first = poll_api_first(self.peer_streak);
+            // Waiting from here: the select below returns at once when
+            // there is work, and otherwise this is the loop's idle time.
+            self.pacing.wait();
             let arrived = if api_first {
                 tokio::select! {
                     biased;
@@ -1697,6 +1828,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     () = sleep, if wake.is_some() => continue,
                 }
             };
+            self.pacing.woke();
             match arrived {
                 Some(Arrived::Api(event)) => {
                     self.peer_streak = 0;
@@ -2144,8 +2276,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
             _ => None,
         };
+        // A snapshot is due on its interval, and an idle domain is the
+        // one whose counters an operator is asking about (task-d45).
+        let report = self.pacing.due.filter(|_| self.pacing.every.is_some());
         [
-            expiry, parked, reoffer, redial, renewal, election, resend, catch_up, pages,
+            expiry, parked, reoffer, redial, renewal, election, resend, catch_up, pages, report,
         ]
         .into_iter()
         .flatten()

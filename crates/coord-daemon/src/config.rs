@@ -78,10 +78,14 @@ const fn default_checkpoint_after() -> u64 {
     4096
 }
 
-/// The admission rate a configuration that names none gets (task-d26):
-/// under a sixth of what catch-up executes at one 64-command window per
-/// durable batch of 10 ms, so one frontend at its bound leaves a
-/// returning voter most of its catch-up rate to gain with.
+/// The admission rate a configuration that names none gets (task-d26): a
+/// design target and a ceiling, not a proved bound. It is under a sixth
+/// of what catch-up would execute at one 64-command window per durable
+/// batch of 10 ms, which nothing has measured; task-d33's budget oracle
+/// is its check. At the 35 to 100 commands a second a domain sustains
+/// today it never binds. It gates client requests only: resolves,
+/// watches and held retries bypass it, and every session of a frontend
+/// shares one bucket.
 pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
 
 const fn default_max_admitted_per_second() -> u32 {
@@ -95,17 +99,18 @@ pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = MAX_COMMAND_TABLE_CAPACITY;
 /// table must hold a proposal's worth of in-flight commands and still
 /// reclaim, and the follower's held-proposal bound is a multiple of it.
 pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
-/// The largest. A Sync is selected from up to five reports, and a report
-/// carries at most twice the table (its live records and its retirement
-/// window, `coord_consensus::max_report_entries`; a larger one is set
-/// aside), so the table bounds the Sync -- which is written as one row
-/// and sent as one frame. A worst-case entry, with its admission digest,
-/// one dependency and the largest sequence number, is 208 bytes, and the
-/// row takes 10,180 of them; five disjoint reports at this capacity are
-/// 10,000 (task-d20, measured by
-/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`). A
-/// selection with more dependencies per entry that still does not fit is
-/// refused by name, not written.
+/// The largest. A report carries at most twice the table (its live
+/// records and its retirement window, `coord_consensus::max_report_entries`;
+/// a larger one is set aside), and a Sync is capped to the same, 2,000
+/// commands at this capacity, except kept entries, which are never cut
+/// (task-d24). The Sync is written as one row and sent as one frame, and
+/// the row binds first. An entry with its admission digest, one
+/// dependency and the largest sequence number is 208 bytes, and each
+/// further dependency 32 more; 2,000 such entries are 416,000 bytes, a
+/// fifth of the row, so at the cap an entry has about 1,058 bytes, some
+/// 27 dependencies on average, before the Sync is refused by name rather
+/// than written (task-d20, measured by
+/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`).
 pub const MAX_COMMAND_TABLE_CAPACITY: usize = coord_consensus::MAX_TABLE_CAPACITY;
 
 const fn default_command_table_capacity() -> usize {
@@ -122,6 +127,38 @@ impl Default for Limits {
             checkpoint_after_records: default_checkpoint_after(),
             command_table_capacity: default_command_table_capacity(),
             max_admitted_per_second: default_max_admitted_per_second(),
+        }
+    }
+}
+
+/// Reporting this node's metrics while it serves (task-d45).
+///
+/// A snapshot printed only at start and at a clean end says nothing
+/// about a daemon that was killed, which is the daemon a fault run and
+/// a stuck one leave behind. One every interval leaves the last
+/// interval's counters in the log however the process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Seconds between the snapshots a serving node prints. Zero prints
+    /// only the ones at start and at the end.
+    #[serde(default = "default_metrics_interval")]
+    pub interval_seconds: u64,
+}
+
+/// The interval a configuration that names none gets: often enough that
+/// a killed daemon's last line is recent, rarely enough that the log is
+/// not the snapshot.
+pub const DEFAULT_METRICS_INTERVAL_SECONDS: u64 = 10;
+
+const fn default_metrics_interval() -> u64 {
+    DEFAULT_METRICS_INTERVAL_SECONDS
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            interval_seconds: default_metrics_interval(),
         }
     }
 }
@@ -598,6 +635,9 @@ pub struct Config {
     /// Absent, it is off.
     #[serde(default)]
     pub floor: FloorConfig,
+    /// Printing this node's metrics while it serves (task-d45).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).

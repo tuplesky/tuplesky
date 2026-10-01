@@ -534,6 +534,37 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     /// error alone discarded those completions, so a caller waiting on
     /// the barrier waited for something that had already happened.
     deferred_events: Vec<StorageEvent>,
+    /// What lowering has cost since the store opened (task-d45).
+    cost: LoweringCost,
+}
+
+/// What a store's lowering has cost since it opened (task-d45).
+///
+/// Counted here, in the store, because every lowering passes through it:
+/// a voter's flush of its round, the applier's flush when it applies a
+/// command, and a reconcile from either. Counted at a caller, the
+/// applier's lowerings were the ones missed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoweringCost {
+    /// Flushes and reconciles that wrote something: a journal group, a
+    /// projection commit or both.
+    pub lowerings: u64,
+    /// Journal groups appended, each a synced write.
+    pub appends: u64,
+    /// Projection transactions committed.
+    pub commits: u64,
+}
+
+impl LoweringCost {
+    fn charge(&mut self, report: &FlushReport) {
+        let appends = report.appends as u64;
+        let commits = report.commits as u64;
+        if appends + commits > 0 {
+            self.lowerings += 1;
+        }
+        self.appends += appends;
+        self.commits += commits;
+    }
 }
 
 impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
@@ -552,6 +583,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let allocator = StreamAllocator::restore(high_water, mappings)?;
         Ok(JournaledStore {
             deferred_events: Vec::new(),
+            cost: LoweringCost::default(),
             journal,
             allocator,
             cluster,
@@ -1514,9 +1546,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         match self.materialize() {
             Ok(materialized) => {
                 report.absorb(materialized);
+                self.cost.charge(&report);
                 Ok(report)
             }
             Err(e) => {
+                // The append happened and was synced whatever the
+                // projection did; it is counted.
+                self.cost.charge(&report);
                 // Those records are durable: their journal barriers
                 // completed, and a later stage failing does not take
                 // that back. They are handed to the next report rather
@@ -1632,7 +1668,13 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
             other => return Err(JournaledError::NotReady(other)),
         }
+        self.cost.charge(&report);
         Ok(report)
+    }
+
+    /// What lowering has cost since this store opened (task-d45).
+    pub const fn cost(&self) -> LoweringCost {
+        self.cost
     }
 
     /// The domain's authoritative durable cut (design Section 4.8): the
