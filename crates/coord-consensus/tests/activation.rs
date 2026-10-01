@@ -3956,6 +3956,72 @@ fn replay_promise_model(path: &[PromiseStep]) -> (PromiseRun, Follower, StorageM
     (run, f, storage)
 }
 
+/// A duplicate Sync of the ballot the voter already synchronized and
+/// activated converges without change, even behind a higher promise in
+/// flight: it is not held there and reported superseded later.
+#[test]
+fn a_duplicate_sync_of_the_active_ballot_is_not_held_behind_a_promise() {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(1),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity: 32,
+    });
+    f.step(boot_event(1));
+    let mut storage = StorageModel::default();
+    let mut queue = VecDeque::new();
+    fn persist(
+        effects: Vec<Effect>,
+        storage: &mut StorageModel,
+        queue: &mut VecDeque<coord_core::effect::BarrierId>,
+    ) {
+        for e in effects {
+            if let Effect::Persist(b) = e {
+                queue.push_back(b.barrier);
+                storage.submit(b);
+            }
+        }
+    }
+    fn drain(
+        f: &mut Follower,
+        storage: &mut StorageModel,
+        queue: &mut VecDeque<coord_core::effect::BarrierId>,
+    ) {
+        while let Some(barrier) = queue.pop_front() {
+            storage.complete(barrier).unwrap();
+            let effects = f.step(Event::Storage(StorageEvent::JournalDurable {
+                barrier_id: barrier,
+                journal_seq: LocalJournalSeq::new(storage.durable_seq()).unwrap(),
+            }));
+            persist(effects, storage, queue);
+        }
+    }
+    let [p1_leader, p3_leader, p1_sync] = <[_; 3]>::try_from(promise_model_messages()).unwrap();
+    persist(f.step(peer_event(p1_leader.0, p1_leader.1)), &mut storage, &mut queue);
+    drain(&mut f, &mut storage, &mut queue);
+    persist(f.step(peer_event(p1_sync.0, p1_sync.1.clone())), &mut storage, &mut queue);
+    drain(&mut f, &mut storage, &mut queue);
+    assert_eq!(f.ballots().synced(), ballot(1, 2));
+    assert!(f.take_rejections().is_empty());
+    // P3's promise is queued, not yet durable, and P1's Sync arrives again.
+    persist(f.step(peer_event(p3_leader.0, p3_leader.1)), &mut storage, &mut queue);
+    let e = f.step(peer_event(p1_sync.0, p1_sync.1));
+    assert!(
+        !e.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "a duplicate Sync wrote nothing: {e:?}"
+    );
+    drain(&mut f, &mut storage, &mut queue);
+    assert_eq!(f.ballots().promised(), ballot(3, 0));
+    let rejections = f.take_rejections();
+    assert!(
+        !rejections
+            .iter()
+            .any(|r| matches!(r, FollowerRejection::SyncSuperseded(_))),
+        "the duplicate was held and reported superseded: {rejections:?}"
+    );
+}
+
 /// task-d18's model: every order of `NewLeader` for P1 = (1, 2) and
 /// P3 = (3, 0), P1's Sync, and each queued row completing durably or
 /// failing. In no order is the durable promise below a ballot `Promise`
@@ -5524,6 +5590,67 @@ fn a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing() {
         entry.is_none_or(|e| e.phase < Phase::Accept),
         "b1's entry installed at b2: {entry:?}"
     );
+}
+
+/// task-d24 review: a payload for a command the in-flight Sync marker
+/// releases is not taken. Taken, z's payload and dependency rows landed
+/// after the batch that deleted them; at durability the table and the
+/// payloads dropped z, but the ledger and the disk kept it, and its slot
+/// came back at the next restart.
+#[test]
+fn a_payload_for_a_command_the_sync_in_flight_releases_writes_nothing() {
+    let (b1, b2) = (ballot(1, 2), ballot(2, 0));
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let older = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    drive_durable(&mut f, peer_event(r(2), ProtocolMessage::Sync(older)));
+    drive_durable(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b2,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    assert!(
+        f.report(b2).entries.iter().any(|e| e.command == z),
+        "z is in the report the release is cut from"
+    );
+    let newer = SyncDecision {
+        ballot: b2,
+        source_ballot: b1,
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(0), ProtocolMessage::Sync(newer)));
+    let installs = f.step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: z,
+            payload: payload_record(admit_z),
+        },
+    ));
+    assert!(
+        !installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "z's payload was written after the batch that releases it: {installs:?}"
+    );
+    for e in durable_events(&marker) {
+        let more = f.step(e);
+        for e in durable_events(&more) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b2);
+    assert_eq!(f.table().phase_of(&z), None, "z kept its slot");
+    assert!(f.payload(&z).is_none(), "z's payload was kept");
+    assert!(f.ledger().record(&z).is_none(), "the ledger kept z");
 }
 
 /// The payload row a replica writes for the admission `admit`.
