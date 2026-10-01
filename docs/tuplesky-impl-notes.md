@@ -5682,7 +5682,13 @@ happens at any cluster size.
   the promise is held in `early_sync`. After every storage event it is
   dropped (`SyncSuperseded`) once a higher promise is durable, and
   installed once no higher promise is in flight, which means every higher
-  promise's row failed.
+  promise's row failed. On `coordd` that last branch is effectively dead:
+  after a higher promise's row fails, the store fence stays at that
+  promise, so the released Sync's batch is refused and surfaces as
+  `SyncNotDurable`. It is kept for a store without that fence.
+- A duplicate Sync of the ballot already synchronized and active
+  converges without change before the hold, so it is not held behind a
+  promise and reported superseded later (from review).
 - Every write of the promise row carries the highest promise already
   queued for disk (`BallotState::highest_queued`). A promise from
   `on_new_leader` carries a ballot above it by construction. A Sync's row
@@ -5691,6 +5697,18 @@ happens at any cluster size.
   own row, not the promise row.
 - Nothing changes in the commit rule, the Sync's selection or any row
   format.
+- The promise row written from `on_new_leader` and the in-memory
+  `synced` rest on the ordered-journal contract: rows land in the order
+  they were queued, and a batch fails only when the store fence refuses
+  it. On `coordd` the fence is the only source of a failed batch, so a
+  Sync batch cannot fail while a later promise row lands. A store where
+  batches fail independently is task-d29's failure model, and carrying a
+  durable `synced` instead would move `synced` backwards on the common
+  path.
+- The held Sync is not persisted. A crash while it is held loses it, as
+  the path before this change lost the Sync row queued behind the P3 row;
+  the recovered promise is then P1 with nothing sent for P3 (`Promise` is
+  `SendWhenDurable`), and task-d10's ceiling bounds the wait.
 
 ### Evidence
 
@@ -5698,6 +5716,11 @@ happens at any cluster size.
   (`coord-consensus`, `activation`): the checklist review's probe. At
   `d4bd28c` the durable row reads `promised: (1, 2)` after `Promise(3,
   0)` was published. It passes now.
+- `a_duplicate_sync_of_the_active_ballot_is_not_held_behind_a_promise`
+  (`activation`): a Sync of the active ballot repeated while a higher
+  promise is in flight writes nothing and is not reported superseded.
+  With the duplicate check back after the hold it fails, naming the
+  `SyncSuperseded` rejection.
 - `no_order_of_two_promises_and_a_sync_lowers_the_durable_promise`
   (`activation`): a model of every order of `NewLeader` for P1 and P3,
   P1's Sync, and each queued row completing durably or failing, in
@@ -5711,6 +5734,12 @@ happens at any cluster size.
 
 - The protocol oracle of task-d30 checks the same property on the real
   machines under a simulated network.
+- A voter that promised a ballot but never received its Sync is not
+  re-Synced by the leader: the leader re-asks only voters not in
+  `joined` (task-d33), and task-d20 did not change that. It waits for
+  task-d10's ceiling and a new campaign. Re-sending the Sync to a
+  promised but unsynchronized voter is a liveness follow-up of its own,
+  not task-d20's (from review).
 
 ## Only adoptions count toward the slow majority
 
@@ -5936,6 +5965,17 @@ So a cycle would have to cross between kinds, and every crossing is ruled
 out above: edges go from candidates to (A) or (C), from (A) to (A) or
 (C), and from (C) only to (C). The graph is acyclic.
 
+Fact 2 needs one more thing, which the code gives: one dependency set
+per command per ballot. The slow-path re-send reuses the proposal's
+dependencies, and a reporter's ACCEPT copy comes from adoption or from
+Sync installation under `guard_accept`, both carrying the leader's
+dependencies. The soft spot is fact 3: the (C) cases assume that
+committed dependencies agree, which is the safety property itself. So
+the argument proves that a cycle implies a guard bypassed or an earlier
+safety violation, not that a cycle is impossible. That is the reason to
+halt, and the halt is the same class of stop as task-d14's two decisions
+for one command (from review).
+
 ### The rule
 
 - `recovery::entry_order` is the one ordering, and `Leader::from_recovered`
@@ -5956,6 +5996,16 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
   or a corrupt peer can; installing the acyclic part would execute what
   the rest of the domain may never (Codex review).
 - Nothing changes in what is selected.
+- Halting is the right strength. Any resolution drops an edge that some
+  reporter accepted under its guard (fact 1), so resolving would choose
+  which invariant to break. Two consequences follow and are accepted for
+  an invariant violation:
+  - The candidate closes its campaign only after its promise row is
+    durable, so the next campaign after task-d10's ceiling selects the
+    same reports and halts too. The domain stops one node per campaign
+    until an operator acts.
+  - The check in `on_sync` lets one Sync from a foreign build halt every
+    follower that receives it.
 
 ### Evidence
 
@@ -5974,7 +6024,12 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
   from the row, it queues neither entry and is halted. Both fail without
   the check.
 - `a_recovery_cycle_stop_names_the_commands` (`coordd`): the stop's
-  prefix, the count, and the first eight entries in full.
+  prefix, the count, and the first eight entries in full. The serve
+  loop's stop itself (`serve.rs`) is exercised only through
+  `describe_recovery_cycle`, as task-d14's two-decisions stop it copies
+  is. `halt_on_cycle` sets the generic stop flag, and both `coordd` and
+  the simulator's oracle check `recovery_cycle()` first, so a cycle is
+  not reported as an incompatible admission.
 - Before this change, the candidate bound such a Sync, and the new leader
   proposed nothing of the cycle and everything else.
 
@@ -6584,12 +6639,24 @@ snapshots from one replica as inconsistent.
   - The voter answers only the candidate its report went to, for that
     ballot, from the same version.
 - **Bounded assembler.** A campaign refuses a report announcing more
-  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The
-  extra page lets a report one entry past the bound still assemble, so
-  task-d20 names it. The pages held are one campaign's, since a new
-  campaign replaces the old one, plus the one report the voter serves.
+  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The extra page
+  is slack: 8 pages of 256 already hold 2,048 entries, so a report just
+  past the bound assembles without it. What the bound admits is up to
+  2,304 entries, and the campaign refuses what is past the bound by name
+  (task-d20). The pages held are one campaign's, since a new campaign
+  replaces the old one, plus the one report the voter serves (from
+  review).
+- **Pacing.** The first ask goes out one re-send interval after the
+  campaign starts, which gives the published pages 250 ms to arrive. The
+  worst case is `MAX_PAGE_ASK` duplicate pages per voter per interval,
+  idempotent at the assembler, and shares no budget with the leader's
+  proposal re-send. Report pages and their requests ride the control
+  lane, the lane that dropped the original page, so a 16-page answer can
+  drop again; the retry converges, and a smaller ask would be gentler.
 
-The report format is unchanged.
+The report format is unchanged. A build that paginates smaller would
+announce more pages and be refused `OutOfBounds`, as an older build that
+ignores the request is left to the ballot's time-out.
 
 ### Evidence
 
