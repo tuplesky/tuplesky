@@ -1365,7 +1365,11 @@ impl Follower {
             let epoch = self.config.identity.epoch;
             // A record the selection neither selected nor re-proposed,
             // and no selected entry depends on, was decided nowhere
-            // (task-d24): the selection is taken from a majority's
+            // (task-d24). The dependency clause is redundant and kept as
+            // a guard: a record a kept entry depends on is itself kept, a
+            // followed re-proposal, or executed and retired, so it changes
+            // no outcome, unless a selection-completeness bug would turn
+            // into a lost payload. The selection is taken from a majority's
             // reports and keeps every command a quorum of an earlier
             // ballot could have decided, so a command it leaves out was
             // not decided below this ballot. Kept, it held its slot until
@@ -3820,6 +3824,16 @@ impl Follower {
             .selected_admission(&command)
             .is_some_and(|d| d != payload.admission_digest())
         {
+            return Vec::new();
+        }
+        // A command the Sync whose marker is being written releases is not
+        // taken meanwhile (task-d24 review). Taken, its payload and
+        // dependency rows land after the batch that deletes them, and the
+        // release at durability drops it from the table but not from the
+        // ledger or the disk, so the slot came back at the next restart.
+        // A payload asks no promise fence, so this is the only gate; the
+        // command is asked for again if a later selection names it.
+        if self.sync_barrier.is_some() && self.sync_released.contains(&command) {
             return Vec::new();
         }
         if self.payloads.contains_key(&command) {

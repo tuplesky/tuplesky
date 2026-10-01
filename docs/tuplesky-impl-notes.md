@@ -6695,12 +6695,26 @@ finishes or recovers admitted commands could be refused by a full table.
   and pulled commands enter a full table: a Sync's placeholders through
   `expect_beyond_capacity`, and its payloads as a command whose turn has
   come does.
+  - What one eighth is sized for (review): recovery work ignores the
+    bound, so the reserve is what lets a voter admitted to seven eighths
+    hold one catch-up window (`MAX_CATCH_UP_COMMANDS`, 64) or its
+    placeholders and still report within twice the table: 875 + 125 +
+    1,000 retired = 2,000 at the largest table. Below a table of 512
+    the reserve is smaller than a window and the beyond-capacity path
+    carries the rest; at the smallest table, 32, it is 4. A Sync's
+    entries are made to fit by the release rule and the Sync's cap, not
+    by the reserve.
 - **Release of records decided nowhere.** In the Sync's own install
   batch, as task-d11 puts its demotions there, some undecided records are
   released:
   - which: those this voter's report for the ballot named, that the
     Sync neither selected nor re-proposed, and that no selected entry
-    depends on;
+    depends on. The last clause is redundant and kept as a guard: a
+    record a kept entry depends on is itself kept, a followed
+    re-proposal, or executed and retired, which needs catch-up whatever
+    happens to the local record. It changes no outcome, but keeps a
+    selection-completeness bug (the open task-d19 item) from becoming a
+    lost payload (review);
   - their dependency rows and payload rows are deleted;
   - the table releases them and repairs the key index once the batch is
     durable. A key whose latest command was released takes that
@@ -6733,8 +6747,9 @@ finishes or recovers admitted commands could be refused by a full table.
   at every ballot, with no exit.
   - A Sync now carries at most `MAX_REPORT_ENTRIES` commands
     (`within_bound`, applied by `select_with`): every kept entry, then
-    re-proposals in the selection's order, which is identity order, until
-    the bound.
+    re-proposals in identity order, the re-proposed set's order, which is
+    deterministic and is not the order the leader proposes them in,
+    until the bound.
   - A re-proposal a kept entry depends on goes first, wherever it falls
     in that order. The new leader re-proposes such an entry right after
     it, so leaving it out would leave the entry waiting for a proposal
@@ -6756,7 +6771,11 @@ finishes or recovers admitted commands could be refused by a full table.
   - The last is a voter far behind, task-d08's and task-d32's case.
     Kept entries are never cut, since one may be decided: a selection
     whose kept entries alone pass the bound carries them all, and its
-    row bound (`SyncTooLarge`) still applies.
+    row bound (`SyncTooLarge`) still applies. A Sync refused that way on
+    its kept entries alone fails every election by construction, since
+    every later campaign keeps the same entries. It is reachable only
+    above about 27 dependencies per entry on average over 2,000 entries;
+    its owner is task-d32 (review of task-d20).
   - A voter that takes a capped Sync's re-proposals holds only what the
     Sync names, having released the rest of what it reported, so its
     report for the next ballot is within the bound.
@@ -6857,6 +6876,30 @@ finishes or recovers admitted commands could be refused by a full table.
   voter is as if it never held the command, and the proposal fetches the
   payload as any missing one, before and after a restart.
 
+Both are justified (review). The selection can speak only for what the
+promising majority reported, and admission is fenced from the promise,
+so the cut is exactly what a selection could have covered; the restart
+rebuild (`undecided()` while promised and synchronized differ) is a
+superset only by records nothing could have added. In the c2 example, c2
+is in the late voter's report, so it is released there too, and it
+comes back through the re-sent proposal and a payload fetch, which is
+what the second departure makes work: `missing_payloads` keys on absent
+payloads, so a kept payload row would never be fetched again.
+
+### A late payload for a command the Sync releases
+
+A payload answer reaches `on_request` without the promise fence. One for
+an entry an older Sync left pending, which the newer Sync omits, could
+arrive between the newer marker's issue and its durability: the command
+was still pending, so it was initialized beyond capacity, and its payload
+and dependency rows landed after the batch that deletes them. At
+durability the table and the payloads dropped it, but the ledger and the
+disk kept it. No acceptance leaked, since a voter does not vote while
+its promise and active ballot differ, but the slot came back at the next
+restart until the next Sync released it again. A payload for a command
+the in-flight marker releases is now not taken (`on_payload`); a later
+selection that names it asks for it again (review).
+
 ### Evidence
 
 - `a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them`
@@ -6900,6 +6943,12 @@ finishes or recovers admitted commands could be refused by a full table.
     keeps that re-proposal.
   - The rest are the first in identity order.
   - Without the cap the Sync names 10,000.
+- `a_payload_for_a_command_the_sync_in_flight_releases_writes_nothing`
+  (`activation`): b1's Sync leaves z pending, b2's omits it, and z's
+  payload arrives while b2's marker is in flight. Nothing is written for
+  it, and after durability neither the table, the payloads nor the
+  ledger hold z. Without the gate z's payload and dependency rows are
+  queued after the marker.
 - `a_leader_crash_right_after_a_capped_sync_is_followed_by_a_campaign_that_completes`
   (`activation`):
   - Five voters at the largest table. Four each pre-accepted 875

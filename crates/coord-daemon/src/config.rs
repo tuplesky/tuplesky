@@ -73,17 +73,18 @@ pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = MAX_COMMAND_TABLE_CAPACITY;
 /// table must hold a proposal's worth of in-flight commands and still
 /// reclaim, and the follower's held-proposal bound is a multiple of it.
 pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
-/// The largest. A Sync is selected from up to five reports, and a report
-/// carries at most twice the table (its live records and its retirement
-/// window, `coord_consensus::max_report_entries`; a larger one is set
-/// aside), so the table bounds the Sync -- which is written as one row
-/// and sent as one frame. A worst-case entry, with its admission digest,
-/// one dependency and the largest sequence number, is 208 bytes, and the
-/// row takes 10,180 of them; five disjoint reports at this capacity are
-/// 10,000 (task-d20, measured by
-/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`). A
-/// selection with more dependencies per entry that still does not fit is
-/// refused by name, not written.
+/// The largest. A report carries at most twice the table (its live
+/// records and its retirement window, `coord_consensus::max_report_entries`;
+/// a larger one is set aside), and a Sync is capped to the same, 2,000
+/// commands at this capacity, except kept entries, which are never cut
+/// (task-d24). The Sync is written as one row and sent as one frame, and
+/// the row binds first. An entry with its admission digest, one
+/// dependency and the largest sequence number is 208 bytes, and each
+/// further dependency 32 more; 2,000 such entries are 416,000 bytes, a
+/// fifth of the row, so at the cap an entry has about 1,058 bytes, some
+/// 27 dependencies on average, before the Sync is refused by name rather
+/// than written (task-d20, measured by
+/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`).
 pub const MAX_COMMAND_TABLE_CAPACITY: usize = coord_consensus::MAX_TABLE_CAPACITY;
 
 const fn default_command_table_capacity() -> usize {

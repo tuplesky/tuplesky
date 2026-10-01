@@ -5592,6 +5592,67 @@ fn a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing() {
     );
 }
 
+/// task-d24 review: a payload for a command the in-flight Sync marker
+/// releases is not taken. Taken, z's payload and dependency rows landed
+/// after the batch that deleted them; at durability the table and the
+/// payloads dropped z, but the ledger and the disk kept it, and its slot
+/// came back at the next restart.
+#[test]
+fn a_payload_for_a_command_the_sync_in_flight_releases_writes_nothing() {
+    let (b1, b2) = (ballot(1, 2), ballot(2, 0));
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let older = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    drive_durable(&mut f, peer_event(r(2), ProtocolMessage::Sync(older)));
+    drive_durable(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b2,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    assert!(
+        f.report(b2).entries.iter().any(|e| e.command == z),
+        "z is in the report the release is cut from"
+    );
+    let newer = SyncDecision {
+        ballot: b2,
+        source_ballot: b1,
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(0), ProtocolMessage::Sync(newer)));
+    let installs = f.step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: z,
+            payload: payload_record(admit_z),
+        },
+    ));
+    assert!(
+        !installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "z's payload was written after the batch that releases it: {installs:?}"
+    );
+    for e in durable_events(&marker) {
+        let more = f.step(e);
+        for e in durable_events(&more) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b2);
+    assert_eq!(f.table().phase_of(&z), None, "z kept its slot");
+    assert!(f.payload(&z).is_none(), "z's payload was kept");
+    assert!(f.ledger().record(&z).is_none(), "the ledger kept z");
+}
+
 /// The payload row a replica writes for the admission `admit`.
 fn payload_record(admit: Event) -> coord_consensus::PayloadRecordV1 {
     let mut other = Follower::new(FollowerConfig {
