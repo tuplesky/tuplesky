@@ -127,11 +127,16 @@ fn store(boot: BootId) -> Applier<StoreWorker<ModelEngine>> {
 /// One admitted client request, as a collector's submission would have
 /// produced it at the verifier boundary.
 fn admitted(sequence: u64) -> coord_core::event::AdmittedRequest {
+    admitted_putting(sequence, b"v".to_vec())
+}
+
+/// [`admitted`], putting `value`.
+fn admitted_putting(sequence: u64, value: Vec<u8>) -> coord_core::event::AdmittedRequest {
     let mut logical = LogicalRequest::new(
         NS,
         CanonicalOperation::Put(PutOp {
             key: b"k".to_vec(),
-            value: b"v".to_vec(),
+            value,
             lease: None,
             prev_kv: false,
         }),
@@ -185,15 +190,17 @@ fn journaled_applier(
     boot: BootId,
     me: ReplicaId,
 ) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
-    let mut store = JournaledStore::open(
-        ModelJournal::new(),
-        CLUSTER,
-        me,
-        inc(),
-        boot,
-        JournalLimits::default(),
-    )
-    .unwrap();
+    journaled_applier_within(boot, me, JournalLimits::default())
+}
+
+/// [`journaled_applier`] under `limits`.
+fn journaled_applier_within(
+    boot: BootId,
+    me: ReplicaId,
+    limits: JournalLimits,
+) -> Applier<JournaledDomain<ModelJournal, ModelEngine>> {
+    let mut store =
+        JournaledStore::open(ModelJournal::new(), CLUSTER, me, inc(), boot, limits).unwrap();
     store
         .attach(DOMAIN, ShardId::new(0).unwrap(), ModelEngine::new())
         .unwrap();
@@ -241,7 +248,15 @@ fn journaled_applier(
 /// journal: its own record is the quorum, so what it proposes it also
 /// executes.
 fn journaled_lone_leader(boot: BootId) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
-    let applier = journaled_applier(boot, r(0));
+    journaled_lone_leader_within(boot, JournalLimits::default())
+}
+
+/// [`journaled_lone_leader`] under `limits`.
+fn journaled_lone_leader_within(
+    boot: BootId,
+    limits: JournalLimits,
+) -> Node<JournaledDomain<ModelJournal, ModelEngine>> {
+    let applier = journaled_applier_within(boot, r(0), limits);
     let bootstrapped = applier.store().application_base().execution_position;
     let alone = ConfigurationIdentity {
         voters: vec![r(0)].into_iter().collect(),
@@ -859,6 +874,60 @@ fn lowering_in_groups_a_staged_group_is_journaled_by_the_flush_and_answered_by_f
         "one projection commit"
     );
     assert!(node.applier().kv_revision().unwrap() > revision_before);
+    assert!(
+        !out.frontend.is_empty(),
+        "the results went to the collector"
+    );
+}
+
+/// Lowering in groups, a group whose batches would overfill the store's
+/// queue in bytes is lowered before the next command is applied, and
+/// that command is applied after it (task-d47; #138's review).
+///
+/// The queue here holds two of these commands' batches at most, and the
+/// group's count is far from its bound, so only the byte check stands
+/// between the third command and a refusal that would stop the voter.
+#[test]
+fn lowering_in_groups_a_group_that_would_overfill_the_queue_in_bytes_is_lowered_first() {
+    let boot = BootId([11; 16]);
+    let limits = JournalLimits {
+        max_queued_bytes_per_domain: 24 * 1024,
+        ..JournalLimits::default()
+    };
+    let mut node = journaled_lone_leader_within(boot, limits);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    const COMMANDS: u64 = 6;
+    for sequence in 1..=COMMANDS {
+        node.on_event(
+            Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 3 * 1024])),
+            &ballot(),
+        )
+        .expect("admitted");
+        node.flush(&ballot()).expect("flushed");
+    }
+    assert!(node.can_execute());
+
+    let cost = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().cost().expect("counted").lowering
+    };
+    let before = cost(&node);
+    let out = node
+        .execute(&ballot())
+        .expect("a full queue is lowered, not refused");
+    assert_eq!(node.executed, COMMANDS);
+    assert!(!node.applier().in_group());
+    assert!(
+        cost(&node).commits - before.commits > 1,
+        "the commands did not fit one group's queue"
+    );
     assert!(
         !out.frontend.is_empty(),
         "the results went to the collector"
