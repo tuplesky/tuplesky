@@ -187,6 +187,19 @@ pub struct CommandTable {
     /// every entry being rescanned each time anything moved (task-d26).
     /// A set, so it holds at most the table's records and tombstones.
     raised: Option<BTreeSet<CommandId>>,
+    /// Every command whose record is at ACCEPT, and possibly some that
+    /// have moved on since (task-d46): what the learner examines,
+    /// instead of every vote set it holds, executed history included.
+    /// Entered where a record reaches ACCEPT ([`CommandTable::accept`],
+    /// [`CommandTable::restore`]); left lazily, by
+    /// [`CommandTable::in_accept`].
+    accepted: BTreeSet<CommandId>,
+    /// Every command whose record is at COMMIT (task-d46): what the next
+    /// command to execute is chosen from, instead of every record.
+    /// Entered by [`CommandTable::commit`] and [`CommandTable::restore`],
+    /// left by [`CommandTable::execute`] and
+    /// [`CommandTable::restore_executed`], the only ways out of COMMIT.
+    committed: BTreeSet<CommandId>,
 }
 
 impl CommandTable {
@@ -204,6 +217,8 @@ impl CommandTable {
             last_executed: None,
             unretired: VecDeque::new(),
             raised: None,
+            accepted: BTreeSet::new(),
+            committed: BTreeSet::new(),
         }
     }
 
@@ -221,6 +236,8 @@ impl CommandTable {
             last_executed: None,
             unretired: VecDeque::new(),
             raised: None,
+            accepted: BTreeSet::new(),
+            committed: BTreeSet::new(),
         }
     }
 
@@ -245,8 +262,16 @@ impl CommandTable {
             last_executed: None,
             unretired: VecDeque::new(),
             raised: None,
+            accepted: BTreeSet::new(),
+            committed: BTreeSet::new(),
         };
         for (c, r) in records {
+            if r.phase == Phase::Accept {
+                table.accepted.insert(c);
+            }
+            if r.phase == Phase::Commit {
+                table.committed.insert(c);
+            }
             table.records.insert(c, r);
         }
         let mut per_key: BTreeMap<Vec<u8>, Vec<CommandId>> = BTreeMap::new();
@@ -712,8 +737,43 @@ impl CommandTable {
         let record = self.initialized_mut(&command)?;
         record.deps = deps;
         record.phase = Phase::Accept;
+        self.accepted.insert(command);
         self.raise(command);
         Ok(())
+    }
+
+    /// The records at COMMIT, in identity order (task-d46): those the
+    /// next command to execute is among.
+    pub fn in_commit(&self) -> impl Iterator<Item = (&CommandId, &CommandRecord)> {
+        debug_assert!(
+            self.records
+                .iter()
+                .filter(|(_, r)| r.phase == Phase::Commit)
+                .all(|(c, _)| self.committed.contains(c)),
+            "a record at COMMIT is missing from the executable set"
+        );
+        self.committed
+            .iter()
+            .filter_map(|c| self.records.get_key_value(c))
+            .filter(|(_, r)| r.phase == Phase::Commit && r.payload.is_some())
+    }
+
+    /// The commands at ACCEPT, in identity order (task-d46): those the
+    /// learner can commit. Costs what is in flight, not the history.
+    pub fn in_accept(&mut self) -> Vec<CommandId> {
+        let records = &self.records;
+        self.accepted
+            .retain(|c| records.get(c).is_some_and(|r| r.phase == Phase::Accept));
+        // Every record at ACCEPT is entered where it got there; a path
+        // that missed would leave a command the learner never commits.
+        debug_assert!(
+            self.records
+                .iter()
+                .filter(|(_, r)| r.phase == Phase::Accept)
+                .all(|(c, _)| self.accepted.contains(c)),
+            "a record at ACCEPT is missing from the learner's set"
+        );
+        self.accepted.iter().copied().collect()
     }
 
     /// Make `command` the latest command on `key`: the next command
@@ -780,6 +840,7 @@ impl CommandTable {
         let deps = record.deps.clone();
         guard_commit(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Commit;
+        self.committed.insert(command);
         self.raise(command);
         Ok(())
     }
@@ -794,6 +855,7 @@ impl CommandTable {
         let deps = record.deps.clone();
         guard_execute(&deps, |c| self.phase_of(c))?;
         self.initialized_mut(&command)?.phase = Phase::Executed;
+        self.committed.remove(&command);
         self.last_executed = Some(command);
         self.unretired.push_back(command);
         self.raise(command);
@@ -841,6 +903,7 @@ impl CommandTable {
     /// prefix): it is remembered as executed, which is all there is left
     /// to say about it.
     pub fn restore_executed(&mut self, command: &CommandId) {
+        self.committed.remove(command);
         self.last_executed = Some(*command);
         self.raise(*command);
         match self.records.get_mut(command) {

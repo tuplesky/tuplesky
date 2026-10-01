@@ -403,6 +403,11 @@ pub struct Follower {
     held: BTreeMap<CommandId, HeldProposal>,
     /// Adopted commands: leader sequence number and whether durable.
     adopted: BTreeMap<CommandId, (u64, bool)>,
+    /// The adopted commands with no payload here (task-d46): the part of
+    /// [`Follower::missing_payloads`] that `adopted` contributes, kept as
+    /// the two maps change. `adopted` keeps executed commands until the
+    /// history sweep, so reading it whole each turn cost the history.
+    adopted_lacking: alloc::collections::BTreeSet<CommandId>,
     pending: BTreeMap<BarrierId, Pending>,
     deferred: BTreeMap<BarrierId, DeferredVote>,
     votes: BTreeMap<CommandId, VoteSet>,
@@ -561,6 +566,18 @@ pub struct Follower {
 /// binding went to whichever command sorted last, and a restart could
 /// restore the presentation the leader's had displaced and refuse exact
 /// retries of the leader's command as another command's.
+/// The adopted commands with no payload (task-d46).
+fn lacking(
+    adopted: &BTreeMap<CommandId, (u64, bool)>,
+    payloads: &BTreeMap<CommandId, PayloadRecordV1>,
+) -> alloc::collections::BTreeSet<CommandId> {
+    adopted
+        .keys()
+        .filter(|c| !payloads.contains_key(c))
+        .copied()
+        .collect()
+}
+
 fn restored_bindings<'a>(
     table: &CommandTable,
     payloads: impl IntoIterator<Item = (&'a CommandId, &'a PayloadRecordV1)>,
@@ -662,6 +679,7 @@ impl Follower {
             .filter(|(_, r)| r.phase >= Phase::Accept)
             .map(|(c, _)| (*c, (u64::MAX, true)))
             .collect();
+        let adopted_lacking = lacking(&adopted, &payloads);
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             catch_up: CatchUp::default(),
@@ -679,6 +697,7 @@ impl Follower {
             bindings,
             held: BTreeMap::new(),
             adopted,
+            adopted_lacking,
             pending: BTreeMap::new(),
             deferred: BTreeMap::new(),
             votes: BTreeMap::new(),
@@ -809,6 +828,7 @@ impl Follower {
             }
             touched.insert(p.retry_key);
             self.payloads.insert(c, p);
+            self.note_lacking(c);
             self.served_payloads.insert(c);
         }
         let restored = restored_bindings(
@@ -857,6 +877,7 @@ impl Follower {
             bindings: state.bindings,
             held: BTreeMap::new(),
             adopted: BTreeMap::new(),
+            adopted_lacking: alloc::collections::BTreeSet::new(),
             pending: BTreeMap::new(),
             votes: BTreeMap::new(),
             payloads: state.payloads,
@@ -1620,6 +1641,7 @@ impl Follower {
         self.votes.clear();
         self.held.clear();
         self.adopted.clear();
+        self.adopted_lacking.clear();
         self.leader_committed = None;
         self.named_facts = named_facts(&decision);
         self.replace_sync_pending(&decision);
@@ -1641,6 +1663,7 @@ impl Follower {
         self.served_payloads.remove(command);
         self.votes.remove(command);
         self.adopted.remove(command);
+        self.note_lacking(*command);
         self.held.remove(command);
     }
 
@@ -2033,12 +2056,17 @@ impl Follower {
         // arrived before its submission leaves a placeholder, and a
         // command the leader proposed out of its own scheduler has no
         // submission coming at all.
+        debug_assert_eq!(
+            self.adopted_lacking,
+            lacking(&self.adopted, &self.payloads),
+            "the adopted commands lacking a payload were not kept with the maps"
+        );
         let mut out: Vec<CommandId> = self
             .held
             .keys()
             .chain(self.sync_pending.keys())
-            .chain(self.adopted.keys())
             .filter(|c| !self.payloads.contains_key(c))
+            .chain(self.adopted_lacking.iter())
             .copied()
             .chain(self.held.keys().filter(|c| self.awaits_rebind(c)).copied())
             .chain(
@@ -2734,6 +2762,7 @@ impl Follower {
             .entry(entry.payload.retry_key)
             .or_insert(command);
         self.payloads.insert(command, entry.payload.clone());
+        self.note_lacking(command);
         let epoch = self.config.identity.epoch;
         let (barrier, updates) = batch
             .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
@@ -2789,6 +2818,17 @@ impl Follower {
         // that, and kept it grew with every key ever submitted -- at boot,
         // with every payload row there is (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
+        self.adopted_lacking = lacking(&self.adopted, &self.payloads);
+    }
+
+    /// Re-read whether `command` is adopted here with no payload, after
+    /// either map changed for it (task-d46).
+    fn note_lacking(&mut self, command: CommandId) {
+        if self.adopted.contains_key(&command) && !self.payloads.contains_key(&command) {
+            self.adopted_lacking.insert(command);
+        } else {
+            self.adopted_lacking.remove(&command);
+        }
     }
 
     fn learn(&mut self) {
@@ -2817,13 +2857,16 @@ impl Follower {
         let Some(through) = self.leader_committed else {
             return false;
         };
+        // From the commands at ACCEPT rather than every adoption, which
+        // keeps executed ones until the history sweep (task-d46).
         let mut ready: Vec<(u64, CommandId)> = self
-            .adopted
-            .iter()
-            .filter(|(c, (seqnum, durable))| {
-                *durable && *seqnum <= through && self.table.phase_of(c) == Some(Phase::Accept)
+            .table
+            .in_accept()
+            .into_iter()
+            .filter_map(|c| match self.adopted.get(&c) {
+                Some((seqnum, true)) if *seqnum <= through => Some((*seqnum, c)),
+                _ => None,
             })
-            .map(|(c, (seqnum, _))| (*seqnum, *c))
             .collect();
         ready.sort_unstable();
         let mut progressed = false;
@@ -3411,6 +3454,7 @@ impl Follower {
         };
         self.bindings.insert(retry_key, command);
         self.payloads.insert(command, payload.clone());
+        self.note_lacking(command);
         // The leader's proposal came first, under other attested facts:
         // held, and waiting for the leader's payload (`awaits_rebind`).
         if self.awaits_rebind(&command) {
@@ -3526,6 +3570,7 @@ impl Follower {
                 return self.acknowledge_decided(&proposal, from);
             }
             self.adopted.remove(&command);
+            self.note_lacking(command);
         }
         if self.table.record(&command).is_none()
             && self.table.phase_of(&command) == Some(Phase::Executed)
@@ -3806,6 +3851,7 @@ impl Follower {
                 self.sync_demoted.retain(|c| *c != command);
                 self.adopted
                     .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
+                self.note_lacking(command);
                 let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
@@ -4460,6 +4506,7 @@ impl Follower {
         }
         self.bindings.insert(payload.retry_key, command);
         self.payloads.insert(command, payload.clone());
+        self.note_lacking(command);
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         self.durable_payloads.insert(barrier, command);
         alloc::vec![Effect::Persist(PersistBatch {
@@ -4488,6 +4535,7 @@ impl Follower {
         }
         self.bindings.insert(payload.retry_key, command);
         self.payloads.insert(command, payload.clone());
+        self.note_lacking(command);
         self.served_payloads.remove(&command);
         if let Some(held) = self.held.get(&command) {
             let mut set = VoteSet::new(self.config.quorum.clone(), command);

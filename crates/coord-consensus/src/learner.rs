@@ -137,15 +137,21 @@ impl Learner {
     ) -> Vec<CommandId> {
         let mut committed = Vec::new();
         loop {
-            let candidates: Vec<(CommandId, Learned)> = votes
-                .iter()
-                .filter(|(c, _)| table.phase_of(c) == Some(Phase::Accept))
-                .filter_map(|(c, v)| {
+            // The commands at ACCEPT, not every vote set held: executed
+            // ones keep theirs until the history sweep, and a pass over
+            // them costs the history rather than the change (task-d46).
+            // The same commands as filtering the vote sets by phase, in
+            // the same order.
+            let candidates: Vec<(CommandId, Learned)> = table
+                .in_accept()
+                .into_iter()
+                .filter_map(|c| {
+                    let v = votes.get(&c)?;
                     let learned = match self.mode {
                         LearningMode::Full => v.learned(),
                         LearningMode::SlowOnly => v.learned_slow(),
                     }?;
-                    Some((*c, learned))
+                    Some((c, learned))
                 })
                 .collect();
             let mut progressed = false;
@@ -176,9 +182,10 @@ impl Learner {
         table: &CommandTable,
         seqnum_of: impl Fn(&CommandId) -> Option<u64>,
     ) -> Option<CommandId> {
+        // The records at COMMIT only: the table keeps executed ones
+        // until it retires them (task-d46).
         table
-            .records()
-            .filter(|(_, r)| r.phase == Phase::Commit)
+            .in_commit()
             .filter(|(_, r)| guard_execute(&r.deps, |d| table.phase_of(d)).is_ok())
             .map(|(c, _)| (seqnum_of(c).unwrap_or(u64::MAX), *c))
             .min()
