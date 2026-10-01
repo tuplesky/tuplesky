@@ -188,6 +188,28 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual([js.percentile(ms, q) for q in (0.5, 0.95, 0.99)], [50.0, 95.0, 99.0])
         self.assertEqual(js.percentile([7.0], 0.99), 7.0)
 
+    def test_network_under_a_simulated_wan(self):
+        def wan_line(msg):
+            return f"2026-09-27 10:00:00,000{{GMT}}\tINFO\t[jepsen nemesis] jepsen.tuplesky.wan: {msg}\n"
+
+        lines = [
+            wan_line('WAN regions: {"n1" "us-east", "n2" "us-west"}'),
+            wan_line("WAN clients: first"),
+            wan_line("WAN round trip n1 -> n2 : 66.4 ms, profile 66 ms"),
+            wan_line("WAN round trip n2 -> control : nil ms, profile 66 ms"),
+            file_line("10:00:01", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+        ]
+        self.assertEqual(
+            js.parse_network(lines),
+            ("first", [("n1", "n2", "66.4", "66"), ("n2", "control", "nil", "66")]),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "jepsen.log"), "w") as f:
+                f.writelines(lines)
+            text = js.summarize(d, ["n1", "n2"], "Jepsen")
+        self.assertIn("round trips measured at setup; clients beside the first node", text)
+        self.assertIn("| n1 | n2 | 66.4 | 66 |", text)
+
     def test_missing_files_leave_sections_out(self):
         with tempfile.TemporaryDirectory() as empty:
             text = js.summarize(empty, [], "Jepsen")

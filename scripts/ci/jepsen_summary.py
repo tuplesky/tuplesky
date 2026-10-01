@@ -8,6 +8,8 @@ directory (`store/latest`) and writes what a reader looks for first:
 * the operation counts, `ok` per 30 s, the last `ok` and the final heal;
 * the throughput, `ok` a second until the final heal, and each operation's
   latency percentiles, for the throughput and WAN runs;
+* under a simulated WAN, the round trips the nemesis measured at setup
+  against the profile's (jepsen.tuplesky.wan);
 * each node's final reads, which say whether the domain served again;
 * the commonest failure reasons;
 * the faults, in order;
@@ -77,6 +79,9 @@ SLINGSHOT = re.compile(r':type :[\w.-]+/([\w-]+).*?:error \\?"([^"\\]*)')
 RECOVERED = re.compile(r"^recovered .*\bexecuted=(\d+)")
 # Written into the log by Jepsen's start-daemon!, one per :start of the node.
 STARTING = "Jepsen starting "
+# jepsen.tuplesky.wan's setup: "WAN round trip n1 -> n2 : 66.2 ms, profile 66 ms".
+WAN_RTT = re.compile(r"WAN round trip (\S+) -> (\S+) : (\S+) ms, profile (\S+) ms")
+WAN_CLIENTS = re.compile(r"WAN clients: (\S+)")
 
 
 @dataclass
@@ -207,6 +212,24 @@ def parse_voter(lines) -> Voter:
     return v
 
 
+def parse_network(lines) -> tuple[str | None, list[tuple[str, str, str, str]]]:
+    """Where the clients sat, and each round trip measured under a
+    simulated WAN, as (from, to, measured, profile)."""
+    clients, rows = None, []
+    for line in lines:
+        m = FILE_LINE.match(line.rstrip("\n")) or CONSOLE_LINE.match(line.rstrip("\n"))
+        if not m or m["logger"] != "jepsen.tuplesky.wan":
+            continue
+        r = WAN_RTT.search(m["msg"])
+        if r:
+            rows.append((r[1], r[2], r[3], r[4]))
+            continue
+        c = WAN_CLIENTS.search(m["msg"])
+        if c:
+            clients = c[1]
+    return clients, rows
+
+
 def percentile(sorted_ms: list[float], q: float) -> float:
     """The nearest-rank percentile of an ascending list. The rounding keeps
     0.95 * 100 from ranking as 96."""
@@ -268,9 +291,12 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
     out = [f"## {title}", ""]
     log_path = os.path.join(store, "jepsen.log")
     ops = []
+    clients, network = None, []
     if os.path.exists(log_path):
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            ops = parse_ops(f)
+            lines = f.readlines()
+        ops = parse_ops(lines)
+        clients, network = parse_network(lines)
     results_path = os.path.join(store, "results.edn")
     if os.path.exists(results_path):
         with open(results_path, encoding="utf-8", errors="replace") as f:
@@ -390,6 +416,18 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
             out.append(
                 f"| {inv.at:%H:%M:%S} | {(inv.at - start).seconds} | `{inv.f}` | {clip(inv.value, 30)} | {result} |"
             )
+        out.append("")
+        out.append("</details>")
+        out.append("")
+
+    if network:
+        where = f"; clients beside {'the first node' if clients == 'first' else 'each node'}" if clients else ""
+        out.append(f"<details><summary>Simulated WAN: round trips measured at setup{where}</summary>")
+        out.append("")
+        out.append("| From | To | Measured (ms) | Profile (ms) |")
+        out.append("| --- | --- | --- | --- |")
+        for a, b, rtt, profile in network:
+            out.append(f"| {a} | {b} | {rtt} | {profile} |")
         out.append("")
         out.append("</details>")
         out.append("")

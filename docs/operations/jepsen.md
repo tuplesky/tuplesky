@@ -182,16 +182,26 @@ three jobs (`scripts/ci/jepsen_scenario.sh`); a non-empty `workload`,
   eu-west-1; one region's nodes are 1 ms apart. A number instead delays
   every pair by that many milliseconds. Each node's egress gets a prio
   qdisc with a netem band per distinct delay among its peers, and a u32
-  filter per peer, so traffic to the control node, where the clients run,
-  is not delayed. The delays hold from the nemesis's setup to its
-  teardown, final reads included. The nemesis logs the round trip it
-  measures from `n1` to each node, and warns when one is short of the
-  profile.
+  filter per peer. The delays hold from the nemesis's setup to its
+  teardown, final reads included.
+* **The clients** run on the control node, which by default
+  (`--wan-clients first`) sits beside `n1`, as a control node on real
+  hosts sits in one region: each node's traffic to it is delayed by the
+  node's whole round trip to `n1`, since only the nodes' egress is shaped.
+  The first WAN runs left the clients' traffic unshaped, which made
+  SwiftPaxos's fast path, where a client sends to every replica and waits
+  for a quorum's answers, look free: 1 ms at p50 under a 33 to 65 ms WAN.
+  `--wan-clients local` keeps that model, every client beside its node.
+* **Checking the shaping:** the nemesis measures the round trip from `n1`
+  to each node and from each node to the clients, logs it, and warns when
+  one is short of the profile; the job summary lists them.
 * **The packet fault** (`packet`) disrupts the traffic to and from one
   node, a minority or every node, for a while, on top of the profile: 1%
   or 5% loss, 50 ms more delay with 25 ms of jitter (which reorders), 5%
-  reordering, 2% duplication, 1% corruption, or a 10 Mbit/s cap. Its stop
-  and the final heal go back to the profile. Jepsen's own packet nemesis
+  reordering, 1% corruption, or a 10 Mbit/s cap, between nodes. Its stop
+  and the final heal go back to the profile. Not duplication: the kernel
+  refuses a duplicating netem in a tree with other netems (the first
+  SwiftPaxos WAN run's nemesis crashed on it). Jepsen's own packet nemesis
   is not used: it gives a node one netem queue and clears the rest, which
   would erase the WAN. The etcd test gets the same profile and fault: the
   job adds a `--wan` option and `:packet` to it and routes its packages
