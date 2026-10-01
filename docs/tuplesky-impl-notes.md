@@ -8262,3 +8262,88 @@ default (`[floor] enabled = false`).
   - `common_state_over_the_inline_cap_refuses_the_floor_at_start`.
   - `the_floor_keeps_its_images_apart_from_the_local_checkpoints`
     (config).
+
+## What a command costs every voter
+
+task-d45: the counters the throughput tasks (task-d46 through task-d49)
+are measured by, and a CI job that fails when they regress.
+
+- **On an interval.** `coordd` prints its metrics snapshot every
+  `[metrics] interval_seconds` (10 by default; 0 turns it off) as well as
+  at start and when serving ends, which a killed daemon never reaches.
+  The snapshot is printed at the top of a pass, before the pass's work,
+  so a pass that never ends does not take the interval with it, and the
+  report's deadline is one of the loop's wake-ups, so an idle voter
+  prints too.
+- **`cost`** is a voter's reading, since its domain loop started:
+  commands executed; lowerings (a `JournaledStore` flush or reconcile
+  that appended or committed anything, counted in the store, so the
+  node's turns, `apply` and reconcile are all in it); journal appends
+  and projection commits; journal syncs, read from raft-engine's own
+  `WriteStats.syncs` (`JournalEngine::syncs`; an engine that does not
+  count them reports `NotInstrumented`, never zero); the loop's busy
+  time and uptime; and `recent`, the busy time and commands executed
+  since the last printed snapshot. A process without a voter reports
+  `NotThisRole`.
+- **Busy time** is the loop's running time less its waits in the
+  `select` that takes its next event. Measuring the waits rather than
+  the work means no path through a pass can be missed. On tmpfs it
+  tracks the domain thread's CPU time within 5% (the thread's
+  `utime + stime`, read from `/proc`, against `busy` on the same run);
+  on a disk it also counts the syncs the loop waits on, which is the
+  point.
+- **Checked against `strace`.** One voter of a three-voter domain on
+  tmpfs, traced for `fdatasync` on its journal and its store while a
+  single caller ran 1,000 operations, the count taken between two
+  snapshot writes the trace also saw: 1,553 journal syncs by the
+  snapshot's count and 1,553 by `strace`; the store's `fdatasync`s
+  3,109 against two per projection commit, 3,106 (redb syncs twice per
+  durable commit).
+
+### The gate
+
+`scripts/bench/command-cost.sh` stands up a three-voter domain on tmpfs
+for each caller count (1 and 10), offers 2,500 operations closed-loop
+after 100 of warm-up, with a snapshot every second, and lets each voter
+print one more after the load ends. `scripts/ci/command_cost.py` reduces
+each voter's snapshots to per-command readings and `gate` compares the
+busiest voter's with `scripts/ci/command-cost-baseline.json`: busy time
+per command over the run and over the last quarter of the commands the
+voter executed, and journal syncs per command. Completed commands a
+second are reported and never gated. The `command cost` job in
+`build-test.yml` runs it on every change that is not docs-only.
+
+- **A fixed number of operations, not 60 s.** The cost of a command
+  grows with the history before it (task-d46): on this container the
+  busiest voter's busy time per command was 4.4 ms read 10 s into a run
+  and 6.6 ms read at its end, 2,500 operations later. A run of fixed
+  length measures a different history on a faster machine. And at
+  60 s's worth today (9,000 operations at one caller) one voter fell
+  behind -- 2,334 commands executed against the others' 9,102, at 97%
+  busy -- after which its per-command readings measure its backlog.
+  2,500 operations is the most every voter keeps up with on a 4-core
+  runner today.
+- **The last quarter.** A whole-run average spreads work that grows
+  with history over commands that ran while it was short; the last
+  quarter is read at the largest history the run reaches, between the
+  first snapshot past three quarters of a voter's final count and the
+  first at it.
+- **Negative control.** A third `missing_payloads` call per pass of the
+  domain loop (`coordd` already makes two; it chains every key of
+  `held`, `sync_pending` and `adopted` and sorts them). The busiest
+  voter fell behind, and its last-quarter busy time per command rose
+  from 11.0-15.0 ms in four runs without it to 24.0 ms at one caller,
+  and from 11.2-14.7 ms to 23.5 ms at ten: the gate fails on both. Its
+  whole-run figure rose by about a fifth, inside that reading's margin.
+  A scan of every record of the command table per pass instead raised
+  the whole-run readings by 11% and 3%: that table is bounded by its
+  capacity, and a scan of it is cheap beside a turn.
+- **Repeats.** Without a change, the busiest voter's readings moved by
+  up to 19% over the whole run and 37% over the last quarter between
+  four runs on this container. So each caller count runs three times
+  and the gate compares the median.
+- **The baseline** holds, per caller count, the largest reading seen
+  across runs, with margins of 25% (busy over the run), 30% (busy over
+  the last quarter) and 10% (syncs). It was first recorded from those four runs on this
+  container (4 vCPU) and is re-recorded from the job's own runner.
+  A change that moves it says why.

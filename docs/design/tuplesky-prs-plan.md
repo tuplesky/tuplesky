@@ -2220,7 +2220,7 @@ Require the named 2-2-1 region-loss schedules and privileged API-server/Kine edg
   - commands executed;
   - the domain thread's busy time over the interval.
 - **In the harnesses:** `jepsen_summary.py` and `shim-stress.py` report, for each voter, lowerings, syncs and busy time per executed command, and the busy fraction over the run.
-- **A gate:** a CI job runs a fault-free three-voter throughput run on tmpfs, at one client and at ten, for 60 s each. It fails when a voter's busy time per command, or its syncs per command, regress past a stated margin from a baseline recorded in the repository. It reports completed commands a second but does not gate on them: on shared runners throughput varies by more than a regression worth catching. A PR that moves the baseline says why.
+- **A gate:** a CI job runs a fault-free three-voter throughput run on tmpfs, at one client and at ten, three times each, over a fixed number of operations rather than a fixed time (a command's cost grows with the history before it, and at 60 s's worth of operations today one voter falls behind). It fails when the median over the repeats of the busiest voter's busy time per command, over the run or over the run's last quarter of commands, or of its syncs per command, regresses past a stated margin from a baseline recorded in the repository. It reports completed commands a second but does not gate on them: on shared runners throughput varies by more than a regression worth catching. A PR that moves the baseline says why.
 
 **Acceptance:**
 - A daemon killed with SIGKILL leaves its last interval's counters in its log.
