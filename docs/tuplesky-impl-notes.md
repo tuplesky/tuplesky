@@ -8340,19 +8340,28 @@ second are reported and never gated. The `command cost` job in
   readings and three repeats without it pass. A scan of every record of the
   command table per pass instead raised the whole-run readings by only
   11% and 3%: that table is bounded by its capacity, and a scan of it
-  is cheap beside a turn.
+  is cheap beside a turn. After task-d46 the extra `missing_payloads`
+  call reads indexes and costs little, so the control is now task-d46's
+  own learner change undone (the learner reading every vote set and
+  every record again): three repeats per caller count read 3.71 and
+  6.26 ms (whole run, last quarter) at one caller and 3.52 and 5.65 ms
+  at ten, and the gate fails all four busy readings against the
+  baseline below.
 - **Repeats.** Without a change, the busiest voter's readings moved by
   up to 19% over the whole run and 37% over the last quarter between
   four runs on this container. So each caller count runs three times
   and the gate compares the median.
 - **The baseline** holds, per caller count, the largest reading seen
   in the job's own runs on its runner, with margins of 25% (busy over
-  the run), 30% (busy over the last quarter) and 10% (syncs). On the
-  `ubuntu-24.04` runner one voter falls behind in every repeat at
-  today's cost (1,098 to 1,749 of 2,602 commands executed, 12.6 to
-  17.1 ms per command), where on this container every voter kept up;
-  the baseline is that runner's. task-d46, which removes the work that
-  makes the voter fall behind, moves it down.
+  the run), 50% (busy over the last quarter) and 10% (syncs). Before
+  task-d46, on the `ubuntu-24.04` runner one voter fell behind in every
+  repeat (1,098 to 1,749 of 2,602 commands executed, 12.6 to 17.1 ms
+  per command). task-d46 moved it down, from that job's run on its own
+  head: 1.35 and 1.65 ms at one caller, 1.47 and 1.67 ms at ten, 3.00
+  syncs per command. The last quarter's margin went from 30% to 50%
+  then: it is a reading over some 650 commands, and an unchanged run on
+  this container read 2.35 ms at ten callers against the runner's 1.67,
+  while the control above reads more than three times the baseline.
   A change that moves it says why.
 
 ## Per-event work that does not grow with history
