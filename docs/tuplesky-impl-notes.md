@@ -5964,6 +5964,17 @@ So a cycle would have to cross between kinds, and every crossing is ruled
 out above: edges go from candidates to (A) or (C), from (A) to (A) or
 (C), and from (C) only to (C). The graph is acyclic.
 
+Fact 2 needs one more thing, which the code gives: one dependency set
+per command per ballot. The slow-path re-send reuses the proposal's
+dependencies, and a reporter's ACCEPT copy comes from adoption or from
+Sync installation under `guard_accept`, both carrying the leader's
+dependencies. The soft spot is fact 3: the (C) cases assume that
+committed dependencies agree, which is the safety property itself. So
+the argument proves that a cycle implies a guard bypassed or an earlier
+safety violation, not that a cycle is impossible. That is the reason to
+halt, and the halt is the same class of stop as task-d14's two decisions
+for one command (from review).
+
 ### The rule
 
 - `recovery::entry_order` is the one ordering, and `Leader::from_recovered`
@@ -5984,6 +5995,16 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
   or a corrupt peer can; installing the acyclic part would execute what
   the rest of the domain may never (Codex review).
 - Nothing changes in what is selected.
+- Halting is the right strength. Any resolution drops an edge that some
+  reporter accepted under its guard (fact 1), so resolving would choose
+  which invariant to break. Two consequences follow and are accepted for
+  an invariant violation:
+  - The candidate closes its campaign only after its promise row is
+    durable, so the next campaign after task-d10's ceiling selects the
+    same reports and halts too. The domain stops one node per campaign
+    until an operator acts.
+  - The check in `on_sync` lets one Sync from a foreign build halt every
+    follower that receives it.
 
 ### Evidence
 
@@ -6002,7 +6023,12 @@ out above: edges go from candidates to (A) or (C), from (A) to (A) or
   from the row, it queues neither entry and is halted. Both fail without
   the check.
 - `a_recovery_cycle_stop_names_the_commands` (`coordd`): the stop's
-  prefix, the count, and the first eight entries in full.
+  prefix, the count, and the first eight entries in full. The serve
+  loop's stop itself (`serve.rs`) is exercised only through
+  `describe_recovery_cycle`, as task-d14's two-decisions stop it copies
+  is. `halt_on_cycle` sets the generic stop flag, and both `coordd` and
+  the simulator's oracle check `recovery_cycle()` first, so a cycle is
+  not reported as an incompatible admission.
 - Before this change, the candidate bound such a Sync, and the new leader
   proposed nothing of the cycle and everything else.
 
