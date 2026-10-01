@@ -445,6 +445,55 @@ pub struct MetricsSnapshot {
     pub view_age: Measure<Duration>,
     /// Engine pressure as the storage engine reports it.
     pub engine_pressure: Measure<Headroom>,
+    /// What this node's work has cost since it started, or why it has
+    /// no such reading (task-d45).
+    pub cost: Measure<Cost>,
+}
+
+/// What a voter's work has cost since it started (task-d45).
+///
+/// Every count is cumulative, so a reader divides one snapshot's
+/// difference from an earlier one by the commands executed between them
+/// and gets a per-command cost that does not depend on when the process
+/// started. The one windowed reading is [`Cost::recent`], the domain
+/// loop's busy time over the last reporting interval, because that is
+/// the reading a log of a killed daemon is read for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cost {
+    /// Commands this replica applied.
+    pub executed: u64,
+    /// Lowerings that wrote something: a journal group, a projection
+    /// commit or both, wherever they ran -- the voter's own flush, the
+    /// applier's when it applied a command, and every reconcile.
+    pub lowerings: u64,
+    /// Journal groups appended.
+    pub journal_appends: u64,
+    /// Synced writes as the journal counts them: its groups, mapping
+    /// updates and compactions. Unavailable when the journal does not
+    /// count its own.
+    pub journal_syncs: Measure<u64>,
+    /// Projection transactions committed.
+    pub projection_commits: u64,
+    /// Time the domain loop spent working rather than waiting for an
+    /// event, since it started. A lowering's syncs are inside it, since
+    /// the loop waits for them.
+    pub busy: Duration,
+    /// How long the domain loop has been running.
+    pub uptime: Duration,
+    /// The last reporting interval alone, or why there is none: the first
+    /// snapshot of a run has no interval behind it.
+    pub recent: Measure<Interval>,
+}
+
+/// One reporting interval of the domain loop (task-d45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interval {
+    /// How long the interval was.
+    pub span: Duration,
+    /// How much of it the loop was busy.
+    pub busy: Duration,
+    /// Commands applied in it.
+    pub executed: u64,
 }
 
 impl MetricsSnapshot {

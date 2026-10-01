@@ -131,6 +131,38 @@ impl Default for Limits {
     }
 }
 
+/// Reporting this node's metrics while it serves (task-d45).
+///
+/// A snapshot printed only at start and at a clean end says nothing
+/// about a daemon that was killed, which is the daemon a fault run and
+/// a stuck one leave behind. One every interval leaves the last
+/// interval's counters in the log however the process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Seconds between the snapshots a serving node prints. Zero prints
+    /// only the ones at start and at the end.
+    #[serde(default = "default_metrics_interval")]
+    pub interval_seconds: u64,
+}
+
+/// The interval a configuration that names none gets: often enough that
+/// a killed daemon's last line is recent, rarely enough that the log is
+/// not the snapshot.
+pub const DEFAULT_METRICS_INTERVAL_SECONDS: u64 = 10;
+
+const fn default_metrics_interval() -> u64 {
+    DEFAULT_METRICS_INTERVAL_SECONDS
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            interval_seconds: default_metrics_interval(),
+        }
+    }
+}
+
 /// Agreeing a forgetting floor (task-d27; design Section 5.3).
 ///
 /// A voter that takes part exports the shared checkpoint at every floor
@@ -603,6 +635,9 @@ pub struct Config {
     /// Absent, it is off.
     #[serde(default)]
     pub floor: FloorConfig,
+    /// Printing this node's metrics while it serves (task-d45).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).

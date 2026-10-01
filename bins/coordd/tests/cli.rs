@@ -1724,6 +1724,93 @@ async fn a_request_is_served_end_to_end_by_the_voter_in_this_process() {
     );
 }
 
+/// The cost a daemon reports outlives the daemon (task-d45).
+///
+/// A snapshot printed only at a clean end is the one a killed daemon
+/// never prints, and a killed daemon is what a fault run and a stuck
+/// node leave behind. With an interval, the last interval's counters
+/// are in the log whatever ended the process: here SIGKILL, after it
+/// executed the caller's session and three writes.
+///
+/// The counts are checked for what they must be, not for exact values:
+/// every command this voter executed was lowered at least once, every
+/// lowering wrote a journal group or a projection commit, and the
+/// journal synced at least once per group it appended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_daemon_leaves_its_last_intervals_cost_in_its_log() {
+    let dir = workspace("cost-on-kill");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    let mut text = std::fs::read_to_string(&path).expect("read config");
+    text.push_str("\n[metrics]\ninterval_seconds = 1\n");
+    std::fs::write(&path, text).expect("write config");
+
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let mut daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x46; 16]).await;
+    for sequence in 1..=3u64 {
+        ask(&caller.connection, &caller.put(sequence, b"k", b"v"))
+            .await
+            .expect("the daemon answered the write");
+    }
+    // An interval snapshot after the work: the first one of a run has
+    // no interval behind it, so this waits for one that has.
+    let executed = |line: &str| -> Option<u64> {
+        let snapshot: serde_json::Value =
+            serde_json::from_str(line.strip_prefix("metrics ")?).ok()?;
+        let cost = &snapshot["cost"]["Observed"];
+        cost["recent"]["Observed"].is_object().then_some(())?;
+        cost["executed"].as_u64()
+    };
+    assert!(
+        daemon.waits_until(10, |said| said.lines().filter_map(executed).any(|n| n >= 4)),
+        "no interval snapshot counted the session and the three writes:\n{}",
+        daemon.said()
+    );
+
+    // SIGKILL: nothing at the end of the run is printed.
+    daemon.child.kill().expect("killed");
+    daemon.child.wait().expect("reaped");
+    std::thread::sleep(Duration::from_millis(200));
+    let said = daemon.said();
+    assert!(
+        !said.contains("the api plane ended"),
+        "the daemon ended cleanly, so this is not a killed daemon's log"
+    );
+    let last = said
+        .lines()
+        .rfind(|line| line.starts_with("metrics "))
+        .expect("a snapshot was printed before the kill");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(last.strip_prefix("metrics ").expect("prefixed")).expect("json");
+    let cost = &snapshot["cost"]["Observed"];
+    let count = |field: &str| {
+        cost[field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{field}: {last}"))
+    };
+    assert!(count("executed") >= 4, "{last}");
+    assert!(count("lowerings") >= count("executed"), "{last}");
+    assert!(
+        count("lowerings") <= count("journal_appends") + count("projection_commits"),
+        "a lowering was counted that wrote nothing: {last}"
+    );
+    let syncs = cost["journal_syncs"]["Observed"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the raft-engine journal counts its syncs: {last}"));
+    assert!(syncs >= count("journal_appends"), "{last}");
+    assert!(
+        cost["recent"]["Observed"].is_object(),
+        "an interval snapshot carries its interval: {last}"
+    );
+    assert!(
+        cost["busy"]["secs"].as_u64().is_some() && cost["uptime"]["secs"].as_u64().is_some(),
+        "{last}"
+    );
+}
+
 /// The same invocation is answered the same way after a restart.
 ///
 /// The daemon stops, the process that held the collector's retained

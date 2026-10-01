@@ -141,6 +141,12 @@ pub trait Persistence {
     /// Lower as much accepted work as one group allows.
     fn lower(&mut self) -> Result<Lowered, EngineError>;
 
+    /// What lowering has cost since this coordinator opened (task-d45),
+    /// or `None` when it does not count it.
+    fn cost(&self) -> Option<StorageCost> {
+        None
+    }
+
     /// Resolve an indeterminate outcome against what is actually durable.
     fn reconcile(&mut self) -> Result<Lowered, EngineError>;
 
@@ -438,6 +444,13 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
         self.store.flush().map(lowered_from_journal).map_err(engine)
     }
 
+    fn cost(&self) -> Option<StorageCost> {
+        Some(StorageCost {
+            lowering: self.store.cost(),
+            journal_syncs: self.store.journal().syncs(),
+        })
+    }
+
     fn reconcile(&mut self) -> Result<Lowered, EngineError> {
         self.store
             .reconcile(self.domain)
@@ -461,6 +474,18 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
         })?;
         crate::protocol::read_protocol(&cut, epoch, budget)
     }
+}
+
+/// What a coordinator's lowering has cost since it opened (task-d45).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageCost {
+    /// Lowerings, journal appends and projection commits, as the store
+    /// counted them.
+    pub lowering: crate::journaled::LoweringCost,
+    /// Synced writes as the journal counted them, or `None` when the
+    /// journal does not count its own. More than the appends: mapping
+    /// updates and compactions sync too.
+    pub journal_syncs: Option<u64>,
 }
 
 fn lowered_from_journal(report: crate::journaled::FlushReport) -> Lowered {

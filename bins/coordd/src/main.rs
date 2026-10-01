@@ -539,6 +539,14 @@ fn report_metrics(
         frontiers,
         view_age: Measure::Unavailable(Unavailable::NotInstrumented),
         engine_pressure: Measure::Unavailable(Unavailable::NoBound),
+        // Before the first turn there is a cost to report only where a
+        // voter will run, and it has executed nothing yet: the counts
+        // the serving loop prints start from this point (task-d45).
+        cost: if roles.votes() {
+            Measure::Unavailable(Unavailable::NoSamples)
+        } else {
+            Measure::Unavailable(Unavailable::NotThisRole)
+        },
     };
     match serde_json::to_string(&snapshot) {
         Ok(rendered) => println!("metrics {rendered}"),
@@ -1220,6 +1228,15 @@ fn main() -> ExitCode {
         // name another role (task-d02).
         for renewing in renewings {
             domain = domain.with_renewal(renewing);
+        }
+        // A snapshot on an interval as well as at the end, so a daemon
+        // that is killed leaves its last interval's counters in its log
+        // (task-d45).
+        if config.metrics.interval_seconds > 0 {
+            domain.report_every(
+                std::time::Duration::from_secs(config.metrics.interval_seconds),
+                roles.clone(),
+            );
         }
         // The leaf's deadline is raced against the whole loop, not only
         // checked at the top of each pass: a pass can wait inside itself
