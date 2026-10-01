@@ -486,7 +486,7 @@ covers.
 | O11 | Publish nothing that is not durable | Storage coordinator | A failed sync or reopen | Fail-stop until a reopen succeeds; corruption quarantines and never recovers in place | `sync_failure_inside_a_write_panics_and_fail_stops_until_reopen`, `sync_error_is_indeterminate_and_the_crash_image_is_all_or_nothing`, `failed_reopen_quarantines_the_engine_until_a_reopen_succeeds`, `disk_quarantine_stops_serving_and_never_recovers_in_place` |
 | O12 | Never hold two decisions for one command | Every voter | Facts that contradict what it committed, executed or answered | The voter stops and says what it compared | `a_voter_handed_other_facts_for_a_command_it_committed_stops`, `a_voter_handed_other_facts_for_a_command_it_retired_stops`, `a_pulled_command_executed_otherwise_stops_the_voter`, `a_late_release_that_contradicts_the_answer_is_refused`, `a_follower_restarting_from_a_cyclic_sync_row_stays_halted` |
 | O13 | Never vote again under an identity whose state is gone | Operator, enforced by the harness and startup | A node directory without its state | Refused; reintroduction through membership (Section 5.4) | `a_voter_whose_state_is_gone_is_refused_not_initialized_again`, `another_manifest_quarantines_rather_than_reinitializing`, `a_pinned_node_without_its_journal_quarantines` |
-| O14 | Establish a leader | Each voter's election schedule | No link to the leader it promised, or no leader | A jittered wait per voter before campaigning, doubled to a ceiling while campaigns produce no leader; a promise counts as a leader only until the ceiling; a campaign still under way at the ceiling is replaced | `two_survivors_of_one_failure_do_not_campaign_at_the_same_instant`, `campaigns_that_produce_no_leader_back_off_to_the_ceiling`, `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling` |
+| O14 | Establish a leader | Each voter's election schedule; the leader's re-ask for a lost Sync | No link to the leader it promised, no leader, or a Sync lost to a voter that promised | A jittered wait per voter before campaigning, doubled to a ceiling while campaigns produce no leader; a promise counts as a leader only until the ceiling; a campaign still under way at the ceiling is replaced. A voter that promised but has not voted is sent `NewLeader` each re-send tick, repeats its promise while unsynchronized, and is answered with the Sync | `two_survivors_of_one_failure_do_not_campaign_at_the_same_instant`, `campaigns_that_produce_no_leader_back_off_to_the_ceiling`, `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling`, `a_late_voter_whose_sync_was_lost_is_sent_it_again`, `a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again` |
 
 Three rows are narrower than their obligation. O10 covers a voter behind
 a floor only up to refusing what it cannot prove, and has two halves
@@ -511,7 +511,8 @@ voters is up with its state, and admission pauses. Then:
    and bounded, doubling to the ceiling, and start only without a live
    leader; a voter linked to its leader never campaigns. With messages
    timely, one campaign completes its recovery reports from a majority
-   and installs one Sync (O5, O6). Two conditions in the code carry
+   and installs one Sync (O5, O6); a Sync lost to a voter that promised
+   is sent again on its repeated promise (O14). Two conditions in the code carry
    this step. A promise counts as a leader only until the ceiling, so
    stability needs the candidate to bind its Sync within it, which the
    bounds on reports and Syncs give (task-d05, task-d20). And a campaign
