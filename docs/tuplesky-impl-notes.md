@@ -5708,7 +5708,8 @@ happens at any cluster size.
 - The held Sync is not persisted. A crash while it is held loses it, as
   the path before this change lost the Sync row queued behind the P3 row;
   the recovered promise is then P1 with nothing sent for P3 (`Promise` is
-  `SendWhenDurable`), and task-d10's ceiling bounds the wait.
+  `SendWhenDurable`). The leader's re-ask sends the Sync again (see
+  What is left), and task-d10's ceiling bounds the wait.
 
 ### Evidence
 
@@ -5734,12 +5735,20 @@ happens at any cluster size.
 
 - The protocol oracle of task-d30 checks the same property on the real
   machines under a simulated network.
-- A voter that promised a ballot but never received its Sync is not
-  re-Synced by the leader: the leader re-asks only voters not in
-  `joined` (task-d33), and task-d20 did not change that. It waits for
-  task-d10's ceiling and a new campaign. Re-sending the Sync to a
-  promised but unsynchronized voter is a liveness follow-up of its own,
-  not task-d20's (from review).
+- A voter that promised a ballot but never received its Sync is sent
+  it again by task-d33's findings (#130, `b975923`), above this change
+  in the stack. Such a voter has not voted, so it is not in the
+  leader's `joined`, and each re-send tick sends it `NewLeader`. It
+  answers with `promise_again`, which repeats the promise when
+  `bound() == promised() == ballot` and `synced != ballot`. The leader
+  answers the repeated promise with the Sync it leads from
+  (`on_late_promise`). The tests are
+  `a_late_voter_whose_sync_was_lost_is_sent_it_again` and
+  `a_campaign_time_voter_whose_sync_was_lost_is_sent_it_again`
+  (`activation`). A Sync whose marker batch failed is installed again
+  through task-d24's `sync_unwritten` (#122). So the deferral needs no
+  task of its own; an earlier version of this note said such a voter is
+  not re-Synced, which read the `joined` loop backwards (from review).
 
 ## Only adoptions count toward the slow majority
 
