@@ -33,7 +33,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-o01 through task-o06 | Finalized streams, regional observers/relays, Kine watch/read integration | Capability-specific gates |
 | task-m01 through task-m05 | Authoritative discovery, full-client Kine and integrated membership | Operational production requirement |
 | task-d01 through task-d33, task-d35 through task-d44 | Daemon runtime wiring (election, leaf renewal, reconnection and why a dial failed), one execution order on every replica, recovery bounded by execution, a Sync that leaves no stale acceptance, a new leader that chains after what it executed, a diverged node that stays stopped and says what it compared, a decision that names its admission facts, every proposal and decision reaching every voter, every vote reaching the leader, catch-up, multi-host test provisioning, and the correctness-checklist remediation (a promise a Sync cannot lower, slow decisions recovery keeps, a Sync that fits its row, collector obligations that end, client outcomes, table room for recovery, a resource contract, forgetting wired into `coordd` and a learner reinstall behind its floor, the failure and obligation contract, and the real machines under simulation), an execution chain every voter compares, a scrub of the replicated state, a prepared transition, a staged learner, a configuration installed into a running daemon, and voter replacement through the sealed handoff | Required before task-64/task-65 qualification and task-66 |
-| task-d45 through task-d50 | Throughput: a command's cost measured on every node and gated in CI, per-turn work independent of history, durable group writes, the projection's durability under the journal, re-sends only once an answer is due, and reads and the fast path off the slow path | task-d45 through task-d49 required before task-64 and task-q01; task-d50 after its design amendment |
+| task-d45 through task-d50 | Throughput: a command's cost measured on every node and gated in CI, per-turn work independent of history, durable group writes, the projection's durability under the journal, re-sends only once an answer is due, and reads and the fast path off the slow path | task-d45 through task-d49 required before task-64, task-q01 and task-62's remaining rows; task-d50 after its design amendment |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -201,9 +201,9 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d43](#task-d43) | Recover the terminal closure after the seal | task-55, task-56, task-d05, task-d11, task-d14, task-d44 |
 | [task-d44](#task-d44) | Serve executed history across a transition | task-d08, task-d35, task-d39, task-d42 |
 | [task-d45](#task-d45) | Measure a command's cost on every node, and gate on it | task-61, task-j08 |
-| [task-d46](#task-d46) | Keep per-turn and per-event work independent of history | task-d06, task-d24, task-d30, task-d45 |
+| [task-d46](#task-d46) | Keep per-turn and per-event work independent of history | task-d06, task-d24, task-d27, task-d30, task-d45 |
 | [task-d47](#task-d47) | Lower a turn's transitions as durable groups | task-j03, task-j05, task-j08, task-d24, task-d30, task-d45, task-d46 |
-| [task-d48](#task-d48) | Settle the projection's durability under the journal | task-53, task-59, task-j04, task-j05, task-d47 |
+| [task-d48](#task-d48) | Commit the projection in one phase under the journal | task-53, task-59, task-j04, task-j05, task-d47 |
 | [task-d49](#task-d49) | Re-send a proposal only once its answer is due | task-d07, task-d15, task-d45 |
 | [task-d50](#task-d50) | Serve reads and the fast path without waiting on the slow path | task-28, task-29, task-d46, task-d47, task-d49 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49 |
@@ -1039,6 +1039,8 @@ Running it found five defects the certification suite could not, each of which b
 A sixth was published with the matrix rather than hidden in it and has since been closed, and closing it took two fixes rather than one. The published finding was a replica that fell behind, recovered but not quickly, and lost about three operations in ten of the read-heavy rows to the caller's deadline while it did. The first half of the cause is the catch-up path: a replica repeated its bounded payload ask whenever the count of what it was missing moved, which -- because that count moves when a command arrives by identity as well as when a payload arrives -- is on nearly every turn under load, so the bulk lane the transfer was separated onto filled with answers to asks already superseded and the replica fell further behind for having asked. A replica now asks again when its last batch was answered in full and otherwise on the retry floor.
 
 The second half was not in the catch-up path at all, and only became total once the asks were paced: the drive loop polls the peer plane and the caller's plane in a biased select, peer first, and on a busy domain the peer plane is ready on every poll -- so one voter served 4560 api events and then not one more while its peer arm took another 80000, and every caller bound to that frontend waited out its deadline against a node that was otherwise working. The bias is a budget now. With both, the re-run matrix answers every operation it offers except a handful that meet the ten-second deadline on a saturated domain, where the published run lost 113 to 126 of 400 on every read-heavy row. The impaired rows and the Section 21.5 five-voter 2-2-1 region-loss schedules need `NET_ADMIN` and iproute2, which the environment the published rows were run in does not have; they are recorded as not run, and the runner takes them unchanged on a host that does.
+
+The rows still recorded as not run, and any reference result published again, wait on task-d45 through task-d49, so that the matrix measures the protocol rather than the sync chain and the history scans those tasks remove (the [throughput amendment](#gate-checklist-and-deferred-work)). This cannot be a prerequisite edge: task-c01 and task-c02 came out of this task's first runs, and the throughput tasks build on them (task-d46 depends on task-c02 through task-d06, and task-d49 on task-c01 through task-d07 and task-d03). A result taken before task-d49 merges is labelled with the commit it ran on and is not a reference result.
 
 **Review boundary:** Optimizations are separate measured follow-ups. No nondurable headline or implicit default/migration change.
 
@@ -2181,7 +2183,7 @@ Require the named 2-2-1 region-loss schedules and privileged API-server/Kine edg
   - commands executed;
   - the domain thread's busy time over the interval.
 - **In the harnesses:** `jepsen_summary.py` and `shim-stress.py` report, for each voter, lowerings, syncs and busy time per executed command, and the busy fraction over the run.
-- **A gate:** a CI job runs a fault-free three-voter throughput run on tmpfs, at one client and at ten, for 60 s each. It fails when completed commands a second, or a voter's busy time per command, regress past a stated margin from a baseline recorded in the repository. A PR that moves the baseline says why.
+- **A gate:** a CI job runs a fault-free three-voter throughput run on tmpfs, at one client and at ten, for 60 s each. It fails when a voter's busy time per command, or its syncs per command, regress past a stated margin from a baseline recorded in the repository. It reports completed commands a second but does not gate on them: on shared runners throughput varies by more than a regression worth catching. A PR that moves the baseline says why.
 
 **Acceptance:**
 - A daemon killed with SIGKILL leaves its last interval's counters in its log.
@@ -2193,7 +2195,7 @@ Require the named 2-2-1 region-loss schedules and privileged API-server/Kine edg
 <a id="task-d46"></a>
 ### task-d46: Keep per-turn and per-event work independent of history
 
-**Prerequisites:** task-d06, task-d24, task-d30, task-d45.  
+**Prerequisites:** task-d06, task-d24, task-d27, task-d30, task-d45.  
 **Design:** Sections 4.6, 4.7.
 
 **Implement:** With one client, on loopback and on tmpfs, throughput fell from 101 to 36 commands a second over 90 s. Over the same 90 s a follower's domain thread went from 50% to 99% busy, about 5 ms to about 27 ms of CPU per command; the leader's stayed near 50%. Stack samples of that thread put it in four places:
@@ -2210,15 +2212,15 @@ Make each of them O(change) or O(log n):
 - index proposals by barrier and keep `advance_pending` incremental;
 - skip `unexecuted_in_order` while speculation is off, and keep the order when it is on;
 - keep proposals awaiting a re-send in order of their last send;
-- retire executed history continuously, a bounded amount per execution, inside the retirement window, keeping task-d06's chain total across retirement.
+- retire executed history continuously, a bounded amount per execution, inside the retirement window task-d27 activates. This is the in-memory history only: the `ledger`, `votes`, `proposals`, `held` and `adopted` entries above the floor. A durable row is never retired here; trimming those below the floor stays task-d27's. An undecided record keeps its slot (task-d24), and task-d06's chain stays total across retirement.
 
 **Acceptance:**
 - In task-d45's run, a follower's busy time per command at 280 s is within 20% of its value at 20 s, at one client and at ten (today it grows four- to five-fold).
 - Completed commands per 30 s over a 300 s run show no downward trend beyond the run-to-run spread.
 - The tmpfs ceiling at ten clients at least doubles.
-- The deterministic cluster tests, task-d30's protocol simulator at its 100-seed setting and task-d24's crash tests (a leader that crashes right after a capped Sync, and the campaign after it that completes at the largest table) pass unchanged, and the simulator's decisions match the current code's on the same seeds.
+- The deterministic cluster tests, task-d30's protocol simulator with `PROTOCOL_SIM_SEEDS=100` (its default is 12 seeds) and task-d24's crash tests (a leader that crashes right after a capped Sync, and the campaign after it that completes at the largest table) pass unchanged, and the simulator's decisions match the current code's on the same seeds.
 
-**Review boundary:** Data structures and call sites in the consensus machines and `coordd`'s loop. No decision, dependency or execution order changes.
+**Review boundary:** Data structures and call sites in the consensus machines and `coordd`'s loop. No decision, dependency or execution order changes, and no durable row is removed.
 
 <a id="task-d47"></a>
 ### task-d47: Lower a turn's transitions as durable groups
@@ -2249,24 +2251,28 @@ The application batch of an executed command is lowered on its own as well. Meas
 **Review boundary:** The lowering loop, the journal group, the projection transaction and when frames are released. No change to what is durable before which message.
 
 <a id="task-d48"></a>
-### task-d48: Settle the projection's durability under the journal
+### task-d48: Commit the projection in one phase under the journal
 
 **Prerequisites:** task-53, task-59, task-j04, task-j05, task-d47.  
-**Design:** Sections 17.3, 17.4 (amended by this task).
+**Design:** Sections 17.3, 17.3.4 (amended by this task).
 
-**Implement:** In `coordd`'s composition the journal is the durable record (task-j03). The projection can be rebuilt from it above `journaled_through`, yet every materialization commits redb with `Durability::Immediate` and two-phase commit. Section 17.4 already lets strict mode select projection durability.
+**Implement:** In `coordd`'s composition the journal is the durable record (task-j03), yet every materialization commits redb with `Durability::Immediate` and two-phase commit, two `fdatasync`s for each group task-d47 lowers. Section 17.3.4 selects Immediate and local two-phase hardening "from the reviewed redb contract" and asks for recovery to be measured.
 
-- **Decide**, with the recovery invariants written out in the design amendment, between:
-  - **(a)** committing the projection non-durably, and making it durable at checkpoint publication and at a bounded lag, with start replaying the journal above the projection's durable mark;
-  - **(b)** keeping it durable but in one-phase commit with checksums.
-- **Implement** the choice, and state what each costs in recovery time and in syncs.
+- **Commit in one phase, with checksums.** Amend 17.3.4's hardening line: the projection stays durable at every commit, committed in one phase with redb's checksums, and the amendment states why that is safe with the journal underneath. A commit torn by a crash rolls back to the one before it, and start-up re-lowers the journal above it.
+- **Measure recovery** under one-phase and two-phase commit, and state what each costs in recovery time and in syncs.
+- **Write out the invariants** the current code depends on, which any later change to the projection's durability must keep:
+  - the collector answers a resolve from the projection (`retained_answer` in `coordd`, `settle_from_record` in the collector), so a command the journal holds is never answered `Unknown` or `Forgotten`;
+  - the divergence tooling reads `executed_v1` from the projection.
+
+A projection committed non-durably and made durable only at checkpoints is not this task. It is task-j06's `journaled-replay` profile (17.3.4), which the gate checklist fences: it needs task-j06's qualification and cannot relax durable materialization silently. If task-d45's numbers after this task show the remaining projection sync still bounds throughput, the path is to promote task-j06 from optional. Under that profile a node replays the journal above the projection's durable mark before it serves or answers a resolve.
 
 **Acceptance:**
-- Projection syncs per group fall to zero under (a), with the bounded lag measured, or to one under (b).
-- SIGKILL at random points in task-09's and task-j05's disk-fault runs recovers to the journal's state, and the projection's durable mark is never ahead of the journal.
+- Projection syncs per group fall from two to one, and recovery time under one-phase commit is reported beside two-phase.
+- SIGKILL at random points in task-09's and task-j05's disk-fault runs recovers to the journal's state, and no resolve after the restart answers `Unknown` or `Forgotten` for a command the journal holds.
+- A projection commit torn at task-j05's fault points is rolled back and re-lowered from the journal.
 - Checkpoints (task-53, task-j04) and backups still cover a durable projection.
 
-**Review boundary:** The projection's durability contract, its mark and the start-up replay.
+**Review boundary:** The projection's commit mode, its 17.3.4 amendment and the recovery measurement. No non-durable projection, which stays task-j06's.
 
 <a id="task-d49"></a>
 ### task-d49: Re-send a proposal only once its answer is due
@@ -2274,20 +2280,24 @@ The application batch of an executed command is lowered on its own as well. Meas
 **Prerequisites:** task-d07, task-d15, task-d45.  
 **Design:** Section 4.6.
 
-**Implement:** With one client, a leader refused at least 8,192 duplicate votes in 100 s for about 4,000 commands. The cause is the first re-send: it has no age check (`resend_unvoted`), so every proposal not yet adopted at a 250 ms tick goes out again, however recently it was sent. Each duplicate is another step on a follower's domain thread, which is already the bottleneck (task-d46).
+**Implement:** With one client, a leader refused at least 8,192 duplicate votes in 100 s for about 4,000 commands, about two a command. At one client a command takes about 20 ms, so no proposal is 250 ms old at a tick, and the re-send's missing age check is not what sends them. The window is. `resend_unvoted` counts a voter as having voted only by its slow adoption (`VoteSet::adopted_by` reads only the slow votes). It keeps every proposal that voter has not adopted whose seqnum is above its highest adoption, or whose phase is below `Commit`. A follower's fast acknowledgement does not count. So a command decided on the fast path, or learned from the leader's commit frontier before the follower adopted it, stays in the window until it leaves the maps. Each re-send reaches a follower that already holds the proposal, the follower answers with the vote it already gave, and the leader refuses that vote. Each duplicate is another step on a follower's domain thread, which is already the bottleneck (task-d46).
 
+In this order:
+- **Re-send only what the leader still needs from that voter:** a proposal that is not decided and that the voter has not acknowledged, on the fast path or the slow, with task-d15's rule for the votes the leader still needs.
 - **Gate every re-send on age:** re-send a proposal only once it is older than the re-send interval since its last send, the first re-send included.
 - **Make the interval adaptive:** scale it to the observed vote latency, a smoothed high percentile with today's 250 ms as the floor.
 - **Make a duplicate cheap:** refusing a duplicate vote is constant-time on both sides.
+- **Count re-sends by reason** in task-d45's snapshot: lost (the voter lacked the proposal), late (its vote arrived after the re-send), already acknowledged and already decided. The duplicate threshold alone cannot tell a wrong fix from a right one.
 
-task-d07's and task-d15's guarantees hold: every proposal a voter lacks, and every vote the leader still needs, is asked for again.
+This is liveness as well as cost. The window takes `RESEND_PER_VOTER` (16) proposals a voter. Filled with proposals that voter already acknowledged, it starves the one that was really lost, which breaks task-d07's guarantee. task-d07's and task-d15's guarantees hold: every proposal a voter lacks, and every vote the leader still needs, is asked for again.
 
 **Acceptance:**
 - Duplicate-vote refusals stay below 5% of commands at one, ten and fifty clients (today at least 200% at one client).
-- A proposal lost in transit is re-sent within twice the interval.
+- Re-sends counted as already acknowledged or already decided are zero in a fault-free run.
+- A proposal lost in transit is re-sent within twice the interval, including when 16 or more proposals the voter acknowledged sit in its window. Counting only slow adoption fails this (negative control).
 - task-d07's and task-d15's tests pass.
 
-**Review boundary:** The leader's re-send timer and the duplicate refusal.
+**Review boundary:** The leader's re-send window and timer, and the duplicate refusal.
 
 <a id="task-d50"></a>
 ### task-d50: Serve reads and the fast path without waiting on the slow path
@@ -2323,10 +2333,10 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **Where the time goes.** Two costs, both on each node's single domain thread:
   - about five lowerings and fifteen `fdatasync`s per command on every node, nothing grouped across commands. This is the ceiling on a runner's disk.
   - per-turn and per-event scans over the whole retained history, which saturate a follower with one client. This is the ceiling where syncs are cheap.
-  - Re-sends without an age check add duplicate votes to the busy follower.
-- **The tasks.** task-d45 measures a command's cost on every node and gates on it in CI. task-d46 makes per-turn work independent of history. task-d47 lowers a turn's transitions as the durable groups Section 17.3.3 already requires. task-d48 settles the projection's durability under the journal. task-d49 re-sends a proposal only once its answer is due.
-- **Gating.** task-d45 through task-d49 are prerequisites of task-64 and task-q01, so that the qualification and WAN numbers measure the protocol rather than these costs. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47 and task-d49 do not change the design. task-d48 amends Section 17.4's projection durability; task-d50 amends Sections 4.5, 6.3 and 17.4.
+  - Re-sends of proposals a voter already acknowledged, since the re-send window counts only slow adoptions, add duplicate votes to the busy follower.
+- **The tasks.** task-d45 measures a command's cost on every node and gates on it in CI. task-d46 makes per-turn work independent of history. task-d47 lowers a turn's transitions as the durable groups Section 17.3.3 already requires. task-d48 commits the projection in one phase under the journal; a non-durable projection stays task-j06's `journaled-replay` profile, promoted from optional only if the numbers justify it. task-d49 re-sends only what the leader still needs from a voter, and only once its answer is due.
+- **Gating.** task-d45 through task-d49 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-62's remaining rows, and any reference result it publishes again, wait on them for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
+- **Design changes.** task-d45 through task-d47 and task-d49 do not change the design. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 
