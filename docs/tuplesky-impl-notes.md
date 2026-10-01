@@ -7565,3 +7565,15 @@ section ends with the conditional argument for why the work completes.
     `coordd init` itself. `a_start_never_initializes_a_voter_without_state`
     covers the refusal. `multi-host-local.sh` and the `multi_host` tests
     start each voter with `--init` once and restart it without.
+  - A partial `coordd init` that leaves a `state/` directory still reads
+    as initialized on the next start. That predates this task and is
+    recorded, not fixed here (review).
+- **From review of the contract.** O14, leader establishment, is a row
+  of its own, since Step 2 of the liveness argument rests on it, and
+  Step 2 now states the two conditions the code supplies: a promise
+  counts as a leader only until the ceiling, and a campaign still under
+  way at the ceiling is replaced. O1 cites the re-dial trigger's test,
+  O6 the payload asks a peer never answers, and O12 the one test of a
+  stop surviving restart; the rest of that is task-d13's. O10's two
+  owed halves are named: task-d27's second part for the stop, task-d32
+  for the return.

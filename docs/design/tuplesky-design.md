@@ -473,23 +473,28 @@ covers.
 
 | # | Obligation | Owner | Trigger | Escalation | Tests |
 |---|---|---|---|---|---|
-| O1 | Offer an admitted submission to every voter until each has voted, refused or the ballot changed | Collector | Admission; a full queue; a re-dial; a ballot change | A bounded re-offer budget per destination; a refusal ends the entry with the refusal's status; a ballot change asks for every entry again | `a_full_queue_costs_that_destination_and_is_offered_again_by_itself`, `a_callers_deadline_does_not_discard_the_delivery_obligation`, `refused_retries_free_every_pending_slot`, `a_ballot_change_asks_for_every_entry_again`, `another_request_under_a_bound_key_ends_with_a_conflict` |
+| O1 | Offer an admitted submission to every voter until each has voted, refused or the ballot changed | Collector | Admission; a full queue; a re-dial; a ballot change | A bounded re-offer budget per destination; a refusal ends the entry with the refusal's status; a ballot change asks for every entry again | `a_full_queue_costs_that_destination_and_is_offered_again_by_itself`, `a_returning_link_brings_its_reoffers_forward`, `a_callers_deadline_does_not_discard_the_delivery_obligation`, `refused_retries_free_every_pending_slot`, `a_ballot_change_asks_for_every_entry_again`, `another_request_under_a_bound_key_ends_with_a_conflict` |
 | O2 | Answer the caller with the decided outcome | Collector, then the durable record | A release; a caller's resolve | A lost or refused release is settled from the executed record; an entry holding nothing is asked for again; past the window the record answers (Section 6.5) | `a_lost_release_is_settled_from_the_durable_record`, `a_refused_repair_falls_back_to_the_durable_record`, `an_entry_holding_nothing_is_asked_for_again_then_settled_from_the_record` |
 | O3 | Publish a vote once, and only once, it is durable | Voter | Its barrier completing; a restart | After a restart, the voter acknowledges again from the durable row on the next resend | `a_lost_acknowledgement_is_published_again_after_the_voter_restarts`, `a_restored_adoption_is_acknowledged_again_on_a_resend`, `follower_restarts_at_every_persist_boundary_reproduce_the_acknowledged_outcomes` |
 | O4 | Resend a proposal until every voter voted | Leader | A timer while acknowledgements are missing | A voter linked late learns it from the resend; a lost acknowledgement behind a counted one is asked for again | `a_voter_linked_after_a_proposal_went_out_learns_it_from_the_resend`, `a_lost_acknowledgement_is_published_again_on_a_resend`, `a_lost_acknowledgement_behind_a_counted_one_is_asked_for_again` |
 | O5 | Report durable protocol state at a promise's cut | Voter | A promise request | The report is read from durable rows, never from phases in memory; a Sync or promise in flight never lowers the durable promise | `reports_come_from_durable_state_at_the_cut_not_in_memory_phases`, `a_sync_behind_a_promise_in_flight_does_not_lower_the_durable_promise`, `no_order_of_two_promises_and_a_sync_lowers_the_durable_promise` |
-| O6 | Carry every possibly decided command into the next ballot | New leader | Election after a leader fault | Recovery selects every learned decision from any majority's reports; a failed campaign is retried under a higher ballot | `every_learned_decision_is_selected_by_every_recovering_majority`, `a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row`, `possible_fast_decisions_are_recovered_from_the_fixed_fast_set` |
+| O6 | Carry every possibly decided command into the next ballot | New leader | Election after a leader fault | Recovery selects every learned decision from any majority's reports; a failed campaign is retried under a higher ballot; a selected payload a peer never sends is asked for again, and a late or duplicated answer does not count as the answer | `every_learned_decision_is_selected_by_every_recovering_majority`, `a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row`, `possible_fast_decisions_are_recovered_from_the_fixed_fast_set`, `a_proposal_ahead_of_the_selected_payload_does_not_leave_the_sync_waiting`, `a_late_or_duplicated_payload_answer_does_not_count_as_answering_the_ask` |
 | O7 | Execute every committed command, in the decided order | Every voter | A commit, a Sync, or the leader's frontier | A follower that heard only the leader executes what it commits; the frontier stops at the first command not committed | `a_follower_that_hears_only_the_leader_executes_what_it_commits`, `a_follower_restarted_with_adoptions_in_flight_executes_what_the_leader_commits`, `the_leaders_frontier_stops_at_the_first_command_it_has_not_committed` |
 | O8 | Bring a voter that fell behind back into service | The lagging voter, served by its peers | A full table; a dependency it does not hold; a heal | Paged catch-up, resumable across restarts | `a_voter_past_a_full_table_catches_up_and_its_table_drains`, `a_restart_in_the_middle_of_a_page_resumes_without_executing_twice`, `a_follower_cut_off_for_thirty_seconds_serves_within_ten_of_the_heal` |
 | O9 | Keep an executed invocation's result for its retries | The durable retry record | Execution, atomically with the result | A retry or resolve is answered from the record after any restart, or withheld when the caller may not read it | `a_read_retried_after_a_restart_gets_its_retained_result`, `the_same_invocation_is_answered_the_same_way_after_a_restart`, `a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`, `a_retry_after_unknown_submits_the_same_invocation_again` |
 | O10 | Retire only what nothing can still ask for | Retry floor; checkpoint floor | A floor advancing | A stale retirement never lowers a floor; a floor is certified by a majority of promises and fences what it covers | `a_stale_retirement_never_lowers_the_floor`, `retired_or_unknown_sessions_and_retired_sequences_never_execute`, `a_majority_of_promises_certifies_the_floor_a_missing_voter_would_have_blocked`, `a_delayed_message_cannot_revive_state_below_the_published_floor`, `a_proposal_that_acknowledges_a_different_floor_is_refused` |
 | O11 | Publish nothing that is not durable | Storage coordinator | A failed sync or reopen | Fail-stop until a reopen succeeds; corruption quarantines and never recovers in place | `sync_failure_inside_a_write_panics_and_fail_stops_until_reopen`, `sync_error_is_indeterminate_and_the_crash_image_is_all_or_nothing`, `failed_reopen_quarantines_the_engine_until_a_reopen_succeeds`, `disk_quarantine_stops_serving_and_never_recovers_in_place` |
-| O12 | Never hold two decisions for one command | Every voter | Facts that contradict what it committed, executed or answered | The voter stops and says what it compared | `a_voter_handed_other_facts_for_a_command_it_committed_stops`, `a_voter_handed_other_facts_for_a_command_it_retired_stops`, `a_pulled_command_executed_otherwise_stops_the_voter`, `a_late_release_that_contradicts_the_answer_is_refused` |
+| O12 | Never hold two decisions for one command | Every voter | Facts that contradict what it committed, executed or answered | The voter stops and says what it compared | `a_voter_handed_other_facts_for_a_command_it_committed_stops`, `a_voter_handed_other_facts_for_a_command_it_retired_stops`, `a_pulled_command_executed_otherwise_stops_the_voter`, `a_late_release_that_contradicts_the_answer_is_refused`, `a_follower_restarting_from_a_cyclic_sync_row_stays_halted` |
 | O13 | Never vote again under an identity whose state is gone | Operator, enforced by the harness and startup | A node directory without its state | Refused; reintroduction through membership (Section 5.4) | `a_voter_whose_state_is_gone_is_refused_not_initialized_again`, `another_manifest_quarantines_rather_than_reinitializing`, `a_pinned_node_without_its_journal_quarantines` |
+| O14 | Establish a leader | Each voter's election schedule | No link to the leader it promised, or no leader | A jittered wait per voter before campaigning, doubled to a ceiling while campaigns produce no leader; a promise counts as a leader only until the ceiling; a campaign still under way at the ceiling is replaced | `two_survivors_of_one_failure_do_not_campaign_at_the_same_instant`, `campaigns_that_produce_no_leader_back_off_to_the_ceiling`, `a_voter_whose_promise_does_not_synchronize_campaigns_after_the_ceiling` |
 
-Two rows are narrower than their obligation. O10 covers a voter behind
-a floor only up to refusing what it cannot prove: bringing that voter
-back from behind a floor that has moved on is task-d32. O11 is shown on
+Three rows are narrower than their obligation. O10 covers a voter behind
+a floor only up to refusing what it cannot prove, and has two halves
+still owed: stopping at the floor needs the durable rows below it
+trimmed, which is task-d27's second part (the first trims nothing yet),
+and bringing that voter back from behind a floor that has moved on is
+task-d32. O12's stop is shown surviving a restart only for a recovery
+cycle; for the other stops that is task-d13's. O11 is shown on
 the journal, the engine and the composed node; a failed barrier
 stopping a voter inside a running domain is exercised by the mixed-fault
 qualification (task-64), not by a unit test.
@@ -502,9 +507,17 @@ voters is up with its state, and admission pauses. Then:
 1. The outstanding work is finite. Admission is paused, the collector
    bounds its pending entries, and each voter's table is bounded by its
    capacity; retirement and catch-up only shrink it.
-2. A leader is established. Election waits are jittered per voter and
-   start only without a live leader; with messages timely, one campaign completes
-   its recovery reports from a majority and installs one Sync (O5, O6).
+2. A leader is established (O14). Election waits are jittered per voter
+   and bounded, doubling to the ceiling, and start only without a live
+   leader; a voter linked to its leader never campaigns. With messages
+   timely, one campaign completes its recovery reports from a majority
+   and installs one Sync (O5, O6). Two conditions in the code carry
+   this step. A promise counts as a leader only until the ceiling, so
+   stability needs the candidate to bind its Sync within it, which the
+   bounds on reports and Syncs give (task-d05, task-d20). And a campaign
+   still under way at the ceiling is replaced, which frees one whose
+   reports or payload answers never come. Then a voter linked and
+   synchronized is led, and a led voter does not campaign.
 3. Every admitted command is decided. The leader resends each proposal
    until every up voter voted (O4); votes are published once durable
    (O3); the collector re-offers what the leader has not seen (O1). A
