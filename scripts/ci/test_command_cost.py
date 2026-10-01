@@ -34,14 +34,15 @@ def log(*snapshots, tail=""):
     return "\n".join(lines) + "\n" + tail
 
 
-def run(callers, busy_ms, syncs, tail_ms=None):
-    # By default each voter's last quarter costs what its whole run did.
+def run(callers, busy_ms, syncs, tail_ms=None, head_ms=None):
+    # By default each voter's last quarter, and what came before it,
+    # cost what its whole run did.
     tail_ms = tail_ms or busy_ms
+    head_ms = head_ms or busy_ms
     return {"callers": callers, "voters": [
-        {"node": "n1", "busy_ms_per_command": busy_ms[0], "journal_syncs_per_command": syncs[0],
-         "tail_busy_ms_per_command": tail_ms[0]},
-        {"node": "n2", "busy_ms_per_command": busy_ms[1], "journal_syncs_per_command": syncs[1],
-         "tail_busy_ms_per_command": tail_ms[1]},
+        {"node": node, "busy_ms_per_command": busy_ms[i], "journal_syncs_per_command": syncs[i],
+         "tail_busy_ms_per_command": tail_ms[i], "head_busy_ms_per_command": head_ms[i]}
+        for i, node in enumerate(("n1", "n2"))
     ]}
 
 
@@ -93,6 +94,21 @@ class ReduceTests(unittest.TestCase):
         )
         # From 80 executed to 100: two seconds over twenty commands.
         self.assertAlmostEqual(cost.tail_busy("n1", text), 100.0)
+        # Before it: two seconds over the first eighty.
+        head, _ = cost.head_and_tail_busy("n1", text)
+        self.assertAlmostEqual(head, 25.0)
+
+    def test_a_cost_that_doubles_linearly_reads_past_the_margin(self):
+        # A command's cost grows from 1 ms to 2 ms over 1,000 commands,
+        # a snapshot every 50: the last quarter over the first three
+        # reads about 1.36, where over the whole run it would read 1.25.
+        busy, snaps = 0.0, []
+        for executed in range(1, 1001):
+            busy += (1 + executed / 1000) / 1000
+            if executed % 50 == 0:
+                snaps.append(snapshot(executed=executed, busy=busy))
+        head, tail = cost.head_and_tail_busy("n1", log(*snaps))
+        self.assertAlmostEqual(tail / head, 1.36, places=2)
 
     def test_a_last_quarter_no_two_snapshots_bracket_is_absent(self):
         with self.assertRaises(cost.Absent):

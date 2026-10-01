@@ -24,8 +24,16 @@
 # 9,000 operations one voter falls behind, and its readings then
 # measure its backlog.
 #
+# The default mix without its scans: a scan reads from a random key to
+# the end of the key space, so it costs more as the puts fill it. That
+# is the application's state growing, not the per-turn work this gate
+# guards, and it lifts an unchanged run's last quarter by as much as a
+# regression would.
+#
 # Inputs, all optional:
 #   MEASURED     operations offered per run          (default 2500)
+#   MIX          the bench's operation mix           (default
+#                put=15,get=55,contended=20,txn=5)
 #   REPEATS      runs per caller count; the gate
 #                compares their median              (default 3)
 #   WARMUP       warm-up operations, not measured     (default 100)
@@ -48,6 +56,7 @@ BENCH=${BENCH:-$ROOT/target/release/coord-wan-bench}
 MEASURED=${MEASURED:-2500}
 REPEATS=${REPEATS:-3}
 WARMUP=${WARMUP:-100}
+MIX=${MIX:-put=15,get=55,contended=20,txn=5}
 STATE_ROOT=${STATE_ROOT:-/dev/shm}
 INTERVAL=1
 CALLER_COUNTS=${*:-1 10}
@@ -131,7 +140,7 @@ for repeat in $(seq 1 "$REPEATS"); do
     --label "command cost, 3 voters, $callers callers" \
     --durability "journal-first, one fsync per record, stores on tmpfs" \
     --topology "single-host loopback, 3 voters" \
-    --arrival-ns 0 --warmup-ops "$WARMUP" --measured-ops "$MEASURED" \
+    --arrival-ns 0 --warmup-ops "$WARMUP" --measured-ops "$MEASURED" --mix "$MIX" \
     --callers "$callers" --frontends 3 --deadline-ms 30000 \
     --out "$out/bench.json" >&2 || status=1
   ended=$(date +%s.%N)
