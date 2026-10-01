@@ -449,7 +449,7 @@ pub fn select_with(
             }
         }
     }
-    possible_fast_decisions(config, source_ballot, reports, &mut entries);
+    possible_fast_decisions(config, source_ballot, reports, &mut entries, &from_below);
     for c in entries.keys() {
         reproposed.remove(c);
     }
@@ -482,16 +482,8 @@ fn possible_fast_decisions(
     source_ballot: Ballot,
     reports: &[RecoveryReport],
     entries: &mut BTreeMap<CommandId, SyncEntry>,
+    from_below: &BTreeSet<CommandId>,
 ) {
-    let source_leader = source_ballot.leader;
-    if reports
-        .iter()
-        .any(|r| r.replica == source_leader && r.committed_ballot == source_ballot)
-    {
-        // The source leader's own rows are authoritative: a command it
-        // never proposed cannot have been learned fast.
-        return;
-    }
     // The fast set of the source ballot (the default rule until the
     // retained operator quorum table of task-m01).
     let Ok(source_config) =
@@ -502,9 +494,7 @@ fn possible_fast_decisions(
     let fast_reporters: Vec<&RecoveryReport> = reports
         .iter()
         .filter(|r| {
-            r.committed_ballot == source_ballot
-                && r.replica != source_leader
-                && source_config.fast_set().contains(&r.replica)
+            r.committed_ballot == source_ballot && source_config.fast_set().contains(&r.replica)
         })
         .collect();
     let Some(first) = fast_reporters.first() else {
@@ -533,6 +523,7 @@ fn possible_fast_decisions(
             record(r, &e.command).is_some_and(|o| {
                 o.phase == Phase::PreAccept
                     && o.path == e.path
+                    && same_set(&o.deps, &e.deps)
                     && o.payload_present
                     && o.admission == e.admission
             })
@@ -556,6 +547,36 @@ fn possible_fast_decisions(
         seen
     };
     let conflicts = |a: &[Vec<u8>], b: &[Vec<u8>]| a.iter().any(|k| b.contains(k));
+    // Whether the selection orders `x` after `c`: `c` is in `x`'s closure
+    // over the selected entries' dependencies.
+    let selected: BTreeMap<CommandId, Vec<CommandId>> =
+        entries.iter().map(|(k, e)| (*k, e.deps.clone())).collect();
+    let after = |x: &CommandId, c: &CommandId| -> bool {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<CommandId> = selected.get(x).cloned().unwrap_or_default();
+        while let Some(d) = stack.pop() {
+            if d == *c {
+                return true;
+            }
+            if seen.insert(d)
+                && let Some(deps) = selected.get(&d)
+            {
+                stack.extend(deps.iter().copied());
+            }
+        }
+        false
+    };
+    // Whether the member's order put `a` before a command whose closure
+    // over the member's records is `prefix`: `a` is in it, or is decided
+    // before a command in it that the member no longer holds. Such a
+    // command was executed there, after everything the selection orders
+    // before it, and retiring it cut the member's own closure short.
+    let forgotten_before = |prefix: &BTreeSet<CommandId>, a: &CommandId| -> bool {
+        prefix.contains(a)
+            || prefix
+                .iter()
+                .any(|d| record(first, d).is_none() && selected.contains_key(d) && after(d, a))
+    };
     loop {
         let before = candidates.len();
         let keys: Vec<CommandId> = candidates.keys().copied().collect();
@@ -563,10 +584,39 @@ fn possible_fast_decisions(
             let entry = candidates[&c].clone();
             let prefix = closure(&c);
             let ordered_after_adopted = entries.values().all(|adopted| {
-                let a = record(first, &adopted.command);
-                !conflicts(&entry.keys, a.map_or(&[][..], |a| &a.keys))
-                    || (prefix.contains(&adopted.command)
-                        && a.is_some_and(|a| a.path == adopted.path))
+                // Ordered after `c` by the selection itself: nothing it
+                // says constrains the member's order before `c`.
+                if after(&adopted.command, &c) {
+                    return true;
+                }
+                match record(first, &adopted.command) {
+                    Some(a) => {
+                        !conflicts(&entry.keys, &a.keys)
+                            || (prefix.contains(&adopted.command) && a.path == adopted.path)
+                    }
+                    // A decision of an earlier ballot precedes everything
+                    // the source ballot ordered; the member may simply
+                    // have executed it and forgotten it.
+                    None if from_below.contains(&adopted.command) => true,
+                    // Absent from the member's records, but its order put
+                    // it before `c`: `c`'s own dependencies name it, or a
+                    // command they name that the member no longer holds
+                    // was decided after it. The member executed and
+                    // retired it, and an ancestor it held is no evidence
+                    // against the member's path (task-d34, #118 item 5).
+                    None if forgotten_before(&prefix, &adopted.command) => true,
+                    // Accepted at the source ballot and before `c` there,
+                    // yet absent from the member's records and from what
+                    // its order put before `c`: the member's order never
+                    // placed it, so its path for `c` is not the leader's,
+                    // whatever it says (task-d30). Only a command with no
+                    // conflict keys at all is exempt.
+                    None => {
+                        let keys: Vec<Vec<u8>> =
+                            adopted.paths.iter().map(|(k, _)| k.clone()).collect();
+                        !keys.is_empty() && !conflicts(&entry.keys, &keys)
+                    }
+                }
             });
             let prefix_decided = prefix
                 .iter()

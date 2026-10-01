@@ -238,6 +238,72 @@ pub enum FollowerRejection {
 /// A recovery report this replica owes a candidate.
 type ReportDue = crate::role::PendingReport;
 
+/// Report each selected entry in its record's place: the selected phase,
+/// order and facts supersede a record at or below them, and an entry with
+/// no record here is reported as selected with its payload outstanding
+/// (task-d30, task-d34). A follower overlays the Sync it is installing; a
+/// leader overlays the selection it leads from, whose entries it may not
+/// have proposed.
+pub(crate) fn overlay_selected<'a>(
+    report: &mut RecoveryReport,
+    entries: impl Iterator<Item = (&'a CommandId, &'a SyncEntry)>,
+) {
+    let mut known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
+    for (command, entry) in entries {
+        if known.contains(command) {
+            // Known here at or below the selection, or with another
+            // order: a record older than the Sync, which the report
+            // must not present as this ballot's state. The selected
+            // entry is what this replica durably accepted at the
+            // synchronized ballot (a restart resumes installing it
+            // from the row), so it is reported in the record's place
+            // (task-d30), whatever the record agrees with it on.
+            if let Some(e) = report.entries.iter_mut().find(|e| e.command == *command)
+                && (e.phase <= entry.phase || !crate::vote::same_set(&e.deps, &entry.deps))
+            {
+                e.phase = entry.phase;
+                e.deps = entry.deps.clone();
+                e.path = entry.path;
+                e.paths = entry.paths.clone();
+                e.seqnum = entry.seqnum;
+                // Selected under other facts than the record's: the
+                // payload held here is another presentation's, and
+                // the selected one is still to be fetched and rebound
+                // (task-d14). Claiming it present would count this
+                // replica as a supplier of a payload it cannot serve.
+                if let Some(named) = entry.admission
+                    && e.admission != Some(named)
+                {
+                    e.admission = Some(named);
+                    e.payload_present = false;
+                }
+            }
+            continue;
+        }
+        report.entries.push(ReportEntry {
+            command: *command,
+            phase: entry.phase,
+            deps: entry.deps.clone(),
+            path: entry.path,
+            paths: entry.paths.clone(),
+            seqnum: entry.seqnum,
+            // The conflict keys come from the payload, which is
+            // exactly what has not arrived. The per-key digests the
+            // selection installed name the keys the selected order
+            // was recorded against, which is what a reader of this
+            // entry can rely on.
+            keys: entry.paths.iter().map(|(k, _)| k.clone()).collect(),
+            payload_present: false,
+            // The facts the selection named: the payload that arrives
+            // has to be the one under them (task-d14).
+            admission: entry.admission,
+        });
+        // A selected entry still pending comes twice, from the pending
+        // set and from the selection: reported once.
+        known.insert(*command);
+    }
+}
+
 /// Report every command this replica executed as committed (task-d05).
 ///
 /// A commit is not written as a row, so a durable record says ACCEPT for
@@ -399,6 +465,12 @@ pub struct Follower {
     /// installed only if every higher promise's row fails, and dropped
     /// once one of them is durable.
     sync_behind_promise: Option<(ReplicaId, SyncDecision)>,
+    /// The selection of the synchronized ballot, once its Sync row is
+    /// durable (or read back from that row after a restart): what this
+    /// replica accepted at the ballot its reports are labelled with
+    /// (task-d30). A report takes each of its entries over a durable
+    /// record that is behind it, whatever installation has reached.
+    synced_selection: Option<SyncDecision>,
     /// The commit frontier the leader of the current ballot announced:
     /// every proposal of the ballot up to this sequence number is
     /// committed there (task-d09). Reset with the ballot.
@@ -530,6 +602,7 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
+            synced_selection: resumed.clone(),
             resumed,
             early_sync: None,
             sync_behind_promise: None,
@@ -623,6 +696,15 @@ impl Follower {
 
     /// A follower from state carried across a role change, under `quorum`.
     pub fn from_recovered(state: RecoveredState, quorum: BallotConfiguration) -> Self {
+        // The selection of the ballot this replica is synchronized to, as a
+        // restart reads it from the durable Sync row: a deposed leader's
+        // own, whose entries it may not have installed (task-d34). Without
+        // it, a selected command whose payload the leader lacked was
+        // pre-accepted afresh when the payload came, and reported so under
+        // the synchronized ballot.
+        let selection = state
+            .synced_selection
+            .filter(|d| d.ballot == state.ballots.synced());
         Follower {
             config: FollowerConfig {
                 identity: state.identity,
@@ -666,15 +748,17 @@ impl Follower {
             won: None,
             awaiting_sync: Vec::new(),
             rejections: Vec::new(),
-            resumed: None,
+            resumed: selection.clone(),
             early_sync: None,
             sync_behind_promise: None,
+            synced_selection: selection,
             leader_committed: None,
             proposal_cursor: 0,
             replay: crate::replay::EvidenceStore::new(state.capacity),
             catch_up: CatchUp::default(),
             diverged: None,
         }
+        .resume_sync()
     }
 
     /// Give up the role: everything durable or learned, nothing
@@ -695,6 +779,7 @@ impl Follower {
             report_due: self.report_due,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
+            synced_selection: self.synced_selection,
         }
     }
 
@@ -1149,7 +1234,10 @@ impl Follower {
                 .filter(|(c, r)| {
                     r.payload.is_some()
                         && r.phase == Phase::Accept
-                        && !decision.entries.contains_key(c)
+                        && decision
+                            .entries
+                            .get(c)
+                            .is_none_or(|e| !crate::vote::same_set(&e.deps, &r.deps))
                 })
                 .map(|(c, r)| {
                     let mut r = r.clone();
@@ -1196,6 +1284,13 @@ impl Follower {
         self.adopted.clear();
         self.leader_committed = None;
         self.named_facts = named_facts(&decision);
+        // What an earlier Sync left uninstalled is superseded: its entries
+        // are not this ballot's, and installing one would write an
+        // acceptance the new selection re-proposed or left out, back over
+        // the demotion (task-d34: a restart resumed an older Sync, took a
+        // newer one, and the older entry's ACCEPT came back at the new
+        // synchronized ballot).
+        self.sync_pending.clear();
         for (c, e) in &decision.entries {
             if self.table.phase_of(c).is_none() {
                 let _ = self.table.expect(*c);
@@ -1403,30 +1498,21 @@ impl Follower {
         // drop a selected command entirely. The entries are reported for
         // what they are — selected, with their order, payload still
         // outstanding — so the selection preserves them.
-        let known: BTreeSet<CommandId> = report.entries.iter().map(|e| e.command).collect();
-        for (command, entry) in &self.sync_pending {
-            if known.contains(command) {
-                continue;
-            }
-            report.entries.push(ReportEntry {
-                command: *command,
-                phase: entry.phase,
-                deps: entry.deps.clone(),
-                path: entry.path,
-                paths: entry.paths.clone(),
-                seqnum: entry.seqnum,
-                // The conflict keys come from the payload, which is
-                // exactly what has not arrived. The per-key digests the
-                // selection installed name the keys the selected order
-                // was recorded against, which is what a reader of this
-                // entry can rely on.
-                keys: entry.paths.iter().map(|(k, _)| k.clone()).collect(),
-                payload_present: false,
-                // The facts the selection named: the payload that arrives
-                // has to be the one under them (task-d14).
-                admission: entry.admission,
-            });
-        }
+        //
+        // The whole synchronized selection, not only the commands the
+        // ledger names: an entry whose late payload let it install has
+        // left the pending set, and until its row is durable the ledger
+        // does not name it either (task-d34, protocol_sim row 10, three
+        // voters, seed 58). Left out, a candidate reading the report
+        // re-proposed a command its own synchronized selection held at
+        // ACCEPT. What this replica executed and forgot is left out below.
+        let selected = self
+            .synced_selection
+            .as_ref()
+            .filter(|d| d.ballot == self.ballots.synced())
+            .into_iter()
+            .flat_map(|d| d.entries.iter());
+        overlay_selected(&mut report, self.sync_pending.iter().chain(selected));
         // History is left out: a command this replica executed and keeps
         // nothing else about. Every command a report names is one the
         // candidate may need to install or fetch, and reporting the whole
@@ -2729,11 +2815,15 @@ impl Follower {
             }
             rebinding = true;
         }
-        // The leader's order is recorded into the path logs as soon as it is
-        // known (prototype `recordLeaderHash`); a missing payload only makes
-        // a placeholder that nothing can see.
-        self.table
-            .record_leader_path(command, proposal.seqnum.unwrap_or(0), &proposal.paths);
+        // The leader's order goes into the path logs only when this replica
+        // takes it as its own, at adoption (`advance_pending`) or a Sync's
+        // installation, not on arrival as the prototype's
+        // `recordLeaderHash` does (task-d34, F7): a command pre-accepted
+        // after an arrival-time alignment took the leader's path over this
+        // replica's own history, so an equal path no longer meant an equal
+        // history, and with the leader absent recovery could not rebuild a
+        // fast decision's ancestors from this replica's records. A missing
+        // payload only makes a placeholder that nothing can see.
         if self.table.phase_of(&command).is_none() && self.table.expect(command).is_err() {
             // No room for a placeholder. That is a reason to wait, and it
             // is emphatically not a reason to return: what this function
@@ -2933,6 +3023,14 @@ impl Follower {
                         .push(FollowerRejection::AdmissionConflict { command, accepted });
                     continue;
                 }
+                // Taken as this replica's own order now, so its logs follow
+                // the leader's from here (task-d34, F7), as a Sync's
+                // installation aligns them beside `adopt`.
+                self.table.record_leader_path(
+                    command,
+                    held.proposal.seqnum.unwrap_or(0),
+                    &held.proposal.paths,
+                );
                 // A command already learned or executed (installed from a
                 // Sync, or durable across a restart) keeps its phase: the
                 // re-proposal only supplies the new ballot's order.
@@ -3031,6 +3129,24 @@ impl Follower {
             outbox.observe(event);
         }
         self.ballots.on_storage(event);
+        // Ledger bookkeeping covers every batch staged, as the leader's
+        // does, and not only the ones this follower is waiting on: a batch
+        // this replica staged while it led, and that completes after it
+        // was deposed, is what its recovery report must show. Left
+        // staged, the ledger kept the older record, and a later commit
+        // landed on dependencies the command was never decided with
+        // (task-d30). A batch applied here is applied once.
+        if let Some(barrier) = event.barrier() {
+            match event {
+                StorageEvent::JournalDurable { journal_seq, .. } => {
+                    self.ledger.durable(barrier, *journal_seq);
+                }
+                StorageEvent::Failed { .. } => {
+                    self.ledger.failed(barrier);
+                }
+                _ => {}
+            }
+        }
         // The synchronized-ballot row carries its own barrier, which is not
         // one of the pending vote or adoption batches: the new ballot
         // becomes this replica's only when that row is a fact.
@@ -3047,6 +3163,9 @@ impl Follower {
                     // not this ballot is still the one to activate: the
                     // table follows its rows.
                     self.ledger.durable(barrier, *journal_seq);
+                    if self.ballots.synced() == decision.ballot {
+                        self.synced_selection = Some(decision.clone());
+                    }
                     for command in core::mem::take(&mut self.sync_demoted) {
                         self.table.demote(&command);
                     }
@@ -3056,6 +3175,22 @@ impl Follower {
                     if self.ballots.promised() == decision.ballot {
                         self.activate(decision)
                     } else {
+                        // The row is durable all the same: this replica is
+                        // synchronized to the selection, a restart would
+                        // resume installing it from the row, and the next
+                        // candidate reads a report labelled with its
+                        // ballot. So its entries are held for
+                        // installation, and reported, as an activated
+                        // Sync's are; only the ballot is not taken up
+                        // (task-d30). What an older Sync left pending is
+                        // superseded by this one, as at activation.
+                        self.sync_pending.clear();
+                        for (c, e) in &decision.entries {
+                            if self.table.phase_of(c).is_none() {
+                                let _ = self.table.expect(*c);
+                            }
+                            self.sync_pending.insert(*c, e.clone());
+                        }
                         self.rejections
                             .push(FollowerRejection::SyncSuperseded(decision.ballot));
                         Vec::new()

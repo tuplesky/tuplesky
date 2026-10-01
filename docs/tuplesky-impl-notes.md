@@ -5886,9 +5886,10 @@ Evidence:
     voters on `leader_adopted=false, [Adopted(None), None]` recovered from
     {r0, r2}. Restricted to five voters, it fails on
     `[Adopted(None), Adopted(None), None, None]` from {r0, r3, r4}.
-  - A fast decision whose leader holds only its proposal row is skipped
-    here. Recovering it needs the source leader counted among the fast-set
-    members, which #118 (item 1) adds, stacked above.
+  - A fast decision whose leader holds only its proposal row needs the
+    source leader counted among the fast-set members to be recovered. #116
+    skips it, and #118 (item 1) adds that rule and checks it here too:
+    with #118, the model passes with the skip removed.
 - `the_leaders_reply_is_not_its_adoption_at_five_voters`
   (`coord-collector`, `composition`): the leader's release and reply plus
   two adoptions stay `AwaitingVotes`, and the leader's `SlowAck` or a
@@ -6046,3 +6047,314 @@ for one command (from review).
 - The argument is on paper. task-d30's protocol oracle runs the real
   machines under faults at three and five voters, and any cycle there
   stops a node by this rule and fails the run.
+
+## What the protocol simulator found in recovery
+
+task-d34. task-d30's simulator drives the real `Leader` and `Follower`
+machines at three and five voters. It loses, duplicates, reorders and
+holds back messages, completes journal batches at random times, and
+crashes, restarts and campaigns nodes. Its oracle checks one execution
+order, promises never lowered, and one dependency set per command across
+the frontend's learning and every replica's execution. Its first runs
+found the decisions below lost or contradicted by recovery. Each was
+traced to its cause, and each has a deterministic test that fails
+without its change.
+
+### The findings
+
+1. **The source leader's report made the possible-fast rule skip
+   itself.**
+   - The leader's reply to the frontend waits for its proposal batch,
+     which records the command at PRE-ACCEPT (and a proposal row nothing
+     reads). The leader's own ACCEPT row is a later batch.
+   - A leader that crashed between the two reported PRE-ACCEPT. A
+     selection that heard the source leader returned from the rule
+     early, since "its rows are authoritative", and re-proposed a
+     command the frontend had learned fast.
+   - Now the source leader is one of the fast-set members the rule
+     reads. Test:
+     `a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row`.
+2. **A fast acknowledgement could carry the leader's path and other
+   dependencies.**
+   - A follower that received the leader's proposal before the payload
+     has the leader's digests in its logs (`record_leader_path`). When
+     the payload arrives, its fast acknowledgement carries that path
+     beside dependencies computed from its own log.
+   - The fast predicate compared paths only, so it learned the command
+     with the leader's dependencies, which the member had not recorded.
+     Recovery then rebuilt it from the member's.
+   - Fast learning, and the rule's candidates, now also require the
+     same dependency set: `[EXT: stricter]`. Tests:
+     `a_fast_acknowledgement_with_the_leaders_path_and_other_dependencies_decides_nothing`
+     and
+     `members_agreeing_on_a_path_but_not_on_dependencies_decide_nothing_fast`.
+3. **task-d11 demoted only what a Sync leaves out.**
+   - An earlier ballot's acceptance that the Sync carries with other
+     dependencies stayed at ACCEPT until the entry was installed, which
+     waits for dependencies and payloads.
+   - A report taken meanwhile presented it under the new synchronized
+     ballot, and the next selection halted on `IncompatibleAccepted`.
+   - It is now demoted in the same install batch. Test:
+     `a_sync_demotes_an_acceptance_it_carries_with_other_dependencies`.
+4. **A report could omit the synchronized selection.**
+   - Installing an entry removed it from the pending set when its batch
+     was queued, while the report reads the durable ledger. Between the
+     two, the report said the command was only pre-accepted, under the
+     ballot whose selection had accepted it.
+   - A Sync whose row landed after a higher promise's (superseded) was
+     neither installed nor reported, although the promise row said this
+     replica was synchronized to it.
+   - The synchronized ballot's selection is now kept once its row is
+     durable, and read back from that row on restart. The report takes
+     each of its entries over a durable record that is not past it, or
+     that orders the command otherwise, facts included. A superseded
+     Sync's entries are held for installation, as a restart would resume
+     them. Tests:
+     `a_report_takes_the_selection_over_an_installation_still_in_flight`
+     and `a_superseded_sync_still_has_its_selection_reported`.
+   - The Codex review found two gaps in that overlay. A record at the
+     selected phase with the same dependencies but another presentation
+     kept its own admission, so a report carrying the selection's facts
+     made the next selection `IncompatibleAdmission`. And a replaced
+     admission kept the record's `payload_present`, so a selection could
+     count this replica as a supplier of a payload it does not hold. The
+     selected facts now replace the record's whenever the record is not
+     past the selected phase, and the payload is reported absent until
+     the rebind of task-d14 lands. Test:
+     `a_report_names_the_selected_facts_and_no_payload_held_under_others`.
+5. **The rule's conflict check passed vacuously.**
+   - A candidate was checked against conflicting adopted commands
+     through the member's own records, so a decided command the member
+     never held passed, and the candidate was kept ahead of it with the
+     member's order.
+   - Now:
+     - a command the selection orders after the candidate constrains
+       nothing;
+     - an earlier ballot's decision the member does not hold may have
+       been executed and forgotten, and constrains nothing;
+     - an at-source command the member does not hold rules the
+       candidate out.
+   - Tests:
+     `a_candidate_its_member_ordered_without_an_accepted_command_is_not_kept`
+     and
+     `a_candidate_whose_member_forgot_an_earlier_ballots_decision_is_kept`.
+6. **A follower's ledger ignored batches it staged as leader.**
+   - The follower applied a completion to its ledger only for batches it
+     was waiting on. A batch its leader role staged and that completed
+     after a deposition was lost to its reports, and a later commit
+     landed on stale dependencies.
+   - The follower's ledger now covers every staged batch, as the
+     leader's did. Test:
+     `a_batch_staged_as_leader_reaches_the_followers_ledger`.
+
+The simulator also caught two infidelities of its own, fixed there and
+not here:
+- It delivered frames across a crash, which a connection per stream
+  does not.
+- It let an execution outrun earlier journal batches, which `coordd`'s
+  single-writer apply does not.
+
+### F7: a path from an order the replica does not hold
+
+A fast decision failed when its only reporting fast-set member had
+recorded the leader's path for commands it had not adopted:
+- `record_leader_path` ran when a proposal arrived. It aligned the
+  per-key logs to the leader's order while the record kept its own
+  dependencies.
+- A command pre-accepted after that took the leader's path over this
+  replica's own history, so an equal path no longer meant an equal
+  history.
+- With the leader absent, recovery could not rebuild the fast decision's
+  ancestors from the member's records. The rule refused them and, with
+  them, the decided command.
+
+Two options were put to review. vicaya chose the second on #118:
+- The logs follow the leader's order only when the replica takes it as
+  its own: at adoption (`advance_pending`) and at a Sync's installation,
+  which already paired the alignment with `adopt`. Not when a proposal
+  arrives.
+- A fast acknowledgement's path, and a record's reported path, come from
+  those logs only. A fast acknowledgement stays evidence of the replica's
+  own durable history, the principle task-d19 applies to the slow path.
+- The first option, where a pre-accepted record takes the leader's
+  dependencies, needed a durable PRE-ACCEPT rewrite on every arrival and
+  changed what a PRE-ACCEPT record means.
+- The cost is fast-path rate when payloads reach a member in another
+  order than the leader's proposals.
+- The mapping row for `recordLeaderHash` is `[EXT: stricter]`.
+
+Evidence:
+- `a_proposal_that_is_not_adopted_leaves_the_path_log_alone`
+  (`follower`): the leader orders cz, c0, c1. A replica that never held
+  cz pre-accepts c0, takes c0's proposal (held for cz), then pre-accepts
+  c1. c1's path is the one a replica that never saw the proposal
+  computes. It fails with the arrival-time alignment.
+- task-d30's simulator (#119), with task-d19's leader adoption merged:
+  - 40 seeds: every one of 400 runs passes, against 2 failures before
+    this change.
+  - 100 seeds: 2 of 1,000 fail, against 8.
+  - Catch-up at the default seeds: all 120 pass, against 1 failure.
+- Still owed: the fast-path rate before and after on the stress driver.
+  The two remaining failures at 1,000 runs are the two cases below.
+
+Aligning at adoption left two more ways for a path to name a history the
+records do not hold. task-d30's simulator found both at row 10, three
+voters, without catch-up (seeds 52 and 86):
+- **A command left behind a synchronization.** Aligning a log to one
+  command leaves every command the replica pre-accepted before it in the
+  pending suffix, now placed after it. Their records still hold the
+  dependencies they were pre-accepted with, without it. The log now keeps
+  those commands as reordered. Until each is synchronized itself, or
+  executed and retired, its head is `reordered_path` of the true one,
+  which no leader path equals. Test:
+  `a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders`
+  (`graph`).
+- **A new leader's anchor.** A new leader anchors its first fresh
+  proposal after the recovered order's tails, and its path log went on
+  digesting its own appends, which need not pass through them. In seed
+  52 the leader installed 454d from its Sync, and its path for 65da
+  skipped 454d while its dependencies named it. r2 had never held 454d,
+  and its appends were the same. It reached the same path for 65da with
+  other dependencies, then an equal path and equal dependencies for 81be.
+  The collector learned 81be fast over two histories, and recovery
+  without the leader re-proposed it after 454d. `anchor_all` now
+  re-anchors the log at `anchored_path` of the tails, which a follower
+  reaches only by synchronizing to a path chained from it. Test:
+  `a_leaders_path_follows_the_tails_it_anchors_after` (`graph`).
+- Both tests fail without their change. With both, task-d30's rows run
+  clean at 1,000 seeds (100 per row and size), with catch-up and
+  without.
+- Cost: after a leader change, a follower's fast acknowledgements match
+  again only once it has adopted one fresh proposal. A pre-accepted
+  command reordered behind a synchronization holds its replica's head
+  off the leader's until its own order arrives. A command retired while
+  still in a log's pending suffix stays there: `PathLog::forget` clears
+  only its reordered mark, so the next `sync_known` marks it reordered
+  again, and that key's head stays off the leader's until a restart
+  rebuilds the log.
+
+### Item 5: a member that forgot an at-source command
+
+The possible-fast rule dropped a candidate when a conflicting command
+accepted at the source ballot, and not ordered after it, was missing from
+the member's records. That case is reachable. A member executes a and
+then f, both accepted at the source ballot. It retires both, which
+nothing stops while a later command is still pre-accepted. Its
+pre-acceptance of x names f. Its report then holds x, but not f or a.
+The rule refused x, which may have been decided fast, and that is the
+unsafe direction.
+
+History does not need to travel in the report: the member's own records
+already say what its order put before x. The rule now also keeps x when
+the missing command is in x's closure over the member's records. It also
+keeps x when the missing command was decided before a command in that
+closure that the member no longer holds. Such a command was executed
+there after everything the selection orders before it. A missing command
+reached neither way still drops the candidate.
+
+Test:
+`a_candidate_whose_member_forgot_an_at_source_command_it_ordered_first_is_kept`
+(`model`). It fails without the change, and its second half keeps the
+drop for a command the forgotten one says nothing about.
+
+Residual: a retired ancestor the selection no longer carries, because
+every reporter forgot it, reaches nothing further. A candidate behind it
+can still be dropped. That drop does not depend on the new rule:
+`prefix_decided` (`recovery.rs`) already drops a candidate whose
+member's prefix names a command that is neither selected nor a
+candidate, whatever the rule above decides.
+
+### Re-proposals after the entries that follow them
+
+Found on #122's branch at 100 seeds (row 10, three voters, seed 58). The
+fork predates the failing ballot:
+- b17's selection kept 0db8 at ACCEPT with dependency 9a0f, which it
+  re-proposed rather than selected. ef62 and 15a3 followed 0db8.
+- The new leader chained its re-proposals after the recovered tail:
+  9a0f, then a95c, b135 and ff68 after it. 0db8 and a95c both followed
+  9a0f, two branches of one key's order, and the voters executed ff68
+  and 0db8 in different orders.
+- Chaining the re-proposals after such an entry instead makes a cycle
+  with the command it waits on.
+- The entry itself was re-proposed before its dependency, and the
+  acceptance guard refused it.
+
+`Leader::from_recovered` now:
+- leaves out of the first chain every entry that follows a re-proposed
+  command;
+- re-proposes such an entry right after the last re-proposed command it
+  follows;
+- goes on with the chain after the last of those entries.
+
+Test: `reproposals_go_on_after_the_entries_that_follow_them`
+(`activation`). It requires every two of the commands to be ordered and
+none to be on a cycle, and it fails without the change.
+
+A re-proposed command this leader already holds at or past COMMIT keeps
+the dependencies it was decided with and is not proposed again. The
+entries that follow it are still proposed, right after it, and the chain
+goes on after them. Skipped along with it, as they first were, they were
+proposed nowhere: followers installed them at ACCEPT with nothing to vote
+on, the leader never committed them, and everything chained after them
+waited. The reachable case is a reporter behind the source ballot
+re-proposing a command the at-source voters retired. Test:
+`entries_that_follow_a_reproposed_command_the_leader_executed_are_proposed`
+(`activation`), which fails without the change.
+
+The selection that re-proposed 9a0f had a cause of its own. r2 held 9a0f
+and 65b2 at ACCEPT through b10's selection, and its b11 and b16 reports
+named them. Their payloads reached it while it campaigned for b17. Each
+then installed, which took it out of the pending set, and its row was
+not durable yet, so the durable ledger did not name it either. The
+report overlaid the synchronized selection only on commands the ledger
+named, so r2's own report left both out, and b17 re-proposed them. The
+report now overlays the whole synchronized selection; what the replica
+executed and forgot is still left out. Test:
+`a_selected_entry_installing_from_a_late_payload_is_reported`
+(`activation`), which fails without the change. An entry both pending
+and selected is reported once; it was pushed twice.
+
+### An older Sync's pending entries
+
+Found by task-d30's simulator (row 2, five voters, seed 0) once the
+leader's own adoption (#116) was merged. A voter restarted with an older
+Sync still installing, took a newer one, and activation added the newer
+entries beside the older ones. The older entry's payload then arrived,
+and it installed at ACCEPT from the older selection, at the newer
+synchronized ballot and over the demotion. The next campaign stopped on
+`IncompatibleAccepted`. A Sync's activation, and a Sync held for
+installation because a higher promise overtook its row, now clear what
+an older one left pending. task-d20's `replace_sync_pending` supersedes
+this where it lands. Tests (`activation`), each failing without the
+change:
+- `an_older_syncs_pending_entry_does_not_install_after_a_newer_sync`;
+- `an_older_syncs_pending_entry_does_not_install_after_a_superseded_newer_sync`.
+
+### A deposed leader's selection
+
+Found on #122's branch at 100 seeds (row 2, three voters, seed 45):
+- A leader can win with a selection naming a command whose payload it
+  does not hold. `Leader::repropose` skips a placeholder, so nothing is
+  proposed for it.
+- Deposed, it became a follower that did not carry its own Sync, since
+  `RecoveredState` had no place for it. Its reports under the
+  synchronized ballot omitted the command.
+- When the payload came, it pre-accepted the command afresh and reported
+  that PRE-ACCEPT at the source ballot. The next selection re-proposed a
+  command another voter had executed.
+
+The leader now keeps the selection it leads from. `into_recovered`
+hands it on as `RecoveredState::synced_selection`, and
+`Follower::from_recovered` resumes it as a restart resumes the durable
+Sync row: entries it has not installed are pending, and reports name the
+selected facts.
+
+The leader's own report overlays that selection too, through the same
+`overlay_selected` the follower uses. The report a deposed leader owes is
+often built while it still leads, from its rows alone. Seed 45's was: its
+re-proposal of the command was not durable yet, so the report showed its
+older PRE-ACCEPT under the synchronized ballot.
+
+Test: `a_deposed_leader_keeps_its_selection_for_what_it_never_proposed`
+(`activation`). It fails at the leader's report without the overlay, and
+at the follower's without the carried selection.

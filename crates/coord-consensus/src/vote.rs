@@ -329,7 +329,11 @@ impl VoteSet {
     /// preferred when both hold; both need the leader proposal.
     pub fn learned(&self) -> Option<Learned> {
         let leader = self.leader.as_ref()?;
-        let agreeing_paths = self.fast.values().filter(|a| a.path == leader.path).count();
+        let agreeing_paths = self
+            .fast
+            .values()
+            .filter(|a| a.path == leader.path && same_set(&a.deps, &leader.deps))
+            .count();
         if agreeing_paths + 1 >= self.config.fast_size() {
             return Some(Learned::Fast {
                 deps: leader.deps.clone(),

@@ -154,8 +154,8 @@ pub use follower::{
     Follower, FollowerConfig, FollowerRejection, HELD_PROPOSAL_SLACK, HeldProposal,
 };
 pub use graph::{
-    Closure, ClosureCursor, ClosureProgress, PathLog, chain, combined_path, demoted_path,
-    empty_path,
+    Closure, ClosureCursor, ClosureProgress, PathLog, anchored_path, chain, combined_path,
+    demoted_path, empty_path, reordered_path,
 };
 pub use handoff::{
     ActivationCertificate, CancellationCertificate, Evidence, HandoffError, InstallRecord,

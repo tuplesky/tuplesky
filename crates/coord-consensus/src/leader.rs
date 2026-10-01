@@ -262,6 +262,10 @@ pub struct Leader {
     /// they are durable: each is then its own adoption, counted like a
     /// follower's (task-d19).
     own_adoptions: BTreeMap<BarrierId, OwnAdoption>,
+    /// The selection this leader leads from, handed to its follower when
+    /// it is deposed (task-d34): an entry whose payload this leader lacked
+    /// was never proposed, and the follower installs it from here.
+    selection: Option<SyncDecision>,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -273,6 +277,26 @@ struct OwnAdoption {
     /// The barriers its publication required: if one of them fails, the
     /// outbox drops the publication and it is made again.
     requires: Vec<BarrierId>,
+}
+
+/// The commands a chain of re-proposals follows once `ready`, entries of
+/// `decision` that were waiting on re-proposed commands, are placed after
+/// `last` (task-d34): those of `last` and `ready` that no other of them
+/// depends on, over the selected dependencies.
+fn ready_tails(decision: &SyncDecision, last: &[CommandId], ready: &[CommandId]) -> Vec<CommandId> {
+    let set: BTreeSet<CommandId> = last.iter().chain(ready).copied().collect();
+    let depended: BTreeSet<CommandId> = set
+        .iter()
+        .filter_map(|c| decision.entries.get(c))
+        .flat_map(|e| e.deps.iter().copied())
+        .collect();
+    let mut tails: Vec<CommandId> = Vec::new();
+    for c in last.iter().chain(ready) {
+        if !depended.contains(c) && !tails.contains(c) {
+            tails.push(*c);
+        }
+    }
+    tails
 }
 
 impl Leader {
@@ -310,6 +334,7 @@ impl Leader {
         let table = CommandTable::with_capacity(config.capacity);
         Leader {
             replay: crate::replay::EvidenceStore::new(config.capacity),
+            selection: None,
             config,
             boot: None,
             alloc: None,
@@ -377,6 +402,7 @@ impl Leader {
             outbox: self.outbox,
             frontend: self.config.frontend,
             capacity: self.config.capacity,
+            synced_selection: self.selection,
         }
     }
 
@@ -421,6 +447,7 @@ impl Leader {
             fenced: None,
             recovery_cycle: None,
             replay: crate::replay::EvidenceStore::new(state.capacity),
+            selection: Some(decision.clone()),
         };
         let _ = identity;
         // Dependency order among the entries: a command follows every
@@ -455,11 +482,37 @@ impl Leader {
         // since (task-d12, stress run d12-11). Depending on a command that
         // is already behind the tail orders nothing wrongly, so the chain
         // starts after all of them.
+        //
+        // Nor an entry that follows a re-proposed command: an acceptance
+        // the selection carries may name a dependency it re-proposes
+        // (task-d34, protocol_sim row 10, three voters, seed 58). Such an
+        // entry comes after that command's re-proposal, and chaining the
+        // re-proposals after it made a cycle; chaining them after the
+        // command alone left the entry and the next re-proposal both
+        // following it, two branches of one key's order that voters
+        // executed in different orders.
+        let mut dependents: BTreeMap<CommandId, Vec<CommandId>> = BTreeMap::new();
+        for (c, e) in &decision.entries {
+            for d in &e.deps {
+                dependents.entry(*d).or_default().push(*c);
+            }
+        }
+        // For each entry that follows a re-proposed command, the
+        // re-proposed commands it follows.
+        let mut awaits: BTreeMap<CommandId, BTreeSet<CommandId>> = BTreeMap::new();
+        for r in &decision.reproposed {
+            let mut stack = dependents.get(r).cloned().unwrap_or_default();
+            while let Some(e) = stack.pop() {
+                if awaits.entry(e).or_default().insert(*r) {
+                    stack.extend(dependents.get(&e).into_iter().flatten().copied());
+                }
+            }
+        }
         let mut last: Vec<CommandId> = Vec::new();
         if let Some(tail) = order
             .iter()
             .rev()
-            .find(|c| leader.table.phase_of(c) < Some(Phase::Executed))
+            .find(|c| leader.table.phase_of(c) < Some(Phase::Executed) && !awaits.contains_key(c))
         {
             last.push(*tail);
         }
@@ -479,8 +532,11 @@ impl Leader {
         // control lane in one pass, and the lane refused dozens of them
         // (task-d07).
         let mut published = 0usize;
-        for c in order {
-            let entry = &decision.entries[&c];
+        // An entry waiting on a re-proposed command is re-proposed right
+        // after it, below: before it, its dependency is not accepted here
+        // and the acceptance guard refuses it.
+        for c in order.iter().filter(|c| !awaits.contains_key(c)) {
+            let entry = &decision.entries[c];
             // A command selected as committed that this leader executed
             // has nothing left to decide: the Sync carries the commit, and
             // every voter installing it commits the command without a vote.
@@ -488,16 +544,33 @@ impl Leader {
             // a long history proposed hundreds of such commands in one
             // pass, and the lanes refused the ones it had not executed
             // along with them (task-d05).
-            if entry.phase >= Phase::Commit && leader.table.phase_of(&c) == Some(Phase::Executed) {
+            if entry.phase >= Phase::Commit && leader.table.phase_of(c) == Some(Phase::Executed) {
                 continue;
             }
             let deps = entry.deps.clone();
             let publish = published < REPROPOSE_BATCH;
             published += 1;
-            effects.extend(leader.repropose(c, deps, publish));
+            effects.extend(leader.repropose(*c, deps, publish));
         }
+        let mut done: BTreeSet<CommandId> = BTreeSet::new();
         for c in &decision.reproposed {
+            // The entries that follow `c` and nothing re-proposed after it:
+            // the chain goes on after the last of them, not after `c`.
+            done.insert(*c);
+            let ready: Vec<CommandId> = order
+                .iter()
+                .filter(|e| {
+                    awaits
+                        .get(e)
+                        .is_some_and(|rs| rs.contains(c) && rs.is_subset(&done))
+                })
+                .copied()
+                .collect();
             if leader.table.phase_of(c).is_none() {
+                effects.extend(leader.repropose_entries(decision, &ready, &mut published));
+                if !ready.is_empty() {
+                    last = ready_tails(decision, &last, &ready);
+                }
                 continue;
             }
             // A command this leader committed was decided in an earlier
@@ -507,13 +580,28 @@ impl Leader {
             // would give it other dependencies than the ones it was
             // decided with, and anchoring the next proposal after it
             // would fork the order at a command executed long ago.
+            //
+            // The entries that follow it are still this ballot's to
+            // propose: they were held out of the first pass, and leaving
+            // them here left them proposed nowhere, installed at ACCEPT
+            // with nothing to vote on, and everything chained after them
+            // waiting (task-d34 review). They name it among their
+            // dependencies, so they order after it everywhere.
             if leader.table.phase_of(c) >= Some(Phase::Commit) {
+                effects.extend(leader.repropose_entries(decision, &ready, &mut published));
+                if !ready.is_empty() {
+                    last = ready_tails(decision, &last, &ready);
+                }
                 continue;
             }
             let deps = core::mem::replace(&mut last, alloc::vec![*c]);
+            if !ready.is_empty() {
+                last = ready_tails(decision, &last, &ready);
+            }
             let publish = published < REPROPOSE_BATCH;
             published += 1;
             effects.extend(leader.repropose(*c, deps, publish));
+            effects.extend(leader.repropose_entries(decision, &ready, &mut published));
         }
         // The first fresh proposal of this ballot follows the recovered
         // order's tail. Re-proposing moved nothing in the table, so its
@@ -552,6 +640,28 @@ impl Leader {
     /// Propose a known command under this ballot with `deps`. With
     /// `publish` false the proposal is recorded and made durable but not
     /// sent: [`Leader::resend_unvoted`] sends it, paced (task-d07).
+    /// Re-propose `entries` of `decision`, in the order given, with their
+    /// selected dependencies (task-d34): the entries that waited on a
+    /// re-proposed command, once it is.
+    fn repropose_entries(
+        &mut self,
+        decision: &SyncDecision,
+        entries: &[CommandId],
+        published: &mut usize,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for c in entries {
+            let entry = &decision.entries[c];
+            if entry.phase >= Phase::Commit && self.table.phase_of(c) == Some(Phase::Executed) {
+                continue;
+            }
+            let publish = *published < REPROPOSE_BATCH;
+            *published += 1;
+            effects.extend(self.repropose(*c, entry.deps.clone(), publish));
+        }
+        effects
+    }
+
     fn repropose(
         &mut self,
         command: CommandId,
@@ -962,8 +1072,24 @@ impl Leader {
         let mut report =
             self.ledger
                 .report(self.config.identity.replica, ballot, self.ballots.synced());
+        // The report is labelled with the ballot this leader synchronized
+        // to, and its selection is that ballot's state, whether or not its
+        // re-proposal batches are durable yet, or were made at all for an
+        // entry whose payload it lacks (task-d34). Reported from the rows
+        // alone, a command it selected at ACCEPT read as this replica's
+        // older PRE-ACCEPT, or as never accepted, at the source ballot,
+        // and the next selection re-proposed a command another voter had
+        // executed.
+        if let Some(selection) = self
+            .selection
+            .as_ref()
+            .filter(|d| d.ballot == self.ballots.synced())
+        {
+            crate::follower::overlay_selected(&mut report, selection.entries.iter());
+        }
         report.entries.retain(|e| !self.table.forgotten(&e.command));
         crate::follower::report_executed_as_committed(&mut report, &self.table);
+        report.entries.sort_by_key(|e| e.command);
         report
     }
 
