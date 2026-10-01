@@ -19,7 +19,8 @@ that ran while the history was short.
 
 `gate` fails when, at any caller count the baseline records, the
 busiest voter's busy time per command, over the run or over its last
-quarter, the second over the first, or its journal syncs per command
+quarter, any voter's second over its first, or the busiest voter's
+journal syncs per command
 exceed the baseline by more than the baseline's stated margin. The
 ratio is where work that grows with history shows first, whatever the
 machine's speed: a uniform slowdown moves both readings and leaves it. Each caller count is run more than
@@ -175,9 +176,16 @@ GATED = (
 
 def reading(run: dict, field: str) -> float:
     """A run's gated reading: the busiest voter's, or for `tail_ratio`
-    the busiest voter's last quarter over its whole run."""
+    the largest of each voter's last quarter over its own whole run.
+    The ratio is taken per voter: the largest last quarter over the
+    largest whole run, from two voters, would hide a follower whose
+    cost grew under a leader that is busier throughout."""
     if field == "tail_ratio":
-        return busiest(run, "tail_busy_ms_per_command") / busiest(run, "busy_ms_per_command")
+        return max(
+            voter["tail_busy_ms_per_command"] / voter["busy_ms_per_command"]
+            for voter in run["voters"]
+            if voter["busy_ms_per_command"] > 0
+        )
     return busiest(run, field)
 
 

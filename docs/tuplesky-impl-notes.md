@@ -8363,8 +8363,17 @@ Completed commands a second are reported and never gated. The `command cost` job
 - **The ratio** of the last quarter to the whole run is what grows
   when the cost of a command grows with history, and it needs no
   machine to compare with: a faster runner moves both readings, not
-  their ratio. The baseline is 1.22 at one caller and 1.15 at ten; the
-  control above reads 1.69 at both and fails it. An unchanged run on
+  their ratio. It is each voter's own, and the largest is gated: the
+  largest last quarter over the largest whole run, taken from two
+  voters, would hide a follower whose cost grew under a leader busier
+  throughout. Per voter it is noisier than the busiest voter's alone
+  (each of three voters reads its own ~650-command window): unchanged
+  code read up to 1.25 and 1.15 (one caller, ten) on the runner at
+  0c2b7ff and up to 1.41 and 1.30 at b68dc01, and the baseline is the
+  larger. The control above reads 1.69 at both, which fails the ratio
+  at ten callers only, by a hair; it is the busy readings, at more than
+  twice the baseline, that catch it. The ratio is the backstop for
+  growth on a machine fast enough to hide it from those. An unchanged run on
   this container once read 2.35 ms over the last quarter at ten callers
   against the runner's 1.67, and a re-run read within the baseline. No
   local checkpoint falls in that window (each run's exports land

@@ -34,7 +34,9 @@ def log(*snapshots, tail=""):
     return "\n".join(lines) + "\n" + tail
 
 
-def run(callers, busy_ms, syncs, tail_ms=(1.0, 1.0)):
+def run(callers, busy_ms, syncs, tail_ms=None):
+    # By default each voter's last quarter costs what its whole run did.
+    tail_ms = tail_ms or busy_ms
     return {"callers": callers, "voters": [
         {"node": "n1", "busy_ms_per_command": busy_ms[0], "journal_syncs_per_command": syncs[0],
          "tail_busy_ms_per_command": tail_ms[0]},
@@ -47,10 +49,10 @@ BASELINE = {
     "margins": {"busy_ms_per_command": 0.25, "tail_busy_ms_per_command": 0.25,
                 "tail_ratio": 0.30, "journal_syncs_per_command": 0.10},
     "runs": [
-        {"callers": 1, "busy_ms_per_command": 10.0, "tail_busy_ms_per_command": 1.0,
-         "tail_ratio": 0.1, "journal_syncs_per_command": 5.0},
-        {"callers": 10, "busy_ms_per_command": 8.0, "tail_busy_ms_per_command": 1.0,
-         "tail_ratio": 0.125, "journal_syncs_per_command": 4.0},
+        {"callers": 1, "busy_ms_per_command": 10.0, "tail_busy_ms_per_command": 10.0,
+         "tail_ratio": 1.0, "journal_syncs_per_command": 5.0},
+        {"callers": 10, "busy_ms_per_command": 8.0, "tail_busy_ms_per_command": 8.0,
+         "tail_ratio": 1.0, "journal_syncs_per_command": 4.0},
     ],
 }
 
@@ -110,13 +112,14 @@ class GateTests(unittest.TestCase):
         self.assertEqual(cost.gate(BASELINE, result), [])
 
     def test_the_busiest_voter_is_what_is_gated(self):
-        result = {"runs": [run(1, (2.0, 12.6), (5.0, 5.0)), run(10, (8.0, 8.0), (4.0, 4.0))]}
+        result = {"runs": [run(1, (2.0, 12.6), (5.0, 5.0), tail_ms=(2.0, 12.0)),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
         self.assertIn("busy_ms_per_command", failures[0])
 
     def test_a_last_quarter_past_the_margin_fails(self):
-        result = {"runs": [run(1, (10.0, 10.0), (5.0, 5.0), tail_ms=(1.0, 1.3)),
+        result = {"runs": [run(1, (10.0, 10.0), (5.0, 5.0), tail_ms=(10.0, 12.8)),
                            run(10, (8.0, 8.0), (4.0, 4.0))]}
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
@@ -125,11 +128,21 @@ class GateTests(unittest.TestCase):
     def test_a_last_quarter_grown_past_the_run_fails_on_any_machine(self):
         # A faster machine: both readings under the baseline's, but the
         # last quarter has grown against the run past the ratio's margin.
-        result = {"runs": [run(1, (7.0, 7.0), (5.0, 5.0), tail_ms=(1.0, 1.0)),
+        result = {"runs": [run(1, (7.0, 7.0), (5.0, 5.0), tail_ms=(7.0, 9.5)),
                            run(10, (8.0, 8.0), (4.0, 4.0))]}
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
         self.assertIn("tail_ratio", failures[0])
+
+    def test_the_ratio_is_each_voters_own(self):
+        # A follower's last quarter grew 40% over its own run while the
+        # leader, busier throughout, did not: the largest last quarter
+        # over the largest whole run (1.0) would hide it.
+        result = {"runs": [run(1, (10.0, 2.0), (5.0, 5.0), tail_ms=(10.0, 2.8)),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
+        failures = cost.gate(BASELINE, result)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("tail_ratio 1.400", failures[0])
 
     def test_syncs_past_the_margin_fail(self):
         result = {"runs": [run(1, (10.0, 10.0), (5.6, 5.0)), run(10, (8.0, 8.0), (4.0, 4.0))]}
@@ -139,12 +152,15 @@ class GateTests(unittest.TestCase):
 
     def test_the_median_of_the_repeats_is_what_is_gated(self):
         # One repeat far past the margin, two within it: the median passes.
-        result = {"runs": [run(1, (20.0, 1.0), (5.0, 5.0)), run(1, (10.0, 1.0), (5.0, 5.0)),
-                           run(1, (11.0, 1.0), (5.0, 5.0)), run(10, (8.0, 8.0), (4.0, 4.0))]}
+        flat = (10.0, 1.0)
+        result = {"runs": [run(1, (20.0, 1.0), (5.0, 5.0), flat),
+                           run(1, (10.0, 1.0), (5.0, 5.0), flat),
+                           run(1, (11.0, 1.0), (5.0, 5.0), flat),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
         self.assertEqual(cost.gate(BASELINE, result), [])
         # Two of three past it: the median fails.
-        result["runs"][1] = run(1, (13.0, 1.0), (5.0, 5.0))
-        result["runs"][2] = run(1, (14.0, 1.0), (5.0, 5.0))
+        result["runs"][1] = run(1, (13.0, 1.0), (5.0, 5.0), flat)
+        result["runs"][2] = run(1, (14.0, 1.0), (5.0, 5.0), flat)
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
         self.assertIn("median of 3", failures[0])
