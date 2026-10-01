@@ -1544,6 +1544,8 @@ fn the_collector_event_trace_is_frozen_for_go_reuse() {
             CollectorEvent::Reconfigured { .. } => "reconfigured",
             CollectorEvent::Reoffered { .. } => "reoffered",
             CollectorEvent::Undisseminated { .. } => "undisseminated",
+            CollectorEvent::VoterRefused { .. } => "voter-refused",
+            CollectorEvent::Solicited { .. } => "solicited",
         })
         .collect();
     for k in [

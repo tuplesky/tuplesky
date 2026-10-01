@@ -44,7 +44,7 @@ use crate::commands::{CommandRecord, CommandTable, InitError};
 use crate::learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 use crate::messages::{
     CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
-    MAX_PROPOSAL_ASK, ProtocolMessage,
+    MAX_PROPOSAL_ASK, ProtocolMessage, SubmissionRefusal,
 };
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
@@ -2961,6 +2961,35 @@ impl Follower {
         Vec::new()
     }
 
+    /// Tell the frontend that submitted `command` why this replica did
+    /// nothing with it (task-d22): a refusal that produced no effect left
+    /// the collector's entry pending for good. Not durable, and not
+    /// needed to be: a collector that misses it solicits again.
+    fn refuse(&mut self, command: CommandId, refusal: SubmissionRefusal) -> Vec<Effect> {
+        let Some(boot) = self.boot else {
+            return Vec::new();
+        };
+        let ballot = self.config.quorum.ballot();
+        let context = self
+            .ballots
+            .context(boot, self.ballots.promised(), LocalJournalSeq::ZERO);
+        let frame = ProtocolMessage::Refused {
+            ballot,
+            command,
+            refusal,
+        }
+        .encode();
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.publish(PendingSend {
+                context,
+                requires: Vec::new(),
+                to: self.config.frontend,
+                frame,
+            });
+        }
+        self.release()
+    }
+
     /// How often `command`'s evidence has been published again this boot
     /// (diagnostic).
     pub fn evidence_repairs(&self, command: &CommandId) -> u32 {
@@ -3028,11 +3057,14 @@ impl Follower {
         };
         match self.bindings.get(&retry_key) {
             Some(bound) if *bound != command => {
+                let bound = *bound;
                 self.rejections
-                    .push(FollowerRejection::RequestIdentityConflict {
-                        retry_key,
-                        bound: *bound,
-                    });
+                    .push(FollowerRejection::RequestIdentityConflict { retry_key, bound });
+                // Said only once the binding is durable: one a crash could
+                // still undo is no answer about the key.
+                if self.served_payloads.contains(&bound) {
+                    return self.refuse(command, SubmissionRefusal::OtherCommand { bound });
+                }
                 return Vec::new();
             }
             // The same identity again. Whether it is the same *request*
@@ -3055,14 +3087,16 @@ impl Follower {
                     Some(accepted) => {
                         self.rejections
                             .push(FollowerRejection::RequestFactsConflict { command, accepted });
-                        Vec::new()
+                        self.refuse(command, SubmissionRefusal::OtherFacts { accepted })
                     }
                     // Bound but no payload row to compare against: nothing
                     // here can vouch for the facts, so nothing is replayed
-                    // and nothing is re-initialized over the binding.
+                    // and nothing is re-initialized over the binding. The
+                    // command went to history, and what it did is in the
+                    // durable record.
                     None => {
                         self.rejections.push(FollowerRejection::Duplicate(command));
-                        Vec::new()
+                        self.refuse(command, SubmissionRefusal::Forgotten)
                     }
                 };
             }
@@ -3121,7 +3155,12 @@ impl Follower {
             Err(InitError::PayloadConflict) => {
                 self.rejections
                     .push(FollowerRejection::PayloadConflict(command));
-                return Vec::new();
+                return match self.table.record(&command).and_then(|r| r.payload) {
+                    Some(accepted) => {
+                        self.refuse(command, SubmissionRefusal::OtherFacts { accepted })
+                    }
+                    None => Vec::new(),
+                };
             }
         };
         self.bindings.insert(retry_key, command);
@@ -3972,7 +4011,7 @@ impl Follower {
                 }
                 out
             }
-            ProtocolMessage::LeaderReply { .. } => Vec::new(),
+            ProtocolMessage::LeaderReply { .. } | ProtocolMessage::Refused { .. } => Vec::new(),
         }
     }
 

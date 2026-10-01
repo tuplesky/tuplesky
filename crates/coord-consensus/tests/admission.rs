@@ -175,9 +175,15 @@ fn a_fresh_receipt_on_a_retry_does_not_replace_what_was_accepted() {
     );
 
     // A second presentation of the same command with another receipt.
+    // Nothing new is proposed for a command already accepted: the only
+    // effect is the reason, to the frontend (task-d22).
+    let effects = f.step(admitted(4, 99));
     assert!(
-        f.step(admitted(4, 99)).is_empty(),
-        "nothing new is proposed for a command already accepted"
+        effects.len() == 1
+            && effects.iter().all(|e| matches!(e, Effect::SendWhenDurable { frame, .. }
+                if matches!(ProtocolMessage::decode(frame),
+                    Ok(ProtocolMessage::Refused { refusal: coord_consensus::SubmissionRefusal::OtherFacts { .. }, .. })))),
+        "{effects:?}"
     );
     // The same identity under other facts is a conflict, not a
     // duplicate: nothing is replayed for it, because what this replica

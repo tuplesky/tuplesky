@@ -139,6 +139,10 @@ pub struct Counts {
     /// that had not taken it. Not second submissions: the same
     /// envelope, the same command identity.
     pub reoffered: u64,
+    /// Submissions of pending commands that held neither half of a
+    /// release, sent to every voter again to ask for their evidence
+    /// (task-d22).
+    pub solicited: u64,
     /// Submissions this node's own voter refused at its door.
     pub refused: u64,
     /// Results the collector released to a waiting caller.
@@ -1138,8 +1142,11 @@ struct Reoffers<'a> {
 
 impl Deadline for Reoffers<'_> {
     fn next_deadline(&self) -> Option<std::time::Instant> {
-        self.dispatcher
-            .next_due()
+        // A re-offer, or a command due to be asked for again (task-d22).
+        [self.dispatcher.next_due(), self.dispatcher.next_solicit()]
+            .into_iter()
+            .flatten()
+            .min()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()))
     }
 }
@@ -1210,6 +1217,12 @@ const UNDELIVERABLE_SAID_AT: u64 = 64;
 /// crowd out the work it exists to enable. This is the whole of what a
 /// turn spends on it; what is still owed after that is owed on the next
 /// turn, on the collector's schedule.
+///
+/// Solicitation spends the same number of destinations a turn on its own
+/// (`due_solicits`), an entry's voters all at once or not at all: a
+/// configuration of more than 16 voters would never solicit. Voter counts
+/// are three or five (task-d31), so this is moot today, and has to change
+/// with this bound if that does.
 const OFFERS_PER_TURN: usize = 16;
 
 /// How many peer events in a row are taken before the caller's plane is
@@ -2682,7 +2695,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .frontend
             .dispatcher_mut()
             .due_offers(now, OFFERS_PER_TURN);
-        for plan in due {
+        // And the commands that have held neither half of a release long
+        // enough, submitted to every voter again to ask for what they
+        // said (task-d22). The same fan-out and the same offer report: a
+        // voter that took the submission answers it again.
+        let solicits = self
+            .frontend
+            .frontend
+            .dispatcher_mut()
+            .due_solicits(now, OFFERS_PER_TURN);
+        let plans = due
+            .into_iter()
+            .map(|plan| (plan, false))
+            .chain(solicits.into_iter().map(|plan| (plan, true)));
+        for (plan, solicit) in plans {
             let command = plan.command;
             let out = fanout::dispatch(
                 &self.frontend.membership,
@@ -2693,12 +2719,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     .map(|l| l as &dyn fanout::LocalIngress),
                 &plan,
             );
-            self.frontend.counts.reoffered += 1;
+            if solicit {
+                self.frontend.counts.solicited += 1;
+            } else {
+                self.frontend.counts.reoffered += 1;
+            }
             self.record_offer(command, &out);
             // Said, and said less as it goes on: a re-offer is delivery
             // backpressure being worked off, which an operator wants to
             // know is happening without a line per attempt.
-            if let Some(n) = self.recurring.seen("reoffered") {
+            if !solicit && let Some(n) = self.recurring.seen("reoffered") {
                 eprintln!(
                     "this collector offered a submission again to a voter that could not take it ({n} so far)"
                 );
@@ -2781,6 +2811,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let (this_turn, cursor) =
             coord_daemon::settle::window(half, self.settle_cursor, SETTLE_PER_TURN);
         self.settle_cursor = cursor;
+        let conflicts =
+            coord_daemon::settle::conflicts_for(self.backing.applier(), this_turn.iter().copied());
         let records = coord_daemon::settle::records_for(self.backing.applier(), this_turn);
         // The release this collector holds and what this node executed
         // disagreeing is not an ordinary outcome: every replica executes
@@ -2805,6 +2837,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 self.frontend.counts.settled_from_record += settled;
                 for delivery in deliveries {
                     self.answer(delivery);
+                }
+                // A key this node's record binds to another command: the
+                // domain executed that one under it (task-d22).
+                for (command, bound) in conflicts {
+                    let dispatcher = self.frontend.frontend.dispatcher_mut();
+                    if let Ok(delivery) = dispatcher.settle_conflict_from_record(command, bound) {
+                        self.frontend.counts.settled_from_record += 1;
+                        if let Some(delivery) = delivery {
+                            self.answer(delivery);
+                        }
+                    }
                 }
                 None
             }
