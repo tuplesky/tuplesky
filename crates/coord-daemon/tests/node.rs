@@ -799,6 +799,72 @@ fn lowering_in_groups_the_commands_ready_together_execute_as_one_group() {
     );
 }
 
+/// Lowering in groups, a staged group is journaled by the flush with
+/// the protocol's batches, and materialized, its results handed out,
+/// only by [`Node::finish`] (task-d47).
+///
+/// So what the journal append released -- votes, on a voter with peers --
+/// goes out after one sync, not after the group's projection commit too.
+#[test]
+fn lowering_in_groups_a_staged_group_is_journaled_by_the_flush_and_answered_by_finish() {
+    let boot = BootId([10; 16]);
+    let mut node = journaled_lone_leader(boot);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    for sequence in 1..=5 {
+        node.on_event(Event::Admitted(admitted(sequence)), &ballot())
+            .expect("admitted");
+    }
+    node.flush(&ballot()).expect("flushed");
+    assert!(node.can_execute());
+
+    let cost = |node: &Node<JournaledDomain<ModelJournal, ModelEngine>>| {
+        node.applier().store().cost().expect("counted").lowering
+    };
+    let before = cost(&node);
+    let revision_before = node.applier().kv_revision().unwrap();
+    let mut out = node.stage(&ballot()).expect("staged");
+    out.absorb(node.flush(&ballot()).expect("flushed"));
+    let journaled = cost(&node);
+    assert_eq!(node.executed, 5);
+    assert!(node.applier().in_group(), "the group stays staged");
+    assert_eq!(journaled.appends - before.appends, 1, "one journal append");
+    assert_eq!(
+        journaled.commits, before.commits,
+        "no projection commit yet"
+    );
+    assert_eq!(node.applier().kv_revision().unwrap(), revision_before);
+    assert!(
+        out.frontend.is_empty(),
+        "a result went out before its group materialized"
+    );
+
+    let out = node.finish(&ballot()).expect("finished");
+    let finished = cost(&node);
+    assert!(!node.applier().in_group());
+    assert_eq!(
+        finished.appends, journaled.appends,
+        "nothing left to journal"
+    );
+    assert_eq!(
+        finished.commits - journaled.commits,
+        1,
+        "one projection commit"
+    );
+    assert!(node.applier().kv_revision().unwrap() > revision_before);
+    assert!(
+        !out.frontend.is_empty(),
+        "the results went to the collector"
+    );
+}
+
 /// Lowering in groups, a proposal goes to the voters only once the flush
 /// has made its own record journal-durable (task-d47).
 ///

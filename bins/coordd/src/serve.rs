@@ -2355,7 +2355,29 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let Backing::Voting(voter) = &mut self.backing else {
             return false;
         };
-        match voter.flush() {
+        // What the journal append released goes out before the execution
+        // group's projection commit, and the group's results after it.
+        let journaled = voter.flush();
+        if self.stops_on(api, journaled) {
+            return true;
+        }
+        let Backing::Voting(voter) = &mut self.backing else {
+            unreachable!("checked above");
+        };
+        let finished = voter.finish();
+        self.stops_on(api, finished)
+    }
+
+    /// Send one step of a flush's output, or report why the voter stops.
+    fn stops_on(
+        &mut self,
+        api: &Transport,
+        step: Result<coord_daemon::Outbound, DriveError>,
+    ) -> bool {
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        match step {
             Ok(out) => {
                 let provenance = voter.provenance();
                 self.frontend.follow(voter.node().machine().active());

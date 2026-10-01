@@ -501,6 +501,9 @@ pub struct Node<P: Persistence> {
     /// Whether a [`Node::flush`] is running: its rounds lower what they
     /// persist rather than leave it queued.
     flushing: bool,
+    /// What the commands of a staged execution group led to, carried out
+    /// once [`Node::finish`] has materialized the group (task-d47).
+    staged: Vec<Effect>,
 }
 
 /// Most commands one execution group applies before it is lowered
@@ -539,6 +542,7 @@ impl<P: Persistence> Node<P> {
             floor: None,
             grouped: false,
             flushing: false,
+            staged: Vec::new(),
         }
     }
 
@@ -602,7 +606,11 @@ impl<P: Persistence> Node<P> {
         // to carry out.
         self.unreleased = true;
         let mut out = self.carry_out(next, ballot)?;
-        if self.grouped && self.applier.store().unmaterialized() > 0 && !self.can_execute() {
+        if self.grouped
+            && !self.applier.in_group()
+            && self.applier.store().unmaterialized() > 0
+            && !self.can_execute()
+        {
             let mut next = Vec::new();
             self.lower_once(&mut next, false)?;
             out.absorb(self.carry_out(next, ballot)?);
@@ -1252,6 +1260,27 @@ impl<P: Persistence> Node<P> {
             outcome.indeterminate = settled.indeterminate;
         }
         for event in outcome.events {
+            // A staged execution group's batches are journaled with the
+            // protocol's (task-d47); they are the applier's to complete,
+            // and none of the machine's. One definitely not journaled is
+            // a command reported applied that will not be.
+            if event
+                .barrier()
+                .is_some_and(|barrier| coord_core::outbox::is_application(&barrier))
+            {
+                if matches!(
+                    event,
+                    StorageEvent::Failed {
+                        error: coord_core::event::StorageError::DefinitelyNotCommitted,
+                        ..
+                    }
+                ) {
+                    return Err(DriveError::Engine(
+                        "an execution group was definitely not journaled".into(),
+                    ));
+                }
+                continue;
+            }
             self.outbox.observe(&event);
             next.extend(self.machine_mut().step(Event::Storage(event)));
         }
@@ -1323,14 +1352,41 @@ impl<P: Persistence> Node<P> {
     /// path rather than the early one -- slower, never wrong -- which is
     /// the preview's behaviour and not the architecture's.
     pub fn execute(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        self.run_executions(ballot, false)
+    }
+
+    /// Apply the commands whose turn has come, as [`Node::execute`] does,
+    /// but leave the last group staged: submitted, not lowered, and its
+    /// results held (task-d47). A [`Node::flush`] then journals it with
+    /// the protocol's batches in one append, and [`Node::finish`]
+    /// materializes it and hands out its results.
+    pub fn stage(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        self.run_executions(ballot, true)
+    }
+
+    /// Materialize the staged execution group, if there is one, and carry
+    /// out what its commands led to (task-d47).
+    pub fn finish(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        if !self.applier.in_group() {
+            return Ok(Outbound::default());
+        }
+        let mut held = core::mem::take(&mut self.staged);
+        self.close_group(&mut held, ballot)
+    }
+
+    fn run_executions(&mut self, ballot: &Ballot, stage: bool) -> Result<Outbound, DriveError> {
         let mut out = Outbound::default();
         // What the commands of an open group led to: carried out once the
         // group has materialized, never before (task-d47).
-        let mut held: Vec<Effect> = Vec::new();
+        let mut held: Vec<Effect> = core::mem::take(&mut self.staged);
         loop {
             let Some(command) = self.machine().next_executable() else {
-                // What the group led to may let more commands execute.
                 if self.applier.in_group() {
+                    if stage {
+                        self.staged = held;
+                        break;
+                    }
+                    // What the group led to may let more commands execute.
                     out.absorb(self.close_group(&mut held, ballot)?);
                     continue;
                 }
@@ -1351,7 +1407,11 @@ impl<P: Persistence> Node<P> {
                 // and the runtime asks for what it is missing.
                 self.awaiting = Some(command);
                 if self.applier.in_group() {
-                    out.absorb(self.close_group(&mut held, ballot)?);
+                    if stage {
+                        self.staged = held;
+                    } else {
+                        out.absorb(self.close_group(&mut held, ballot)?);
+                    }
                 }
                 return Ok(out);
             };

@@ -654,19 +654,25 @@ impl<P: Persistence> Voter<P> {
         self.node.machine().leads()
     }
 
-    /// Lower what this voter's rounds left queued, then apply every
-    /// command whose turn has come, and hand out what that released
-    /// (task-d47, [`Node::flush`]). A runtime lowering in groups calls
-    /// this rather than [`Voter::execute`], once it has no more events
-    /// ready, so the commands that executed in the meantime are one group
-    /// and the protocol's batches lowered beside them.
+    /// Apply every command whose turn has come as a staged group, journal
+    /// it with what this voter's rounds left queued, and hand out what
+    /// that released (task-d47, [`Node::stage`], [`Node::flush`]). A
+    /// runtime lowering in groups calls this, then [`Voter::finish`],
+    /// rather than [`Voter::execute`], once it has no more events ready.
     pub fn flush(&mut self) -> Result<Outbound, DriveError> {
-        // The protocol's batches first, so the votes they carry go out
-        // after one journal sync, and not after the execution group's
-        // projection commit as well.
-        let mut out = self.node.flush(&self.ballot)?;
-        out.absorb(self.node.execute(&self.ballot)?);
+        // The ready commands are staged first, so their batches and the
+        // protocol's share one journal append; what that releases is
+        // handed out here, before the group's projection commit, and the
+        // group's results by [`Voter::finish`] after it.
+        let mut out = self.node.stage(&self.ballot)?;
+        out.absorb(self.node.flush(&self.ballot)?);
         Ok(out)
+    }
+
+    /// Materialize the execution group a [`Voter::flush`] staged and hand
+    /// out its results (task-d47).
+    pub fn finish(&mut self) -> Result<Outbound, DriveError> {
+        self.node.finish(&self.ballot)
     }
 
     /// Whether [`Voter::flush`] has anything to do: batches queued, or a
