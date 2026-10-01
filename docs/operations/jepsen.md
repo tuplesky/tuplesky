@@ -143,7 +143,7 @@ SSH, and fails unless every voter takes a write.
 weekly. It builds `coordd`, `coord-harness` and `coord-jepsen` in release
 mode, checks `tuplesky/jepsen` out at `jepsen-ref`, stands a five-node
 cluster up, smokes it, and runs one test (the `scenario`, below, with the
-`workload`, `nemesis`, `wan` and `time-limit` inputs overriding it). The test's store directory is
+`workload`, `nemesis`, `wan`, `time-limit` and `concurrency` inputs overriding it). The test's store directory is
 uploaded as an artifact, without the provisioned run directory, which
 holds the domain's fixture keys. The containers share the runner's clock,
 so the workflow does not offer the `clock` fault.
@@ -155,7 +155,9 @@ merged (tuplesky/jepsen#1); a run can name another branch, tag or commit.
 
 The `scenario` input sets the load, the faults and the network for all
 three jobs (`scripts/ci/jepsen_scenario.sh`); a non-empty `workload`,
-`nemesis`, `swiftpaxos`, `wan` or `time-limit` input overrides its value.
+`nemesis`, `swiftpaxos`, `wan`, `time-limit` or `concurrency` input
+overrides its value. `concurrency` is Jepsen's: a number of clients, or a
+multiple of the nodes such as `5n`; a throughput sweep is one run a value.
 
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |
@@ -377,7 +379,15 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   `ProposalRepublished` after the final start, from the last "Jepsen
   starting" line the final heal writes into every node's log. A leader
   that goes on republishing its lease command after the heal, the stall
-  #109 closed, shows there.
+  #109 closed, shows there;
+* and the stages each voter timed (journal writes, materialization,
+  admission: completed, refused, mean, max and total time), from the
+  `metrics` line `coordd` prints when its serving loop ends. Jepsen stops
+  `coordd` with `SIGKILL`, which prints none, so the table is there only
+  for a voter that stopped on its own; it is how a run would confirm the
+  journal's synchronous writes once `coordd` reports them on a signal or
+  periodically. The raft-engine journal's sync count (`WriteStats`) is not
+  in that line at all.
 
 The last 400 lines of each voter's log follow in the TupleSky job's log.
 

@@ -8,6 +8,8 @@
 #   IN_NEMESIS     their faults; empty for the scenario's
 #   IN_SWIFTPAXOS  SwiftPaxos's faults; empty for the scenario's
 #   IN_TIME_LIMIT  seconds of workload; empty for the scenario's
+#   IN_CONCURRENCY clients, a number or a multiple of the nodes (5n);
+#                  empty for the scenario's
 #   IN_WAN         the network: none, regions, or one-way milliseconds;
 #                  empty for the scenario's
 #
@@ -46,6 +48,12 @@ workload=${IN_WORKLOAD:-$workload}
 nemesis=${IN_NEMESIS:-$nemesis}
 swiftpaxos=${IN_SWIFTPAXOS:-$swiftpaxos}
 time_limit=${IN_TIME_LIMIT:-$time_limit}
+concurrency=${IN_CONCURRENCY:-$concurrency}
+case $concurrency in
+  *[!0-9n]* | "" | n* | *n?*)
+    echo "::error::concurrency '$concurrency' is not a number or a multiple of the nodes (5n)" >&2
+    exit 1 ;;
+esac
 wan=${IN_WAN:-$wan}
 
 # The etcd test's --rate must be positive; 100000 a second staggers its
@@ -60,7 +68,11 @@ if [ "$nemesis" = none ]; then recovery_time=0; fi
 
 # Appended to each job summary's title, after the system, workload and faults.
 suffix=""
-if [ "$rate" = 0 ]; then suffix+=", unthrottled at $concurrency"; fi
+if [ "$rate" = 0 ]; then
+  suffix+=", unthrottled at $concurrency"
+elif [ -n "${IN_CONCURRENCY:-}" ]; then
+  suffix+=", $concurrency clients"
+fi
 if [ "$wan" != none ]; then suffix+=", wan $wan"; fi
 
 out=${GITHUB_ENV:-/dev/stdout}

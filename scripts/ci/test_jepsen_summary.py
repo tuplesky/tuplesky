@@ -55,6 +55,7 @@ this voter's machine refused: Backpressure (1 so far)
 this voter's machine refused: Promise(CandidateBehind { candidate: ExecutionPosition(1), own: ExecutionPosition(9) }) (1 so far)
 cannot reach a voter on the peer plane: voter 02 Control: 127.0.0.1:7002: Rejected(Transport("connection lost")) (3 so far)
 cannot reach a voter to submit to it: voter 02: 127.0.0.1:7102: Rejected(Timeout) (1 so far)
+metrics {"stages":[{"stage":"Admission","metrics":{"Observed":{"entered":40,"completed":38,"refused":2,"latency":{"count":38,"total":{"secs":0,"nanos":19000000},"max":{"secs":0,"nanos":2000000}}}}},{"stage":"ClientTransit","metrics":{"Unavailable":"NotInstrumented"}},{"stage":"Journal","metrics":{"Observed":{"entered":120,"completed":120,"refused":0,"latency":{"count":120,"total":{"secs":1,"nanos":200000000},"max":{"secs":0,"nanos":45500000}}}}},{"stage":"Materialization","metrics":{"Observed":{"entered":0,"completed":0,"refused":0,"latency":{"count":0,"total":{"secs":0,"nanos":0},"max":{"secs":0,"nanos":0}}}}}],"durability":{"Unavailable":"NotInstrumented"}}
 """
 
 
@@ -87,6 +88,14 @@ class ParseTests(unittest.TestCase):
         self.assertNotIn("alert 120", v.counts)
         self.assertNotIn("stopped", v.counts)
         self.assertEqual(v.after_start, {})
+
+    def test_stages_from_the_last_metrics_line(self):
+        v = js.parse_voter(VOTER.splitlines(keepends=True))
+        # The first boot's empty snapshot is replaced by the last one, and
+        # a stage that is not instrumented is left out, not read as zero.
+        self.assertEqual(set(v.stages), {"Admission", "Journal", "Materialization"})
+        self.assertEqual(v.stages["Journal"], (120, 120, 0, 120, 1.2, 0.0455))
+        self.assertEqual(js.parse_voter(["metrics {not json\n"]).stages, {})
 
     def test_counts_after_the_final_start(self):
         republished = "this voter's machine refused: ProposalRepublished(CommandIdDigest32(ab)) ({} so far)\n"
@@ -163,6 +172,12 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("| n1 | 2 | 9 | 5820 | follows ballot 3 led by 02020202 | 3 |", self.text)
         # A store that did not open reads "?", not a number.
         self.assertIn("| n2 | 2 | 9 | ? | follows ballot 3 led by 02020202 | 3 |", self.text)
+
+    def test_stages(self):
+        self.assertIn("| n1 | Journal | 120 | 0 | 10.00 | 45.5 | 1.2 |", self.text)
+        self.assertIn("| n2 | Admission | 38 | 2 | 0.50 | 2.0 | 0.0 |", self.text)
+        # A stage nothing passed through has no row.
+        self.assertNotIn("Materialization", self.text)
 
     def test_executed_at_end_without_a_file(self):
         with tempfile.TemporaryDirectory() as d:

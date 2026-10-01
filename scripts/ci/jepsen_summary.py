@@ -15,7 +15,10 @@ directory (`store/latest`) and writes what a reader looks for first:
 * the faults, in order;
 * for a TupleSky run, one row per voter from its `coordd.log`: boots,
   where it last recovered, its last role and the refusals and stops that
-  mark the failures seen so far.
+  mark the failures seen so far;
+* and the stages each voter timed in its last boot (journal writes,
+  materialization, admission), from the `metrics` line it prints when it
+  stops cleanly.
 
     scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
 
@@ -29,6 +32,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime
+import json
 import math
 import os
 import re
@@ -109,6 +113,37 @@ class Voter:
     # final heal starts every node (or finds it running) and says so in
     # its log, so this is what a voter did after the final heal.
     after_start: dict = field(default_factory=dict)
+    # The stages the last `metrics` line reports as observed, by name:
+    # (entered, completed, refused, samples, total seconds, max seconds).
+    # A voter prints it when it stops cleanly, so it covers the boot that
+    # ran to the end, and a killed boot has none.
+    stages: dict = field(default_factory=dict)
+
+
+def parse_stages(snapshot: dict) -> dict:
+    """The observed stages of a coordd metrics snapshot (task-61): its
+    `stages` are `{"stage": name, "metrics": {"Observed": {...}}}` or an
+    `Unavailable` reason, and each latency's durations are serde's
+    `{"secs", "nanos"}`."""
+
+    def seconds(d) -> float:
+        return d.get("secs", 0) + d.get("nanos", 0) / 1e9 if isinstance(d, dict) else 0.0
+
+    out = {}
+    for reading in snapshot.get("stages") or []:
+        m = (reading.get("metrics") or {}).get("Observed") if isinstance(reading, dict) else None
+        if not isinstance(m, dict):
+            continue
+        lat = m.get("latency") or {}
+        out[reading.get("stage", "?")] = (
+            m.get("entered", 0),
+            m.get("completed", 0),
+            m.get("refused", 0),
+            lat.get("count", 0),
+            seconds(lat.get("total")),
+            seconds(lat.get("max")),
+        )
+    return out
 
 
 def parse_time(ts: str) -> datetime.datetime:
@@ -177,6 +212,10 @@ def parse_voter(lines) -> Voter:
 
     for line in lines:
         if line.startswith("metrics "):
+            try:
+                v.stages = parse_stages(json.loads(line[len("metrics "):]))
+            except (ValueError, AttributeError):
+                pass
             continue
         if STARTING in line:
             v.after_start = {}
@@ -457,6 +496,20 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
                 f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} | {v.role} | {ballot} | {counts} | {after} |"
             )
         out.append("")
+        timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
+        if timed:
+            out.append(
+                "**Stages** (each voter's last boot, from the `metrics` line it prints when it stops; "
+                "a `Journal` write is one synchronous store write)"
+            )
+            out.append("")
+            out.append("| Node | Stage | Completed | Refused | Mean (ms) | Max (ms) | Total (s) |")
+            out.append("| --- | --- | --- | --- | --- | --- | --- |")
+            for node, name, (_, completed, refused, samples, total, peak) in timed:
+                mean = f"{total / samples * 1000:.2f}" if samples else "-"
+                peak_ms = f"{peak * 1000:.1f}" if samples else "-"
+                out.append(f"| {node} | {name} | {completed} | {refused} | {mean} | {peak_ms} | {total:.1f} |")
+            out.append("")
     return "\n".join(out) + "\n"
 
 

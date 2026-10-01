@@ -50,6 +50,9 @@ on:
       time-limit:
         description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"
         default: ""
+      concurrency:
+        description: "Clients, as a number or a multiple of the nodes such as 5n; empty for the scenario's (2n, or 10n for throughput)"
+        default: ""
       nodes:
         description: Voters (containers), 3 or 5
         default: "5"
@@ -91,6 +94,7 @@ env:
   IN_NEMESIS: ${{ inputs.nemesis }}
   IN_WAN: ${{ inputs.wan }}
   IN_TIME_LIMIT: ${{ inputs.time-limit }}
+  IN_CONCURRENCY: ${{ inputs.concurrency }}
   IN_SWIFTPAXOS: ${{ inputs.swiftpaxos }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
