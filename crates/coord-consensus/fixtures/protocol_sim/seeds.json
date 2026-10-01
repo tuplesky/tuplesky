@@ -1,0 +1,13 @@
+[
+  {"row": 1, "voters": 3, "seed": 7, "found": "task-d34 (1): a fast decision re-proposed after its leader crashed before its ACCEPT row"},
+  {"row": 2, "voters": 3, "seed": 6, "found": "task-d34 (2): a fast acknowledgement with the leader's path and local dependencies"},
+  {"row": 4, "voters": 3, "seed": 10, "found": "task-d34 (3): a carried acceptance with other dependencies reported under the new ballot"},
+  {"row": 1, "voters": 3, "seed": 3, "found": "task-d34 (4): a report omitting the synchronized selection while its installation was in flight"},
+  {"row": 10, "voters": 3, "seed": 75, "found": "task-d34 (5): a candidate kept ahead of a decided command its member never held"},
+  {"row": 3, "voters": 3, "seed": 70, "found": "task-d34 (6): a batch staged as leader lost to the follower's ledger"},
+  {"row": 10, "voters": 3, "seed": 0, "found": "task-d18 reverted: the durable promise fell below a published Promise"},
+  {"row": 10, "voters": 3, "seed": 1, "found": "task-d18 reverted: the durable promise fell below a published Promise"},
+  {"row": 3, "voters": 5, "seed": 3, "found": "task-d19 reverted: two dependency sets at five voters"},
+  {"row": 10, "voters": 5, "seed": 0, "found": "task-d19 reverted: two dependency sets at five voters"},
+  {"row": 2, "voters": 5, "seed": 0, "found": "task-d19: an older Sync resumed after a restart and left pending beside a newer one wrote its ACCEPT back over the demotion"}
+]

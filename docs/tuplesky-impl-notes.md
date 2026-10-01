@@ -6358,3 +6358,149 @@ older PRE-ACCEPT under the synchronized ballot.
 Test: `a_deposed_leader_keeps_its_selection_for_what_it_never_proposed`
 (`activation`). It fails at the leader's report without the overlay, and
 at the follower's without the carried selection.
+
+## The real replica machines under a protocol oracle
+
+task-d30. `coord-sim` ran only reference actors, and the multi-node tests
+that run `Leader` and `Follower` drop messages by hand for a few seeds.
+`crates/coord-consensus/tests/protocol_sim.rs` runs the real machines at
+three and five voters, table capacity 32, under one seeded schedule
+(`coord_sim::rng::NamedStreams`), and checks a protocol oracle after
+every step.
+
+### The simulator
+
+- **Machines as `coordd` runs them:**
+  - full learning;
+  - the role changes a won campaign or a deposition asks for
+    (`Node::change_role`);
+  - restarts rebuilt from durable rows only, at the synchronized ballot,
+    as `main.rs` builds them;
+  - the leader's re-send and the follower's payload asks on a timer.
+- **The network:**
+  - Delivers in any order, loses and duplicates, and holds some frames
+    back until a later campaign (old-ballot messages).
+  - Each frame is its own stream of a connection, so a crash ends what
+    was in flight to or from the crashed node. That includes frames
+    already delivered to a peer's buffer and not yet read, which is
+    stronger than a real crash: a stale frame from a dead node arriving
+    after its death is under-tested.
+- **Storage:**
+  - Each node's journal completes its batches in submission order at
+    times of the schedule's choosing. A crash loses what is not durable.
+  - An execution first flushes the journal, since `coordd` applies
+    through the same single-writer journal and waits for its batch.
+- **Scenarios:** the checklist's failure-test matrix rows 1 (fill
+  capacity, fail the leader), 2 (different tentative sets), 3 (dense
+  conflicts, early missing dependency), 4 (acknowledgement before
+  payload, repeated; the checklist's "hold expires" has no machine timer
+  to fire here, so the row is the acknowledgement before the payload,
+  presented again) and 10 (delayed old-ballot messages), as knob
+  presets. Each is run for 12 seeds at each size by default;
+  `PROTOCOL_SIM_SEEDS` raises that.
+- **Replay:** `PROTOCOL_SIM_ONE=row,voters,seed` with
+  `PROTOCOL_SIM_TRACE=1` replays one seed and prints its trace:
+  deliveries, completions, executions, campaigns, the reports a winning
+  campaign selected from, and what the frontend learned.
+
+### The oracle
+
+1. **One order.** Every replica executes a prefix of one sequence.
+2. **Promises never lowered.** A node's durable promise row never
+   decreases and is never below a ballot it published `Promise` for.
+3. **One dependency set per command.** The set a shadow collector learned
+   it with (`VoteSet::learned` over what reached the frontend) equals the
+   set each replica executed it with. The shadow counts a leader reply
+   under the admission the command was submitted under, as the real
+   collector does, not under whichever acknowledgement came first.
+4. **No halt.** No replica stops on two decisions, a recovery cycle or
+   `IncompatibleAccepted`.
+5. **Every learned decision executes.** After the fault schedule every
+   node comes back and loss, duplication, crashes and admissions stop.
+   The domain then runs, with an election whenever nothing executes for
+   6,000 steps, until what the frontend learned has executed, for at most
+   60,000 steps. Oracle 3 compares a decision only when a replica
+   executes it, so a decision learned from a durable majority, dropped by
+   the next selection and never re-proposed, passed the other four.
+   - One stall is counted rather than failed: every follower's table is
+     full and refuses work (`Backpressure`), so nothing more is proposed
+     or executed. That is task-d24's gap (table room for recovery, #122,
+     above this branch), and the exemption goes when it is merged up. At
+     the default seeds, 6 of 120 runs end that way; at 40 seeds, 32 of
+     400. No run fails the oracle otherwise.
+- **Coverage.** Each row checks, at each size, that more runs learned a
+  decision than learned none, or the frontend's oracles are vacuous.
+  Row 3 at five voters learns nothing in 4 of 12 runs, and rows 1 and 2
+  in 1 and 4: admissions there reach too few voters for a quorum before
+  the schedule ends. A per-run minimum would fail those rows as defined.
+
+Seeds that once failed are kept in
+`fixtures/protocol_sim/seeds.json` and replayed on every run.
+
+### Evidence
+
+- **At the default seeds** (12 per row and size, 120 runs), every row
+  passes with task-d34, and the kept seeds pass.
+- **With task-d18 reverted** (40 seeds per row and size, 400 runs): 85
+  runs fail the promise check, against none in the baseline.
+- **With task-d19 reverted** (same seeds): 28 runs fail, 5 of them at
+  five voters. The baseline has 6 failures, 2 at five voters.
+- **Before task-d34:** the simulator found its six defects, each kept as
+  a seed.
+
+### What is left
+
+- At 100 seeds per row and size, 14 of 1,000 runs still failed. The
+  sampled traces show the design question recorded under task-d34 (a
+  fast decision whose only reporting fast-set member recorded the
+  leader's path for commands it had not adopted) and further
+  stale-acceptance cases. So rows 1 to 4 and 10 pass at the default
+  seeds, not at every seed.
+- **With the leader's own adoption (#116, option 1) merged:**
+  - Default seeds: all 120 runs pass.
+  - 40 seeds: 2 of 400 runs fail, against 6 before.
+  - 100 seeds: 8 of 1,000 fail, against 14.
+  - Catch-up at the default seeds: 1 of 120 fails, against 3.
+  - Every remaining failure is row 10 (delayed old-ballot messages) at
+    three voters, a command executed with two dependency sets.
+  - The merge moved one schedule onto a stale-Sync case:
+    `IncompatibleAccepted` at row 2, five voters, seed 0, now a kept
+    seed. A voter restarted with an older Sync still installing, took a
+    newer one, and `activate` added the newer entries beside the older
+    ones. The older entry then wrote the old ballot's ACCEPT back over
+    the demotion. `activate` now clears what an older Sync left pending,
+    the part of task-d20's `replace_sync_pending` this branch needs. The
+    fix is task-d34's, with its tests ("An older Sync's pending
+    entries"); this branch keeps the seed.
+- **With #118's F7 decision merged as well** (path logs aligned only at
+  adoption and a Sync's installation):
+  - Catch-up is on by default (`PROTOCOL_SIM_NO_CATCH_UP` turns it off),
+    as `coordd`'s pacer always runs.
+  - With catch-up: the default seeds and 100 seeds per row and size pass,
+    all 1,000 runs.
+  - Without catch-up, before #118's last two path changes: 40 seeds
+    pass (400 runs), and 100 seeds fail 2 of 1,000 (row 10, three
+    voters, seeds 52 and 86).
+  - Seed 52, traced with the path each proposal and fast
+    acknowledgement carries: b1's leader installed 454d from its own
+    Sync and anchored its first fresh proposal, 65da, after it. Its path
+    log still digested only its own appends, so 65da's path skipped 454d
+    while its dependencies named it. r2 never held 454d, pre-accepted
+    65da with `<b002>` and reached the same path. It then fast-acknowledged
+    81be with the leader's path and dependencies over another history.
+    With the leader absent, recovery re-proposed 81be after 454d.
+  - Seed 86 is a command pre-accepted ahead of one the log was then
+    aligned to, left behind it in the log without it in its record.
+  - Both are fixed on #118 (see "F7: a path from an order the replica
+    does not hold"). With them, and #118 item 5, 100 seeds per row and
+    size pass, all 1,000 runs, with catch-up and without.
+- Budgets and progress after healing are task-d33's oracles.
+- **Catch-up.** A follower's timer asks its leader for executed
+  history, as `coordd`'s pacer does, and the donor's page is served from
+  its durable rows. A pulled command executed otherwise than its donor is
+  an oracle failure.
+  - At the default seeds it serves about 14,000 pages, executes about
+    1,300 pulled commands, and finds no catch-up divergence.
+  - It was off by default while it reached the fast-path gap that #116
+    and #118 closed.
+- Row 1 counts leader crashes and fails if a run of it crashed none.
