@@ -7382,3 +7382,83 @@ contract needed and a test for each.
 - `admission_is_bounded_by_its_rate_and_a_retry_takes_nothing`: the
   burst, the refusal, a retry passing, the refill, and the cap on the
   refill.
+
+## Three or five voters, and the source ballot's own fast set
+
+task-d31, from the checklist review. The configuration validator accepted
+epochs of one, two and four voters, while the design allows three or five
+and has no fast quorum for two or four. Recovery computed the source
+ballot's fast set with `c2_default` whatever the ballot ran under, while
+`verify_ballot` accepts C1 or any valid C2 set. A ballot with another fast
+set would therefore be recovered against the wrong one. Every production
+path builds `c2_default` today, so the mismatch could not happen yet, and
+this change keeps it from happening once one does not.
+
+### What changed
+
+- **Voter counts.** An epoch has three or five voters, or one for the
+  single-voter test profile.
+  - `GroupConfigurationV1::validate_shape` refuses two and four
+    (`ConfigError::UnsupportedVoterCount`). That covers every genesis and
+    handoff record the configuration chain takes.
+  - `Membership::from_genesis`, which coordd places a node with, refuses
+    them too (`MembershipError::UnsupportedVoterCount`,
+    `supported_voter_count`).
+  - `coord-harness` refuses `--voters 2` or `4` before provisioning
+    anything.
+- **One voter is the test profile.** A single-voter domain lets one
+  process carry a request through consensus in a test, and no deployment
+  survives the loss of its only voter.
+  - coordd's `place` refuses one in a build without debug assertions,
+    which is what ships, naming the profile. This is the same rule
+    config.rs applies to its test-only switches.
+  - Every existing single-voter test is a test build and runs as before:
+    the 23 single-voter domains of `bins/coordd/tests/cli.rs` and the
+    unit tests of `serve.rs`.
+  - So coordd's test suite is debug-only: `cargo test --release -p
+    coordd` fails those single-voter tests by design. No workflow runs
+    it; the only release build is the Kubernetes certification, on three
+    voters (review).
+  - The single-voter domains of `coord-daemon`, `coord-consensus`,
+    `coord-collector` and `coord-checkpoint` tests are built from the
+    libraries, never through coordd's placement, and are unaffected.
+- **The source ballot's fast set.** `recovery::select_from` takes the
+  configuration each source ballot ran under, where the candidate knows
+  it, and applies the possible-fast rule to that ballot's fast set.
+  - A configuration of another ballot, epoch or voter set is not taken for
+    the source's.
+  - Unknown, the default rule applies, as before.
+  - A campaign knows the configuration its candidate ran under
+    (`Campaign::knowing`). That ballot is the likeliest source of the
+    selection.
+  - The wiring of `Campaign::knowing` has no behavioural test, and none
+    is possible yet: `activate` always builds `c2_default`, so no
+    production ballot runs another fast set before task-m01. The rule
+    itself is tested on `select_from` (review).
+  - The C1 rule cannot qualify two values: it needs `fast_size −
+    unreported` agreeing reports, and twice that exceeds the reports
+    whenever there are more than `2n − 2·fast_size`, which holds for
+    three voters with a fast set of three and five with four.
+- **A resize is 3 → 5 in one handoff.** Refusing four voters means no
+  epoch passes through four, which matches task-d41's equal-count
+  replacement: a voter is replaced, and the count changes only by a
+  handoff that goes straight from three to five (review).
+- **Tests that used unsupported counts** now use a supported one:
+  - the catalog tests move from two voters to three;
+  - the fabricated-handoff case changes a voter's incarnation instead of
+    dropping a voter;
+  - the second genesis manifest has five voters instead of four.
+
+### Evidence
+
+- `possible_fast_decisions_follow_the_source_ballots_own_fast_set`
+  (`coord-consensus`, `model`): with the source ballot's own fast set
+  {r0, r2}, r2's pre-acceptance is kept as a possible fast decision. The
+  default set, {r0, r1}, re-proposes it, and a configuration of another
+  ballot is ignored.
+- `a_manifest_of_two_or_four_voters_is_refused` (`coord-membership`,
+  `catalog`) and the two new cases in `coord-types`' `config_v1`
+  validation table.
+- `a_single_voter_domain_is_refused_by_a_release_build` (`coordd`
+  unit): a test build runs one voter, a release build refuses it by
+  name, and three and five run in either.

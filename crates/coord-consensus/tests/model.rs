@@ -1468,3 +1468,93 @@ fn a_candidate_whose_member_forgot_an_earlier_ballots_decision_is_kept() {
         decision.reproposed
     );
 }
+
+/// Recovery reads the source ballot's fast set from its configuration
+/// where it is known (task-d31). Ballot 0 ran with the fast set {r0, r2},
+/// not the default {r0, r1}: r2's pre-acceptance may be a fast decision,
+/// which the default rule, looking at r1 instead, would re-propose.
+#[test]
+fn possible_fast_decisions_follow_the_source_ballots_own_fast_set() {
+    let cfg = config(3, 1, &[1, 0], 1);
+    let source = config(3, 0, &[0, 2], 0);
+    let c1 = cmd(1);
+    let reports = vec![
+        report_for(1, ballot(1, 1), 0, vec![]),
+        report_for(2, ballot(1, 1), 0, vec![entry(c1, Phase::PreAccept, &[])]),
+    ];
+    let known = coord_consensus::select_from(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |b| (*b == source.ballot()).then(|| source.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        known.entries.get(&c1).map(|e| e.phase),
+        Some(Phase::Accept),
+        "a possible fast decision of the source ballot was not kept: {known:?}"
+    );
+    assert!(known.reproposed.is_empty());
+    // Under the default fast set r1 is the member heard, and it holds
+    // nothing: the command is re-proposed.
+    let default = select(&cfg, &reports).unwrap();
+    assert!(!default.entries.contains_key(&c1));
+    assert_eq!(default.reproposed, BTreeSet::from([c1]));
+    // A configuration of another ballot, epoch or voter set is not taken
+    // for the source's.
+    let other = config(3, 0, &[0, 2], 7);
+    let ignored =
+        coord_consensus::select_from(&cfg, &reports, |_, _| false, |_| Some(other.clone()))
+            .unwrap();
+    assert_eq!(ignored, default);
+}
+
+/// Under C1 a fast quorum is any `fast_size` voters with the leader, not a
+/// fixed set (task-d31, Codex review on #127). With five voters it is any
+/// four with r0. Reports from r0, r1 and r2 where r0 and r1 pre-accepted x
+/// alike and r2 holds nothing: {r0, r1, r3, r4} may have decided x fast,
+/// and r2 was simply outside that quorum. Requiring every reporting
+/// member to agree re-proposed a command that may have been learned.
+#[test]
+fn a_c1_candidate_needs_only_the_members_a_fast_quorum_could_not_miss() {
+    let cfg = config(5, 1, &[1, 0, 2], 1);
+    let source = BallotConfiguration::c1(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(0, 0),
+        (0..5).map(r).collect(),
+    )
+    .unwrap();
+    let under_c1 = |reports: &[RecoveryReport]| {
+        coord_consensus::select_from(
+            &cfg,
+            reports,
+            |_, _| false,
+            |b| (*b == source.ballot()).then(|| source.clone()),
+        )
+        .unwrap()
+    };
+    let x = cmd(1);
+    let held = |replica| report_for(replica, ballot(1, 1), 0, vec![pre_accept_with(x, &[], 5)]);
+    let empty = |replica| report_for(replica, ballot(1, 1), 0, vec![]);
+
+    // Two of three reporters agree, one of them the leader: kept.
+    let decision = under_c1(&[held(0), held(1), empty(2)]);
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.phase),
+        Some(Phase::Accept),
+        "{decision:?}"
+    );
+    // Without the leader's report, two agreeing members still fit a fast
+    // quorum with the two that did not report.
+    let decision = under_c1(&[held(1), held(2), empty(3)]);
+    assert!(decision.entries.contains_key(&x), "{decision:?}");
+    // The leader is in every fast quorum: its report without x rules a
+    // fast decision out.
+    let decision = under_c1(&[empty(0), held(1), held(2)]);
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+    // One agreeing member of three reports cannot be a fast quorum's share.
+    let decision = under_c1(&[held(1), empty(2), empty(3)]);
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+}

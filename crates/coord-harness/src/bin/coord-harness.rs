@@ -186,6 +186,14 @@ fn provision(
     if voters == 0 {
         return Err("a domain with no voters has no quorum".into());
     }
+    // What the voters would refuse at start, said before anything is
+    // provisioned (task-d31).
+    if !coord_membership::membership::supported_voter_count(usize::from(voters)) {
+        return Err(format!(
+            "--voters {voters}: an epoch has three or five voters (one is the test profile)"
+        )
+        .into());
+    }
     Ok(coord_harness::provision(&Plan {
         hosts,
         listen_any: provisioning.listen_any,

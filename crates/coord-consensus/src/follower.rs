@@ -977,7 +977,14 @@ impl Follower {
                 .encode(),
             });
         }
-        self.campaign = Some(Campaign::new(config).bounded(crate::recovery::MAX_REPORT_ENTRIES));
+        // The ballot this replica ran under is the likeliest source of the
+        // selection: its fast set is the one recovery must look for fast
+        // decisions of, whatever it is (task-d31).
+        self.campaign = Some(
+            Campaign::new(config)
+                .bounded(crate::recovery::MAX_REPORT_ENTRIES)
+                .knowing(self.config.quorum.clone()),
+        );
         let mut out = alloc::vec![effects.persist];
         out.extend(self.release());
         out

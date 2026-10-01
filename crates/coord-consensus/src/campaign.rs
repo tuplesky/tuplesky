@@ -18,7 +18,7 @@ use coord_types::ids::{Ballot, ReplicaId};
 
 use crate::phase::Phase;
 use crate::quorum::BallotConfiguration;
-use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select_with};
+use crate::recovery::{RecoveryError, RecoveryReport, SyncDecision, select_from};
 use crate::summary::{PageError, ReportAssembler, ReportPage};
 
 /// The campaign for one ballot.
@@ -39,6 +39,9 @@ pub struct Campaign {
     payloads_requested: BTreeSet<ReplicaId>,
     /// How many times the complete reports were assembled (task-d26).
     assemblies: u64,
+    /// Configurations of earlier ballots the candidate ran under, the
+    /// source ballot's among them if it is known (task-d31).
+    sources: Vec<BallotConfiguration>,
 }
 
 impl Campaign {
@@ -56,6 +59,7 @@ impl Campaign {
             published: false,
             payloads_requested: BTreeSet::new(),
             assemblies: 0,
+            sources: Vec::new(),
         }
     }
 
@@ -115,6 +119,17 @@ impl Campaign {
     /// A report page from a voter.
     pub fn page(&mut self, page: ReportPage) -> Result<(), PageError> {
         self.assembler.accept(page)
+    }
+
+    /// The configuration an earlier ballot ran under (task-d31): if it is
+    /// the source ballot of the selection, the possible-fast rule is
+    /// applied to its fast set rather than the default one.
+    #[must_use]
+    pub fn knowing(mut self, source: BallotConfiguration) -> Self {
+        if source.ballot() != self.config.ballot() {
+            self.sources.push(source);
+        }
+        self
     }
 
     /// Hold no report larger than `report_limit` entries, and a page more
@@ -283,7 +298,8 @@ impl Campaign {
             };
         }
         let decision = loop {
-            match select_with(&self.config, &reports, &supplied) {
+            let source = |b: &Ballot| self.sources.iter().find(|c| c.ballot() == *b).cloned();
+            match select_from(&self.config, &reports, &supplied, source) {
                 Ok(decision) => break decision,
                 Err(RecoveryError::HalfInitialized { replica, command }) => {
                     if replica != self.config.leader() && reports.len() > self.config.slow_size() {
