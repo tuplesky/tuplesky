@@ -220,8 +220,10 @@ impl Learner {
             });
         }
         let cursor = table.closure_start(command).map_err(LearnError::Guard)?;
+        // Stop at what already executed: its predecessors were
+        // established then (task-d53).
         let closed = match table
-            .closure_step(cursor, usize::MAX)
+            .unexecuted_closure_step(cursor, usize::MAX)
             .map_err(LearnError::Guard)?
         {
             ClosureProgress::Complete(c) => c.members.into_iter().collect(),

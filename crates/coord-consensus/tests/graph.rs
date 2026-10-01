@@ -316,6 +316,63 @@ fn closure_traversal_is_exact_and_incremental() {
     );
 }
 
+/// An execution's evidence stops at what already executed: an executed
+/// command's predecessors were established when it ran, so walking
+/// through them again proves nothing, and the full walk visits every
+/// executed record the table holds on every execution (task-d53).
+#[test]
+fn an_executions_closure_stops_at_what_already_executed() {
+    for executed in [10u8, 200] {
+        let mut t = CommandTable::new();
+        for i in 0..=executed {
+            t.initialize(cmd(i), payload(i), k("chain")).unwrap();
+            let deps = t.record(&cmd(i)).unwrap().deps.clone();
+            t.accept(cmd(i), deps).unwrap();
+            t.commit(cmd(i)).unwrap();
+            if i < executed {
+                t.execute(cmd(i)).unwrap();
+            }
+        }
+        let last = cmd(executed);
+        let ClosureProgress::Complete(full) = t
+            .closure_step(t.closure_start(last).unwrap(), usize::MAX)
+            .unwrap()
+        else {
+            panic!("an unbounded step completes");
+        };
+        assert_eq!(
+            full.visits,
+            usize::from(executed),
+            "the full walk visits every one"
+        );
+        let ClosureProgress::Complete(needed) = t
+            .unexecuted_closure_step(t.closure_start(last).unwrap(), usize::MAX)
+            .unwrap()
+        else {
+            panic!("an unbounded step completes");
+        };
+        assert_eq!(needed.members, BTreeSet::from([cmd(executed - 1)]));
+        assert_eq!(needed.visits, 1, "however many executed before it");
+    }
+    // An unexecuted predecessor is walked through, down to what executed.
+    let mut t = CommandTable::new();
+    for i in 0..4u8 {
+        t.initialize(cmd(i), payload(i), k("chain")).unwrap();
+        let deps = t.record(&cmd(i)).unwrap().deps.clone();
+        t.accept(cmd(i), deps).unwrap();
+        t.commit(cmd(i)).unwrap();
+    }
+    t.execute(cmd(0)).unwrap();
+    let ClosureProgress::Complete(needed) = t
+        .unexecuted_closure_step(t.closure_start(cmd(3)).unwrap(), usize::MAX)
+        .unwrap()
+    else {
+        panic!("an unbounded step completes");
+    };
+    assert_eq!(needed.members, BTreeSet::from([cmd(0), cmd(1), cmd(2)]));
+    assert_eq!(needed.visits, 3);
+}
+
 #[test]
 fn backpressure_refuses_new_work_without_deleting_unresolved_acceptance() {
     let mut t = CommandTable::with_capacity(3);
