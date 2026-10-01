@@ -2334,7 +2334,7 @@ This is liveness as well as cost. The window takes `RESEND_PER_VOTER` (16) propo
 - Duplicate-vote refusals stay below 5% of commands at one, ten and fifty clients (today at least 200% at one client).
 - Re-sends counted as already acknowledged or already decided are zero in a fault-free run.
 - A proposal lost in transit is re-sent within twice the interval, including when 16 or more proposals the voter acknowledged sit in its window. Counting only slow adoption fails this (negative control).
-- One voter paused (`SIGSTOP`) for 5 s under ten clients executes again within a stated bound of being resumed, and the leader's lane to it drains (its refused-frame count stops rising) within the same bound.
+- One voter paused (`SIGSTOP`) for 5 s under ten clients executes again within a bound of being resumed, and the leader's lane to it drains (its refused-frame count stops rising) within the same bound. task-d49's PR states the bound and derives it from the re-send interval and the catch-up hand-off threshold above.
 - task-d07's and task-d15's tests pass.
 
 **Review boundary:** The leader's re-send window and timer, and the duplicate refusal.
@@ -2373,7 +2373,7 @@ Write the design amendment first, then implement it:
 - **The pin's cost** is task-d37's: redb cannot reuse pages freed while the snapshot is open, so the file grows by about the write volume during the export, and the bound is stated and measured the same way. An export that exceeds its bound is abandoned and reported, never queued behind the next, and the previous baseline stays selected.
 
 **Acceptance:**
-- In task-d46's long runs with local checkpoints at their default, a follower's busy time per command at 280 s is within 20% of its value at 20 s, at one client and at ten, and no voter falls behind.
+- In task-d46's long runs with local checkpoints at their default, a follower's busy time per command at 280 s is within 20% of its value at 20 s, at one client and at ten, and no voter is more than 5,000 commands behind the leader's executed count at any 30 s snapshot. With checkpoints off those runs stayed within about 3,200, snapshot skew included; with the inline export a voter ended more than 9,000 behind.
 - The domain thread's longest pass during an export stays within the bound task-d37 sets for opening its snapshot.
 - An image written off the thread is byte-identical to one written synchronously at the same represented position.
 - task-j04's crash points (create, sync, rename, pointer, trim, purge, old-delete), with the crash now possible while the background write is in flight, recover a valid selected image plus its suffix or quarantine explicitly, every time.
