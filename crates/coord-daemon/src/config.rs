@@ -78,10 +78,14 @@ const fn default_checkpoint_after() -> u64 {
     4096
 }
 
-/// The admission rate a configuration that names none gets (task-d26):
-/// under a sixth of what catch-up executes at one 64-command window per
-/// durable batch of 10 ms, so one frontend at its bound leaves a
-/// returning voter most of its catch-up rate to gain with.
+/// The admission rate a configuration that names none gets (task-d26): a
+/// design target and a ceiling, not a proved bound. It is under a sixth
+/// of what catch-up would execute at one 64-command window per durable
+/// batch of 10 ms, which nothing has measured; task-d33's budget oracle
+/// is its check. At the 35 to 100 commands a second a domain sustains
+/// today it never binds. It gates client requests only: resolves,
+/// watches and held retries bypass it, and every session of a frontend
+/// shares one bucket.
 pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
 
 const fn default_max_admitted_per_second() -> u32 {

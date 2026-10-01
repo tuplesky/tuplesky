@@ -7317,17 +7317,33 @@ contract needed and a test for each.
   - Catch-up executes up to 64 commands per durable batch (task-d25), so
     the default leaves a returning voter most of its rate to gain on the
     domain with. The time it needs is then bounded by its gap.
+  - The default is a design target and a ceiling, not a proved bound
+    (review): the 64-per-10-ms rate it is set under is unmeasured, and
+    task-d33's budget oracle is its check. It gates only client
+    requests, after the session-busy check and before the pending
+    insert; resolves, watches and held retries bypass it, and one bucket
+    per frontend is shared by every session. At the 35 to 100 commands a
+    second a domain sustains today it never binds.
 
 ### What this does not cover
 
-- **The executed-history set.** It holds one identity per command
-  executed, which a Sync and a restart's guards ask about. Bounding it
-  needs the quorum-safe floor below which no recovery can name a
-  command, and that is task-d27's. So are the tombstones kept for keys no
-  longer written, every durable row of an executed command, and disk
-  headroom. The task's long run, memory flat in history once admission
-  stops, therefore waits on task-d27: every other structure here is flat
-  in history already.
+- **The executed-history set and the tombstones.** The set holds one
+  identity per command executed, which a Sync and a restart's guards ask
+  about; `CommandTable.history` is inserted into at two sites and never
+  removed from. Bounding it needs the quorum-safe floor below which no
+  recovery can name a command. The plan now names the owners (review):
+  task-d46 retires the in-memory history above the floor continuously,
+  this set and the per-key tombstones with it; task-d27 owns every
+  durable row of an executed command below the floor and disk headroom
+  (#133). The task's long run, memory flat in history once admission
+  stops, therefore waits on those two: every other structure here is
+  flat in history already.
+- **The callers' plane carries more than admissions** (review of
+  task-d33). It carries this node's collector evidence too, so a fixed
+  share of the loop for that plane (`PEER_BEFORE_API`) throttles answers
+  along with new requests. Two shapes of fix: evidence to the collector
+  on a lane with the peer plane's priority, or a per-turn budget that
+  drains both planes. A follow-up of this contract, not yet owned.
 - **`limits.max_response_bytes` is not wired to the planner.** The
   planner's response limit decides a replicated result, so it is schema,
   8 MiB on every replica; the setting is what this node buffers, and the
