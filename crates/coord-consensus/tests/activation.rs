@@ -6018,6 +6018,20 @@ fn an_executed_command_retired_with_its_key_unbound_is_not_taken_again() {
         l.table().record(&theirs).is_none(),
         "the leader proposed an executed command again"
     );
+    // Its own rejection, so a trace tells the refusal from an evidence
+    // repair (review).
+    let Some(Role::Leader(l)) = cluster.nodes[1].role.as_mut() else {
+        panic!("r1 did not lead");
+    };
+    let rejections = l.take_rejections();
+    assert!(
+        rejections.contains(&coord_consensus::Rejection::Forgotten(theirs)),
+        "{rejections:?}"
+    );
+    assert!(
+        !rejections.contains(&coord_consensus::Rejection::Duplicate(theirs)),
+        "{rejections:?}"
+    );
 }
 
 /// task-d33 (protocol_sim row 4, five voters, seed 6): a Sync that
