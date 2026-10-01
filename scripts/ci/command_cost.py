@@ -19,7 +19,7 @@ that ran while the history was short.
 
 `gate` fails when, at any caller count the baseline records, the
 busiest voter's busy time per command, over the run or over its last
-quarter, any voter's second over its first, or the busiest voter's
+quarter, any voter's last quarter over its first three, or the busiest voter's
 journal syncs per command
 exceed the baseline by more than the baseline's stated margin. The
 ratio is where work that grows with history shows first, whatever the
@@ -108,14 +108,16 @@ def per_command(node: str, snapshot: dict) -> dict:
 TAIL = 0.25
 
 
-def tail_busy(node: str, log: str) -> float:
-    """Busy milliseconds per command over the last quarter of the
-    commands a voter executed.
+def head_and_tail_busy(node: str, log: str) -> tuple[float, float]:
+    """Busy milliseconds per command before and over the last quarter of
+    the commands a voter executed.
 
-    The window opens at the first snapshot that had executed three
+    The last quarter opens at the first snapshot that had executed three
     quarters of the voter's final count and closes at the first that had
     executed all of it, so the idle time after the load ended is not in
-    it.
+    it. What came before it is everything up to that first snapshot,
+    warm-up included: the last quarter is compared with the rest of the
+    run, not with the whole of it, which would put it on both sides.
     """
     costs = []
     for snapshot in snapshots(log):
@@ -128,9 +130,17 @@ def tail_busy(node: str, log: str) -> float:
     end = next(c for c in costs if c["executed"] == final)
     start = next(c for c in costs if c["executed"] >= (1 - TAIL) * final)
     executed = end["executed"] - start["executed"]
-    if executed == 0:
+    if executed == 0 or start["executed"] == 0:
         raise Absent(f"{node}'s snapshots do not bracket the last quarter of its commands")
-    return (seconds(end["busy"]) - seconds(start["busy"])) * 1000 / executed
+    head = seconds(start["busy"]) * 1000 / start["executed"]
+    tail = (seconds(end["busy"]) - seconds(start["busy"])) * 1000 / executed
+    return head, tail
+
+
+def tail_busy(node: str, log: str) -> float:
+    """Busy milliseconds per command over the last quarter of the
+    commands a voter executed."""
+    return head_and_tail_busy(node, log)[1]
 
 
 def reduce(callers: int, wall: float, bench: dict | None, logs: dict[str, str]) -> dict:
@@ -141,7 +151,9 @@ def reduce(callers: int, wall: float, bench: dict | None, logs: dict[str, str]) 
         if snapshot is None:
             raise Absent(f"{node}'s log has no metrics snapshot")
         reading = per_command(node, snapshot)
-        reading["tail_busy_ms_per_command"] = tail_busy(node, text)
+        head, tail = head_and_tail_busy(node, text)
+        reading["head_busy_ms_per_command"] = head
+        reading["tail_busy_ms_per_command"] = tail
         voters.append(reading)
     run = {"callers": callers, "wall_seconds": wall, "voters": voters}
     if bench is not None:
@@ -176,15 +188,18 @@ GATED = (
 
 def reading(run: dict, field: str) -> float:
     """A run's gated reading: the busiest voter's, or for `tail_ratio`
-    the largest of each voter's last quarter over its own whole run.
+    the largest of each voter's last quarter over its own first three.
     The ratio is taken per voter: the largest last quarter over the
-    largest whole run, from two voters, would hide a follower whose
-    cost grew under a leader that is busier throughout."""
+    largest rest of the run, from two voters, would hide a follower
+    whose cost grew under a leader that is busier throughout. And it is
+    over the first three quarters, not the whole run, which would hold
+    the last quarter on both sides: a cost growing linearly from c to 2c
+    reads 1.25 against the whole run, 1.36 against the rest."""
     if field == "tail_ratio":
         return max(
-            voter["tail_busy_ms_per_command"] / voter["busy_ms_per_command"]
+            voter["tail_busy_ms_per_command"] / voter["head_busy_ms_per_command"]
             for voter in run["voters"]
-            if voter["busy_ms_per_command"] > 0
+            if voter["head_busy_ms_per_command"] > 0
         )
     return busiest(run, field)
 
