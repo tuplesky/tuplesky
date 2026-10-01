@@ -4065,14 +4065,26 @@ fn a_duplicate_sync_of_the_active_ballot_is_not_held_behind_a_promise() {
         }
     }
     let [p1_leader, p3_leader, p1_sync] = <[_; 3]>::try_from(promise_model_messages()).unwrap();
-    persist(f.step(peer_event(p1_leader.0, p1_leader.1)), &mut storage, &mut queue);
+    persist(
+        f.step(peer_event(p1_leader.0, p1_leader.1)),
+        &mut storage,
+        &mut queue,
+    );
     drain(&mut f, &mut storage, &mut queue);
-    persist(f.step(peer_event(p1_sync.0, p1_sync.1.clone())), &mut storage, &mut queue);
+    persist(
+        f.step(peer_event(p1_sync.0, p1_sync.1.clone())),
+        &mut storage,
+        &mut queue,
+    );
     drain(&mut f, &mut storage, &mut queue);
     assert_eq!(f.ballots().synced(), ballot(1, 2));
     assert!(f.take_rejections().is_empty());
     // P3's promise is queued, not yet durable, and P1's Sync arrives again.
-    persist(f.step(peer_event(p3_leader.0, p3_leader.1)), &mut storage, &mut queue);
+    persist(
+        f.step(peer_event(p3_leader.0, p3_leader.1)),
+        &mut storage,
+        &mut queue,
+    );
     let e = f.step(peer_event(p1_sync.0, p1_sync.1));
     assert!(
         !e.iter().any(|e| matches!(e, Effect::Persist(_))),
