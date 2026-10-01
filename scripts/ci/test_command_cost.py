@@ -34,23 +34,26 @@ def log(*snapshots, tail=""):
     return "\n".join(lines) + "\n" + tail
 
 
-def run(callers, busy_ms, syncs, tail_ms=(1.0, 1.0)):
+def run(callers, busy_ms, syncs, tail_ms=None, head_ms=None):
+    # By default each voter's last quarter, and what came before it,
+    # cost what its whole run did.
+    tail_ms = tail_ms or busy_ms
+    head_ms = head_ms or busy_ms
     return {"callers": callers, "voters": [
-        {"node": "n1", "busy_ms_per_command": busy_ms[0], "journal_syncs_per_command": syncs[0],
-         "tail_busy_ms_per_command": tail_ms[0]},
-        {"node": "n2", "busy_ms_per_command": busy_ms[1], "journal_syncs_per_command": syncs[1],
-         "tail_busy_ms_per_command": tail_ms[1]},
+        {"node": node, "busy_ms_per_command": busy_ms[i], "journal_syncs_per_command": syncs[i],
+         "tail_busy_ms_per_command": tail_ms[i], "head_busy_ms_per_command": head_ms[i]}
+        for i, node in enumerate(("n1", "n2"))
     ]}
 
 
 BASELINE = {
     "margins": {"busy_ms_per_command": 0.25, "tail_busy_ms_per_command": 0.25,
-                "journal_syncs_per_command": 0.10},
+                "tail_ratio": 0.30, "journal_syncs_per_command": 0.10},
     "runs": [
-        {"callers": 1, "busy_ms_per_command": 10.0, "tail_busy_ms_per_command": 1.0,
-         "journal_syncs_per_command": 5.0},
-        {"callers": 10, "busy_ms_per_command": 8.0, "tail_busy_ms_per_command": 1.0,
-         "journal_syncs_per_command": 4.0},
+        {"callers": 1, "busy_ms_per_command": 10.0, "tail_busy_ms_per_command": 10.0,
+         "tail_ratio": 1.0, "journal_syncs_per_command": 5.0},
+        {"callers": 10, "busy_ms_per_command": 8.0, "tail_busy_ms_per_command": 8.0,
+         "tail_ratio": 1.0, "journal_syncs_per_command": 4.0},
     ],
 }
 
@@ -84,21 +87,59 @@ class ReduceTests(unittest.TestCase):
     def test_the_last_quarter_is_read_between_the_snapshots_that_bracket_it(self):
         text = log(
             snapshot(executed=50, busy=1.0),
-            snapshot(executed=80, busy=2.0),
-            snapshot(executed=100, busy=4.0),
+            snapshot(executed=75, busy=1.875),
+            snapshot(executed=100, busy=4.375),
             # After the load: idle, and not in the window.
-            snapshot(executed=100, busy=4.5),
+            snapshot(executed=100, busy=4.875),
         )
-        # From 80 executed to 100: two seconds over twenty commands.
+        # From 75 executed to 100: two and a half seconds over 25 commands.
         self.assertAlmostEqual(cost.tail_busy("n1", text), 100.0)
+        # Before it: 1.875 seconds over the first 75.
+        head, _ = cost.head_and_tail_busy("n1", text)
+        self.assertAlmostEqual(head, 25.0)
+
+    def test_a_last_quarter_inside_one_snapshot_interval_is_interpolated(self):
+        # A run fast enough that a quarter of it passes between two
+        # snapshots a second apart. Between 40 and 100 executed every
+        # command cost 25 ms, so three quarters falls at 1.875 s busy.
+        text = log(
+            snapshot(executed=0, busy=0.5),
+            snapshot(executed=40, busy=1.0),
+            snapshot(executed=100, busy=2.5),
+            snapshot(executed=100, busy=3.0),
+        )
+        head, tail = cost.head_and_tail_busy("n1", text)
+        self.assertAlmostEqual(head, 25.0)
+        self.assertAlmostEqual(tail, 25.0)
+
+    def test_a_cost_that_doubles_linearly_reads_past_the_margin(self):
+        # A command's cost grows from 1 ms to 2 ms over 1,000 commands,
+        # a snapshot every 50: the last quarter over the first three
+        # reads about 1.36, where over the whole run it would read 1.25.
+        busy, snaps = 0.0, []
+        for executed in range(1, 1001):
+            busy += (1 + executed / 1000) / 1000
+            if executed % 50 == 0:
+                snaps.append(snapshot(executed=executed, busy=busy))
+        head, tail = cost.head_and_tail_busy("n1", log(*snaps))
+        self.assertAlmostEqual(tail / head, 1.36, places=2)
+        # With a snapshot only every 200, as a second apart is on a fast
+        # runner's short run, and none on three quarters, it still reads
+        # within 0.02 of that.
+        coarse = [s for s in snaps if s["cost"]["Observed"]["executed"] % 200 == 0]
+        head, tail = cost.head_and_tail_busy("n1", log(*coarse))
+        self.assertAlmostEqual(tail / head, 1.36, delta=0.02)
 
     def test_a_last_quarter_no_two_snapshots_bracket_is_absent(self):
+        # No snapshot was taken before three quarters had executed.
         with self.assertRaises(cost.Absent):
-            cost.tail_busy("n1", log(snapshot(executed=10), snapshot(executed=100)))
+            cost.tail_busy("n1", log(snapshot(executed=80), snapshot(executed=100)))
+        with self.assertRaises(cost.Absent):
+            cost.tail_busy("n1", log(snapshot(executed=0), snapshot(executed=0)))
 
     def test_reduce_reports_throughput_without_gating_on_it(self):
         bench = {"achieved": {"completed": 600, "wall_ns": 60 * 10**9}}
-        two = log(snapshot(executed=90, busy=1.8), snapshot())
+        two = log(snapshot(executed=0, busy=0.2), snapshot(executed=90, busy=1.8), snapshot())
         result = cost.reduce(1, 61.0, bench, {"n1": two, "n2": two})
         self.assertAlmostEqual(result["completed_per_second"], 10.0)
         self.assertEqual([v["node"] for v in result["voters"]], ["n1", "n2"])
@@ -110,17 +151,37 @@ class GateTests(unittest.TestCase):
         self.assertEqual(cost.gate(BASELINE, result), [])
 
     def test_the_busiest_voter_is_what_is_gated(self):
-        result = {"runs": [run(1, (2.0, 12.6), (5.0, 5.0)), run(10, (8.0, 8.0), (4.0, 4.0))]}
+        result = {"runs": [run(1, (2.0, 12.6), (5.0, 5.0), tail_ms=(2.0, 12.0)),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
         self.assertIn("busy_ms_per_command", failures[0])
 
     def test_a_last_quarter_past_the_margin_fails(self):
-        result = {"runs": [run(1, (10.0, 10.0), (5.0, 5.0), tail_ms=(1.0, 1.3)),
+        result = {"runs": [run(1, (10.0, 10.0), (5.0, 5.0), tail_ms=(10.0, 12.8)),
                            run(10, (8.0, 8.0), (4.0, 4.0))]}
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
         self.assertIn("tail_busy_ms_per_command", failures[0])
+
+    def test_a_last_quarter_grown_past_the_run_fails_on_any_machine(self):
+        # A faster machine: both readings under the baseline's, but the
+        # last quarter has grown against the run past the ratio's margin.
+        result = {"runs": [run(1, (7.0, 7.0), (5.0, 5.0), tail_ms=(7.0, 9.5)),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
+        failures = cost.gate(BASELINE, result)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("tail_ratio", failures[0])
+
+    def test_the_ratio_is_each_voters_own(self):
+        # A follower's last quarter grew 40% over its own run while the
+        # leader, busier throughout, did not: the largest last quarter
+        # over the largest whole run (1.0) would hide it.
+        result = {"runs": [run(1, (10.0, 2.0), (5.0, 5.0), tail_ms=(10.0, 2.8)),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
+        failures = cost.gate(BASELINE, result)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("tail_ratio 1.400", failures[0])
 
     def test_syncs_past_the_margin_fail(self):
         result = {"runs": [run(1, (10.0, 10.0), (5.6, 5.0)), run(10, (8.0, 8.0), (4.0, 4.0))]}
@@ -130,12 +191,15 @@ class GateTests(unittest.TestCase):
 
     def test_the_median_of_the_repeats_is_what_is_gated(self):
         # One repeat far past the margin, two within it: the median passes.
-        result = {"runs": [run(1, (20.0, 1.0), (5.0, 5.0)), run(1, (10.0, 1.0), (5.0, 5.0)),
-                           run(1, (11.0, 1.0), (5.0, 5.0)), run(10, (8.0, 8.0), (4.0, 4.0))]}
+        flat = (10.0, 1.0)
+        result = {"runs": [run(1, (20.0, 1.0), (5.0, 5.0), flat),
+                           run(1, (10.0, 1.0), (5.0, 5.0), flat),
+                           run(1, (11.0, 1.0), (5.0, 5.0), flat),
+                           run(10, (8.0, 8.0), (4.0, 4.0))]}
         self.assertEqual(cost.gate(BASELINE, result), [])
         # Two of three past it: the median fails.
-        result["runs"][1] = run(1, (13.0, 1.0), (5.0, 5.0))
-        result["runs"][2] = run(1, (14.0, 1.0), (5.0, 5.0))
+        result["runs"][1] = run(1, (13.0, 1.0), (5.0, 5.0), flat)
+        result["runs"][2] = run(1, (14.0, 1.0), (5.0, 5.0), flat)
         failures = cost.gate(BASELINE, result)
         self.assertEqual(len(failures), 1)
         self.assertIn("median of 3", failures[0])

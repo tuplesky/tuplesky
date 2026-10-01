@@ -477,6 +477,19 @@ struct Stats {
     /// Largest ratio of Sync examinations to the Sync work given, in
     /// hundredths.
     peak_examinations_pct: u64,
+    /// What the run decided, folded into one number: every node's
+    /// execution order and every learned command's dependencies
+    /// (task-d46). A change that must not move a decision -- a data
+    /// structure under the machines -- leaves it as it was, seed for
+    /// seed.
+    decisions: u64,
+}
+
+/// FNV-1a over `bytes`, continuing from `hash`.
+fn fold(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 impl Sim {
@@ -1703,6 +1716,20 @@ impl Sim {
         }
         self.heal();
         self.stats.ballots = self.highest_ballot;
+        let mut decisions = 0xcbf2_9ce4_8422_2325;
+        for (i, node) in self.nodes.iter().enumerate() {
+            decisions = fold(decisions, &(i as u64).to_be_bytes());
+            for c in &node.executed {
+                decisions = fold(decisions, &c.0.0);
+            }
+        }
+        for (c, (deps, _)) in &self.decided {
+            decisions = fold(decisions, &c.0.0);
+            for d in deps {
+                decisions = fold(decisions, &d.0.0);
+            }
+        }
+        self.stats.decisions = decisions;
         self.stats
     }
 
@@ -2417,6 +2444,7 @@ fn run_row(row: u8) {
                     totals.peak_held = totals.peak_held.max(s.peak_held);
                     totals.peak_examinations_pct =
                         totals.peak_examinations_pct.max(s.peak_examinations_pct);
+                    totals.decisions = fold(totals.decisions, &s.decisions.to_be_bytes());
                 }
                 Err(e) => failures.push(e),
             }

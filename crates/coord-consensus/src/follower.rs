@@ -403,6 +403,35 @@ pub struct Follower {
     held: BTreeMap<CommandId, HeldProposal>,
     /// Adopted commands: leader sequence number and whether durable.
     adopted: BTreeMap<CommandId, (u64, bool)>,
+    /// The adopted commands with no payload here (task-d46): the part of
+    /// [`Follower::missing_payloads`] that `adopted` contributes, kept as
+    /// the two maps change. `adopted` keeps executed commands until the
+    /// history sweep, so reading it whole each turn cost the history.
+    adopted_lacking: alloc::collections::BTreeSet<CommandId>,
+    /// The held proposals with no payload here, kept like
+    /// `adopted_lacking` (task-d46). A replica that falls behind holds up
+    /// to `HELD_PROPOSAL_SLACK` tables of proposals, and reading them all
+    /// on every turn kept it behind.
+    held_lacking: alloc::collections::BTreeSet<CommandId>,
+    /// Every held proposal that awaits a rebind ([`Follower::awaits_rebind`]),
+    /// and perhaps some that no longer do (task-d46). A held command
+    /// starts awaiting one only when it is held or its record's payload
+    /// is bound, and each of those is followed by `note_lacking`; it
+    /// stops when it is rebound, released, adopted or committed, which
+    /// is why the set is filtered when it is read.
+    rebinds: alloc::collections::BTreeSet<CommandId>,
+    /// The held proposals to examine at the next `advance_pending`: the
+    /// ones held since, and the ones whose blocker the table noted a
+    /// change for (task-d46). Every held proposal that can be adopted is
+    /// here or in `held_waiters` under a command whose change is noted.
+    held_check: alloc::collections::BTreeSet<CommandId>,
+    /// The held proposals that cannot be adopted yet, under the one
+    /// command each waits on first (`held_blocker`), as task-d26 keeps
+    /// pending Sync entries: adopting no longer reads every held proposal
+    /// on every event, which kept a replica that had fallen behind there.
+    /// An entry may name a proposal no longer held; it is dropped when
+    /// read, and at the history sweep.
+    held_waiters: BTreeMap<CommandId, alloc::collections::BTreeSet<CommandId>>,
     pending: BTreeMap<BarrierId, Pending>,
     deferred: BTreeMap<BarrierId, DeferredVote>,
     votes: BTreeMap<CommandId, VoteSet>,
@@ -561,6 +590,17 @@ pub struct Follower {
 /// binding went to whichever command sorted last, and a restart could
 /// restore the presentation the leader's had displaced and refuse exact
 /// retries of the leader's command as another command's.
+/// The commands of `known` with no payload (task-d46).
+fn lacking<'a>(
+    known: impl Iterator<Item = &'a CommandId>,
+    payloads: &BTreeMap<CommandId, PayloadRecordV1>,
+) -> alloc::collections::BTreeSet<CommandId> {
+    known
+        .filter(|c| !payloads.contains_key(c))
+        .copied()
+        .collect()
+}
+
 fn restored_bindings<'a>(
     table: &CommandTable,
     payloads: impl IntoIterator<Item = (&'a CommandId, &'a PayloadRecordV1)>,
@@ -657,11 +697,12 @@ impl Follower {
         let report_cut = (ballots.promised() != ballots.synced())
             .then(|| (ballots.promised(), table.undecided().copied().collect()));
         let bindings = restored_bindings(&table, payloads.iter());
-        let adopted = table
+        let adopted: BTreeMap<CommandId, (u64, bool)> = table
             .records()
             .filter(|(_, r)| r.phase >= Phase::Accept)
             .map(|(c, _)| (*c, (u64::MAX, true)))
             .collect();
+        let adopted_lacking = lacking(adopted.keys(), &payloads);
         Follower {
             replay: crate::replay::EvidenceStore::new(config.capacity),
             catch_up: CatchUp::default(),
@@ -679,6 +720,11 @@ impl Follower {
             bindings,
             held: BTreeMap::new(),
             adopted,
+            adopted_lacking,
+            held_lacking: alloc::collections::BTreeSet::new(),
+            rebinds: alloc::collections::BTreeSet::new(),
+            held_check: alloc::collections::BTreeSet::new(),
+            held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             deferred: BTreeMap::new(),
             votes: BTreeMap::new(),
@@ -809,6 +855,7 @@ impl Follower {
             }
             touched.insert(p.retry_key);
             self.payloads.insert(c, p);
+            self.note_lacking(c);
             self.served_payloads.insert(c);
         }
         let restored = restored_bindings(
@@ -857,6 +904,11 @@ impl Follower {
             bindings: state.bindings,
             held: BTreeMap::new(),
             adopted: BTreeMap::new(),
+            adopted_lacking: alloc::collections::BTreeSet::new(),
+            held_lacking: alloc::collections::BTreeSet::new(),
+            rebinds: alloc::collections::BTreeSet::new(),
+            held_check: alloc::collections::BTreeSet::new(),
+            held_waiters: BTreeMap::new(),
             pending: BTreeMap::new(),
             votes: BTreeMap::new(),
             payloads: state.payloads,
@@ -906,7 +958,10 @@ impl Follower {
 
     /// Give up the role: everything durable or learned, nothing
     /// ballot-scoped.
-    pub fn into_recovered(self) -> RecoveredState {
+    pub fn into_recovered(mut self) -> RecoveredState {
+        // Held proposals are ballot-scoped and stay here; what the table
+        // noted for them would only grow under the next role.
+        self.table.watch_moves(false);
         // Taken in after the campaign cut its own report: pre-accepted
         // here and fenced from any acknowledgement (`on_admitted`), so no
         // ballot decided them and no selection of this campaign names
@@ -1619,7 +1674,12 @@ impl Follower {
         .expect("valid ballot");
         self.votes.clear();
         self.held.clear();
+        self.held_lacking.clear();
+        self.rebinds.clear();
+        self.held_check.clear();
+        self.held_waiters.clear();
         self.adopted.clear();
+        self.adopted_lacking.clear();
         self.leader_committed = None;
         self.named_facts = named_facts(&decision);
         self.replace_sync_pending(&decision);
@@ -1642,6 +1702,7 @@ impl Follower {
         self.votes.remove(command);
         self.adopted.remove(command);
         self.held.remove(command);
+        self.note_lacking(*command);
     }
 
     /// Hold `decision`'s entries for installation, in place of whatever an
@@ -2034,13 +2095,12 @@ impl Follower {
         // command the leader proposed out of its own scheduler has no
         // submission coming at all.
         let mut out: Vec<CommandId> = self
-            .held
+            .sync_pending
             .keys()
-            .chain(self.sync_pending.keys())
-            .chain(self.adopted.keys())
             .filter(|c| !self.payloads.contains_key(c))
+            .chain(self.adopted_lacking.iter())
+            .chain(self.held_missing())
             .copied()
-            .chain(self.held.keys().filter(|c| self.awaits_rebind(c)).copied())
             .chain(
                 self.sync_pending
                     .keys()
@@ -2734,6 +2794,7 @@ impl Follower {
             .entry(entry.payload.retry_key)
             .or_insert(command);
         self.payloads.insert(command, entry.payload.clone());
+        self.note_lacking(command);
         let epoch = self.config.identity.epoch;
         let (barrier, updates) = batch
             .get_or_insert_with(|| (self.alloc.as_mut().expect("booted").allocate(), Vec::new()));
@@ -2789,6 +2850,60 @@ impl Follower {
         // that, and kept it grew with every key ever submitted -- at boot,
         // with every payload row there is (task-d26).
         self.bindings.retain(|_, c| !table.forgotten(c));
+        self.adopted_lacking = lacking(self.adopted.keys(), &self.payloads);
+        self.held_lacking = lacking(self.held.keys(), &self.payloads);
+        let held = &self.held;
+        self.held_waiters.retain(|_, waiting| {
+            waiting.retain(|c| held.contains_key(c));
+            !waiting.is_empty()
+        });
+    }
+
+    /// Re-read whether `command` is adopted or held here with no
+    /// payload, and whether it awaits a rebind, after `adopted`, `held`,
+    /// `payloads` or its record's payload changed for it (task-d46).
+    fn note_lacking(&mut self, command: CommandId) {
+        let lacks = !self.payloads.contains_key(&command);
+        if lacks && self.adopted.contains_key(&command) {
+            self.adopted_lacking.insert(command);
+        } else {
+            self.adopted_lacking.remove(&command);
+        }
+        if lacks && self.held.contains_key(&command) {
+            self.held_lacking.insert(command);
+        } else {
+            self.held_lacking.remove(&command);
+        }
+        if self.awaits_rebind(&command) {
+            self.rebinds.insert(command);
+        } else {
+            self.rebinds.remove(&command);
+        }
+    }
+
+    /// The held proposals whose payload this replica lacks or must
+    /// rebind, read from the indexes `note_lacking` keeps (task-d46).
+    fn held_missing(&self) -> impl Iterator<Item = &CommandId> {
+        debug_assert_eq!(
+            self.adopted_lacking,
+            lacking(self.adopted.keys(), &self.payloads),
+            "the adopted commands lacking a payload were not kept with the maps"
+        );
+        debug_assert_eq!(
+            self.held_lacking,
+            lacking(self.held.keys(), &self.payloads),
+            "the held commands lacking a payload were not kept with the maps"
+        );
+        debug_assert!(
+            self.held
+                .keys()
+                .filter(|c| self.awaits_rebind(c))
+                .all(|c| self.rebinds.contains(c)),
+            "a held command awaiting a rebind was not noted"
+        );
+        self.held_lacking
+            .iter()
+            .chain(self.rebinds.iter().filter(|c| self.awaits_rebind(c)))
     }
 
     fn learn(&mut self) {
@@ -2817,13 +2932,16 @@ impl Follower {
         let Some(through) = self.leader_committed else {
             return false;
         };
+        // From the commands at ACCEPT rather than every adoption, which
+        // keeps executed ones until the history sweep (task-d46).
         let mut ready: Vec<(u64, CommandId)> = self
-            .adopted
-            .iter()
-            .filter(|(c, (seqnum, durable))| {
-                *durable && *seqnum <= through && self.table.phase_of(c) == Some(Phase::Accept)
+            .table
+            .in_accept()
+            .into_iter()
+            .filter_map(|c| match self.adopted.get(&c) {
+                Some((seqnum, true)) if *seqnum <= through => Some((*seqnum, c)),
+                _ => None,
             })
-            .map(|(c, (seqnum, _))| (*seqnum, *c))
             .collect();
         ready.sort_unstable();
         let mut progressed = false;
@@ -2878,9 +2996,8 @@ impl Follower {
     fn due_payloads(&self) -> Vec<CommandId> {
         let through = self.leader_committed;
         let mut due: Vec<(u64, CommandId)> = self
-            .held
-            .iter()
-            .filter(|(c, _)| !self.payloads.contains_key(c) || self.awaits_rebind(c))
+            .held_missing()
+            .filter_map(|c| self.held.get(c).map(|h| (c, h)))
             .filter(|(_, h)| {
                 through.is_some_and(|t| h.proposal.seqnum.is_some_and(|s| s <= t))
                     || crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
@@ -2889,6 +3006,7 @@ impl Follower {
             .filter_map(|(c, h)| h.proposal.seqnum.map(|s| (s, *c)))
             .collect();
         due.sort_unstable();
+        due.dedup();
         due.into_iter().map(|(_, c)| c).collect()
     }
 
@@ -3411,6 +3529,7 @@ impl Follower {
         };
         self.bindings.insert(retry_key, command);
         self.payloads.insert(command, payload.clone());
+        self.note_lacking(command);
         // The leader's proposal came first, under other attested facts:
         // held, and waiting for the leader's payload (`awaits_rebind`).
         if self.awaits_rebind(&command) {
@@ -3526,6 +3645,7 @@ impl Follower {
                 return self.acknowledge_decided(&proposal, from);
             }
             self.adopted.remove(&command);
+            self.note_lacking(command);
         }
         if self.table.record(&command).is_none()
             && self.table.phase_of(&command) == Some(Phase::Executed)
@@ -3612,6 +3732,11 @@ impl Follower {
             }
         }
         self.held.insert(command, HeldProposal { proposal });
+        // Nothing is held before this, so nothing waits on a change the
+        // table did not note.
+        self.table.watch_moves(true);
+        self.held_check.insert(command);
+        self.note_lacking(command);
         self.advance_pending()
     }
 
@@ -3710,6 +3835,63 @@ impl Follower {
         self.release()
     }
 
+    /// What a held proposal waits on before it can be adopted, or `None`
+    /// if it can be adopted now: the command itself while its record is
+    /// not initialized or awaits a rebind, else its first dependency
+    /// below ACCEPT.
+    ///
+    /// Initialized, not merely known. A proposal that arrived before the
+    /// payload leaves a placeholder, and a placeholder cannot be
+    /// accepted: there is nothing to accept an order *for* yet. It stays
+    /// held until the payload arrives -- from the submission, or from the
+    /// leader that proposed it. Nor under other facts than the
+    /// proposal's: that one waits for the leader's payload to be bound.
+    fn held_blocker(&self, command: &CommandId, held: &HeldProposal) -> Option<CommandId> {
+        if !self.table.is_initialized(command) || self.awaits_rebind(command) {
+            return Some(*command);
+        }
+        match crate::phase::guard_accept(&held.proposal.deps, |d| self.table.phase_of(d)) {
+            Ok(()) => None,
+            Err(
+                crate::phase::GuardViolation::DependencyUnknown { dep }
+                | crate::phase::GuardViolation::DependencyNotAccepted { dep }
+                | crate::phase::GuardViolation::DependencyNotCommitted { dep }
+                | crate::phase::GuardViolation::DependencyNotExecuted { dep },
+            ) => Some(dep),
+        }
+    }
+
+    /// The held proposals that can be adopted now, in identity order
+    /// (task-d46): of the ones held since the last call and the ones
+    /// waiting on a command the table noted a change for. Each that
+    /// cannot waits again, under what it waits on now.
+    fn held_ready(&mut self) -> Vec<CommandId> {
+        for command in self.table.take_moved() {
+            if let Some(waiting) = self.held_waiters.remove(&command) {
+                self.held_check.extend(waiting);
+            }
+            if self.held.contains_key(&command) {
+                self.held_check.insert(command);
+            }
+        }
+        let mut ready = Vec::new();
+        for command in core::mem::take(&mut self.held_check) {
+            let Some(held) = self.held.get(&command) else {
+                continue;
+            };
+            match self.held_blocker(&command, held) {
+                None => ready.push(command),
+                Some(blocker) => {
+                    self.held_waiters
+                        .entry(blocker)
+                        .or_default()
+                        .insert(command);
+                }
+            }
+        }
+        ready
+    }
+
     /// Adopt every held proposal whose payload is initialized and whose
     /// dependencies are all at least ACCEPT; repeat while progress is made.
     fn advance_pending(&mut self) -> Vec<Effect> {
@@ -3734,31 +3916,20 @@ impl Follower {
             return effects;
         }
         loop {
-            let ready: Vec<CommandId> = self
-                .held
-                .iter()
-                .filter(|(c, h)| {
-                    // Initialized, not merely known. A proposal that
-                    // arrived before the payload leaves a placeholder,
-                    // and a placeholder cannot be accepted: there is
-                    // nothing to accept an order *for* yet. It stays
-                    // held until the payload arrives -- from the
-                    // submission, or from the leader that proposed it.
-                    // Nor under other facts than the proposal's: that
-                    // one waits for the leader's payload to be bound.
-                    self.table.is_initialized(c)
-                        && !self.awaits_rebind(c)
-                        && crate::phase::guard_accept(&h.proposal.deps, |d| self.table.phase_of(d))
-                            .is_ok()
-                })
-                .map(|(c, _)| *c)
-                .collect();
+            let ready = self.held_ready();
             if ready.is_empty() {
+                debug_assert!(
+                    self.held
+                        .iter()
+                        .all(|(c, h)| self.held_blocker(c, h).is_some()),
+                    "a held proposal that can be adopted was not examined"
+                );
                 self.learn();
                 return effects;
             }
             for command in ready {
                 let held = self.held.remove(&command).expect("ready");
+                self.note_lacking(command);
                 // The proposal asserts the admission it was ordered under.
                 // Adopted under other attested facts, this replica would
                 // execute a command the quorum never admitted as such --
@@ -3806,6 +3977,7 @@ impl Follower {
                 self.sync_demoted.retain(|c| *c != command);
                 self.adopted
                     .insert(command, (held.proposal.seqnum.unwrap_or(u64::MAX), false));
+                self.note_lacking(command);
                 let epoch = self.config.identity.epoch;
                 let record = self.table.record(&command).expect("adopted").clone();
                 let admission = record.payload.unwrap_or_else(|| admission_digest(None, 0));
@@ -4460,6 +4632,7 @@ impl Follower {
         }
         self.bindings.insert(payload.retry_key, command);
         self.payloads.insert(command, payload.clone());
+        self.note_lacking(command);
         let barrier = self.alloc.as_mut().expect("booted").allocate();
         self.durable_payloads.insert(barrier, command);
         alloc::vec![Effect::Persist(PersistBatch {
@@ -4488,6 +4661,7 @@ impl Follower {
         }
         self.bindings.insert(payload.retry_key, command);
         self.payloads.insert(command, payload.clone());
+        self.note_lacking(command);
         self.served_payloads.remove(&command);
         if let Some(held) = self.held.get(&command) {
             let mut set = VoteSet::new(self.config.quorum.clone(), command);

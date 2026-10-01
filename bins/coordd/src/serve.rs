@@ -2593,21 +2593,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             return;
         }
         let images = housekeeping.images.clone();
+        // The export runs on this thread until task-d51 moves it off, and
+        // the domain takes no event meanwhile: its duration is in the line
+        // so that a run whose voter stalls here shows why.
+        let started = std::time::Instant::now();
         let outcome = self
             .backing
             .applier_mut()
             .store_mut()
             .publish_local(&images, &limits);
+        let took = started.elapsed();
         let housekeeping = self.housekeeping.as_mut().expect("just borrowed");
         match outcome {
             Ok(Some(published)) => {
                 housekeeping.done.0 += 1;
                 housekeeping.floor = after;
                 eprintln!(
-                    "checkpoint represented={} retired={} reclaimed={}",
+                    "checkpoint represented={} retired={} reclaimed={} took_ms={}",
                     published.represented.get(),
                     published.retired,
-                    published.reclaimed
+                    published.reclaimed,
+                    took.as_millis()
                 );
             }
             // Nothing new to represent: the projection has materialized
@@ -2618,7 +2624,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Err(e) => {
                 housekeeping.done.1 += 1;
                 housekeeping.floor = gap.saturating_add(after);
-                eprintln!("this node could not publish a recovery checkpoint: {e}");
+                eprintln!(
+                    "this node could not publish a recovery checkpoint after {} ms: {e}",
+                    took.as_millis()
+                );
             }
         }
     }

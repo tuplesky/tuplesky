@@ -7,10 +7,10 @@ the lowerings it ran, the journal appends and syncs, the projection
 commits, and the time the loop was busy rather than waiting. This
 reduces each voter's snapshots to what one executed command cost it:
 over the whole run, from its last snapshot, and over the last quarter
-of the commands it executed, from the snapshots that bracket them. The
-second is the cost at the run's largest history, where work that grows
-with history shows first; a whole-run average spreads it over commands
-that ran while the history was short.
+of the commands it executed, interpolated between the snapshots around
+three quarters. The second is the cost at the run's largest history,
+where work that grows with history shows first; a whole-run average
+spreads it over commands that ran while the history was short.
 
     command_cost.py reduce --callers N --wall SECONDS [--bench REPORT] LOG...
     command_cost.py collect COST_JSON...
@@ -19,8 +19,11 @@ that ran while the history was short.
 
 `gate` fails when, at any caller count the baseline records, the
 busiest voter's busy time per command, over the run or over its last
-quarter, or its journal syncs per command exceed the baseline by more
-than the baseline's stated margin. Each caller count is run more than
+quarter, any voter's last quarter over its first three, or the busiest voter's
+journal syncs per command
+exceed the baseline by more than the baseline's stated margin. The
+ratio is where work that grows with history shows first, whatever the
+machine's speed: a uniform slowdown moves both readings and leaves it. Each caller count is run more than
 once and the median of the repeats is what is compared: one run on a
 shared runner can be a third off the next, and a regression worth
 catching moves every repeat. It reports completed commands a
@@ -105,14 +108,20 @@ def per_command(node: str, snapshot: dict) -> dict:
 TAIL = 0.25
 
 
-def tail_busy(node: str, log: str) -> float:
-    """Busy milliseconds per command over the last quarter of the
-    commands a voter executed.
+def head_and_tail_busy(node: str, log: str) -> tuple[float, float]:
+    """Busy milliseconds per command before and over the last quarter of
+    the commands a voter executed.
 
-    The window opens at the first snapshot that had executed three
-    quarters of the voter's final count and closes at the first that had
-    executed all of it, so the idle time after the load ended is not in
-    it.
+    The last quarter opens where the voter had executed three quarters of
+    its final count and closes at the first snapshot that had executed
+    all of it, so the idle time after the load ended is not in it. A
+    snapshot rarely falls on three quarters exactly, and at a second
+    apart a quarter of a short run can pass between two of them, so the
+    busy time there is interpolated between the snapshots on either side,
+    as if every command between them cost the same. What came before it
+    is everything up to that point, warm-up included: the last quarter is
+    compared with the rest of the run, not with the whole of it, which
+    would put it on both sides.
     """
     costs = []
     for snapshot in snapshots(log):
@@ -122,12 +131,26 @@ def tail_busy(node: str, log: str) -> float:
     if not costs:
         raise Absent(f"{node}'s log has no observed cost")
     final = costs[-1]["executed"]
-    end = next(c for c in costs if c["executed"] == final)
-    start = next(c for c in costs if c["executed"] >= (1 - TAIL) * final)
-    executed = end["executed"] - start["executed"]
-    if executed == 0:
+    opens = (1 - TAIL) * final
+    before = [c for c in costs if c["executed"] <= opens]
+    if final == 0 or not before:
         raise Absent(f"{node}'s snapshots do not bracket the last quarter of its commands")
-    return (seconds(end["busy"]) - seconds(start["busy"])) * 1000 / executed
+    below = before[-1]
+    above = next(c for c in costs if c["executed"] >= opens)
+    end = next(c for c in costs if c["executed"] == final)
+    busy = seconds(below["busy"])
+    if above["executed"] > below["executed"]:
+        busy += ((seconds(above["busy"]) - busy)
+                 * (opens - below["executed"]) / (above["executed"] - below["executed"]))
+    head = busy * 1000 / opens
+    tail = (seconds(end["busy"]) - busy) * 1000 / (final - opens)
+    return head, tail
+
+
+def tail_busy(node: str, log: str) -> float:
+    """Busy milliseconds per command over the last quarter of the
+    commands a voter executed."""
+    return head_and_tail_busy(node, log)[1]
 
 
 def reduce(callers: int, wall: float, bench: dict | None, logs: dict[str, str]) -> dict:
@@ -138,7 +161,9 @@ def reduce(callers: int, wall: float, bench: dict | None, logs: dict[str, str]) 
         if snapshot is None:
             raise Absent(f"{node}'s log has no metrics snapshot")
         reading = per_command(node, snapshot)
-        reading["tail_busy_ms_per_command"] = tail_busy(node, text)
+        head, tail = head_and_tail_busy(node, text)
+        reading["head_busy_ms_per_command"] = head
+        reading["tail_busy_ms_per_command"] = tail
         voters.append(reading)
     run = {"callers": callers, "wall_seconds": wall, "voters": voters}
     if bench is not None:
@@ -163,7 +188,30 @@ def median(values: list[float]) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2
 
 
-GATED = ("busy_ms_per_command", "tail_busy_ms_per_command", "journal_syncs_per_command")
+GATED = (
+    "busy_ms_per_command",
+    "tail_busy_ms_per_command",
+    "tail_ratio",
+    "journal_syncs_per_command",
+)
+
+
+def reading(run: dict, field: str) -> float:
+    """A run's gated reading: the busiest voter's, or for `tail_ratio`
+    the largest of each voter's last quarter over its own first three.
+    The ratio is taken per voter: the largest last quarter over the
+    largest rest of the run, from two voters, would hide a follower
+    whose cost grew under a leader that is busier throughout. And it is
+    over the first three quarters, not the whole run, which would hold
+    the last quarter on both sides: a cost growing linearly from c to 2c
+    reads 1.25 against the whole run, 1.36 against the rest."""
+    if field == "tail_ratio":
+        return max(
+            voter["tail_busy_ms_per_command"] / voter["head_busy_ms_per_command"]
+            for voter in run["voters"]
+            if voter["head_busy_ms_per_command"] > 0
+        )
+    return busiest(run, field)
 
 
 def gate(baseline: dict, result: dict) -> list[str]:
@@ -181,7 +229,7 @@ def gate(baseline: dict, result: dict) -> list[str]:
             continue
         for field in GATED:
             limit = expected[field] * (1 + margins[field])
-            seen = median([busiest(run, field) for run in runs])
+            seen = median([reading(run, field) for run in runs])
             if seen > limit:
                 failures.append(
                     f"{callers} callers: {field} {seen:.3f} (median of {len(runs)}) "
@@ -195,21 +243,25 @@ def table(result: dict) -> str:
     """The readings as a Markdown table, one row per voter per run."""
     lines = [
         "| callers | completed/s | node | executed | lowerings/cmd | syncs/cmd "
-        "| appends/cmd | commits/cmd | busy ms/cmd | last quarter | busy |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| appends/cmd | commits/cmd | busy ms/cmd | first three quarters "
+        "| last quarter | ratio | busy |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for run in result["runs"]:
         rate = run.get("completed_per_second")
         rate = "--" if rate is None else f"{rate:.1f}"
         for v in run["voters"]:
             busy = "--" if v["busy_fraction"] is None else f"{v['busy_fraction']:.0%}"
+            head = v.get("head_busy_ms_per_command")
+            ratio = "--" if not head else f"{v['tail_busy_ms_per_command'] / head:.2f}"
+            head = "--" if head is None else f"{head:.2f}"
             lines.append(
                 f"| {run['callers']} | {rate} | {v['node']} | {v['executed']} "
                 f"| {v['lowerings_per_command']:.2f} | {v['journal_syncs_per_command']:.2f} "
                 f"| {v['journal_appends_per_command']:.2f} "
                 f"| {v['projection_commits_per_command']:.2f} "
-                f"| {v['busy_ms_per_command']:.2f} | {v['tail_busy_ms_per_command']:.2f} "
-                f"| {busy} |"
+                f"| {v['busy_ms_per_command']:.2f} | {head} "
+                f"| {v['tail_busy_ms_per_command']:.2f} | {ratio} | {busy} |"
             )
     return "\n".join(lines)
 
