@@ -376,9 +376,12 @@ impl ReportAssembler {
     }
 
     /// Refuse a report announcing more than the pages `entries` entries
-    /// take, and one page more (task-d28): one past the bound still
-    /// assembles, so the campaign names it (task-d20), and nothing larger
-    /// is held.
+    /// take, and one page more (task-d28). The page more is slack, not
+    /// what lets a report just past the bound assemble: at 2,000 entries
+    /// and 256 a page, 8 pages already hold 2,048. What the bound admits
+    /// is up to one full page past the pages `entries` take, 2,304
+    /// entries at the default, and the campaign then refuses what is past
+    /// `entries` by name (task-d20); nothing larger is held.
     pub fn bound_entries(&mut self, entries: usize) {
         let pages = entries.div_ceil(MAX_PAGE_ENTRIES).saturating_add(1);
         self.max_pages = u32::try_from(pages).map_or(MAX_REPORT_PAGES, |p| p.min(MAX_REPORT_PAGES));
