@@ -8356,8 +8356,8 @@ Completed commands a second are reported and never gated. The `command cost` job
   call reads indexes and costs little, so the control is now task-d46's
   own learner change undone (the learner reading every vote set and
   every record again). On the mix without scans, three repeats per
-  caller count read 3.11 and 5.06 ms (whole run, last quarter) and a
-  ratio of 1.97 at one caller, and 3.04 and 4.88 ms and 1.97 at ten,
+  caller count read 3.11 and 4.96 ms (whole run, last quarter) and a
+  ratio of 1.97 at one caller, and 3.04 and 4.84 ms and 1.98 at ten,
   and the gate fails all six readings against the baseline below.
 - **Repeats.** Without a change, the busiest voter's readings moved by
   up to 19% over the whole run and 37% over the last quarter between
@@ -8369,9 +8369,13 @@ Completed commands a second are reported and never gated. The `command cost` job
   (syncs). Before task-d46, on the `ubuntu-24.04` runner one voter fell
   behind in every repeat (1,098 to 1,749 of 2,602 commands executed,
   12.6 to 17.1 ms per command). task-d46 moved it down, from that job's
-  run on its own head with the mix without scans: 1.27 and 1.79 ms and
-  a ratio of 1.48 at one caller, 1.35 and 1.66 ms and 1.32 at ten, 3.00
-  syncs per command.
+  run on its own head with the mix without scans and the interpolated
+  window (build-test run 36908805251): 1.32 and 1.45 ms and a ratio of
+  1.19 at one caller, 1.46 and 1.65 ms and 1.19 at ten, 3.00 syncs per
+  command. Every voter's ratio in that run was 1.08 to 1.19. Against it
+  the learner revert's medians (3.11 and 4.96 ms and 1.97 at one caller,
+  3.04 and 4.84 ms and 1.98 at ten, read on this container) fail all
+  six readings; the ratio limit is 1.55 at both caller counts.
 - **The ratio** of a voter's last quarter to its first three is what
   grows when the cost of a command grows with history, and it needs no
   machine to compare with: a faster runner moves both readings, not
@@ -8396,7 +8400,7 @@ Completed commands a second are reported and never gated. The `command cost` job
   warm-up that was to show it, 5,000 commands past the first sweep,
   reads 1.07 to 1.29 interpolated, no lower than without it, so that
   account was wrong. The learner revert reads 1.77 to 2.04 on the same
-  window (medians of the largest voter 1.96 at one caller and 1.98 at
+  window (medians of the largest voter 1.97 at one caller and 1.98 at
   ten).
 - **Noise.** An unchanged run on this container once read 2.35 ms over
   the last quarter at ten callers against the runner's 1.67, and a
