@@ -681,12 +681,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         &mut self,
         domain: DomainId,
         shard: ShardId,
-        engine: E,
+        mut engine: E,
         baseline: LocalJournalSeq,
     ) -> Result<StorageStreamId, JournaledError> {
         if self.domains.contains_key(&domain) {
             return Err(JournaledError::AlreadyAttached);
         }
+        // The journal is the projection's redo log from here on, the
+        // replay below included (task-d48).
+        engine.commit_under_journal();
         let key = StreamKey {
             cluster: self.cluster,
             domain,

@@ -243,6 +243,16 @@ pub trait LocalEngine: Send + 'static {
 
     /// Begin the unique write transaction.
     fn begin_write(&mut self) -> Result<Self::Write<'_>, EngineError>;
+
+    /// The journal is this engine's redo log from now on (task-d48,
+    /// Section 17.3.4): every transition the engine commits is already
+    /// journal-durable, and start-up re-lowers the journal above the
+    /// engine's applied stamp. [`WriteTxn::commit_durable`] stays durable;
+    /// an engine may only change how it detects a commit a crash tore, as
+    /// long as such a commit rolls back to the one before it. Called by
+    /// the journaled coordinator when it attaches the engine; nothing else
+    /// may call it. The default changes nothing.
+    fn commit_under_journal(&mut self) {}
 }
 
 /// Reserved capability (task-j06): atomic working-state application without
