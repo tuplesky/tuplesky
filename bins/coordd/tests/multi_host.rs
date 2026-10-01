@@ -94,11 +94,17 @@ struct Voter {
 }
 
 impl Voter {
-    fn start(&mut self, n: usize) {
+    /// `init` for the first start, as `coord-harness start --init`; a
+    /// restart resumes the voter's own state and never initializes.
+    fn start(&mut self, n: usize, init: bool) {
         let label = format!("n{n}");
         let config = self.bundle.join("coordd.toml");
-        coord_harness::run::initialize_node(&binary(), &label, &config, &self.bundle)
-            .expect("initialized from the bundle");
+        if init {
+            coord_harness::run::initialize_node(&binary(), &label, &config, &self.bundle)
+                .expect("initialized from the bundle");
+        } else {
+            coord_harness::run::resume_node(&label, &self.bundle).expect("resumed from its state");
+        }
         self.daemon = Some(
             coord_harness::run::start_node(&binary(), &label, &config, &self.bundle)
                 .unwrap_or_else(|e| panic!("{e}:\n{}", self.said())),
@@ -198,7 +204,7 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
         })
         .collect();
     for (i, voter) in voters.iter_mut().enumerate().take(2) {
-        voter.start(i + 1);
+        voter.start(i + 1, true);
     }
     for (i, voter) in voters.iter().enumerate().take(2) {
         assert!(
@@ -221,7 +227,8 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
         "two voters of three did not establish a write"
     );
 
-    voters[2].start(3);
+    // Its first start, late.
+    voters[2].start(3, true);
     for (i, voter) in voters.iter().enumerate() {
         assert!(
             voter.waits_until(60, 0, meshed),
@@ -295,7 +302,7 @@ async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_vo
         })
         .collect();
     for (i, voter) in voters.iter_mut().enumerate() {
-        voter.start(i + 1);
+        voter.start(i + 1, true);
     }
     for (i, voter) in voters.iter().enumerate() {
         assert!(
@@ -330,7 +337,7 @@ async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_vo
         );
     }
     let since: Vec<usize> = voters.iter().map(|v| v.said().len()).collect();
-    voters[2].start(3);
+    voters[2].start(3, false);
     for (i, voter) in voters.iter().enumerate() {
         assert!(
             voter.waits_until(60, since[i], meshed),

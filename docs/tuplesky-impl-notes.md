@@ -7531,3 +7531,58 @@ no longer keeps is answered from the collector's memory, `Unknown` when
 that is gone too. The client's next step is the same either way:
 submitting the invocation again reaches the retained record with the
 request in hand.
+
+## The failure and obligation contract
+
+task-d29. Design Section 5.5 indexes, in one place, what may fail, what
+each of the eight transitions leaves owed, and who owes it. Each of the
+thirteen obligations has an owner, a trigger, an escalation, and named
+tests in which that owner acts after the fault the row covers. The
+section ends with the conditional argument for why the work completes.
+
+- **Checklist gaps it closes.** A1: the failure model. A3: the
+  transitions, and retirement for bindings and the collector window.
+  A5: an owner and escalation for every obligation, where task-d22 gave
+  refused entries theirs. B9: the argument. G1: retirement justified by
+  what can still ask, not by recency alone.
+- **Two rows are narrower than their obligation.**
+  - O10: a voter behind a floor that moved on is refused what it cannot
+    prove, and bringing it back is task-d32.
+  - O11: a failed barrier stopping a running voter is shown on the
+    journal, the engine and the composed node, not inside a domain.
+    Mixed-fault qualification covers it there.
+- **The harness refusal (G5).**
+  - The certification harness initialized any node directory without
+    state, so a voter whose disk was wiped came back as an empty voter
+    under its old identity. Section 5.4 forbids exactly that.
+  - `initialize_node` now writes an `initialized` marker next to the
+    state it created. A marker without state is `RunError::StateLost`,
+    and nothing is initialized. A directory with state and no marker
+    gets the marker, so directories created before this change keep
+    working.
+  - `a_voter_whose_state_is_gone_is_refused_not_initialized_again`
+    drives it with a stand-in `coordd`.
+  - The marker lives in the node's bundle, so it goes when the whole
+    bundle does. A bundle copied again from the provisioning host then
+    has neither state nor marker, exactly like one that never ran, and
+    `coord-harness start` initialized it (Codex review on #129). A start
+    now never initializes: `resume_node` refuses a voter without state as
+    `RunError::NotInitialized` and runs nothing, and only
+    `coord-harness start --init`, which the runbook reserves for a voter's
+    first start, runs `initialize_node`. The harness cannot tell the two
+    bundles apart, so the operator's intent is the evidence, as with
+    `coordd init` itself. `a_start_never_initializes_a_voter_without_state`
+    covers the refusal. `multi-host-local.sh` and the `multi_host` tests
+    start each voter with `--init` once and restart it without.
+  - A partial `coordd init` that leaves a `state/` directory still reads
+    as initialized on the next start. That predates this task and is
+    recorded, not fixed here (review).
+- **From review of the contract.** O14, leader establishment, is a row
+  of its own, since Step 2 of the liveness argument rests on it, and
+  Step 2 now states the two conditions the code supplies: a promise
+  counts as a leader only until the ceiling, and a campaign still under
+  way at the ceiling is replaced. O1 cites the re-dial trigger's test,
+  O6 the payload asks a peer never answers, and O12 the one test of a
+  stop surviving restart; the rest of that is task-d13's. O10's two
+  owed halves are named: task-d27's second part for the stop, task-d32
+  for the return.
