@@ -2258,7 +2258,7 @@ The application batch of an executed command is lowered on its own as well. Meas
 
 **Implement:** In `coordd`'s composition the journal is the durable record (task-j03), yet every materialization commits redb with `Durability::Immediate` and two-phase commit, two `fdatasync`s for each group task-d47 lowers. Section 17.3.4 selects Immediate and local two-phase hardening "from the reviewed redb contract" and asks for recovery to be measured.
 
-- **Commit in one phase, with checksums.** Amend 17.3.4's hardening line: the projection stays durable at every commit, committed in one phase with redb's checksums, and the amendment states why that is safe with the journal underneath. A commit torn by a crash rolls back to the one before it, and start-up re-lowers the journal above it.
+- **Commit in one phase, with checksums.** Amend 17.3.4's hardening line: the projection stays durable at every commit, committed in one phase with redb's checksums, and the amendment states why that is safe with the journal underneath. A commit torn by a crash rolls back to the one before it, and start-up re-lowers the journal above it. The amendment also states the residual: one-phase commit relies on the commit slot's checksum to detect a torn write, which two-phase commit does not need.
 - **Measure recovery** under one-phase and two-phase commit, and state what each costs in recovery time and in syncs.
 - **Write out the invariants** the current code depends on, which any later change to the projection's durability must keep:
   - the collector answers a resolve from the projection (`retained_answer` in `coordd`, `settle_from_record` in the collector), so a command the journal holds is never answered `Unknown` or `Forgotten`;
@@ -2269,7 +2269,7 @@ A projection committed non-durably and made durable only at checkpoints is not t
 **Acceptance:**
 - Projection syncs per group fall from two to one, and recovery time under one-phase commit is reported beside two-phase.
 - SIGKILL at random points in task-09's and task-j05's disk-fault runs recovers to the journal's state, and no resolve after the restart answers `Unknown` or `Forgotten` for a command the journal holds.
-- A projection commit torn at task-j05's fault points is rolled back and re-lowered from the journal.
+- A projection commit torn at task-j05's fault points is rolled back and re-lowered from the journal. This is the test of the checksum residual the amendment states.
 - Checkpoints (task-53, task-j04) and backups still cover a durable projection.
 
 **Review boundary:** The projection's commit mode, its 17.3.4 amendment and the recovery measurement. No non-durable projection, which stays task-j06's.
