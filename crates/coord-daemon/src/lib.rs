@@ -66,6 +66,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod catch_up;
 pub mod config;
 pub mod diagnostics;
 pub mod fanout;

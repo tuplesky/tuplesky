@@ -118,6 +118,7 @@ extern crate alloc;
 
 pub mod ballot;
 pub mod campaign;
+pub mod catch_up;
 pub mod commands;
 pub mod feature;
 pub mod floor;
@@ -143,6 +144,7 @@ pub use ballot::{
     PromiseRejection, ReplicaRole, SealEffects, SealRejection, SyncRejection,
 };
 pub use campaign::Campaign;
+pub use catch_up::{CatchUpDivergence, DonorExecution, OwnExecution};
 pub use commands::{CommandRecord, CommandTable, InitError, Initialized, RetireError};
 pub use floor::{
     ActivatedFloor, ActivationError, Discovered, FenceVerdict, FloorCandidate, FloorConflict,
@@ -166,7 +168,8 @@ pub use leader::{
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{
-    MAX_PAYLOAD_TRANSFER, MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, is_payload_transfer,
+    CatchUpEntry, MAX_CATCH_UP_BYTES, MAX_CATCH_UP_COMMANDS, MAX_PAYLOAD_TRANSFER,
+    MAX_PROPOSAL_ASK, PathAnchors, ProtocolMessage, is_payload_transfer,
 };
 pub use phase::{GuardViolation, Phase, guard_accept, guard_commit, guard_execute};
 pub use publication::{DurableRecord, Publication};
@@ -179,10 +182,10 @@ pub use role::{PendingReport, RecoveredState};
 pub use rows::{
     PayloadRecordV1, PromiseRecordV1, ProposalRecordV1, SYNC_KIND, SYNC_SCHEMA_VERSION,
     SealRecordV1, SyncRecordV1, decode_dependency, decode_payload, decode_promise, decode_proposal,
-    decode_seal, decode_sync, dependency_key, dependency_update, encode_dependency, encode_payload,
-    encode_promise, encode_proposal, encode_seal, encode_sync, payload_key, payload_update,
-    promise_key, promise_update, proposal_key, proposal_update, seal_key, seal_update, sync_key,
-    sync_update,
+    decode_seal, decode_sync, dependency_delete, dependency_key, dependency_update,
+    encode_dependency, encode_payload, encode_promise, encode_proposal, encode_seal, encode_sync,
+    payload_key, payload_update, promise_key, promise_update, proposal_key, proposal_update,
+    seal_key, seal_update, sync_key, sync_update,
 };
 pub use speculation::{
     DEFAULT_SPECULATION_BOUND, ReleaseGate, Speculation, SpeculationMismatch, SpeculationRequest,

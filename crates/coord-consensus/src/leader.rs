@@ -1865,6 +1865,8 @@ impl Leader {
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PromiseRefused { .. }
+            | ProtocolMessage::CatchUpRequest { .. }
+            | ProtocolMessage::CatchUpPage { .. }
             | ProtocolMessage::PayloadResponse { .. } => Vec::new(),
         }
     }

@@ -465,6 +465,12 @@ impl<P: Persistence> Voter<P> {
                 coord_consensus::ProtocolMessage::Sync(decision.clone()).encode(),
             ));
         }
+        // A lagging voter's ask for this node's executed history is
+        // answered from its durable rows, which the machine does not
+        // hold (task-d08).
+        if let Some(coord_consensus::ProtocolMessage::CatchUpRequest { ballot, after }) = &message {
+            out.absorb(self.node.serve_catch_up(provenance.from(), *ballot, *after));
+        }
         out.absorb(self.node.on_event(
             Event::Peer(AuthenticatedPeerMessage::new(provenance, frame)),
             &self.ballot,
@@ -595,6 +601,29 @@ impl<P: Persistence> Voter<P> {
     pub fn request_payloads(&mut self) -> Result<Outbound, DriveError> {
         let leader = self.ballot.leader;
         self.node.request_payloads(leader, &self.ballot)
+    }
+
+    /// Ask a peer for the commands it executed after this voter's
+    /// frontier, when `pacer` says it is time (task-d08): the leader
+    /// first, then the other voters in turn.
+    pub fn catch_up(
+        &mut self,
+        pacer: &mut crate::catch_up::Pacer,
+        now: std::time::Instant,
+    ) -> Result<Outbound, DriveError> {
+        let machine = self.node.machine();
+        let standing = crate::catch_up::Standing {
+            executed: machine.executed_through(),
+            holds: machine.holds_unexecuted(),
+            busy: machine.catching_up(),
+            leads: machine.leads(),
+        };
+        let voters: Vec<ReplicaId> = machine.identity().voters.iter().copied().collect();
+        let me = self.ingress.replica();
+        match pacer.due(now, standing, me, self.ballot.leader, &voters) {
+            Some(donor) => self.node.request_catch_up(donor, &self.ballot),
+            None => Ok(Outbound::default()),
+        }
     }
 
     /// The command execution is waiting for a payload for, if any.
