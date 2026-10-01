@@ -6639,12 +6639,24 @@ snapshots from one replica as inconsistent.
   - The voter answers only the candidate its report went to, for that
     ballot, from the same version.
 - **Bounded assembler.** A campaign refuses a report announcing more
-  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The
-  extra page lets a report one entry past the bound still assemble, so
-  task-d20 names it. The pages held are one campaign's, since a new
-  campaign replaces the old one, plus the one report the voter serves.
+  pages than `MAX_REPORT_ENTRIES` entries take, plus one. The extra page
+  is slack: 8 pages of 256 already hold 2,048 entries, so a report just
+  past the bound assembles without it. What the bound admits is up to
+  2,304 entries, and the campaign refuses what is past the bound by name
+  (task-d20). The pages held are one campaign's, since a new campaign
+  replaces the old one, plus the one report the voter serves (from
+  review).
+- **Pacing.** The first ask goes out one re-send interval after the
+  campaign starts, which gives the published pages 250 ms to arrive. The
+  worst case is `MAX_PAGE_ASK` duplicate pages per voter per interval,
+  idempotent at the assembler, and shares no budget with the leader's
+  proposal re-send. Report pages and their requests ride the control
+  lane, the lane that dropped the original page, so a 16-page answer can
+  drop again; the retry converges, and a smaller ask would be gentler.
 
-The report format is unchanged.
+The report format is unchanged. A build that paginates smaller would
+announce more pages and be refused `OutOfBounds`, as an older build that
+ignores the request is left to the ballot's time-out.
 
 ### Evidence
 
