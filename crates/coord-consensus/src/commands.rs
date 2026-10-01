@@ -128,6 +128,16 @@ struct KeyState {
 /// this many (task-d24). The rest is kept for the work that finishes or
 /// recovers admitted commands: a Sync's entries and the commands catch-up
 /// pulls, which enter a full table.
+///
+/// Recovery work does not respect the bound at all; it enters beyond
+/// capacity. What the reserve is sized for is that a voter admitted to
+/// seven eighths can hold one catch-up window (`MAX_CATCH_UP_COMMANDS`,
+/// 64) or its placeholders and still report within twice the table: at
+/// the largest table, 875 admitted, 125 recovering and 1,000 retired is
+/// 2,000. Below a table of 512 the reserve is smaller than a window and
+/// the beyond-capacity path carries the rest; at the smallest table, 32,
+/// it is 4. A Sync's entries are made to fit by the release rule and the
+/// Sync's cap, not by the reserve.
 pub const RECOVERY_RESERVE_PARTS: usize = 8;
 
 /// The command table of one replica in one domain.
