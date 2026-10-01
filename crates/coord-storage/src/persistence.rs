@@ -116,6 +116,18 @@ pub trait Persistence {
     /// because a durable journal record is never a failed batch.
     fn unmaterialized(&self) -> usize;
 
+    /// Whether an application batch may be submitted while the one before
+    /// it is still waiting to materialize (task-d47): whether
+    /// [`Persistence::application_base`] already counts what is queued.
+    ///
+    /// The journal-first coordinator's base is its queued frontier, so an
+    /// applier can plan a group of commands and lower them together. The
+    /// reference worker's is its projection's own frontier, so there a
+    /// command is applied, and lowered, before the next is planned.
+    fn chains_applications(&self) -> bool {
+        false
+    }
+
     /// Whether the queue has room for `batch` now.
     ///
     /// Only the queue's own bounds, which is the refusal a caller can do
@@ -140,6 +152,16 @@ pub trait Persistence {
 
     /// Lower as much accepted work as one group allows.
     fn lower(&mut self) -> Result<Lowered, EngineError>;
+
+    /// Make as much accepted work as one group allows durable, without
+    /// necessarily applying it to the projection yet (task-d47). Where
+    /// the projection is the record this is [`Persistence::lower`]. On
+    /// the journal-first path it is the journal append alone: what it
+    /// made durable is materialized by a later lowering, and a recovery
+    /// cut includes it meanwhile.
+    fn journal(&mut self) -> Result<Lowered, EngineError> {
+        self.lower()
+    }
 
     /// What lowering has cost since this coordinator opened (task-d45),
     /// or `None` when it does not count it.
@@ -396,6 +418,10 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
         self.store.has_room(self.domain, batch)
     }
 
+    fn chains_applications(&self) -> bool {
+        true
+    }
+
     fn follow_ballot(&mut self, ballot: coord_types::ids::Ballot) {
         self.ballot = coord_types::ids::Ballot {
             epoch: self.application_base().configuration,
@@ -442,6 +468,13 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
 
     fn lower(&mut self) -> Result<Lowered, EngineError> {
         self.store.flush().map(lowered_from_journal).map_err(engine)
+    }
+
+    fn journal(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .append()
+            .map(lowered_from_journal)
+            .map_err(engine)
     }
 
     fn cost(&self) -> Option<StorageCost> {

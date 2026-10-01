@@ -25,10 +25,22 @@ use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest};
 use coord_types::{CommandId, RetryKey};
 
-use crate::materialize::{ApplyOutcome, apply_plan_sharing, apply_refused_plan_sharing};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use coord_core::effect::BarrierId;
+use coord_core::event::{StorageError, StorageEvent};
+use coord_state::KvEvent;
+use coord_store_api::engine::SnapshotSource;
+
+use crate::cut::{CutOverlay, RecoveryCut};
+use crate::lowering::ExecutionFrontier;
+use crate::materialize::{
+    ApplyOutcome, Pending, Submitted, apply_plan_sharing, apply_refused_plan_sharing, prepare,
+};
 use crate::persistence::Persistence;
 use crate::retry::{self, Admission, RetryBinding};
-use crate::view::ViewError;
+use crate::view::{GatedView, ViewError};
 use crate::views::{
     ViewBudget, ViewBuildError, build_authorized_view, build_internal_view, load_authorization,
 };
@@ -86,6 +98,15 @@ pub enum ApplyError {
     Diverged,
     /// A durable revision could not be published to the watch hub.
     Publish(PublishError),
+    /// A group's batches were definitely not journaled after the commands
+    /// in it were reported applied (task-d47). Nothing of the group was
+    /// released; the replica restarts from its journal.
+    GroupLost,
+    /// Within a group, the store has no room for the command's batch
+    /// beside what is already queued (task-d47). Nothing was submitted or
+    /// changed: the caller lowers the group and the queue, and applies the
+    /// same command again.
+    GroupFull,
 }
 
 impl From<EngineError> for ApplyError {
@@ -137,7 +158,59 @@ pub struct Applier<P: Persistence> {
     /// Kept only once [`Applier::share_foreign`] says someone takes them.
     foreign: Vec<coord_core::event::StorageEvent>,
     sharing: bool,
+    /// The commands applied since [`Applier::begin_group`] whose batches
+    /// have not materialized yet (task-d47).
+    group: Option<Group>,
 }
+
+/// Commands applied as one group: planned one after another, each over
+/// what the ones before it wrote, and lowered together (task-d47).
+#[derive(Default)]
+struct Group {
+    /// Every row the group's batches write, in order, a later write of a
+    /// key winning: what a command planned after them reads through.
+    overlay: Arc<CutOverlay>,
+    /// Barriers of the group's batches.
+    barriers: BTreeSet<BarrierId>,
+    /// The application the group's last batch completes. The journal
+    /// keeps the batches in order and the projection takes them in that
+    /// order, so this one materialized means all of them did.
+    last: Option<Pending>,
+    /// Watch publications owed once the group has materialized, in order.
+    publications: Vec<Publication>,
+}
+
+/// A watch publication held until its revision has materialized.
+enum Publication {
+    /// A revision this group produced, with its complete event set.
+    Events {
+        namespace: NamespaceId,
+        revision: KvRevision,
+        events: Vec<KvEvent>,
+    },
+    /// Every durable revision through this one, read back from storage.
+    Through(KvRevision),
+}
+
+/// What a command is planned against: the projection's snapshot, with a
+/// group's own unmaterialized writes over it.
+type PlanningView<P> =
+    GatedView<RecoveryCut<<<P as Persistence>::Reader as SnapshotSource>::View, Arc<CutOverlay>>>;
+
+/// Whether `event` says one of `barriers` will never be journaled.
+fn lost(event: &StorageEvent, barriers: &BTreeSet<BarrierId>) -> bool {
+    matches!(
+        event,
+        StorageEvent::Failed {
+            barrier_id,
+            error: StorageError::DefinitelyNotCommitted,
+        } if barriers.contains(barrier_id)
+    )
+}
+
+/// How many lowerings finishing a group may wait through (as
+/// `materialize::complete` waits for one application).
+const GROUP_LOWERINGS: usize = 64;
 
 impl<P: Persistence> Applier<P> {
     /// An applier over an opened store; the watch hub starts at the
@@ -163,6 +236,7 @@ impl<P: Persistence> Applier<P> {
             hub: WatchHub::new(published, floor),
             foreign: Vec::new(),
             sharing: false,
+            group: None,
         })
     }
 
@@ -194,12 +268,243 @@ impl<P: Persistence> Applier<P> {
     }
 
     /// Reconcile the store, keeping what it settles for other batches.
-    fn reconcile(&mut self) -> Result<(), EngineError> {
+    ///
+    /// Within a group, a batch of the group found definitely not journaled
+    /// ends it: the commands it holds were already reported applied.
+    fn reconcile(&mut self) -> Result<(), ApplyError> {
         let settled = self.store.reconcile()?;
+        let group_lost = self
+            .group
+            .as_ref()
+            .is_some_and(|group| settled.events.iter().any(|e| lost(e, &group.barriers)));
         if self.sharing {
             self.foreign.extend(settled.events);
         }
+        if group_lost {
+            return Err(ApplyError::GroupLost);
+        }
         Ok(())
+    }
+
+    /// Apply the commands that follow as one group (task-d47), when the
+    /// store can chain them ([`Persistence::chains_applications`]).
+    ///
+    /// Each is planned over the snapshot with the group's own writes laid
+    /// over it, and submitted; [`Applier::apply`] returns its outcome
+    /// without lowering anything. [`Applier::finish_group`] then lowers
+    /// the group, one journal write and one projection transaction for
+    /// all of it within the journal's group bounds, and only then
+    /// publishes its revisions to watches. Until then nothing it applied
+    /// is readable, and its caller must disclose none of it.
+    ///
+    /// Returns whether commands are now being grouped.
+    pub fn begin_group(&mut self) -> bool {
+        if self.group.is_none() && self.store.chains_applications() {
+            self.group = Some(Group::default());
+        }
+        self.group.is_some()
+    }
+
+    /// Whether a group is open ([`Applier::begin_group`]).
+    pub const fn in_group(&self) -> bool {
+        self.group.is_some()
+    }
+
+    /// Batches applied in the open group and not lowered yet.
+    pub fn grouped(&self) -> usize {
+        self.group.as_ref().map_or(0, |group| group.barriers.len())
+    }
+
+    /// Lower the open group until every batch in it has materialized, then
+    /// publish its revisions to watches in order.
+    ///
+    /// A batch of the group definitely not journaled is
+    /// [`ApplyError::GroupLost`]: its command was reported applied, so it
+    /// cannot be planned again here. A batch journaled whose projection
+    /// is still owed is not a failure; lowering goes on.
+    pub fn finish_group(&mut self) -> Result<(), ApplyError> {
+        let Some(group) = self.group.take() else {
+            return Ok(());
+        };
+        if let Some(last) = group.last {
+            let mut materialized = false;
+            for _ in 0..GROUP_LOWERINGS {
+                if self.materialized_position()? >= last.position {
+                    materialized = true;
+                    break;
+                }
+                let lowered = self.store.lower()?;
+                let produced = lowered.events.len();
+                let group_lost = lowered.events.iter().any(|e| lost(e, &group.barriers));
+                if self.sharing {
+                    self.foreign.extend(lowered.events);
+                }
+                if group_lost {
+                    return Err(ApplyError::GroupLost);
+                }
+                if lowered.indeterminate {
+                    let settled = self.store.reconcile()?;
+                    let group_lost = settled.events.iter().any(|e| lost(e, &group.barriers));
+                    if self.sharing {
+                        self.foreign.extend(settled.events);
+                    }
+                    if group_lost {
+                        return Err(ApplyError::GroupLost);
+                    }
+                } else if produced == 0
+                    && self.store.queued() == 0
+                    && self.store.unmaterialized() == 0
+                    && self.materialized_position()? < last.position
+                {
+                    return Err(ApplyError::Engine(EngineError::new(
+                        coord_store_api::engine::ErrorClass::Corrupt,
+                        "a group's last batch was neither materialized nor rejected",
+                    )));
+                }
+            }
+            if !materialized && self.materialized_position()? < last.position {
+                return Err(ApplyError::Engine(EngineError::new(
+                    coord_store_api::engine::ErrorClass::Busy,
+                    "a group did not materialize within its bound",
+                )));
+            }
+        }
+        for publication in group.publications {
+            match publication {
+                Publication::Events {
+                    namespace,
+                    revision,
+                    events,
+                } => self.publish(namespace, revision, &events)?,
+                Publication::Through(revision) => self.publish_through(revision)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The execution position the projection has materialized through.
+    fn materialized_position(&self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        Ok(self
+            .store
+            .reader()
+            .snapshot()?
+            .meta()
+            .frontier
+            .execution_position)
+    }
+
+    /// The view a command is planned against. Outside a group, the
+    /// projection's snapshot. Within one, the same snapshot with the
+    /// group's writes over it, at the frontier the group has reached, so
+    /// the plan's base is the queued frontier the store will check.
+    fn planning_view(&self) -> Result<PlanningView<P>, ApplyError> {
+        let gated = self.store.reader().snapshot()?;
+        let mut meta = *gated.meta();
+        let overlay = match &self.group {
+            Some(group) => {
+                let base = self.store.application_base();
+                meta.frontier = ExecutionFrontier {
+                    configuration: base.configuration,
+                    execution_position: base.execution_position,
+                };
+                group.overlay.clone()
+            }
+            None => Arc::new(CutOverlay::new()),
+        };
+        let durable = gated.meta().stamp.journal_seq();
+        Ok(GatedView::new(
+            RecoveryCut::new(gated, overlay, durable),
+            meta,
+        ))
+    }
+
+    /// Make `plan` durable as its own batch, or, within a group, submit it
+    /// and add it to the group. `refused` is the command a refusal records
+    /// as executed ([`apply_refused_plan_sharing`]).
+    fn land(
+        &mut self,
+        barrier: BarrierId,
+        namespace: NamespaceId,
+        plan: &coord_state::ApplyPlan,
+        binding: Option<&RetryBinding>,
+        refused: Option<&CommandId>,
+    ) -> Result<ApplyOutcome, ApplyError> {
+        if self.group.is_none() {
+            let others = self.sharing.then_some(&mut self.foreign);
+            return Ok(match refused {
+                Some(command) => apply_refused_plan_sharing(
+                    &mut self.store,
+                    barrier,
+                    namespace,
+                    plan,
+                    command,
+                    others,
+                ),
+                None => {
+                    apply_plan_sharing(&mut self.store, barrier, namespace, plan, binding, others)
+                }
+            }?);
+        }
+        let (mut batch, kind, pending) = prepare(barrier, namespace, plan, binding)?;
+        if let Some(command) = refused {
+            batch.updates.push(crate::retry::executed_update(
+                command,
+                plan.position,
+                plan.revision,
+                pending.result_digest,
+            )?);
+        }
+        // A group's batches stay queued until it is lowered, so the queue
+        // can fill -- in bytes as well as in batches -- before the group's
+        // count does. Refused as full, the batch would fail the voter; the
+        // caller lowers instead and comes back. With nothing queued and
+        // nothing grouped, lowering would free nothing, and the submission
+        // below reports what is wrong.
+        let lowerable =
+            self.group.as_ref().is_some_and(|g| g.last.is_some()) || self.store.queued() > 0;
+        if lowerable && !self.store.has_room(&batch) {
+            return Err(ApplyError::GroupFull);
+        }
+        let updates = batch.updates.clone();
+        match crate::materialize::submit(&mut self.store, batch, kind)? {
+            Submitted::Accepted => {
+                let group = self.group.as_mut().expect("checked above");
+                Arc::make_mut(&mut group.overlay).extend(&updates);
+                group.barriers.insert(barrier);
+                group.last = Some(pending);
+                Ok(ApplyOutcome::Applied(Vec::new()))
+            }
+            Submitted::Replan => Ok(ApplyOutcome::Replan),
+            Submitted::Indeterminate => Ok(ApplyOutcome::Indeterminate),
+        }
+    }
+
+    /// Announce `revision`'s complete event set to watches, once it is
+    /// durable: now, or within a group once the group has materialized.
+    fn publish(
+        &mut self,
+        namespace: NamespaceId,
+        revision: KvRevision,
+        events: &[KvEvent],
+    ) -> Result<(), ApplyError> {
+        if let Some(group) = self.group.as_mut() {
+            group.publications.push(Publication::Events {
+                namespace,
+                revision,
+                events: events.to_vec(),
+            });
+            return Ok(());
+        }
+        match self.hub.publish(namespace, revision, events) {
+            Ok(()) => Ok(()),
+            // The hub is behind, because an earlier revision was
+            // established by reconciliation rather than by this path.
+            // Replay the durable events of everything it missed; a gap is
+            // never left behind, since every later publication would be
+            // refused.
+            Err(PublishError::Gap { .. }) => self.publish_through(revision),
+            Err(e) => Err(ApplyError::Publish(e)),
+        }
     }
 
     /// The watch hub fed by this applier.
@@ -395,7 +700,7 @@ impl<P: Persistence> Applier<P> {
         binding: &RetryBinding,
     ) -> Result<AppliedOutcome, ApplyError> {
         for _ in 0..8 {
-            let gated = self.store.reader().snapshot()?;
+            let gated = self.planning_view()?;
             match retry::lookup(gated.view(), &binding.retry_key)? {
                 Some(record) if record.command_id == binding.command_id => {
                     if let Some(revision) = record.revision {
@@ -440,14 +745,7 @@ impl<P: Persistence> Applier<P> {
             // command changed -- a session row and a consumed receipt,
             // an authority epoch, a deleted key -- so the outcome is
             // recoverable exactly when the change is.
-            match apply_plan_sharing(
-                &mut self.store,
-                barrier,
-                namespace,
-                &planned,
-                Some(binding),
-                self.sharing.then_some(&mut self.foreign),
-            )? {
+            match self.land(barrier, namespace, &planned, Some(binding), None)? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -477,7 +775,7 @@ impl<P: Persistence> Applier<P> {
         reason: RejectionReason,
     ) -> Result<AppliedOutcome, ApplyError> {
         for _ in 0..8 {
-            let gated = self.store.reader().snapshot()?;
+            let gated = self.planning_view()?;
             let planned = rejection_plan_at(
                 self.store.application_base(),
                 crate::codecs::read_kv_revision(gated.view())?,
@@ -486,14 +784,7 @@ impl<P: Persistence> Applier<P> {
             .map_err(ApplyError::Plan)?;
             drop(gated);
             let barrier = self.alloc.allocate();
-            match apply_refused_plan_sharing(
-                &mut self.store,
-                barrier,
-                namespace,
-                &planned,
-                &command,
-                self.sharing.then_some(&mut self.foreign),
-            )? {
+            match self.land(barrier, namespace, &planned, None, Some(&command))? {
                 ApplyOutcome::Applied(_) => {
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -537,7 +828,7 @@ impl<P: Persistence> Applier<P> {
         let namespace: NamespaceId = request.namespace;
         let session = binding.retry_key.session_id;
         for _ in 0..8 {
-            let gated = self.store.reader().snapshot()?;
+            let gated = self.planning_view()?;
             // A retained result is handed back only if the request would
             // still be authorized now: losing a permission protects what
             // it produced, exactly as it would a fresh execution.
@@ -597,13 +888,12 @@ impl<P: Persistence> Applier<P> {
                     .map_err(ApplyError::Plan)?;
                     drop(gated);
                     let barrier = self.alloc.allocate();
-                    match apply_refused_plan_sharing(
-                        &mut self.store,
+                    match self.land(
                         barrier,
                         namespace,
                         &planned,
-                        &binding.command_id,
-                        self.sharing.then_some(&mut self.foreign),
+                        None,
+                        Some(&binding.command_id),
                     )? {
                         ApplyOutcome::Applied(_) => {
                             let response = postcard::to_allocvec(&planned.response)
@@ -660,29 +950,13 @@ impl<P: Persistence> Applier<P> {
             };
             drop(gated);
             let barrier = self.alloc.allocate();
-            match apply_plan_sharing(
-                &mut self.store,
-                barrier,
-                namespace,
-                &planned,
-                Some(binding),
-                self.sharing.then_some(&mut self.foreign),
-            )? {
+            match self.land(barrier, namespace, &planned, Some(binding), None)? {
                 ApplyOutcome::Applied(_) => {
                     if let Some(revision) = planned.revision {
                         // Irrevocable now: the revision's complete event set
-                        // becomes visible to watches only at this point.
-                        match self.hub.publish(namespace, revision, &planned.events) {
-                            Ok(()) => {}
-                            // The hub is behind, because an earlier
-                            // revision was established by reconciliation
-                            // rather than by this path. Replay the durable
-                            // events of everything it missed; a gap is
-                            // never left behind, since every later
-                            // publication would be refused.
-                            Err(PublishError::Gap { .. }) => self.publish_through(revision)?,
-                            Err(e) => return Err(ApplyError::Publish(e)),
-                        }
+                        // becomes visible to watches only at this point (a
+                        // group's, once the group has materialized).
+                        self.publish(namespace, revision, &planned.events)?;
                     }
                     let response = postcard::to_allocvec(&planned.response)
                         .map_err(|_| ApplyError::MalformedPayload)?;
@@ -708,6 +982,13 @@ impl<P: Persistence> Applier<P> {
     /// established outside the applying path has to reach it this way
     /// before anything later can be published.
     fn publish_through(&mut self, through: KvRevision) -> Result<(), ApplyError> {
+        // Within a group the revision may be one the group wrote, which
+        // storage does not hold yet: it is published once the group has
+        // materialized.
+        if let Some(group) = self.group.as_mut() {
+            group.publications.push(Publication::Through(through));
+            return Ok(());
+        }
         loop {
             let published = self.hub.published();
             if published >= through {

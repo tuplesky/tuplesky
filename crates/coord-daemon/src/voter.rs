@@ -377,6 +377,11 @@ impl<P: Persistence> Voter<P> {
     /// transitions it refused, so no barrier waits for ever on work the
     /// old ballot can no longer make durable.
     fn fence(&mut self) -> Result<Outbound, DriveError> {
+        // What is queued is lowered first, under the ballot it was made
+        // under, as a node lowering each round would have (task-d47):
+        // the fence refuses only the work of a ballot left behind, and
+        // work this voter made before it promised was not.
+        let mut out = self.node.flush(&self.ballot)?;
         let refused = self
             .node
             .applier_mut()
@@ -387,7 +392,6 @@ impl<P: Persistence> Voter<P> {
             self.fenced_at
                 .map_or(self.ballot, |fence| highest(fence, self.ballot)),
         );
-        let mut out = Outbound::default();
         for event in refused {
             self.fenced += 1;
             out.absorb(self.node.on_storage(event, &self.ballot)?);
@@ -648,6 +652,38 @@ impl<P: Persistence> Voter<P> {
     /// Whether this replica currently leads its ballot.
     pub fn leads(&self) -> bool {
         self.node.machine().leads()
+    }
+
+    /// Apply every command whose turn has come as a staged group, journal
+    /// it with what this voter's rounds left queued, and hand out what
+    /// that released (task-d47, [`Node::stage`], [`Node::flush`]). A
+    /// runtime lowering in groups calls this, then [`Voter::finish`],
+    /// rather than [`Voter::execute`], once it has no more events ready.
+    pub fn flush(&mut self) -> Result<Outbound, DriveError> {
+        // The ready commands are staged first, so their batches and the
+        // protocol's share one journal append; what that releases is
+        // handed out here, before the group's projection commit, and the
+        // group's results by [`Voter::finish`] after it.
+        let mut out = self.node.stage(&self.ballot)?;
+        out.absorb(self.node.flush(&self.ballot)?);
+        Ok(out)
+    }
+
+    /// Materialize the execution group a [`Voter::flush`] staged and hand
+    /// out its results (task-d47).
+    pub fn finish(&mut self) -> Result<Outbound, DriveError> {
+        self.node.finish(&self.ballot)
+    }
+
+    /// Whether [`Voter::flush`] has anything to do: batches queued, or a
+    /// command to apply.
+    pub fn owes_flush(&self) -> bool {
+        self.queued() > 0 || self.node.can_execute()
+    }
+
+    /// Batches this voter submitted and has not lowered yet.
+    pub fn queued(&self) -> usize {
+        self.node.applier().store().queued()
     }
 
     /// Apply every command whose turn has come.

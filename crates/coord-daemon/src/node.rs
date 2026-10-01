@@ -342,6 +342,14 @@ impl Machine {
         }
     }
 
+    /// Whether this replica holds the payload of `command`.
+    pub fn holds_payload(&self, command: &CommandId) -> bool {
+        match self {
+            Machine::Leader(m) => m.payload(command).is_some(),
+            Machine::Follower(m) => m.payload(command).is_some(),
+        }
+    }
+
     /// The payload of a command this replica has learned.
     pub fn payload(&self, command: &CommandId) -> Option<PayloadRecordV1> {
         match self {
@@ -486,7 +494,27 @@ pub struct Node<P: Persistence> {
     /// The forgetting floor this voter agrees with its peers, when it
     /// takes part (task-d27).
     floor: Option<crate::floor::Floor>,
+    /// Whether this node lowers in groups (task-d47): a round leaves what
+    /// it persisted queued for [`Node::flush`], and execution applies the
+    /// commands whose turn has come as groups.
+    grouped: bool,
+    /// Whether a [`Node::flush`] is running: its rounds lower what they
+    /// persist rather than leave it queued.
+    flushing: bool,
+    /// What the commands of a staged execution group led to, carried out
+    /// once [`Node::finish`] has materialized the group (task-d47).
+    staged: Vec<Effect>,
 }
+
+/// Most commands one execution group applies before it is lowered
+/// (task-d47). Half the journal group's 64 records, so the protocol's
+/// batches queued with them still fit beside them in one append.
+const GROUP_COMMANDS: usize = 32;
+
+/// Queued batches past which execution lowers what is queued before it
+/// applies more (task-d47): half of `JournalLimits`' default 256 per
+/// domain.
+const GROUP_QUEUE_ROOM: usize = 128;
 
 impl<P: Persistence> Node<P> {
     /// A node over `machine` and `applier`, publishing to `frontend`.
@@ -512,7 +540,99 @@ impl<P: Persistence> Node<P> {
             pages_served: 0,
             unreleased: false,
             floor: None,
+            grouped: false,
+            flushing: false,
+            staged: Vec::new(),
         }
+    }
+
+    /// Whether a command's turn has come and this replica holds its
+    /// payload: whether [`Node::execute`] would apply something now.
+    pub fn can_execute(&self) -> bool {
+        let machine = self.machine();
+        machine
+            .next_executable()
+            .is_some_and(|command| machine.holds_payload(&command))
+    }
+
+    /// Whether this node lowers in groups ([`Node::lower_in_groups`]).
+    pub const fn lowers_in_groups(&self) -> bool {
+        self.grouped
+    }
+
+    /// Lower in groups (task-d47, design Section 17.3.3).
+    ///
+    /// A round then submits what its machine persisted and leaves it
+    /// queued: [`Node::flush`] lowers everything queued as one group,
+    /// one journal write and one projection transaction, and releases the
+    /// sends that waited on it. The runtime flushes once it has no more
+    /// events ready, or after a bounded number of them. Execution applies
+    /// the commands whose turn has come as groups of up to
+    /// `GROUP_COMMANDS` and lowers each group once
+    /// ([`Applier::begin_group`]).
+    ///
+    /// Nothing is released earlier than before: a send still waits on the
+    /// barrier it names, and a group's results are handed out only once
+    /// the group has materialized. Things are released later, by up to the
+    /// rest of the group.
+    pub fn lower_in_groups(&mut self) {
+        self.grouped = true;
+    }
+
+    /// Lower everything queued as one group and hand what that made
+    /// durable to the outbox and the machine (task-d47).
+    ///
+    /// What the machine does in answer is carried out at once, its own
+    /// batches lowered with it, so a flush leaves nothing it produced
+    /// queued.
+    ///
+    /// Lowering in groups, a flush journals and does not materialize: a
+    /// send waits on its batch's journal durability and on nothing else,
+    /// and the projection takes what the flush journaled with the next
+    /// execution group, which materializes anyway. When no command is
+    /// ready to execute, the flush materializes it itself, so the
+    /// projection never waits on execution that is not coming.
+    pub fn flush(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let was = core::mem::replace(&mut self.flushing, true);
+        let flushed = self.flush_queued(ballot);
+        self.flushing = was;
+        flushed
+    }
+
+    fn flush_queued(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let mut next = Vec::new();
+        self.lower_queued(&mut next)?;
+        // A round releases what became durable, even with nothing more
+        // to carry out.
+        self.unreleased = true;
+        let mut out = self.carry_out(next, ballot)?;
+        if self.grouped
+            && !self.applier.in_group()
+            && self.applier.store().unmaterialized() > 0
+            && !self.can_execute()
+        {
+            let mut next = Vec::new();
+            self.lower_once(&mut next, false)?;
+            out.absorb(self.carry_out(next, ballot)?);
+        }
+        Ok(out)
+    }
+
+    /// Lower until nothing is queued, or a lowering moves nothing.
+    ///
+    /// One lowering takes everything queued that fits one journal group.
+    /// The bound is the queue's own depth when this started, so a
+    /// lowering that moves nothing -- an append still in flight, an
+    /// uncertain head -- ends the loop rather than spinning; the next
+    /// round lowers again. Lowering in groups, it journals only
+    /// ([`Node::flush`]).
+    fn lower_queued(&mut self, next: &mut Vec<Effect>) -> Result<(), DriveError> {
+        let mut attempts = self.applier.store().queued() + 1;
+        while self.applier.store().queued() > 0 && attempts > 0 {
+            self.lower_once(next, self.grouped)?;
+            attempts -= 1;
+        }
+        Ok(())
     }
 
     /// Take part in agreeing a forgetting floor (task-d27).
@@ -1068,31 +1188,16 @@ impl<P: Persistence> Node<P> {
             self.outbox.observe(&event);
             next.extend(self.machine_mut().step(Event::Storage(event)));
         }
-        if persisted {
-            // One lowering moves one group, and a group takes one batch
-            // per domain. A round that submitted more than one -- two
-            // adoptions decided together, a proposal beside the
-            // acceptance its predecessor unblocked -- leaves the rest
-            // queued, and nothing comes back for them on its own: the
-            // next lowering happens only because something else was
-            // persisted. So the queue would lag by one for ever, and
-            // whatever was submitted last would never become durable at
-            // all. A replica that never reports a batch durable never
-            // releases the vote that waited on it, and the quorum that
-            // vote belongs to does not form.
-            //
-            // The bound is the queue's own depth when this started, so a
-            // lowering that moves nothing -- an append still in flight,
-            // an uncertain head -- ends the loop rather than spinning;
-            // the next round lowers again.
-            let mut attempts = self.applier.store().queued() + 1;
-            loop {
-                self.lower_once(&mut next)?;
-                attempts -= 1;
-                if self.applier.store().queued() == 0 || attempts == 0 {
-                    break;
-                }
-            }
+        // Lowered here, everything this round submitted: nothing comes
+        // back for a queued batch on its own, so whatever was left queued
+        // would never become durable unless something else was persisted
+        // after it, and the vote it carried would never be released.
+        //
+        // Lowering in groups (task-d47), the round leaves it queued
+        // instead, and the runtime's `Node::flush` lowers it with
+        // whatever the events after this one queue.
+        if persisted && (!self.grouped || self.flushing) {
+            self.lower_queued(&mut next)?;
         }
         for waiting in self.outbox.pending() {
             self.withheld += 1;
@@ -1125,12 +1230,18 @@ impl<P: Persistence> Node<P> {
     }
 
     /// Lower one group and hand what it made durable to the outbox and
-    /// the machine; the machine's answers join `next`.
-    fn lower_once(&mut self, next: &mut Vec<Effect>) -> Result<(), DriveError> {
+    /// the machine; the machine's answers join `next`. `journal_only`
+    /// journals it without materializing it ([`Persistence::journal`]).
+    fn lower_once(&mut self, next: &mut Vec<Effect>, journal_only: bool) -> Result<(), DriveError> {
         let store = self.applier.store_mut();
-        let mut outcome =
-            Self::measured(self.recorder.as_deref(), Stage::Journal, || store.lower())
-                .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
+        let mut outcome = Self::measured(self.recorder.as_deref(), Stage::Journal, || {
+            if journal_only {
+                store.journal()
+            } else {
+                store.lower()
+            }
+        })
+        .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
         // Indeterminate is not "failed": the group's outcome is unknown,
         // and what settles it is the store's own record, read back by a
         // reconcile, never an assumption either way. It is settled here,
@@ -1149,6 +1260,27 @@ impl<P: Persistence> Node<P> {
             outcome.indeterminate = settled.indeterminate;
         }
         for event in outcome.events {
+            // A staged execution group's batches are journaled with the
+            // protocol's (task-d47); they are the applier's to complete,
+            // and none of the machine's. One definitely not journaled is
+            // a command reported applied that will not be.
+            if event
+                .barrier()
+                .is_some_and(|barrier| coord_core::outbox::is_application(&barrier))
+            {
+                if matches!(
+                    event,
+                    StorageEvent::Failed {
+                        error: coord_core::event::StorageError::DefinitelyNotCommitted,
+                        ..
+                    }
+                ) {
+                    return Err(DriveError::Engine(
+                        "an execution group was definitely not journaled".into(),
+                    ));
+                }
+                continue;
+            }
             self.outbox.observe(&event);
             next.extend(self.machine_mut().step(Event::Storage(event)));
         }
@@ -1199,7 +1331,7 @@ impl<P: Persistence> Node<P> {
             if before == 0 {
                 break;
             }
-            self.lower_once(next)?;
+            self.lower_once(next, false)?;
             if self.applier.store().queued() >= before {
                 break;
             }
@@ -1220,8 +1352,46 @@ impl<P: Persistence> Node<P> {
     /// path rather than the early one -- slower, never wrong -- which is
     /// the preview's behaviour and not the architecture's.
     pub fn execute(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        self.run_executions(ballot, false)
+    }
+
+    /// Apply the commands whose turn has come, as [`Node::execute`] does,
+    /// but leave the last group staged: submitted, not lowered, and its
+    /// results held (task-d47). A [`Node::flush`] then journals it with
+    /// the protocol's batches in one append, and [`Node::finish`]
+    /// materializes it and hands out its results.
+    pub fn stage(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        self.run_executions(ballot, true)
+    }
+
+    /// Materialize the staged execution group, if there is one, and carry
+    /// out what its commands led to (task-d47).
+    pub fn finish(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        if !self.applier.in_group() {
+            return Ok(Outbound::default());
+        }
+        let mut held = core::mem::take(&mut self.staged);
+        self.close_group(&mut held, ballot)
+    }
+
+    fn run_executions(&mut self, ballot: &Ballot, stage: bool) -> Result<Outbound, DriveError> {
         let mut out = Outbound::default();
-        while let Some(command) = self.machine().next_executable() {
+        // What the commands of an open group led to: carried out once the
+        // group has materialized, never before (task-d47).
+        let mut held: Vec<Effect> = core::mem::take(&mut self.staged);
+        loop {
+            let Some(command) = self.machine().next_executable() else {
+                if self.applier.in_group() {
+                    if stage {
+                        self.staged = held;
+                        break;
+                    }
+                    // What the group led to may let more commands execute.
+                    out.absorb(self.close_group(&mut held, ballot)?);
+                    continue;
+                }
+                break;
+            };
             // A command whose turn has come but whose payload this
             // replica does not hold is not something to skip past: the
             // order is the whole of the guarantee, and going on would
@@ -1236,29 +1406,43 @@ impl<P: Persistence> Node<P> {
                 // all. So execution stops here, the command is named,
                 // and the runtime asks for what it is missing.
                 self.awaiting = Some(command);
+                if self.applier.in_group() {
+                    if stage {
+                        self.staged = held;
+                    } else {
+                        out.absorb(self.close_group(&mut held, ballot)?);
+                    }
+                }
                 return Ok(out);
             };
             self.awaiting = None;
+            if self.applier.grouped() >= GROUP_COMMANDS {
+                out.absorb(self.close_group(&mut held, ballot)?);
+            }
+            // The protocol's batches a runtime lowering in groups left
+            // queued go first when they fill half the store's queue, so an
+            // application batch is never refused as the queue is full.
+            if self.grouped && self.applier.store().queued() >= GROUP_QUEUE_ROOM {
+                out.absorb(self.close_group(&mut held, ballot)?);
+                out.absorb(self.flush(ballot)?);
+            }
+            let grouping = self.grouped && self.applier.begin_group();
             let applier = &mut self.applier;
-            let outcome = Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
-                applier.apply(command, &payload)
-            })
-            .map_err(|e| {
-                // A committed command has to be applied at its position,
-                // so a refused apply cannot be failed and forgotten the
-                // way a protocol transition is. Nothing but a promise at
-                // or above the fence moves it, and this voter does not
-                // make one on its own; a restart does.
-                if matches!(&e, coord_storage::ApplyError::Engine(engine) if coord_storage::materialize::is_fenced(engine)) {
-                    let id: String = command.0.0[..4]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    DriveError::Fenced(format!("the apply of command {id}"))
-                } else {
-                    DriveError::Engine(format!("{e:?}"))
-                }
-            })?;
+            let outcome =
+                match Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
+                    applier.apply(command, &payload)
+                }) {
+                    // The group and the protocol's queued batches leave no
+                    // room for this command's batch: lower them, and apply
+                    // the same command again (task-d47). Nothing of it was
+                    // submitted.
+                    Err(coord_storage::ApplyError::GroupFull) => {
+                        out.absorb(self.close_group(&mut held, ballot)?);
+                        out.absorb(self.flush(ballot)?);
+                        continue;
+                    }
+                    applied => applied.map_err(|e| Self::apply_error(&command, &e))?,
+                };
             self.executed += 1;
             if let Some(order) = self.order.as_mut()
                 && !order.note(outcome.position, command)
@@ -1278,23 +1462,79 @@ impl<P: Persistence> Node<P> {
             // while leading and never retries a release it skipped; that
             // gap, and the base's 3 of 16, are open in the notes ("A
             // result the leader executed while not leading").
+            //
+            // Within a group the machine hears the outcome now, which is
+            // what lets it name the next command, and what it answers is
+            // held until the group has materialized: a release, a send
+            // and a result all wait for the group (task-d47).
             let effects = self.machine_mut().applied(command, &outcome)?;
-            out.absorb(self.carry_out(effects, ballot)?);
             // At a floor boundary the view is exactly the command's: the
             // apply returned once its batch was readable, and only a
             // command moves the frontier (task-d27). A retry answered from
             // the record carries its original position, behind the
-            // frontier, and is no boundary.
+            // frontier, and is no boundary. A group ends at the boundary,
+            // so it too is read with nothing after it applied.
             let frontier = self.machine().executed_through();
-            if self
+            let boundary = self
                 .floor
                 .as_ref()
-                .is_some_and(|floor| floor.due(outcome.position, frontier))
-            {
+                .is_some_and(|floor| floor.due(outcome.position, frontier));
+            if grouping {
+                held.extend(effects);
+                if boundary {
+                    out.absorb(self.close_group(&mut held, ballot)?);
+                }
+            } else {
+                out.absorb(self.carry_out(effects, ballot)?);
+            }
+            if boundary {
                 out.absorb(self.floor_boundary(outcome.position, ballot)?);
             }
         }
         Ok(out)
+    }
+
+    /// Lower the open execution group until it has materialized, then
+    /// carry out what its commands led to (task-d47).
+    fn close_group(
+        &mut self,
+        held: &mut Vec<Effect>,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let applier = &mut self.applier;
+        Self::measured(self.recorder.as_deref(), Stage::Journal, || {
+            applier.finish_group()
+        })
+        .map_err(|e| match e {
+            // Its commands were reported applied and their results are
+            // held here, unreleased. The journal is the record, so the
+            // replica restarts from it rather than plan them again.
+            coord_storage::ApplyError::GroupLost => {
+                DriveError::Engine("an execution group was definitely not journaled".into())
+            }
+            other => DriveError::Engine(format!("{other:?}")),
+        })?;
+        let effects = core::mem::take(held);
+        self.carry_out(effects, ballot)
+    }
+
+    /// The driver's account of an apply that failed.
+    fn apply_error(command: &CommandId, e: &coord_storage::ApplyError) -> DriveError {
+        // A committed command has to be applied at its position,
+        // so a refused apply cannot be failed and forgotten the
+        // way a protocol transition is. Nothing but a promise at
+        // or above the fence moves it, and this voter does not
+        // make one on its own; a restart does.
+        if matches!(e, coord_storage::ApplyError::Engine(engine) if coord_storage::materialize::is_fenced(engine))
+        {
+            let id: String = command.0.0[..4]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            DriveError::Fenced(format!("the apply of command {id}"))
+        } else {
+            DriveError::Engine(format!("{e:?}"))
+        }
     }
 
     /// Storage facts the runtime observed outside a round (a reconcile, a
