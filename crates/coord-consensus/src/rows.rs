@@ -314,6 +314,18 @@ pub fn payload_update(
     })
 }
 
+/// The update deleting a command's payload row (task-d24): a record a
+/// Sync released goes with its payload, so the replica is as if it never
+/// held the command, and a later proposal of it fetches the payload as
+/// any missing one is fetched, before and after a restart.
+pub fn payload_delete(command: &CommandId) -> StoreUpdate {
+    StoreUpdate {
+        collection: Collection::PayloadV1.id(),
+        key: payload_key(command),
+        value: None,
+    }
+}
+
 /// The leader's recoverable proposal state for a command.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProposalRecordV1 {

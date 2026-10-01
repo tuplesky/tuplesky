@@ -880,3 +880,79 @@ fn a_command_anchored_at_every_committed_tail_follows_the_last_one() {
     let after = table.initialize(cmd(5), payload(5), k("key")).unwrap();
     assert_eq!(after.deps, vec![cmd(4)]);
 }
+
+/// task-d24: releasing an undecided record repairs the conflict index: a
+/// key whose latest command it was takes the released command's own
+/// dependencies, so the next command on the key follows what the released
+/// one followed; a decided record is never released.
+#[test]
+fn releasing_the_latest_command_hands_the_key_back_to_its_predecessor() {
+    let id = |n: u8| CommandId(Digest32([n; 32]));
+    let key = vec![b"*".to_vec()];
+    let mut t = CommandTable::with_capacity(16);
+    let a = t.initialize(id(1), Digest32([1; 32]), key.clone()).unwrap();
+    assert!(a.deps.is_empty());
+    let b = t.initialize(id(2), Digest32([2; 32]), key.clone()).unwrap();
+    assert_eq!(b.deps, vec![id(1)]);
+    assert!(t.release(&id(2)));
+    assert_eq!(t.phase_of(&id(2)), None);
+    let c = t.initialize(id(3), Digest32([3; 32]), key.clone()).unwrap();
+    assert_eq!(
+        c.deps,
+        vec![id(1)],
+        "the next command follows the released one's predecessor"
+    );
+    t.accept(id(1), vec![]).unwrap();
+    t.commit(id(1)).unwrap();
+    assert!(!t.release(&id(1)), "a decided record stays");
+}
+
+/// A released command leaves the key's path log (task-d24): the next
+/// command's path is the one a replica that never held it computes, so
+/// its fast-path evidence agrees with theirs.
+#[test]
+fn a_released_command_leaves_the_path_log() {
+    let id = |n: u8| CommandId(Digest32([n; 32]));
+    let key = vec![b"*".to_vec()];
+    let mut released = CommandTable::with_capacity(16);
+    released
+        .initialize(id(1), Digest32([1; 32]), key.clone())
+        .unwrap();
+    released
+        .initialize(id(2), Digest32([2; 32]), key.clone())
+        .unwrap();
+    assert!(released.release(&id(2)));
+    let after_release = released
+        .initialize(id(3), Digest32([3; 32]), key.clone())
+        .unwrap();
+    let mut never = CommandTable::with_capacity(16);
+    never
+        .initialize(id(1), Digest32([1; 32]), key.clone())
+        .unwrap();
+    let without = never
+        .initialize(id(3), Digest32([3; 32]), key.clone())
+        .unwrap();
+    assert_eq!(after_release.paths, without.paths);
+    assert_eq!(after_release.path, without.path);
+}
+
+/// A released command that was reordered behind a synchronization no
+/// longer holds the head off the leader's paths (task-d24 with task-d34):
+/// released, it stands for no history at all.
+#[test]
+fn a_released_reordered_command_frees_the_head() {
+    let (x, y) = (cmd(1), cmd(2));
+    let mut leader = CommandTable::new();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let mut follower = CommandTable::new();
+    follower.initialize(x, payload(1), k("key")).unwrap();
+    follower.initialize(y, payload(2), k("key")).unwrap();
+    follower.record_leader_path(y, 0, &ly.paths);
+    assert_eq!(
+        follower.log(b"key").unwrap().reordered(),
+        &BTreeSet::from([x])
+    );
+    assert!(follower.release(&x));
+    assert!(follower.log(b"key").unwrap().reordered().is_empty());
+    assert_eq!(follower.path_head(b"key"), leader.path_head(b"key"));
+}

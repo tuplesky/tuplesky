@@ -125,7 +125,8 @@ pub struct SyncDecision {
     /// Adopted commands, keyed by identity.
     pub entries: BTreeMap<CommandId, SyncEntry>,
     /// Commands seen only below ACCEPT or only in lower-ballot reports:
-    /// re-proposed under the new ballot.
+    /// re-proposed under the new ballot, as many as fit beside the
+    /// entries within [`MAX_REPORT_ENTRIES`] (task-d24).
     pub reproposed: BTreeSet<CommandId>,
 }
 
@@ -198,6 +199,20 @@ pub enum RecoveryError {
         /// The most a report may carry.
         limit: usize,
     },
+    /// A report announcing more pages than a report of
+    /// [`MAX_REPORT_ENTRIES`] takes, and one more (task-d24 review). It is
+    /// past the bound however its pages come out, so it is set aside as
+    /// one too large is, and it is the campaign's failure, by name, when
+    /// every voter answered and too few fit. Before, each of its pages was
+    /// refused and the campaign waited for the election's ceiling.
+    ReportPastPages {
+        /// Reporter.
+        replica: ReplicaId,
+        /// Pages it announced.
+        pages: u32,
+        /// The most a report may announce.
+        limit: u32,
+    },
     /// A selection whose Sync does not fit the row it is bound in or the
     /// frame it is published in (task-d20): the campaign is refused
     /// rather than the process ended mid-election.
@@ -248,29 +263,59 @@ pub const MAX_REPORT_ENTRIES: usize = max_report_entries(MAX_TABLE_CAPACITY);
 /// cycle and whatever depends on it, in identity order. Nothing is
 /// guessed: no order of a cycle keeps every member's dependencies.
 pub fn entry_order(decision: &SyncDecision) -> Result<Vec<CommandId>, Vec<CommandId>> {
-    let mut order: Vec<CommandId> = Vec::new();
-    let mut placed: BTreeSet<CommandId> = BTreeSet::new();
-    let mut remaining: Vec<CommandId> = decision.entries.keys().copied().collect();
-    while !remaining.is_empty() {
-        let before = remaining.len();
-        remaining.retain(|c| {
-            let deps = &decision.entries[c].deps;
-            if deps
-                .iter()
-                .all(|d| !decision.entries.contains_key(d) || placed.contains(d))
-            {
-                order.push(*c);
-                placed.insert(*c);
-                false
-            } else {
-                true
-            }
-        });
-        if remaining.len() == before {
-            return Err(remaining);
+    // The order is that of placing, pass after pass in identity order,
+    // every entry whose entry dependencies are placed: an entry goes in
+    // the pass after its latest dependency's, or in the same one when
+    // that dependency comes first by identity. Computed here in one walk
+    // of the dependency graph rather than one scan of every entry per
+    // pass (review): a candidate asks this again at each step of its
+    // payload fetches, and a selection of a few thousand entries in long
+    // chains made that quadratic per step.
+    let entries = &decision.entries;
+    let mut unplaced: BTreeMap<CommandId, usize> = BTreeMap::new();
+    let mut dependents: BTreeMap<CommandId, Vec<CommandId>> = BTreeMap::new();
+    let mut ready: Vec<CommandId> = Vec::new();
+    for (c, e) in entries {
+        let deps: BTreeSet<CommandId> = e
+            .deps
+            .iter()
+            .filter(|d| entries.contains_key(d))
+            .copied()
+            .collect();
+        if deps.is_empty() {
+            ready.push(*c);
+        }
+        unplaced.insert(*c, deps.len());
+        for d in deps {
+            dependents.entry(d).or_default().push(*c);
         }
     }
-    Ok(order)
+    let mut pass: BTreeMap<CommandId, usize> = BTreeMap::new();
+    while let Some(d) = ready.pop() {
+        let at = pass.get(&d).copied().unwrap_or(1);
+        pass.insert(d, at);
+        for c in dependents.remove(&d).unwrap_or_default() {
+            let after = if d < c { at } else { at + 1 };
+            let p = pass.entry(c).or_insert(1);
+            *p = (*p).max(after);
+            let left = unplaced.get_mut(&c).expect("an entry");
+            *left -= 1;
+            if *left == 0 {
+                ready.push(c);
+            }
+        }
+    }
+    let stuck: Vec<CommandId> = unplaced
+        .iter()
+        .filter(|(_, left)| **left > 0)
+        .map(|(c, _)| *c)
+        .collect();
+    if !stuck.is_empty() {
+        return Err(stuck);
+    }
+    let mut order: Vec<(usize, CommandId)> = pass.into_iter().map(|(c, p)| (p, c)).collect();
+    order.sort_unstable();
+    Ok(order.into_iter().map(|(_, c)| c).collect())
 }
 
 /// Select the Sync result from `reports` for the ballot of `config`.
@@ -500,12 +545,55 @@ pub fn select_with(
     for c in entries.keys() {
         reproposed.remove(c);
     }
+    let reproposed = within_bound(&entries, reproposed, MAX_REPORT_ENTRIES);
     Ok(SyncDecision {
         ballot: config.ballot(),
         source_ballot,
         entries,
         reproposed,
     })
+}
+
+/// The re-proposals a Sync carries (task-d24, from the review of
+/// task-d20): every kept entry, then re-proposals until the Sync holds
+/// `limit` commands, so a voter that installs it and takes its
+/// re-proposals reports no more than a campaign accepts.
+///
+/// A re-proposal a kept entry depends on goes first, whatever its place:
+/// the new leader re-proposes such an entry right after it, and left out
+/// the entry would wait for a proposal nobody makes. The rest follow in
+/// identity order (the order of the re-proposed set), which is
+/// deterministic, not the order the leader proposes them in. What does
+/// not fit was
+/// decided nowhere, as every re-proposal was not: the installers release
+/// it, as they release any record the Sync neither selects nor
+/// re-proposes, and the collector offers it again.
+///
+/// Kept entries are never cut, since one may be decided, so a selection
+/// whose kept entries alone pass `limit` carries them all; the notes
+/// argue they stay within twice the table.
+fn within_bound(
+    entries: &BTreeMap<CommandId, SyncEntry>,
+    reproposed: BTreeSet<CommandId>,
+    limit: usize,
+) -> BTreeSet<CommandId> {
+    if entries.len().saturating_add(reproposed.len()) <= limit {
+        return reproposed;
+    }
+    let followed: BTreeSet<CommandId> = entries
+        .values()
+        .flat_map(|e| e.deps.iter())
+        .filter(|d| reproposed.contains(d))
+        .copied()
+        .collect();
+    let room = limit.saturating_sub(entries.len().saturating_add(followed.len()));
+    let rest: Vec<CommandId> = reproposed
+        .iter()
+        .filter(|c| !followed.contains(c))
+        .take(room)
+        .copied()
+        .collect();
+    followed.into_iter().chain(rest).collect()
 }
 
 /// Adopt the commands that may have been learned fast under the source

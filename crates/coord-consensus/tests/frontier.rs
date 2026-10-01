@@ -595,7 +595,10 @@ fn a_follower_whose_table_filled_while_it_could_not_learn_catches_up() {
 fn a_follower_asks_first_for_what_the_leader_committed_in_its_order() {
     let capacity = 32;
     let mut cluster = Cluster::new(19, capacity);
-    let commands: Vec<CommandId> = (1..=capacity as u64)
+    // As many as new admission takes: the capacity less the recovery
+    // reserve (task-d24).
+    let admitted = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let commands: Vec<CommandId> = (1..=admitted as u64)
         .map(|n| cluster.admit_to(n, &[0, 1, 2, 4], 9))
         .collect();
     // Only the leader's proposals reach r3, and nothing is settled, so it
@@ -777,14 +780,17 @@ fn a_follower_that_took_a_command_under_other_facts_before_its_proposal_rebinds(
 fn a_command_whose_turn_has_come_is_admitted_before_the_leader_commits_it() {
     let capacity = 8;
     let mut cluster = Cluster::new(53, capacity);
-    let later: Vec<CommandId> = (2..=(capacity as u64 + 1))
+    // A table full for new admission: the capacity less the recovery
+    // reserve (task-d24).
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let later: Vec<CommandId> = (2..=(full as u64 + 1))
         .map(|n| cluster.admit_to(n, &[2, 3, 4], 9))
         .collect();
     cluster.settle();
     let head = cluster.admit_to(1, &[0, 1], 9);
     cluster.settle_ticking(3);
     // The collector re-offers the later commands to the rest.
-    for n in 2..=(capacity as u64 + 1) {
+    for n in 2..=(full as u64 + 1) {
         cluster.admit_to(n, &[0, 1], 9);
     }
     cluster.settle_ticking(capacity * 2);

@@ -50,11 +50,16 @@ const FRONTEND: PeerId = PeerId {
 };
 
 fn identity(me: u8) -> ConfigurationIdentity {
+    identity_among(me, 3)
+}
+
+/// Voter `me`'s identity in a domain of `voters` voters.
+fn identity_among(me: u8, voters: u8) -> ConfigurationIdentity {
     ConfigurationIdentity {
         cluster: ClusterId([1; 16]),
         domain: DomainId([2; 16]),
         epoch: epoch(),
-        voters: (0..3).map(r).collect(),
+        voters: (0..voters).map(r).collect(),
         replica: r(me),
         incarnation: ReplicaIncarnation::new(1).unwrap(),
         role: ReplicaRole::Voter,
@@ -62,7 +67,12 @@ fn identity(me: u8) -> ConfigurationIdentity {
 }
 
 fn quorum(b: Ballot) -> BallotConfiguration {
-    BallotConfiguration::c2_default(epoch(), b, (0..3).map(r).collect()).unwrap()
+    quorum_among(b, 3)
+}
+
+/// Ballot `b`'s configuration in a domain of `voters` voters.
+fn quorum_among(b: Ballot, voters: u8) -> BallotConfiguration {
+    BallotConfiguration::c2_default(epoch(), b, (0..voters).map(r).collect()).unwrap()
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -140,6 +150,8 @@ struct Cluster {
     drop_pages: Vec<(u8, u8)>,
     /// The voters' table capacity.
     capacity: usize,
+    /// How many voters the domain has.
+    voters: u8,
     frontend: Vec<(ReplicaId, ProtocolMessage)>,
     /// Every payload ask sent: who asked, and for what.
     asks: Vec<(usize, Vec<CommandId>)>,
@@ -165,8 +177,15 @@ impl Cluster {
 
     /// A cluster whose voters' tables hold `capacity` commands.
     fn with_capacity(seed: u64, capacity: usize) -> Self {
+        Self::with_voters(seed, capacity, 3)
+    }
+
+    /// The same, with `voters` voters.
+    fn with_voters(seed: u64, capacity: usize, voters: u8) -> Self {
+        let identity = |me| identity_among(me, voters);
+        let quorum = |b| quorum_among(b, voters);
         let mut nodes = Vec::new();
-        for me in 0..3u8 {
+        for me in 0..voters {
             let role = if me == 0 {
                 Role::Leader(Leader::new(
                     LeaderConfig {
@@ -212,6 +231,7 @@ impl Cluster {
             drop_acks: Vec::new(),
             drop_proposals: Vec::new(),
             capacity,
+            voters,
             frontend: Vec::new(),
             asks: Vec::new(),
             proposals_sent: Vec::new(),
@@ -392,9 +412,13 @@ impl Cluster {
                     progressed = true;
                 }
             }
-            // Fetch payloads a follower lacks from the ballot's leader.
+            // Fetch payloads a follower lacks from the ballot's leader: the
+            // runtime's timer, which fires when nothing is in flight. Asked
+            // at every step, a voter lacking a thousand payloads sent an
+            // ask per message delivered, and the answers never caught up.
+            let busy = self.in_flight() > 0;
             for i in 0..self.nodes.len() {
-                if !self.nodes[i].alive || self.no_fetch.contains(&i) {
+                if busy || !self.nodes[i].alive || self.no_fetch.contains(&i) {
                     continue;
                 }
                 if let Some(Role::Follower(f)) = self.nodes[i].role.as_mut()
@@ -403,8 +427,10 @@ impl Cluster {
                     let leader = f.quorum().leader();
                     let effects = f.request_payloads(leader);
                     if !effects.is_empty() {
+                        // An ask that reaches no live voter is no progress.
+                        let queued = self.in_flight();
                         self.handle(i, effects);
-                        progressed = true;
+                        progressed |= self.in_flight() > queued;
                     }
                 }
             }
@@ -412,6 +438,15 @@ impl Cluster {
                 return;
             }
         }
+    }
+
+    /// Messages queued at live nodes.
+    fn in_flight(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|n| n.alive)
+            .map(|n| n.inbox.len())
+            .sum()
     }
 
     /// What the runtime's re-send timer does (task-d07): every leader
@@ -516,7 +551,7 @@ impl Cluster {
             .collect();
         let mut f = Follower::recover_with_syncs(
             FollowerConfig {
-                identity: identity(i as u8),
+                identity: identity_among(i as u8, self.voters),
                 genesis: ballot(0, 0),
                 quorum: q,
                 frontend: FRONTEND,
@@ -5199,9 +5234,306 @@ fn interrupted_campaigns_leave_the_candidates_memory_flat() {
     assert_eq!(pages.len(), 3);
     assert_eq!(
         c.page(pages[0].clone()),
-        Err(coord_consensus::PageError::OutOfBounds)
+        Err(coord_consensus::PageError::PastBound)
     );
     assert_eq!(c.pages_held(), 0);
+}
+
+fn standalone(id: u8, capacity: usize) -> Follower {
+    let mut f = Follower::new(FollowerConfig {
+        identity: identity(id),
+        quorum: quorum(ballot(0, 0)),
+        genesis: ballot(0, 0),
+        frontend: FRONTEND,
+        capacity,
+    });
+    f.step(boot_event(id));
+    f
+}
+
+fn step_durably(f: &mut Follower, event: Event) {
+    let effects = f.step(event);
+    for e in durable_events(&effects) {
+        f.step(e);
+    }
+}
+
+/// task-d24: a voter whose table is full for new admission installs a
+/// Sync whose entries it lacks, and executes them. A placeholder refused
+/// under backpressure dropped the entry silently, and its payload was
+/// refused the same way, so only catch-up could bring it in.
+#[test]
+fn a_voter_with_a_full_table_installs_a_syncs_entries_and_executes_them() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut donor = standalone(2, capacity);
+    let xs: Vec<CommandId> = (0..3u64)
+        .map(|i| {
+            let (c, e) = admission(900 + i, 9);
+            step_durably(&mut donor, e);
+            c
+        })
+        .collect();
+    let mut f = standalone(1, capacity);
+    let filled: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_durably(&mut f, e);
+            c
+        })
+        .collect();
+    let (_, over) = admission(999, 1);
+    f.step(over);
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new admission stops short of the reserved share"
+    );
+    assert_eq!(f.table().len(), full);
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let entries = xs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut e = selected(*c, if i == 0 { &[] } else { &xs[i - 1..i] });
+            e.phase = Phase::Commit;
+            e.admission = donor.payload(c).map(|p| p.admission_digest());
+            (*c, e)
+        })
+        .collect();
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            // What this voter holds is re-proposed, so none of it is
+            // released and the table stays full while the entries come in.
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries,
+                reproposed: filled.iter().copied().collect(),
+            }),
+        ),
+    );
+    for x in &xs {
+        step_durably(
+            &mut f,
+            peer_event(
+                r(2),
+                ProtocolMessage::PayloadResponse {
+                    command: *x,
+                    payload: donor.payload(x).unwrap().clone(),
+                },
+            ),
+        );
+    }
+    let mut executed = Vec::new();
+    while let Some(c) = f.next_executable() {
+        let position = f.executed_through().checked_next().unwrap();
+        let outcome = AppliedOutcome {
+            position,
+            revision: None,
+            result_digest: Digest32(c.0.0),
+            response: c.0.0.to_vec(),
+        };
+        f.applied(c, &outcome).unwrap();
+        executed.push(c);
+    }
+    assert_eq!(executed, xs);
+    for c in &filled {
+        assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+    }
+}
+
+/// task-d24: the records a Sync neither selected nor re-proposed, that
+/// this voter's report for the ballot named, are released with the Sync's
+/// install batch, payloads included; a selected one and a re-proposed one
+/// stay; new work is admitted again. (A record the new leader proposes
+/// after its Sync, reaching this voter first, is
+/// `a_proposal_refused_ahead_of_the_promise_is_sent_again`.)
+#[test]
+fn records_decided_nowhere_are_released_by_the_next_sync() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut f = standalone(1, capacity);
+    let held: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_durably(&mut f, e);
+            c
+        })
+        .collect();
+    let (_, over) = admission(999, 1);
+    f.step(over);
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::Backpressure)
+    );
+    // The promise, and the report it owes, naming every record held.
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let (sel, rep) = (held[3], held[7]);
+    let mut entry = selected(sel, &[]);
+    entry.admission = f.table().record(&sel).and_then(|r| r.payload);
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::from([(sel, entry)]),
+                reproposed: BTreeSet::from([rep]),
+            }),
+        ),
+    );
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        if *c == sel || *c == rep {
+            assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+        } else {
+            assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+            assert!(f.payload(c).is_none(), "{c:?}'s payload was kept");
+        }
+    }
+    assert!(f.ledger().record(&held[0]).is_none());
+    let (_, again) = admission(1000, 1);
+    step_durably(&mut f, again);
+    assert!(
+        !f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new work is admitted after the release"
+    );
+}
+
+/// Step `f`, writing its batches to `storage` and making them durable.
+fn step_stored(f: &mut Follower, storage: &mut StorageModel, event: Event) {
+    let effects = f.step(event);
+    for e in &effects {
+        if let Effect::Persist(batch) = e {
+            let barrier = batch.barrier;
+            storage.submit(batch.clone());
+            storage.complete(barrier).unwrap();
+            let more = f.step(Event::Storage(StorageEvent::JournalDurable {
+                barrier_id: barrier,
+                journal_seq: LocalJournalSeq::new(1).unwrap(),
+            }));
+            for e in &more {
+                if let Effect::Persist(b) = e {
+                    storage.submit(b.clone());
+                    storage.complete(b.barrier).unwrap();
+                    f.step(Event::Storage(StorageEvent::JournalDurable {
+                        barrier_id: b.barrier,
+                        journal_seq: LocalJournalSeq::new(1).unwrap(),
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// A voter restarted between its report and the Sync still releases
+/// what the Sync leaves out (task-d24): the cut is rebuilt from the
+/// undecided durable records of a promise not yet synchronized, which
+/// after the promise's fence are the ones the report named. Without it
+/// the delayed Sync released nothing and the table stayed full.
+#[test]
+fn a_voter_restarted_before_the_sync_still_releases_what_it_leaves_out() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut storage = StorageModel::default();
+    let mut f = standalone(1, capacity);
+    let held: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_stored(&mut f, &mut storage, e);
+            c
+        })
+        .collect();
+    step_stored(
+        &mut f,
+        &mut storage,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    assert_eq!(f.ballots().promised(), b);
+    // Killed before the Sync arrives, and brought back from its rows.
+    storage.crash();
+    let mut f = Follower::recover_with_syncs(
+        FollowerConfig {
+            identity: identity(1),
+            genesis: ballot(0, 0),
+            quorum: quorum(ballot(0, 0)),
+            frontend: FRONTEND,
+            capacity,
+        },
+        promise_row(&storage),
+        None,
+        dependency_rows(&storage),
+        payload_rows(&storage),
+        Vec::new(),
+        ExecutionPosition::ZERO,
+    )
+    .restore_execution(ExecutionPosition::ZERO, [])
+    .restore_payloads(payload_rows(&storage));
+    f.step(boot_event(9));
+    assert_eq!(f.ballots().promised(), b);
+    let (sel, rep) = (held[3], held[7]);
+    let mut entry = selected(sel, &[]);
+    entry.admission = f.table().record(&sel).and_then(|r| r.payload);
+    step_stored(
+        &mut f,
+        &mut storage,
+        peer_event(
+            r(2),
+            ProtocolMessage::Sync(SyncDecision {
+                ballot: b,
+                source_ballot: ballot(0, 0),
+                entries: BTreeMap::from([(sel, entry)]),
+                reproposed: BTreeSet::from([rep]),
+            }),
+        ),
+    );
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        if *c == sel || *c == rep {
+            assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+        } else {
+            assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+        }
+    }
+    let (_, again) = admission(1000, 1);
+    step_stored(&mut f, &mut storage, again);
+    assert!(
+        !f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new work is admitted after the release"
+    );
 }
 
 /// task-d20 review: nothing installs while a newer Sync's marker is still
@@ -5272,6 +5604,67 @@ fn a_payload_arriving_while_a_sync_marker_is_in_flight_installs_nothing() {
     );
 }
 
+/// task-d24 review: a payload for a command the in-flight Sync marker
+/// releases is not taken. Taken, z's payload and dependency rows landed
+/// after the batch that deleted them; at durability the table and the
+/// payloads dropped z, but the ledger and the disk kept it, and its slot
+/// came back at the next restart.
+#[test]
+fn a_payload_for_a_command_the_sync_in_flight_releases_writes_nothing() {
+    let (b1, b2) = (ballot(1, 2), ballot(2, 0));
+    let (mut f, x) = follower_with_x_promised(b1);
+    let (z, admit_z) = admission(2, 2);
+    let older = SyncDecision {
+        ballot: b1,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(x, selected(x, &[])), (z, selected(z, &[x]))]),
+        reproposed: BTreeSet::new(),
+    };
+    drive_durable(&mut f, peer_event(r(2), ProtocolMessage::Sync(older)));
+    drive_durable(
+        &mut f,
+        peer_event(
+            r(0),
+            ProtocolMessage::NewLeader {
+                ballot: b2,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    assert!(
+        f.report(b2).entries.iter().any(|e| e.command == z),
+        "z is in the report the release is cut from"
+    );
+    let newer = SyncDecision {
+        ballot: b2,
+        source_ballot: b1,
+        entries: BTreeMap::from([(x, selected(x, &[]))]),
+        reproposed: BTreeSet::new(),
+    };
+    let marker = f.step(peer_event(r(0), ProtocolMessage::Sync(newer)));
+    let installs = f.step(peer_event(
+        r(0),
+        ProtocolMessage::PayloadResponse {
+            command: z,
+            payload: payload_record(admit_z),
+        },
+    ));
+    assert!(
+        !installs.iter().any(|e| matches!(e, Effect::Persist(_))),
+        "z's payload was written after the batch that releases it: {installs:?}"
+    );
+    for e in durable_events(&marker) {
+        let more = f.step(e);
+        for e in durable_events(&more) {
+            f.step(e);
+        }
+    }
+    assert_eq!(f.ballots().synced(), b2);
+    assert_eq!(f.table().phase_of(&z), None, "z kept its slot");
+    assert!(f.payload(&z).is_none(), "z's payload was kept");
+    assert!(f.ledger().record(&z).is_none(), "the ledger kept z");
+}
+
 /// The payload row a replica writes for the admission `admit`.
 fn payload_record(admit: Event) -> coord_consensus::PayloadRecordV1 {
     let mut other = Follower::new(FollowerConfig {
@@ -5307,4 +5700,341 @@ fn drive_durable(f: &mut Follower, event: Event) {
         }
         effects = events.into_iter().flat_map(|e| f.step(e)).collect();
     }
+}
+
+/// task-d24 review: a report announcing more pages than the bound fails
+/// the campaign by name once every voter answered, as one too large does.
+/// Before, each of its pages was refused, the voter counted as not yet
+/// reported, and the campaign waited for the election's ceiling.
+#[test]
+fn a_report_announcing_more_pages_than_the_bound_fails_the_campaign_by_name() {
+    let config = quorum(ballot(1, 0));
+    let report = |replica: u8, entries: u8| RecoveryReport {
+        replica: r(replica),
+        ballot: config.ballot(),
+        committed_ballot: ballot(0, 0),
+        entries: (0..entries)
+            .map(|n| accepted_entry(CommandId(Digest32([replica * 16 + n; 32])), &[]))
+            .collect(),
+    };
+    // At a bound of one entry a report may announce two pages.
+    let mut c = coord_consensus::Campaign::new(config.clone()).bounded(1);
+    c.own_report(report(0, 0));
+    for replica in [1, 2] {
+        c.promise(r(replica));
+    }
+    let pages = coord_consensus::paginate(&report(1, 3), 1);
+    assert_eq!(c.page(pages[0].clone()), Err(PageError::PastBound));
+    // r2 not heard yet: waiting is right, since its report may fit.
+    assert!(matches!(c.try_select(1, |_, _| false), Ok(None)));
+    assert!(
+        c.missing_pages().iter().all(|(v, _)| *v != r(1)),
+        "a report past the bound is not asked for again"
+    );
+    // r2 past the bound too: every voter answered, and too few fit.
+    let pages = coord_consensus::paginate(&report(2, 4), 1);
+    assert_eq!(c.page(pages[1].clone()), Err(PageError::PastBound));
+    assert_eq!(
+        c.try_select(1, |_, _| false),
+        Err(RecoveryError::ReportPastPages {
+            replica: r(1),
+            pages: 3,
+            limit: 2,
+        })
+    );
+    // With r2's report in bounds instead, r1's is set aside and the
+    // selection is made from the majority without it.
+    let mut c = coord_consensus::Campaign::new(config.clone()).bounded(1);
+    c.own_report(report(0, 0));
+    for replica in [1, 2] {
+        c.promise(r(replica));
+    }
+    let pages = coord_consensus::paginate(&report(1, 3), 1);
+    assert_eq!(c.page(pages[2].clone()), Err(PageError::PastBound));
+    for page in coord_consensus::paginate(&report(2, 1), 1) {
+        c.page(page).unwrap();
+    }
+    assert!(matches!(c.try_select(1, |_, _| false), Ok(Some(_))));
+}
+
+/// task-d24 review: five disjoint reports of `MAX_REPORT_ENTRIES` give a
+/// Sync of at most `MAX_REPORT_ENTRIES` commands. Before, every entry was
+/// re-proposed, a Sync of five reports' worth, and every voter taking its
+/// re-proposals reported past the bound.
+///
+/// Every kept entry stays, and so does a re-proposal one depends on
+/// wherever it falls in the order; the rest are taken in identity order.
+#[test]
+fn five_disjoint_full_reports_give_a_sync_within_the_bound() {
+    let limit = coord_consensus::MAX_REPORT_ENTRIES;
+    let config = quorum_among(ballot(1, 0), 5);
+    let id = |voter: u8, n: usize| {
+        let mut bytes = [0u8; 32];
+        bytes[0] = voter;
+        bytes[1..9].copy_from_slice(&(n as u64).to_be_bytes());
+        CommandId(Digest32(bytes))
+    };
+    let mut reports: Vec<RecoveryReport> = (0..5u8)
+        .map(|voter| RecoveryReport {
+            replica: r(voter),
+            ballot: config.ballot(),
+            committed_ballot: ballot(0, 0),
+            entries: (0..limit)
+                .map(|n| {
+                    let mut e = accepted_entry(id(voter, n), &[]);
+                    e.phase = Phase::PreAccept;
+                    e
+                })
+                .collect(),
+        })
+        .collect();
+    // r0 accepted two commands at the source ballot, one following the
+    // last command r4 pre-accepted, which identity order would cut.
+    let (kept, follows) = (id(0xf0, 0), id(0xf0, 1));
+    let last = id(4, limit - 1);
+    reports[0].entries[0] = accepted_entry(kept, &[]);
+    reports[0].entries[1] = accepted_entry(follows, &[last]);
+    let decision = select(&config, &reports).unwrap();
+    assert_eq!(decision.entries.len() + decision.reproposed.len(), limit);
+    assert!(decision.entries.contains_key(&kept));
+    assert!(decision.entries.contains_key(&follows));
+    assert!(
+        decision.reproposed.contains(&last),
+        "the dependency was cut"
+    );
+    // The rest in identity order: r0's own come first and fill it.
+    assert!(decision.reproposed.contains(&id(0, 2)));
+    assert!(!decision.reproposed.contains(&id(1, 0)));
+    coord_consensus::bounded_sync_update(epoch(), &decision).unwrap();
+    // A voter that takes every re-proposal holds no more than the Sync
+    // names, since it released the rest of what it reported: its own
+    // report for the next ballot is within the bound.
+    let named: BTreeSet<CommandId> = decision
+        .entries
+        .keys()
+        .chain(&decision.reproposed)
+        .copied()
+        .collect();
+    assert!(named.len() <= limit);
+}
+
+/// task-d24 review: a Sync whose marker batch failed still releases what
+/// it leaves out when it is sent again. The cut was taken when the
+/// release set was computed, so the failed batch lost it, and the Sync
+/// sent again activated over rows never written and released nothing:
+/// the table stayed full for the boot.
+#[test]
+fn a_sync_sent_again_after_its_marker_failed_still_releases() {
+    let capacity = 32;
+    let full = capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS;
+    let b = ballot(1, 2);
+    let mut f = standalone(1, capacity);
+    let held: Vec<CommandId> = (0..full as u64)
+        .map(|i| {
+            let (c, e) = admission(100 + i, 1);
+            step_durably(&mut f, e);
+            c
+        })
+        .collect();
+    step_durably(
+        &mut f,
+        peer_event(
+            r(2),
+            ProtocolMessage::NewLeader {
+                ballot: b,
+                executed: ExecutionPosition::ZERO,
+            },
+        ),
+    );
+    let (sel, rep) = (held[3], held[7]);
+    let mut entry = selected(sel, &[]);
+    entry.admission = f.table().record(&sel).and_then(|r| r.payload);
+    let sync = SyncDecision {
+        ballot: b,
+        source_ballot: ballot(0, 0),
+        entries: BTreeMap::from([(sel, entry)]),
+        reproposed: BTreeSet::from([rep]),
+    };
+    // The marker's batch fails.
+    let effects = f.step(peer_event(r(2), ProtocolMessage::Sync(sync.clone())));
+    let barrier = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Persist(batch) => Some(batch.barrier),
+            _ => None,
+        })
+        .expect("the marker's batch");
+    f.step(Event::Storage(StorageEvent::Failed {
+        barrier_id: barrier,
+        error: coord_core::event::StorageError::DefinitelyNotCommitted,
+    }));
+    assert!(
+        f.take_rejections()
+            .contains(&FollowerRejection::SyncNotDurable(b))
+    );
+    assert!(held.iter().all(|c| f.table().phase_of(c).is_some()));
+    // Sent again, it installs again and releases.
+    step_durably(&mut f, peer_event(r(2), ProtocolMessage::Sync(sync)));
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        if *c == sel || *c == rep {
+            assert!(f.table().phase_of(c).is_some(), "{c:?} was released");
+        } else {
+            assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+        }
+    }
+    let (_, again) = admission(1000, 1);
+    step_durably(&mut f, again);
+    assert!(
+        !f.take_rejections()
+            .contains(&FollowerRejection::Backpressure),
+        "new work is admitted after the release"
+    );
+}
+
+/// Submissions that reached one voter each and never the leader: voter
+/// `v` pre-accepts `per_voter` commands no other voter holds, and nothing
+/// decides them.
+fn disjoint_undecided(cluster: &mut Cluster, voters: &[u8], per_voter: u64) -> Vec<Vec<CommandId>> {
+    let mut held = Vec::new();
+    let mut seq = 1;
+    for v in voters {
+        let mut mine = Vec::new();
+        for _ in 0..per_voter {
+            mine.push(cluster.admit_at(seq, (seq % 251) as u8, &[*v as usize]));
+            seq += 1;
+        }
+        cluster.settle();
+        held.push(mine);
+    }
+    held
+}
+
+fn leads(cluster: &Cluster, i: usize, b: Ballot) -> bool {
+    matches!(&cluster.nodes[i].role, Some(Role::Leader(l)) if l.config_quorum().ballot() == b)
+}
+
+/// task-d24's acceptance, in a shape the domain reaches (review): five
+/// voters, the old leader gone for good, and the voter holding a full
+/// table of records decided nowhere reporting after the selection was
+/// made. Its report is not among those the selection used, so nothing
+/// the Sync names covers its records, and it releases them all and takes
+/// new work. With three voters and one gone, the two left are a majority
+/// and both reports are always used, so that shape releases nothing.
+#[test]
+fn a_voter_whose_report_came_after_the_selection_drains_its_table() {
+    let capacity = 32;
+    let full = (capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS) as u64;
+    let mut cluster = Cluster::with_voters(71, capacity, 5);
+    let held = disjoint_undecided(&mut cluster, &[1], full).remove(0);
+    assert!(
+        held.iter()
+            .all(|c| cluster.nodes[1].follower().table().phase_of(c) == Some(Phase::PreAccept))
+    );
+    cluster.crash(0);
+    // r1's report reaches r2 after the selection: its one page is lost,
+    // and nothing asks for it again before r2, r3 and r4 select.
+    cluster.drop_pages.push((1, 2));
+    let b = ballot(1, 2);
+    cluster.campaign(2, b);
+    cluster.settle();
+    assert!(cluster.drop_pages.is_empty(), "r1's page was dropped");
+    assert!(leads(&cluster, 2, b));
+    let f = cluster.nodes[1].follower();
+    assert_eq!(f.ballots().synced(), b);
+    for c in &held {
+        assert_eq!(f.table().phase_of(c), None, "{c:?} was kept");
+    }
+    // New work, taken without backpressure and executed everywhere.
+    let before = cluster.nodes[1].executed.len();
+    cluster.nodes[1].follower_mut().take_rejections();
+    let c = cluster.admit(900, 2);
+    cluster.settle_resending(2);
+    assert!(
+        !cluster.nodes[1]
+            .follower_mut()
+            .take_rejections()
+            .contains(&FollowerRejection::Backpressure)
+    );
+    assert_eq!(cluster.nodes[1].executed.len(), before + 1);
+    assert_eq!(cluster.nodes[1].executed.last(), Some(&c));
+}
+
+/// task-d24 review: a leader that crashes right after installing a Sync
+/// its selection had to cap is followed by a campaign that completes.
+///
+/// Four voters each pre-accepted a full table's admission, 875 commands
+/// whose submissions reached no other voter, so any majority's reports
+/// name at least 2,625 to re-propose. The new leader's re-proposals are
+/// taken everywhere and executed nowhere before it crashes. Uncapped, each
+/// voter then held the whole selection decided and unexecuted, reported
+/// past `MAX_REPORT_ENTRIES`, and every later campaign failed on its own
+/// report, at every ballot. Capped, the Sync names the bound, each voter
+/// released the rest of what it reported, and each report stays within it.
+#[test]
+fn a_leader_crash_right_after_a_capped_sync_is_followed_by_a_campaign_that_completes() {
+    let limit = coord_consensus::MAX_REPORT_ENTRIES;
+    let capacity = coord_consensus::MAX_TABLE_CAPACITY;
+    let full = (capacity - capacity / coord_consensus::RECOVERY_RESERVE_PARTS) as u64;
+    let mut cluster = Cluster::with_voters(73, capacity, 5);
+    let held = disjoint_undecided(&mut cluster, &[1, 2, 3, 4], full);
+    cluster.crash(0);
+    cluster.no_execute = vec![1, 2, 3, 4];
+    let b = ballot(1, 1);
+    cluster.campaign(1, b);
+    cluster.settle();
+    assert!(leads(&cluster, 1, b));
+    let Some(Role::Leader(l)) = &cluster.nodes[1].role else {
+        unreachable!()
+    };
+    // The new leader holds what its Sync names, and nothing more.
+    let taken = l.table().records().count();
+    assert!(taken <= limit, "the new leader holds {taken}");
+    // Its re-proposals are decided, at the runtime's re-send pace, and
+    // executed nowhere; then it is gone.
+    for _ in 0..400 {
+        let Some(Role::Leader(l)) = &cluster.nodes[1].role else {
+            unreachable!()
+        };
+        if l.table().undecided().next().is_none() {
+            break;
+        }
+        cluster.resend();
+        cluster.settle();
+    }
+    cluster.crash(1);
+    let next = ballot(2, 2);
+    for i in 2..5 {
+        let f = cluster.nodes[i].follower();
+        assert_eq!(f.ballots().synced(), b, "r{i} did not install the Sync");
+        let own = f.report(next).entries.len();
+        assert!(own <= limit, "r{i} reports {own}");
+        let released = held[i - 1]
+            .iter()
+            .filter(|c| f.table().phase_of(c).is_none())
+            .count();
+        assert!(released > 0, "r{i} released nothing");
+    }
+    cluster.campaign(2, next);
+    cluster.settle();
+    assert!(leads(&cluster, 2, next), "the campaign did not complete");
+    // And the domain serves: the recovered order executes, and new work
+    // submitted after it does too.
+    cluster.no_execute.clear();
+    for _ in 0..400 {
+        let Some(Role::Leader(l)) = &cluster.nodes[2].role else {
+            unreachable!()
+        };
+        if l.table().undecided().next().is_none() && cluster.nodes[3].next_executable().is_none() {
+            break;
+        }
+        cluster.resend();
+        cluster.settle();
+    }
+    let c = cluster.admit(90_000, 3);
+    cluster.settle_resending(2);
+    assert!(
+        cluster.nodes[3].executed.contains(&c),
+        "new work was not served"
+    );
 }
