@@ -1114,6 +1114,31 @@ impl CommandTable {
             .map_err(|dep| GuardViolation::DependencyUnknown { dep })
     }
 
+    /// Advance a traversal that stops at executed commands: an executed
+    /// dependency is a member, and nothing beyond it is visited.
+    ///
+    /// This is the closure an execution still needs evidence for. Every
+    /// predecessor of an executed command was established when it
+    /// executed, so walking through it again proves nothing new, and the
+    /// full walk (`closure_step`) visits every executed record the table
+    /// still holds, up to its capacity, on every execution (task-d53). A
+    /// placeholder or unknown dependency stops it as `DependencyUnknown`,
+    /// as there.
+    pub fn unexecuted_closure_step(
+        &self,
+        cursor: ClosureCursor,
+        budget: usize,
+    ) -> Result<ClosureProgress, GuardViolation> {
+        cursor
+            .step(budget, |c| match self.records.get(c) {
+                Some(r) if r.payload.is_none() => None,
+                Some(r) if r.phase == Phase::Executed => Some(Vec::new()),
+                Some(r) => Some(r.deps.clone()),
+                None => self.history.contains(c).then(Vec::new),
+            })
+            .map_err(|dep| GuardViolation::DependencyUnknown { dep })
+    }
+
     fn initialized(&self, command: &CommandId) -> Result<&CommandRecord, GuardViolation> {
         self.records
             .get(command)

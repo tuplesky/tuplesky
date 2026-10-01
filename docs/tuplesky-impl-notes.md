@@ -8624,3 +8624,21 @@ the domain thread, at every concurrency.
 - task-d53 takes the closure walk out first; it is a quarter of the CPU
   and independent of the storage work.
 
+**task-d53, measured.** `Learner::established` now walks only what has
+not executed; the guard makes that the command's direct dependencies.
+- **Busy time.** `command-cost.sh`, the binary before and after
+  alternated twice on this container, three repeats per caller count
+  each (medians of six):
+
+  | callers | busiest voter's busy ms/cmd | completed/s | ratio |
+  | --- | --- | --- | --- |
+  | 1 | 1.36 → 1.05 (−23%) | 452 → 545 | 1.13 → 1.05 |
+  | 10 | 1.29 → 0.95 (−26%) | 713 → 969 | 1.20 → 1.07 |
+
+- **The ratio.** The unchanged ratio of task-d45's gate falls to about
+  1.05, so the closure walk was what made it 1.1 to 1.2: the table filled
+  over the first thousand commands of a run.
+- **The profile** at ten callers: `Learner::established` is 0.5% of the
+  domain thread, from 24.5%. The projection's redb transaction is now
+  46% of it, the rest of consensus 15%, the storage around the
+  projection 9% and the journal 5%.
