@@ -88,6 +88,11 @@ pub enum Rejection {
     /// fault: the reply this leader already published for it is offered
     /// to the submitter again (task-c02).
     Duplicate(CommandId),
+    /// The command was presented again after it executed and its record
+    /// or payload went to history: refused as `Forgotten`, with nothing
+    /// repaired (task-d33). Apart from [`Rejection::Duplicate`] so that a
+    /// trace tells the refusal from an evidence repair.
+    Forgotten(CommandId),
     /// The retry key is bound to this command, but the presentation
     /// carries other admission facts or another acknowledged floor. The
     /// identity is shared; the request is not, and nothing is replayed
@@ -237,6 +242,11 @@ pub const RESEND_PER_VOTER: usize = 16;
 /// peer's executed history instead (`coord_daemon::catch_up::STILL_FOR`).
 /// A longer gap would turn a proposal that really was lost into a
 /// history fetch on the bulk lane.
+///
+/// The `NewLeader` asked again of a voter that has not joined is not
+/// paced by this: one small frame per such voter per call, which an idle
+/// voter costs on every re-send tick and which is cheap enough not to
+/// need it.
 pub const RESEND_BACKOFF_CAP: u32 = 4;
 
 /// The leader machine of one domain.
@@ -1755,7 +1765,7 @@ impl Leader {
                         self.refuse(command, SubmissionRefusal::OtherFacts { accepted })
                     }
                     None => {
-                        self.rejections.push(Rejection::Duplicate(command));
+                        self.rejections.push(Rejection::Forgotten(command));
                         self.refuse(command, SubmissionRefusal::Forgotten)
                     }
                 };
@@ -1768,7 +1778,7 @@ impl Leader {
         // answer as a bound command whose payload went to history; the
         // table holds no record, so initializing would take it as new.
         if self.table.retired(&command) {
-            self.rejections.push(Rejection::Duplicate(command));
+            self.rejections.push(Rejection::Forgotten(command));
             return self.refuse(command, SubmissionRefusal::Forgotten);
         }
         // Atomic initialization: admission binding, conservative
