@@ -1346,17 +1346,19 @@ impl Follower {
             self.halt_on_cycle(cycle);
             return Vec::new();
         }
+        let already_synced = self.ballots.synced() == decision.ballot
+            && self.sync_unwritten != Some(decision.ballot);
+        if already_synced && self.config.quorum.ballot() == decision.ballot {
+            // Duplicate Sync of the active ballot: converges without change,
+            // and is not held behind a promise in flight, which would only
+            // report it superseded later.
+            return Vec::new();
+        }
         if self.ballots.promises_in_flight().iter().any(|p| {
             p.ballot.compare_same_epoch(&decision.ballot) == Some(core::cmp::Ordering::Greater)
         }) {
             // Behind a promise in flight: held, not installed (task-d18).
             self.sync_behind_promise = Some((from, decision));
-            return Vec::new();
-        }
-        let already_synced = self.ballots.synced() == decision.ballot
-            && self.sync_unwritten != Some(decision.ballot);
-        if already_synced && self.config.quorum.ballot() == decision.ballot {
-            // Duplicate Sync of the active ballot: converges without change.
             return Vec::new();
         }
         if !already_synced {
@@ -1421,7 +1423,11 @@ impl Follower {
             let epoch = self.config.identity.epoch;
             // A record the selection neither selected nor re-proposed,
             // and no selected entry depends on, was decided nowhere
-            // (task-d24): the selection is taken from a majority's
+            // (task-d24). The dependency clause is redundant and kept as
+            // a guard: a record a kept entry depends on is itself kept, a
+            // followed re-proposal, or executed and retired, so it changes
+            // no outcome, unless a selection-completeness bug would turn
+            // into a lost payload. The selection is taken from a majority's
             // reports and keeps every command a quorum of an earlier
             // ballot could have decided, so a command it leaves out was
             // not decided below this ballot. Kept, it held its slot until
@@ -1555,12 +1561,14 @@ impl Follower {
     /// The Sync whose row is durable is the synchronized ballot's
     /// selection, and it supersedes every earlier one: a decision of an
     /// earlier ballot was accepted by a majority there, which the later
-    /// selection's reports intersect, so it is among the later entries;
-    /// an earlier entry the later selection leaves out was never decided,
-    /// and its acceptance, if any, was demoted with the later marker
-    /// (task-d11). Kept, the earlier entries went into every report after
-    /// it, so a voter behind across failed ballots reported more each
-    /// time, and the Sync selected from its report grew with them.
+    /// selection's reports intersect, so a voter there reports it unless
+    /// it executed and retired it past its window. An earlier entry the
+    /// later selection leaves out was therefore never decided, or was
+    /// executed by a reporter and retired, which catch-up serves; its
+    /// acceptance, if any, was demoted with the later marker (task-d11).
+    /// Kept, the earlier entries went into every report after it, so a
+    /// voter behind across failed ballots reported more each time, and
+    /// the Sync selected from its report grew with them.
     ///
     /// What an earlier Sync left uninstalled is not this ballot's, and
     /// installing one of its entries would write an acceptance the new
@@ -4180,6 +4188,16 @@ impl Follower {
             .selected_admission(&command)
             .is_some_and(|d| d != payload.admission_digest())
         {
+            return Vec::new();
+        }
+        // A command the Sync whose marker is being written releases is not
+        // taken meanwhile (task-d24 review). Taken, its payload and
+        // dependency rows land after the batch that deletes them, and the
+        // release at durability drops it from the table but not from the
+        // ledger or the disk, so the slot came back at the next restart.
+        // A payload asks no promise fence, so this is the only gate; the
+        // command is asked for again if a later selection names it.
+        if self.sync_barrier.is_some() && self.sync_released.contains(&command) {
             return Vec::new();
         }
         if self.payloads.contains_key(&command) {
