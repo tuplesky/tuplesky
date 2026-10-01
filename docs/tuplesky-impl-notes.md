@@ -8642,3 +8642,103 @@ not executed; the guard makes that the command's direct dependencies.
   domain thread, from 24.5%. The projection's redb transaction is now
   46% of it, the rest of consensus 15%, the storage around the
   projection 9% and the journal 5%.
+
+## Lowering in groups
+
+task-d47. `coordd` lowered one domain's queued batches one at a time,
+and each executed command's application batch on its own as well: at
+every concurrency about three syncs a command on every voter, in series
+on the domain thread. A voter now lowers what is ready together.
+
+- **The journal group** (`JournaledDomain::append`) takes every queued
+  transition of a stream that fits its bounds, 64 records or 256 KiB,
+  as one raft-engine entry of chained records, synced once. Each record
+  keeps its own barrier, sequence and predecessor digest, so
+  `JournalDurable` still names each batch, and a vote is still justified
+  by its own record's final durable state (17.3.3). An uncertain entry
+  is reconciled all or none.
+- **The flush.** `coordd`'s loop leaves what its rounds persist queued,
+  and flushes once no event is ready, or 64 batches are queued, or 64
+  events have passed with something owed (`FLUSH_QUEUED`,
+  `FLUSH_EVENTS`). A flush is:
+  1. *stage*: the commands whose turn has come are applied as one
+     execution group, at most 32 (`GROUP_COMMANDS`). Each is planned
+     over the projection with the group's earlier writes laid over it
+     (`RecoveryCut` with the group's overlay); planning reads no
+     protocol, payload or checkpoint row, so it does not matter that
+     those are not yet materialized;
+  2. *journal*: the group's application batches and the protocol's
+     queued batches go into one journal append, without materializing;
+  3. what that append released -- votes, proposals, commits -- goes out;
+  4. *finish*: the group is materialized, one projection commit, and its
+     results, sends and watch events go out. They are held until then,
+     never before.
+  When nothing can execute, the flush materializes what it journaled
+  itself, so the projection does not fall behind the journal.
+- **Recovery.** A group journaled but not materialized is replayed from
+  the journal at boot, as one batch was. A refused projection commit is
+  redone from the same plan, not replanned.
+
+**Which thread syncs.** All of it is still the domain thread's: the
+journal sync, the projection commit and execution, in series. Grouping
+divides the syncs among the commands of a flush; it does not take them
+off the thread. That is task-d52's.
+
+**task-j05 is not implemented**, so its fault points do not exist. This
+task brings its own tests at the same boundary:
+- `composed.rs`: a group of commands lowers once and leaves the same
+  projection, results and revisions as applying them one at a time; a
+  boot that ends between a group's journal sync and its projection
+  commit recovers every command of the group from the journal; a
+  refused projection commit of a group is redone, not replanned.
+- `journaled.rs`: an uncertain entry of several records reconciles all
+  or none.
+- `node.rs`: a vote and a proposal go out only after the flush that
+  journals them; the commands ready together execute as one group; a
+  staged group is journaled by the flush and answered only by finish.
+- **Negative control:** a driver that reports a record journal-durable
+  before journaling it -- a release moved ahead of its sync -- fails the
+  vote and proposal tests.
+
+### Measured
+
+Three voters on loopback, `scripts/bench/command-cost.sh` (2,500
+operations, the gate's mix without scans, three repeats per caller
+count), task-d46's binary and this task's alternated twice; medians of
+six. Stores on the container's disk (`STATE_ROOT`, 0.3 to 0.4 ms an
+`fdatasync`):
+
+| callers | completed/s, task-d46 → task-d47 | journal syncs per command per voter | projection commits per command |
+| --- | --- | --- | --- |
+| 10 | 209.6 → 687.8 (3.28×; 202–216 → 676–720) | 3.00 → 0.51–0.64 | 3.00 → 0.34–0.38 |
+| 1 | 188.3 → 227.5 (183–193 → 225–237) | 3.00 → leader 3.00, followers 2.00–2.16 | 3.00 → 2.00 |
+
+At fifty callers on disk (5,000 operations, one run each): 138.3 → 754.5
+completed a second, 0.17 to 0.19 journal syncs and 0.11 to 0.13
+projection commits a command per voter. Single runs on this container
+vary by a quarter: task-d46 read 182.8 in an earlier run.
+
+Stores on tmpfs, the gate's own setting, against task-d53's binary (this
+task's base), three repeats each, medians:
+
+| callers | completed/s | busiest voter's busy ms/cmd | syncs per command per voter | ratio |
+| --- | --- | --- | --- | --- |
+| 10 | 805.3 → 1170.5 | 1.14 → 0.75 | 3.00 → 0.54–0.67 | 1.04–1.12 → 1.01–1.11 |
+| 1 | 456.6 → 511.1 | 1.29 → 1.10 | 3.00 → leader 3.00, followers 1.96–2.30 | 0.81–1.14 → 0.97–1.15 |
+
+Every reading is inside the `command cost` gate's limits, which are
+upper bounds; the baseline stays task-d46's until the runner's readings
+of this task are in.
+
+- **At ten callers** a flush holds a few commands and their protocol
+  batches, and the voters are busy about half the time: the rest is the
+  round trip. The leader (n1) syncs a little more often than the
+  followers.
+- **At one caller** there is little to group: the leader still syncs
+  three times a command, and every voter commits the projection twice
+  rather than three times.
+- The first version of this task executed after the flush's journal
+  append and materialized in the same step, so the votes a flush
+  released waited for the group's projection commit too: 546.6 a second
+  at ten callers, 2.81×. Sending what the append released before
+  materializing is the difference.
