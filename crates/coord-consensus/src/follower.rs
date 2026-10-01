@@ -1260,16 +1260,18 @@ impl Follower {
             self.halt_on_cycle(cycle);
             return Vec::new();
         }
+        let already_synced = self.ballots.synced() == decision.ballot;
+        if already_synced && self.config.quorum.ballot() == decision.ballot {
+            // Duplicate Sync of the active ballot: converges without change,
+            // and is not held behind a promise in flight, which would only
+            // report it superseded later.
+            return Vec::new();
+        }
         if self.ballots.promises_in_flight().iter().any(|p| {
             p.ballot.compare_same_epoch(&decision.ballot) == Some(core::cmp::Ordering::Greater)
         }) {
             // Behind a promise in flight: held, not installed (task-d18).
             self.sync_behind_promise = Some((from, decision));
-            return Vec::new();
-        }
-        let already_synced = self.ballots.synced() == decision.ballot;
-        if already_synced && self.config.quorum.ballot() == decision.ballot {
-            // Duplicate Sync of the active ballot: converges without change.
             return Vec::new();
         }
         if !already_synced {
@@ -1400,10 +1402,11 @@ impl Follower {
     /// The Sync whose row is durable is the synchronized ballot's
     /// selection, and it supersedes every earlier one: a decision of an
     /// earlier ballot was accepted by a majority there, which the later
-    /// selection's reports intersect, so it is among the later entries;
-    /// an earlier entry the later selection leaves out was never decided,
-    /// and its acceptance, if any, was demoted with the later marker
-    /// (task-d11). Kept, the earlier entries went into every report after
+    /// selection's reports intersect, so a voter there reports it unless
+    /// it executed and retired it past its window. An earlier entry the
+    /// later selection leaves out was therefore never decided, or was
+    /// executed by a reporter and retired, which catch-up serves; its
+    /// acceptance, if any, was demoted with the later marker (task-d11). Kept, the earlier entries went into every report after
     /// it, so a voter behind across failed ballots reported more each
     /// time, and the Sync selected from its report grew with them.
     ///
