@@ -8402,6 +8402,16 @@ Completed commands a second are reported and never gated. The `command cost` job
   account was wrong. The learner revert reads 1.77 to 2.04 on the same
   window (medians of the largest voter 1.97 at one caller and 1.98 at
   ten).
+- **Two limits of the window.** The first three quarters' busy time is
+  read from a snapshot's cumulative count, so it includes the voter's
+  busy time before its first command (boot, and the 100 warm-up
+  operations). On a 2,600-command run that is a few percent of it, and it
+  lowers the ratio: it can hide a little growth, never invent any.
+  Subtracting the first snapshot's busy time and count from both sides
+  removes it if that ever matters. And the reading is absent again on a
+  runner that executes three quarters of the run inside the first
+  snapshot interval, about 2,000 commands a second at one caller; a
+  snapshot more often than once a second would remove that.
 - **Noise.** An unchanged run on this container once read 2.35 ms over
   the last quarter at ten callers against the runner's 1.67, and a
   re-run read within the baseline. No local checkpoint falls in that
@@ -8522,6 +8532,19 @@ the local checkpoint on, a voter still falls behind (the 2.5 s stalls)
 and catches up slowly. What lets a voter that has fallen behind catch
 up, rather than only not stop, is task-d49's: a re-send window full of
 proposals the voter already acknowledged starves the one it lost.
+
+**An intermittent on the same pressure.** On d891e9c (build-test run
+36900303341, `rust (x86_64)`, job 110497626808),
+`a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+failed its assertion that no voter ever logs a full bulk lane: one logged
+`QueueFull { lane: Bulk }` for 64 frames and counting, recovered after
+96, and every caller was answered. The consensus code was the same as on
+the green runs either side of it (7830ff1 and 6a8dd83), the test passed
+6 of 6 times on this container, and it took 52 s on the runner beside
+the 338 s activation test. What the assertion measures is re-sends and
+catch-up answers competing for a loaded voter's lanes, which is
+task-d49's subject, so it is left as it is. A later failure of the same
+assertion is counted here rather than analyzed again.
 
 ### Not done here
 
