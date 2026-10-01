@@ -3871,13 +3871,21 @@ fn one_frame(bytes: &[u8]) -> Result<Frame, coord_types::wire_v1::WireError> {
     Ok(frame)
 }
 
-/// A refusal of a retained result, in the shape the output gate refuses
-/// a live one it will not disclose.
+/// A refusal to admit a request the record says may not execute.
 fn refusal(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    status(command, coord_collector::codes::NOT_ADMITTED, detail)
+}
+
+/// An executed command's retained result withheld, in the shape the
+/// output gate withholds a live one (task-d23).
+fn withheld(command: coord_types::CommandId, detail: &str) -> Option<Vec<u8>> {
+    status(command, coord_collector::codes::OUTPUT_WITHHELD, detail)
+}
+
+/// A response carrying one frozen code.
+fn status(command: coord_types::CommandId, code: u16, detail: &str) -> Option<Vec<u8>> {
     MessageV1::Response(coord_collector::codes::error_response(
-        command,
-        coord_collector::codes::NOT_ADMITTED,
-        detail,
+        command, code, detail,
     ))
     .encode()
     .ok()
@@ -4011,13 +4019,22 @@ impl core::fmt::Display for TransportError {
     }
 }
 
-/// What the durable record answers for a request, ahead of admission:
-/// the retained result, gated as a fresh one is, or a refusal from the
-/// record. `None` sends the request on to admission.
+/// What the durable record answers for a request or a resolve, ahead of
+/// admission and of the collector's memory: the retained result, gated
+/// as a fresh one is, or a status from the record. `None` sends the frame
+/// on: a request to admission, a resolve to the collector.
 ///
 /// [`Domain::retained`] with what it reads named: the frontend that holds
 /// the caller's binding and this node's store. Split out so it can be
 /// asked of a frontend bound on a node whose projection is behind.
+///
+/// A resolve is answered from the record too (task-d23). The collector
+/// remembers a bounded window of outcomes, and only those it collected
+/// itself, so an outcome evicted from it, or asked of a frontend that
+/// never saw the request, was `Unknown` while this node held the executed
+/// record. A resolve names no request, and a result is gated against the
+/// request it answers; this node's payload row says what the request was
+/// while it keeps one. Without it, only a retirement is answered here.
 fn retained_answer<P: Persistence>(
     frontend: &mut BoundFrontend,
     store: &P,
@@ -4027,10 +4044,15 @@ fn retained_answer<P: Persistence>(
 ) -> Option<Vec<u8>> {
     use coord_storage::retry::Resolution;
 
-    let MessageV1::Request(request) = decode(frame).ok()? else {
-        return None;
+    let (key, command, logical, resolving) = match decode(frame).ok()? {
+        MessageV1::Request(request) => {
+            let logical = request.logical().ok()?;
+            let command = coord_types::CommandId::derive(&request.retry_key, &logical).ok()?;
+            (request.retry_key, command, Some(logical), false)
+        }
+        MessageV1::ResolveRequest(resolve) => (resolve.retry_key, resolve.command_id, None, true),
+        _ => return None,
     };
-    let key = request.retry_key;
     // The connection must be bound, and bound to the session whose
     // invocation this is. A retained result belongs to a session,
     // and reading one is not something an unbound caller -- or a
@@ -4039,32 +4061,88 @@ fn retained_answer<P: Persistence>(
     if !binding.active(health) || binding.session != key.session_id {
         return None;
     }
-    let logical = request.logical().ok()?;
-    let command = coord_types::CommandId::derive(&key, &logical).ok()?;
-    let resolved = {
+    let (logical, resolved, executed, below_floor) = {
         let gated = store.reader().snapshot().ok()?;
-        resolve_retained(gated.view(), key, command, &logical).ok()??
+        let view = gated.view();
+        let logical = logical.or_else(|| requested(view, key, command));
+        let resolved = match &logical {
+            Some(logical) => resolve_retained(view, key, command, logical).ok()??,
+            // Nothing to gate a result against: whatever the record holds
+            // is not handed out, and only a retirement, which needs no
+            // request, is answered -- the floor's own, or one read below
+            // for a session that may no longer execute.
+            None => match resolve_retained_unread(view, key, command).ok()?? {
+                known @ (Resolution::Retired { .. } | Resolution::NoSession) => known,
+                _ => return None,
+            },
+        };
+        let executed = matches!(resolved, Resolution::NoSession)
+            && coord_storage::retry::lookup(view, &key)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.command_id == command);
+        // A session that may no longer execute is answered `NoSession`
+        // before its floor is read, and retirement deleted the rows it
+        // covered. The floor row is still durable, and a sequence at or
+        // below it was retired: that is known here, whatever the
+        // collector still remembers. To a request as to a resolve: a
+        // sequence at or below the floor never executes again (`admit`
+        // answers it `TooOld`), and one that did executed with its row
+        // deleted, so `NOT_ADMITTED` could name a command that ran.
+        let below_floor = matches!(resolved, Resolution::NoSession)
+            && !executed
+            && coord_storage::retry::floor(view, &key.session_id, &key.client_instance_id, 0)
+                .ok()
+                .is_some_and(|floor| key.request_sequence <= floor.floor);
+        (logical, resolved, executed, below_floor)
     };
     let record = match resolved {
         Resolution::Result(record) => record,
         // The command executed, and this caller may not have what it
-        // produced -- or may not execute at all any more. The same
-        // refusal the output gate gives a live result it will not
-        // disclose; the command is not proposed a second time.
+        // produced -- or may not execute at all any more. The status the
+        // output gate gives a live result it will not disclose; the
+        // command is not proposed a second time, and it is not reported
+        // as never admitted (task-d23).
+        Resolution::Unauthorized => {
+            return withheld(command, "output not authorized by current policy");
+        }
+        Resolution::NoSession if executed => {
+            return withheld(command, "the session may no longer read this result");
+        }
+        // The session may no longer execute, and nothing says this
+        // command ran: at or below the floor it is retired, to a request
+        // and to a resolve; above it, a request is not admitted and a
+        // resolve is left to the collector's memory.
+        Resolution::NoSession if below_floor => {
+            return status(
+                command,
+                coord_collector::codes::RESULT_RETIRED,
+                "retired: the result is no longer kept",
+            );
+        }
+        Resolution::NoSession if resolving => return None,
         Resolution::NoSession => {
             return refusal(command, "the session may no longer execute");
         }
-        Resolution::Unauthorized => {
-            return refusal(command, "output not authorized by current policy");
+        // Retired below the floor: to a resolve, the outcome is no longer
+        // retrievable (task-d23). A request goes on to admission, which
+        // decides a retired sequence at the command's own position.
+        Resolution::Retired { .. } if resolving => {
+            return status(
+                command,
+                coord_collector::codes::RESULT_RETIRED,
+                "retired: the result is no longer kept",
+            );
         }
-        // Not executed, retired below the floor, or a retry key bound
-        // to another payload: replicated execution decides each of
-        // those at the command's own position, not this node from a
-        // record that is not this command's.
+        // Not executed, or a retry key bound to another payload:
+        // replicated execution, or the collector for a resolve, decides
+        // each of those, not this node from a record that is not this
+        // command's.
         Resolution::Pending | Resolution::Retired { .. } | Resolution::Conflict { .. } => {
             return None;
         }
     };
+    let logical = logical?;
     let response = coord_types::wire_v1::ResponseV1 {
         command_id: command,
         outcome: coord_types::wire_v1::OutcomeV1::Ok {
@@ -4085,6 +4163,62 @@ fn retained_answer<P: Persistence>(
         Delivered::Answer(delivery) => Some(delivery.frame),
         Delivered::Unbound { .. } => None,
     }
+}
+
+/// The request an invocation made, from this node's payload row for
+/// `command` (task-d23): only a row under the invocation's own retry key,
+/// whose request derives the command's identity again.
+///
+/// The row's `admission` is not consulted: re-deriving the identity from
+/// the key and the request binds the bytes, whichever admission carried
+/// them.
+fn requested<V: coord_store_api::OrderedRead>(
+    view: &V,
+    key: RetryKey,
+    command: CommandId,
+) -> Option<coord_types::logical_v1::LogicalRequest> {
+    let bytes = view
+        .get(
+            coord_store_api::Collection::PayloadV1.id(),
+            &coord_consensus::rows::payload_key(&command),
+        )
+        .ok()??;
+    let payload = coord_consensus::rows::decode_payload(&bytes).ok()?;
+    if payload.retry_key != key {
+        return None;
+    }
+    let logical: coord_types::logical_v1::LogicalRequest =
+        postcard::from_bytes(&payload.logical).ok()?;
+    (CommandId::derive(&key, &logical).ok()? == command).then_some(logical)
+}
+
+/// [`resolve_retained`] without the request: nothing is authorized, so a
+/// retained result reads as `Unauthorized` and is never handed out.
+fn resolve_retained_unread<V: coord_store_api::OrderedRead>(
+    view: &V,
+    key: RetryKey,
+    command: CommandId,
+) -> Result<Option<coord_storage::retry::Resolution>, coord_store_api::EngineError> {
+    use coord_storage::retry::RetryBinding;
+    if view
+        .get(
+            coord_store_api::Collection::SessionV1.id(),
+            &coord_storage::codecs::session_key(&key.session_id),
+        )?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    coord_storage::retry::resolve(
+        view,
+        &RetryBinding {
+            retry_key: key,
+            command_id: command,
+            retires: None,
+        },
+        |_| false,
+    )
+    .map(Some)
 }
 
 /// What this node's record says about the invocation `key` names, before
@@ -4485,6 +4619,193 @@ mod tests {
                 if *code == coord_collector::codes::NOT_ADMITTED),
             "{:?}",
             response.outcome
+        );
+
+        // task-d23: a resolve is answered from the record too.
+        let answer = |frontend: &mut BoundFrontend,
+                      store: &StoreWorker<ModelEngine>,
+                      frame: &Frame|
+         -> Option<OutcomeV1> {
+            let bytes = super::retained_answer(frontend, store, &health, CONNECTION, frame)?;
+            match decode_stream(&bytes).unwrap().as_slice() {
+                [MessageV1::Response(response)] => Some(response.outcome.clone()),
+                other => panic!("{other:?}"),
+            }
+        };
+        let code_of = |outcome: Option<OutcomeV1>| match outcome {
+            Some(OutcomeV1::Err { code, .. }) => Some(code),
+            other => panic!("{other:?}"),
+        };
+        let invocation = |sequence: u64| {
+            let key = RetryKey {
+                request_sequence: RequestSequence::new(sequence).unwrap(),
+                ..retry
+            };
+            (key, CommandId::derive(&key, &logical).unwrap())
+        };
+        let resolve_frame = |key: RetryKey, command: CommandId| {
+            frame_of(
+                &MessageV1::ResolveRequest(coord_types::wire_v1::ResolveRequestV1 {
+                    retry_key: key,
+                    command_id: command,
+                })
+                .encode()
+                .unwrap(),
+            )
+        };
+        let request_frame = |key: RetryKey| {
+            frame_of(
+                &MessageV1::Request(RequestV1::new(key, &logical, 0, 0).unwrap())
+                    .encode()
+                    .unwrap(),
+            )
+        };
+        let mut write = |store: &mut StoreWorker<ModelEngine>, updates| {
+            store
+                .submit(PersistBatch {
+                    barrier: barriers.allocate(),
+                    base: Some(store.application_base()),
+                    updates,
+                })
+                .unwrap();
+            assert_eq!(store.flush().unwrap().committed, 1);
+        };
+        // The executed record of an invocation this frontend never saw,
+        // and the payload row that says what it asked. The retained
+        // outcome is a denial, which any caller may have replayed.
+        let executed = |key: RetryKey, command: CommandId, payload: bool| {
+            let response = postcard::to_allocvec(&Response {
+                revision: KvRevision::new(3).unwrap(),
+                outcome: Outcome::ErrPermissionDenied,
+            })
+            .unwrap();
+            let mut updates = vec![coord_core::StoreUpdate {
+                collection: coord_store_api::Collection::RetryV1.id(),
+                key: coord_storage::codecs::retry_key(&key),
+                value: Some(
+                    coord_storage::codecs::encode_retry(&coord_storage::codecs::RetryRecordV1 {
+                        command_id: command,
+                        position: coord_types::ids::ExecutionPosition::new(3).unwrap(),
+                        revision: None,
+                        result_digest: coord_storage::retry::result_digest(&response),
+                        response,
+                    })
+                    .unwrap(),
+                ),
+            }];
+            if payload {
+                updates.push(
+                    coord_consensus::rows::payload_update(
+                        &command,
+                        &coord_consensus::PayloadRecordV1 {
+                            retry_key: key,
+                            logical: logical.canonical_bytes().unwrap(),
+                            admission: None,
+                            ack_through: 0,
+                        },
+                    )
+                    .unwrap(),
+                );
+            }
+            updates
+        };
+        write(
+            &mut store,
+            coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, true).unwrap(),
+        );
+        let (key2, command2) = invocation(2);
+        write(&mut store, executed(key2, command2, true));
+        // Asked of a frontend that never saw the request: the executed
+        // result, from the record, through the output gate.
+        let resolved = answer(&mut frontend, &store, &resolve_frame(key2, command2));
+        assert!(
+            matches!(&resolved, Some(OutcomeV1::Ok { .. })),
+            "{resolved:?}"
+        );
+        // Without the payload row nothing can be gated, and the collector
+        // answers from its memory.
+        let (key3, command3) = invocation(3);
+        write(&mut store, executed(key3, command3, false));
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key3, command3)),
+            None
+        );
+        // Past the retirement floor: retired, not unknown.
+        write(
+            &mut store,
+            vec![coord_core::StoreUpdate {
+                collection: coord_store_api::Collection::RetryFloorV1.id(),
+                key: coord_storage::codecs::retry_floor_key(&SESSION, &retry.client_instance_id),
+                value: Some(
+                    coord_storage::codecs::encode_retry_floor(
+                        &coord_storage::codecs::RetryFloorV1 {
+                            floor: RequestSequence::new(4).unwrap(),
+                            width: 4,
+                        },
+                    )
+                    .unwrap(),
+                ),
+            }],
+        );
+        let (key4, command4) = invocation(4);
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key4, command4)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Retired again, the session may not read what the command it
+        // executed produced: withheld, to a request and to a resolve,
+        // and never reported as not admitted.
+        write(
+            &mut store,
+            coord_storage::policy::bootstrap_session(&SESSION, ALICE, 4, false).unwrap(),
+        );
+        let (key5, command5) = invocation(5);
+        write(&mut store, executed(key5, command5, true));
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key5))),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key5, command5)
+            )),
+            Some(coord_collector::codes::OUTPUT_WITHHELD)
+        );
+        // A session that may no longer execute is refused before its
+        // floor is read, and retirement deleted the row: what the floor
+        // covers is still retired, not left to the collector's memory.
+        assert_eq!(
+            code_of(answer(
+                &mut frontend,
+                &store,
+                &resolve_frame(key4, command4)
+            )),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // And to a request re-sent at or below the floor, say by a client
+        // restored from before its acknowledgement: retired too. Not
+        // admitted would tell it a write that may have happened did not.
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key4))),
+            Some(coord_collector::codes::RESULT_RETIRED)
+        );
+        // Above the floor, with no record, nothing is known here; a
+        // request there is not admitted, since the session may no longer
+        // execute.
+        let (key6, command6) = invocation(6);
+        assert_eq!(
+            answer(&mut frontend, &store, &resolve_frame(key6, command6)),
+            None
+        );
+        assert_eq!(
+            code_of(answer(&mut frontend, &store, &request_frame(key6))),
+            Some(coord_collector::codes::NOT_ADMITTED)
         );
     }
 

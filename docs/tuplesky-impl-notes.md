@@ -7462,3 +7462,72 @@ this change keeps it from happening once one does not.
 - `a_single_voter_domain_is_refused_by_a_release_build` (`coordd`
   unit): a test build runs one voter, a release build refuses it by
   name, and three and five run in either.
+
+## What a client is told of its outcome
+
+task-d23. Three answers told a client less than the domain knew, or
+something else:
+- **A withheld result read as not admitted.** The output gate answered
+  `NOT_ADMITTED` when it would not disclose an executed command's
+  result, and so did `coordd`'s answer from the retained record. The SDK
+  maps `NOT_ADMITTED` to a definite failure and throws its credential
+  away, so a write that happened was reported as one that did not.
+- **A resolve read only the collector's memory.** An outcome evicted
+  from the resolved window, or asked of a frontend that never saw the
+  request, was `Unknown` while the node held the executed record.
+- **`Unknown` was final in the SDK.** `retry()` after it replayed the
+  stored `Unknown` and sent nothing.
+
+What changed:
+- **Two appended codes.**
+  - `OUTPUT_WITHHELD` (`0x0007`): the command executed and its result
+    is not disclosed. The gate's denials use it, and so does the
+    retained-record answer: for a result the session may not read, and
+    for a session that may no longer execute when the retry row shows
+    the command executed. A session that may not execute, with nothing
+    executed, is still `NOT_ADMITTED`, as is every refusal at the door.
+  - `RESULT_RETIRED` (`0x0008`): the sequence is at or below its client
+    instance's retirement floor, and no result is kept.
+- **A resolve asks the durable record first.** A `ResolveRequest` names
+  no request, and a result is gated against the request it answers, so
+  `coordd` reads the request from its payload row for the command. It
+  takes only a row under the invocation's own retry key whose request
+  derives the command's identity again.
+  - The executed result goes out through the output gate, as a
+    retained answer to a request does.
+  - Without the payload row nothing is handed out, and the collector
+    answers from its memory.
+  - Past the floor the answer is `RESULT_RETIRED`, which needs no
+    request.
+  - A session that is retired, or whose trust rule is disabled, is
+    answered `NoSession` before `retry::resolve` reads its floor, and
+    retirement deleted the retry rows the floor covers. The floor row
+    stays, so a resolve at or below it is answered `RESULT_RETIRED` from
+    that row, not left to a collector that may have evicted the outcome
+    (Codex on #128).
+- **The SDK** gains `Outcome::Withheld` and `Outcome::Retired`, both
+  final. Neither invalidates the credential, and `retry()` replays them
+  without sending. `retry()` after `Unknown` submits the same invocation
+  again, same identity and same bytes, and the domain answers it from
+  its record where it executed. The Go adapter already sent the
+  identical request again after `Unknown`. It maps `0x0007` to
+  `PermissionDenied` with its own message and `0x0008` to `DataLoss`.
+
+Tests:
+- `coordd` (`a_caller_bound_on_a_node_that_is_behind_is_admitted_not_refused`,
+  extended). A resolve through a frontend that never saw the request
+  returns the executed result from the record. Without the payload row
+  it is left to the collector. Past the floor it is retired. With the
+  session retired, a request and a resolve of an executed command are
+  withheld, never not admitted.
+- `coord-sdk`: `a_retry_after_unknown_submits_the_same_invocation_again`
+  and `a_withheld_result_and_a_retired_one_are_their_own_outcomes`.
+- `coord-session`: every gate denial the binding tests check is now
+  `OUTPUT_WITHHELD`. A foreign session's request, refused at the door,
+  is still `NOT_ADMITTED`.
+
+Residual: a resolve of an executed command whose payload row this node
+no longer keeps is answered from the collector's memory, `Unknown` when
+that is gone too. The client's next step is the same either way:
+submitting the invocation again reaches the retained record with the
+request in hand.
