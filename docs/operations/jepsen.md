@@ -386,12 +386,12 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   #109 closed, shows there;
 * and the stages each voter timed (journal writes, materialization,
   admission: completed, refused, mean, max and total time), from the
-  `metrics` line `coordd` prints when its serving loop ends. Jepsen stops
-  `coordd` with `SIGKILL`, which prints none, so the table is there only
-  for a voter that stopped on its own; it is how a run would confirm the
-  journal's synchronous writes once `coordd` reports them on a signal or
-  periodically. The raft-engine journal's sync count (`WriteStats`) is not
-  in that line at all.
+  last `metrics` line `coordd` printed. It prints one every
+  `metrics.interval_seconds` and when its serving loop ends (task-d45), so
+  a voter Jepsen stopped with `SIGKILL` still shows its counters as of its
+  last interval. The counts run from that boot. A `Journal` write is one
+  synchronous store write; the raft-engine journal's own sync count
+  (`WriteStats`) is not in that line.
 
 The last 400 lines of each voter's log follow in the TupleSky job's log.
 

@@ -17,8 +17,8 @@ directory (`store/latest`) and writes what a reader looks for first:
   where it last recovered, its last role and the refusals and stops that
   mark the failures seen so far;
 * and the stages each voter timed in its last boot (journal writes,
-  materialization, admission), from the `metrics` line it prints when it
-  stops cleanly.
+  materialization, admission), from the last `metrics` line it printed:
+  it prints one on an interval and when it stops cleanly.
 
     scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
 
@@ -499,7 +499,7 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
         if timed:
             out.append(
-                "**Stages** (each voter's last boot, from the `metrics` line it prints when it stops; "
+                "**Stages** (each voter's last boot, from the last `metrics` line it printed, on its interval or at a clean stop; "
                 "a `Journal` write is one synchronous store write)"
             )
             out.append("")
