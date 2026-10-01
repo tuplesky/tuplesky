@@ -7406,6 +7406,10 @@ this change keeps it from happening once one does not.
   - Every existing single-voter test is a test build and runs as before:
     the 23 single-voter domains of `bins/coordd/tests/cli.rs` and the
     unit tests of `serve.rs`.
+  - So coordd's test suite is debug-only: `cargo test --release -p
+    coordd` fails those single-voter tests by design. No workflow runs
+    it; the only release build is the Kubernetes certification, on three
+    voters (review).
   - The single-voter domains of `coord-daemon`, `coord-consensus`,
     `coord-collector` and `coord-checkpoint` tests are built from the
     libraries, never through coordd's placement, and are unaffected.
@@ -7418,6 +7422,18 @@ this change keeps it from happening once one does not.
   - A campaign knows the configuration its candidate ran under
     (`Campaign::knowing`). That ballot is the likeliest source of the
     selection.
+  - The wiring of `Campaign::knowing` has no behavioural test, and none
+    is possible yet: `activate` always builds `c2_default`, so no
+    production ballot runs another fast set before task-m01. The rule
+    itself is tested on `select_from` (review).
+  - The C1 rule cannot qualify two values: it needs `fast_size −
+    unreported` agreeing reports, and twice that exceeds the reports
+    whenever there are more than `2n − 2·fast_size`, which holds for
+    three voters with a fast set of three and five with four.
+- **A resize is 3 → 5 in one handoff.** Refusing four voters means no
+  epoch passes through four, which matches task-d41's equal-count
+  replacement: a voter is replaced, and the count changes only by a
+  handoff that goes straight from three to five (review).
 - **Tests that used unsupported counts** now use a supported one:
   - the catalog tests move from two voters to three;
   - the fabricated-handoff case changes a voter's incarnation instead of
