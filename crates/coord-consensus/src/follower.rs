@@ -1184,16 +1184,18 @@ impl Follower {
             self.halt_on_cycle(cycle);
             return Vec::new();
         }
+        let already_synced = self.ballots.synced() == decision.ballot;
+        if already_synced && self.config.quorum.ballot() == decision.ballot {
+            // Duplicate Sync of the active ballot: converges without change,
+            // and is not held behind a promise in flight, which would only
+            // report it superseded later.
+            return Vec::new();
+        }
         if self.ballots.promises_in_flight().iter().any(|p| {
             p.ballot.compare_same_epoch(&decision.ballot) == Some(core::cmp::Ordering::Greater)
         }) {
             // Behind a promise in flight: held, not installed (task-d18).
             self.sync_behind_promise = Some((from, decision));
-            return Vec::new();
-        }
-        let already_synced = self.ballots.synced() == decision.ballot;
-        if already_synced && self.config.quorum.ballot() == decision.ballot {
-            // Duplicate Sync of the active ballot: converges without change.
             return Vec::new();
         }
         if !already_synced {
