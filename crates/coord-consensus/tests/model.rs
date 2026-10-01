@@ -263,6 +263,9 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("r1-forged-proposal", fast(1, b, c1, &deps, 7, Some(3))),
             ("r2-slow", slow(2, b, c1)),
             ("r2-slow-redelivered", slow(2, b, c1)),
+            // The leader's proposal is not its adoption: its acceptance
+            // row is durable only once this arrives (task-d19).
+            ("leader-adoption", slow(0, b, c1)),
             ("leader-redelivered", fast(0, b, c1, &deps, 7, Some(0))),
             ("leader-without-seqnum", fast(0, b, c1, &deps, 7, None)),
         ],
@@ -339,7 +342,8 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
     assert!(!fast_path.rejected.contains_key("r1-slow-adoption"));
 
     // Differing dependency path: no fast learning; the leader order is
-    // adopted by r1 (equal deps) and r2 (slow ack) -> slow path.
+    // adopted by r2 and by the leader itself once its acceptance row is
+    // durable (task-d19) -> slow path.
     let slow_path = explore(
         "slow-path-path-disagreement",
         &cfg,
@@ -348,6 +352,7 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("leader-proposal", fast(0, b, c1, &deps, 7, Some(0))),
             ("r1-fast-other-path", fast(1, b, c1, &deps, 8, None)),
             ("r2-slow", slow(2, b, c1)),
+            ("leader-adoption", slow(0, b, c1)),
         ],
     );
     assert_eq!(
@@ -1054,4 +1059,214 @@ fn decoded_configurations_are_validated_like_constructed_ones() {
     let mut stranger = serde_json::to_value(&good).unwrap();
     stranger["fast_set"] = serde_json::to_value(BTreeSet::from([r(0), r(1), r(9)])).unwrap();
     assert!(serde_json::from_value::<BallotConfiguration>(stranger).is_err());
+}
+
+/// Checklist P5/P6 (task-d19): a fast-set member's fast acknowledgement
+/// does not count toward the slow majority, and a slow decision made of
+/// adoptions survives any recovering majority with its dependencies.
+///
+/// Five voters, fast set {r0, r1, r2}. Counting r1's fast acknowledgement
+/// as an adoption made x learned from r0, r1 and r3; then r2, recovering
+/// from r1, r2 and r4, held only r1's PRE-ACCEPT and re-proposed x with
+/// new dependencies, although the collector may already have released it.
+#[test]
+fn a_slow_decision_counting_a_fast_ack_survives_recovery() {
+    let src = BallotConfiguration::c2_default(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(0, 0),
+        (0..5).map(r).collect(),
+    )
+    .unwrap();
+    // Fast set of ballot 0 is {r0, r1, r2}.
+    let b0 = ballot(0, 0);
+    let (y, x) = (cmd(0), cmd(1));
+    let mut set = VoteSet::new(src.clone(), x);
+    set.add(fast(0, b0, x, &[y], 7, Some(1))).unwrap();
+    // r1, a fast-set member, pre-accepted x with the leader's dependencies
+    // but another path: no fast decision, and no adoption either.
+    set.add(fast(1, b0, x, &[y], 9, None)).unwrap();
+    set.add(slow(3, b0, x)).unwrap();
+    assert_eq!(
+        set.learned(),
+        None,
+        "a fast acknowledgement counted as an adoption"
+    );
+    assert_eq!(set.learned_slow(), None);
+    // r1 adopts, and r1 holds x at ACCEPT; with the leader's own adoption,
+    // its acceptance row durable, x is learned (task-d19).
+    set.add(slow(1, b0, x)).unwrap();
+    assert_eq!(set.learned(), None, "the leader's proposal counted");
+    set.add(slow(0, b0, x)).unwrap();
+    assert_eq!(set.learned(), Some(Learned::Slow { deps: vec![y] }));
+    // r0 and r3 are gone. r2 leads ballot 1 and hears r1, r2 and r4: the
+    // one member of the deciding quorum it hears is r1, at ACCEPT.
+    let cfg = BallotConfiguration::c2_default(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(1, 2),
+        (0..5).map(r).collect(),
+    )
+    .unwrap();
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![entry(y, Phase::Accept, &[]), entry(x, Phase::Accept, &[y])],
+        ),
+        report_for(2, ballot(1, 2), 0, vec![entry(y, Phase::Accept, &[])]),
+        report_for(4, ballot(1, 2), 0, vec![entry(y, Phase::Accept, &[])]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    let kept = decision.entries.get(&x);
+    assert!(
+        kept.is_some_and(|e| e.deps == vec![y]),
+        "x was learned with deps [y] but recovery selected {kept:?}, reproposed {:?}",
+        decision.reproposed
+    );
+}
+
+/// What one non-leader voter of the source ballot did with x.
+#[derive(Clone, Copy, Debug)]
+enum XState {
+    /// Nothing reached it.
+    None,
+    /// Pre-accepted x with the leader's dependencies (`true`) or others.
+    Pre(bool),
+    /// Adopted the leader's proposal, after a fast acknowledgement with
+    /// the leader's dependencies, with others, or none.
+    Adopted(Option<bool>),
+}
+
+const X_STATES: [XState; 6] = [
+    XState::None,
+    XState::Pre(true),
+    XState::Pre(false),
+    XState::Adopted(None),
+    XState::Adopted(Some(true)),
+    XState::Adopted(Some(false)),
+];
+
+/// task-d19's bounded model, joining learning with selection at three and
+/// five voters: every combination of what the non-leaders did with one
+/// command x, whose leader ordered it after y, and of whether the leader's
+/// own acceptance row became durable; for every combination whose vote
+/// set learns x, every majority of reports, under every new leader among
+/// them, selects x with the learned dependencies.
+///
+/// A leader whose acceptance row is not durable reports x at PRE-ACCEPT,
+/// as a restarted leader does when a crash lost that batch: its proposal
+/// row is all it holds. Counting the proposal toward the slow majority
+/// fails here (the Codex case on #116).
+#[test]
+fn every_learned_decision_is_selected_by_every_recovering_majority() {
+    let (y, x) = (cmd(0), cmd(1));
+    let leader_deps = vec![y];
+    let other_deps: Vec<CommandId> = Vec::new();
+    let mut checked = 0u32;
+    for n in [3u8, 5] {
+        let src = BallotConfiguration::c2_default(
+            ConfigurationEpoch::new(1).unwrap(),
+            ballot(0, 0),
+            (0..n).map(r).collect(),
+        )
+        .unwrap();
+        let others = usize::from(n - 1);
+        let combos = X_STATES.len().pow(others as u32);
+        for (code, leader_adopted) in
+            (0..combos).flat_map(|code| [false, true].map(|adopted| (code, adopted)))
+        {
+            let mut states = Vec::new();
+            let mut c = code;
+            for _ in 0..others {
+                states.push(X_STATES[c % X_STATES.len()]);
+                c /= X_STATES.len();
+            }
+            let b0 = ballot(0, 0);
+            let mut set = VoteSet::new(src.clone(), x);
+            set.add(fast(0, b0, x, &leader_deps, 7, Some(1))).unwrap();
+            if leader_adopted {
+                set.add(slow(0, b0, x)).unwrap();
+            }
+            for (i, s) in states.iter().enumerate() {
+                let replica = (i + 1) as u8;
+                let fast_eligible = src.fast_eligible(&r(replica));
+                let pre = match s {
+                    XState::Pre(same) | XState::Adopted(Some(same)) => Some(*same),
+                    _ => None,
+                };
+                if let (Some(same), true) = (pre, fast_eligible) {
+                    let (deps, path) = if same {
+                        (&leader_deps, 7)
+                    } else {
+                        (&other_deps, 9)
+                    };
+                    set.add(fast(replica, b0, x, deps, path, None)).unwrap();
+                }
+                if matches!(s, XState::Adopted(_)) {
+                    set.add(slow(replica, b0, x)).unwrap();
+                }
+            }
+            let Some(learned) = set.learned() else {
+                continue;
+            };
+            // A fast decision whose leader holds only its PRE-ACCEPT
+            // proposal row is recovered once the source leader counts
+            // among the fast-set members (#118, item 1).
+            if !leader_adopted && matches!(learned, Learned::Fast { .. }) {
+                continue;
+            }
+            let entry_of = |replica: u8| -> Option<ReportEntry> {
+                if replica == 0 {
+                    let phase = if leader_adopted {
+                        Phase::Accept
+                    } else {
+                        Phase::PreAccept
+                    };
+                    return Some(entry(x, phase, &leader_deps));
+                }
+                match states[usize::from(replica) - 1] {
+                    XState::None => None,
+                    XState::Pre(true) => Some(entry(x, Phase::PreAccept, &leader_deps)),
+                    XState::Pre(false) => Some(entry(x, Phase::PreAccept, &other_deps)),
+                    XState::Adopted(_) => Some(entry(x, Phase::Accept, &leader_deps)),
+                }
+            };
+            for mask in 0u32..(1 << n) {
+                let members: Vec<u8> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
+                if members.len() < src.slow_size() {
+                    continue;
+                }
+                for &new_leader in &members {
+                    let cfg = BallotConfiguration::c2_default(
+                        ConfigurationEpoch::new(1).unwrap(),
+                        ballot(1, new_leader),
+                        (0..n).map(r).collect(),
+                    )
+                    .unwrap();
+                    let reports: Vec<RecoveryReport> = members
+                        .iter()
+                        .map(|&m| {
+                            let mut entries = vec![entry(y, Phase::Accept, &[])];
+                            entries.extend(entry_of(m));
+                            report_for(m, ballot(1, new_leader), 0, entries)
+                        })
+                        .collect();
+                    let decision = select(&cfg, &reports).unwrap_or_else(|e| {
+                        panic!(
+                            "n={n} leader_adopted={leader_adopted} states={states:?} \
+                             members={members:?}: {e:?}"
+                        )
+                    });
+                    let kept = decision.entries.get(&x);
+                    assert!(
+                        kept.is_some_and(|e| e.deps == learned.deps()),
+                        "n={n} leader_adopted={leader_adopted} states={states:?} learned \
+                         {learned:?}, members {members:?} under r{new_leader} selected {kept:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked}");
 }

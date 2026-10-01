@@ -10,10 +10,29 @@
 //! * fast: the leader's proposal plus fast-set members whose dependency
 //!   path digest equals the leader's (prototype client `accept`: checksum
 //!   equality), `fast_size` members in total including the leader;
-//! * slow: the leader's proposal plus adoption acknowledgements (a slow
-//!   acknowledgement, or a fast acknowledgement whose dependency set equals
-//!   the leader's; prototype `acceptFastAndSlowAck`), `slow_size` members
-//!   in total including the leader.
+//! * slow: the leader's proposal plus `slow_size` adoption
+//!   acknowledgements, each a durable ACCEPT copy at the ballot, from any
+//!   voters, the leader's own included. Only adoptions count (task-d19).
+//!   The prototype's `acceptFastAndSlowAck` also counts a fast
+//!   acknowledgement whose dependency set equals the leader's; that is
+//!   stricter here (`[EXT: stricter]` in the source mapping). At five
+//!   voters a slow decision counting a fast-set member's fast
+//!   acknowledgement is not always visible to recovery: a recovering
+//!   majority can hold two fast-set pre-accepts of one command with
+//!   different dependencies and neither the leader nor an ACCEPT copy, and
+//!   then cannot tell which of them was decided.
+//!
+//!   The leader is not counted for its proposal either. Its proposal row
+//!   is PRE-ACCEPT and its acceptance is a separate batch, which a crash
+//!   can lose after the followers' adoptions made a majority with it: the
+//!   restarted leader then reports the command at PRE-ACCEPT, and a
+//!   recovering majority of it and the non-adopters holds no ACCEPT copy
+//!   (task-d19, Codex review). So the leader acknowledges its own order
+//!   like any adopter, with a slow acknowledgement published once its
+//!   acceptance row is durable (`[EXT]` in the source mapping). A slow
+//!   decision is then `slow_size` durable ACCEPT copies at its ballot,
+//!   every majority of reports holds one, and selection keeps ACCEPT at
+//!   the source ballot.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -132,8 +151,6 @@ pub enum VoteError {
     WrongCommand,
     /// The sender already voted for this command in this ballot.
     Duplicate,
-    /// The leader must send a proposal, not an adoption acknowledgement.
-    LeaderSlowAck,
     /// A non-leader vote carried a leader sequence number.
     ForgedProposal,
     /// The leader proposal carried no sequence number; the leader assigns
@@ -265,10 +282,10 @@ impl VoteSet {
                     self.fast.insert(replica, ack);
                 }
             }
+            // The leader's own adoption counts like anyone's: it says the
+            // leader's acceptance row is durable, which its proposal does
+            // not (task-d19).
             Vote::Slow(_) => {
-                if is_leader {
-                    return Err(VoteError::LeaderSlowAck);
-                }
                 if !self.slow.insert(replica) {
                     return Err(VoteError::Duplicate);
                 }
@@ -279,17 +296,19 @@ impl VoteSet {
     }
 
     /// The conservative slow predicate only (task-24 learner): the leader
-    /// proposal adopted by a majority including the leader.
+    /// proposal adopted by a majority.
+    ///
+    /// Only adoption acknowledgements count toward that majority, never a
+    /// fast acknowledgement, whatever dependencies it carries, and never
+    /// the leader's proposal by itself (task-d19): an adoption is a
+    /// durable ACCEPT copy at this ballot, which any later majority of
+    /// recovery reports holds and selection keeps, and neither a fast-set
+    /// member's PRE-ACCEPT nor the leader's proposal row is. The leader
+    /// counts once its own adoption, published when its acceptance row is
+    /// durable, has arrived.
     pub fn learned_slow(&self) -> Option<Learned> {
         let leader = self.leader.as_ref()?;
-        let mut adopting: BTreeSet<ReplicaId> = self.slow.clone();
-        adopting.extend(
-            self.fast
-                .values()
-                .filter(|a| same_set(&a.deps, &leader.deps))
-                .map(|a| a.replica),
-        );
-        (adopting.len() + 1 >= self.config.slow_size()).then(|| Learned::Slow {
+        (self.slow.len() >= self.config.slow_size()).then(|| Learned::Slow {
             deps: leader.deps.clone(),
         })
     }
@@ -316,19 +335,7 @@ impl VoteSet {
                 deps: leader.deps.clone(),
             });
         }
-        let mut adopting: BTreeSet<ReplicaId> = self.slow.clone();
-        adopting.extend(
-            self.fast
-                .values()
-                .filter(|a| same_set(&a.deps, &leader.deps))
-                .map(|a| a.replica),
-        );
-        if adopting.len() + 1 >= self.config.slow_size() {
-            return Some(Learned::Slow {
-                deps: leader.deps.clone(),
-            });
-        }
-        None
+        self.learned_slow()
     }
 }
 
