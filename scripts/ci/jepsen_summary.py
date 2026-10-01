@@ -6,6 +6,8 @@ directory (`store/latest`) and writes what a reader looks for first:
 
 * the verdict, with Elle's anomaly types when there are any;
 * the operation counts, `ok` per 30 s, the last `ok` and the final heal;
+* the throughput, `ok` a second until the final heal, and each operation's
+  latency percentiles, for the throughput and WAN runs;
 * each node's final reads, which say whether the domain served again;
 * the commonest failure reasons;
 * the faults, in order;
@@ -25,6 +27,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime
+import math
 import os
 import re
 import sys
@@ -204,6 +207,41 @@ def parse_voter(lines) -> Voter:
     return v
 
 
+def percentile(sorted_ms: list[float], q: float) -> float:
+    """The nearest-rank percentile of an ascending list. The rounding keeps
+    0.95 * 100 from ranking as 96."""
+    rank = math.ceil(round(q * len(sorted_ms), 6))
+    return sorted_ms[max(0, min(len(sorted_ms), rank) - 1)]
+
+
+def throughput(client: list[Op], end: datetime.datetime | None):
+    """`ok` operations a second from the first invocation to `end` (the
+    final heal, or the last completion without one), and the latency of
+    each `ok` operation completed by then, in milliseconds, by function.
+    A worker's operations are sequential, so an operation's invocation is
+    its worker's last one. Times are the log's, to the millisecond."""
+    if not client:
+        return 0, 0.0, {}
+    start = client[0].at
+    if end is None:
+        end = client[-1].at
+    latencies = collections.defaultdict(list)
+    invoked = {}
+    oks = 0
+    for o in client:
+        if o.at > end:
+            break
+        if o.type == "invoke":
+            invoked[o.thread] = o
+            continue
+        inv = invoked.pop(o.thread, None)
+        if o.type == "ok":
+            oks += 1
+            if inv is not None:
+                latencies[o.f].append((o.at - inv.at).total_seconds() * 1000)
+    return oks, (end - start).total_seconds(), {f: sorted(ms) for f, ms in latencies.items()}
+
+
 def node_of(op: Op, nodes: list[str]) -> str:
     """Jepsen binds worker thread N to node N mod the node count."""
     m = WORKER.match(op.thread)
@@ -266,6 +304,23 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         row = " · ".join(f"{b * BUCKET_S}s:{buckets.get(b, 0)}" for b in range(end + 1))
         out.append(f"`ok` per {BUCKET_S} s: {row}")
         out.append("")
+
+        n_ok, secs, latencies = throughput(client, heal)
+        if secs > 0:
+            until = "the final heal" if heal is not None else "the last operation"
+            peak = max(buckets.values(), default=0) / BUCKET_S
+            out.append(
+                f"**Throughput:** {n_ok} `ok` in {secs:.0f} s until {until}, "
+                f"{n_ok / secs:.1f} `ok`/s (best {BUCKET_S} s: {peak:.1f}/s)"
+            )
+            out.append("")
+        if latencies:
+            out.append("| Latency of `ok` (ms) | Count | p50 | p95 | p99 | Max |")
+            out.append("| --- | --- | --- | --- | --- | --- |")
+            for f, ms in sorted(latencies.items()):
+                cells = " | ".join(f"{percentile(ms, q):.0f}" for q in (0.5, 0.95, 0.99))
+                out.append(f"| `{f}` | {len(ms)} | {cells} | {ms[-1]:.0f} |")
+            out.append("")
 
         # The final reads: each worker's operations invoked after the last
         # fault operation (the final heal), with what answered them. A

@@ -142,14 +142,68 @@ SSH, and fails unless every voter takes a write.
 `.github/workflows/jepsen.yml` runs that on a GitHub runner, by hand or
 weekly. It builds `coordd`, `coord-harness` and `coord-jepsen` in release
 mode, checks `tuplesky/jepsen` out at `jepsen-ref`, stands a five-node
-cluster up, smokes it, and runs one test (`workload`, `nemesis`,
-`time-limit` inputs; `--concurrency 2n`). The test's store directory is
+cluster up, smokes it, and runs one test (the `scenario`, below, with the
+`workload`, `nemesis`, `wan` and `time-limit` inputs overriding it). The test's store directory is
 uploaded as an artifact, without the provisioned run directory, which
 holds the domain's fixture keys. The containers share the runner's clock,
 so the workflow does not offer the `clock` fault.
 
 `jepsen-ref` defaults to `main` of `tuplesky/jepsen`, where the project
 merged (tuplesky/jepsen#1); a run can name another branch, tag or commit.
+
+#### Scenarios
+
+The `scenario` input sets the load, the faults and the network for all
+three jobs (`scripts/ci/jepsen_scenario.sh`); a non-empty `workload`,
+`nemesis`, `swiftpaxos`, `wan` or `time-limit` input overrides its value.
+
+| Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
+| --- | --- | --- | --- | --- | --- |
+| `faults` (default, weekly, pull requests) | append | kill, pause, partition (pause, partition) | 20/s, 2 clients a node | the runner's bridge | 300 s |
+| `throughput` | register | none | unthrottled, 10 clients a node | the runner's bridge | 120 s |
+| `wan` | append | packet | 20/s, 2 clients a node | three regions | 300 s |
+| `wan-throughput` | register | none | unthrottled, 10 clients a node | three regions | 120 s |
+
+* **Throughput:** `--rate 0` takes the throttle off in the TupleSky and
+  SwiftPaxos tests; each client issues its next operation as soon as the
+  last completes, so the `ok` rate is what the system sustains at that
+  concurrency. The etcd test takes no 0, so it gets 100000 a second,
+  which staggers its clients by 10 microseconds on average. The workload
+  is the register one, independent keys, 100 operations a key, so no
+  system's clients contend on a key and all three run the same Knossos
+  check. The TupleSky test skips its 60 s wait before the final reads when
+  nothing was faulted. The job summary gives `ok` a second until the final heal (or the
+  end), the best 30 s, and each operation's latency percentiles.
+* **A simulated WAN** (`jepsen.tuplesky.wan` in tuplesky/jepsen):
+  `regions` places the nodes round-robin in three regions, `n1` us-east,
+  `n2` us-west, `n3` eu-west, `n4` us-east, `n5` us-west. One way, us-east
+  to us-west is 33 ms, us-east to eu-west 37 ms and us-west to eu-west
+  65 ms, about half the round trips between AWS us-east-1, us-west-2 and
+  eu-west-1; one region's nodes are 1 ms apart. A number instead delays
+  every pair by that many milliseconds. Each node's egress gets a prio
+  qdisc with a netem band per distinct delay among its peers, and a u32
+  filter per peer, so traffic to the control node, where the clients run,
+  is not delayed. The delays hold from the nemesis's setup to its
+  teardown, final reads included. The nemesis logs the round trip it
+  measures from `n1` to each node, and warns when one is short of the
+  profile.
+* **The packet fault** (`packet`) disrupts the traffic to and from one
+  node, a minority or every node, for a while, on top of the profile: 1%
+  or 5% loss, 50 ms more delay with 25 ms of jitter (which reorders), 5%
+  reordering, 2% duplication, 1% corruption, or a 10 Mbit/s cap. Its stop
+  and the final heal go back to the profile. Jepsen's own packet nemesis
+  is not used: it gives a node one netem queue and clears the rest, which
+  would erase the WAN. The etcd test gets the same profile and fault: the
+  job adds a `--wan` option and `:packet` to it and routes its packages
+  through `jepsen.tuplesky.nemesis/with-wan`.
+* **The runner's kernel** carries the shaping, since the containers share
+  it: the jobs load `sch_prio`, `sch_netem` and `cls_u32`, from
+  `linux-modules-extra` when the cloud kernel lacks them, whenever the
+  network or the faults need them.
+
+The other scenarios need a `jepsen-ref` with `jepsen.tuplesky.wan`; the
+jobs say so and stop on one without it, and the `faults` scenario still
+runs on one from before.
 
 Beside it, on a runner of its own, the `etcd-baseline` job runs Jepsen's
 own etcd test ([jepsen-io/etcd](https://github.com/jepsen-io/etcd),
@@ -186,7 +240,7 @@ and its behaviour under faults have something to be compared with:
     keep one schedule. Runs from `f12fee0` on are a new series: compare
     their `ok` counts with each other, not with earlier runs.
 
-Its store is the `jepsen-store-etcd-append` artifact.
+Its store is the `jepsen-store-etcd-<scenario>-<workload>` artifact.
 
 A third job, `swiftpaxos-baseline`, runs
 [SwiftPaxos](https://github.com/imdea-software/swiftpaxos), the reference
@@ -220,7 +274,7 @@ same kind of cluster:
   protocol, and TupleSky's counts are not to be read against them.
 
 Its store, with the master's and the clients' logs under `control/`, is
-the `jepsen-store-swiftpaxos-register` artifact.
+the `jepsen-store-swiftpaxos-<scenario>-register` artifact.
 
 Each test runs under `timeout`, bounded at the time limit plus 20
 minutes. A test whose final phase hangs then fails in that time, instead
@@ -265,6 +319,10 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
 * the verdict, with Elle's anomaly types when there are any;
 * the operation counts, `ok` per 30 s, the last `ok` and the last fault
   operation (the final heal);
+* the throughput, `ok` a second until the final heal (or the last
+  operation, without faults) and the best 30 s, and each operation's
+  latency percentiles (p50, p95, p99, max) among the `ok` ones by then,
+  from the log's millisecond times;
 * each node's final reads after the heal, and why the others failed,
   which says whether the domain served again;
 * the commonest reasons an operation was not `ok`, and the faults in

@@ -15,6 +15,12 @@
 # registers (SwiftPaxos has no transactions), and pause and partition only,
 # since a killed SwiftPaxos replica cannot rejoin.
 #
+# A run's scenario sets the load, the faults and the network for all three
+# (scripts/ci/jepsen_scenario.sh): `faults` (the default, and the weekly and
+# pull-request runs), `throughput` (no faults, unthrottled clients, the most
+# each system sustains), `wan` (three simulated regions, with packet faults
+# on top: jepsen.tuplesky.wan) and `wan-throughput`.
+#
 # Like the Kubernetes certification, this is a qualification run and not
 # part of `CI`: it is dispatched, weekly, or run once for a pull request
 # that changes the Jepsen harness itself. A Jepsen run that finds an anomaly or a crash is
@@ -27,15 +33,23 @@ on:
       jepsen-ref:
         description: Branch, tag or commit of tuplesky/jepsen to run
         default: main
+      scenario:
+        description: "faults (kill, pause, partition at 20/s), throughput (no faults, unthrottled, register), wan (three simulated regions, packet faults) or wan-throughput"
+        type: choice
+        options: [faults, throughput, wan, wan-throughput]
+        default: faults
       workload:
-        description: "append, wr or register"
-        default: append
+        description: "append, wr or register; empty for the scenario's"
+        default: ""
       nemesis:
-        description: "Comma-separated faults (kill, pause, partition), or none. Not clock: the containers share this runner's clock."
-        default: kill,pause,partition
+        description: "Comma-separated faults (kill, pause, partition, packet), or none; empty for the scenario's. Not clock: the containers share this runner's clock."
+        default: ""
+      wan:
+        description: "The network between the nodes: none, regions, or one-way milliseconds between every two; empty for the scenario's"
+        default: ""
       time-limit:
-        description: Seconds of workload before healing
-        default: "300"
+        description: "Seconds of workload before healing; empty for the scenario's (300, or 120 for throughput)"
+        default: ""
       nodes:
         description: Voters (containers), 3 or 5
         default: "5"
@@ -43,8 +57,8 @@ on:
         description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it"
         default: latest
       swiftpaxos:
-        description: "Faults for the SwiftPaxos baseline (pause, partition; kill ends its cluster), none, or skip to not run it"
-        default: pause,partition
+        description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
+        default: ""
   # A change to the Jepsen harness itself runs it once, on the pull
   # request, with the defaults. Not a required check.
   pull_request:
@@ -52,6 +66,7 @@ on:
       - .github/workflows/jepsen.yml
       - crates/coord-jepsen/**
       - scripts/ci/jepsen_bounded.sh
+      - scripts/ci/jepsen_scenario.sh
       - scripts/ci/jepsen_summary.py
   schedule:
     # Weekly, after the Kubernetes certification.
@@ -67,14 +82,18 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Scheduled runs have no inputs; these are the dispatch defaults.
+  # Scheduled runs have no inputs; these are the dispatch defaults. The
+  # load, faults and network come from the scenario, in each job's first
+  # step (scripts/ci/jepsen_scenario.sh); a non-empty input overrides it.
   JEPSEN_REF: ${{ inputs.jepsen-ref || 'main' }}
-  WORKLOAD: ${{ inputs.workload || 'append' }}
-  NEMESIS: ${{ inputs.nemesis || 'kill,pause,partition' }}
-  TIME_LIMIT: ${{ inputs.time-limit || '300' }}
+  SCENARIO: ${{ inputs.scenario || 'faults' }}
+  IN_WORKLOAD: ${{ inputs.workload }}
+  IN_NEMESIS: ${{ inputs.nemesis }}
+  IN_WAN: ${{ inputs.wan }}
+  IN_TIME_LIMIT: ${{ inputs.time-limit }}
+  IN_SWIFTPAXOS: ${{ inputs.swiftpaxos }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
-  SWIFTPAXOS_NEMESIS: ${{ inputs.swiftpaxos || 'pause,partition' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
   ETCD_TEST_REPO: jepsen-io/etcd
   ETCD_TEST_REF: b47cc401f27bfb7c28afd9ac088b5f0dca4501b8
@@ -97,6 +116,33 @@ jobs:
           ref: ${{ env.JEPSEN_REF }}
           path: jepsen
           persist-credentials: false
+      - name: Choose the scenario's settings
+        run: |
+          tuplesky/scripts/ci/jepsen_scenario.sh
+          cat "$GITHUB_ENV"
+          . <(grep -E '^(SCENARIO|NEMESIS|SWIFTPAXOS_NEMESIS|WAN|RATE)=' "$GITHUB_ENV")
+          # The scenarios other than faults need jepsen.tuplesky.wan and
+          # --rate 0 (tuplesky/jepsen#4).
+          if [ ! -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ] && \
+             { [ "$SCENARIO" != faults ] || [ "$WAN" != none ] || [ "$RATE" = 0 ] || \
+               [[ ",$NEMESIS,$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; }; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no jepsen.tuplesky.wan; dispatch with a jepsen-ref that has it (tuplesky/jepsen#4), or the faults scenario"
+            exit 1
+          fi
+      - name: Load the kernel's traffic shaping
+        # --wan and the packet fault shape each node's egress with a prio
+        # qdisc, netem bands and u32 filters. The containers share this
+        # runner's kernel, which loads them; the cloud kernel keeps netem in
+        # its extra modules.
+        run: |
+          if [ "$WAN" != none ] || [[ ",$NEMESIS," == *,packet,* ]]; then
+            sudo modprobe -a sch_prio sch_netem cls_u32 || {
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              sudo modprobe -a sch_prio sch_netem cls_u32
+            }
+            lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
+          fi
       - name: Install the exact Rust toolchain from rust-toolchain.toml
         working-directory: tuplesky
         run: rustup show active-toolchain || rustup toolchain install
@@ -155,7 +201,10 @@ jobs:
         # this concurrency group, until the job's own timeout. A minute
         # before the bound it prints every JVM's threads and each node's
         # processes, to say where it hung.
+        # --wan only with a profile, so the faults scenario runs on a
+        # harness from before it.
         run: |
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
@@ -165,7 +214,10 @@ jobs:
             --workload "$WORKLOAD" \
             --nemesis "$NEMESIS" \
             --time-limit "$TIME_LIMIT" \
-            --concurrency 2n
+            --rate "$RATE" \
+            --recovery-time "$RECOVERY_TIME" \
+            --concurrency "$CONCURRENCY" \
+            ${wan[@]+"${wan[@]}"}
       - name: Read how far each voter executed
         if: always()
         # Each voter's highest executed position at the end, from its store
@@ -190,7 +242,7 @@ jobs:
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "TupleSky: $WORKLOAD, $NEMESIS"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -266,7 +318,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: jepsen-store-${{ env.WORKLOAD }}
+          name: jepsen-store-${{ env.SCENARIO }}-${{ env.WORKLOAD }}
           path: ${{ runner.temp }}/jepsen-store.tgz
           retention-days: 14
           if-no-files-found: warn
@@ -297,6 +349,33 @@ jobs:
           ref: ${{ env.ETCD_TEST_REF }}
           path: etcd-test
           persist-credentials: false
+      - name: Choose the scenario's settings
+        run: |
+          tuplesky/scripts/ci/jepsen_scenario.sh
+          cat "$GITHUB_ENV"
+          . <(grep -E '^(SCENARIO|NEMESIS|SWIFTPAXOS_NEMESIS|WAN|RATE)=' "$GITHUB_ENV")
+          # The scenarios other than faults need jepsen.tuplesky.wan and
+          # --rate 0 (tuplesky/jepsen#4).
+          if [ ! -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ] && \
+             { [ "$SCENARIO" != faults ] || [ "$WAN" != none ] || [ "$RATE" = 0 ] || \
+               [[ ",$NEMESIS,$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; }; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no jepsen.tuplesky.wan; dispatch with a jepsen-ref that has it (tuplesky/jepsen#4), or the faults scenario"
+            exit 1
+          fi
+      - name: Load the kernel's traffic shaping
+        # --wan and the packet fault shape each node's egress with a prio
+        # qdisc, netem bands and u32 filters. The containers share this
+        # runner's kernel, which loads them; the cloud kernel keeps netem in
+        # its extra modules.
+        run: |
+          if [ "$WAN" != none ] || [[ ",$NEMESIS," == *,packet,* ]]; then
+            sudo modprobe -a sch_prio sch_netem cls_u32 || {
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              sudo modprobe -a sch_prio sch_netem cls_u32
+            }
+            lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
+          fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -360,42 +439,67 @@ jobs:
           open(path, "w").write(src)
           PY
           grep -n 'cu/signal!' src/jepsen/etcd/db.clj
-      - name: Give the etcd test the TupleSky test's kill schedule
+      - name: Give the etcd test the TupleSky test's kill schedule and network
         # The combined nemesis draws kill/start and pause/resume from one
         # mix, so a start can wait minutes after a kill. jepsen.tuplesky
         # staggers the two on their own (jepsen.tuplesky.nemesis); the
         # baseline loads the same namespace so both tests keep one schedule.
+        # With jepsen.tuplesky.wan, it also takes the same --wan profile
+        # and packet fault: a --wan option, :packet among its faults, and
+        # the WAN nemesis in place of Jepsen's packet package.
         run: |
           mkdir -p etcd-test/src/jepsen/tuplesky
           cp jepsen/tuplesky/src/jepsen/tuplesky/nemesis.clj etcd-test/src/jepsen/tuplesky/
-          python3 - etcd-test/src/jepsen/etcd/nemesis.clj <<'PY'
+          wan=false
+          if [ -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ]; then
+            cp jepsen/tuplesky/src/jepsen/tuplesky/wan.clj etcd-test/src/jepsen/tuplesky/
+            wan=true
+          fi
+          python3 - etcd-test/src/jepsen "$wan" <<'PY'
           import sys
-          path = sys.argv[1]
-          src = open(path).read()
-          edits = [
+          root, wan = sys.argv[1], sys.argv[2] == "true"
+          def edit(path, edits):
+              src = open(path).read()
+              for old, new in edits:
+                  if src.count(old) != 1:
+                      sys.exit(f"{path} no longer has: {old!r}")
+                  src = src.replace(old, new)
+              open(path, "w").write(src)
+          packages = "(tn/separate-db-faults opts (nc/nemesis-packages opts))"
+          if wan:
+              packages = f"(tn/with-wan opts {packages})"
+          edit(f"{root}/etcd/nemesis.clj", [
               ("            [jepsen.nemesis [combined :as nc]",
                "            [jepsen.tuplesky.nemesis :as tn]\n"
                "            [jepsen.nemesis [combined :as nc]"),
-              ("    (-> (nc/nemesis-packages opts)",
-               "    (-> (tn/separate-db-faults opts (nc/nemesis-packages opts))"),
-          ]
-          for old, new in edits:
-              if src.count(old) != 1:
-                  sys.exit(f"etcd nemesis.clj no longer has: {old!r}")
-              src = src.replace(old, new)
-          open(path, "w").write(src)
+              ("    (-> (nc/nemesis-packages opts)", f"    (-> {packages}"),
+          ])
+          if wan:
+              edit(f"{root}/etcd.clj", [
+                  ("    :clock :member})", "    :clock :member :packet})"),
+                  ("                         :interval  (:nemesis-interval opts)})",
+                   "                         :wan       (:wan opts)\n"
+                   "                         :interval  (:nemesis-interval opts)})"),
+                  ('   [nil "--nemesis-interval SECONDS"',
+                   '   [nil "--wan PROFILE" "none, regions, or one-way milliseconds (jepsen.tuplesky.wan)"\n'
+                   '    :parse-fn #(jepsen.tuplesky.wan/parse-spec %)]\n\n'
+                   '   [nil "--nemesis-interval SECONDS"'),
+              ])
           PY
           grep -n 'tn/' etcd-test/src/jepsen/etcd/nemesis.clj
+          grep -n 'wan' etcd-test/src/jepsen/etcd.clj || true
       - name: Stand the cluster up
         run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
       - name: Run the etcd test
         working-directory: etcd-test
-        # The tuplesky test's rate (20/s) and fault interval (30 s) rather
-        # than the etcd test's defaults (200/s, 5 s). Bounded as the
-        # tuplesky test is, with the same dump before the bound: two etcd
-        # runs stopped on a :pause :all that never returned, one of them
-        # for 84 minutes after its time limit.
+        # The tuplesky test's rate, fault interval (30 s) and operations per
+        # register (100) rather than the etcd test's defaults (200/s, 5 s,
+        # 200); unthrottled is a rate of 100000/s here, since the etcd test
+        # takes no 0. Bounded as the tuplesky test is, with the same dump
+        # before the bound: two etcd runs stopped on a :pause :all that
+        # never returned, one of them for 84 minutes after its time limit.
         run: |
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
@@ -405,15 +509,17 @@ jobs:
             --workload "$WORKLOAD" \
             --nemesis "$NEMESIS" \
             --nemesis-interval 30 \
-            --rate 20 \
+            --ops-per-key 100 \
+            --rate "$ETCD_RATE" \
             --time-limit "$TIME_LIMIT" \
-            --concurrency 2n
+            --concurrency "$CONCURRENCY" \
+            ${wan[@]+"${wan[@]}"}
       - name: Summarize the run
         if: always()
         run: |
           if [ -d etcd-test/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -427,7 +533,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: jepsen-store-etcd-${{ env.WORKLOAD }}
+          name: jepsen-store-etcd-${{ env.SCENARIO }}-${{ env.WORKLOAD }}
           path: ${{ runner.temp }}/jepsen-store.tgz
           retention-days: 14
           if-no-files-found: warn
@@ -457,6 +563,33 @@ jobs:
           if [ ! -d jepsen/swiftpaxos ]; then
             echo "::error::tuplesky/jepsen@$JEPSEN_REF has no swiftpaxos project (tuplesky/jepsen#2 adds it); dispatch with that branch as jepsen-ref, or swiftpaxos: skip"
             exit 1
+          fi
+      - name: Choose the scenario's settings
+        run: |
+          tuplesky/scripts/ci/jepsen_scenario.sh
+          cat "$GITHUB_ENV"
+          . <(grep -E '^(SCENARIO|NEMESIS|SWIFTPAXOS_NEMESIS|WAN|RATE)=' "$GITHUB_ENV")
+          # The scenarios other than faults need jepsen.tuplesky.wan and
+          # --rate 0 (tuplesky/jepsen#4).
+          if [ ! -f jepsen/tuplesky/src/jepsen/tuplesky/wan.clj ] && \
+             { [ "$SCENARIO" != faults ] || [ "$WAN" != none ] || [ "$RATE" = 0 ] || \
+               [[ ",$NEMESIS,$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; }; then
+            echo "::error::tuplesky/jepsen@$JEPSEN_REF has no jepsen.tuplesky.wan; dispatch with a jepsen-ref that has it (tuplesky/jepsen#4), or the faults scenario"
+            exit 1
+          fi
+      - name: Load the kernel's traffic shaping
+        # --wan and the packet fault shape each node's egress with a prio
+        # qdisc, netem bands and u32 filters. The containers share this
+        # runner's kernel, which loads them; the cloud kernel keeps netem in
+        # its extra modules.
+        run: |
+          if [ "$WAN" != none ] || [[ ",$SWIFTPAXOS_NEMESIS," == *,packet,* ]]; then
+            sudo modprobe -a sch_prio sch_netem cls_u32 || {
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+              sudo modprobe -a sch_prio sch_netem cls_u32
+            }
+            lsmod | grep -E '^(sch_prio|sch_netem|cls_u32) '
           fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -501,9 +634,10 @@ jobs:
             --bin-dir "$RUNNER_TEMP/swiftpaxos-bin"
       - name: Run the SwiftPaxos test
         working-directory: jepsen/swiftpaxos
-        # The TupleSky test's time limit, fault interval, rate and
-        # concurrency, bounded the same way.
+        # The TupleSky test's time limit, fault interval, rate, concurrency
+        # and network, bounded the same way.
         run: |
+          wan=(); if [ "$WAN" != none ]; then wan=(--wan "$WAN"); fi
           "$GITHUB_WORKSPACE/tuplesky/scripts/ci/jepsen_bounded.sh" \
             $((TIME_LIMIT + 1200)) "$RUNNER_TEMP/cluster/nodes" -- lein run test \
             --nodes-file "$RUNNER_TEMP/cluster/nodes" \
@@ -512,15 +646,16 @@ jobs:
             --bin-dir "$RUNNER_TEMP/swiftpaxos-bin" \
             --nemesis "$SWIFTPAXOS_NEMESIS" \
             --nemesis-interval 30 \
-            --rate 20 \
+            --rate "$RATE" \
             --time-limit "$TIME_LIMIT" \
-            --concurrency 2n
+            --concurrency "$CONCURRENCY" \
+            ${wan[@]+"${wan[@]}"}
       - name: Summarize the run
         if: always()
         run: |
           if [ -d jepsen/swiftpaxos/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/swiftpaxos/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "SwiftPaxos: register, $SWIFTPAXOS_NEMESIS$TITLE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -546,7 +681,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: jepsen-store-swiftpaxos-register
+          name: jepsen-store-swiftpaxos-${{ env.SCENARIO }}-register
           path: ${{ runner.temp }}/jepsen-store.tgz
           retention-days: 14
           if-no-files-found: warn

@@ -145,6 +145,11 @@ class SummaryTests(unittest.TestCase):
     def test_counts_and_last_ok(self):
         self.assertIn("| 4 | 2 | 2 | 0 | 10:01:42 (+101 s) | 10:00:40 (+39 s) |", self.text)
 
+    def test_throughput_until_the_heal(self):
+        # One ok before the heal at +39 s; the final read after it is left out.
+        self.assertIn("**Throughput:** 1 `ok` in 39 s until the final heal, 0.0 `ok`/s", self.text)
+        self.assertIn("| `:txn` | 1 | 1000 | 1000 | 1000 | 1000 |", self.text)
+
     def test_final_reads_pair_invocations_after_the_heal(self):
         self.assertIn("1 of 2 nodes served a final read", self.text)
         self.assertIn("| n1 | 1 | 0 |  |", self.text)
@@ -162,6 +167,26 @@ class SummaryTests(unittest.TestCase):
     def test_executed_at_end_without_a_file(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(js.read_executed_at_end(d), "-")
+
+    def test_throughput_without_faults(self):
+        ops = js.parse_ops(
+            [
+                file_line("10:00:00", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+                file_line("10:00:01", "jepsen worker 1", "1\t:invoke\t:write\t3"),
+                file_line("10:00:01", "jepsen worker 0", "0\t:ok\t:read\t3"),
+                file_line("10:00:02", "jepsen worker 0", "0\t:invoke\t:read\tnil"),
+                file_line("10:00:03", "jepsen worker 1", "1\t:info\t:write\t3\ttimeout"),
+                file_line("10:00:04", "jepsen worker 0", "0\t:ok\t:read\t3"),
+            ]
+        )
+        oks, secs, latencies = js.throughput(ops, None)
+        self.assertEqual((oks, secs), (2, 4.0))
+        self.assertEqual(latencies, {":read": [1000.0, 2000.0]})
+
+    def test_percentiles_are_nearest_rank(self):
+        ms = [float(i) for i in range(1, 101)]
+        self.assertEqual([js.percentile(ms, q) for q in (0.5, 0.95, 0.99)], [50.0, 95.0, 99.0])
+        self.assertEqual(js.percentile([7.0], 0.99), 7.0)
 
     def test_missing_files_leave_sections_out(self):
         with tempfile.TemporaryDirectory() as empty:
