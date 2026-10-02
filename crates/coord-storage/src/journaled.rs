@@ -2004,6 +2004,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// materializes here, on this thread, as
     /// [`JournaledStore::materialize`] does.
     ///
+    /// A domain whose commit this call took back refused is lent again on
+    /// the next call, not this one.
+    ///
     /// The report carries what the commits taken back materialized, as
     /// [`JournaledStore::materialize`] reports it; nothing lent now is
     /// reported until its outcome is taken.
@@ -2016,8 +2019,25 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let mut report = FlushReport::default();
         report.events.append(&mut self.deferred_events);
         let materializer = self.materializer.as_mut().expect("checked above");
+        // Domains whose commit this call took back refused: not lent again
+        // until the next call. The materializer's waker runs this as soon
+        // as a commit is back, so lent at once, a refusal that persists
+        // would be retried in a loop with nothing else between; the next
+        // call comes with the domain thread's next turn, which is how
+        // often a refused materialization was retried before the commit
+        // left the thread.
+        let mut refused = Vec::new();
         while let Some(done) = materializer.try_take() {
-            match take_back(&mut self.domains, done) {
+            let domain = done.domain();
+            let result = take_back(&mut self.domains, done);
+            if self
+                .domains
+                .get(&domain)
+                .is_some_and(|d| d.status == DomainStatus::MaterializationDeferred)
+            {
+                refused.push(domain);
+            }
+            match result {
                 Ok(one) => report.absorb(one),
                 Err(e) => {
                     self.cost.charge(&report);
@@ -2029,6 +2049,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         for (id, state) in &mut self.domains {
             if state.lent.is_some()
                 || state.pending.is_empty()
+                || refused.contains(id)
                 || matches!(
                     state.status,
                     DomainStatus::Quarantined | DomainStatus::MaterializationUncertain

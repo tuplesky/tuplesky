@@ -264,7 +264,8 @@ fn a_commit_refused_gives_its_records_back_ahead_of_those_journaled_behind_it() 
 
     // Taken back refused: the records are owed again, in journal order,
     // ahead of the two behind them, and all five go out as the next
-    // commit.
+    // commit -- on the next hand-off, not the one that took the refusal
+    // back, which the materializer's waker drives (Codex review, #140).
     let report = world.store.hand_off().unwrap();
     assert!(materialized(&report.events).is_empty());
     assert_eq!(
@@ -272,8 +273,15 @@ fn a_commit_refused_gives_its_records_back_ahead_of_those_journaled_behind_it() 
         Some(DomainStatus::MaterializationDeferred)
     );
     assert_eq!(world.store.unmaterialized(A), 5);
-    assert_eq!(handle.waiting(), 1);
+    assert_eq!(
+        handle.waiting(),
+        0,
+        "a refused commit was lent again at once"
+    );
+    assert!(!world.store.lent(A));
 
+    world.store.hand_off().unwrap();
+    assert_eq!(handle.waiting(), 1);
     assert!(handle.run());
     let report = world.store.hand_off().unwrap();
     let expected: Vec<BarrierId> = first.into_iter().chain(second).collect();
