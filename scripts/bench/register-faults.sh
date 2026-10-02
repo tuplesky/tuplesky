@@ -18,13 +18,20 @@
 #              after that is killed and restarted the same way
 #   partition  the leader's daemon sockets are cut off from the other
 #              voters' (iptables, so root) for FAULT_FOR seconds at
-#              FAULT_AT. Its callers keep reaching it; they only read,
-#              and nobody writes for two seconds either side of the cut,
-#              so a leader that served reads without confirming its
-#              ballot would answer from a state the new leader has
-#              moved past. This is the scenario the negative control
-#              (a coordd built with `--features skip-read-confirmation`)
-#              is expected to fail.
+#              FAULT_AT (default 45: the others notice only at the
+#              transport's 30 s idle timeout). Its own callers keep
+#              reaching it and only read, a few times a second, so their
+#              sessions stay inside half their window and none of their
+#              reads is ordered. The other frontends' callers do nothing
+#              for two seconds before the cut until two seconds after,
+#              so the leader holds no proposal it cannot commit. A
+#              leader that served reads without confirming its ballot
+#              would then answer, once the others elect a leader and
+#              write, from a state they have moved past: this is the
+#              scenario the negative control (a coordd built with
+#              `--features skip-read-confirmation`) is expected to fail.
+#              With confirmation its reads wait out the cut, fall back
+#              to the ordered path and end unknown.
 #
 # `coord-register` records each operation's invocation and completion
 # and checks the history (crates/coord-wan-bench/src/register.rs); its
@@ -53,11 +60,13 @@ COORDD=${COORDD:-$ROOT/target/release/coordd}
 HARNESS=${HARNESS:-$ROOT/target/release/coord-harness}
 REGISTER=${REGISTER:-$ROOT/target/release/coord-register}
 FAULT_AT=${FAULT_AT:-10}
-FAULT_FOR=${FAULT_FOR:-5}
+if [ "$SCENARIO" = partition ]; then FAULT_FOR=${FAULT_FOR:-45}; else FAULT_FOR=${FAULT_FOR:-5}; fi
 FAULT_GAP=${FAULT_GAP:-12}
 LONG_PAUSE=${LONG_PAUSE:-40}
 if [ "$SCENARIO" = pause ]; then
   RUN_SECONDS=${RUN_SECONDS:-$((FAULT_AT + FAULT_GAP + LONG_PAUSE + 20))}
+elif [ "$SCENARIO" = partition ]; then
+  RUN_SECONDS=${RUN_SECONDS:-$((FAULT_AT + FAULT_FOR + 15))}
 else
   RUN_SECONDS=${RUN_SECONDS:-40}
 fi
@@ -164,12 +173,15 @@ INDEX=${LEADER#n}
 
 READ_ONLY=""
 QUIET=""
+READ_ONLY_INTERVAL_MS=0
 if [ "$SCENARIO" = partition ]; then
   READ_ONLY=$INDEX
+  READ_ONLY_INTERVAL_MS=200
   QUIET="$((FAULT_AT - 2))-$((FAULT_AT + 2)),$((FAULT_AT + FAULT_FOR - 2))-$((FAULT_AT + FAULT_FOR + 2))"
 fi
 "$REGISTER" --dir "$DIR" --callers-per-frontend "$CALLERS" --keys "$KEYS" \
   --seconds "$RUN_SECONDS" --read-only-frontends "$READ_ONLY" --quiet "$QUIET" \
+  --read-only-interval-ms "$READ_ONLY_INTERVAL_MS" \
   --history "$OUT_DIR/history.jsonl" --summary "$OUT_DIR/summary.json" \
   > "$OUT_DIR/register.log" 2>&1 &
 REGISTER_PID=$!

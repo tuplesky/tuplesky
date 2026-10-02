@@ -50,9 +50,14 @@ struct Cli {
     #[arg(long, default_value = "")]
     read_only_frontends: String,
     /// Windows, as `FROM-UNTIL` seconds into the run (comma-separated),
-    /// in which no caller writes.
+    /// in which the callers of frontends that write do nothing at all,
+    /// so a fault applied inside one finds nothing of theirs in flight.
     #[arg(long, default_value = "")]
     quiet: String,
+    /// Pause between a read-only caller's operations, so its session
+    /// stays well inside its window and none of its reads is ordered.
+    #[arg(long, default_value_t = 0)]
+    read_only_interval_ms: u64,
     /// Where the history goes, one operation per line.
     #[arg(long)]
     history: PathBuf,
@@ -116,13 +121,16 @@ struct Plan {
     deadline: Duration,
     until: Instant,
     start: Instant,
+    read_only_interval: Duration,
 }
 
 impl Plan {
-    fn writes_now(&self) -> bool {
+    /// Whether this caller is to keep still now: a caller that writes,
+    /// inside a quiet window.
+    fn quiet_now(&self) -> bool {
         let at = self.start.elapsed().as_secs_f64();
         !self.read_only
-            && !self
+            && self
                 .quiet
                 .iter()
                 .any(|(from, until)| at >= *from && at < *until)
@@ -180,7 +188,8 @@ async fn caller(
             let instance = (index * 64 + attempt % 64) as u16;
             attempt += 1;
             match Caller::connect(&dir, &provisioned, &minter, frontend, instance).await {
-                Ok(c) => {
+                Ok(mut c) => {
+                    c.abandon_unknown_outcomes();
                     if attempt > 1 {
                         counts.reconnects += 1;
                     }
@@ -190,12 +199,19 @@ async fn caller(
             }
             continue;
         };
+        if plan.quiet_now() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        if plan.read_only && !plan.read_only_interval.is_zero() {
+            tokio::time::sleep(plan.read_only_interval).await;
+        }
         // xorshift: the mix need not be reproducible, only spread.
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         let key = (state % plan.keys as u64) as u32;
-        let write = plan.writes_now() && ((state >> 20) % 100) < plan.write_percent as u64;
+        let write = !plan.read_only && ((state >> 20) % 100) < plan.write_percent as u64;
         let invoked = plan.start.elapsed().as_nanos() as u64;
         if write {
             written += 1;
@@ -352,6 +368,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         deadline: Duration::from_millis(cli.deadline_ms),
         until: start + Duration::from_secs(cli.seconds),
         start,
+        read_only_interval: Duration::from_millis(cli.read_only_interval_ms),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
