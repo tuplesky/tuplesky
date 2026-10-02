@@ -59,6 +59,11 @@ on:
       etcd-version:
         description: "etcd for the baseline: a version such as 3.7.2, latest (the newest stable release), or none to skip it"
         default: latest
+      store:
+        description: "Where TupleSky's voters and etcd keep their stores: disk, or tmpfs to measure without the runner's disk"
+        type: choice
+        options: [disk, tmpfs]
+        default: disk
       swiftpaxos:
         description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
         default: ""
@@ -96,6 +101,7 @@ env:
   IN_TIME_LIMIT: ${{ inputs.time-limit }}
   IN_CONCURRENCY: ${{ inputs.concurrency }}
   IN_SWIFTPAXOS: ${{ inputs.swiftpaxos }}
+  IN_STORE: ${{ inputs.store }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
@@ -192,7 +198,12 @@ jobs:
         working-directory: jepsen/tuplesky
         run: lein test
       - name: Stand the cluster up
-        run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
+        # With store tmpfs, each voter's binary and store live on a tmpfs.
+        run: |
+          tmpfs=()
+          if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt/tuplesky); fi
+          jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
+            ${tmpfs[@]+"${tmpfs[@]}"}
       - name: Deploy a domain on it and put a write through every voter
         run: |
           jepsen/tuplesky/docker/smoke.sh --dir "$RUNNER_TEMP/cluster" \
@@ -246,7 +257,7 @@ jobs:
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -493,7 +504,12 @@ jobs:
           grep -n 'tn/' etcd-test/src/jepsen/etcd/nemesis.clj
           grep -n 'wan' etcd-test/src/jepsen/etcd.clj || true
       - name: Stand the cluster up
-        run: jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster"
+        # With store tmpfs, etcd's binary and data directory live on a tmpfs.
+        run: |
+          tmpfs=()
+          if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt/etcd); fi
+          jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
+            ${tmpfs[@]+"${tmpfs[@]}"}
       - name: Run the etcd test
         working-directory: etcd-test
         # The tuplesky test's rate, fault interval (30 s) and operations per
@@ -523,7 +539,7 @@ jobs:
         run: |
           if [ -d etcd-test/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py etcd-test/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "etcd $ETCD_VERSION: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi

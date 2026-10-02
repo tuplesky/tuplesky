@@ -13,6 +13,8 @@
 #   NODES          the cluster's nodes (5), for the register minimum
 #   IN_WAN         the network: none, regions, or one-way milliseconds;
 #                  empty for the scenario's
+#   IN_STORE       disk (default) or tmpfs: where TupleSky's voters and
+#                  etcd keep their stores (SwiftPaxos writes none)
 #
 # faults:          append; kill, pause, partition (SwiftPaxos: pause,
 #                  partition); 20 operations a second from 2 clients a node,
@@ -93,6 +95,13 @@ elif [ -n "${IN_CONCURRENCY:-}" ]; then
 fi
 if [ "$wan" != none ]; then suffix+=", wan $wan"; fi
 
+store=${IN_STORE:-disk}
+case $store in
+  disk) store_suffix="" ;;
+  tmpfs) store_suffix=", stores on tmpfs" ;;
+  *) echo "store must be disk or tmpfs, not $store" >&2; exit 2 ;;
+esac
+
 out=${GITHUB_ENV:-/dev/stdout}
 {
   echo "SCENARIO=$scenario"
@@ -106,4 +115,6 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "WAN=$wan"
   echo "RECOVERY_TIME=$recovery_time"
   echo "TITLE_SUFFIX=$suffix"
+  echo "STORE=$store"
+  echo "STORE_SUFFIX=$store_suffix"
 } >> "$out"

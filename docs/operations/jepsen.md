@@ -163,6 +163,16 @@ Jepsen refuses a test whose clients do not split evenly into such groups,
 so a register run's count goes up to the next multiple of `2n` (`1n` runs
 as `2n`, `5n` as `6n`) and its summaries' titles say so.
 
+The `store` input is `disk` (the default) or `tmpfs`. With `tmpfs`, the
+cluster is stood up with `docker/up.sh --tmpfs` (from tuplesky/jepsen's
+`claude/docker-tmpfs-mounts` until it merges), which puts `/opt/tuplesky`
+in each TupleSky node, and `/opt/etcd` in each etcd node, on a tmpfs.
+That is where each voter's binary and store live, and etcd's binary and
+data directory. Their fsyncs then cost next to nothing, so a `tmpfs` run
+beside a `disk` run shows how much of a result is the store's synchronous
+writes. SwiftPaxos keeps nothing durable, so its job ignores the input.
+The summaries' titles end in "stores on tmpfs".
+
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |
 | `faults` (default, weekly, pull requests) | append | kill, pause, partition (pause, partition) | 20/s, 2 clients a node | the runner's bridge | 300 s |
