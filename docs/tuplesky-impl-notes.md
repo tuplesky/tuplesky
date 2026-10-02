@@ -8981,7 +8981,9 @@ the bottleneck.
   send included: the call count is stamped on the proposal when its
   batch is durable and its first send released (`Proposal::sent`). A
   re-proposal held back from a new leader's first batch has no first
-  send; it goes out on the next call, counted as `deferred`.
+  send; it goes out on the next call, counted as `deferred`, unless its
+  batch is refused and presented again first, which sends it to every
+  voter and so publishes it (#141).
 - **The interval is the voter's.** It is the 99th percentile of the
   calls the voter's latest 128 adoptions took to arrive, between one
   call and `RESEND_INTERVAL_CAP` (four, one second, as task-d33's
@@ -8999,15 +9001,23 @@ the bottleneck.
   behind a full lane, kept a lost proposal after them from ever being
   sent again. The window is now the voter's first sixteen proposals
   that are due.
-- **A decided proposal is left to catch-up once it is old.** A
+- **A decided proposal is mostly left to catch-up once it is old.** A
   proposal the leader decided needs no vote; it is re-sent for the
   voter, which holds everything ordered after a proposal it lacks. It
-  is re-sent only until `RESEND_HANDOFF_CALLS` (eight, two seconds)
-  after its first send: at the floor interval, one, two and four calls
-  after it. By then a voter that still lacks it has held that work with
-  its frontier still for twice `catch_up::STILL_FOR` and has asked a
-  peer for executed history, which carries the command (task-d08). A
-  proposal that is not decided is never handed off: its vote may be
+  is re-sent at its back-off only until `RESEND_HANDOFF_CALLS` (eight,
+  two seconds) after its first send: at the floor interval, one, two
+  and four calls after it. By then a voter that still lacks it and holds
+  work behind it has had its frontier still for twice
+  `catch_up::STILL_FOR` and has asked a peer for executed history,
+  which carries the command (task-d08). After that it is handed off:
+  re-sent only as a trickle, one handed-off proposal a voter a call,
+  each one eight calls apart, so a voter that is far behind is sent at
+  most four of them a second. The trickle is for a voter catch-up does
+  not reach: one that missed both the submission and the proposal
+  through an outage holds no work behind the command, and on a quiet
+  domain nothing arrives after it to make it ask (#141; the first cut
+  stopped re-sending outright, and such a voter never got the command).
+  A proposal that is not decided is never handed off: its vote may be
   the one the leader still needs (task-d15).
 - **A duplicate costs its lookup.** A refused vote returns before the
   learner runs, on the leader and the follower: nothing was counted,
@@ -9039,7 +9049,13 @@ and reverted:
 - taking the window before asking what is due fails
   `a_lost_proposal_is_resent_with_a_full_window_ahead_of_it`;
 - holding the interval at the floor fails
-  `a_slow_voter_is_given_its_own_interval`.
+  `a_slow_voter_is_given_its_own_interval`;
+- stopping re-sends at the hand-off fails
+  `a_voter_that_missed_a_command_through_a_long_outage_gets_it_on_a_quiet_domain`
+  and `a_decided_proposal_is_trickled_once_old`;
+- not publishing a re-proposal presented again fails
+  `a_held_back_reproposal_presented_again_is_not_sent_again_at_once`
+  ("sent again on the next call, as a first send").
 
 ### Measured
 

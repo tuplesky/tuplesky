@@ -187,7 +187,8 @@ pub struct Proposal {
     /// Whether the proposal's first send went out with its batch: queued
     /// behind it, and released once it is durable. A re-proposal past
     /// the first `REPROPOSE_BATCH` is not, and goes out from
-    /// [`Leader::resend_unvoted`] instead.
+    /// [`Leader::resend_unvoted`] instead, unless a definite rejection of
+    /// its batch has it presented again first, which publishes it.
     pub published: bool,
     /// The [`Leader::resend_unvoted`] call count when the first send went
     /// out (task-d49): once the batch was durable, for a published
@@ -272,8 +273,9 @@ pub const RESEND_INTERVAL_CAP: u64 = 4;
 pub const RESEND_LATENCY_SAMPLES: usize = 128;
 
 /// How many calls of [`Leader::resend_unvoted`] after its first send a
-/// decided proposal is still re-sent to a voter that has not acknowledged
-/// it (task-d49): past it, the leader leaves it to catch-up.
+/// decided proposal is re-sent to a voter that has not acknowledged it
+/// at its usual back-off (task-d49). Past it, the proposal is handed off:
+/// it is left mostly to catch-up, and trickled.
 ///
 /// A decided proposal needs no vote, so what it is re-sent for is the
 /// voter: one that lacks it holds everything ordered after it. Eight
@@ -282,11 +284,19 @@ pub const RESEND_LATENCY_SAMPLES: usize = 128;
 /// held that work, its frontier still, long enough to have asked a peer
 /// for executed history, which carries the command (task-d08). At the
 /// floor interval that is three re-sends, one, two and four calls after
-/// the first send. More would load a voter that is that far behind with
-/// frames it cannot use yet: one slow pass fills its control lane, and
-/// each re-send meets the same full lane (task-d46). A proposal that is
-/// not decided is never handed off: its vote may be the one the leader
-/// still needs (task-d15).
+/// the first send. Re-sending a voter that far behind everything it
+/// lacks would load it with frames it cannot use yet: one slow pass
+/// fills its control lane, and each re-send meets the same full lane
+/// (task-d46).
+///
+/// Catch-up does not cover every voter that lacks one, though: a voter
+/// that missed both the submission and the proposal holds no work to be
+/// still on, and on a quiet domain nothing after it arrives to make it
+/// ask. So a handed-off proposal is still re-sent, one a voter a call
+/// and each one this many calls apart: a trickle that costs a voter
+/// that is far behind four frames a second, and reaches one that came
+/// back from an outage. A proposal that is not decided is never handed
+/// off: its vote may be the one the leader still needs (task-d15).
 pub const RESEND_HANDOFF_CALLS: u64 = 8;
 
 /// What [`Leader::resend_unvoted`] sent and what came of it (task-d49),
@@ -321,8 +331,9 @@ pub struct ResendCounts {
     /// re-sent to: its first adoption was on its way when the re-send
     /// went out.
     pub late: u64,
-    /// Decided proposals left to catch-up, per voter, once
-    /// [`RESEND_HANDOFF_CALLS`] old.
+    /// Decided proposals handed off, per voter, once
+    /// [`RESEND_HANDOFF_CALLS`] old: re-sent since only as a trickle,
+    /// and counted under [`ResendCounts::decided`] when they are.
     pub handed_off: u64,
     /// Votes refused as duplicates, fast or slow, re-sent or not.
     pub duplicate_votes: u64,
@@ -361,6 +372,9 @@ enum Resend {
     Deferred,
     /// A re-send of a decided proposal.
     Decided,
+    /// A re-send of a decided proposal past [`RESEND_HANDOFF_CALLS`]:
+    /// the voter's one trickled this call.
+    HandedOff,
     /// A re-send of one the voter acknowledged on the fast path.
     Acknowledged,
     /// A re-send of one the voter has not answered.
@@ -374,7 +388,8 @@ struct Resent {
     next: u64,
     /// The back-off gap last waited, in calls (`RESEND_BACKOFF_CAP`).
     gap: u32,
-    /// Whether it was left to catch-up (`RESEND_HANDOFF_CALLS`).
+    /// Whether it was handed off (`RESEND_HANDOFF_CALLS`): re-sent since
+    /// only as a trickle.
     handed_off: bool,
 }
 
@@ -1097,11 +1112,13 @@ impl Leader {
     /// out its interval does not keep a lost one behind it from being
     /// sent.
     ///
-    /// A decided proposal is re-sent to a voter only until it is
-    /// [`RESEND_HANDOFF_CALLS`] old. After that it is the voter's to fetch
-    /// from executed history (task-d08): the leader needs nothing from
-    /// it, and a voter that is that far behind is loaded by every frame
-    /// it cannot use yet.
+    /// A decided proposal is re-sent to a voter at that back-off only
+    /// until it is [`RESEND_HANDOFF_CALLS`] old. After that it is mostly
+    /// the voter's to fetch from executed history (task-d08): the leader
+    /// needs nothing from it, and a voter that is that far behind is
+    /// loaded by every frame it cannot use yet. It is still trickled, one
+    /// a voter a call, each that many calls apart, for a voter that has
+    /// nothing to catch up on to ask for it.
     pub fn resend_unvoted(&mut self, per_voter: usize) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
@@ -1132,7 +1149,6 @@ impl Leader {
         let ballot = self.config.quorum.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
         let mut chosen: Vec<(CommandId, ReplicaId, Resend)> = Vec::new();
-        let mut handed: Vec<(CommandId, ReplicaId)> = Vec::new();
         for voter in &self.config.identity.voters {
             if *voter == me {
                 continue;
@@ -1145,6 +1161,7 @@ impl Leader {
                 .map(|(s, _)| *s)
                 .max();
             let mut taken = 0;
+            let mut trickled = false;
             for (seqnum, command) in &order {
                 if taken == per_voter {
                     break;
@@ -1161,15 +1178,15 @@ impl Leader {
                 }
                 let resent = self.resent.get(&(*command, *voter));
                 let sent = self.proposals[command].sent;
-                if decided && sent.is_some_and(|at| call >= at.saturating_add(RESEND_HANDOFF_CALLS))
-                {
-                    if resent.is_some_and(|r| !r.handed_off) {
-                        handed.push((*command, *voter));
-                    }
-                    continue;
-                }
+                let old = decided
+                    && sent.is_some_and(|at| call >= at.saturating_add(RESEND_HANDOFF_CALLS));
                 let kind = match (resent, sent) {
                     (Some(r), _) if call < r.next => continue,
+                    _ if old && trickled => continue,
+                    _ if old => {
+                        trickled = true;
+                        Resend::HandedOff
+                    }
                     (None, Some(sent)) if call < sent.saturating_add(interval) => continue,
                     (None, None) => Resend::Deferred,
                     _ if decided => Resend::Decided,
@@ -1186,12 +1203,6 @@ impl Leader {
                 chosen.push((*command, *voter, kind));
             }
         }
-        for key in handed {
-            if let Some(r) = self.resent.get_mut(&key) {
-                r.handed_off = true;
-                self.counts.handed_off += 1;
-            }
-        }
         let mut sends = Vec::new();
         for (command, voter, kind) in chosen {
             match kind {
@@ -1199,6 +1210,19 @@ impl Leader {
                     let p = self.proposals.get_mut(&command).expect("in the order");
                     p.sent.get_or_insert(call);
                     self.counts.deferred += 1;
+                }
+                Resend::HandedOff => {
+                    let r = self.resent.entry((command, voter)).or_insert(Resent {
+                        next: 0,
+                        gap: 0,
+                        handed_off: false,
+                    });
+                    if !r.handed_off {
+                        r.handed_off = true;
+                        self.counts.handed_off += 1;
+                    }
+                    r.next = call + RESEND_HANDOFF_CALLS;
+                    self.counts.decided += 1;
                 }
                 kind => {
                     let interval = self.resend_interval(&voter);
@@ -2330,6 +2354,10 @@ impl Leader {
         self.by_barrier.insert(barrier, command);
         proposal.barrier = barrier;
         proposal.attempts += 1;
+        // Republished below to every voter: a re-proposal held back from
+        // a new leader's first batch has had its first send now, and its
+        // re-sends are timed from its batch (task-d49).
+        proposal.published = true;
         let batch = PersistBatch {
             barrier,
             base: None,

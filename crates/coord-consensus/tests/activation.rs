@@ -162,6 +162,14 @@ struct Cluster {
     hold_from: Vec<u8>,
     /// Frames parked: (to, from, frame).
     parked: Vec<(usize, ReplicaId, Vec<u8>)>,
+    /// Every proposal sent: (from, to, command).
+    proposed: Vec<(usize, u8, CommandId)>,
+    /// A leader whose first batch for a proposal of one of these commands
+    /// that it has not published yet is refused, definitely: (leader,
+    /// commands). Cleared once it fires.
+    reject_unpublished: Option<(usize, Vec<CommandId>)>,
+    /// The command whose batch `reject_unpublished` refused.
+    rejected: Option<CommandId>,
 }
 
 /// How many rounds `Cluster::settle` runs before it calls the cluster
@@ -242,6 +250,9 @@ impl Cluster {
             proposals_sent: Vec::new(),
             hold_from: Vec::new(),
             parked: Vec::new(),
+            proposed: Vec::new(),
+            reject_unpublished: None,
+            rejected: None,
         }
     }
 
@@ -257,6 +268,23 @@ impl Cluster {
             match e {
                 Effect::Persist(batch) => {
                     let barrier = batch.barrier;
+                    if let Some((leader, commands)) = &self.reject_unpublished
+                        && *leader == i
+                        && let Some(Role::Leader(l)) = self.nodes[i].role.as_ref()
+                        && let Some(command) = commands.iter().copied().find(|c| {
+                            l.proposal(c)
+                                .is_some_and(|p| p.barrier == barrier && !p.published)
+                        })
+                    {
+                        self.reject_unpublished = None;
+                        self.rejected = Some(command);
+                        let more = self.nodes[i].step(Event::Storage(StorageEvent::Failed {
+                            barrier_id: barrier,
+                            error: coord_core::event::StorageError::DefinitelyNotCommitted,
+                        }));
+                        self.handle(i, more);
+                        continue;
+                    }
                     let node = &mut self.nodes[i];
                     node.storage.submit(batch);
                     node.storage.complete(barrier).unwrap();
@@ -279,8 +307,9 @@ impl Cluster {
                         self.asks.push((i, commands));
                     }
                     let dest = to.replica.0[0];
-                    if let Ok(ProtocolMessage::Proposal(_)) = ProtocolMessage::decode(&frame) {
+                    if let Ok(ProtocolMessage::Proposal(p)) = ProtocolMessage::decode(&frame) {
                         self.proposals_sent.push((i, dest));
+                        self.proposed.push((i, dest, p.command));
                     }
                     if self.cut.contains(&(i as u8, dest)) || !self.nodes[dest as usize].alive {
                         continue;
@@ -1648,11 +1677,11 @@ fn a_lost_proposal_is_resent_with_a_full_window_ahead_of_it() {
     }
 }
 
-/// A decided proposal a voter has not acknowledged is re-sent to it only
-/// until it is `RESEND_HANDOFF_CALLS` old, and is then the voter's to
-/// fetch from executed history (task-d49).
+/// A decided proposal a voter has not acknowledged is re-sent to it at
+/// its back-off only until it is `RESEND_HANDOFF_CALLS` old, and then
+/// only trickled, that many calls apart (task-d49).
 #[test]
-fn a_decided_proposal_is_left_to_catch_up_once_old() {
+fn a_decided_proposal_is_trickled_once_old() {
     let handoff = coord_consensus::RESEND_HANDOFF_CALLS as usize;
     let mut cluster = Cluster::new(73);
     // r2 never hears from the leader: c1 is decided by r0 and r1.
@@ -1673,12 +1702,49 @@ fn a_decided_proposal_is_left_to_catch_up_once_old() {
             sent_on.push(call);
         }
     }
-    // One, two and four calls after the first send, and not from the
-    // eighth on.
-    assert_eq!(sent_on, vec![1, 2, 4]);
+    // One, two and four calls after the first send, then once every
+    // eight calls from the eighth on.
+    assert_eq!(sent_on, vec![1, 2, 4, handoff, 2 * handoff]);
     let counts = resend_counts(&cluster, 0);
-    assert_eq!(counts.decided, 3, "{counts:?}");
+    assert_eq!(counts.decided, 5, "{counts:?}");
     assert_eq!(counts.handed_off, 1, "{counts:?}");
+}
+
+/// A voter that missed both the submission and the proposal through an
+/// outage longer than the hand-off still gets the proposal once it is
+/// back (task-d49, #141).
+///
+/// It holds no work behind the command to be still on, and on a quiet
+/// domain nothing after it arrives, so catch-up has nothing to ask for:
+/// the leader's trickle is what reaches it.
+#[test]
+fn a_voter_that_missed_a_command_through_a_long_outage_gets_it_on_a_quiet_domain() {
+    let handoff = coord_consensus::RESEND_HANDOFF_CALLS as usize;
+    let mut cluster = Cluster::new(79);
+    cluster.cut = vec![(0, 2), (1, 2)];
+    let c1 = cluster.admit_at(1, 1, &[0, 1]);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, vec![c1]);
+    for _ in 0..(3 * handoff) {
+        cluster.resend();
+        cluster.settle();
+    }
+    assert!(
+        cluster.nodes[2].executed.is_empty(),
+        "r2 heard of c1 through the cut"
+    );
+    assert!(resend_counts(&cluster, 0).handed_off >= 1);
+    cluster.cut.clear();
+    // Nothing else is admitted: the domain is quiet.
+    for _ in 0..=handoff {
+        cluster.resend();
+        cluster.settle();
+    }
+    assert_eq!(
+        cluster.nodes[2].executed,
+        vec![c1],
+        "a handed-off proposal never reached the voter once it was back"
+    );
 }
 
 /// The same, with the voter restarted before the re-send (task-d07).
@@ -1797,6 +1863,57 @@ fn a_new_leader_publishes_its_reproposals_in_batches_and_all_arrive() {
         .count();
     assert_eq!(first, batch, "the new leader's first pass to r1");
     cluster.settle_resending(commands.len() / coord_consensus::RESEND_PER_VOTER + 2);
+    for i in [1usize, 2] {
+        let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
+        let wanted: BTreeSet<CommandId> = commands.iter().copied().collect();
+        assert_eq!(executed, wanted, "node {i}");
+    }
+}
+
+/// A re-proposal held back from a new leader's first batch, whose batch
+/// is refused and presented again, is published with it: its re-sends
+/// are timed from that send, and it is not sent again on the next call as
+/// a deferred first send (task-d49, #141).
+#[test]
+fn a_held_back_reproposal_presented_again_is_not_sent_again_at_once() {
+    let batch = coord_consensus::REPROPOSE_BATCH;
+    let mut cluster = Cluster::with_capacity(47, 4 * batch);
+    cluster.drop_proposals = vec![(0, 1), (0, 2)];
+    let commands: Vec<CommandId> = (0..(batch as u64 + 5))
+        .map(|n| cluster.admit(n + 1, (n % 250) as u8))
+        .collect();
+    cluster.settle();
+    cluster.drop_proposals.clear();
+    cluster.crash(0);
+    cluster.reject_unpublished = Some((2, commands.clone()));
+    cluster.campaign(2, ballot(1, 2));
+    cluster.settle();
+    assert!(matches!(cluster.nodes[2].role, Some(Role::Leader(_))));
+    let rejected = cluster
+        .rejected
+        .expect("a held-back re-proposal's batch was refused");
+    let Some(Role::Leader(l)) = cluster.nodes[2].role.as_ref() else {
+        unreachable!()
+    };
+    let p = l.proposal(&rejected).expect("still proposed");
+    assert!(p.published, "presented again to every voter, so published");
+    assert!(p.sent.is_some(), "its send is stamped once durable");
+    let presented = cluster
+        .proposed
+        .iter()
+        .filter(|(from, to, c)| *from == 2 && *to == 1 && *c == rejected)
+        .count();
+    assert_eq!(presented, 1, "presented again to r1 once");
+    let before = cluster.proposed.len();
+    cluster.resend();
+    cluster.settle();
+    assert!(
+        !cluster.proposed[before..]
+            .iter()
+            .any(|(from, _, c)| *from == 2 && *c == rejected),
+        "sent again on the next call, as a first send"
+    );
+    cluster.settle_resending(commands.len() / coord_consensus::RESEND_PER_VOTER + 4);
     for i in [1usize, 2] {
         let executed: BTreeSet<CommandId> = cluster.nodes[i].executed.iter().copied().collect();
         let wanted: BTreeSet<CommandId> = commands.iter().copied().collect();
