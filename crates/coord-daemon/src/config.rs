@@ -256,6 +256,16 @@ pub const STATE_PROFILE: &str = "strict-single-store-v1";
 pub const JOURNAL_ENGINE: &str = "raft-engine";
 /// Profile of [`JOURNAL_ENGINE`].
 pub const JOURNAL_PROFILE: &str = "journaled-strict-v1";
+/// The replay-backed profile (task-j06, Section 17.3.4): projection
+/// commits are working commits, made durable on
+/// [`JournalConfig::projection_durable_commits`],
+/// [`JournalConfig::projection_durable_records`] and
+/// [`JournalConfig::projection_durable_ms`], before every checkpoint
+/// publication and at a clean stop, and a crash's loss is replayed from
+/// the journal before the node answers. Named, never defaulted: the
+/// strict profile stays the default until task-j05 qualifies the journal
+/// this one leans on for more.
+pub const JOURNAL_REPLAY_PROFILE: &str = "journaled-replay-v1";
 /// An engine that is built and tested but carries no production support:
 /// it reports its own platforms, and task-s03's review boundary keeps it
 /// out of a production graph. Named here so configuring it is refused for
@@ -336,6 +346,38 @@ pub struct JournalConfig {
     /// Shards this node writes.
     #[serde(default = "one_shard")]
     pub shards: u16,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], working projection commits at
+    /// most between durable ones. Ignored under the strict profile.
+    #[serde(default = "projection_durable_commits")]
+    pub projection_durable_commits: u32,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], journal records at most applied
+    /// by working commits between durable ones: what a crash makes the
+    /// next start replay.
+    #[serde(default = "projection_durable_records")]
+    pub projection_durable_records: u32,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], milliseconds at most a working
+    /// commit waits for a durable one while the node is busy.
+    #[serde(default = "projection_durable_ms")]
+    pub projection_durable_ms: u64,
+}
+
+impl JournalConfig {
+    /// Whether the projection runs under [`JOURNAL_REPLAY_PROFILE`].
+    pub fn replays_projection(&self) -> bool {
+        self.profile == JOURNAL_REPLAY_PROFILE
+    }
+}
+
+fn projection_durable_commits() -> u32 {
+    64
+}
+
+fn projection_durable_records() -> u32 {
+    4096
+}
+
+fn projection_durable_ms() -> u64 {
+    100
 }
 
 fn journal_engine() -> String {
@@ -930,7 +972,31 @@ impl Config {
         engine_named("state", &self.state.engine, STATE_ENGINE)?;
         engine_named("state.profile", &self.state.profile, STATE_PROFILE)?;
         engine_named("journal", &self.journal.engine, JOURNAL_ENGINE)?;
-        engine_named("journal.profile", &self.journal.profile, JOURNAL_PROFILE)?;
+        if !self.journal.replays_projection() {
+            engine_named("journal.profile", &self.journal.profile, JOURNAL_PROFILE)?;
+        }
+        for (field, value) in [
+            (
+                "journal.projection_durable_commits",
+                u64::from(self.journal.projection_durable_commits),
+            ),
+            (
+                "journal.projection_durable_records",
+                u64::from(self.journal.projection_durable_records),
+            ),
+            (
+                "journal.projection_durable_ms",
+                self.journal.projection_durable_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::OutOfRange {
+                    field,
+                    min: 1,
+                    max: u64::from(u32::MAX),
+                });
+            }
+        }
         // A node that journals nothing has no authoritative transition to
         // apply from, so zero shards is a configuration that cannot serve.
         if self.journal.shards == 0 {

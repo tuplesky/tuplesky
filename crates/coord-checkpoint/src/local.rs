@@ -608,6 +608,9 @@ pub fn install_local<E: coord_store_api::engine::LocalEngine>(
     {
         let view = engine.reader().snapshot()?;
         for collection in Collection::ALL {
+            if collection == Collection::MetaV1 {
+                continue;
+            }
             // One row, and room for it: a byte budget too small to
             // return the first row would report every collection empty
             // and make this check say nothing at all.
@@ -616,6 +619,38 @@ pub fn install_local<E: coord_store_api::engine::LocalEngine>(
                 return Err(InstallLocalError::NotEmpty {
                     collection: collection.id().0,
                 });
+            }
+        }
+        // A staged generation carries its own identity record (task-j06
+        // reinstalls into one). It is admitted only where the image holds
+        // the very same rows, so the install changes none of them; any
+        // other metadata -- a stamp above all -- is a target that is not
+        // empty.
+        let meta = Collection::MetaV1.id();
+        let image: std::collections::BTreeMap<&[u8], &[u8]> = checkpoint
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.rows.iter())
+            .filter(|row| row.collection == meta.0)
+            .map(|row| (row.key.as_slice(), row.value.as_slice()))
+            .collect();
+        let mut resume_after = None;
+        loop {
+            let page = view.scan_page(
+                meta,
+                &ScanRequest {
+                    resume_after: resume_after.clone(),
+                    ..ScanRequest::all(64, 1 << 20)
+                },
+            )?;
+            for row in &page.rows {
+                if image.get(row.key.as_slice()) != Some(&row.value.as_slice()) {
+                    return Err(InstallLocalError::NotEmpty { collection: meta.0 });
+                }
+            }
+            match page.rows.last() {
+                Some(last) if !page.exhausted => resume_after = Some(last.key.clone()),
+                _ => break,
             }
         }
     }

@@ -436,6 +436,64 @@ fn an_image_is_never_merged_and_never_inherited() {
     ));
 }
 
+/// A staged generation carries its own identity record (task-j06
+/// reinstalls into one): a metadata row the image holds as it is is
+/// admitted, and one that differs from the image is a target that is not
+/// fresh.
+#[test]
+fn a_target_may_hold_only_metadata_the_image_holds_as_it_is() {
+    let source = engine();
+    let checkpoint = exported(&source);
+    let meta = Collection::MetaV1.id();
+    let row = checkpoint
+        .chunks
+        .iter()
+        .flat_map(|chunk| chunk.rows.iter())
+        .find(|row| row.collection == meta.0)
+        .expect("the image carries metadata")
+        .clone();
+
+    let mut staged = ModelEngine::new();
+    let mut tx = staged.begin_write().unwrap();
+    tx.put(meta, &row.key, &row.value).unwrap();
+    tx.commit_durable().unwrap();
+    install_local(
+        &mut staged,
+        &checkpoint,
+        &origin(3),
+        &InstallLocalLimits::default(),
+    )
+    .expect("the same row is admitted");
+
+    let mut differs = ModelEngine::new();
+    let mut tx = differs.begin_write().unwrap();
+    tx.put(meta, &row.key, b"another value").unwrap();
+    tx.commit_durable().unwrap();
+    assert!(matches!(
+        install_local(
+            &mut differs,
+            &checkpoint,
+            &origin(3),
+            &InstallLocalLimits::default()
+        ),
+        Err(coord_checkpoint::local::InstallLocalError::NotEmpty { collection }) if collection == meta.0
+    ));
+
+    let mut unknown = ModelEngine::new();
+    let mut tx = unknown.begin_write().unwrap();
+    tx.put(meta, b"not-in-the-image", b"row").unwrap();
+    tx.commit_durable().unwrap();
+    assert!(matches!(
+        install_local(
+            &mut unknown,
+            &checkpoint,
+            &origin(3),
+            &InstallLocalLimits::default()
+        ),
+        Err(coord_checkpoint::local::InstallLocalError::NotEmpty { .. })
+    ));
+}
+
 fn image_dir(root: &Path, id: &Digest32) -> std::path::PathBuf {
     let mut name = String::with_capacity(64);
     for byte in id.0 {

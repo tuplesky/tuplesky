@@ -489,25 +489,41 @@ impl WriteTxn for RedbWrite<'_> {
 
     fn commit_durable(mut self) -> Result<(), CommitFailure> {
         let txn = self.txn.take().expect("transaction open");
-        match txn.commit() {
-            Ok(()) => Ok(()),
-            // A poisoned transaction never reached the commit path.
-            Err(redb::CommitError::TransactionPoisoned) => {
-                Err(CommitFailure::DefinitelyNotCommitted(EngineError::new(
-                    ErrorClass::Io,
-                    "transaction poisoned before commit",
-                )))
-            }
-            // Anything during commit/sync is indeterminate: redb may have
-            // written the commit record before reporting the failure.
-            Err(redb::CommitError::Storage(s)) => {
-                Err(CommitFailure::Indeterminate(storage_error(s)))
-            }
-            Err(other) => Err(CommitFailure::Indeterminate(EngineError::new(
-                ErrorClass::Io,
-                redact(&other),
-            ))),
+        commit(txn)
+    }
+
+    /// One `Durability::None` commit (task-j06): visible at once, made
+    /// durable by the next Immediate commit, rolled back by a crash
+    /// before one. redb never leaves part of a commit: the header names
+    /// the last durable commit until a durable one replaces it.
+    fn commit_working(mut self) -> Result<(), CommitFailure> {
+        let mut txn = self.txn.take().expect("transaction open");
+        if let Err(e) = txn.set_durability(redb::Durability::None) {
+            // Nothing was written: the transaction is dropped unapplied.
+            return Err(CommitFailure::DefinitelyNotCommitted(EngineError::new(
+                ErrorClass::Unsupported,
+                redact(&e),
+            )));
         }
+        commit(txn)
+    }
+}
+
+/// Commit `txn`, sorting a failure into what is known of its outcome.
+fn commit(txn: redb::WriteTransaction) -> Result<(), CommitFailure> {
+    match txn.commit() {
+        Ok(()) => Ok(()),
+        // A poisoned transaction never reached the commit path.
+        Err(redb::CommitError::TransactionPoisoned) => Err(CommitFailure::DefinitelyNotCommitted(
+            EngineError::new(ErrorClass::Io, "transaction poisoned before commit"),
+        )),
+        // Anything during commit/sync is indeterminate: redb may have
+        // written the commit record before reporting the failure.
+        Err(redb::CommitError::Storage(s)) => Err(CommitFailure::Indeterminate(storage_error(s))),
+        Err(other) => Err(CommitFailure::Indeterminate(EngineError::new(
+            ErrorClass::Io,
+            redact(&other),
+        ))),
     }
 }
 
@@ -560,5 +576,16 @@ impl LocalEngine for RedbEngine {
 
     fn commit_under_journal(&mut self) {
         self.one_phase = true;
+    }
+
+    const WORKING_STATE: bool = true;
+
+    /// An empty Immediate commit: redb persists every `Durability::None`
+    /// commit before it with it (task-j06).
+    fn sync_working(&mut self) -> Result<(), CommitFailure> {
+        let txn = self
+            .begin_write()
+            .map_err(CommitFailure::DefinitelyNotCommitted)?;
+        txn.commit_durable()
     }
 }

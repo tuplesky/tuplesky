@@ -376,6 +376,12 @@ pub struct Frontiers {
     pub materialized: u64,
     /// `C`: the published local checkpoint boundary.
     pub checkpoint: u64,
+    /// The projection's last durable commit, under the replay-backed
+    /// profile (task-j06): what a crash leaves of `M`, and where the
+    /// next start replays from. Absent under the strict profile, where
+    /// it is `M`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_durable: Option<u64>,
 }
 
 impl Frontiers {

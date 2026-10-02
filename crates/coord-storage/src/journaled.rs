@@ -168,6 +168,51 @@ impl Default for JournalLimits {
     }
 }
 
+/// How each domain's projection commits (task-j06, Section 17.3.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectionProfile {
+    /// `journaled-strict-v1`: every projection commit is durable before
+    /// it returns. The default, and the only profile a node serves with
+    /// unless it is configured otherwise.
+    #[default]
+    Strict,
+    /// `journaled-replay`: projection commits are working commits,
+    /// visible at once and made durable on `cadence`, and at every point
+    /// that needs the projection itself durable: before a checkpoint
+    /// pointer is appended and its prefix retired, and when
+    /// [`JournaledStore::sync_projections`] is called. A crash rolls the
+    /// projection back to its last durable commit, and the attach that
+    /// follows replays the journal above it before the domain serves.
+    Replay(DurableCadence),
+}
+
+/// How often a replay-backed projection makes its working commits durable
+/// (task-j06): after at most `commits` working commits or `records`
+/// records applied by them, whichever comes first.
+///
+/// The bound is on what a crash costs: the records above the projection's
+/// durable commit are replayed from the journal at the next attach. redb
+/// also frees pages only at a durable commit, so the cadence bounds the
+/// file's growth as well. A bound by time is the caller's, through
+/// [`JournaledStore::request_durable_projection`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableCadence {
+    /// Working commits at most between durable ones.
+    pub commits: NonZeroU32,
+    /// Records at most applied by working commits between durable ones.
+    pub records: NonZeroU32,
+}
+
+/// What a replay-backed projection has committed since it was last
+/// durable (task-j06).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Working {
+    commits: u32,
+    records: u32,
+    /// The next commit is to be durable, whatever the cadence says.
+    requested: bool,
+}
+
 /// What a submitted transition records (design Section 17.3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransitionKind {
@@ -298,6 +343,17 @@ pub enum JournaledError {
     /// The journal is lent to the [`Appender`] and this borrow cannot
     /// wait for it to come back (task-d54).
     JournalLent,
+    /// The projection found at attach does not continue the journal: it
+    /// is behind the published baseline, or its applied stamp is not the
+    /// record the journal holds at that sequence. Nothing was attached.
+    /// Under the replay-backed profile the caller discards it and
+    /// installs the baseline's image instead (task-j06, Section 17.16.4);
+    /// the journal itself is not in question.
+    ProjectionInvalid(&'static str),
+    /// The engine has no working-state capability
+    /// ([`LocalEngine::WORKING_STATE`]), so the replay-backed profile
+    /// cannot run over it (task-j06).
+    WorkingStateUnsupported,
 }
 
 impl fmt::Display for JournaledError {
@@ -316,6 +372,12 @@ impl fmt::Display for JournaledError {
             JournaledError::Frontier(e) => write!(f, "frontier: {e}"),
             JournaledError::Quarantined(what) => write!(f, "quarantined: {what}"),
             JournaledError::JournalLent => f.write_str("the journal is lent to the appender"),
+            JournaledError::ProjectionInvalid(what) => {
+                write!(f, "the projection does not continue the journal: {what}")
+            }
+            JournaledError::WorkingStateUnsupported => {
+                f.write_str("the projection engine has no working-state capability")
+            }
         }
     }
 }
@@ -497,6 +559,12 @@ struct Domain<E: LocalEngine> {
     lent: Option<usize>,
     status: DomainStatus,
     fence: Option<Ballot>,
+    /// The projection's last durable commit (task-j06): what a crash
+    /// leaves of it. Equal to `M` under the strict profile, where every
+    /// commit is durable.
+    projection_durable: LocalJournalSeq,
+    /// Working commits since the last durable one.
+    working: Working,
 }
 
 impl<E: LocalEngine> Domain<E> {
@@ -508,6 +576,52 @@ impl<E: LocalEngine> Domain<E> {
 
     fn applied(&self) -> AppliedFrontier {
         AppliedFrontier::from_stamp(&self.meta.stamp)
+    }
+
+    /// Whether the next projection commit, of `records` records, is to be
+    /// durable (task-j06).
+    fn commit_durably(&self, profile: ProjectionProfile, records: usize) -> bool {
+        match profile {
+            ProjectionProfile::Strict => true,
+            ProjectionProfile::Replay(cadence) => {
+                let records = u32::try_from(records).unwrap_or(u32::MAX);
+                self.working.requested
+                    || self.working.commits.saturating_add(1) >= cadence.commits.get()
+                    || self.working.records.saturating_add(records) >= cadence.records.get()
+            }
+        }
+    }
+
+    /// Account a projection commit of `records` records that returned,
+    /// durable or working.
+    fn committed(&mut self, durable: bool, records: usize) {
+        if durable {
+            self.projection_durable = self.meta.stamp.journal_seq();
+            self.working = Working::default();
+        } else {
+            let records = u32::try_from(records).unwrap_or(u32::MAX);
+            self.working.commits = self.working.commits.saturating_add(1);
+            self.working.records = self.working.records.saturating_add(records);
+        }
+    }
+
+    /// Make the working commits so far durable (task-j06). The engine is
+    /// held: every caller takes a lent one back first.
+    fn sync_projection(&mut self) -> Result<(), JournaledError> {
+        if self.projection_durable >= self.frontiers.materialized() {
+            return Ok(());
+        }
+        let Some(engine) = self.engine.as_mut() else {
+            return Err(JournaledError::Quarantined(
+                "a projection sync while the engine is lent",
+            ));
+        };
+        engine
+            .sync_working()
+            .map_err(|e| JournaledError::Engine(e.error().clone()))?;
+        self.projection_durable = self.frontiers.materialized();
+        self.working = Working::default();
+        Ok(())
     }
 
     /// Take the front transition out of the queue once it is sealed into a
@@ -579,6 +693,8 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     /// The journal's synced writes as of the last time this store held
     /// it, reported while it is lent.
     syncs: Option<u64>,
+    /// How projections commit (task-j06).
+    profile: ProjectionProfile,
 }
 
 /// One stream's entry in a sealed group: the domain, the barrier the
@@ -637,6 +753,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             deferred_uncertain: false,
             cost: LoweringCost::default(),
             syncs: journal.syncs(),
+            profile: ProjectionProfile::Strict,
             journal: Some(journal),
             appender: None,
             appending: None,
@@ -833,6 +950,19 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 "projection is materialized past the journal's durable head",
             ));
         }
+        // A projection behind the published baseline cannot be carried
+        // forward: the prefix through `C` may already be retired, and a
+        // replay from `M` could not cross it. Under the replay-backed
+        // profile that is a projection a crash rolled back past what a
+        // forced durable commit should have kept, and the caller installs
+        // the baseline's image instead (task-j06). A baseline past the
+        // journal's own head is the journal's inconsistency, not the
+        // projection's, and the frontiers below refuse it.
+        if applied.materialized < baseline && baseline <= durable {
+            return Err(JournaledError::ProjectionInvalid(
+                "the projection is behind the published baseline",
+            ));
+        }
         let frontiers = Frontiers::recovered(durable, applied.materialized, baseline)?;
         let gate = Arc::new(Frontier::default());
         gate.set_completed(meta.stamp.store_seq());
@@ -855,8 +985,16 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             lent: None,
             status: DomainStatus::Ready,
             fence: None,
+            // What a crash left is durable, whichever profile wrote it.
+            projection_durable: applied.materialized,
+            working: Working::default(),
         };
-        Self::replay(self.journal.as_ref().expect(HELD), &mut state, self.limits)?;
+        Self::replay(
+            self.journal.as_ref().expect(HELD),
+            &mut state,
+            self.limits,
+            self.profile,
+        )?;
         // Replay moved the projection forward, so the application
         // frontiers have to describe the recovered history rather than
         // the projection as it was found. Leaving them at the pre-replay
@@ -949,6 +1087,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         journal: &J,
         domain: &mut Domain<E>,
         limits: JournalLimits,
+        profile: ProjectionProfile,
     ) -> Result<(), JournaledError> {
         let target = domain.frontiers.durable();
         let mut expect = RecordExpectation {
@@ -965,6 +1104,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // one the mapping serves; every record after it may not go
         // below the record before it, within a page or across one.
         let mut accepted = ReplicaIncarnation::ZERO;
+        let mut first = true;
         while domain.frontiers.materialized() < target {
             let page = journal.read_suffix(
                 domain.origin.stream,
@@ -994,7 +1134,20 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 if written_at >= accepted && written_at <= domain.origin.incarnation {
                     expect.origin.incarnation = written_at;
                 }
-                record.verify(&expect)?;
+                if let Err(e) = record.verify(&expect) {
+                    // The first record above the projection names, as its
+                    // predecessor, the record the projection's stamp
+                    // claims to have applied last. A mismatch there is a
+                    // projection that does not continue the journal, not
+                    // a journal that is broken (task-j06).
+                    if first && record.predecessor() != domain.head_digest {
+                        return Err(JournaledError::ProjectionInvalid(
+                            "the projection's applied stamp is not the journal's record",
+                        ));
+                    }
+                    return Err(e.into());
+                }
+                first = false;
                 accepted = written_at;
                 expect = expect.after(&record)?;
                 batch.push(Durable {
@@ -1008,7 +1161,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             let last = batch.last().expect("nonempty page").record.digest();
             domain.pending = batch;
             domain.pending_meta = None;
-            let report = Self::materialize_domain(domain)?;
+            let report = Self::materialize_domain(domain, profile)?;
             if report.materialized == 0 {
                 return Err(domain.quarantine("replay made no progress"));
             }
@@ -1077,7 +1230,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                         record,
                     })
                     .collect();
-                Self::materialize_domain(state)?;
+                Self::materialize_domain(state, self.profile)?;
                 Ok(())
             }
             Err(failure) => {
@@ -1161,6 +1314,16 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 "a checkpoint pointer of another origin",
             ));
         }
+        // Under the replay-backed profile the projection is made durable
+        // first (task-j06). The pointer retires the journal through `C`,
+        // and a crash afterwards rolls the projection back to its last
+        // durable commit; that commit has to be at `C` or past it, or the
+        // replay at the next attach would start below a retired prefix.
+        // The engine is held: the drain above took back a lent one.
+        if matches!(self.profile, ProjectionProfile::Replay(_)) {
+            state.sync_projection()?;
+            debug_assert!(state.projection_durable >= state.frontiers.materialized());
+        }
         // `C <= M` is what makes the image loadable: an image claiming
         // records the projection has not applied represents obligations
         // it does not contain. The frontier is the one place that rule
@@ -1193,7 +1356,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     barrier: None,
                     record,
                 });
-                Self::materialize_domain(state)?;
+                Self::materialize_domain(state, self.profile)?;
                 state
                     .frontiers
                     .publish_checkpoint(pointer.represented)
@@ -1243,6 +1406,82 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 published: pointer.represented,
                 retired: false,
             }),
+        }
+    }
+
+    /// Whether `engine`, the projection a boot found, continues `domain`'s
+    /// stream (task-j06, Section 17.16.4), checked before anything is
+    /// attached and without writing anything.
+    ///
+    /// Its applied stamp has to be at the published `baseline` or past it,
+    /// and has to name the record the journal holds there: the record
+    /// after it names the stamp's digest as its predecessor, or, where the
+    /// projection is at the journal's head, the record at the stamp has
+    /// that digest. Otherwise it is
+    /// [`JournaledError::ProjectionInvalid`], and under the replay-backed
+    /// profile the caller discards it and installs the baseline's image.
+    /// [`JournaledStore::attach_with_baseline`] refuses the same
+    /// projection; this is for a caller that still holds what it would
+    /// reinstall into. A stream this boot has no mapping for is not
+    /// checked, nor is the stamp of a projection that has applied
+    /// nothing.
+    pub fn validate_projection(
+        &self,
+        domain: DomainId,
+        engine: &E,
+        baseline: LocalJournalSeq,
+    ) -> Result<(), JournaledError> {
+        let key = StreamKey {
+            cluster: self.cluster,
+            domain,
+            incarnation: self.incarnation,
+        };
+        let Some(stream) = self.allocator.lookup(&key) else {
+            return Ok(());
+        };
+        let journal = self.journal.as_ref().ok_or(JournaledError::JournalLent)?;
+        let durable = journal.durable_head(stream)?;
+        let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
+        let applied = AppliedFrontier::from_stamp(&meta.stamp);
+        let materialized = applied.materialized;
+        if materialized < baseline && baseline <= durable {
+            return Err(JournaledError::ProjectionInvalid(
+                "the projection is behind the published baseline",
+            ));
+        }
+        if materialized == LocalJournalSeq::ZERO || materialized > durable {
+            // Nothing applied to check, or a journal behind its own
+            // projection, which attach refuses as the journal's fault.
+            return Ok(());
+        }
+        let mismatch = Err(JournaledError::ProjectionInvalid(
+            "the projection's applied stamp is not the journal's record",
+        ));
+        if materialized < durable {
+            let page = journal.read_suffix(stream, materialized, self.limits.read)?;
+            match page.records.first() {
+                Some(next) if next.predecessor() == applied.last_digest => Ok(()),
+                Some(_) => mismatch,
+                None => Err(JournaledError::Quarantined(
+                    "journal reports no records below its own durable head",
+                )),
+            }
+        } else {
+            let before =
+                LocalJournalSeq::new(materialized.get() - 1).expect("below a valid sequence");
+            if before < journal.retained_from(stream)? {
+                // The record at the stamp is retired; a stream whose
+                // head is retired has a pointer after it, so this is
+                // not reached by a stream that serves.
+                return Ok(());
+            }
+            let page = journal.read_suffix(stream, before, self.limits.read)?;
+            match page.records.first() {
+                Some(at) if at.seq() == materialized && at.digest() == applied.last_digest => {
+                    Ok(())
+                }
+                _ => mismatch,
+            }
         }
     }
 
@@ -1775,6 +2014,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             self.deferred_uncertain |= report.indeterminate;
             return Err(e);
         }
+        let profile = self.profile;
         for state in self.domains.values_mut() {
             if state.pending.is_empty() {
                 continue;
@@ -1785,7 +2025,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             ) {
                 continue;
             }
-            match Self::materialize_domain(state) {
+            match Self::materialize_domain(state, profile) {
                 Ok(one) => report.absorb(one),
                 Err(e) => {
                     // The domains that did materialize completed their
@@ -2164,7 +2404,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     // batch that failed is never resubmitted.
                     state.pending_meta = None;
                     state.status = DomainStatus::Ready;
-                    report.absorb(Self::materialize_domain(state)?);
+                    report.absorb(Self::materialize_domain(state, self.profile)?);
                 } else {
                     return Err(state.quarantine(
                         "projection stamp matches neither the pending materialization nor the prior state",
@@ -2256,11 +2496,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     }
 
     /// Apply one domain's durable records atomically, on this thread.
-    fn materialize_domain(state: &mut Domain<E>) -> Result<FlushReport, JournaledError> {
+    fn materialize_domain(
+        state: &mut Domain<E>,
+        profile: ProjectionProfile,
+    ) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         if state.pending.is_empty() {
             return Ok(report);
         }
+        let durable = state.commit_durably(profile, state.pending.len());
         let Some(engine) = state.engine.as_mut() else {
             // Every caller takes a lent engine back first.
             return Err(JournaledError::Quarantined(
@@ -2277,7 +2521,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // redo would be dropped while the domain stayed ready, and a
         // later record could stamp the projection past it for good.
         let next = state.frontiers.materialized().checked_next().ok();
-        let commit = match project(engine, &pending, &mut meta, next, &state.gate, &mut failure) {
+        let commit = match project(
+            engine,
+            &pending,
+            &mut meta,
+            next,
+            &state.gate,
+            durable,
+            &mut failure,
+        ) {
             Ok(commit) => commit,
             Err(e) => {
                 state.pending = pending;
@@ -2297,6 +2549,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     .advance_materialized(meta.stamp.journal_seq())?;
                 state.pending_meta = None;
                 state.status = DomainStatus::Ready;
+                state.committed(durable, pending.len());
                 report.commits = 1;
                 report.materialized = pending.len();
                 for item in pending {
@@ -2340,6 +2593,77 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let drained = self.drain()?;
         self.materializer = Some(materializer);
         Ok(drained)
+    }
+
+    /// Commit every domain's projection under the replay-backed profile
+    /// from now on (task-j06, Section 17.3.4's `journaled-replay`):
+    /// working commits, durable on `cadence` and before every checkpoint
+    /// publication. Refused over an engine without the working-state
+    /// capability, which would only pretend to have it.
+    ///
+    /// Called before the domains are attached, so their replay runs under
+    /// it as well; a projection attached before keeps every commit it
+    /// already made durable, and the same rules apply to it from here.
+    pub fn replay_projection(&mut self, cadence: DurableCadence) -> Result<(), JournaledError> {
+        if !E::WORKING_STATE {
+            return Err(JournaledError::WorkingStateUnsupported);
+        }
+        self.profile = ProjectionProfile::Replay(cadence);
+        Ok(())
+    }
+
+    /// How projections commit (task-j06).
+    pub fn projection_profile(&self) -> ProjectionProfile {
+        self.profile
+    }
+
+    /// A domain's projection as a crash would leave it (task-j06): the
+    /// journal sequence of its last durable commit. `M` itself under the
+    /// strict profile.
+    pub fn projection_durable(&self, domain: DomainId) -> Option<LocalJournalSeq> {
+        self.domains.get(&domain).map(|d| match self.profile {
+            ProjectionProfile::Strict => d.frontiers.materialized(),
+            ProjectionProfile::Replay(_) => d.projection_durable,
+        })
+    }
+
+    /// Make the next projection commit of every domain that has working
+    /// commits a durable one (task-j06), whatever the cadence says. For a
+    /// caller that bounds the time a working commit stays volatile; it
+    /// waits for nothing.
+    pub fn request_durable_projection(&mut self) {
+        if matches!(self.profile, ProjectionProfile::Strict) {
+            return;
+        }
+        for state in self.domains.values_mut() {
+            if state.projection_durable < state.frontiers.materialized() {
+                state.working.requested = true;
+            }
+        }
+    }
+
+    /// Make every domain's working projection commits durable now
+    /// (task-j06), for a clean shutdown or before anything that needs the
+    /// projection itself to survive a crash. A commit the materializer
+    /// has out, and an append the appender has out, are waited for and
+    /// taken back first, and what they completed is reported.
+    ///
+    /// Nothing to do under the strict profile, beyond that drain.
+    pub fn sync_projections(&mut self) -> Result<FlushReport, JournaledError> {
+        let report = self.drain()?;
+        if matches!(self.profile, ProjectionProfile::Replay(_)) {
+            for state in self.domains.values_mut() {
+                if state.status == DomainStatus::Quarantined {
+                    continue;
+                }
+                if let Err(e) = state.sync_projection() {
+                    self.deferred_events.extend(report.events);
+                    self.deferred_uncertain |= report.indeterminate;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Whether projection commits leave the caller's thread
@@ -2394,6 +2718,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // often a refused materialization was retried before the commit
         // left the thread.
         let mut refused = Vec::new();
+        let profile = self.profile;
         while let Some(done) = materializer.try_take() {
             let domain = done.domain();
             let result = take_back(&mut self.domains, done);
@@ -2434,6 +2759,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 domain: *id,
                 engine,
                 next: state.frontiers.materialized().checked_next().ok(),
+                durable: state.commit_durably(profile, records.len()),
                 records,
                 meta: state.meta,
                 gate: state.gate.clone(),
@@ -2489,6 +2815,7 @@ fn take_back<E: LocalEngine>(
         engine,
         mut records,
         outcome,
+        durable,
     } = done;
     let state = domains
         .get_mut(&domain)
@@ -2510,6 +2837,7 @@ fn take_back<E: LocalEngine>(
             state
                 .frontiers
                 .advance_materialized(meta.stamp.journal_seq())?;
+            state.committed(durable, records.len());
             if state.status == DomainStatus::MaterializationDeferred {
                 state.status = DomainStatus::Ready;
             }
@@ -2574,6 +2902,7 @@ fn project<E: LocalEngine>(
     meta: &mut DurableMeta,
     next: Option<LocalJournalSeq>,
     gate: &Frontier,
+    durable: bool,
     failure: &mut Option<&'static str>,
 ) -> Result<Option<Result<(), CommitFailure>>, JournaledError> {
     let mut tx = engine.begin_write()?;
@@ -2624,7 +2953,15 @@ fn project<E: LocalEngine>(
     // visible and the gate moving waits the moment out rather than being
     // refused a snapshot that is durable (`GatedReader::snapshot`).
     gate.begin_commit(meta.stamp.store_seq());
-    let committed = tx.commit_durable();
+    // A working commit (task-j06) is as visible as a durable one, and as
+    // recoverable: every record it applied is journal-durable already,
+    // and an attach after a crash replays them from the stamp a crash
+    // leaves, before the domain serves.
+    let committed = if durable {
+        tx.commit_durable()
+    } else {
+        tx.commit_working()
+    };
     if committed.is_ok() {
         gate.set_completed(meta.stamp.store_seq());
     }
@@ -2737,6 +3074,8 @@ pub struct MaterializeJob<E: LocalEngine> {
     meta: DurableMeta,
     next: Option<LocalJournalSeq>,
     gate: Arc<Frontier>,
+    /// Whether the commit is durable or a working one (task-j06).
+    durable: bool,
 }
 
 impl<E: LocalEngine> MaterializeJob<E> {
@@ -2762,9 +3101,18 @@ impl<E: LocalEngine> MaterializeJob<E> {
             mut meta,
             next,
             gate,
+            durable,
         } = self;
         let mut failure = None;
-        let outcome = match project(&mut engine, &records, &mut meta, next, &gate, &mut failure) {
+        let outcome = match project(
+            &mut engine,
+            &records,
+            &mut meta,
+            next,
+            &gate,
+            durable,
+            &mut failure,
+        ) {
             Err(e) => Outcome::Failed(e),
             Ok(None) => Outcome::Refused(failure.expect("failure set")),
             Ok(Some(Ok(()))) => Outcome::Committed(meta),
@@ -2776,6 +3124,7 @@ impl<E: LocalEngine> MaterializeJob<E> {
             engine,
             records,
             outcome,
+            durable,
         }
     }
 
@@ -2791,6 +3140,7 @@ pub struct MaterializeDone<E: LocalEngine> {
     engine: E,
     records: Vec<Durable>,
     outcome: Outcome,
+    durable: bool,
 }
 
 impl<E: LocalEngine> MaterializeDone<E> {

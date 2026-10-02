@@ -884,6 +884,10 @@ pub struct Domain<P: Persistence> {
     frontend: Frontend,
     /// This node's own recovery baseline, where it keeps one.
     housekeeping: Option<Housekeeping>,
+    /// How long a working projection commit may wait for a durable one
+    /// under the replay-backed profile, and when one was last asked for
+    /// (task-j06). `None` under the strict profile.
+    durable_projection: Option<(std::time::Duration, std::time::Instant)>,
     /// The other voters, where this process votes. `None` for a process
     /// that does not, and for a domain with nobody else in it.
     plane: Option<PeerPlane>,
@@ -1461,6 +1465,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             backing,
             frontend,
             housekeeping: None,
+            durable_projection: None,
             plane: None,
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
@@ -1654,6 +1659,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 journal,
                 materialized,
                 checkpoint,
+                projection_durable: self
+                    .backing
+                    .applier()
+                    .store()
+                    .projection_durable()
+                    .map(|seq| seq.get()),
             }),
             None => Measure::Unavailable(Unavailable::Quarantined),
         };
@@ -1709,6 +1720,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             done: (0, 0),
         });
         self
+    }
+
+    /// Ask for a durable projection commit at least every `every` under
+    /// the replay-backed profile (task-j06): the time bound beside the
+    /// store's own count of commits and records.
+    pub fn with_durable_projection_every(mut self, every: std::time::Duration) -> Self {
+        self.durable_projection = Some((every, std::time::Instant::now()));
+        self
+    }
+
+    /// Make every working projection commit durable, for a clean stop
+    /// (task-j06): a start after it replays nothing the projection had
+    /// applied. A failure is said and left: the journal still holds every
+    /// record, and the next start replays them.
+    pub fn sync_projections(&mut self) {
+        if let Err(e) = self.backing.applier_mut().store_mut().sync_projections() {
+            eprintln!("the projection could not be made durable at the stop: {e}");
+        }
     }
 
     /// Baselines published, and cycles that failed.
@@ -2855,6 +2884,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// node whose checkpoints have been failing for a week is a node
     /// whose disk is filling, and that is an operator's to see.
     fn maintain(&mut self) {
+        // Asking costs nothing: the next projection commit is the durable
+        // one, whichever thread makes it.
+        if let Some((every, last)) = &mut self.durable_projection {
+            let now = std::time::Instant::now();
+            if now.duration_since(*last) >= *every {
+                *last = now;
+                self.backing
+                    .applier_mut()
+                    .store_mut()
+                    .request_durable_projection();
+            }
+        }
         let Some(housekeeping) = &self.housekeeping else {
             return;
         };

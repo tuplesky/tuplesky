@@ -8,6 +8,7 @@
 //! journal, filesystem and process faults are task-j05; nothing here claims
 //! power-loss qualification.
 
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use coord_core::effect::{BootId, PersistBatch, StoreUpdate};
@@ -16,7 +17,7 @@ use coord_journal_api::stream::ShardId;
 use coord_journal_raft_engine::{JournalIdentity, JournalOptions, RaftEngineJournal};
 use coord_redb_faultkit::{FaultBackend, FaultPlan, Tail};
 use coord_storage::journaled::{
-    DomainStatus, JournalLimits, JournaledStore, Submission, TransitionKind,
+    DomainStatus, DurableCadence, JournalLimits, JournaledStore, Submission, TransitionKind,
 };
 use coord_storage_redb::RedbEngine;
 use coord_store_api::engine::{OrderedRead, ScanRequest};
@@ -314,6 +315,21 @@ fn two_domains_share_one_synced_journal_write_and_keep_separate_durable_projecti
     }
 }
 
+/// How many `KvCurrentV1` rows a projection holds, read from the engine
+/// itself.
+fn kv_rows(engine: &RedbEngine) -> usize {
+    use coord_store_api::engine::{LocalEngine, SnapshotSource};
+    let snapshot = engine.reader().snapshot().unwrap();
+    snapshot
+        .scan_page(
+            Collection::KvCurrentV1.id(),
+            &ScanRequest::all(1024, 1 << 20),
+        )
+        .unwrap()
+        .rows
+        .len()
+}
+
 /// Copy a directory tree: the journal as the crash left it, for a second
 /// replay.
 fn copy_tree(from: &Path, to: &Path) {
@@ -389,6 +405,23 @@ fn materialize_steps(store: &mut JournaledStore<RaftEngineJournal, RedbEngine>, 
 /// rows a resolve is answered from among them).
 #[test]
 fn a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state() {
+    crash_matrix(None);
+}
+
+/// task-j06: the same matrix under the replay-backed profile. The
+/// projection's commits are working commits, durable every third one, so
+/// a crash also loses whole commits redb reported done; the next boot
+/// replays them from the journal before the domain serves, and its rows
+/// are still exactly the journal's.
+#[test]
+fn a_crash_anywhere_under_the_replay_profile_recovers_the_journals_state() {
+    crash_matrix(Some(DurableCadence {
+        commits: NonZeroU32::new(3).unwrap(),
+        records: NonZeroU32::new(u32::MAX).unwrap(),
+    }));
+}
+
+fn crash_matrix(replay: Option<DurableCadence>) {
     const STEPS: u64 = 4;
     let probe_dir = tempfile::tempdir().unwrap();
     let measure = |dir: &Path, plan: Option<(u64, Tail)>| {
@@ -405,6 +438,9 @@ fn a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state
             JournalLimits::default(),
         )
         .unwrap();
+        if let Some(cadence) = replay {
+            store.replay_projection(cadence).unwrap();
+        }
         store.attach(A, shard(), engine).unwrap();
         let setup = shared.ops();
         if let Some((k, tail)) = plan {
@@ -420,11 +456,14 @@ fn a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state
             engines.iter().all(|(_, e)| e.commits_in_one_phase()),
             "attached under the journal, the projection commits in one phase"
         );
+        // What a crash after the last commit would leave, taken before the
+        // engines close: a clean close is itself a durable commit.
+        let image = shared.crash_image(Tail::All);
         drop(journal);
         drop(engines);
-        (setup, shared)
+        (setup, shared, image)
     };
-    let (setup, probe) = measure(&probe_dir.path().join("journal"), None);
+    let (setup, probe, image) = measure(&probe_dir.path().join("journal"), None);
     let workload_ops = probe.ops() - setup;
     assert!(
         workload_ops > 10,
@@ -451,6 +490,9 @@ fn a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state
             JournalLimits::default(),
         )
         .unwrap();
+        if let Some(cadence) = replay {
+            next.replay_projection(cadence).unwrap();
+        }
         next.attach(A, shard(), engine)
             .expect("the projection attaches");
         let recovered = next.frontiers(A).unwrap();
@@ -459,12 +501,25 @@ fn a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state
         rows(&next, A)
     };
 
+    // Under the replay profile the workload ends on working commits that
+    // redb reported done and a crash loses, every write the process issued
+    // surviving or not: redb holds a `Durability::None` commit's pages
+    // until the next durable one. Under the strict profile it loses none.
+    let (backend, _) = FaultBackend::new(image, FaultPlan::default());
+    let crashed = RedbEngine::from_backend(backend, CACHE).unwrap();
+    let kept = kv_rows(&crashed);
+    if replay.is_some() {
+        assert!(kept < STEPS as usize, "{kept} of {STEPS} kv rows survived");
+    } else {
+        assert_eq!(kept, STEPS as usize);
+    }
+
     let mut with_executed = 0;
     for k in 1..=workload_ops {
         for tail in [Tail::None, Tail::All, Tail::Seeded(k)] {
             let dir = tempfile::tempdir().unwrap();
             let journal_dir = dir.path().join("journal");
-            let (_, shared) = measure(&journal_dir, Some((k, tail)));
+            let (_, shared, _) = measure(&journal_dir, Some((k, tail)));
             assert!(shared.is_frozen(), "k={k}: the crash happened");
             let image = shared.crash_image(tail);
             let reference_dir = dir.path().join("reference");
@@ -488,5 +543,54 @@ fn a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state
     assert!(
         with_executed > 0,
         "some crashes left executed rows to recover"
+    );
+}
+
+/// task-j06 over redb: `sync_projections` makes every working commit
+/// durable, so a crash that keeps nothing unsynced keeps all of them, and
+/// the next boot replays nothing.
+#[test]
+fn sync_projections_makes_redbs_working_commits_durable() {
+    const STEPS: u64 = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = RaftEngineJournal::create(
+        &dir.path().join("journal"),
+        identity(),
+        &JournalOptions::default(),
+    )
+    .unwrap();
+    let (backend, shared) = FaultBackend::new(Vec::new(), FaultPlan::default());
+    let engine = RedbEngine::create_on_backend(backend, CACHE).unwrap();
+    let mut store = JournaledStore::open(
+        journal,
+        CLUSTER,
+        REPLICA,
+        inc(),
+        FIRST_BOOT,
+        JournalLimits::default(),
+    )
+    .unwrap();
+    store
+        .replay_projection(DurableCadence {
+            commits: NonZeroU32::new(u32::MAX).unwrap(),
+            records: NonZeroU32::new(u32::MAX).unwrap(),
+        })
+        .unwrap();
+    store.attach(A, shard(), engine).unwrap();
+    materialize_steps(&mut store, STEPS);
+    let frontiers = store.frontiers(A).unwrap();
+    assert!(store.projection_durable(A).unwrap() < frontiers.materialized());
+    let (backend, _) = FaultBackend::new(shared.crash_image(Tail::None), FaultPlan::default());
+    assert!(kv_rows(&RedbEngine::from_backend(backend, CACHE).unwrap()) < STEPS as usize);
+
+    store.sync_projections().unwrap();
+    assert_eq!(
+        store.projection_durable(A).unwrap(),
+        frontiers.materialized()
+    );
+    let (backend, _) = FaultBackend::new(shared.crash_image(Tail::None), FaultPlan::default());
+    assert_eq!(
+        kv_rows(&RedbEngine::from_backend(backend, CACHE).unwrap()),
+        STEPS as usize
     );
 }
