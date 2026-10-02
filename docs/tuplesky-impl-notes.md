@@ -8742,3 +8742,110 @@ of this task are in.
   released waited for the group's projection commit too: 546.6 a second
   at ten callers, 2.81×. Sending what the append released before
   materializing is the difference.
+
+## The projection's commit under the journal
+
+task-d48. Each projection commit took two `fdatasync`s: redb's two-phase
+commit syncs the new commit slot and its pages, then flips the header to
+it and syncs again. Under the journal the projection now commits in one
+phase: one sync, with redb's checksums detecting a commit a crash tore.
+Section 17.3.4 is amended with why that is safe, the residual it leaves,
+and the invariants any later change to the projection's durability must
+keep.
+
+- **Where it is set.** `LocalEngine::commit_under_journal`, which the
+  journaled coordinator calls when it attaches an engine, before replay.
+  Only `RedbEngine` acts on it. An engine not under the journal (the
+  strict single-store reference, a restore's fill, a checkpoint's
+  install target, the lifecycle's own records) keeps two-phase commit.
+  There is no operator switch.
+- **Still durable at every commit.** `Materialized` is reported only once
+  the commit's sync has returned; quick-repair stays off.
+
+**Tests.** task-j05's fault points do not exist (task-j05 is not
+implemented), so the evidence is task-09's fault backend and the
+composed store:
+- `coord-redb-faultkit`'s crash matrix runs in both modes: a crash after
+  every write and sync of a five-commit workload, with nothing,
+  everything, or a seeded torn and reordered subset of the unsynced tail
+  surviving, reopens at an acknowledged state or the commit after it,
+  never a partial one. The subprocess-death test (real files, `abort()`)
+  runs in both modes too.
+- `a_commit_under_the_journal_syncs_once_and_otherwise_twice`: the
+  backend's own count of syncs, 2 a commit in two phases and 1 in one.
+- `a_one_phase_commit_torn_under_its_header_rolls_back_to_the_commit_before`:
+  the residual, built on purpose. The crash image is the synced state
+  plus the header the third commit wrote, naming its new slot, and none
+  of the pages that slot names. redb opens it at the second commit. The
+  control opens the same header with its pages at the third.
+- `journaled_real.rs`,
+  `a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state`:
+  raft-engine and redb composed, the projection crashed after every one
+  of its writes and syncs under the three tails. The next boot's rows,
+  executed rows included, are exactly those of the same journal replayed
+  into an empty projection.
+
+### Recovery
+
+Quick-repair is off in both modes, so a crash costs the same full repair
+either way: redb walks the file verifying checksums and rebuilds its
+allocator. One-phase commit adds only the rollback when the newest slot
+fails, which is the walk it does anyway. `recovery_time.rs` (ignored; run
+by hand) fills a database a MiB a commit, copies the file while it is
+open after its last commit -- a crash image, since redb clears its
+recovery mark only on a clean close -- and times opening the copy. On
+the container's disk:
+
+| MiB written | file MiB | commit | commits took s | reopen after crash s |
+| --- | --- | --- | --- | --- |
+| 64 | 257 | two phases | 0.82 | 0.48 |
+| 64 | 257 | one phase | 0.66 | 0.49 |
+| 256 | 1028 | two phases | 3.00 | 2.00 |
+| 256 | 1028 | one phase | 3.07 | 1.90 |
+| 512 | 2056 | two phases | 6.62 | 3.24 |
+| 512 | 2056 | one phase | 6.33 | 2.94 |
+
+About 1.5 s per GiB of file in both modes. That is what a node's restart
+pays before it replays the journal, whatever the commit mode.
+
+### Measured
+
+**Syncs.** The voters run under `strace -f -c`, one ten-caller run of
+the `command cost` bench on the container's disk with each binary:
+`fdatasync` calls per executed command per voter fall from 1.58-1.65 to
+1.21-1.25. Each is the voter's journal syncs plus its projection
+commits, counted twice before and once after (under strace, task-d47's voters
+made 0.65 to 0.77 journal syncs and 0.42 to 0.48 commits a command, and
+task-d48's 0.71 to 0.80 and 0.44 to 0.51).
+So a projection commit is now one sync, measured at the system call.
+
+**Throughput.** `scripts/bench/command-cost.sh` on the container's disk,
+task-d47's binary and this task's alternated three times, three
+repeats per caller count each, medians of nine:
+
+| callers | completed/s, task-d47 → task-d48 | the leader's busy ms/cmd |
+| --- | --- | --- |
+| 10 | 508.5 → 531.0 (+4%) | 1.76-2.34 → 1.79-1.89 (one stalled run aside) |
+| 1 | 158.6 → 186.2 (+17%) | 5.5-6.0 → 4.6-5.1 |
+
+- **The disk was slower than for task-d47's readings.** task-d47 read
+  687.8 at ten callers there and 508.5 here, the same binary on the
+  same container. Comparisons hold only within one alternation.
+- **One of task-d48's ten-caller runs read 259.3.** Every voter's
+  journal stage (the journal sync and the projection commit) took 30 s
+  where the run beside it took 3.8, the longest step 1.38 s, with the
+  same counts of syncs and commits. All three voters stalled at once on
+  the disk they share. It is in the median.
+- **At one caller** a command costs the leader three journal syncs and
+  two projection commits in series, so a sync less a commit shows: 17%.
+  **At ten callers** the voters are busy under 60% of the time and a
+  projection commit is 0.35 a command, so one sync less a commit is
+  about 0.1 ms of a 1.8 ms command: 4%.
+- **What bounds it now** is not the projection's sync: at ten callers a
+  voter is idle 40% of the time, waiting on the round trip that the
+  journal sync and the commit sit in, in series on the domain thread.
+  That is task-d52's. task-j06's replay profile stays optional.
+
+On tmpfs the readings are inside the `command cost` gate's margins
+(1,051 to 1,240 completed a second at ten callers, 0.71 to 0.82 busy ms
+a command); a sync costs nothing there, so the change does not show.
