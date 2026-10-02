@@ -2335,7 +2335,7 @@ This is liveness as well as cost. The window takes `RESEND_PER_VOTER` (16) propo
 - Re-sends counted as already acknowledged or already decided are zero in a fault-free run.
 - A proposal lost in transit is re-sent within twice the interval, including when 16 or more proposals the voter acknowledged sit in its window. Counting only slow adoption fails this (negative control).
 - One voter paused (`SIGSTOP`) for 5 s under ten clients executes again within a bound of being resumed, and the leader's lane to it drains (its refused-frame count stops rising) within the same bound. task-d49's PR states the bound and derives it from the re-send interval and the catch-up hand-off threshold above.
-- task-d07's and task-d15's tests pass.
+- task-d07's and task-d15's tests pass. The PR reports how `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up` fares under load, since its full-bulk-lane assertion has failed intermittently on a loaded runner (task-d46's notes, build-test run 36900303341).
 
 **Review boundary:** The leader's re-send window and timer, and the duplicate refusal.
 

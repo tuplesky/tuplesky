@@ -8305,11 +8305,16 @@ are measured by, and a CI job that fails when they regress.
 `scripts/bench/command-cost.sh` stands up a three-voter domain on tmpfs
 for each caller count (1 and 10), offers 2,500 operations closed-loop
 after 100 of warm-up, with a snapshot every second, and lets each voter
-print one more after the load ends. `scripts/ci/command_cost.py` reduces
-each voter's snapshots to per-command readings and `gate` compares the
-busiest voter's with `scripts/ci/command-cost-baseline.json`: busy time
-per command over the run and over the last quarter of the commands the
-voter executed, the ratio of the two, and journal syncs per command.
+print one more after the load ends. The mix is the bench's default
+without its scans: a scan reads from a random key to the end of the key
+space, so it costs more as the puts fill it, which is the application's
+state growing and not the per-turn work the gate guards.
+`scripts/ci/command_cost.py` reduces each voter's snapshots to
+per-command readings and `gate` compares them with
+`scripts/ci/command-cost-baseline.json`: the busiest voter's busy time
+per command over the run and over the last quarter of the commands it
+executed, the largest of any voter's last quarter over its first three,
+and the busiest voter's journal syncs per command.
 Completed commands a second are reported and never gated. The `command cost` job in
 `build-test.yml` runs it on every change that is not docs-only.
 
@@ -8325,9 +8330,16 @@ Completed commands a second are reported and never gated. The `command cost` job
   runner today.
 - **The last quarter.** A whole-run average spreads work that grows
   with history over commands that ran while it was short; the last
-  quarter is read at the largest history the run reaches, between the
-  first snapshot past three quarters of a voter's final count and the
-  first at it.
+  quarter is read at the largest history the run reaches, from three
+  quarters of a voter's final count to the first snapshot at it. A
+  snapshot rarely lands on three quarters, so the busy time there is
+  interpolated between the snapshots on either side, as if each command
+  between them cost the same. Opening the window at the first snapshot
+  past three quarters instead, as the gate first did, made the window
+  anywhere from 7% to 46% of the run at a second between snapshots, and
+  on a runner past about 650 commands a second at one caller the
+  quarter fell between two snapshots and the reading was absent (#98's
+  carry of 6a8dd83, three of three repeats).
 - **Negative control.** A third `missing_payloads` call per pass of the
   domain loop (`coordd` already makes two; it chains every key of
   `held`, `sync_pending` and `adopted` and sorts them). Three repeats
@@ -8343,43 +8355,70 @@ Completed commands a second are reported and never gated. The `command cost` job
   is cheap beside a turn. After task-d46 the extra `missing_payloads`
   call reads indexes and costs little, so the control is now task-d46's
   own learner change undone (the learner reading every vote set and
-  every record again): three repeats per caller count read 3.71 and
-  6.26 ms (whole run, last quarter) at one caller and 3.52 and 5.65 ms
-  at ten, and the gate fails all four busy readings against the
-  baseline below.
+  every record again). On the mix without scans, three repeats per
+  caller count read 3.11 and 4.96 ms (whole run, last quarter) and a
+  ratio of 1.97 at one caller, and 3.04 and 4.84 ms and 1.98 at ten,
+  and the gate fails all six readings against the baseline below.
 - **Repeats.** Without a change, the busiest voter's readings moved by
   up to 19% over the whole run and 37% over the last quarter between
   four runs on this container. So each caller count runs three times
   and the gate compares the median.
 - **The baseline** holds, per caller count, the largest reading seen
   in the job's own runs on its runner, with margins of 25% (busy over
-  the run), 30% (busy over the last quarter and the ratio of the two)
-  and 10% (syncs). Before
-  task-d46, on the `ubuntu-24.04` runner one voter fell behind in every
-  repeat (1,098 to 1,749 of 2,602 commands executed, 12.6 to 17.1 ms
-  per command). task-d46 moved it down, from that job's run on its own
-  head: 1.35 and 1.65 ms at one caller, 1.47 and 1.67 ms at ten, 3.00
-  syncs per command.
-- **The ratio** of the last quarter to the whole run is what grows
-  when the cost of a command grows with history, and it needs no
+  the run), 30% (busy over the last quarter, and the ratio) and 10%
+  (syncs). Before task-d46, on the `ubuntu-24.04` runner one voter fell
+  behind in every repeat (1,098 to 1,749 of 2,602 commands executed,
+  12.6 to 17.1 ms per command). task-d46 moved it down, from that job's
+  run on its own head with the mix without scans and the interpolated
+  window (build-test run 36908805251): 1.32 and 1.45 ms and a ratio of
+  1.19 at one caller, 1.46 and 1.65 ms and 1.19 at ten, 3.00 syncs per
+  command. Every voter's ratio in that run was 1.08 to 1.19. Against it
+  the learner revert's medians (3.11 and 4.96 ms and 1.97 at one caller,
+  3.04 and 4.84 ms and 1.98 at ten, read on this container) fail all
+  six readings; the ratio limit is 1.55 at both caller counts.
+- **The ratio** of a voter's last quarter to its first three is what
+  grows when the cost of a command grows with history, and it needs no
   machine to compare with: a faster runner moves both readings, not
-  their ratio. It is each voter's own, and the largest is gated: the
-  largest last quarter over the largest whole run, taken from two
-  voters, would hide a follower whose cost grew under a leader busier
-  throughout. Per voter it is noisier than the busiest voter's alone
-  (each of three voters reads its own ~650-command window): unchanged
-  code read up to 1.25 and 1.15 (one caller, ten) on the runner at
-  0c2b7ff and up to 1.41 and 1.30 at b68dc01, and the baseline is the
-  larger. The control above reads 1.69 at both, which fails the ratio
-  at ten callers only, by a hair; it is the busy readings, at more than
-  twice the baseline, that catch it. The ratio is the backstop for
-  growth on a machine fast enough to hide it from those. An unchanged run on
-  this container once read 2.35 ms over the last quarter at ten callers
-  against the runner's 1.67, and a re-run read within the baseline. No
-  local checkpoint falls in that window (each run's exports land
-  between executed 900 and 1,340, and the last quarter starts past
-  1,950), so that reading was the container's load, not a growth; the
-  margins stay at 30% and a change that moves them says why.
+  their ratio. Two choices in it:
+  - *Per voter.* The largest last quarter over the largest first three,
+    taken from two voters, would hide a follower whose cost grew under a
+    leader busier throughout.
+  - *Over the first three quarters, not the whole run.* The whole run
+    holds the last quarter on both sides of the division: a cost
+    growing linearly from c to 2c reads 1.25 against it and 1.36
+    against the first three, and `test_command_cost.py` pins the
+    second.
+- **What an unchanged run's ratio is.** With the interpolated window,
+  unchanged code on this container reads 1.09 to 1.20 at one caller and
+  1.13 to 1.20 at ten, every voter alike, and 1.16 to 1.24 with local
+  checkpoints off: about the 1.1 to 1.2 of the long runs. Read from the
+  first snapshot past three quarters, the same logs read 1.14 to 1.41,
+  and the high ones were the narrow windows: the last second of a run
+  costs about 1.5 ms a command against 1.2 before it, and a window of 7%
+  of the run is mostly that second. An earlier account here put the
+  1.3 to 1.5 down to a short run never reaching a history sweep; the
+  warm-up that was to show it, 5,000 commands past the first sweep,
+  reads 1.07 to 1.29 interpolated, no lower than without it, so that
+  account was wrong. The learner revert reads 1.77 to 2.04 on the same
+  window (medians of the largest voter 1.97 at one caller and 1.98 at
+  ten).
+- **Two limits of the window.** The first three quarters' busy time is
+  read from a snapshot's cumulative count, so it includes the voter's
+  busy time before its first command (boot, and the 100 warm-up
+  operations). On a 2,600-command run that is a few percent of it, and it
+  lowers the ratio: it can hide a little growth, never invent any.
+  Subtracting the first snapshot's busy time and count from both sides
+  removes it if that ever matters. And the reading is absent again on a
+  runner that executes three quarters of the run inside the first
+  snapshot interval, about 2,000 commands a second at one caller; a
+  snapshot more often than once a second would remove that.
+- **Noise.** An unchanged run on this container once read 2.35 ms over
+  the last quarter at ten callers against the runner's 1.67, and a
+  re-run read within the baseline. No local checkpoint falls in that
+  window (each run's exports land between executed 900 and 1,340, and
+  the last quarter starts past 1,950), so that reading was the
+  container's load, not a growth; the margins stay at 30% and a change
+  that moves them says why.
 
 ## Per-event work that does not grow with history
 
@@ -8474,7 +8513,9 @@ so the loop only selects the image, trims and reclaims. Pacing exports
 by the projection's size instead would keep the export cost per command
 constant, at the price of a journal (and a restart's replay) that grows
 with the state, so the plan does not take it. Until task-d51, task-62's
-throughput rows run with `checkpoint_after_records = 0` and say so.
+throughput rows run with `checkpoint_after_records = 0` and say so. Each
+publication's `checkpoint` line carries `took_ms`, so a run that left
+them on shows the stall in the voter's log.
 
 ### Open: a voter that stops executing
 
@@ -8491,6 +8532,19 @@ the local checkpoint on, a voter still falls behind (the 2.5 s stalls)
 and catches up slowly. What lets a voter that has fallen behind catch
 up, rather than only not stop, is task-d49's: a re-send window full of
 proposals the voter already acknowledged starves the one it lost.
+
+**An intermittent on the same pressure.** On d891e9c (build-test run
+36900303341, `rust (x86_64)`, job 110497626808),
+`a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`
+failed its assertion that no voter ever logs a full bulk lane: one logged
+`QueueFull { lane: Bulk }` for 64 frames and counting, recovered after
+96, and every caller was answered. The consensus code was the same as on
+the green runs either side of it (7830ff1 and 6a8dd83), the test passed
+6 of 6 times on this container, and it took 52 s on the runner beside
+the 338 s activation test. What the assertion measures is re-sends and
+catch-up answers competing for a loaded voter's lanes, which is
+task-d49's subject, so it is left as it is. A later failure of the same
+assertion is counted here rather than analyzed again.
 
 ### Not done here
 

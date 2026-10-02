@@ -7,10 +7,10 @@ the lowerings it ran, the journal appends and syncs, the projection
 commits, and the time the loop was busy rather than waiting. This
 reduces each voter's snapshots to what one executed command cost it:
 over the whole run, from its last snapshot, and over the last quarter
-of the commands it executed, from the snapshots that bracket them. The
-second is the cost at the run's largest history, where work that grows
-with history shows first; a whole-run average spreads it over commands
-that ran while the history was short.
+of the commands it executed, interpolated between the snapshots around
+three quarters. The second is the cost at the run's largest history,
+where work that grows with history shows first; a whole-run average
+spreads it over commands that ran while the history was short.
 
     command_cost.py reduce --callers N --wall SECONDS [--bench REPORT] LOG...
     command_cost.py collect COST_JSON...
@@ -112,12 +112,16 @@ def head_and_tail_busy(node: str, log: str) -> tuple[float, float]:
     """Busy milliseconds per command before and over the last quarter of
     the commands a voter executed.
 
-    The last quarter opens at the first snapshot that had executed three
-    quarters of the voter's final count and closes at the first that had
-    executed all of it, so the idle time after the load ended is not in
-    it. What came before it is everything up to that first snapshot,
-    warm-up included: the last quarter is compared with the rest of the
-    run, not with the whole of it, which would put it on both sides.
+    The last quarter opens where the voter had executed three quarters of
+    its final count and closes at the first snapshot that had executed
+    all of it, so the idle time after the load ended is not in it. A
+    snapshot rarely falls on three quarters exactly, and at a second
+    apart a quarter of a short run can pass between two of them, so the
+    busy time there is interpolated between the snapshots on either side,
+    as if every command between them cost the same. What came before it
+    is everything up to that point, warm-up included: the last quarter is
+    compared with the rest of the run, not with the whole of it, which
+    would put it on both sides.
     """
     costs = []
     for snapshot in snapshots(log):
@@ -127,13 +131,19 @@ def head_and_tail_busy(node: str, log: str) -> tuple[float, float]:
     if not costs:
         raise Absent(f"{node}'s log has no observed cost")
     final = costs[-1]["executed"]
-    end = next(c for c in costs if c["executed"] == final)
-    start = next(c for c in costs if c["executed"] >= (1 - TAIL) * final)
-    executed = end["executed"] - start["executed"]
-    if executed == 0 or start["executed"] == 0:
+    opens = (1 - TAIL) * final
+    before = [c for c in costs if c["executed"] <= opens]
+    if final == 0 or not before:
         raise Absent(f"{node}'s snapshots do not bracket the last quarter of its commands")
-    head = seconds(start["busy"]) * 1000 / start["executed"]
-    tail = (seconds(end["busy"]) - seconds(start["busy"])) * 1000 / executed
+    below = before[-1]
+    above = next(c for c in costs if c["executed"] >= opens)
+    end = next(c for c in costs if c["executed"] == final)
+    busy = seconds(below["busy"])
+    if above["executed"] > below["executed"]:
+        busy += ((seconds(above["busy"]) - busy)
+                 * (opens - below["executed"]) / (above["executed"] - below["executed"]))
+    head = busy * 1000 / opens
+    tail = (seconds(end["busy"]) - busy) * 1000 / (final - opens)
     return head, tail
 
 
