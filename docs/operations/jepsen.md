@@ -49,6 +49,14 @@ Every answer is `{"type": "ok" | "fail" | "info", ...}`, with the request's
 `"id"` echoed. Keys and values are any JSON; a key is stored as the prefix
 followed by its JSON text, a value as its JSON text.
 
+A read of one key (a `read`, or the snapshot read of a transaction that
+touches one key) is a bare Range at the latest revision. Since task-d50 a
+frontend sends it to its leader, which serves it behind a confirmation
+round, and orders it only on a refusal or after 1.5 s; each voter's
+`cost.reads`, in the job summary's Domain loop table, counts what its
+barrier served. A read of more keys is one read-only transaction, which
+is always ordered.
+
 ### What the verdicts promise
 
 A Jepsen checker takes `fail` to mean the operation had no effect, so a

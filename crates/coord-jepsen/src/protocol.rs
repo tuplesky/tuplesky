@@ -15,7 +15,10 @@
 //! with the request's `"id"` echoed when it had one. Keys and values are
 //! any JSON; the shim stores a value as its JSON text.
 //!
-//! A transaction that only reads is one snapshot read. One that writes
+//! A read, or a transaction that reads one key, is one Range, which a
+//! leader serves behind its confirmation round (task-d50); more keys are
+//! one read-only transaction, which is ordered. Either is one snapshot.
+//! A transaction that only reads is that snapshot read. One that writes
 //! is optimistic, as the etcd test's is: a snapshot read of every key it
 //! touches, then one transaction guarded on each of those keys'
 //! modification revisions that writes the final value of every key it

@@ -75,9 +75,14 @@ impl Codec {
         request
     }
 
-    /// Read the latest committed value of each key in one transaction:
-    /// one snapshot, whatever the number of keys.
+    /// Read the latest committed value of each key in one snapshot. One
+    /// key is a bare Range, which a frontend beside a voter sends to its
+    /// leader rather than ordering (task-d50); more are one transaction,
+    /// which is always ordered.
     pub fn read(&self, keys: &[Value]) -> LogicalRequest {
+        if let [key] = keys {
+            return self.request(CanonicalOperation::Range(exact(self.key(key))));
+        }
         self.request(CanonicalOperation::Txn(TxnOp {
             compares: Vec::new(),
             success: keys
@@ -192,33 +197,37 @@ pub struct Seen {
     pub mod_revision: KvRevision,
 }
 
-/// Read an established snapshot read of `keys`, in the order asked.
+/// Read an established snapshot read of `keys`, in the order asked: a
+/// transaction's ranges, or one bare range for one key ([`Codec::read`]).
 pub fn snapshot(response: &Response, keys: usize) -> Result<Vec<Seen>, String> {
-    let Outcome::Txn { succeeded, results } = &response.outcome else {
-        return Err(refused(&response.outcome));
+    let results = match &response.outcome {
+        range @ Outcome::Range { .. } if keys == 1 => std::slice::from_ref(range),
+        Outcome::Txn { succeeded, results } if *succeeded && results.len() == keys => results,
+        Outcome::Txn { results, .. } => {
+            return Err(format!(
+                "a read of {keys} keys came back with {} results",
+                results.len()
+            ));
+        }
+        other => return Err(refused(other)),
     };
-    if !succeeded || results.len() != keys {
-        return Err(format!(
-            "a read of {keys} keys came back with {} results",
-            results.len()
-        ));
+    results.iter().map(seen).collect()
+}
+
+fn seen(result: &Outcome) -> Result<Seen, String> {
+    match result {
+        Outcome::Range { items, .. } => Ok(match items.first() {
+            Some(item) => Seen {
+                value: decode(&item.entry.value),
+                mod_revision: item.entry.mod_revision,
+            },
+            None => Seen {
+                value: Value::Null,
+                mod_revision: KvRevision::ZERO,
+            },
+        }),
+        other => Err(refused(other)),
     }
-    results
-        .iter()
-        .map(|result| match result {
-            Outcome::Range { items, .. } => Ok(match items.first() {
-                Some(item) => Seen {
-                    value: decode(&item.entry.value),
-                    mod_revision: item.entry.mod_revision,
-                },
-                None => Seen {
-                    value: Value::Null,
-                    mod_revision: KvRevision::ZERO,
-                },
-            }),
-            other => Err(refused(other)),
-        })
-        .collect()
 }
 
 /// The name of an established outcome that is not the one asked for.
@@ -497,6 +506,7 @@ mod tests {
         writes.insert(c.key(&json!(1)), json!([1, 2]));
         for request in [
             c.read(&[json!(1), json!(2)]),
+            c.read(&[json!(1)]),
             c.write(&json!(1), &json!(3)),
             c.cas(&json!(1), &json!(3), &json!(4)),
             c.guarded_write(&observed, &writes),
@@ -595,6 +605,36 @@ mod tests {
         assert_eq!(seen[1].value, Value::Null);
         assert_eq!(seen[1].mod_revision, KvRevision::ZERO);
         assert!(snapshot(&response, 3).is_err());
+    }
+
+    #[test]
+    fn one_key_is_read_as_a_bare_range() {
+        let c = codec();
+        assert!(matches!(
+            c.read(&[json!(1)]).operation,
+            CanonicalOperation::Range(RangeOp { revision: None, .. })
+        ));
+        assert!(matches!(
+            c.read(&[json!(1), json!(2)]).operation,
+            CanonicalOperation::Txn(_)
+        ));
+        for (outcome, value, revision) in [
+            (range(Some(&json!(3)), 7), json!(3), rev(7)),
+            (range(None, 0), Value::Null, KvRevision::ZERO),
+        ] {
+            let Answer::Established(response) = established(outcome) else {
+                unreachable!()
+            };
+            assert_eq!(
+                snapshot(&response, 1).unwrap(),
+                vec![Seen {
+                    value,
+                    mod_revision: revision
+                }]
+            );
+            // A bare range answers one key only.
+            assert!(snapshot(&response, 2).is_err());
+        }
     }
 
     #[test]
