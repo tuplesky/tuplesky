@@ -334,7 +334,8 @@ pub enum Evaluated {
 /// the ordered path would have recorded at that state. What the ordered
 /// path would not execute as new work -- a retry, a request outside its
 /// session's window, a session that is unknown or retired -- is left to
-/// it, and so is any plan that is not a range result: a refusal is an
+/// it, and so is a request past half its session's window, which the
+/// ordered path must retire behind, and so is any plan that is not a range result: a refusal is an
 /// outcome the ordered path records, and recording it is not this
 /// path's to skip.
 pub fn evaluate<P: Persistence>(store: &P, held: &Held) -> Evaluated {
@@ -366,6 +367,18 @@ pub fn evaluate<P: Persistence>(store: &P, held: &Held) -> Evaluated {
         Ok(Admission::New)
     ) {
         return Evaluated::NotServable;
+    }
+    // A read served here records nothing, so it retires nothing either:
+    // only an ordered command moves its client's floor, by at most
+    // `MAX_RETIRE_PER_COMMAND` sequences. A session that read only
+    // through this path would walk its sequence out of its window, and
+    // past it even its ordered requests are refused without retiring
+    // anything. So past half the window from the floor the read is
+    // ordered instead, and pulls the floor up behind it.
+    let sequence = request.retry_key.request_sequence.get();
+    match retry::session_floor(gated.view(), &request.retry_key) {
+        Ok(Some(floor)) if sequence - floor.floor.get() <= u64::from(floor.width / 2) => {}
+        _ => return Evaluated::NotServable,
     }
     let session = request.retry_key.session_id;
     let Ok(view) = build_authorized_view(

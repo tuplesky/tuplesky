@@ -1395,6 +1395,12 @@ impl Caller {
 
     /// One `Range` of exactly `key`, as a client would send it.
     fn range(&self, sequence: u64, key: &[u8]) -> Vec<u8> {
+        self.range_acking(sequence, key, 0)
+    }
+
+    /// One `Range` of exactly `key` that acknowledges every result
+    /// through `ack_through`.
+    fn range_acking(&self, sequence: u64, key: &[u8], ack_through: u64) -> Vec<u8> {
         let mut logical = coord_types::logical_v1::LogicalRequest::new(
             coord_types::ids::NamespaceId([0x5e; 16]),
             coord_types::logical_v1::CanonicalOperation::Range(coord_types::logical_v1::RangeOp {
@@ -1407,8 +1413,13 @@ impl Caller {
         );
         logical.canonicalize();
         coord_types::wire_v1::MessageV1::Request(
-            coord_types::wire_v1::RequestV1::new(self.invocation(sequence), &logical, 0, 0)
-                .expect("bounded"),
+            coord_types::wire_v1::RequestV1::new(
+                self.invocation(sequence),
+                &logical,
+                0,
+                ack_through,
+            )
+            .expect("bounded"),
         )
         .encode()
         .expect("bounded")
@@ -1920,6 +1931,47 @@ async fn a_read_retried_after_a_restart_gets_its_retained_result() {
         again.outcome, first.outcome,
         "a read retried after a restart was not given its retained result"
     );
+}
+
+/// A session that only reads keeps being served past its window.
+///
+/// A read the leader serves without ordering it records nothing and so
+/// retires nothing; only an ordered command moves the session's floor.
+/// A session that read through the leader alone walked its sequence out
+/// of its 1024-wide window and was then refused everything, ordered
+/// requests included (task-d50). Past half the window the leader now
+/// leaves the read to the ordered path, which retires behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_only_reads_is_served_past_its_window() {
+    let dir = workspace("read-window");
+    let ca = credentials(&dir, 1, coord_types::wire_v1::PeerRole::Voter);
+    genesis_of(&dir, 1, Some(&ca.node_spki));
+    let ring = sts_keys(&dir);
+    let path = config_only(&dir);
+    assert_eq!(run(&path, &["init"]).code, Some(0));
+    let daemon = start(&path);
+    let caller = Caller::bind(&daemon, &ca, &ring, [0x47; 16]).await;
+    ask(&caller.connection, &caller.put(1, b"k", b"v"))
+        .await
+        .expect("the daemon answered the write");
+    for sequence in 2..=2600u64 {
+        let answer = ask(
+            &caller.connection,
+            &caller.range_acking(sequence, b"k", sequence - 1),
+        )
+        .await
+        .unwrap_or_else(|| panic!("read {sequence} was not answered\n{}", daemon.said()));
+        let response = response_of(&answer);
+        let coord_types::wire_v1::OutcomeV1::Ok { result, .. } = &response.outcome else {
+            panic!("read {sequence} was not answered with a result: {response:?}");
+        };
+        let read: coord_state::Response =
+            postcard::from_bytes(result.as_slice()).expect("the read's result decodes");
+        assert!(
+            matches!(read.outcome, coord_state::Outcome::Range { .. }),
+            "read {sequence} was answered {read:?}"
+        );
+    }
 }
 
 /// A restarted replica comes back owing what it already owed.
