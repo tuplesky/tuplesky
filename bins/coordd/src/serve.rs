@@ -1138,9 +1138,15 @@ struct Pacing {
     every: Option<(std::time::Duration, coord_daemon::role::RoleSet)>,
     /// When the next snapshot is due.
     due: Option<std::time::Instant>,
-    /// The last printed snapshot's instant, busy time and executed
-    /// count: where the current interval began.
-    last: Option<(std::time::Instant, std::time::Duration, u64)>,
+    /// The last printed snapshot's instant, busy time, executed count
+    /// and the domain thread's CPU time: where the current interval
+    /// began.
+    last: Option<(
+        std::time::Instant,
+        std::time::Duration,
+        u64,
+        Option<std::time::Duration>,
+    )>,
 }
 
 impl Pacing {
@@ -1331,6 +1337,18 @@ const FLUSH_QUEUED: usize = 64;
 /// many more are ready (task-d47).
 const FLUSH_EVENTS: u32 = 64;
 
+/// Whether the loop lowers before it takes another event: a full journal
+/// group's worth is queued, or a run of events left a flush owed.
+///
+/// Nothing queued can be journaled while an append is out on the
+/// appender's thread (task-d54), so a full group behind one is not a
+/// reason to flush: the flush would move nothing, and with events still
+/// arriving it would run after every one of them. The appender's wake
+/// takes the append back, and the flush after it lends the group.
+const fn flush_due(queued: usize, appending: bool, owed: bool, since_flush: u32) -> bool {
+    (queued >= FLUSH_QUEUED && !appending) || (owed && since_flush >= FLUSH_EVENTS)
+}
+
 /// Whether the caller's plane is polled before the peer plane this
 /// turn, given how many peer events have been taken since the last
 /// caller's event.
@@ -1495,7 +1513,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// What this voter's work has cost since the loop started, with the
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
-        use coord_daemon::metrics::{Cost, Interval, Measure, Unavailable};
+        use coord_daemon::metrics::{Cost, Cpu, Interval, Measure, Unavailable};
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
             // cost this reports is a voter's: per command it executed in
@@ -1508,13 +1526,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let now = std::time::Instant::now();
         let executed = voter.node().executed;
         let busy = self.pacing.busy(self.started, now);
+        // This runs on the domain loop's thread, so the calling thread's
+        // CPU time is the loop's.
+        let domain_cpu = crate::cpu::this_thread();
         let recent = match self.pacing.last {
-            Some((at, busy_then, executed_then)) => Measure::Observed(Interval {
+            Some((at, busy_then, executed_then, cpu_then)) => Measure::Observed(Interval {
                 span: now.saturating_duration_since(at),
                 busy: busy.saturating_sub(busy_then),
                 executed: executed.saturating_sub(executed_then),
+                domain_cpu: match (domain_cpu, cpu_then) {
+                    (Some(cpu), Some(then)) => Measure::Observed(cpu.saturating_sub(then)),
+                    _ => Measure::Unavailable(Unavailable::NotInstrumented),
+                },
             }),
             None => Measure::Unavailable(Unavailable::NoSamples),
+        };
+        let cpu = match (domain_cpu, crate::cpu::process()) {
+            (Some(domain), Some(process)) => Measure::Observed(Cpu { domain, process }),
+            _ => Measure::Unavailable(Unavailable::NotInstrumented),
         };
         Measure::Observed(Cost {
             executed,
@@ -1532,6 +1561,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             established_fast: voter.node().established.fast,
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
+            cpu,
         })
     }
 
@@ -1553,7 +1583,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Backing::Voting(voter) => voter.node().executed,
             Backing::Serving(_) => 0,
         };
-        self.pacing.last = Some((now, self.pacing.busy(self.started, now), executed));
+        self.pacing.last = Some((
+            now,
+            self.pacing.busy(self.started, now),
+            executed,
+            crate::cpu::this_thread(),
+        ));
         self.pacing.due = Some(now + every);
     }
 
@@ -1733,7 +1768,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // command that is ready from executing for as long as they
             // kept arriving (task-d47).
             let owed = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
-            if (self.queued() >= FLUSH_QUEUED || (owed && self.since_flush >= FLUSH_EVENTS))
+            let appending = matches!(&self.backing, Backing::Voting(v) if v.appending());
+            if flush_due(self.queued(), appending, owed, self.since_flush)
                 && self.stops_on_flush(transport)
             {
                 return;
@@ -4830,8 +4866,9 @@ mod tests {
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 
     use super::{
-        PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed,
-        ask_for_payloads_now, payload_batch_size, poll_api_first,
+        FLUSH_EVENTS, FLUSH_QUEUED, PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring,
+        SAID_IN_FULL, addressed, ask_for_payloads_now, flush_due, payload_batch_size,
+        poll_api_first,
     };
 
     /// A session this node has not projected yet is "not yet", not a
@@ -5385,6 +5422,20 @@ mod tests {
     /// 4560 api events and then not one more while its peer arm took
     /// another 80000, and every caller bound to that frontend waited
     /// out its deadline against a node that was otherwise working.
+    /// A full group queued behind an append that is out is not a flush
+    /// (task-d54): it could move nothing until the append is back.
+    #[test]
+    fn a_full_group_behind_an_append_out_is_not_flushed() {
+        assert!(flush_due(FLUSH_QUEUED, false, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED, true, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED * 4, true, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED - 1, false, false, FLUSH_EVENTS));
+        // A flush owed after a run of events is owed whatever is out:
+        // `owes_flush` already leaves out what waits on the append.
+        assert!(flush_due(0, true, true, FLUSH_EVENTS));
+        assert!(!flush_due(0, false, true, FLUSH_EVENTS - 1));
+    }
+
     #[test]
     fn the_peer_planes_priority_is_bounded_so_a_caller_is_never_starved() {
         // Ordinary: the peer plane goes first, which is the ordering

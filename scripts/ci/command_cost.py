@@ -105,6 +105,22 @@ def per_command(node: str, snapshot: dict) -> dict:
         **resends_of(cost, executed),
         **paths_of(cost),
         **reads_of(cost),
+        **cpu_of(cost, executed),
+    }
+
+
+def cpu_of(cost: dict, executed: int) -> dict:
+    """CPU milliseconds per command (task-d54): the domain loop's own
+    thread, beside its busy time, which also counts the syncs it waits
+    for, and the whole process. Empty for a binary older than the
+    reading, or a host that has none."""
+    cpu = cost.get("cpu")
+    if not isinstance(cpu, dict) or "Observed" not in cpu:
+        return {}
+    cpu = cpu["Observed"]
+    return {
+        "domain_cpu_ms_per_command": seconds(cpu["domain"]) * 1000 / executed,
+        "process_cpu_ms_per_command": seconds(cpu["process"]) * 1000 / executed,
     }
 
 
@@ -292,9 +308,10 @@ def table(result: dict) -> str:
     lines = [
         "| callers | completed/s | node | executed | lowerings/cmd | syncs/cmd "
         "| appends/cmd | commits/cmd | busy ms/cmd | first three quarters "
-        "| last quarter | ratio | busy | re-sends/cmd | duplicate votes/cmd |",
+        "| last quarter | ratio | busy | domain CPU ms/cmd | process CPU ms/cmd "
+        "| re-sends/cmd | duplicate votes/cmd |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
-        "| --- | --- |",
+        "| --- | --- | --- | --- |",
     ]
     for run in result["runs"]:
         rate = run.get("completed_per_second")
@@ -311,6 +328,8 @@ def table(result: dict) -> str:
                 f"| {v['projection_commits_per_command']:.2f} "
                 f"| {v['busy_ms_per_command']:.2f} | {head} "
                 f"| {v['tail_busy_ms_per_command']:.2f} | {ratio} | {busy} "
+                f"| {per_command_or_dash(v, 'domain_cpu_ms_per_command')} "
+                f"| {per_command_or_dash(v, 'process_cpu_ms_per_command')} "
                 f"| {per_command_or_dash(v, 'resent_per_command')} "
                 f"| {per_command_or_dash(v, 'duplicate_votes_per_command')} |"
             )

@@ -173,6 +173,10 @@ struct InFlight {
     position: coord_types::ids::ExecutionPosition,
     /// The rows the group's own batches write.
     own: Arc<CutOverlay>,
+    /// The barriers of the group's own batches. Their append may still be
+    /// out when the group is handed off (task-d54), so a lowering that
+    /// takes it back later checks it for a lost batch.
+    barriers: BTreeSet<BarrierId>,
     /// Watch publications owed once it has materialized, in order.
     publications: Vec<Publication>,
 }
@@ -474,7 +478,10 @@ impl<P: Persistence> Applier<P> {
         while self.store.queued() > 0 && attempts > 0 {
             let before = self.store.queued();
             let journaled = self.store.journal()?;
-            self.take_lowered(journaled, &group.barriers)?;
+            // The append this takes back may be an earlier group's.
+            let mut barriers = self.in_flight_barriers();
+            barriers.extend(group.barriers.iter().copied());
+            self.take_lowered(journaled, &barriers)?;
             if self.store.queued() >= before {
                 break;
             }
@@ -483,6 +490,7 @@ impl<P: Persistence> Applier<P> {
         self.inflight.push_back(InFlight {
             position: last.position,
             own: group.own,
+            barriers: group.barriers.clone(),
             publications: group.publications,
         });
         let handed = self.store.hand_off()?;
@@ -511,8 +519,17 @@ impl<P: Persistence> Applier<P> {
     pub fn drain(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
         if self.store.pipelined() {
             for _ in 0..GROUP_LOWERINGS {
+                let barriers = self.in_flight_barriers();
                 let drained = self.store.drain()?;
-                self.take_lowered(drained, &BTreeSet::new())?;
+                self.take_lowered(drained, &barriers)?;
+                // A group handed off while an append was out is still
+                // queued (task-d54): it is journaled before it can
+                // materialize.
+                if self.store.queued() > 0 {
+                    let journaled = self.store.journal()?;
+                    self.take_lowered(journaled, &barriers)?;
+                    continue;
+                }
                 if self.store.unmaterialized() == 0 {
                     break;
                 }
@@ -531,6 +548,14 @@ impl<P: Persistence> Applier<P> {
             )));
         }
         Ok(through)
+    }
+
+    /// The barriers of every group handed off and not yet materialized.
+    fn in_flight_barriers(&self) -> BTreeSet<BarrierId> {
+        self.inflight
+            .iter()
+            .flat_map(|flight| flight.barriers.iter().copied())
+            .collect()
     }
 
     /// Publish the revisions of the groups in flight that the projection

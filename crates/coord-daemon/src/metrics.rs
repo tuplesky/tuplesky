@@ -494,6 +494,25 @@ pub struct Cost {
     /// (task-d50). Zero for a voter that never led.
     #[serde(default)]
     pub reads: Reads,
+    /// CPU time used since the process started (task-d54), or why there
+    /// is no reading. Beside [`Cost::busy`], which counts the syncs the
+    /// loop waits for, it says what the work itself cost.
+    #[serde(default = "not_instrumented")]
+    pub cpu: Measure<Cpu>,
+}
+
+/// CPU time a voter's process has used (task-d54), cumulative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cpu {
+    /// The domain loop's own thread.
+    pub domain: Duration,
+    /// Every thread of the process: the loop, the appender and the
+    /// materializer, the transport's workers.
+    pub process: Duration,
+}
+
+fn not_instrumented<T>() -> Measure<T> {
+    Measure::Unavailable(Unavailable::NotInstrumented)
 }
 
 /// What a leader's read barrier did (task-d50), cumulative.
@@ -568,6 +587,9 @@ pub struct Interval {
     pub busy: Duration,
     /// Commands applied in it.
     pub executed: u64,
+    /// CPU time the domain loop's thread used in it (task-d54).
+    #[serde(default = "not_instrumented")]
+    pub domain_cpu: Measure<Duration>,
 }
 
 impl MetricsSnapshot {

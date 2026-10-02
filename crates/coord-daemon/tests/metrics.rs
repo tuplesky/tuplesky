@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Cost, Durability, Frontiers, Headroom, Interval, Lane, LaneReading, Latency,
+    Cost, Cpu, Durability, Frontiers, Headroom, Interval, Lane, LaneReading, Latency,
     MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Reads, Recorder, Resends, ShardIndex,
     ShardReading, Stage, StageReading, Unavailable,
 };
@@ -342,6 +342,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 span: Duration::from_secs(10),
                 busy: Duration::from_secs(7),
                 executed: 210,
+                domain_cpu: Measure::Observed(Duration::from_secs(4)),
             }),
             resends: Resends {
                 unanswered: 3,
@@ -361,6 +362,10 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 waited_index_ms: 2700,
                 waited_ms: 2800,
             },
+            cpu: Measure::Observed(Cpu {
+                domain: Duration::from_secs(25),
+                process: Duration::from_secs(70),
+            }),
         }),
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");
