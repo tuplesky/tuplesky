@@ -676,15 +676,19 @@ impl<P: Persistence> Node<P> {
     /// Lower until nothing is queued, or a lowering moves nothing.
     ///
     /// One lowering takes everything queued that fits one journal group.
-    /// The bound is the queue's own depth when this started, so a
-    /// lowering that moves nothing -- an append still in flight, an
-    /// uncertain head -- ends the loop rather than spinning; the next
-    /// round lowers again. Lowering in groups, it journals only
-    /// ([`Node::flush`]).
+    /// The bound is the queue's own depth when this started, and a
+    /// lowering that moves nothing -- an append still out on the
+    /// appender's thread (task-d54), an uncertain head -- ends the loop
+    /// rather than spinning; the next round lowers again. Lowering in
+    /// groups, it journals only ([`Node::flush`]).
     fn lower_queued(&mut self, next: &mut Vec<Effect>) -> Result<(), DriveError> {
         let mut attempts = self.applier.store().queued() + 1;
         while self.applier.store().queued() > 0 && attempts > 0 {
+            let before = self.applier.store().queued();
             self.lower_once(next, self.grouped)?;
+            if self.applier.store().queued() >= before {
+                break;
+            }
             attempts -= 1;
         }
         Ok(())
@@ -1625,11 +1629,24 @@ impl<P: Persistence> Node<P> {
     /// event of a group goes out here and never before the projection has
     /// committed the group: the same rule as a group materialized on this
     /// thread, kept across the hand-off.
+    ///
+    /// A journal append out on the appender's thread (task-d54) is taken
+    /// back here as well, once it has finished: what it made durable
+    /// releases the sends that waited on it, its facts go to the machine,
+    /// and what was queued meanwhile goes out as the next append.
     pub fn settle(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         if !self.applier.pipelined() {
             return Ok(Outbound::default());
         }
-        self.release_through_settled(ballot)
+        let mut out = Outbound::default();
+        if self.applier.store().appending() {
+            let mut next = Vec::new();
+            self.lower_once(&mut next, true)?;
+            self.unreleased = true;
+            out.absorb(self.carry_out(next, ballot)?);
+        }
+        out.absorb(self.release_through_settled(ballot)?);
+        Ok(out)
     }
 
     /// Wait for every group handed off to materialize, and carry out what

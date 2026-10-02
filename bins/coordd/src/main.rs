@@ -18,6 +18,7 @@
 //! configuration every replica agreed on.
 
 mod backup;
+mod cpu;
 mod election;
 mod enroll;
 mod genesis;
@@ -1048,7 +1049,8 @@ fn main() -> ExitCode {
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
     // Notified by the voter's materializer thread as each projection
-    // commit finishes (task-d52).
+    // commit finishes (task-d52), and by its appender thread as each
+    // journal append does (task-d54).
     let materialized = std::sync::Arc::new(tokio::sync::Notify::new());
     let backing = if roles.votes() {
         match voter(&placed, applier, boot, config.limits.command_table_capacity)
@@ -1571,6 +1573,11 @@ fn voter(
 /// domain thread journals a group and goes on executing, and the group's
 /// results go out once the materializer has committed it and
 /// `materialized` has woken the loop to take it back.
+///
+/// The journal's synced appends leave the domain thread the same way
+/// (task-d54): the domain thread seals a group and goes on, and what the
+/// group made durable is released once the appender has synced it and
+/// `materialized` has woken the loop to take it back.
 fn pipeline(
     mut voter: coord_daemon::Voter<store::Persistence>,
     materialized: &std::sync::Arc<tokio::sync::Notify>,
@@ -1587,6 +1594,18 @@ fn pipeline(
         .store_mut()
         .pipeline(Box::new(materializer))
         .map_err(|e| format!("the projection could not be pipelined: {e:?}"))?;
+    let notify = std::sync::Arc::clone(materialized);
+    let appender = coord_storage::ThreadAppender::new(std::sync::Arc::new(move || {
+        notify.notify_one();
+    }))
+    .map_err(|e| format!("the appender thread could not start: {e}"))?;
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline_journal(Box::new(appender))
+        .map_err(|e| format!("the journal could not be pipelined: {e:?}"))?;
     Ok(voter)
 }
 

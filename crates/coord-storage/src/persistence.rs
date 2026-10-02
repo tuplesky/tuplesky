@@ -176,6 +176,14 @@ pub trait Persistence {
         false
     }
 
+    /// Whether a journal append is out on another thread now, its outcome
+    /// not yet taken (task-d54). A [`Persistence::journal`] takes it back
+    /// once it has finished and moves nothing before: what is queued
+    /// meanwhile waits for the next group.
+    fn appending(&self) -> bool {
+        false
+    }
+
     /// Take back the projection commits that have finished, without
     /// waiting, and hand what is journaled and not materialized to the
     /// next one (task-d52). The facts of the commits taken back are
@@ -517,12 +525,16 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
     fn cost(&self) -> Option<StorageCost> {
         Some(StorageCost {
             lowering: self.store.cost(),
-            journal_syncs: self.store.journal().syncs(),
+            journal_syncs: self.store.journal_syncs(),
         })
     }
 
     fn pipelined(&self) -> bool {
         self.store.pipelined()
+    }
+
+    fn appending(&self) -> bool {
+        self.store.appending()
     }
 
     fn hand_off(&mut self) -> Result<Lowered, EngineError> {

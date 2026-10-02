@@ -9,20 +9,29 @@
 //! each of its points -- a job handed over and not started, a commit
 //! returned and not taken back -- and end the boot there.
 //!
+//! Journal appends leave the domain thread the same way (task-d54):
+//! [`JournaledStore::append`] lends the shared journal to an [`Appender`]
+//! for one synced group append. [`ThreadAppender`] runs it on a thread of
+//! its own; [`ManualAppender`] runs it when a test says so.
+//!
 //! [`JournaledStore::hand_off`]: crate::journaled::JournaledStore::hand_off
+//! [`JournaledStore::append`]: crate::journaled::JournaledStore::append
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use coord_journal_api::engine::JournalEngine;
 use coord_store_api::engine::LocalEngine;
 use coord_types::ids::DomainId;
 
-use crate::journaled::{MaterializeDone, MaterializeJob, Materializer};
+use crate::journaled::{
+    AppendDone, AppendJob, Appender, MaterializeDone, MaterializeJob, Materializer,
+};
 
-/// Called on the materializer's thread each time a commit finishes, so
-/// the domain thread wakes and takes it back.
+/// Called on the materializer's or the appender's thread each time a job
+/// finishes, so the domain thread wakes and takes it back.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// Projection commits on a thread of their own (task-d52).
@@ -228,5 +237,186 @@ impl<E: LocalEngine> Materializer<E> for ManualMaterializer<E> {
             .collect();
         engines.extend(shared.waiting.drain(..).map(MaterializeJob::abandon));
         engines
+    }
+}
+
+/// Journal appends on a thread of their own (task-d54).
+///
+/// The store has at most one append out, and the thread calls the waker
+/// after each. Dropping it ends the thread once a job already submitted
+/// has run; a journal still out is dropped there.
+pub struct ThreadAppender<J: JournalEngine + Send + 'static> {
+    jobs: Option<Sender<AppendJob<J>>>,
+    done: Receiver<AppendDone<J>>,
+    out: usize,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl<J: JournalEngine + Send + 'static> ThreadAppender<J> {
+    /// Start the thread. `waker` is called after each append.
+    pub fn new(waker: Waker) -> std::io::Result<Self> {
+        let (jobs, inbox) = channel::<AppendJob<J>>();
+        let (outbox, done) = channel::<AppendDone<J>>();
+        let thread = std::thread::Builder::new()
+            .name("appender".into())
+            .spawn(move || {
+                while let Ok(job) = inbox.recv() {
+                    if outbox.send(job.run()).is_err() {
+                        return;
+                    }
+                    waker();
+                }
+            })?;
+        Ok(ThreadAppender {
+            jobs: Some(jobs),
+            done,
+            out: 0,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl<J: JournalEngine + Send + 'static> Appender<J> for ThreadAppender<J> {
+    fn submit(&mut self, job: AppendJob<J>) {
+        let jobs = self.jobs.as_ref().expect("open until dropped");
+        // The thread ends only when this sender is dropped or the done
+        // channel is, and neither has happened while `self` lives.
+        jobs.send(job).expect("the appender thread is running");
+        self.out += 1;
+    }
+
+    fn try_take(&mut self) -> Option<AppendDone<J>> {
+        if self.out == 0 {
+            return None;
+        }
+        match self.done.try_recv() {
+            Ok(done) => {
+                self.out -= 1;
+                Some(done)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                panic!("the appender thread ended with an append out")
+            }
+        }
+    }
+
+    fn take(&mut self) -> Option<AppendDone<J>> {
+        if self.out == 0 {
+            return None;
+        }
+        let done = self
+            .done
+            .recv()
+            .expect("the appender thread ended with an append out");
+        self.out -= 1;
+        Some(done)
+    }
+
+    fn reclaim(&mut self) -> Option<J> {
+        self.take().map(AppendDone::into_journal)
+    }
+}
+
+impl<J: JournalEngine + Send + 'static> Drop for ThreadAppender<J> {
+    fn drop(&mut self) {
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Journal appends run only when a test says so (task-d54).
+///
+/// The store owns the appender and the test keeps the
+/// [`ManualAppendHandle`]: an append waits, lent and not started, until
+/// [`ManualAppendHandle::run`]; a finished one waits until the store takes
+/// it back. A store that must wait ([`Appender::take`]) runs it itself, so
+/// waiting never hangs.
+pub struct ManualAppender<J: JournalEngine> {
+    shared: Arc<Mutex<ManualAppends<J>>>,
+}
+
+/// The test's side of a [`ManualAppender`].
+pub struct ManualAppendHandle<J: JournalEngine> {
+    shared: Arc<Mutex<ManualAppends<J>>>,
+}
+
+struct ManualAppends<J: JournalEngine> {
+    waiting: Option<AppendJob<J>>,
+    finished: Option<AppendDone<J>>,
+}
+
+impl<J: JournalEngine + Send> ManualAppender<J> {
+    /// An appender and the handle that runs its appends.
+    pub fn new() -> (Self, ManualAppendHandle<J>) {
+        let shared = Arc::new(Mutex::new(ManualAppends {
+            waiting: None,
+            finished: None,
+        }));
+        (
+            ManualAppender {
+                shared: shared.clone(),
+            },
+            ManualAppendHandle { shared },
+        )
+    }
+}
+
+impl<J: JournalEngine> ManualAppendHandle<J> {
+    /// Whether an append is lent and not started.
+    pub fn waiting(&self) -> bool {
+        self.shared.lock().expect("not poisoned").waiting.is_some()
+    }
+
+    /// Whether an append has run and not been taken back.
+    pub fn finished(&self) -> bool {
+        self.shared.lock().expect("not poisoned").finished.is_some()
+    }
+
+    /// Run the waiting append; whether there was one. Its outcome waits
+    /// for the store to take it back.
+    pub fn run(&self) -> bool {
+        let job = self.shared.lock().expect("not poisoned").waiting.take();
+        let Some(job) = job else {
+            return false;
+        };
+        let done = job.run();
+        self.shared.lock().expect("not poisoned").finished = Some(done);
+        true
+    }
+}
+
+impl<J: JournalEngine + Send> Appender<J> for ManualAppender<J> {
+    fn submit(&mut self, job: AppendJob<J>) {
+        let mut shared = self.shared.lock().expect("not poisoned");
+        assert!(
+            shared.waiting.is_none() && shared.finished.is_none(),
+            "a store has one append out at a time"
+        );
+        shared.waiting = Some(job);
+    }
+
+    fn try_take(&mut self) -> Option<AppendDone<J>> {
+        self.shared.lock().expect("not poisoned").finished.take()
+    }
+
+    fn take(&mut self) -> Option<AppendDone<J>> {
+        if let Some(done) = self.try_take() {
+            return Some(done);
+        }
+        let job = self.shared.lock().expect("not poisoned").waiting.take()?;
+        Some(job.run())
+    }
+
+    /// What has run gives the journal back, outcome unseen; what has not
+    /// gives it back unrun. Either is where a crash could end the boot.
+    fn reclaim(&mut self) -> Option<J> {
+        let mut shared = self.shared.lock().expect("not poisoned");
+        if let Some(done) = shared.finished.take() {
+            return Some(done.into_journal());
+        }
+        shared.waiting.take().map(AppendJob::abandon)
     }
 }
