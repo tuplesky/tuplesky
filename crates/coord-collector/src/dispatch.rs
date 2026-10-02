@@ -86,7 +86,21 @@ struct PendingRead {
     leader: ReplicaId,
     admitted: AdmittedRequest,
     reserved: bool,
-    deadline: MonotonicMillis,
+    /// When it was presented: a fallback's client deadline is measured
+    /// from here, not from the fallback.
+    since: MonotonicMillis,
+    /// When the leader's answer stops being waited for.
+    fallback_at: MonotonicMillis,
+    /// The client's own deadline, if it named one.
+    client_deadline: Option<MonotonicMillis>,
+}
+
+impl PendingRead {
+    /// The earlier of the fallback and the client's deadline.
+    fn deadline(&self) -> MonotonicMillis {
+        self.client_deadline
+            .map_or(self.fallback_at, |d| d.min(self.fallback_at))
+    }
 }
 
 /// What a leader's answer to a read, or its absence, came to.
@@ -292,10 +306,29 @@ impl Dispatcher {
                     }
                 };
                 let reserved = admitted.reserved;
+                // A retry key whose read is waiting on its leader is bound
+                // to that read: another payload under it is a conflict,
+                // as it would be under an ordered command.
+                if let Some(waiting) = self.reads.get(&key) {
+                    let command = request
+                        .logical()
+                        .ok()
+                        .and_then(|logical| CommandId::derive(&key, &logical).ok());
+                    if command != Some(waiting.command) {
+                        self.admission.settled_reservation(&key, reserved);
+                        return self.respond(
+                            connection,
+                            key,
+                            command.unwrap_or_else(|| command_of(&key)),
+                            codes::REQUEST_IDENTITY_CONFLICT,
+                            "retry key bound to another payload",
+                        );
+                    }
+                }
                 if let Some(read) = self.read_for(&request) {
                     return self.send_read(now, connection, read, admitted.request, reserved);
                 }
-                self.order(now, connection, key, &admitted.request, reserved)
+                self.order(now, now, connection, key, &admitted.request, reserved)
             }
             MessageV1::ResolveRequest(resolve) => {
                 if caller.role != coord_types::wire_v1::PeerRole::Client
@@ -686,15 +719,19 @@ impl Dispatcher {
     /// Submit an admitted request for ordering: the path every request
     /// that is not a leader read takes, and the one a refused read takes
     /// after.
+    ///
+    /// `since` is when the request was presented, which its client
+    /// deadline is measured from.
     fn order(
         &mut self,
         now: MonotonicMillis,
+        since: MonotonicMillis,
         connection: u64,
         key: RetryKey,
         admitted: &AdmittedRequest,
         reserved: bool,
     ) -> Action {
-        match self.collector.submit(now, admitted) {
+        match self.collector.submit_since(now, since, admitted) {
             Ok(Submitted::FanOut(fan_out)) => {
                 self.attach(connection, key);
                 Action::FanOut(fan_out)
@@ -737,11 +774,15 @@ impl Dispatcher {
     /// The leader and the request of a read the barrier would serve, if
     /// `request` is one and this collector is sending reads there.
     ///
-    /// Not an invocation the collector is already ordering: a retry of a
-    /// read that went the ordered way waits for that answer, since the
-    /// command may already have executed.
+    /// Not an invocation the collector has bound, being collected or
+    /// retained: a retry of a read that went the ordered way waits for
+    /// that answer, or is given it, since the command may already have
+    /// executed -- whether or not a caller is still attached to it.
     fn read_for(&self, request: &RequestV1) -> Option<(Ballot, CommandId, RequestV1)> {
-        if !self.leader_reads || self.owner.contains_key(&request.retry_key) {
+        if !self.leader_reads
+            || self.owner.contains_key(&request.retry_key)
+            || self.collector.is_bound(&request.retry_key)
+        {
             return None;
         }
         let logical = request.logical().ok().filter(servable)?;
@@ -760,14 +801,21 @@ impl Dispatcher {
         reserved: bool,
     ) -> Action {
         let key = request.retry_key;
-        // The same read presented again before its answer: this caller
-        // waits for that one.
+        let client_deadline =
+            (request.deadline_ms > 0).then(|| now.plus(u64::from(request.deadline_ms)));
+        // The same read presented again before its answer (its payload
+        // checked by the caller): this caller waits for that one, under
+        // the deadline it presented, as an attach to an ordered command
+        // does.
         if let Some(waiting) = self.reads.get_mut(&key) {
+            debug_assert_eq!(waiting.command, command);
             waiting.connection = connection;
+            waiting.since = now;
+            waiting.client_deadline = client_deadline;
             return Action::Pending { command };
         }
         let Ok(frame) = read_frame(&ReadV1 { ballot, request }) else {
-            return self.order(now, connection, key, &admitted, reserved);
+            return self.order(now, now, connection, key, &admitted, reserved);
         };
         self.reads.insert(
             key,
@@ -777,7 +825,9 @@ impl Dispatcher {
                 leader: ballot.leader,
                 admitted,
                 reserved,
-                deadline: now.plus(READ_FALLBACK_MILLIS),
+                since: now,
+                fallback_at: now.plus(READ_FALLBACK_MILLIS),
+                client_deadline,
             },
         );
         Action::Read(ReadPlan {
@@ -825,6 +875,7 @@ impl Dispatcher {
         }
         Some(ReadResolution::Ordered(self.order(
             now,
+            waiting.since,
             waiting.connection,
             key,
             &waiting.admitted,
@@ -832,20 +883,37 @@ impl Dispatcher {
         )))
     }
 
-    /// Reads whose leader has not answered by their deadline, ordered
-    /// instead (task-d50).
+    /// Reads whose leader has not answered by their deadline (task-d50).
+    ///
+    /// One whose client deadline passed is answered as an ordered
+    /// command is at its deadline: pending, resolvable by identity. A
+    /// read never ordered changed nothing, and resolving it finds
+    /// nothing. Any other is ordered instead, under the deadline it was
+    /// presented with.
     pub fn expire_reads(&mut self, now: MonotonicMillis) -> Vec<Action> {
         let due: Vec<RetryKey> = self
             .reads
             .iter()
-            .filter(|(_, r)| r.deadline <= now)
+            .filter(|(_, r)| r.deadline() <= now)
             .map(|(k, _)| *k)
             .collect();
         let mut out = Vec::new();
         for key in due {
             let waiting = self.reads.remove(&key).expect("listed");
+            if waiting.client_deadline.is_some_and(|d| d <= now) {
+                self.admission.settled(&key);
+                out.push(Action::Respond(Delivery {
+                    connection: waiting.connection,
+                    retry_key: key,
+                    frame: MessageV1::Response(codes::pending_response(waiting.command))
+                        .encode()
+                        .expect("bounded"),
+                }));
+                continue;
+            }
             out.push(self.order(
                 now,
+                waiting.since,
                 waiting.connection,
                 key,
                 &waiting.admitted,
@@ -861,6 +929,7 @@ impl Dispatcher {
         let waiting = self.reads.remove(key)?;
         Some(self.order(
             now,
+            waiting.since,
             waiting.connection,
             *key,
             &waiting.admitted,
@@ -870,7 +939,7 @@ impl Dispatcher {
 
     /// The earliest deadline of a read waiting on its leader.
     pub fn next_read_deadline(&self) -> Option<MonotonicMillis> {
-        self.reads.values().map(|r| r.deadline).min()
+        self.reads.values().map(PendingRead::deadline).min()
     }
 
     fn attach(&mut self, connection: u64, key: RetryKey) {

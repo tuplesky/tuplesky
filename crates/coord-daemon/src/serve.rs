@@ -147,6 +147,9 @@ impl Step {
 
     /// Whether the stream this step names stays open after it.
     pub const fn keeps_the_stream(&self) -> bool {
-        matches!(self, Step::Hold(_) | Step::Submit(_) | Step::Watch { .. })
+        matches!(
+            self,
+            Step::Hold(_) | Step::Submit(_) | Step::Read(_) | Step::Watch { .. }
+        )
     }
 }
