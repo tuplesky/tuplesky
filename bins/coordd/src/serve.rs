@@ -1337,6 +1337,18 @@ const FLUSH_QUEUED: usize = 64;
 /// many more are ready (task-d47).
 const FLUSH_EVENTS: u32 = 64;
 
+/// Whether the loop lowers before it takes another event: a full journal
+/// group's worth is queued, or a run of events left a flush owed.
+///
+/// Nothing queued can be journaled while an append is out on the
+/// appender's thread (task-d54), so a full group behind one is not a
+/// reason to flush: the flush would move nothing, and with events still
+/// arriving it would run after every one of them. The appender's wake
+/// takes the append back, and the flush after it lends the group.
+const fn flush_due(queued: usize, appending: bool, owed: bool, since_flush: u32) -> bool {
+    (queued >= FLUSH_QUEUED && !appending) || (owed && since_flush >= FLUSH_EVENTS)
+}
+
 /// Whether the caller's plane is polled before the peer plane this
 /// turn, given how many peer events have been taken since the last
 /// caller's event.
@@ -1756,7 +1768,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // command that is ready from executing for as long as they
             // kept arriving (task-d47).
             let owed = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
-            if (self.queued() >= FLUSH_QUEUED || (owed && self.since_flush >= FLUSH_EVENTS))
+            let appending = matches!(&self.backing, Backing::Voting(v) if v.appending());
+            if flush_due(self.queued(), appending, owed, self.since_flush)
                 && self.stops_on_flush(transport)
             {
                 return;
@@ -4853,8 +4866,9 @@ mod tests {
     use coord_types::ids::{ReplicaId, ReplicaIncarnation};
 
     use super::{
-        PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring, SAID_IN_FULL, addressed,
-        ask_for_payloads_now, payload_batch_size, poll_api_first,
+        FLUSH_EVENTS, FLUSH_QUEUED, PAYLOAD_RETRY, PEER_BEFORE_API, RECURRING_REASONS, Recurring,
+        SAID_IN_FULL, addressed, ask_for_payloads_now, flush_due, payload_batch_size,
+        poll_api_first,
     };
 
     /// A session this node has not projected yet is "not yet", not a
@@ -5408,6 +5422,20 @@ mod tests {
     /// 4560 api events and then not one more while its peer arm took
     /// another 80000, and every caller bound to that frontend waited
     /// out its deadline against a node that was otherwise working.
+    /// A full group queued behind an append that is out is not a flush
+    /// (task-d54): it could move nothing until the append is back.
+    #[test]
+    fn a_full_group_behind_an_append_out_is_not_flushed() {
+        assert!(flush_due(FLUSH_QUEUED, false, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED, true, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED * 4, true, false, 0));
+        assert!(!flush_due(FLUSH_QUEUED - 1, false, false, FLUSH_EVENTS));
+        // A flush owed after a run of events is owed whatever is out:
+        // `owes_flush` already leaves out what waits on the append.
+        assert!(flush_due(0, true, true, FLUSH_EVENTS));
+        assert!(!flush_due(0, false, true, FLUSH_EVENTS - 1));
+    }
+
     #[test]
     fn the_peer_planes_priority_is_bounded_so_a_caller_is_never_starved() {
         // Ordinary: the peer plane goes first, which is the ordering

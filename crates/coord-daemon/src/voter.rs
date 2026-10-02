@@ -875,7 +875,13 @@ impl<P: Persistence> Voter<P> {
     /// then. Owed one, the runtime would flush in a loop that moves
     /// nothing.
     pub fn owes_flush(&self) -> bool {
-        (self.queued() > 0 && !self.node.applier().store().appending()) || self.node.can_execute()
+        (self.queued() > 0 && !self.appending()) || self.node.can_execute()
+    }
+
+    /// Whether a journal append is out on the appender's thread, its
+    /// outcome not yet taken back (task-d54).
+    pub fn appending(&self) -> bool {
+        self.node.applier().store().appending()
     }
 
     /// Batches this voter submitted and has not lowered yet.
