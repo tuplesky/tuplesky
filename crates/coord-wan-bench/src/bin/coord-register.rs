@@ -136,6 +136,27 @@ struct Counts {
     unknown_writes: u64,
     lost_reads: u64,
     reconnects: u64,
+    /// Operations that did not complete, by kind and bounded reason.
+    why: std::collections::BTreeMap<String, u64>,
+}
+
+/// A bounded name for how an operation failed to complete.
+fn reason(outcome: &Result<coord_sdk::Outcome, Answer>) -> String {
+    match outcome {
+        Ok(coord_sdk::Outcome::Established { result, .. }) => {
+            match postcard::from_bytes::<coord_state::Response>(result) {
+                Ok(response) => format!("{:?}", response.outcome)
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .take(48)
+                    .collect::<String>()
+                    .to_lowercase(),
+                Err(_) => "undecodable-result".into(),
+            }
+        }
+        Ok(other) => coord_wan_bench::caller::refusal(other),
+        Err(answer) => answer.reason(),
+    }
 }
 
 async fn caller(
@@ -203,6 +224,10 @@ async fn caller(
                 counts.writes += 1;
             } else {
                 counts.unknown_writes += 1;
+                *counts
+                    .why
+                    .entry(format!("write:{}", reason(&outcome)))
+                    .or_default() += 1;
             }
             ops.push(Op {
                 caller: index,
@@ -252,17 +277,27 @@ async fn caller(
                                 kind: OpKind::Read { value, revision },
                             });
                         }
-                        None => counts.lost_reads += 1,
+                        None => {
+                            counts.lost_reads += 1;
+                            *counts
+                                .why
+                                .entry(format!("read:{}", reason(&outcome)))
+                                .or_default() += 1;
+                        }
                     }
                     unknown_in_row = 0;
                 }
-                Err(Answer::Unknown) => {
-                    counts.lost_reads += 1;
-                    unknown_in_row += 1;
-                }
                 _ => {
                     counts.lost_reads += 1;
-                    unknown_in_row = 0;
+                    *counts
+                        .why
+                        .entry(format!("read:{}", reason(&outcome)))
+                        .or_default() += 1;
+                    unknown_in_row = if matches!(outcome, Err(Answer::Unknown)) {
+                        unknown_in_row + 1
+                    } else {
+                        0
+                    };
                 }
             }
         }
@@ -360,6 +395,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         counts.unknown_writes += c.unknown_writes;
         counts.lost_reads += c.lost_reads;
         counts.reconnects += c.reconnects;
+        for (why, n) in c.why {
+            *counts.why.entry(why).or_default() += n;
+        }
     }
     history.sort_by_key(|op| op.invoked_ns);
     let mut lines = String::new();
@@ -386,6 +424,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         "writes_established": counts.writes,
         "writes_unknown": counts.unknown_writes,
         "reconnects": counts.reconnects,
+        "not_completed_by_reason": counts.why,
         "violations": violations.len(),
         "first_violations": violations.iter().take(10).collect::<Vec<_>>(),
     });

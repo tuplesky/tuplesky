@@ -8,8 +8,11 @@
 # SCENARIO is one of:
 #
 #   pause      the leader is stopped (SIGSTOP) for FAULT_FOR seconds at
-#              FAULT_AT, and whichever voter leads afterwards is stopped
-#              the same way FAULT_GAP seconds later
+#              FAULT_AT -- shorter than the transport's 30 s idle
+#              timeout, so the others keep following it -- and the voter
+#              leading FAULT_GAP seconds later is stopped for LONG_PAUSE
+#              seconds, past that timeout: the others elect a leader and
+#              the stopped one comes back still believing it leads
 #   kill       the leader is killed (SIGKILL) at FAULT_AT and started
 #              again FAULT_FOR seconds later, then the voter leading
 #              after that is killed and restarted the same way
@@ -30,7 +33,9 @@
 #
 # Inputs, all optional:
 #   COORDD, HARNESS, REGISTER   binaries (default target/release)
-#   RUN_SECONDS                 length of the run           (default 40)
+#   RUN_SECONDS                 length of the run (default 40, and for
+#                               pause long enough for both pauses)
+#   LONG_PAUSE                  the second pause, seconds   (default 40)
 #   CALLERS                     callers per frontend         (default 2)
 #   KEYS                        registers                    (default 4)
 #   FAULT_AT, FAULT_FOR         seconds                (default 10, 5)
@@ -47,12 +52,17 @@ OUT_DIR=$(cd "$OUT_DIR" && pwd)
 COORDD=${COORDD:-$ROOT/target/release/coordd}
 HARNESS=${HARNESS:-$ROOT/target/release/coord-harness}
 REGISTER=${REGISTER:-$ROOT/target/release/coord-register}
-RUN_SECONDS=${RUN_SECONDS:-40}
-CALLERS=${CALLERS:-2}
-KEYS=${KEYS:-4}
 FAULT_AT=${FAULT_AT:-10}
 FAULT_FOR=${FAULT_FOR:-5}
 FAULT_GAP=${FAULT_GAP:-12}
+LONG_PAUSE=${LONG_PAUSE:-40}
+if [ "$SCENARIO" = pause ]; then
+  RUN_SECONDS=${RUN_SECONDS:-$((FAULT_AT + FAULT_GAP + LONG_PAUSE + 20))}
+else
+  RUN_SECONDS=${RUN_SECONDS:-40}
+fi
+CALLERS=${CALLERS:-2}
+KEYS=${KEYS:-4}
 STATE_ROOT=${STATE_ROOT:-/dev/shm}
 
 case "$SCENARIO" in pause|kill|partition) ;; *)
@@ -169,13 +179,13 @@ at() { # wait until N seconds into the run
   while [ $(( $(date +%s) - started )) -lt "$1" ]; do sleep 0.2; done
 }
 
-pause_leader() {
+pause_leader() { # SECONDS
   local who pid
   who=$(leader); pid=$(pid_of "$who")
   [ -n "$pid" ] || { note "no process for $who"; return; }
-  note "stop $who (pid $pid)"
+  note "stop $who (pid $pid) for $1 s"
   kill -STOP "$pid"; STOPPED=$pid
-  sleep "$FAULT_FOR"
+  sleep "$1"
   kill -CONT "$pid"; STOPPED=""
   note "continue $who"
 }
@@ -221,8 +231,8 @@ partition_leader() {
 
 case "$SCENARIO" in
   pause)
-    at "$FAULT_AT"; pause_leader
-    at "$((FAULT_AT + FAULT_GAP))"; pause_leader ;;
+    at "$FAULT_AT"; pause_leader "$FAULT_FOR"
+    at "$((FAULT_AT + FAULT_GAP))"; pause_leader "$LONG_PAUSE" ;;
   kill)
     at "$FAULT_AT"; kill_leader
     at "$((FAULT_AT + FAULT_GAP))"; kill_leader ;;

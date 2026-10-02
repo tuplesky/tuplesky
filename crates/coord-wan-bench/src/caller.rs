@@ -308,7 +308,7 @@ impl Caller {
 
 /// A bounded name for a refusal. Never the detail bytes: a report is
 /// published and a detail is not a label.
-fn refusal(outcome: &coord_sdk::Outcome) -> String {
+pub fn refusal(outcome: &coord_sdk::Outcome) -> String {
     match outcome {
         coord_sdk::Outcome::Established { .. } => "established".into(),
         coord_sdk::Outcome::Unknown => "unknown".into(),
