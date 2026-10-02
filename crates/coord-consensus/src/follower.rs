@@ -4476,7 +4476,11 @@ impl Follower {
             // The runtime's to record, not the machine's (task-d27).
             ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::Refused { .. }
-            | ProtocolMessage::FloorReadiness { .. } => Vec::new(),
+            | ProtocolMessage::FloorReadiness { .. }
+            // The runtime answers a read confirmation from the promise it
+            // can see (task-d50): it is not a machine transition.
+            | ProtocolMessage::ReadConfirm { .. }
+            | ProtocolMessage::ReadConfirmed { .. } => Vec::new(),
         }
     }
 

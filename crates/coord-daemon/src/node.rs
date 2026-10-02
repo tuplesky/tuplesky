@@ -404,6 +404,10 @@ pub struct Outbound {
     pub views: Vec<coord_core::effect::ReadViewRequest>,
     /// Entropy requests, answered with [`Event::Entropy`].
     pub entropy: Vec<u64>,
+    /// Answers to reads the leader read barrier held, each an encoded
+    /// `ReadAnswerV1` frame for the collector that sent the read
+    /// (task-d50).
+    pub reads: Vec<(crate::voter::Origin, Vec<u8>)>,
 }
 
 impl Outbound {
@@ -415,6 +419,7 @@ impl Outbound {
         self.cancel.extend(other.cancel);
         self.views.extend(other.views);
         self.entropy.extend(other.entropy);
+        self.reads.extend(other.reads);
     }
 
     /// Whether the round asked for nothing.
@@ -425,6 +430,7 @@ impl Outbound {
             && self.cancel.is_empty()
             && self.views.is_empty()
             && self.entropy.is_empty()
+            && self.reads.is_empty()
     }
 }
 

@@ -2369,12 +2369,12 @@ Write the design amendment first, then implement it:
   - Speculation is not driven in `coordd`: its release still waits for the command and its prefix to be learned, so it would not remove the journal sync or the round trips.
 - **The fast path stays as it is.** Measured at the leader, its share was 56% with one caller, 6% with ten and 2% with fifty. A finer conflict key is a separate correctness review. The share is reported again with reads off the chain.
 - **Wire.**
-  - Two collector kinds: `ReadV1` (0x0106, frontend to leader) and `ReadAnswerV1` (0x0702, leader to frontend).
+  - Two collector kinds: `ReadV1` (0x0107, frontend to leader) and `ReadAnswerV1` (0x0702, leader to frontend).
   - Two protocol messages appended to `ProtocolMessage`: `ReadConfirm` and `ReadConfirmed`.
   - The 0x08xx read-fence range stays reserved for task-o05's ordered fence.
 - **Acceptance:**
   - At ten callers on this container's disk, a register read's median is no more than one network round trip plus the leader's queue. In practice, a fraction of today's, which pays two journal syncs and the slow path.
-  - A linearizability check (`coord-oracle`) of a register history through every frontend, under a leader kill and a pause, finds no violation. It fails when the confirmation round is skipped, as a negative control.
+  - A linearizability check of a register history through every frontend (`coord-register`, `scripts/bench/register-faults.sh`) finds no violation under a leader kill, a leader pause and a leader partition. The partition run fails when the confirmation round is skipped (`--features skip-read-confirmation`), as a negative control.
   - The Jepsen client's runs, by the owner of #98, are the external evidence.
 
 <a id="task-d51"></a>

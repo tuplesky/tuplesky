@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use coord_core::event::PeerProvenance;
 use coord_types::ids::{ClusterId, DomainId, ReplicaId, ReplicaIncarnation};
 use coord_types::wire_v1::{
-    BoundedBytes, BoundedVec, COLLECTOR_SUBMIT_VERSION, CloseV1, Frame, HelloAckV1, HelloV1,
-    KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1, PeerRole, SESSION_BIND_VERSION, decode,
+    BoundedBytes, BoundedVec, COLLECTOR_READ_VERSION, COLLECTOR_SUBMIT_VERSION, CloseV1, Frame,
+    HelloAckV1, HelloV1, KIND_COLLECTOR_READ, KIND_COLLECTOR_SUBMIT, KIND_SESSION_BIND, MessageV1,
+    PeerRole, SESSION_BIND_VERSION, decode,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{RecvStream, SendStream, VarInt};
@@ -2273,6 +2274,21 @@ async fn read_request(
                 (frame.version != SESSION_BIND_VERSION).then(|| {
                     CloseReason::Malformed(format!("bind frame version {}", frame.version))
                 })
+            } else if frame.kind == KIND_COLLECTOR_READ {
+                // A collector's read for the leader it follows (task-d50):
+                // the third enumerated raw kind, admitted on the same
+                // terms as a submission, since it carries a request made
+                // under somebody else's session.
+                if !peer.identity.role.may_submit_for_clients() {
+                    Some(CloseReason::Rejected("read".into()))
+                } else if frame.version != COLLECTOR_READ_VERSION {
+                    Some(CloseReason::Malformed(format!(
+                        "read frame version {}",
+                        frame.version
+                    )))
+                } else {
+                    None
+                }
             } else if frame.kind == KIND_COLLECTOR_SUBMIT {
                 // A trusted collector's submission: the second
                 // enumerated raw kind, and the only one whose admission

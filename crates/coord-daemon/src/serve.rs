@@ -18,7 +18,7 @@
 //! as closing it. None of those fail a type check, and all of them are
 //! decided here, where a test can state them without a socket.
 
-use coord_collector::{Action, FanOut};
+use coord_collector::{Action, FanOut, ReadPlan};
 use coord_session::Ingress;
 use coord_storage::watch::Registration;
 use coord_transport::CloseCode;
@@ -38,6 +38,9 @@ pub enum Step {
     /// Keep the stream open under the plan's invocation, and send the
     /// plan to the voters first.
     Submit(Box<FanOut>),
+    /// Keep the stream open under the read's invocation, and send it to
+    /// the leader the collector follows first (task-d50).
+    Read(Box<ReadPlan>),
     /// Keep the stream open as this watch's output stream: replay the
     /// registration's revisions onto it, then pump it for as long as the
     /// subscription lasts.
@@ -103,6 +106,7 @@ pub fn step(ingress: Ingress, retry_key: Option<RetryKey>) -> Step {
         Ingress::Action(action) => match action {
             Action::Respond(delivery) => Step::Answer(delivery.frame),
             Action::FanOut(plan) => Step::Submit(Box::new(plan)),
+            Action::Read(plan) => Step::Read(Box::new(plan)),
             Action::Pending { .. } => match retry_key {
                 Some(key) => Step::Hold(key),
                 None => Step::Close {
@@ -136,6 +140,7 @@ impl Step {
         match self {
             Step::Hold(key) => Some(*key),
             Step::Submit(plan) => Some(plan.retry_key),
+            Step::Read(plan) => Some(plan.retry_key),
             _ => None,
         }
     }

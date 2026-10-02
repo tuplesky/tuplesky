@@ -63,7 +63,7 @@ use crate::wire::{SubmitV1, submit_frame};
 
 /// The largest result a client can actually be handed: an API-class
 /// frame, less room for the response's own fields and the frame header.
-const MAX_DELIVERABLE_RESULT_BYTES: usize =
+pub(crate) const MAX_DELIVERABLE_RESULT_BYTES: usize =
     (coord_types::wire_v1::KindRange::Api.max_frame_length() as usize) - 64 * 1024;
 
 /// What a submission envelope may carry beyond its request's own bytes.

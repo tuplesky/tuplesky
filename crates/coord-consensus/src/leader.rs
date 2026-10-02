@@ -1437,6 +1437,33 @@ impl Leader {
         }
     }
 
+    /// The read index of a read arriving now (task-d50; design Section
+    /// 6.3): this ballot's next sequence number. Every command a read
+    /// must see that was learned in this ballot was proposed below it.
+    ///
+    /// `None` while this leader is not leading, and while it has proposed
+    /// nothing in its ballot: what earlier ballots learned is ordered
+    /// ahead of this ballot's first proposal (the chain is total,
+    /// task-d06), so a read waits for one of them to execute, and with
+    /// none there is nothing to wait for that proves it.
+    pub fn read_index(&self) -> Option<u64> {
+        (self.is_leading() && self.seqnum > 0).then_some(self.seqnum)
+    }
+
+    /// Whether every proposal of this ballot below `index` has executed
+    /// here (task-d50). A proposal no longer held executed long ago.
+    pub fn executed_below(&self, index: u64) -> bool {
+        debug_assert!(self.indexes_agree());
+        // The unsettled set is in sequence order, and a settled proposal
+        // is executed (task-d46).
+        self.unsettled
+            .iter()
+            .take_while(|(seqnum, _)| *seqnum < index)
+            .all(|(_, c)| {
+                self.proposals[c].executed || self.table.phase_of(c) >= Some(Phase::Executed)
+            })
+    }
+
     /// Tell every other voter this ballot's commit frontier (task-d09).
     ///
     /// Learning is otherwise all-to-all: a follower commits a command
@@ -2782,6 +2809,8 @@ impl Leader {
             | ProtocolMessage::LeaderReply { .. }
             | ProtocolMessage::Refused { .. }
             | ProtocolMessage::FloorReadiness { .. }
+            | ProtocolMessage::ReadConfirm { .. }
+            | ProtocolMessage::ReadConfirmed { .. }
             | ProtocolMessage::ReportPage(_)
             | ProtocolMessage::PromiseRefused { .. }
             | ProtocolMessage::CatchUpRequest { .. }
