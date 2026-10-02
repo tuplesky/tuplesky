@@ -276,6 +276,14 @@ jobs:
             grep -v '^metrics ' "$log" | tail -n 400
             echo "::endgroup::"
           done
+          # Each voter's last metrics line, whole: the summary reduces it,
+          # and the artifact is not always reachable from where a run is read.
+          echo "::group::Each voter's last metrics line"
+          for log in jepsen/tuplesky/store/latest/n*/coordd.log; do
+            node=$(basename "$(dirname "$log")")
+            echo "$node $(grep '^metrics ' "$log" | tail -n 1)"
+          done
+          echo "::endgroup::"
       - name: Show every voter's execution order around a stop
         if: always()
         # A voter that stops on a command, a release contradicting its own

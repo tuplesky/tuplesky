@@ -138,6 +138,10 @@ class Cost:
     served: int
     refused: int
     waited_ms: int
+    # Commands this voter established on the fast and the slow path
+    # (task-d50); both zero before it.
+    fast: int = 0
+    slow: int = 0
 
 
 def seconds(d) -> float:
@@ -161,6 +165,8 @@ def parse_cost(snapshot: dict) -> Cost | None:
         served=reads.get("served", 0),
         refused=reads.get("refused", 0),
         waited_ms=reads.get("waited_ms", 0),
+        fast=cost.get("established_fast", 0),
+        slow=cost.get("established_slow", 0),
     )
 
 
@@ -558,21 +564,23 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
             reads = any(c.served or c.refused for _, c in costs)
             out.append(
                 "**Domain loop** (each voter's last boot, from the same `metrics` line; busy is time the loop "
-                "spent working rather than waiting for an event, store syncs included"
+                "spent working rather than waiting for an event, store syncs included; fast path is the share of the "
+                "commands this voter established that it established on the fast path"
                 + ("; reads are those its read barrier answered or refused as leader" if reads else "")
                 + ")"
             )
             out.append("")
-            head = "| Node | Executed | Busy (s) | Up (s) | Busy | Busy, last interval | Busy per command (ms) |"
+            head = "| Node | Executed | Busy (s) | Up (s) | Busy | Busy, last interval | Busy per command (ms) | Fast path |"
             if reads:
                 head += " Reads served | Reads refused | Mean read wait (ms) |"
             out.append(head)
-            out.append("| --- " * (7 + (3 if reads else 0)) + "|")
+            out.append("| --- " * (8 + (3 if reads else 0)) + "|")
             for node, c in costs:
                 share = f"{c.busy / c.uptime:.0%}" if c.uptime > 0 else "-"
                 last = f"{c.recent[0] / c.recent[1]:.0%}" if c.recent and c.recent[1] > 0 else "-"
                 per = f"{c.busy * 1000 / c.executed:.2f}" if c.executed else "-"
-                row = f"| {node} | {c.executed} | {c.busy:.1f} | {c.uptime:.1f} | {share} | {last} | {per} |"
+                fast = f"{c.fast / (c.fast + c.slow):.0%} of {c.fast + c.slow}" if c.fast + c.slow else "-"
+                row = f"| {node} | {c.executed} | {c.busy:.1f} | {c.uptime:.1f} | {share} | {last} | {per} | {fast} |"
                 if reads:
                     wait = f"{c.waited_ms / c.served:.1f}" if c.served else "-"
                     row += f" {c.served} | {c.refused} | {wait} |"
