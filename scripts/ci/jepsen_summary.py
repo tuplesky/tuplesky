@@ -145,6 +145,9 @@ class Cost:
     # CPU seconds the domain loop's thread and the whole process used
     # (task-d54); None before it, or where coordd could not read them.
     cpu: tuple[float, float] | None = None
+    # Synced writes the journal counted (its groups, mapping updates and
+    # compactions), or None where it does not count its own.
+    syncs: int | None = None
 
 
 def seconds(d) -> float:
@@ -161,6 +164,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
     recent = (cost.get("recent") or {}).get("Observed")
     reads = cost.get("reads") or {}
     cpu = (cost.get("cpu") or {}).get("Observed")
+    syncs = (cost.get("journal_syncs") or {}).get("Observed")
     return Cost(
         executed=cost.get("executed", 0),
         busy=seconds(cost.get("busy")),
@@ -172,6 +176,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
         fast=cost.get("established_fast", 0),
         slow=cost.get("established_slow", 0),
         cpu=(seconds(cpu.get("domain")), seconds(cpu.get("process"))) if isinstance(cpu, dict) else None,
+        syncs=syncs if isinstance(syncs, int) else None,
     )
 
 
@@ -554,7 +559,8 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         if timed:
             out.append(
                 "**Stages** (each voter's last boot, from the last `metrics` line it printed, on its interval or at a clean stop; "
-                "a `Journal` write is one synchronous store write)"
+                "a `Journal` entry is one lowering step on the domain loop's thread, which includes a store sync only where "
+                "the journal's append still runs inline)"
             )
             out.append("")
             out.append("| Node | Stage | Completed | Refused | Mean (ms) | Max (ms) | Total (s) |")
@@ -568,29 +574,35 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         if costs:
             reads = any(c.served or c.refused for _, c in costs)
             cpu = any(c.cpu for _, c in costs)
+            syncs = any(c.syncs is not None for _, c in costs)
             out.append(
                 "**Domain loop** (each voter's last boot, from the same `metrics` line; busy is time the loop "
                 "spent working rather than waiting for an event, store syncs included; fast path is the share of the "
                 "commands this voter established that it established on the fast path"
+                + ("; journal syncs are the synced writes the journal counted, per executed command" if syncs else "")
                 + ("; CPU is what the loop's own thread and the whole process used, so busy less the loop's CPU is "
-                   "mostly time spent waiting on syncs" if cpu else "")
+                   "time the loop was blocked rather than computing" if cpu else "")
                 + ("; reads are those its read barrier answered or refused as leader" if reads else "")
                 + ")"
             )
             out.append("")
             head = "| Node | Executed | Busy (s) | Up (s) | Busy | Busy, last interval | Busy per command (ms) | Fast path |"
+            if syncs:
+                head += " Journal syncs per command |"
             if cpu:
                 head += " Loop CPU per command (ms) | Process CPU per command (ms) |"
             if reads:
                 head += " Reads served | Reads refused | Mean read wait (ms) |"
             out.append(head)
-            out.append("| --- " * (8 + (2 if cpu else 0) + (3 if reads else 0)) + "|")
+            out.append("| --- " * (8 + (1 if syncs else 0) + (2 if cpu else 0) + (3 if reads else 0)) + "|")
             for node, c in costs:
                 share = f"{c.busy / c.uptime:.0%}" if c.uptime > 0 else "-"
                 last = f"{c.recent[0] / c.recent[1]:.0%}" if c.recent and c.recent[1] > 0 else "-"
                 per = f"{c.busy * 1000 / c.executed:.2f}" if c.executed else "-"
                 fast = f"{c.fast / (c.fast + c.slow):.0%} of {c.fast + c.slow}" if c.fast + c.slow else "-"
                 row = f"| {node} | {c.executed} | {c.busy:.1f} | {c.uptime:.1f} | {share} | {last} | {per} | {fast} |"
+                if syncs:
+                    row += f" {c.syncs / c.executed:.2f} |" if c.syncs is not None and c.executed else " - |"
                 if cpu:
                     row += "".join(
                         f" {t * 1000 / c.executed:.2f} |" if c.cpu and c.executed else " - |" for t in (c.cpu or (0, 0))

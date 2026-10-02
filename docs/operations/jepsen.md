@@ -408,9 +408,10 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   last `metrics` line `coordd` printed. It prints one every
   `metrics.interval_seconds` and when its serving loop ends (task-d45), so
   a voter Jepsen stopped with `SIGKILL` still shows its counters as of its
-  last interval. The counts run from that boot. A `Journal` write is one
-  synchronous store write; the raft-engine journal's own sync count
-  (`WriteStats`) is not in that line;
+  last interval. The counts run from that boot. A `Journal` entry is one
+  lowering step on the domain loop's thread; it includes a store sync only
+  where the journal's append still runs inline, since task-d54 moved the
+  group append to a worker;
 * and, from the same line, each voter's domain loop: commands executed,
   the time the loop was busy (working rather than waiting for an event,
   store syncs included) and up, busy as a share of its uptime and of the
@@ -418,10 +419,13 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   commands it established that it established on the fast path
   (task-d50's counters). A leader's loop near
   100% is the limit on throughput; well below it, the limit is elsewhere,
-  such as the runner's CPU. When voters report CPU time (task-d54), two
-  more columns give the CPU per executed command of the loop's own thread
-  and of the whole process; busy less the loop's CPU is mostly the loop
-  waiting on syncs. When a voter's read barrier answered or
+  such as the runner's CPU or the chain of syncs each command waits
+  through. Where the journal counts its own synced writes
+  (`cost.journal_syncs`), a column gives them per executed command. When
+  voters report CPU time (task-d54), two more columns give the CPU per
+  executed command of the loop's own thread and of the whole process;
+  busy less the loop's CPU is time the loop was blocked rather than
+  computing. When a voter's read barrier answered or
   refused reads as leader (task-d50), three more columns give the reads
   served, refused, and a served read's mean wait to its answer.
 
