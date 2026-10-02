@@ -166,7 +166,8 @@ pub use handoff::{
 };
 pub use leader::{
     CONSERVATIVE_KEY, FenceReason, Leader, LeaderConfig, MAX_PROPOSAL_ATTEMPTS, Proposal,
-    REPROPOSE_BATCH, RESEND_BACKOFF_CAP, RESEND_PER_VOTER, Rejection,
+    REPROPOSE_BATCH, RESEND_BACKOFF_CAP, RESEND_HANDOFF_CALLS, RESEND_INTERVAL_CAP,
+    RESEND_LATENCY_SAMPLES, RESEND_PER_VOTER, Rejection, ResendCounts,
 };
 pub use learner::{AppliedOutcome, LearnError, Learner, LearningMode};
 pub use messages::{

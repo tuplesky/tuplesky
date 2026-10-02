@@ -603,6 +603,11 @@ impl<P: Persistence> Voter<P> {
         self.node.payloads_answered()
     }
 
+    /// What this voter's re-sends did since boot (task-d49).
+    pub fn resend_counts(&self) -> coord_consensus::ResendCounts {
+        self.node.resend_counts()
+    }
+
     /// Send this ballot's voters, again, the proposals they have not voted
     /// on. Only a leader sends anything (task-d07).
     pub fn resend_proposals(&mut self) -> Result<Outbound, DriveError> {

@@ -74,6 +74,17 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reading["busy_ms_per_command"], 20.0)
         self.assertAlmostEqual(reading["busy_fraction"], 0.2)
 
+    def test_resends_are_read_per_command_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["resends"] = {
+            "deferred": 0, "decided": 2, "acknowledged": 1, "unanswered": 3,
+            "lost": 2, "late": 1, "handed_off": 0, "duplicate_votes": 4,
+        }
+        reading = cost.per_command("n1", snap)
+        self.assertAlmostEqual(reading["resent_per_command"], 0.06)
+        self.assertAlmostEqual(reading["duplicate_votes_per_command"], 0.04)
+        self.assertNotIn("resent_per_command", cost.per_command("n1", snapshot()))
+
     def test_an_absent_reading_is_absent_not_zero(self):
         with self.assertRaises(cost.Absent):
             cost.per_command("n1", snapshot(syncs_observed=False))

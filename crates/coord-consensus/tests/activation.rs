@@ -157,6 +157,11 @@ struct Cluster {
     asks: Vec<(usize, Vec<CommandId>)>,
     /// Every proposal sent: (from, to).
     proposals_sent: Vec<(usize, u8)>,
+    /// Senders whose frames are parked rather than delivered, until
+    /// [`Cluster::deliver_parked`].
+    hold_from: Vec<u8>,
+    /// Frames parked: (to, from, frame).
+    parked: Vec<(usize, ReplicaId, Vec<u8>)>,
 }
 
 /// How many rounds `Cluster::settle` runs before it calls the cluster
@@ -235,6 +240,8 @@ impl Cluster {
             frontend: Vec::new(),
             asks: Vec::new(),
             proposals_sent: Vec::new(),
+            hold_from: Vec::new(),
+            parked: Vec::new(),
         }
     }
 
@@ -309,6 +316,10 @@ impl Cluster {
                             ProtocolMessage::Sync(_)
                         )
                     {
+                        continue;
+                    }
+                    if self.hold_from.contains(&(i as u8)) {
+                        self.parked.push((dest as usize, from, frame));
                         continue;
                     }
                     self.nodes[dest as usize].inbox.push_back((from, frame));
@@ -460,6 +471,13 @@ impl Cluster {
                 let effects = l.resend_unvoted(coord_consensus::RESEND_PER_VOTER);
                 self.handle(i, effects);
             }
+        }
+    }
+
+    /// Deliver what the senders in `hold_from` sent while held.
+    fn deliver_parked(&mut self) {
+        for (to, from, frame) in core::mem::take(&mut self.parked) {
+            self.nodes[to].inbox.push_back((from, frame));
         }
     }
 
@@ -1489,6 +1507,178 @@ fn a_committed_proposal_behind_a_counted_acknowledgement_is_not_sent_again() {
             .any(|(from, to)| *from == 0 && *to == 2),
         "c2 was committed, and r2 adopted c3 after it"
     );
+}
+
+/// The re-send counts of the leader at `i`.
+fn resend_counts(cluster: &Cluster, i: usize) -> coord_consensus::ResendCounts {
+    let Some(Role::Leader(l)) = &cluster.nodes[i].role else {
+        panic!("node {i} does not lead");
+    };
+    l.resend_counts()
+}
+
+/// A proposal is not re-sent before its answer is due (task-d49).
+///
+/// r2's adoption of c1 is still on its way at the first re-send after
+/// c1 went out. Re-sent then, r2 answered it again from what it kept
+/// and the leader refused that answer as a duplicate: about two a
+/// command with one client, all of them work on the domain thread for
+/// nothing. A re-send now waits an interval after the proposal's first
+/// send, so the first call after it sends nothing.
+#[test]
+fn a_proposal_is_not_resent_before_its_answer_is_due() {
+    let mut cluster = Cluster::new(67);
+    // What r2 sends is held back: its adoption of c1 has not reached the
+    // leader when the timer fires.
+    cluster.hold_from = vec![2];
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    cluster.proposals_sent.clear();
+    cluster.resend();
+    cluster.hold_from.clear();
+    cluster.deliver_parked();
+    cluster.settle();
+    for i in 0..3 {
+        assert_eq!(cluster.nodes[i].executed, vec![c1], "node {i}");
+    }
+    cluster.resend();
+    cluster.settle();
+    assert!(
+        cluster.proposals_sent.is_empty(),
+        "re-sent a proposal whose answer was not due: {:?}",
+        cluster.proposals_sent
+    );
+    let counts = resend_counts(&cluster, 0);
+    assert_eq!(counts.resent(), 0, "{counts:?}");
+    assert_eq!(counts.duplicate_votes, 0, "{counts:?}");
+}
+
+/// A voter that answers slowly is given longer before a re-send
+/// (task-d49).
+///
+/// r2's adoptions take two calls of the re-send timer to reach the
+/// leader. At the floor interval each was re-sent at the first call after
+/// its send and came back twice. Its re-send interval is now the time its
+/// adoptions take: after a few, a command whose adoption takes as long is
+/// not re-sent at all.
+#[test]
+fn a_slow_voter_is_given_its_own_interval() {
+    let mut cluster = Cluster::new(79);
+    let slow = |cluster: &mut Cluster, seq: u64| {
+        cluster.hold_from = vec![2];
+        let c = cluster.admit(seq, 1);
+        cluster.settle();
+        for _ in 0..2 {
+            cluster.resend();
+            cluster.settle();
+        }
+        cluster.hold_from.clear();
+        cluster.deliver_parked();
+        cluster.settle();
+        c
+    };
+    for seq in 1..=3 {
+        slow(&mut cluster, seq);
+    }
+    let learned = resend_counts(&cluster, 0);
+    assert!(learned.late > 0, "{learned:?}");
+    let c4 = slow(&mut cluster, 4);
+    let counts = resend_counts(&cluster, 0);
+    assert_eq!(
+        counts.resent(),
+        learned.resent(),
+        "re-sent a proposal to a voter whose answers take this long: {counts:?}"
+    );
+    assert_eq!(
+        counts.duplicate_votes, learned.duplicate_votes,
+        "{counts:?}"
+    );
+    assert!(cluster.nodes[2].executed.contains(&c4));
+}
+
+/// A proposal lost in transit is re-sent on the second call after it
+/// went out, with more than a window of proposals ahead of it waiting
+/// for answers (task-d49).
+///
+/// With r1 down and r2's acknowledgements lost, every proposal before
+/// the lost one sits in r2's window unanswered, each re-sent and waiting
+/// out its back-off. The window was the voter's first `per_voter`
+/// proposals not adopted, due or not, so those took every place and the
+/// lost proposal behind them was never sent again while they waited:
+/// r2 held everything after it. The window is now the first proposals
+/// that are due.
+#[test]
+fn a_lost_proposal_is_resent_with_a_full_window_ahead_of_it() {
+    let per_voter = coord_consensus::RESEND_PER_VOTER;
+    let mut cluster = Cluster::with_capacity(71, 8 * per_voter);
+    cluster.crash(1);
+    cluster.drop_acks = vec![(2, 0)];
+    let waiting: Vec<CommandId> = (0..(per_voter as u64 + 4))
+        .map(|n| cluster.admit(n + 1, 1))
+        .collect();
+    cluster.settle();
+    // Two calls: the first window is re-sent and waits out its back-off.
+    cluster.resend();
+    cluster.settle();
+    cluster.resend();
+    cluster.settle();
+    cluster.drop_proposals = vec![(0, 2)];
+    let lost = cluster.admit(1000, 1);
+    cluster.settle();
+    cluster.drop_proposals.clear();
+    assert!(
+        !cluster.nodes[2].executed.contains(&lost),
+        "r2 had the lost proposal"
+    );
+    // The first call after it went out is too early; the second sends it.
+    cluster.resend();
+    cluster.settle();
+    cluster.resend();
+    cluster.settle();
+    assert!(
+        cluster.nodes[2].executed.contains(&lost),
+        "the lost proposal was not re-sent within two intervals"
+    );
+    cluster.drop_acks.clear();
+    cluster.settle_resending(8);
+    let mut all = waiting.clone();
+    all.push(lost);
+    for i in [0usize, 2] {
+        assert_eq!(cluster.nodes[i].executed, all, "node {i}");
+    }
+}
+
+/// A decided proposal a voter has not acknowledged is re-sent to it only
+/// until it is `RESEND_HANDOFF_CALLS` old, and is then the voter's to
+/// fetch from executed history (task-d49).
+#[test]
+fn a_decided_proposal_is_left_to_catch_up_once_old() {
+    let handoff = coord_consensus::RESEND_HANDOFF_CALLS as usize;
+    let mut cluster = Cluster::new(73);
+    // r2 never hears from the leader: c1 is decided by r0 and r1.
+    cluster.cut = vec![(0, 2)];
+    let c1 = cluster.admit(1, 1);
+    cluster.settle();
+    assert_eq!(cluster.nodes[0].executed, vec![c1]);
+    cluster.proposals_sent.clear();
+    let mut sent_on = Vec::new();
+    for call in 0..(3 * handoff) {
+        let before = cluster.proposals_sent.len();
+        cluster.resend();
+        cluster.settle();
+        if cluster.proposals_sent[before..]
+            .iter()
+            .any(|(from, to)| *from == 0 && *to == 2)
+        {
+            sent_on.push(call);
+        }
+    }
+    // One, two and four calls after the first send, and not from the
+    // eighth on.
+    assert_eq!(sent_on, vec![1, 2, 4]);
+    let counts = resend_counts(&cluster, 0);
+    assert_eq!(counts.decided, 3, "{counts:?}");
+    assert_eq!(counts.handed_off, 1, "{counts:?}");
 }
 
 /// The same, with the voter restarted before the re-send (task-d07).

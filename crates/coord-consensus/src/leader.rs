@@ -184,6 +184,16 @@ pub struct Proposal {
     /// that executed long ago -- and would be speculated over, and its
     /// result released a second time to a caller that already has it.
     pub executed: bool,
+    /// Whether the proposal's first send went out with its batch: queued
+    /// behind it, and released once it is durable. A re-proposal past
+    /// the first `REPROPOSE_BATCH` is not, and goes out from
+    /// [`Leader::resend_unvoted`] instead.
+    pub published: bool,
+    /// The [`Leader::resend_unvoted`] call count when the first send went
+    /// out (task-d49): once the batch was durable, for a published
+    /// proposal, or the call that sent it, for one that was not. A re-send
+    /// is due an interval of calls after it, the first included.
+    pub sent: Option<u64>,
 }
 
 /// Why the leader stopped leading. A fenced leader admits nothing and
@@ -234,8 +244,9 @@ pub const RESEND_PER_VOTER: usize = 16;
 /// that was behind filled, so what was dropped was the fresh proposals
 /// and commits that would have let it catch up (task-d33). So the gap
 /// between two re-sends of one proposal to one voter doubles, from one
-/// call to this many: the first re-send is as prompt as it was, and a
-/// voter that is merely behind is sent one at most this often.
+/// call to this many, and is never shorter than the voter's re-send
+/// interval (task-d49): a voter that is merely behind is sent one at most
+/// this often.
 ///
 /// Four calls of `coordd`'s 250 ms timer is one second, which is how long
 /// a voter holding work it cannot execute waits before it fetches a
@@ -248,6 +259,124 @@ pub const RESEND_PER_VOTER: usize = 16;
 /// voter costs on every re-send tick and which is cheap enough not to
 /// need it.
 pub const RESEND_BACKOFF_CAP: u32 = 4;
+
+/// The longest re-send interval, in calls of [`Leader::resend_unvoted`]
+/// (task-d49): the cap on what a voter's observed vote latency raises it
+/// to. One second at `coordd`'s 250 ms timer, as [`RESEND_BACKOFF_CAP`],
+/// and for the same reason: a voter holding work it cannot execute for
+/// longer fetches executed history instead.
+pub const RESEND_INTERVAL_CAP: u64 = 4;
+
+/// How many of a voter's latest vote latencies its re-send interval is
+/// taken from (task-d49).
+pub const RESEND_LATENCY_SAMPLES: usize = 128;
+
+/// How many calls of [`Leader::resend_unvoted`] after its first send a
+/// decided proposal is still re-sent to a voter that has not acknowledged
+/// it (task-d49): past it, the leader leaves it to catch-up.
+///
+/// A decided proposal needs no vote, so what it is re-sent for is the
+/// voter: one that lacks it holds everything ordered after it. Eight
+/// calls of `coordd`'s 250 ms timer are two seconds, twice
+/// `coord_daemon::catch_up::STILL_FOR`: a voter that still lacks it has
+/// held that work, its frontier still, long enough to have asked a peer
+/// for executed history, which carries the command (task-d08). At the
+/// floor interval that is three re-sends, one, two and four calls after
+/// the first send. More would load a voter that is that far behind with
+/// frames it cannot use yet: one slow pass fills its control lane, and
+/// each re-send meets the same full lane (task-d46). A proposal that is
+/// not decided is never handed off: its vote may be the one the leader
+/// still needs (task-d15).
+pub const RESEND_HANDOFF_CALLS: u64 = 8;
+
+/// What [`Leader::resend_unvoted`] sent and what came of it (task-d49),
+/// counted since the leader began leading; [`Leader::take_resend_counts`]
+/// hands them over and starts again.
+///
+/// A re-send is classified when it goes out, by what the leader knew of
+/// the voter's answer then: [`ResendCounts::decided`],
+/// [`ResendCounts::acknowledged`] or [`ResendCounts::unanswered`].
+/// Whether an unanswered one was lost or late shows only afterwards: the
+/// voter's adoption arrives once either way, and a late one arrives
+/// again, as a duplicate, when the voter answers the re-send from what it
+/// kept. [`ResendCounts::lost`] is what is left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResendCounts {
+    /// First sends of re-proposals held back from the first batch: not
+    /// re-sends.
+    pub deferred: u64,
+    /// Re-sends of a proposal the leader had decided.
+    pub decided: u64,
+    /// Re-sends of an undecided proposal to a voter that had acknowledged
+    /// it on the fast path, which does not say it holds the proposal
+    /// (task-d07).
+    pub acknowledged: u64,
+    /// Re-sends of an undecided proposal to a voter that had not answered
+    /// it at all.
+    pub unanswered: u64,
+    /// Adoptions counted from a voter after a re-send of the proposal to
+    /// it.
+    pub answered: u64,
+    /// Adoptions refused as duplicates from a voter the proposal was
+    /// re-sent to: its first adoption was on its way when the re-send
+    /// went out.
+    pub late: u64,
+    /// Decided proposals left to catch-up, per voter, once
+    /// [`RESEND_HANDOFF_CALLS`] old.
+    pub handed_off: u64,
+    /// Votes refused as duplicates, fast or slow, re-sent or not.
+    pub duplicate_votes: u64,
+}
+
+impl ResendCounts {
+    /// Re-sends: every send from [`Leader::resend_unvoted`] but the
+    /// deferred first ones.
+    pub const fn resent(&self) -> u64 {
+        self.decided + self.acknowledged + self.unanswered
+    }
+
+    /// Adoptions after a re-send that were not late: the voter lacked the
+    /// proposal, or its adoption of it was lost.
+    pub const fn lost(&self) -> u64 {
+        self.answered.saturating_sub(self.late)
+    }
+
+    /// Add `other`'s counts to these.
+    pub const fn add(&mut self, other: &ResendCounts) {
+        self.deferred += other.deferred;
+        self.decided += other.decided;
+        self.acknowledged += other.acknowledged;
+        self.unanswered += other.unanswered;
+        self.answered += other.answered;
+        self.late += other.late;
+        self.handed_off += other.handed_off;
+        self.duplicate_votes += other.duplicate_votes;
+    }
+}
+
+/// What one send from [`Leader::resend_unvoted`] is (task-d49).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resend {
+    /// The first send of a proposal held back from its batch.
+    Deferred,
+    /// A re-send of a decided proposal.
+    Decided,
+    /// A re-send of one the voter acknowledged on the fast path.
+    Acknowledged,
+    /// A re-send of one the voter has not answered.
+    Unanswered,
+}
+
+/// One proposal's re-sends to one voter (task-d49).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Resent {
+    /// The call from which it may be re-sent again.
+    next: u64,
+    /// The back-off gap last waited, in calls (`RESEND_BACKOFF_CAP`).
+    gap: u32,
+    /// Whether it was left to catch-up (`RESEND_HANDOFF_CALLS`).
+    handed_off: bool,
+}
 
 /// The leader machine of one domain.
 #[derive(Debug)]
@@ -330,11 +459,25 @@ pub struct Leader {
     /// Calls of `resend_unvoted` so far: the clock its back-off is
     /// counted on.
     resend_calls: u64,
-    /// Per proposal and voter it was re-sent to: the call from which it
-    /// may be re-sent again, and the gap that was waited
-    /// (`RESEND_BACKOFF_CAP`). Kept only while the proposal is held and
-    /// the voter has not adopted it.
-    resent: BTreeMap<(CommandId, ReplicaId), (u64, u32)>,
+    /// Per proposal and voter it was re-sent to: when it may be re-sent
+    /// again, and how often it was. Kept only while the proposal is held
+    /// and the voter has not adopted it.
+    resent: BTreeMap<(CommandId, ReplicaId), Resent>,
+    /// Per voter, how many calls of `resend_unvoted` its latest adoptions
+    /// took to arrive after the proposal's first send, newest last and at
+    /// most `RESEND_LATENCY_SAMPLES`: what its re-send interval is taken
+    /// from (task-d49). Only adoptions of proposals not re-sent to it, so
+    /// an answer to a re-send is never read as a slow answer to the first
+    /// send.
+    latency: BTreeMap<ReplicaId, VecDeque<u64>>,
+    /// Adoptions counted after a re-send, by proposal and voter, with the
+    /// calls they took after the first send: a latency sample once a
+    /// second copy shows the first was the answer to the first send, and
+    /// late (task-d49).
+    /// Kept one call after the adoption, with the call count it came at.
+    answered: BTreeMap<(CommandId, ReplicaId), (u64, u64)>,
+    /// What the re-sends did, until the driver takes it (task-d49).
+    counts: ResendCounts,
 }
 
 /// This leader's adoption of its own order, published and waiting on the
@@ -408,6 +551,9 @@ impl Leader {
             joined: config.identity.voters.iter().copied().collect(),
             resend_calls: 0,
             resent: BTreeMap::new(),
+            latency: BTreeMap::new(),
+            answered: BTreeMap::new(),
+            counts: ResendCounts::default(),
             config,
             boot: None,
             alloc: None,
@@ -539,6 +685,9 @@ impl Leader {
             joined: BTreeSet::from([identity.replica]),
             resend_calls: 0,
             resent: BTreeMap::new(),
+            latency: BTreeMap::new(),
+            answered: BTreeMap::new(),
+            counts: ResendCounts::default(),
         };
         // Dependency order among the entries: a command follows every
         // dependency that is itself an entry. A cycle is an invariant
@@ -888,6 +1037,8 @@ impl Leader {
             attempts: 1,
             accepts: true,
             executed: false,
+            published: publish,
+            sent: None,
         });
         // The row is ACCEPT at this ballot (or a decision): once it is
         // durable, it is this leader's adoption of its own order.
@@ -930,10 +1081,27 @@ impl Leader {
     ///
     /// Paced by the caller, which calls it on a timer rather than per
     /// event; bounded per voter per call, so a voter that is gone costs
-    /// at most `per_voter` frames each time. The window is the voter's
-    /// first `per_voter` unadopted proposals, and one of them re-sent
-    /// lately waits out its back-off (`RESEND_BACKOFF_CAP`) rather than
-    /// giving its place to a later one.
+    /// at most `per_voter` frames each time.
+    ///
+    /// A re-send goes out only once its answer is due (task-d49): an
+    /// interval of calls after the proposal's last send, the first send
+    /// included, and longer after each re-send (`RESEND_BACKOFF_CAP`).
+    /// Sent on the first call after it, a proposal that went out a moment
+    /// before was re-sent to a voter that already held it and whose vote
+    /// was on its way, and that vote came back twice, the second refused
+    /// as a duplicate: about two a command with one client. The interval
+    /// is the voter's own: the calls its recent adoptions took to arrive
+    /// (a high percentile, [`RESEND_LATENCY_SAMPLES`] of them), between
+    /// one call and [`RESEND_INTERVAL_CAP`]. The window is the voter's
+    /// first `per_voter` proposals that are due, so a proposal waiting
+    /// out its interval does not keep a lost one behind it from being
+    /// sent.
+    ///
+    /// A decided proposal is re-sent to a voter only until it is
+    /// [`RESEND_HANDOFF_CALLS`] old. After that it is the voter's to fetch
+    /// from executed history (task-d08): the leader needs nothing from
+    /// it, and a voter that is that far behind is loaded by every frame
+    /// it cannot use yet.
     pub fn resend_unvoted(&mut self, per_voter: usize) -> Vec<Effect> {
         let Some(boot) = self.boot else {
             return Vec::new();
@@ -949,6 +1117,9 @@ impl Leader {
                 proposals.contains_key(command)
                     && !votes.get(command).is_some_and(|v| v.adopted_by(voter))
             });
+            // A second copy comes back within a round trip of the first,
+            // or never: a call is long enough to wait for it.
+            self.answered.retain(|_, (_, at)| *at + 1 > call);
         }
         let mut order: Vec<(u64, CommandId)> = self
             .proposals
@@ -960,52 +1131,108 @@ impl Leader {
         let me = self.config.identity.replica;
         let ballot = self.config.quorum.ballot();
         let context = self.ballots.context(boot, ballot, LocalJournalSeq::ZERO);
-        let mut sends = Vec::new();
+        let mut chosen: Vec<(CommandId, ReplicaId, Resend)> = Vec::new();
+        let mut handed: Vec<(CommandId, ReplicaId)> = Vec::new();
         for voter in &self.config.identity.voters {
             if *voter == me {
                 continue;
             }
+            let interval = self.resend_interval(voter);
             let voted = |c: &CommandId| self.votes.get(c).is_some_and(|v| v.adopted_by(voter));
             let through = order
                 .iter()
                 .filter(|(_, c)| voted(c))
                 .map(|(s, _)| *s)
                 .max();
-            let window: Vec<CommandId> = order
-                .iter()
-                .filter(|(s, c)| {
-                    !voted(c)
-                        && (through.is_none_or(|t| *s > t)
-                            || self
-                                .table
-                                .phase_of(c)
-                                .is_none_or(|phase| phase < Phase::Commit))
-                })
-                .take(per_voter)
-                .map(|(_, c)| *c)
-                .collect();
-            for command in &window {
-                let gap = match self.resent.get(&(*command, *voter)) {
-                    Some(&(from, _)) if call < from => continue,
-                    Some(&(_, gap)) => gap.saturating_mul(2).min(RESEND_BACKOFF_CAP),
-                    None => 1,
+            let mut taken = 0;
+            for (seqnum, command) in &order {
+                if taken == per_voter {
+                    break;
+                }
+                if voted(command) {
+                    continue;
+                }
+                let decided = self
+                    .table
+                    .phase_of(command)
+                    .is_some_and(|phase| phase >= Phase::Commit);
+                if decided && through.is_some_and(|t| *seqnum <= t) {
+                    continue;
+                }
+                let resent = self.resent.get(&(*command, *voter));
+                let sent = self.proposals[command].sent;
+                if decided && sent.is_some_and(|at| call >= at.saturating_add(RESEND_HANDOFF_CALLS))
+                {
+                    if resent.is_some_and(|r| !r.handed_off) {
+                        handed.push((*command, *voter));
+                    }
+                    continue;
+                }
+                let kind = match (resent, sent) {
+                    (Some(r), _) if call < r.next => continue,
+                    (None, Some(sent)) if call < sent.saturating_add(interval) => continue,
+                    (None, None) => Resend::Deferred,
+                    _ if decided => Resend::Decided,
+                    _ if self
+                        .votes
+                        .get(command)
+                        .is_some_and(|v| v.voted().contains(voter)) =>
+                    {
+                        Resend::Acknowledged
+                    }
+                    _ => Resend::Unanswered,
                 };
-                self.resent
-                    .insert((*command, *voter), (call + u64::from(gap), gap));
-                let p = &self.proposals[command];
-                let frame = self.proposal_frame(p);
-                let to = PeerId {
-                    replica: *voter,
-                    incarnation: ReplicaIncarnation::ZERO,
-                };
-                sends.push(PendingSend {
-                    context,
-                    requires: alloc::vec![p.barrier],
-                    to,
-                    frame,
-                });
-                sends.extend(self.own_adoption_send(*command, to));
+                taken += 1;
+                chosen.push((*command, *voter, kind));
             }
+        }
+        for key in handed {
+            if let Some(r) = self.resent.get_mut(&key) {
+                r.handed_off = true;
+                self.counts.handed_off += 1;
+            }
+        }
+        let mut sends = Vec::new();
+        for (command, voter, kind) in chosen {
+            match kind {
+                Resend::Deferred => {
+                    let p = self.proposals.get_mut(&command).expect("in the order");
+                    p.sent.get_or_insert(call);
+                    self.counts.deferred += 1;
+                }
+                kind => {
+                    let interval = self.resend_interval(&voter);
+                    let r = self.resent.entry((command, voter)).or_insert(Resent {
+                        next: 0,
+                        gap: 0,
+                        handed_off: false,
+                    });
+                    r.gap = if r.gap == 0 {
+                        1
+                    } else {
+                        r.gap.saturating_mul(2).min(RESEND_BACKOFF_CAP)
+                    };
+                    r.next = call + u64::from(r.gap).max(interval);
+                    match kind {
+                        Resend::Decided => self.counts.decided += 1,
+                        Resend::Acknowledged => self.counts.acknowledged += 1,
+                        _ => self.counts.unanswered += 1,
+                    }
+                }
+            }
+            let p = &self.proposals[&command];
+            let frame = self.proposal_frame(p);
+            let to = PeerId {
+                replica: voter,
+                incarnation: ReplicaIncarnation::ZERO,
+            };
+            sends.push(PendingSend {
+                context,
+                requires: alloc::vec![p.barrier],
+                to,
+                frame,
+            });
+            sends.extend(self.own_adoption_send(command, to));
         }
         // A voter that has not promised this ballot is asked to, with the
         // frontier this leader executed through, which a late joiner has
@@ -1983,6 +2210,8 @@ impl Leader {
             attempts: 1,
             accepts: false,
             executed: false,
+            published: true,
+            sent: None,
         });
         alloc::vec![persist]
     }
@@ -2035,8 +2264,13 @@ impl Leader {
         {
             match event {
                 StorageEvent::JournalDurable { .. } => {
+                    let calls = self.resend_calls;
                     if let Some(p) = self.proposals.get_mut(&command) {
                         p.durable = true;
+                        // Its first send was released with the batch.
+                        if p.published && p.sent.is_none() {
+                            p.sent = Some(calls);
+                        }
                     }
                     self.settle(command);
                 }
@@ -2661,11 +2895,86 @@ impl Leader {
             }
             return Vec::new();
         };
+        let slow = matches!(vote, Vote::Slow(_));
         if let Err(e) = set.add(vote) {
+            // Nothing was counted, so nothing can be learned or released:
+            // a refusal costs the lookup that found it (task-d49).
+            if e == VoteError::Duplicate {
+                self.counts.duplicate_votes += 1;
+                if slow && let Some((took, _)) = self.answered.remove(&(command, from)) {
+                    self.counts.late += 1;
+                    self.sample_latency(from, took);
+                }
+            }
             self.rejections.push(Rejection::Vote(e));
+            return Vec::new();
+        }
+        if slow && from != self.config.identity.replica {
+            self.note_adoption(command, from);
         }
         self.learn();
         self.release_ready()
+    }
+
+    /// A voter's adoption of `command` was counted: a sample of its vote
+    /// latency, or the answer to a re-send (task-d49).
+    ///
+    /// An adoption of a proposal that was re-sent may answer either send,
+    /// so it is no sample yet (Karn's rule): only a second copy, refused
+    /// as a duplicate, shows that the first answered the first send.
+    /// Without those, a voter slower than its interval would be re-sent
+    /// to every time and its interval would never learn it is slow.
+    fn note_adoption(&mut self, command: CommandId, from: ReplicaId) {
+        let Some(sent) = self.proposals.get(&command).and_then(|p| p.sent) else {
+            return;
+        };
+        let took = self.resend_calls.saturating_sub(sent);
+        if self.resent.contains_key(&(command, from)) {
+            self.counts.answered += 1;
+            self.answered
+                .insert((command, from), (took, self.resend_calls));
+            return;
+        }
+        self.sample_latency(from, took);
+    }
+
+    fn sample_latency(&mut self, voter: ReplicaId, took: u64) {
+        let samples = self.latency.entry(voter).or_default();
+        if samples.len() == RESEND_LATENCY_SAMPLES {
+            samples.pop_front();
+        }
+        samples.push_back(took);
+    }
+
+    /// The calls a re-send to `voter` waits after the last send
+    /// (task-d49): the 99th percentile of how many its latest adoptions
+    /// took, between one and [`RESEND_INTERVAL_CAP`].
+    ///
+    /// An adoption that arrived before the next call took none, and one
+    /// that took `k` would have been re-sent by an interval below `k`. So
+    /// a voter whose adoptions all arrive within a call is re-sent to on
+    /// the second call after a send at the earliest, a quarter to half a
+    /// second at `coordd`'s timer, which is today's floor; one that is
+    /// slower is waited for as long as it usually takes.
+    fn resend_interval(&self, voter: &ReplicaId) -> u64 {
+        let Some(samples) = self.latency.get(voter).filter(|s| !s.is_empty()) else {
+            return 1;
+        };
+        let mut sorted: Vec<u64> = samples.iter().copied().collect();
+        sorted.sort_unstable();
+        let at = (sorted.len() * 99).div_ceil(100).saturating_sub(1);
+        sorted[at].clamp(1, RESEND_INTERVAL_CAP)
+    }
+
+    /// What the re-sends did since [`Leader::take_resend_counts`] was
+    /// last called (task-d49).
+    pub const fn resend_counts(&self) -> ResendCounts {
+        self.counts
+    }
+
+    /// What the re-sends did since this was last called (task-d49).
+    pub fn take_resend_counts(&mut self) -> ResendCounts {
+        core::mem::take(&mut self.counts)
     }
 }
 
