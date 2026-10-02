@@ -667,7 +667,7 @@ impl<P: Persistence> Node<P> {
             && !self.can_execute()
         {
             let mut next = Vec::new();
-            self.lower_once(&mut next, false)?;
+            self.lower_once(&mut next, Lowering::Lower)?;
             out.absorb(self.carry_out(next, ballot)?);
         }
         Ok(out)
@@ -685,7 +685,12 @@ impl<P: Persistence> Node<P> {
         let mut attempts = self.applier.store().queued() + 1;
         while self.applier.store().queued() > 0 && attempts > 0 {
             let before = self.applier.store().queued();
-            self.lower_once(next, self.grouped)?;
+            let lowering = if self.grouped {
+                Lowering::Journal
+            } else {
+                Lowering::Lower
+            };
+            self.lower_once(next, lowering)?;
             if self.applier.store().queued() >= before {
                 break;
             }
@@ -1314,17 +1319,19 @@ impl<P: Persistence> Node<P> {
     }
 
     /// Lower one group and hand what it made durable to the outbox and
-    /// the machine; the machine's answers join `next`. `journal_only`
-    /// journals it without materializing it ([`Persistence::journal`]).
-    fn lower_once(&mut self, next: &mut Vec<Effect>, journal_only: bool) -> Result<(), DriveError> {
+    /// the machine; the machine's answers join `next`. How it lowers is
+    /// `lowering`'s.
+    fn lower_once(&mut self, next: &mut Vec<Effect>, lowering: Lowering) -> Result<(), DriveError> {
         let store = self.applier.store_mut();
-        let mut outcome = Self::measured(self.recorder.as_deref(), Stage::Journal, || {
-            if journal_only {
-                store.journal()
-            } else {
-                store.lower()
-            }
-        })
+        let mut outcome = Self::measured(
+            self.recorder.as_deref(),
+            Stage::Journal,
+            || match lowering {
+                Lowering::Lower => store.lower(),
+                Lowering::Journal => store.journal(),
+                Lowering::TakeBack => store.take_back(),
+            },
+        )
         .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
         // Indeterminate is not "failed": the group's outcome is unknown,
         // and what settles it is the store's own record, read back by a
@@ -1415,7 +1422,7 @@ impl<P: Persistence> Node<P> {
             if before == 0 {
                 break;
             }
-            self.lower_once(next, false)?;
+            self.lower_once(next, Lowering::Lower)?;
             if self.applier.store().queued() >= before {
                 break;
             }
@@ -1632,8 +1639,11 @@ impl<P: Persistence> Node<P> {
     ///
     /// A journal append out on the appender's thread (task-d54) is taken
     /// back here as well, once it has finished: what it made durable
-    /// releases the sends that waited on it, its facts go to the machine,
-    /// and what was queued meanwhile goes out as the next append.
+    /// releases the sends that waited on it and its facts go to the
+    /// machine. What was queued meanwhile is not lent here: the runtime's
+    /// next flush lends it, once the events that arrived during the sync
+    /// have been taken in, so the group holds all of them -- as a sync on
+    /// this thread left them all to the flush after it.
     pub fn settle(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
         if !self.applier.pipelined() {
             return Ok(Outbound::default());
@@ -1641,7 +1651,7 @@ impl<P: Persistence> Node<P> {
         let mut out = Outbound::default();
         if self.applier.store().appending() {
             let mut next = Vec::new();
-            self.lower_once(&mut next, true)?;
+            self.lower_once(&mut next, Lowering::TakeBack)?;
             self.unreleased = true;
             out.absorb(self.carry_out(next, ballot)?);
         }
@@ -1814,4 +1824,16 @@ fn floor_effects(
         }
     }
     effects
+}
+
+/// How [`Node::lower_once`] lowers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lowering {
+    /// Journal and materialize ([`Persistence::lower`]).
+    Lower,
+    /// Journal only ([`Persistence::journal`], task-d47).
+    Journal,
+    /// Take back a journal append that has finished, and lend nothing
+    /// ([`Persistence::take_back`], task-d54).
+    TakeBack,
 }

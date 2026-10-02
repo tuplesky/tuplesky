@@ -1828,6 +1828,42 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         }
     }
 
+    /// Take back the append the [`Appender`] has finished, if one is out,
+    /// without waiting and without lending the next group (task-d54).
+    ///
+    /// What it made durable is reported as [`JournaledStore::append`]
+    /// reports it. What is queued stays queued for the next
+    /// [`JournaledStore::append`]: a caller woken by the appender takes
+    /// the outcome at once, and leaves the next group to the point where
+    /// it would lower anyway, so that the group holds everything that
+    /// arrived during the sync rather than what had been read when the
+    /// wake came.
+    pub fn take_back_append(&mut self) -> Result<FlushReport, JournaledError> {
+        let mut report = FlushReport::default();
+        report.events.append(&mut self.deferred_events);
+        report.indeterminate |= std::mem::take(&mut self.deferred_uncertain);
+        let taken = match self.appender.as_mut() {
+            Some(appender) if self.appending.is_some() => match appender.try_take() {
+                Some(done) => self.take_append(done),
+                None => Ok(FlushReport::default()),
+            },
+            _ => Ok(FlushReport::default()),
+        };
+        match taken {
+            Ok(taken) => {
+                report.absorb(taken);
+                self.cost.charge(&report);
+                Ok(report)
+            }
+            Err(e) => {
+                self.cost.charge(&report);
+                self.deferred_events.append(&mut report.events);
+                self.deferred_uncertain |= report.indeterminate;
+                Err(e)
+            }
+        }
+    }
+
     /// [`JournaledStore::append`] with an appender: take back a finished
     /// append, and lend the journal for the next group if none is out.
     fn lend_append(&mut self) -> Result<FlushReport, JournaledError> {

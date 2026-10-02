@@ -184,6 +184,14 @@ pub trait Persistence {
         false
     }
 
+    /// Take back a journal append that has finished on another thread,
+    /// without waiting and without starting the next (task-d54); what it
+    /// made durable is reported. Nothing is out where nothing is
+    /// pipelined.
+    fn take_back(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
     /// Take back the projection commits that have finished, without
     /// waiting, and hand what is journaled and not materialized to the
     /// next one (task-d52). The facts of the commits taken back are
@@ -535,6 +543,13 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
 
     fn appending(&self) -> bool {
         self.store.appending()
+    }
+
+    fn take_back(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .take_back_append()
+            .map(lowered_from_journal)
+            .map_err(engine)
     }
 
     fn hand_off(&mut self) -> Result<Lowered, EngineError> {
