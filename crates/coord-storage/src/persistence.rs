@@ -169,6 +169,43 @@ pub trait Persistence {
         None
     }
 
+    /// Whether projection commits leave the caller's thread (task-d52):
+    /// whether [`Persistence::hand_off`] returns before what it hands
+    /// over has materialized.
+    fn pipelined(&self) -> bool {
+        false
+    }
+
+    /// Take back the projection commits that have finished, without
+    /// waiting, and hand what is journaled and not materialized to the
+    /// next one (task-d52). The facts of the commits taken back are
+    /// reported; the rest come with a later call.
+    ///
+    /// Where nothing is pipelined this is [`Persistence::lower`].
+    fn hand_off(&mut self) -> Result<Lowered, EngineError> {
+        self.lower()
+    }
+
+    /// Wait for every projection commit out and take it back (task-d52).
+    /// Nothing is out where nothing is pipelined.
+    fn drain(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
+    /// The execution position the projection has committed, as far as
+    /// this coordinator has taken the outcome back: what a result may be
+    /// released at (task-d52).
+    fn materialized_through(&self) -> Result<coord_types::ids::ExecutionPosition, EngineError> {
+        let gated = self.reader().snapshot().map_err(|e| match e {
+            crate::view::ViewError::Engine(e) => e,
+            other => EngineError::new(
+                coord_store_api::engine::ErrorClass::Busy,
+                format!("no durable view: {other:?}"),
+            ),
+        })?;
+        Ok(gated.meta().frontier.execution_position)
+    }
+
     /// Resolve an indeterminate outcome against what is actually durable.
     fn reconcile(&mut self) -> Result<Lowered, EngineError>;
 
@@ -482,6 +519,29 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
             lowering: self.store.cost(),
             journal_syncs: self.store.journal().syncs(),
         })
+    }
+
+    fn pipelined(&self) -> bool {
+        self.store.pipelined()
+    }
+
+    fn hand_off(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .hand_off()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn drain(&mut self) -> Result<Lowered, EngineError> {
+        self.store.drain().map(lowered_from_journal).map_err(engine)
+    }
+
+    fn materialized_through(&self) -> Result<coord_types::ids::ExecutionPosition, EngineError> {
+        Ok(self
+            .store
+            .materialized_frontier(self.domain)
+            .expect("the domain is attached: checked at construction")
+            .execution_position)
     }
 
     fn reconcile(&mut self) -> Result<Lowered, EngineError> {

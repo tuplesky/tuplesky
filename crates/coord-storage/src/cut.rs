@@ -55,6 +55,13 @@ impl CutOverlay {
         }
     }
 
+    /// Lay `later`'s rows over these, a key `later` holds winning.
+    pub fn absorb(&mut self, later: &CutOverlay) {
+        for (key, value) in &later.rows {
+            self.rows.insert(key.clone(), value.clone());
+        }
+    }
+
     /// Rows held (diagnostic).
     pub fn len(&self) -> usize {
         self.rows.len()

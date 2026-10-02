@@ -40,6 +40,18 @@
 //! replay-backed profile that removes the second one is task-j06 and is
 //! not enabled.
 //!
+//! The projection's commit can leave the caller's thread (task-d52).
+//! [`JournaledStore::pipeline`] gives the store a [`Materializer`], and
+//! [`JournaledStore::hand_off`] then lends a domain's engine to it with
+//! the durable records one commit takes, and takes the engine back with
+//! the outcome. The commit is the same transaction with the same guards;
+//! `Materialized` is reported only when its outcome is taken back, and a
+//! domain has at most one commit out, so the order of its commits is the
+//! journal's. What the domain journals meanwhile waits behind it. A
+//! boot that ends with a commit out -- not started, or returned and not
+//! taken back -- recovers like any other, from the journal and the
+//! projection's own stamp.
+//!
 //! Recovery is journal-first as well. [`JournaledStore::attach`] recovers
 //! `J` from the journal's actual valid records and `M` from the
 //! projection's applied stamp, refuses a projection ahead of the journal,
@@ -448,7 +460,11 @@ struct Durable {
 /// durable projection it materializes into.
 struct Domain<E: LocalEngine> {
     origin: RecordOrigin,
-    engine: E,
+    /// The projection's engine; `None` while it is lent to a
+    /// [`Materializer`] for one projection commit (task-d52).
+    engine: Option<E>,
+    /// A reader of the projection, kept for while the engine is lent.
+    reader: E::Reader,
     head: StreamHead,
     frontiers: Frontiers,
     /// Digest of the record at `J`, which the next record chains onto.
@@ -467,8 +483,14 @@ struct Domain<E: LocalEngine> {
     inflight: Vec<Durable>,
     /// Durable records waiting for the projection, in journal order.
     pending: Vec<Durable>,
-    /// Projection metadata the pending materialization would produce.
-    pending_meta: Option<DurableMeta>,
+    /// Projection metadata an uncertain materialization would have
+    /// produced, and how many of the front `pending` records it took.
+    pending_meta: Option<(DurableMeta, usize)>,
+    /// How many durable records a [`Materializer`] is committing to the
+    /// projection with the lent engine (task-d52). They come before
+    /// `pending` in journal order, and the job carries them: its outcome
+    /// gives them back unless they were committed.
+    lent: Option<usize>,
     status: DomainStatus,
     fence: Option<Ballot>,
 }
@@ -536,6 +558,9 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     deferred_events: Vec<StorageEvent>,
     /// What lowering has cost since the store opened (task-d45).
     cost: LoweringCost,
+    /// Where projection commits run when they leave the caller's thread
+    /// (task-d52); `None` commits them in [`JournaledStore::materialize`].
+    materializer: Option<Box<dyn Materializer<E>>>,
 }
 
 /// What a store's lowering has cost since it opened (task-d45).
@@ -592,6 +617,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             boot,
             limits,
             domains: BTreeMap::new(),
+            materializer: None,
         })
     }
 
@@ -618,18 +644,39 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
 
     /// A domain's projection engine (diagnostics and harnesses that crash
     /// and reopen it). Materialization remains its only ordinary writer.
+    ///
+    /// `None` while the engine is lent to a [`Materializer`].
     pub fn projection(&self, domain: DomainId) -> Option<&E> {
-        self.domains.get(&domain).map(|d| &d.engine)
+        self.domains.get(&domain).and_then(|d| d.engine.as_ref())
     }
 
     /// Give the journal and every attached projection back; this
     /// coordinator's boot ends. The next boot opens them again and
     /// recovers its frontiers from what is actually durable.
-    pub fn into_parts(self) -> (J, Vec<(DomainId, E)>) {
+    ///
+    /// An engine lent to a [`Materializer`] is taken back first, whether
+    /// or not its commit ran, and its outcome is not taken: the boot ends
+    /// there, as a crash would end it, and the next one recovers from the
+    /// journal and the projection's own stamp.
+    pub fn into_parts(mut self) -> (J, Vec<(DomainId, E)>) {
+        if let Some(mut materializer) = self.materializer.take() {
+            for (domain, engine) in materializer.reclaim() {
+                if let Some(state) = self.domains.get_mut(&domain) {
+                    state.engine = Some(engine);
+                }
+            }
+        }
         let domains = self
             .domains
             .into_iter()
-            .map(|(id, state)| (id, state.engine))
+            .map(|(id, state)| {
+                (
+                    id,
+                    state
+                        .engine
+                        .expect("a lent engine is reclaimed before the parts are given back"),
+                )
+            })
             .collect();
         (self.journal, domains)
     }
@@ -715,7 +762,8 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             stream,
         };
         let durable = self.journal.durable_head(stream)?;
-        let meta = DurableMeta::read(&engine.reader().snapshot()?)?;
+        let reader = engine.reader();
+        let meta = DurableMeta::read(&reader.snapshot()?)?;
         let applied = AppliedFrontier::from_stamp(&meta.stamp);
         if applied.materialized > durable {
             return Err(JournaledError::Quarantined(
@@ -727,7 +775,8 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         gate.set_completed(meta.stamp.store_seq());
         let mut state = Domain {
             origin,
-            engine,
+            engine: Some(engine),
+            reader,
             head: StreamHead::open(stream, durable),
             frontiers,
             head_digest: applied.last_digest,
@@ -740,6 +789,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             inflight: Vec::new(),
             pending: Vec::new(),
             pending_meta: None,
+            lent: None,
             status: DomainStatus::Ready,
             fence: None,
         };
@@ -1018,6 +1068,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         domain: DomainId,
         pointer: &CheckpointPointerV1,
     ) -> Result<Published, JournaledError> {
+        // The publication record is materialized here, on this thread, so
+        // a commit a materializer has out is taken back first; what it
+        // completed goes out with the next report.
+        let drained = self.drain()?;
+        self.deferred_events.extend(drained.events);
         let barrier = BarrierId {
             node_generation: self.incarnation,
             boot_id: self.boot,
@@ -1224,7 +1279,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     pub fn reader(&self, domain: DomainId) -> Option<GatedReader<E::Reader>> {
         self.domains
             .get(&domain)
-            .map(|d| GatedReader::new(d.engine.reader(), d.gate.clone()))
+            .map(|d| GatedReader::new(d.reader.clone(), d.gate.clone()))
     }
 
     /// Queued transitions of a domain.
@@ -1249,9 +1304,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         })
     }
 
-    /// Durable records of a domain still waiting for the projection.
+    /// Durable records of a domain still waiting for the projection,
+    /// those a [`Materializer`] is committing included.
     pub fn unmaterialized(&self, domain: DomainId) -> usize {
-        self.domains.get(&domain).map_or(0, |d| d.pending.len())
+        self.domains
+            .get(&domain)
+            .map_or(0, |d| d.pending.len() + d.lent.unwrap_or(0))
     }
 
     /// Validate and queue one transition. Nothing is journaled here: the
@@ -1563,9 +1621,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
 
     /// Apply every domain's durable records to its projection, in journal
     /// order, one atomic transaction per domain.
+    ///
+    /// On this thread, and before it returns, whether or not the store is
+    /// [pipelined](JournaledStore::pipeline): every commit a
+    /// [`Materializer`] has out is taken back first, and what it committed
+    /// is reported with the rest.
     pub fn materialize(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         report.events.append(&mut self.deferred_events);
+        if let Err(e) = self.drain_into(&mut report) {
+            self.deferred_events.append(&mut report.events);
+            return Err(e);
+        }
         for state in self.domains.values_mut() {
             if state.pending.is_empty() {
                 continue;
@@ -1701,17 +1768,21 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 }
             }
             DomainStatus::MaterializationUncertain => {
-                let expected = state.pending_meta.ok_or(JournaledError::Quarantined(
+                let (expected, taken) = state.pending_meta.ok_or(JournaledError::Quarantined(
                     "uncertain materialization without the metadata it wrote",
                 ))?;
-                let observed = DurableMeta::read(&state.engine.reader().snapshot()?)?;
+                let observed = DurableMeta::read(&state.reader.snapshot()?)?;
                 if observed == expected {
                     state.meta = observed;
                     state.gate.set_completed(observed.stamp.store_seq());
                     state
                         .frontiers
                         .advance_materialized(observed.stamp.journal_seq())?;
-                    let applied = std::mem::take(&mut state.pending);
+                    // The commit took the front `taken` records; a
+                    // pipelined store journaled more behind them while it
+                    // ran, and those are still owed.
+                    let taken = taken.min(state.pending.len());
+                    let applied: Vec<Durable> = state.pending.drain(..taken).collect();
                     report.materialized = applied.len();
                     report.commits = 1;
                     for item in applied {
@@ -1777,7 +1848,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         ) {
             return Err(CutError::NotReady(state.status));
         }
-        let reader = GatedReader::new(state.engine.reader(), state.gate.clone());
+        let reader = GatedReader::new(state.reader.clone(), state.gate.clone());
         let snapshot = reader.snapshot().map_err(CutError::View)?;
         let durable = state.frontiers.durable();
         let mut seq = snapshot.meta().stamp.journal_seq();
@@ -1818,73 +1889,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         Ok(RecoveryCut::new(snapshot, overlay, durable))
     }
 
-    /// Apply one domain's durable records atomically. The recorded base is
-    /// rechecked inside the write transaction; the applied stamp binds the
-    /// materialized sequence to the digest of the record that produced it,
-    /// so the projection identifies the exact journal history it holds.
-    /// Lower `pending` into the projection in one transaction, advancing
-    /// `meta` as each record is taken. `Ok(None)` means a guard refused
-    /// the batch and `failure` says which; an `Err` means the projection
-    /// itself failed and the caller still owns the redo.
-    fn project(
-        state: &mut Domain<E>,
-        pending: &[Durable],
-        meta: &mut DurableMeta,
-        failure: &mut Option<&'static str>,
-    ) -> Result<Option<Result<(), CommitFailure>>, JournaledError> {
-        let mut tx = state.engine.begin_write()?;
-        // Guards read the durable accepted state inside this very
-        // transaction, never a cached copy.
-        match DurableMeta::read(&tx) {
-            Ok(durable) if durable == *meta => {}
-            Ok(_) => *failure = Some("projection diverged from the pipeline's record"),
-            Err(_) => *failure = Some("projection metadata unreadable"),
-        }
-        if failure.is_none() {
-            // The projection advances one record at a time. A gap would
-            // stamp it past a record it never applied, and replay after a
-            // restart reads only what follows the stamp, so the skipped
-            // record would be lost for good.
-            let mut expect = state.frontiers.materialized().checked_next().ok();
-            for item in pending {
-                let record = &item.record;
-                if expect.is_some_and(|next| next != record.seq()) {
-                    *failure = Some("materialization would skip a journaled record");
-                    break;
-                }
-                if let RecordBody::ApplicationOutcome { base, position, .. } = record.body() {
-                    if *base != meta.frontier.as_base() {
-                        *failure = Some("durable record's base does not extend the projection");
-                        break;
-                    }
-                    meta.frontier = ExecutionFrontier {
-                        configuration: base.configuration,
-                        execution_position: *position,
-                    };
-                }
-                for update in record.body().updates() {
-                    lower_update(&mut tx, update)?;
-                }
-                // The journal sequence is derived from the store sequence
-                // by the constructor, never chosen alongside it.
-                meta.stamp =
-                    AppliedStamp::new(StoreSeq::from_journal(record.seq()), record.digest());
-                expect = record.seq().checked_next().ok();
-            }
-        }
-        if failure.is_some() {
-            drop(tx);
-            return Ok(None);
-        }
-        meta.write(&mut tx)?;
-        Ok(Some(tx.commit_durable()))
-    }
-
+    /// Apply one domain's durable records atomically, on this thread.
     fn materialize_domain(state: &mut Domain<E>) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         if state.pending.is_empty() {
             return Ok(report);
         }
+        let Some(engine) = state.engine.as_mut() else {
+            // Every caller takes a lent engine back first.
+            return Err(JournaledError::Quarantined(
+                "a projection commit while the engine is lent",
+            ));
+        };
         let pending = std::mem::take(&mut state.pending);
         let mut meta = state.meta;
         let mut failure: Option<&'static str> = None;
@@ -1894,7 +1910,8 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // conclusively taken it: every failure below puts it back, or the
         // redo would be dropped while the domain stayed ready, and a
         // later record could stamp the projection past it for good.
-        let commit = match Self::project(state, &pending, &mut meta, &mut failure) {
+        let next = state.frontiers.materialized().checked_next().ok();
+        let commit = match project(engine, &pending, &mut meta, next, &state.gate, &mut failure) {
             Ok(commit) => commit,
             Err(e) => {
                 state.pending = pending;
@@ -1909,7 +1926,6 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         match commit {
             Ok(()) => {
                 state.meta = meta;
-                state.gate.set_completed(meta.stamp.store_seq());
                 state
                     .frontiers
                     .advance_materialized(meta.stamp.journal_seq())?;
@@ -1934,14 +1950,406 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 state.status = DomainStatus::MaterializationDeferred;
             }
             Err(CommitFailure::Indeterminate(_)) => {
+                let taken = pending.len();
                 state.pending = pending;
-                state.pending_meta = Some(meta);
+                state.pending_meta = Some((meta, taken));
                 state.status = DomainStatus::MaterializationUncertain;
                 report.indeterminate = true;
             }
         }
         Ok(report)
     }
+
+    /// Commit projections off the caller's thread from now on (task-d52):
+    /// [`JournaledStore::hand_off`] lends each domain's engine to
+    /// `materializer` for one commit of what it owes, and takes it back
+    /// with the outcome.
+    ///
+    /// A materializer this store already had is drained first, and what
+    /// it committed is reported.
+    pub fn pipeline(
+        &mut self,
+        materializer: Box<dyn Materializer<E>>,
+    ) -> Result<FlushReport, JournaledError> {
+        let drained = self.drain()?;
+        self.materializer = Some(materializer);
+        Ok(drained)
+    }
+
+    /// Whether projection commits leave the caller's thread
+    /// ([`JournaledStore::pipeline`]).
+    pub fn pipelined(&self) -> bool {
+        self.materializer.is_some()
+    }
+
+    /// The execution frontier a domain's projection has committed, as
+    /// far as this store has taken the outcome: what a pipelined caller
+    /// may release up to (task-d52).
+    pub fn materialized_frontier(&self, domain: DomainId) -> Option<ExecutionFrontier> {
+        self.domains.get(&domain).map(|d| d.meta.frontier)
+    }
+
+    /// Whether a domain's engine is lent to the materializer now.
+    pub fn lent(&self, domain: DomainId) -> bool {
+        self.domains.get(&domain).is_some_and(|d| d.lent.is_some())
+    }
+
+    /// Take back the commits the materializer has finished, without
+    /// waiting, and lend each domain that owes the projection something
+    /// and is not lent already its next commit (task-d52).
+    ///
+    /// A domain has at most one commit out. What it journals meanwhile
+    /// waits in its pending records and goes out, all of it, as the next
+    /// commit once this one is back. A store with no materializer
+    /// materializes here, on this thread, as
+    /// [`JournaledStore::materialize`] does.
+    ///
+    /// The report carries what the commits taken back materialized, as
+    /// [`JournaledStore::materialize`] reports it; nothing lent now is
+    /// reported until its outcome is taken.
+    pub fn hand_off(&mut self) -> Result<FlushReport, JournaledError> {
+        if self.materializer.is_none() {
+            let report = self.materialize()?;
+            self.cost.charge(&report);
+            return Ok(report);
+        }
+        let mut report = FlushReport::default();
+        report.events.append(&mut self.deferred_events);
+        let materializer = self.materializer.as_mut().expect("checked above");
+        while let Some(done) = materializer.try_take() {
+            match take_back(&mut self.domains, done) {
+                Ok(one) => report.absorb(one),
+                Err(e) => {
+                    self.cost.charge(&report);
+                    self.deferred_events.append(&mut report.events);
+                    return Err(e);
+                }
+            }
+        }
+        for (id, state) in &mut self.domains {
+            if state.lent.is_some()
+                || state.pending.is_empty()
+                || matches!(
+                    state.status,
+                    DomainStatus::Quarantined | DomainStatus::MaterializationUncertain
+                )
+            {
+                continue;
+            }
+            let Some(engine) = state.engine.take() else {
+                continue;
+            };
+            let records = std::mem::take(&mut state.pending);
+            state.lent = Some(records.len());
+            materializer.submit(MaterializeJob {
+                domain: *id,
+                engine,
+                next: state.frontiers.materialized().checked_next().ok(),
+                records,
+                meta: state.meta,
+                gate: state.gate.clone(),
+            });
+        }
+        self.cost.charge(&report);
+        Ok(report)
+    }
+
+    /// Wait for every commit the materializer has out and take each back
+    /// (task-d52). Afterwards no engine is lent, and what was journaled
+    /// meanwhile is still pending.
+    pub fn drain(&mut self) -> Result<FlushReport, JournaledError> {
+        let mut report = FlushReport::default();
+        let drained = self.drain_into(&mut report);
+        self.cost.charge(&report);
+        match drained {
+            Ok(()) => Ok(report),
+            Err(e) => {
+                self.deferred_events.append(&mut report.events);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`JournaledStore::drain`] into `report`, uncharged. On an error
+    /// what was taken back before it is in `report`.
+    fn drain_into(&mut self, report: &mut FlushReport) -> Result<(), JournaledError> {
+        let Some(materializer) = self.materializer.as_mut() else {
+            return Ok(());
+        };
+        while let Some(done) = materializer.take() {
+            report.absorb(take_back(&mut self.domains, done)?);
+        }
+        Ok(())
+    }
+}
+
+/// Take a lent engine back with its commit's outcome (task-d52).
+fn take_back<E: LocalEngine>(
+    domains: &mut BTreeMap<DomainId, Domain<E>>,
+    done: MaterializeDone<E>,
+) -> Result<FlushReport, JournaledError> {
+    let mut report = FlushReport::default();
+    let MaterializeDone {
+        domain,
+        engine,
+        mut records,
+        outcome,
+    } = done;
+    let state = domains
+        .get_mut(&domain)
+        .ok_or(JournaledError::UnknownDomain)?;
+    state.engine = Some(engine);
+    state.lent = None;
+    // The records go back in front of what was journaled meanwhile,
+    // unless the projection conclusively took them.
+    let give_back = |state: &mut Domain<E>, records: &mut Vec<Durable>| {
+        let taken = records.len();
+        records.append(&mut state.pending);
+        state.pending = std::mem::take(records);
+        taken
+    };
+    match outcome {
+        Outcome::Committed(meta) => {
+            // The materializer moved the gate as its commit returned.
+            state.meta = meta;
+            state
+                .frontiers
+                .advance_materialized(meta.stamp.journal_seq())?;
+            if state.status == DomainStatus::MaterializationDeferred {
+                state.status = DomainStatus::Ready;
+            }
+            report.commits = 1;
+            report.materialized = records.len();
+            for item in records {
+                if let Some(barrier) = item.barrier {
+                    report.events.push(StorageEvent::Materialized {
+                        barrier_id: barrier,
+                        journal_seq: item.record.seq(),
+                    });
+                }
+            }
+        }
+        Outcome::NotCommitted => {
+            give_back(state, &mut records);
+            // A journal append in doubt meanwhile keeps its own status:
+            // it is what has to be reconciled first.
+            if state.status == DomainStatus::Ready {
+                state.status = DomainStatus::MaterializationDeferred;
+            }
+        }
+        Outcome::Indeterminate(meta) => {
+            let taken = give_back(state, &mut records);
+            if !matches!(
+                state.status,
+                DomainStatus::Ready | DomainStatus::MaterializationDeferred
+            ) {
+                return Err(state
+                    .quarantine("a projection commit in doubt beside another outcome in doubt"));
+            }
+            state.pending_meta = Some((meta, taken));
+            state.status = DomainStatus::MaterializationUncertain;
+            report.indeterminate = true;
+        }
+        Outcome::Refused(what) => {
+            give_back(state, &mut records);
+            return Err(state.quarantine(what));
+        }
+        Outcome::Failed(e) => {
+            give_back(state, &mut records);
+            return Err(e);
+        }
+    }
+    Ok(report)
+}
+
+/// Lower `pending` into the projection in one transaction, advancing
+/// `meta` as each record is taken, and commit it. `next` is the sequence
+/// the first record must have. The recorded base is rechecked inside the
+/// write transaction; the applied stamp binds the materialized sequence
+/// to the digest of the record that produced it, so the projection
+/// identifies the exact journal history it holds.
+///
+/// `Ok(None)` means a guard refused the batch and `failure` says which;
+/// an `Err` means the projection itself failed and the caller still owns
+/// the redo. A commit that returns moves `gate` to its stamp before this
+/// does, whichever thread runs it (task-d52).
+fn project<E: LocalEngine>(
+    engine: &mut E,
+    pending: &[Durable],
+    meta: &mut DurableMeta,
+    next: Option<LocalJournalSeq>,
+    gate: &Frontier,
+    failure: &mut Option<&'static str>,
+) -> Result<Option<Result<(), CommitFailure>>, JournaledError> {
+    let mut tx = engine.begin_write()?;
+    // Guards read the durable accepted state inside this very
+    // transaction, never a cached copy.
+    match DurableMeta::read(&tx) {
+        Ok(durable) if durable == *meta => {}
+        Ok(_) => *failure = Some("projection diverged from the pipeline's record"),
+        Err(_) => *failure = Some("projection metadata unreadable"),
+    }
+    if failure.is_none() {
+        // The projection advances one record at a time. A gap would
+        // stamp it past a record it never applied, and replay after a
+        // restart reads only what follows the stamp, so the skipped
+        // record would be lost for good.
+        let mut expect = next;
+        for item in pending {
+            let record = &item.record;
+            if expect.is_some_and(|next| next != record.seq()) {
+                *failure = Some("materialization would skip a journaled record");
+                break;
+            }
+            if let RecordBody::ApplicationOutcome { base, position, .. } = record.body() {
+                if *base != meta.frontier.as_base() {
+                    *failure = Some("durable record's base does not extend the projection");
+                    break;
+                }
+                meta.frontier = ExecutionFrontier {
+                    configuration: base.configuration,
+                    execution_position: *position,
+                };
+            }
+            for update in record.body().updates() {
+                lower_update(&mut tx, update)?;
+            }
+            // The journal sequence is derived from the store sequence
+            // by the constructor, never chosen alongside it.
+            meta.stamp = AppliedStamp::new(StoreSeq::from_journal(record.seq()), record.digest());
+            expect = record.seq().checked_next().ok();
+        }
+    }
+    if failure.is_some() {
+        drop(tx);
+        return Ok(None);
+    }
+    meta.write(&mut tx)?;
+    // A reader that pins a snapshot between the commit making its rows
+    // visible and the gate moving waits the moment out rather than being
+    // refused a snapshot that is durable (`GatedReader::snapshot`).
+    gate.begin_commit(meta.stamp.store_seq());
+    let committed = tx.commit_durable();
+    if committed.is_ok() {
+        gate.set_completed(meta.stamp.store_seq());
+    }
+    gate.end_commit();
+    Ok(Some(committed))
+}
+
+/// Where a pipelined store's projection commits run (task-d52).
+///
+/// [`JournaledStore::hand_off`] lends a domain's engine out with the
+/// records the commit takes ([`MaterializeJob`]); the materializer runs
+/// the job, on whatever thread it likes, and gives the engine back with
+/// the outcome ([`MaterializeDone`]). A store has at most one job of a
+/// domain out, so the order of a domain's commits is the store's.
+pub trait Materializer<E: LocalEngine>: Send {
+    /// Take a job.
+    fn submit(&mut self, job: MaterializeJob<E>);
+
+    /// A finished job, without waiting; `None` when none has finished.
+    fn try_take(&mut self) -> Option<MaterializeDone<E>>;
+
+    /// The next finished job, waiting for one; `None` only when no job
+    /// is out.
+    fn take(&mut self) -> Option<MaterializeDone<E>>;
+
+    /// Every engine lent out, outcomes unseen: a job that has not started
+    /// may be given back without running, and one that has is waited for.
+    /// This store's boot is ending ([`JournaledStore::into_parts`]).
+    fn reclaim(&mut self) -> Vec<(DomainId, E)>;
+}
+
+/// One projection commit lent to a [`Materializer`] (task-d52): a
+/// domain's engine and the durable records the commit takes.
+pub struct MaterializeJob<E: LocalEngine> {
+    domain: DomainId,
+    engine: E,
+    records: Vec<Durable>,
+    meta: DurableMeta,
+    next: Option<LocalJournalSeq>,
+    gate: Arc<Frontier>,
+}
+
+impl<E: LocalEngine> MaterializeJob<E> {
+    /// The domain whose projection this commits.
+    pub const fn domain(&self) -> DomainId {
+        self.domain
+    }
+
+    /// Records the commit takes.
+    pub fn records(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Commit the records to the projection: one durable transaction,
+    /// exactly as [`JournaledStore::materialize`] commits them, the same
+    /// guards rechecked inside it. A commit that returns moves the
+    /// domain's read gate before this returns.
+    pub fn run(self) -> MaterializeDone<E> {
+        let MaterializeJob {
+            domain,
+            mut engine,
+            records,
+            mut meta,
+            next,
+            gate,
+        } = self;
+        let mut failure = None;
+        let outcome = match project(&mut engine, &records, &mut meta, next, &gate, &mut failure) {
+            Err(e) => Outcome::Failed(e),
+            Ok(None) => Outcome::Refused(failure.expect("failure set")),
+            Ok(Some(Ok(()))) => Outcome::Committed(meta),
+            Ok(Some(Err(CommitFailure::DefinitelyNotCommitted(_)))) => Outcome::NotCommitted,
+            Ok(Some(Err(CommitFailure::Indeterminate(_)))) => Outcome::Indeterminate(meta),
+        };
+        MaterializeDone {
+            domain,
+            engine,
+            records,
+            outcome,
+        }
+    }
+
+    /// The engine back, the commit never run.
+    pub fn abandon(self) -> (DomainId, E) {
+        (self.domain, self.engine)
+    }
+}
+
+/// A [`MaterializeJob`] that has run: the engine back, with its outcome.
+pub struct MaterializeDone<E: LocalEngine> {
+    domain: DomainId,
+    engine: E,
+    records: Vec<Durable>,
+    outcome: Outcome,
+}
+
+impl<E: LocalEngine> MaterializeDone<E> {
+    /// The domain whose projection it committed.
+    pub const fn domain(&self) -> DomainId {
+        self.domain
+    }
+
+    /// Whether the commit returned.
+    pub const fn committed(&self) -> bool {
+        matches!(self.outcome, Outcome::Committed(_))
+    }
+
+    /// The engine back, the outcome unseen.
+    pub fn into_engine(self) -> (DomainId, E) {
+        (self.domain, self.engine)
+    }
+}
+
+/// How a lent commit ended.
+enum Outcome {
+    Committed(DurableMeta),
+    NotCommitted,
+    Indeterminate(DurableMeta),
+    Refused(&'static str),
+    Failed(JournaledError),
 }
 
 /// Whether `ballot` is obsolete relative to `promised`.

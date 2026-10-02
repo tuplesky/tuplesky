@@ -1047,9 +1047,13 @@ fn main() -> ExitCode {
     // frontend reads. One writer, one domain: a second handle on this
     // store would be a second writer's worth of opportunity, and the
     // profile has exactly one.
+    // Notified by the voter's materializer thread as each projection
+    // commit finishes (task-d52).
+    let materialized = std::sync::Arc::new(tokio::sync::Notify::new());
     let backing = if roles.votes() {
         match voter(&placed, applier, boot, config.limits.command_table_capacity)
             .and_then(|v| keep_floor(&placed, &config, v))
+            .and_then(|v| pipeline(v, &materialized))
         {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
@@ -1125,6 +1129,7 @@ fn main() -> ExitCode {
         Vec::new()
     };
     let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default())
+        .wake_on_materialized(materialized)
         // Where this node keeps its own recovery images, and how much
         // unrepresented journal it tolerates before making one. Local
         // to this node: no replicated result depends on the answer.
@@ -1559,6 +1564,29 @@ fn voter(
             promised.number
         );
     }
+    Ok(voter)
+}
+
+/// Commit the voter's projection on a thread of its own (task-d52): the
+/// domain thread journals a group and goes on executing, and the group's
+/// results go out once the materializer has committed it and
+/// `materialized` has woken the loop to take it back.
+fn pipeline(
+    mut voter: coord_daemon::Voter<store::Persistence>,
+    materialized: &std::sync::Arc<tokio::sync::Notify>,
+) -> Result<coord_daemon::Voter<store::Persistence>, String> {
+    let notify = std::sync::Arc::clone(materialized);
+    let materializer = coord_storage::ThreadMaterializer::new(std::sync::Arc::new(move || {
+        notify.notify_one();
+    }))
+    .map_err(|e| format!("the materializer thread could not start: {e}"))?;
+    voter
+        .node_mut()
+        .applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline(Box::new(materializer))
+        .map_err(|e| format!("the projection could not be pipelined: {e:?}"))?;
     Ok(voter)
 }
 
