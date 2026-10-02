@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use coord_daemon::metrics::{
     Cost, Durability, Frontiers, Headroom, Interval, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Recorder, ShardIndex, ShardReading, Stage,
-    StageReading, Unavailable,
+    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Reads, Recorder, Resends, ShardIndex,
+    ShardReading, Stage, StageReading, Unavailable,
 };
 use coord_daemon::role::RoleSet;
 
@@ -343,6 +343,24 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 busy: Duration::from_secs(7),
                 executed: 210,
             }),
+            resends: Resends {
+                unanswered: 3,
+                lost: 2,
+                late: 1,
+                duplicate_votes: 1,
+                ..Resends::default()
+            },
+            established_fast: 40,
+            established_slow: 1160,
+            reads: Reads {
+                served: 900,
+                refused: 4,
+                rounds: 310,
+                confirmed: 305,
+                waited_confirm_ms: 450,
+                waited_index_ms: 2700,
+                waited_ms: 2800,
+            },
         }),
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");

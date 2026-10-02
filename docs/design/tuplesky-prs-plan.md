@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 146 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d51` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 148 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d53` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -33,7 +33,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-o01 through task-o06 | Finalized streams, regional observers/relays, Kine watch/read integration | Capability-specific gates |
 | task-m01 through task-m05 | Authoritative discovery, full-client Kine and integrated membership | Operational production requirement |
 | task-d01 through task-d44 | Daemon runtime wiring (election, leaf renewal, reconnection and why a dial failed), one execution order on every replica, recovery bounded by execution, a Sync that leaves no stale acceptance, a new leader that chains after what it executed, a diverged node that stays stopped and says what it compared, a decision that names its admission facts, every proposal and decision reaching every voter, every vote reaching the leader, catch-up, multi-host test provisioning, and the correctness-checklist remediation (a promise a Sync cannot lower, slow decisions recovery keeps, a Sync that fits its row, collector obligations that end, client outcomes, table room for recovery, a resource contract, forgetting wired into `coordd` and a learner reinstall behind its floor, the failure and obligation contract, the real machines under simulation, and the recovery bugs that simulation found), an execution chain every voter compares, a scrub of the replicated state, a prepared transition, a staged learner, a configuration installed into a running daemon, and voter replacement through the sealed handoff | Required before task-64/task-65 qualification and task-66 |
-| task-d45 through task-d51 | Throughput: a command's cost measured on every node and gated in CI, per-turn work independent of history, durable group writes, the projection's durability under the journal, re-sends only once an answer is due, reads and the fast path off the slow path, and the local checkpoint off the domain thread | task-d45 through task-d49 and task-d51 required before task-64, task-q01 and task-62's remaining rows; task-d50 after its design amendment |
+| task-d45 through task-d53 | Throughput: a command's cost measured on every node and gated in CI, per-turn work independent of history, durable group writes, the projection's durability under the journal, re-sends only once an answer is due, reads and the fast path off the slow path, the local checkpoint off the domain thread, execution and materialization on a pipelined applier, and an execution established without walking what already executed | task-d45 through task-d49 and task-d51 through task-d53 required before task-64, task-q01 and task-62's remaining rows; task-d50 after its design amendment |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -126,7 +126,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-61](#task-61) | Complete bounded observability and operator diagnostics | task-31, task-43, task-53, task-57 |
 | [task-62](#task-62) | Build and run the matched native WAN benchmark matrix | task-29, task-32, task-43, task-53, task-61 |
 | [task-63](#task-63) | Measure Kine end-to-end overhead and regression budgets | task-48, task-61, task-62 |
-| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15, task-d18, task-d19, task-d20, task-d21, task-d22, task-d23, task-d24, task-d25, task-d26, task-d27, task-d28, task-d29, task-d30, task-d31, task-d32, task-d33, task-d34, task-d35, task-d36, task-d37, task-d38, task-d39, task-d40, task-d41, task-d42, task-d43, task-d44, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51 |
+| [task-64](#task-64) | Run mixed-fault qualification and automatic minimization | task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15, task-d18, task-d19, task-d20, task-d21, task-d22, task-d23, task-d24, task-d25, task-d26, task-d27, task-d28, task-d29, task-d30, task-d31, task-d32, task-d33, task-d34, task-d35, task-d36, task-d37, task-d38, task-d39, task-d40, task-d41, task-d42, task-d43, task-d44, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 | [task-65](#task-65) | Package and qualify supported deployment targets | task-43, task-48, task-59, task-60, task-61, task-d02, task-d04 |
 | [task-66](#task-66) | Close security, supply-chain and production release gates | task-58, task-59, task-60, task-63, task-64, task-65, task-d02, task-q01 |
 | [task-s01](#task-s01) | Define the portable engine contract and logical collection registry | task-02, task-04 |
@@ -208,7 +208,9 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d49](#task-d49) | Re-send a proposal only once its answer is due | task-d07, task-d08, task-d15, task-d45 |
 | [task-d50](#task-d50) | Serve reads and the fast path without waiting on the slow path | task-28, task-29, task-d46, task-d47, task-d49 |
 | [task-d51](#task-d51) | Export the local checkpoint off the domain thread | task-j04, task-d37 |
-| [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51 |
+| [task-d52](#task-d52) | Execute and materialize on a pipelined applier | task-j03, task-j08, task-d47, task-d48 |
+| [task-d53](#task-d53) | Establish an execution without walking what already executed | task-21, task-24, task-d46 |
+| [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
 
@@ -1042,7 +1044,7 @@ A sixth was published with the matrix rather than hidden in it and has since bee
 
 The second half was not in the catch-up path at all, and only became total once the asks were paced: the drive loop polls the peer plane and the caller's plane in a biased select, peer first, and on a busy domain the peer plane is ready on every poll -- so one voter served 4560 api events and then not one more while its peer arm took another 80000, and every caller bound to that frontend waited out its deadline against a node that was otherwise working. The bias is a budget now. With both, the re-run matrix answers every operation it offers except a handful that meet the ten-second deadline on a saturated domain, where the published run lost 113 to 126 of 400 on every read-heavy row. The impaired rows and the Section 21.5 five-voter 2-2-1 region-loss schedules need `NET_ADMIN` and iproute2, which the environment the published rows were run in does not have; they are recorded as not run, and the runner takes them unchanged on a host that does.
 
-The rows still recorded as not run, and any reference result published again, wait on task-d45 through task-d49 and task-d51, so that the matrix measures the protocol rather than the sync chain and the history scans those tasks remove (the [throughput amendment](#gate-checklist-and-deferred-work)). This cannot be a prerequisite edge: task-c01 and task-c02 came out of this task's first runs, and the throughput tasks build on them (task-d46 depends on task-c02 through task-d06, and task-d49 on task-c01 through task-d07 and task-d03). A result taken before task-d49 merges is labelled with the commit it ran on and is not a reference result. Until task-d51 merges, a node with local checkpoints at their default (`limits.checkpoint_after_records = 4096`) stalls its domain thread for every export, for 1.1 to 2.5 s at a 365,000-record projection and longer as it grows, so a throughput row taken with that default is not reproducible: such a run sets `checkpoint_after_records = 0` and says so.
+The rows still recorded as not run, and any reference result published again, wait on task-d45 through task-d49 and task-d51 through task-d53, so that the matrix measures the protocol rather than the sync chain and the history scans those tasks remove (the [throughput amendment](#gate-checklist-and-deferred-work)). This cannot be a prerequisite edge: task-c01 and task-c02 came out of this task's first runs, and the throughput tasks build on them (task-d46 depends on task-c02 through task-d06, and task-d49 on task-c01 through task-d07 and task-d03). A result taken before task-d49 merges is labelled with the commit it ran on and is not a reference result. Until task-d51 merges, a node with local checkpoints at their default (`limits.checkpoint_after_records = 4096`) stalls its domain thread for every export, for 1.1 to 2.5 s at a 365,000-record projection and longer as it grows, so a throughput row taken with that default is not reproducible: such a run sets `checkpoint_after_records = 0` and says so.
 
 **Review boundary:** Optimizations are separate measured follow-ups. No nondurable headline or implicit default/migration change.
 
@@ -1067,7 +1069,7 @@ The other two came out of chasing the WAN matrix's open finding with this task's
 <a id="task-64"></a>
 ### task-64: Run mixed-fault qualification and automatic minimization
 
-**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15, task-d18, task-d19, task-d20, task-d21, task-d22, task-d23, task-d24, task-d25, task-d26, task-d27, task-d28, task-d29, task-d30, task-d31, task-d32, task-d33, task-d34, task-d35, task-d36, task-d37, task-d38, task-d39, task-d40, task-d41, task-d42, task-d43, task-d44, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51.  
+**Prerequisites:** task-09, task-27, task-32, task-40, task-48, task-53, task-57, task-58, task-60, task-d01, task-d03, task-d05, task-d06, task-d07, task-d08, task-d09, task-d10, task-d11, task-d12, task-d14, task-d15, task-d18, task-d19, task-d20, task-d21, task-d22, task-d23, task-d24, task-d25, task-d26, task-d27, task-d28, task-d29, task-d30, task-d31, task-d32, task-d33, task-d34, task-d35, task-d36, task-d37, task-d38, task-d39, task-d40, task-d41, task-d42, task-d43, task-d44, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53.  
 **Design:** Sections 12, 21, 23 G6.
 
 **Implement:** Minimize combined storage/network/clock/issuer/queue/format/lease/watch/handoff faults. Retain actual redb reference suite and reusable oracles; composed journal and observer integration is explicitly exercised by later qualification. Leader loss and re-election under every fault class is in the matrix, which is why task-d01 is a prerequisite: before it a leader-region outage is an outage of the domain, and the matrix would measure the absence of an election rather than its safety.
@@ -2196,7 +2198,7 @@ Serving is not voting: nothing here counts toward a quorum.
 <a id="task-q01"></a>
 ### task-q01: Produce the combined durable WAN/Kine qualification report
 
-**Prerequisites:** task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51.  
+**Prerequisites:** task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53.  
 **Design:** Sections 14.3, 21, 23.1.
 
 **Implement:** Fixed/changing membership, realistic Kine object churn, replicated native leases, current/historical reads, observer watches, snapshots and actual auth. Collect complete build/config/source identifiers, raw measurements, model/trace coverage, history checks, limits and supported deployments. Include all upstream-issue schedules and post-completion observer source failover.
@@ -2360,6 +2362,21 @@ Write the design amendment first, then implement it:
 
 **Review boundary:** Read semantics, speculation in `coordd` and the fast path. This is the only throughput task that changes protocol behaviour.
 
+**Amendment (this task's decision; design Sections 2.2, 4.5, 6.3, 6.8.1, 6.9.1):**
+- **Reads take a leader read barrier, not speculation.**
+  - A Range without an explicit revision is sent to the leader the frontend follows, and planned over the leader's snapshot. The leader first takes a read index, confirms its ballot with a slow quorum in a round started after the read arrived, and executes and materializes through the read index.
+  - The ordered path stays the fallback for every refusal, deadline and frontend that follows no ballot. Configuration `[reads] path = "ordered"` turns the barrier off.
+  - Speculation is not driven in `coordd`: its release still waits for the command and its prefix to be learned, so it would not remove the journal sync or the round trips.
+- **The fast path stays as it is.** Measured at the leader, its share was 56% with one caller, 6% with ten and 2% with fifty. A finer conflict key is a separate correctness review. The share is reported again with reads off the chain.
+- **Wire.**
+  - Two collector kinds: `ReadV1` (0x0107, frontend to leader) and `ReadAnswerV1` (0x0702, leader to frontend).
+  - Two protocol messages appended to `ProtocolMessage`: `ReadConfirm` and `ReadConfirmed`.
+  - The 0x08xx read-fence range stays reserved for task-o05's ordered fence.
+- **Acceptance:**
+  - At ten callers on this container's disk, a register read's median is no more than one network round trip plus the leader's queue. In practice, a fraction of today's, which pays two journal syncs and the slow path.
+  - A linearizability check of a register history through every frontend (`coord-register`, `scripts/bench/register-faults.sh`) finds no violation under a leader kill, a leader pause and a leader partition. The partition run fails when the confirmation round is skipped (`--features skip-read-confirmation`), as a negative control.
+  - The Jepsen client's runs, by the owner of #98, are the external evidence.
+
 <a id="task-d51"></a>
 ### task-d51: Export the local checkpoint off the domain thread
 
@@ -2380,6 +2397,44 @@ Write the design amendment first, then implement it:
 
 **Review boundary:** When and on which thread the local image is written, and what the domain thread waits for. No change to the image's format, to what it carries or to task-j04's recovery rule.
 
+<a id="task-d52"></a>
+### task-d52: Execute and materialize on a pipelined applier
+
+**Prerequisites:** task-j03, task-j08, task-d47, task-d48.  
+**Design:** Sections 17.3, 17.3.3, 17.3.4.
+
+**Implement:** A profile of the domain thread after task-d46 ([notes](../tuplesky-impl-notes.md#where-a-commands-time-goes-after-task-d46)) put 34% of a command's CPU in the projection's redb transaction and 7% in the applier around it, and with the stores on a disk the projection's syncs add about 1.8 ms a command, all on the domain thread. task-d47 groups the projection's commits and task-d48 takes one of each commit's syncs away, but a group's projection commit still runs on the domain thread after the group's journal sync. A group then costs the domain thread two syncs in series and every command's execution. On the Jepsen runner's disk, about 2.5 ms a sync, that bounds a voter near 1,400 commands a second even at 50 commands a group, which is etcd's rate there with nothing to spare. etcd commits its backend off the raft loop, behind its log.
+
+- **Hand execution and materialization to an applier thread.** The domain thread decides the order and journals. It hands each executable command, in the learner's order, to the applier. The applier executes it against the projection and its own uncommitted writes, commits the projection by group, and returns each outcome as the event the machines already take (`applied`).
+- **Keep every barrier.** A result is released only once its outcome is back. `Materialized` names the applier's committed position. A read from the projection and the collector's settle and retained answers read only committed rows, as today. The applier's queue is bounded, and a full queue holds the learner rather than dropping work.
+- **The journal stays the record.** A command handed over and not yet committed is executed again from the journal at start-up, by task-j03's rule. An outcome the domain thread never received is recognized by its position and never applied twice.
+
+**Acceptance:**
+- With the stores on a disk, the projection's commit and syncs leave the domain thread: its busy time per command at ten clients falls by at least the projection's share measured after task-d48.
+- On the Jepsen throughput scenario at ten and fifty clients, completed commands a second reach etcd's on the same runner.
+- Execution order and results are unchanged: task-d30's simulator digests are identical, and applied positions are contiguous. Releasing a result before its outcome comes back fails the barrier tests (negative control).
+- A crash with work in the hand-off queue, in the middle of an applier group, or after the applier's commit and before the domain thread took the outcome, recovers to the journal's state, and no resolve after the restart answers `Unknown` or `Forgotten` for a command the journal holds.
+
+**Review boundary:** Which thread executes and materializes, and the hand-off queue between them. No change to execution order, to results, or to what is durable before which message.
+
+<a id="task-d53"></a>
+### task-d53: Establish an execution without walking what already executed
+
+**Prerequisites:** task-21, task-24, task-d46.  
+**Design:** Sections 4.2–4.9 (unchanged).
+
+**Implement:** `Learner::established` runs on every executed command, at the leader and at every follower. It walks the command's whole dependency closure through `CommandTable::closure_step`, and that walk continues through every executed record still in the table, up to the table's capacity. `EstablishedResult::establish` then checks the closure for duplicates pairwise, and drops it. Nothing reads the closure after that check: the cursor already visits each command once, and the guard has already required every direct dependency executed, which by induction executes the whole closure. In the profile after task-d46 this was a quarter of the domain thread's CPU per command, at ten clients on tmpfs, and it grows with the table's capacity, not with the work.
+
+- **Stop the walk at executed records.** An executed record's predecessors were established when it executed, so the closure that still needs evidence is the command's unexecuted predecessors, which the guard makes empty.
+- **Check the closure in linear time.** Keep the self and duplicate checks, against a set.
+
+**Acceptance:**
+- The domain thread's busy time per command in `command-cost.sh` falls by at least 20% at one client and at ten, and `Learner::established` leaves the profile's top entries.
+- task-d30's simulator digests are identical, and task-21's closure tests pass, including a placeholder dependency refused as `DependencyUnknown`.
+- With a table of capacity 1,000 kept full, an execution's cost does not depend on how many executed records it holds (a test counts the records visited).
+
+**Review boundary:** The establishment evidence's construction and check. No change to the guard, to what a command may execute after, or to execution order.
+
 ## Gate checklist and deferred work
 
 task-s01, task-s02 feed the strict storage reference through task-07. Optional task-s03, task-s04 need not merge to release redb; retired task-s05 through task-s08 are not replaced by migration or mixed-engine support gates. Same-engine crash/restore, common/local checkpoints, safe replacement and schema lifecycle remain requirements.
@@ -2395,8 +2450,9 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
   - per-turn and per-event scans over the whole retained history, which saturate a follower with one client. This is the ceiling where syncs are cheap.
   - Re-sends of proposals a voter already acknowledged, since the re-send window counts only slow adoptions, add duplicate votes to the busy follower.
 - **The tasks.** task-d45 measures a command's cost on every node and gates on it in CI. task-d46 makes per-turn work independent of history. task-d47 lowers a turn's transitions as the durable groups Section 17.3.3 already requires. task-d48 commits the projection in one phase under the journal; a non-durable projection stays task-j06's `journaled-replay` profile, promoted from optional only if the numbers justify it. task-d49 re-sends only what the leader still needs from a voter, and only once its answer is due. task-d51 moves task-j04's local checkpoint export off the domain thread onto task-d37's snapshot, which task-d46's long runs showed is the cost left there that grows with the state.
-- **Gating.** task-d45 through task-d49 and task-d51 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-62's remaining rows, and any reference result it publishes again, wait on them for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49 and task-d51 do not change the design. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4.
+- **After task-d46, a profile of the domain thread** (`perf`, ten clients, stores on tmpfs; [notes](../tuplesky-impl-notes.md#where-a-commands-time-goes-after-task-d46)) put about 1.15 ms of CPU on each command: 34% in the projection's redb transaction (its commit alone 24%), 25% in `Learner::established` walking every live executed predecessor to build a closure that only a duplicate check reads, 11% in the rest of consensus and 6% in the journal. With the stores on a disk, the journal's and the projection's syncs add about 4.8 ms a command, all on the same thread. Two tasks follow. task-d52 moves execution and materialization onto a pipelined applier, so that the domain thread pays the journal and consensus and the projection's commit and sync overlap the next group: after task-d47 and task-d48 a group still costs the domain thread two syncs in series, which bounds a voter near etcd's rate on the Jepsen runner's disk with nothing to spare. task-d53 establishes an execution from its direct dependencies, which the guard already requires executed, instead of walking every executed predecessor still in the table.
+- **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-62's remaining rows, and any reference result it publishes again, wait on them for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
+- **Design changes.** task-d45 through task-d47, task-d49 and task-d51 through task-d53 do not change the design. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 

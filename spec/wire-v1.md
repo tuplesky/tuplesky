@@ -147,10 +147,10 @@ lane and direction.
 
 ## Collector frames (task-33)
 
-The trusted collector (`spec/collector-v1.md`) uses three raw kinds. Two
-are in the API range because they carry or answer a client request and
-take its class limit; the evidence frame is in the collector-evidence
-range. None is decodable by the typed decoder: they are dispatched by raw
+The trusted collector (`spec/collector-v1.md`) uses five raw kinds. Two
+are in the API range because they carry a client request and take its
+class limit; the answers and the evidence frame are in the
+collector-evidence range. None is decodable by the typed decoder: they are dispatched by raw
 kind at the collector boundary, like peer evidence.
 
 | Kind | Value | Direction | Payload |
@@ -158,6 +158,18 @@ kind at the collector boundary, like peer evidence.
 | Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); API class limit |
 | Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
 | Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
+| Read | `0x0107` | frontend to the leader it follows | `ReadV1 { ballot, request: RequestV1 }` (postcard): a Range without an explicit revision, for the leader read barrier (task-d50); API class limit |
+| ReadAnswer | `0x0702` | leader to frontend | `ReadAnswerV1 { retry_key, ballot, outcome: Served { response } \| Refused { reason } }` (postcard), `reason` one of `NotLeading`, `NothingProposed`, `Expired`, `NotServable`, `Busy`; collector-evidence class limit |
+
+A read is served only by the leader of the ballot named in it, after a
+confirmation round of that ballot (`ProtocolMessage::ReadConfirm` /
+`ReadConfirmed`, appended at indices 20 and 21) started after the read
+arrived and after its executed and materialized state reached the read
+index; the served `response` is the encoded `Response` the ordered path
+would have recorded for a Range at that state. A refusal, or no answer
+by the frontend's deadline, sends the read down the ordered path
+(design Section 6.3). A voter admits `Read` under the same collector-role
+rule as `Submit`.
 
 `FastAck` and `SlowAck` carry the admission digest the sender accepted
 the command under. The command identity is the retry key and the

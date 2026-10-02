@@ -8562,3 +8562,728 @@ assertion is counted here rather than analyzed again.
   each adoption costs that suffix. The digest is the path evidence
   voters compare, so its definition stays; only a follower that is
   behind pays it.
+
+## Where a command's time goes after task-d46
+
+A profile of each voter's domain thread at #136's head (2d9a1d1), taken
+to decide what the throughput tasks after task-d46 must include. Three
+voters on loopback; `coord-wan-bench`, closed loop, the gate's mix
+without scans.
+
+**Stores on tmpfs, ten callers.** `perf record -e cpu-clock --call-graph
+dwarf` on each voter for 12 s of a 15,000-operation run, 602 completed a
+second under the profiler. The domain thread is the process's main
+thread and took 68 to 70% of the process's CPU samples; the four
+transport workers took the rest. Its busy time is about 1.15 ms a
+command. Attributed by the outermost frame of each part (7,365 samples
+over three voters):
+
+| part | share of the domain thread | about, per command |
+| --- | --- | --- |
+| projection: redb write transaction | 36.0% | 0.41 ms |
+| of which the commit (`commit_durable`) | 23.8% | 0.27 ms |
+| `Learner::established` (leader and follower) | 24.5% | 0.28 ms |
+| the rest of consensus | 11.0% | 0.13 ms |
+| storage around the projection (`apply_bound`, lowering) | 7.2% | 0.08 ms |
+| journal (`append_group`, sealing records) | 5.8% | 0.07 ms |
+| the loop itself, transport sends, collector, codec, other | 15.5% | 0.18 ms |
+
+- **`Learner::established`** walks the executed command's whole
+  dependency closure (`closure_step`), through every executed record
+  still in the table, and `EstablishedResult::establish` then checks the
+  result for duplicates pairwise and drops it. The table holds up to its
+  capacity (1,000) of executed records, so the walk is hundreds of
+  records per execution, and the check quadratic in them; the
+  closure is read by nothing else. It probably also accounts for an
+  unchanged 2,600-command run's ratio of 1.1 to 1.2 in task-d45's gate,
+  since the table fills over the first thousand commands; task-d53's
+  runs will say. task-d53.
+- **The projection's commit** costs the same per transaction whatever it
+  carries (flushing pages, the page cache, the allocator), so task-d47's
+  groups divide it.
+
+**Stores on a disk.** The same bench with the stores on the container's
+disk (0.3 to 0.4 ms per `fdatasync`), one run each at 1, 10 and 50
+callers: 159, 165 and 171 completed a second, flat, at 5.4 to 5.9 ms of
+busy time per command and 76 to 78% busy. From the stage counters: two
+journal writes per command, 1.5 ms each; one materialization, 1.8 ms;
+0.65 to 0.9 ms for everything else. Three syncs per command in series on
+the domain thread, at every concurrency.
+
+**What follows.**
+- After task-d47 and task-d48 a group still costs the domain thread its
+  journal sync, then its projection commit and sync, then every
+  command's execution, in series. With about 2.5 ms a sync on the
+  Jepsen runner's disk and 0.6 ms of CPU a command left on the thread, a
+  group of k commands takes 5 + 0.6k ms: about 1,400 commands a second
+  at k = 50, which is etcd's rate on that runner, with fifty clients'
+  worth of grouping needed to get there. With execution and the
+  projection on an applier thread, the domain thread's share is
+  2.5 + 0.4k ms, past 1,500 a second from about k = 10. So the pipelined
+  applier is the fifth task: task-d52.
+- task-d53 takes the closure walk out first; it is a quarter of the CPU
+  and independent of the storage work.
+
+**task-d53, measured.** `Learner::established` now walks only what has
+not executed; the guard makes that the command's direct dependencies.
+- **Busy time.** `command-cost.sh`, the binary before and after
+  alternated twice on this container, three repeats per caller count
+  each (medians of six):
+
+  | callers | busiest voter's busy ms/cmd | completed/s | ratio |
+  | --- | --- | --- | --- |
+  | 1 | 1.36 → 1.05 (−23%) | 452 → 545 | 1.13 → 1.05 |
+  | 10 | 1.29 → 0.95 (−26%) | 713 → 969 | 1.20 → 1.07 |
+
+- **The ratio.** The unchanged ratio of task-d45's gate falls to about
+  1.05, so the closure walk was what made it 1.1 to 1.2: the table filled
+  over the first thousand commands of a run.
+- **The profile** at ten callers: `Learner::established` is 0.5% of the
+  domain thread, from 24.5%. The projection's redb transaction is now
+  46% of it, the rest of consensus 15%, the storage around the
+  projection 9% and the journal 5%.
+
+## Lowering in groups
+
+task-d47. `coordd` lowered one domain's queued batches one at a time,
+and each executed command's application batch on its own as well: at
+every concurrency about three syncs a command on every voter, in series
+on the domain thread. A voter now lowers what is ready together.
+
+- **The journal group** (`JournaledDomain::append`) takes every queued
+  transition of a stream that fits its bounds, 64 records or 256 KiB,
+  as one raft-engine entry of chained records, synced once. Each record
+  keeps its own barrier, sequence and predecessor digest, so
+  `JournalDurable` still names each batch, and a vote is still justified
+  by its own record's final durable state (17.3.3). An uncertain entry
+  is reconciled all or none.
+- **The flush.** `coordd`'s loop leaves what its rounds persist queued,
+  and flushes once no event is ready, or 64 batches are queued, or 64
+  events have passed with something owed (`FLUSH_QUEUED`,
+  `FLUSH_EVENTS`). A flush is:
+  1. *stage*: the commands whose turn has come are applied as one
+     execution group, at most 32 (`GROUP_COMMANDS`). Each is planned
+     over the projection with the group's earlier writes laid over it
+     (`RecoveryCut` with the group's overlay); planning reads no
+     protocol, payload or checkpoint row, so it does not matter that
+     those are not yet materialized;
+  2. *journal*: the group's application batches and the protocol's
+     queued batches go into one journal append, without materializing;
+  3. what that append released -- votes, proposals, commits -- goes out;
+  4. *finish*: the group is materialized, one projection commit, and its
+     results, sends and watch events go out. They are held until then,
+     never before.
+  When nothing can execute, the flush materializes what it journaled
+  itself, so the projection does not fall behind the journal.
+- **Recovery.** A group journaled but not materialized is replayed from
+  the journal at boot, as one batch was. A refused projection commit is
+  redone from the same plan, not replanned.
+
+**Which thread syncs.** All of it is still the domain thread's: the
+journal sync, the projection commit and execution, in series. Grouping
+divides the syncs among the commands of a flush; it does not take them
+off the thread. That is task-d52's.
+
+**task-j05 is not implemented**, so its fault points do not exist. This
+task brings its own tests at the same boundary:
+- `composed.rs`: a group of commands lowers once and leaves the same
+  projection, results and revisions as applying them one at a time; a
+  boot that ends between a group's journal sync and its projection
+  commit recovers every command of the group from the journal; a
+  refused projection commit of a group is redone, not replanned.
+- `journaled.rs`: an uncertain entry of several records reconciles all
+  or none.
+- `node.rs`: a vote and a proposal go out only after the flush that
+  journals them; the commands ready together execute as one group; a
+  staged group is journaled by the flush and answered only by finish.
+- **Negative control:** a driver that reports a record journal-durable
+  before journaling it -- a release moved ahead of its sync -- fails the
+  vote and proposal tests.
+
+### Measured
+
+Three voters on loopback, `scripts/bench/command-cost.sh` (2,500
+operations, the gate's mix without scans, three repeats per caller
+count), task-d46's binary and this task's alternated twice; medians of
+six. Stores on the container's disk (`STATE_ROOT`, 0.3 to 0.4 ms an
+`fdatasync`):
+
+| callers | completed/s, task-d46 → task-d47 | journal syncs per command per voter | projection commits per command |
+| --- | --- | --- | --- |
+| 10 | 209.6 → 687.8 (3.28×; 202–216 → 676–720) | 3.00 → 0.51–0.64 | 3.00 → 0.34–0.38 |
+| 1 | 188.3 → 227.5 (183–193 → 225–237) | 3.00 → leader 3.00, followers 2.00–2.16 | 3.00 → 2.00 |
+
+At fifty callers on disk (5,000 operations, one run each): 138.3 → 754.5
+completed a second, 0.17 to 0.19 journal syncs and 0.11 to 0.13
+projection commits a command per voter. Single runs on this container
+vary by a quarter: task-d46 read 182.8 in an earlier run.
+
+Stores on tmpfs, the gate's own setting, against task-d53's binary (this
+task's base), three repeats each, medians:
+
+| callers | completed/s | busiest voter's busy ms/cmd | syncs per command per voter | ratio |
+| --- | --- | --- | --- | --- |
+| 10 | 805.3 → 1170.5 | 1.14 → 0.75 | 3.00 → 0.54–0.67 | 1.04–1.12 → 1.01–1.11 |
+| 1 | 456.6 → 511.1 | 1.29 → 1.10 | 3.00 → leader 3.00, followers 1.96–2.30 | 0.81–1.14 → 0.97–1.15 |
+
+Every reading is inside the `command cost` gate's limits, which are
+upper bounds; the baseline stays task-d46's until the runner's readings
+of this task are in.
+
+- **At ten callers** a flush holds a few commands and their protocol
+  batches, and the voters are busy about half the time: the rest is the
+  round trip. The leader (n1) syncs a little more often than the
+  followers.
+- **At one caller** there is little to group: the leader still syncs
+  three times a command, and every voter commits the projection twice
+  rather than three times.
+- The first version of this task executed after the flush's journal
+  append and materialized in the same step, so the votes a flush
+  released waited for the group's projection commit too: 546.6 a second
+  at ten callers, 2.81×. Sending what the append released before
+  materializing is the difference.
+
+## The projection's commit under the journal
+
+task-d48. Each projection commit took two `fdatasync`s: redb's two-phase
+commit syncs the new commit slot and its pages, then flips the header to
+it and syncs again. Under the journal the projection now commits in one
+phase: one sync, with redb's checksums detecting a commit a crash tore.
+Section 17.3.4 is amended with why that is safe, the residual it leaves,
+and the invariants any later change to the projection's durability must
+keep.
+
+- **Where it is set.** `LocalEngine::commit_under_journal`, which the
+  journaled coordinator calls when it attaches an engine, before replay.
+  Only `RedbEngine` acts on it. An engine not under the journal (the
+  strict single-store reference, a restore's fill, a checkpoint's
+  install target, the lifecycle's own records) keeps two-phase commit.
+  There is no operator switch.
+- **Still durable at every commit.** `Materialized` is reported only once
+  the commit's sync has returned; quick-repair stays off.
+
+**Tests.** task-j05's fault points do not exist (task-j05 is not
+implemented), so the evidence is task-09's fault backend and the
+composed store:
+- `coord-redb-faultkit`'s crash matrix runs in both modes: a crash after
+  every write and sync of a five-commit workload, with nothing,
+  everything, or a seeded torn and reordered subset of the unsynced tail
+  surviving, reopens at an acknowledged state or the commit after it,
+  never a partial one. The subprocess-death test (real files, `abort()`)
+  runs in both modes too.
+- `a_commit_under_the_journal_syncs_once_and_otherwise_twice`: the
+  backend's own count of syncs, 2 a commit in two phases and 1 in one.
+- `a_one_phase_commit_torn_under_its_header_rolls_back_to_the_commit_before`:
+  the residual, built on purpose. The crash image is the synced state
+  plus the header the third commit wrote, naming its new slot, and none
+  of the pages that slot names. redb opens it at the second commit. The
+  control opens the same header with its pages at the third.
+- `journaled_real.rs`,
+  `a_crash_anywhere_in_a_one_phase_projection_commit_recovers_the_journals_state`:
+  raft-engine and redb composed, the projection crashed after every one
+  of its writes and syncs under the three tails. The next boot's rows,
+  executed rows included, are exactly those of the same journal replayed
+  into an empty projection.
+
+### Recovery
+
+Quick-repair is off in both modes, so a crash costs the same full repair
+either way: redb walks the file verifying checksums and rebuilds its
+allocator. One-phase commit adds only the rollback when the newest slot
+fails, which is the walk it does anyway. `recovery_time.rs` (ignored; run
+by hand) fills a database a MiB a commit, copies the file while it is
+open after its last commit -- a crash image, since redb clears its
+recovery mark only on a clean close -- and times opening the copy. On
+the container's disk:
+
+| MiB written | file MiB | commit | commits took s | reopen after crash s |
+| --- | --- | --- | --- | --- |
+| 64 | 257 | two phases | 0.82 | 0.48 |
+| 64 | 257 | one phase | 0.66 | 0.49 |
+| 256 | 1028 | two phases | 3.00 | 2.00 |
+| 256 | 1028 | one phase | 3.07 | 1.90 |
+| 512 | 2056 | two phases | 6.62 | 3.24 |
+| 512 | 2056 | one phase | 6.33 | 2.94 |
+
+About 1.5 s per GiB of file in both modes. That is what a node's restart
+pays before it replays the journal, whatever the commit mode.
+
+### Measured
+
+**Syncs.** The voters run under `strace -f -c`, one ten-caller run of
+the `command cost` bench on the container's disk with each binary:
+`fdatasync` calls per executed command per voter fall from 1.58-1.65 to
+1.21-1.25. Each is the voter's journal syncs plus its projection
+commits, counted twice before and once after (under strace, task-d47's voters
+made 0.65 to 0.77 journal syncs and 0.42 to 0.48 commits a command, and
+task-d48's 0.71 to 0.80 and 0.44 to 0.51).
+So a projection commit is now one sync, measured at the system call.
+
+**Throughput.** `scripts/bench/command-cost.sh` on the container's disk,
+task-d47's binary and this task's alternated three times, three
+repeats per caller count each, medians of nine:
+
+| callers | completed/s, task-d47 → task-d48 | the leader's busy ms/cmd |
+| --- | --- | --- |
+| 10 | 508.5 → 531.0 (+4%) | 1.76-2.34 → 1.79-1.89 (one stalled run aside) |
+| 1 | 158.6 → 186.2 (+17%) | 5.5-6.0 → 4.6-5.1 |
+
+- **The disk was slower than for task-d47's readings.** task-d47 read
+  687.8 at ten callers there and 508.5 here, the same binary on the
+  same container. Comparisons hold only within one alternation.
+- **One of task-d48's ten-caller runs read 259.3.** Every voter's
+  journal stage (the journal sync and the projection commit) took 30 s
+  where the run beside it took 3.8, the longest step 1.38 s, with the
+  same counts of syncs and commits. All three voters stalled at once on
+  the disk they share. It is in the median.
+- **At one caller** a command costs the leader three journal syncs and
+  two projection commits in series, so a sync less a commit shows: 17%.
+  **At ten callers** the voters are busy under 60% of the time and a
+  projection commit is 0.35 a command, so one sync less a commit is
+  about 0.1 ms of a 1.8 ms command: 4%.
+- **What bounds it now** is not the projection's sync: at ten callers a
+  voter is idle 40% of the time, waiting on the round trip that the
+  journal sync and the commit sit in, in series on the domain thread.
+  That is task-d52's. task-j06's replay profile stays optional.
+
+On tmpfs the readings are inside the `command cost` gate's margins
+(1,051 to 1,240 completed a second at ten callers, 0.71 to 0.82 busy ms
+a command); a sync costs nothing there, so the change does not show.
+
+## The projection's commit off the domain thread
+
+task-d52. After task-d47 and task-d48 a group still cost the domain
+thread its journal sync, then its projection commit and that commit's
+sync, then the next group's execution, in series. The projection's
+commit now runs on a thread of its own, the materializer. The domain
+thread journals a group and goes on executing while the group commits.
+
+- **The hand-off** (`JournaledStore::hand_off`). A domain's engine is
+  lent to the materializer with the durable records one commit takes,
+  and taken back with the outcome. The commit is the same transaction
+  with the same guards as before. Each domain has at most one commit
+  out, so its commits keep the journal's order. What the domain
+  journals meanwhile waits behind the commit that is out, and goes out
+  as the next one when that commit is back.
+- **Facts and results wait for the outcome.**
+  - `Materialized` is reported only once the outcome is taken back.
+  - A group's results, sends and watch events are held in the node
+    (`Node::settle`) until the projection has committed through the
+    group's last position. The rule is the one task-d47 kept for a
+    group materialized on the domain thread.
+  - The materializer's waker wakes `coordd`'s loop to take an outcome
+    back.
+- **Planning over a group in flight.** The next group is planned over
+  the projection's snapshot with the rows of every group still in
+  flight laid over it, oldest first. This is task-d47's group overlay,
+  extended across groups. A snapshot that already holds some of those
+  groups reads the same, because their rows are the ones it holds and
+  every later write is laid over them again. The base the store checks
+  is still its queued frontier.
+- **The read gate.**
+  - The materializer moves a domain's gate as its commit returns.
+  - A commit's rows are visible a moment before that. A reader that
+    pins a snapshot in that moment waits for the commit to return
+    rather than being refused (`Frontier::begin_commit`).
+  - A commit that fails leaves the gate where it was, and the reader is
+    refused as before.
+- **The bound.** Past 256 durable records owed to the projection, the
+  domain thread waits for the commit out (`PIPELINE_RECORDS`). The
+  learner is held there, not dropped.
+- **What stays on the domain thread.**
+  - Execution itself: planning, admission and the retry layer. Only
+    the commit moved. It was the part with the syncs, and in the
+    profile after task-d46 it was the largest share of the CPU. Moving
+    execution as well would need the machines' `applied` to come back
+    from another thread, and the plan's review boundary allows it, but
+    it is not done here.
+  - Checkpoint publication, a floor boundary and a full queue take the
+    commit out back and commit on the domain thread, as before.
+
+**Recovery.** A boot that ends with a commit out recovers like any
+other, from the journal and the projection's own stamp. That holds
+whether the commit had not started or had returned without its outcome
+being taken back. `into_parts` takes every lent engine back without
+looking at its outcome, as a crash would.
+
+**Tests.**
+- `coord-storage`, `tests/pipelined.rs`, with a manual materializer:
+  - a hand-off reports `Materialized` only once taken back, and lends
+    the records journaled behind it next;
+  - a commit refused definitely gives its records back ahead of those
+    behind it;
+  - an indeterminate commit settles from the stamp, and only the
+    records it took;
+  - checkpoint publication takes the commit out back first;
+  - a boot that ends with a commit handed over and not started, after
+    a commit and before its outcome is taken back, and with records
+    journaled behind a commit out, recovers the journal's rows.
+- `view.rs`: a snapshot of a commit still returning waits for the
+  gate, and one of a commit that failed is refused.
+- `coord-daemon`, `tests/node.rs`:
+  - a group's results wait for its commit while the next group
+    executes over it;
+  - a pipelined node sends the collector the same frames, records the
+    same results and reaches the same revision as one that commits on
+    its own thread;
+  - a boot that ends with a commit handed over, in the middle of a
+    group, or before a commit is taken back answers every journaled
+    command's retry key from the recovered projection.
+- **Negative control.** Releasing a group's results when it is handed
+  off rather than when its commit is back fails
+  `pipelined_a_groups_results_wait_for_its_projection_commit_while_execution_goes_on`.
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, task-d48's
+binary and this task's alternated twice, three repeats per caller count
+each, medians of six:
+
+| callers | completed/s, task-d48 → task-d52 | leader busy ms/cmd | leader journal appends/cmd |
+| --- | --- | --- | --- |
+| 10 | 543.3 → 529.1 | 1.81 → 1.79 | 0.63 → 0.84 |
+| 50 | 861.3 → 948.2 (+10%) | 1.18 → 1.04 (−11%) | 0.22 → 0.24 |
+
+- **At ten callers nothing moved**, within this disk's noise (task-d52's
+  six runs read 507 to 582). The commits left the domain thread, but
+  the thread then flushed smaller groups: 0.84 journal appends a
+  command where it made 0.63. Each append is a sync on the domain
+  thread, and with the projection syncing on the same disk beside it
+  an append took about 1.4 ms. The plan's acceptance was that busy
+  time per command at ten callers falls by at least the projection's
+  share. **This run does not meet it.**
+- **At fifty callers** the groups are large enough that the extra
+  appends cost little, and taking the commit off the thread shows:
+  throughput up 10%, and the leader's busy time per command down 11%.
+- **The domain thread is not what bounds throughput here.** In every
+  run each voter's domain thread is busy 40 to 60% of the time. During
+  a fifty-caller run the container's four cores were 75 to 78% busy:
+  three voters, their network threads, the materializers and fifty
+  callers. What is left is latency: the round trips a command waits
+  through (task-d49's re-sends, task-d50's slow path) and the journal
+  sync that is still on the domain thread.
+- **Not measured here:** the Jepsen runner. That is where the plan's
+  comparison with etcd is made.
+
+## Re-sending a proposal once its answer is due
+
+task-d49. With one caller a leader refused at least 8,192 duplicate
+votes in 100 s for about 4,000 commands. Each duplicate was an
+adoption the voter had already sent, answered again because the leader
+had re-sent the proposal while the first answer was on its way: the
+re-send went out on the first call of the 250 ms timer after the
+proposal, however recent, to every voter whose adoption had not
+arrived. Each one was another step on a domain thread that was already
+the bottleneck.
+
+- **Age.** `Leader::resend_unvoted` re-sends a proposal to a voter only
+  once an interval of calls has passed since its last send, the first
+  send included: the call count is stamped on the proposal when its
+  batch is durable and its first send released (`Proposal::sent`). A
+  re-proposal held back from a new leader's first batch has no first
+  send; it goes out on the next call, counted as `deferred`, unless its
+  batch is refused and presented again first, which sends it to every
+  voter and so publishes it (#141).
+- **The interval is the voter's.** It is the 99th percentile of the
+  calls the voter's latest 128 adoptions took to arrive, between one
+  call and `RESEND_INTERVAL_CAP` (four, one second, as task-d33's
+  back-off cap and for its reason). An adoption that arrived before
+  the next call took none, so a voter that answers within a call keeps
+  today's floor: re-sent on the second call after a send at the
+  earliest, a quarter to half a second. An adoption of a proposal that
+  was re-sent may answer either send, so it is not a sample until a
+  second copy arrives and shows the first was late (Karn's rule).
+  Without those, a voter slower than its interval would be re-sent to
+  every time and its interval would never learn it is slow.
+- **The window is what is due.** It was the voter's first sixteen
+  proposals not adopted, and one waiting out its back-off kept its
+  place. Sixteen proposals whose answers were on their way, or lost
+  behind a full lane, kept a lost proposal after them from ever being
+  sent again. The window is now the voter's first sixteen proposals
+  that are due.
+- **A decided proposal is mostly left to catch-up once it is old.** A
+  proposal the leader decided needs no vote; it is re-sent for the
+  voter, which holds everything ordered after a proposal it lacks. It
+  is re-sent at its back-off only until `RESEND_HANDOFF_CALLS` (eight,
+  two seconds) after its first send: at the floor interval, one, two
+  and four calls after it. By then a voter that still lacks it and holds
+  work behind it has had its frontier still for twice
+  `catch_up::STILL_FOR` and has asked a peer for executed history,
+  which carries the command (task-d08). After that it is handed off:
+  re-sent only as a trickle, one handed-off proposal a voter a call,
+  each one eight calls apart, so a voter that is far behind is sent at
+  most four of them a second. The trickle is for a voter catch-up does
+  not reach: one that missed both the submission and the proposal
+  through an outage holds no work behind the command, and on a quiet
+  domain nothing arrives after it to make it ask (#141; the first cut
+  stopped re-sending outright, and such a voter never got the command).
+  A proposal that is not decided is never handed off: its vote may be
+  the one the leader still needs (task-d15).
+- **A duplicate costs its lookup.** A refused vote returns before the
+  learner runs, on the leader and the follower: nothing was counted,
+  so nothing new can be learned.
+- **Counted by reason.** Each re-send is classified when it goes out:
+  decided, acknowledged on the fast path, or unanswered. Answers that
+  came back twice after a re-send are `late`, the other answers to a
+  re-send `lost`, and every refused duplicate vote is counted exactly.
+  They are in the metrics snapshot's `cost.resends`, over every ballot
+  the voter led, and `scripts/ci/command_cost.py` reports re-sends and
+  duplicate votes per command.
+
+**Not as planned.** The plan asked to re-send only what the voter has
+not acknowledged "on the fast path or the slow". A fast acknowledgement
+goes out when the payload arrives, proposal or not (task-d07), and
+`a_fast_acknowledgement_does_not_stand_for_the_proposal` is the case
+where crediting it leaves a voter without a proposal for good. So a
+fast acknowledgement still does not take a proposal out of the window.
+What keeps such a re-send from being a duplicate is its age: in a
+fault-free run nothing is due. Re-sends counted as acknowledged or
+decided are what the snapshot shows if that stops holding.
+
+The plan's negative control, counting only slow adoptions, does not
+apply as stated for the same reason. The ones run here, each by hand
+and reverted:
+
+- re-sending on the first call regardless of age fails
+  `a_proposal_is_not_resent_before_its_answer_is_due`;
+- taking the window before asking what is due fails
+  `a_lost_proposal_is_resent_with_a_full_window_ahead_of_it`;
+- holding the interval at the floor fails
+  `a_slow_voter_is_given_its_own_interval`;
+- stopping re-sends at the hand-off fails
+  `a_voter_that_missed_a_command_through_a_long_outage_gets_it_on_a_quiet_domain`
+  and `a_decided_proposal_is_trickled_once_old`;
+- not publishing a re-proposal presented again fails
+  `a_held_back_reproposal_presented_again_is_not_sent_again_at_once`
+  ("sent again on the next call, as a first send").
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, task-d52's
+binary and this task's alternated twice, three repeats per caller count
+each, medians of six. The duplicate votes for task-d52 are a lower
+bound: its voters log a refusal only at powers of two, and the bound
+adds each voter's largest. This task's are exact, from the snapshot.
+
+| callers | completed/s, task-d52 → task-d49 | leader busy ms/cmd | duplicate votes per command |
+| --- | --- | --- | --- |
+| 1 | 187.8 → 189.0 | 3.16 → 3.12 | ≥ 0.049 → 0 |
+| 10 | 532.2 → 532.5 | 1.77 → 1.76 | ≥ 0.196 → 0 |
+| 50 | 896.8 → 876.1 | 1.10 → 1.11 | ≥ 0.193 → 0 |
+
+- **No duplicate vote at all**, in any of the 18 runs, against at least
+  5% to 20% of commands before. Every run re-sent two proposals, both
+  counted unanswered and answered as lost: the domain's first
+  proposals, which go out before the followers are linked (task-d07's
+  case). None was counted acknowledged or decided.
+- **Throughput and busy time did not move**, within this disk's noise.
+  A refused duplicate was already cheap, and the domain thread is not
+  what bounds these runs (task-d52's notes).
+- **On tmpfs** the command-cost gate passes, with no duplicate vote at
+  1, 10 or 50 callers.
+
+**A paused voter** (`scripts/bench/pause-voter.sh`, ten callers, 20,000
+operations on tmpfs, the third voter stopped five seconds in for five
+seconds), two runs of each binary:
+
+- The paused voter **executes again within 0.03 to 0.06 s** of being
+  continued, with either binary: its frontier has been still for longer
+  than `STILL_FOR`, so it asks for executed history on its first turn,
+  and the first page is a round trip away. The bound is that round trip
+  plus one turn of the voter's loop; the re-send interval does not enter
+  it, since catch-up and not the re-send carries what it missed.
+- In the first cut's runs, which stopped re-sending a decided proposal
+  at the hand-off, the leader re-sent 1,252 and 1,312 decided proposals
+  in all, and handed 1,043 and 1,087 of them off to catch-up. It refused
+  at least 9,216 frames to the paused voter. Most of those were refused
+  while it was stopped, and they were fresh proposals and
+  acknowledgements at the full command rate, not re-sends.
+- **The lane drained in some runs and not in others, with either
+  binary.** In the first session neither binary drained it while the load
+  lasted. The leader's refusals to the voter rose again 6 to 11 s after
+  it was continued, and when the bench ended the voter was still 5,000
+  to 9,000 commands behind: catching up from history, it executed about
+  560 commands a second while the domain executed 800. In a later
+  session, with the trickle, the old binary and the new one alternated
+  twice each, and every run caught up while the load lasted:
+
+  | binary | caught up after continue (s) | refusals last rose after continue (s) | refused to the voter, at least |
+  | --- | --- | --- | --- |
+  | stop at the hand-off | 4.26, 6.06 | 19.02, 16.35 | 8,960, 8,960 |
+  | trickle | 7.83, 5.68 | 8.13, 6.34 | 9,344, 9,344 |
+
+  Two earlier runs with the trickle caught up after 7.25 and 4.11 s,
+  and their refusals last rose 15.65 and 6.91 s after continue. They
+  re-sent 1,434 and 1,497 decided proposals and handed off 49 and 50.
+  The trickle counts a proposal handed off only when it is first
+  trickled, so it is not comparable to the first cut's count.
+  What differs between the two sessions is not explained, and two runs
+  a side do not separate the binaries. **The plan's acceptance, a
+  bound on the lane draining, is not shown.** A voter that is behind
+  needs the fresh traffic to it held back while it catches up, or a
+  catch-up path faster than the domain. That is outside the re-send
+  window.
+- `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`:
+  see the PR.
+
+### Not done here
+
+- **Submissions presented again.** Followers still refuse a submission
+  the collector offers again as `Duplicate(command)`: 64 to 128 of
+  2,651 commands at fifty callers. That is the collector's re-offering
+  (task-c02, task-64), not a vote.
+- **The lane counters.** `coordd` reports its lanes' frames and
+  refusals as `NotInstrumented`; the pause script reads refusals from
+  the log's powers of two.
+
+## Reads off the slow path
+
+task-d50. A Range was a command: ordered, journaled and synced twice,
+and executed like a write. At ten callers on this container's disk its
+operation took 16 ms at the median, as long as a put. The amendment
+(design Section 6.3) serves it from the leader instead, behind a
+confirmation of its ballot.
+
+- **The barrier.** A frontend with a voter beside it sends a Range
+  without an explicit revision to the leader of the ballot it follows
+  (`ReadV1`). The leader takes its highest proposed sequence number as
+  the read index, starts a confirmation round after the read arrived
+  (`ReadConfirm`), and serves the read once a slow quorum including
+  itself has confirmed that round, everything it proposed below the
+  index has executed, and its snapshot has materialized that far. It
+  plans the Range with the ordered path's own admission check, view and
+  planner, so the answer carries the bytes the ordered path would have
+  recorded at that state (`ReadAnswerV1`). A refusal, an answer from
+  anyone but that leader, or no answer within 1.5 s orders the read.
+- **Why it is linearizable.** A write that completed before the read
+  arrived was learned, so a leader proposed it. If that was this leader
+  in this ballot, it is below the index. If it was an earlier ballot,
+  this ballot's first proposal follows it in the total chain. A higher
+  ballot that could have ordered a later write needed a quorum of
+  promises, and every quorum meets the one that confirmed this ballot
+  after the read arrived: a voter confirms only the ballot it promised,
+  so the round could not have confirmed if a higher one had been
+  promised by a quorum first.
+- **A session's window.** A read served this way records nothing, so it
+  retires nothing; only an ordered command moves its client's floor, by
+  at most 64 sequences. A session that read through the leader alone
+  walked out of its 1024-wide window and was then refused everything,
+  ordered requests included (the first register run: a quarter of the
+  reads were `RetryOutOfWindow`). Past half the window from the floor
+  the leader now leaves the read to the ordered path, which retires
+  behind it: about one read in 64 of a read-only session is ordered.
+  `a_session_that_only_reads_is_served_past_its_window` reads 2,600
+  times on one session; without the guard it is refused at read 1,089.
+- **The fast path stays as it is** (the amendment's decision). With
+  reads off the chain the leader's fast-path share at ten callers rose
+  from 6% to 28%; at one caller it is 99%.
+
+### Linearizability under leader faults
+
+`coord-register` (crates/coord-wan-bench) drives four registers through
+every frontend, two callers each, about a third of the operations
+writes of a value no other write puts, and checks the history
+(`register::check`): writes in revision order agree with real time, and
+every read saw a value some write put, at its revision, invoked before
+the read completed, no older than any write or read that completed
+before the read was invoked, and older than any write invoked after it
+completed. An operation whose outcome the caller never learned may or
+may not have happened. Twelve unit tests on constructed histories,
+each rule broken once.
+
+`scripts/bench/register-faults.sh` stands up a three-voter domain and
+faults its leader while the workload runs:
+
+| Scenario | Runs | Violations | Reads | Writes | Leader after |
+|---|---|---|---|---|---|
+| partition 45 s | 2 | 0, 0 | 28,225, 28,993 | 12,109, 12,423 | n2 (elected) |
+| pause 5 s, then 40 s | 2 | 0, 0 | 42,694, 36,539 | 18,875, 16,194 | n2 (elected) |
+| kill and restart, twice | 2 | 0, 0 | 19,870, 19,621 | 8,243, 8,122 | n1 (ballots 1, 2) |
+| partition 45 s, `skip-read-confirmation` | 1 | **260** | 30,994 | 13,096 | n2 |
+
+- **Partition.** The leader's daemon sockets are cut off from the other
+  voters' with iptables; its own callers still reach it, and only read,
+  five times a second. The other frontends' callers do nothing for two
+  seconds either side of the cut, so the leader holds no proposal it
+  cannot commit. The others notice at the transport's 30 s idle timeout
+  and elect a leader. With the round the cut-off leader serves nothing
+  during the cut (its frontend completed 170 and 188 reads in the
+  run); without it, it answers from the state it had, and the check
+  finds 260 stale reads, all at its frontend (rule 4: "a read ... saw
+  revision 3702; revision 5450 had completed before it").
+- **The negative control needs the quiet.** In the first cut of the
+  scenario the writing frontends kept going; the cut-off leader then
+  always held an ordered read or a write it could not commit, its index
+  never executed, and even without the round it served nothing stale.
+  That is the index doing its part, not the round.
+- **Pause.** A 5 s pause is shorter than the idle timeout: nobody else
+  campaigns, and the reads wait it out. The 40 s pause is longer: the
+  others elect n2 and the stopped voter comes back still believing it
+  leads.
+- **Kill.** The killed leader, started again five seconds later,
+  campaigned and won the next ballot before the others noticed it was
+  gone, both times. A voter taking over from a killed leader is the
+  pause run's case.
+- Unknown outcomes: up to 1,677 reads in a pause run (each a caller
+  waiting out its 5 s deadline on the stopped leader's frontend), up to
+  33 writes in a kill run. The register caller gives an unknown outcome
+  up (`Client::abandon`); forgetting it would hold its session's
+  acknowledged prefix, and the session would be refused a window later.
+
+### Measured
+
+This container's disk, the default mix without scans (55% gets),
+2,500 operations, d49b and d50 alternated, two rounds of three repeats;
+medians of the six:
+
+| Callers | Build | Get service p50 | Get whole p50 | Put service p50 | Completed/s |
+|---|---|---|---|---|---|
+| 1 | d49b | 4.09 ms | 13.19 ms | 4.78 ms | 213 |
+| 1 | d50 | 0.83 ms | 6.23 ms | 4.68 ms | 376 |
+| 10 | d49b | 16.21 ms | 34.20 ms | 16.49 ms | 591 |
+| 10 | d50 | 10.81 ms | 23.32 ms | 12.73 ms | 835 |
+
+Per run, the get service p50 at ten callers was 15.7 to 17.6 ms on
+d49b and 10.4 to 11.5 ms on d50; at one caller 4.0 to 4.3 and 0.8 to
+0.9 ms.
+
+Where a served read's time goes, from `cost.reads` on the leader in one
+instrumented run at ten callers (1,492 served, none refused): 2.4 ms on
+average until its confirmation round was seen confirmed, 5.2 ms until
+everything below its index had also executed, 7.8 ms until it was
+answered, the last 2.6 ms the snapshot materializing that far. At one
+caller all three are 0.4 ms. The rest of the 10.8 ms service time is
+the hop from the two frontends that are not the leader's.
+
+**The acceptance at ten callers is not met.** A read there is not one
+round trip plus the leader's queue: it waits for the writes in flight
+when it arrived to execute, and for their projection. Either is a
+follow-up:
+
+- **A lower index.** Every proposal below the index is waited for,
+  committed or not, because a command the collector learned on the fast
+  path may have completed without the leader knowing it was committed.
+  A read needs only the writes that may have completed before it
+  arrived. Bounding those without the leader learning the fast path's
+  outcomes is a protocol change.
+- **The executed state rather than the projection.** The read is
+  planned over the materialized snapshot, which the applier commits off
+  the domain thread (task-d52). Planning it over what has executed but
+  not yet materialized needs a view of the applier's pending batch.
+
+The command-cost gate (tmpfs, three repeats) is within the baseline's
+margins: busy time per executed command 1.15 to 1.19 ms at one caller
+and 1.04 to 1.11 ms at ten on the leader, against a baseline of 1.32
+and 1.46. Executed commands per run fell from about 2,600 to 1,110,
+since reads are no longer commands.
+
+### Not done here
+
+- **A frontend without a voter** still orders every read: it follows no
+  ballot, so it does not know whom to ask. `[reads] path = "ordered"`
+  turns the barrier off everywhere.
+- **Reads at an explicit revision, and transactions,** are ordered as
+  before. Every Range without one is served, scans included; only
+  point reads were measured.
+- **The Jepsen client's runs** are the external evidence (by the owner
+  of #98).

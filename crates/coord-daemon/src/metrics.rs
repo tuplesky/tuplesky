@@ -483,6 +483,80 @@ pub struct Cost {
     /// The last reporting interval alone, or why there is none: the first
     /// snapshot of a run has no interval behind it.
     pub recent: Measure<Interval>,
+    /// What this voter's re-sends of proposals did, over every ballot it
+    /// led (task-d49). Zero for a voter that never led.
+    pub resends: Resends,
+    /// Commands this voter established on the fast path (task-d50).
+    pub established_fast: u64,
+    /// Commands this voter established on the slow path (task-d50).
+    pub established_slow: u64,
+    /// What this voter's read barrier did, over every ballot it led
+    /// (task-d50). Zero for a voter that never led.
+    #[serde(default)]
+    pub reads: Reads,
+}
+
+/// What a leader's read barrier did (task-d50), cumulative.
+///
+/// The waits are summed over the reads served, so a reader divides them
+/// by [`Reads::served`] for the mean: how long a read waited for its
+/// confirmation round, for everything below its index to execute (which
+/// includes the round), and in all before it was answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reads {
+    /// Reads answered by the barrier.
+    pub served: u64,
+    /// Reads refused, ordered by their frontends instead.
+    pub refused: u64,
+    /// Confirmation rounds started.
+    pub rounds: u64,
+    /// Confirmation rounds that confirmed.
+    pub confirmed: u64,
+    /// Milliseconds from arrival to confirmation, summed.
+    pub waited_confirm_ms: u64,
+    /// Milliseconds from arrival to the index executed, summed.
+    pub waited_index_ms: u64,
+    /// Milliseconds from arrival to the answer, summed.
+    pub waited_ms: u64,
+}
+
+/// What a leader's re-sends of proposals did (task-d49), cumulative.
+///
+/// A re-send is classified when it goes out: [`Resends::decided`],
+/// [`Resends::acknowledged`] and [`Resends::unanswered`] add up to every
+/// re-send. Whether an unanswered one was lost or late shows afterwards:
+/// [`Resends::late`] counts adoptions that arrived again, as duplicates,
+/// after a re-send, and [`Resends::lost`] the answers to a re-send that
+/// were not late.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resends {
+    /// First sends of re-proposals held back from a new leader's first
+    /// batch; not re-sends.
+    pub deferred: u64,
+    /// Re-sends of a proposal already decided.
+    pub decided: u64,
+    /// Re-sends to a voter that had acknowledged the proposal on the
+    /// fast path.
+    pub acknowledged: u64,
+    /// Re-sends to a voter that had not answered the proposal.
+    pub unanswered: u64,
+    /// Answers to a re-send that were not late: the voter lacked the
+    /// proposal, or its first answer was lost.
+    pub lost: u64,
+    /// Answers that had been on their way when the re-send went out.
+    pub late: u64,
+    /// Decided proposals the leader stopped re-sending to a voter and left
+    /// to catch-up.
+    pub handed_off: u64,
+    /// Votes refused as duplicates, fast or slow.
+    pub duplicate_votes: u64,
+}
+
+impl Resends {
+    /// Every re-send, whatever its reason.
+    pub const fn resent(&self) -> u64 {
+        self.decided + self.acknowledged + self.unanswered
+    }
 }
 
 /// One reporting interval of the domain loop (task-d45).

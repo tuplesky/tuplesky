@@ -239,6 +239,11 @@ impl BoundFrontend {
             (Action::Pending { command }, Some((key, logical))) => {
                 self.remember(*key, *command, logical);
             }
+            // A read sent to the leader barrier is disclosed through the
+            // same gate, with the same metadata (task-d50).
+            (Action::Read(r), Some((key, logical))) => {
+                self.remember(*key, r.command, logical);
+            }
             _ => {}
         }
         let action = match action {

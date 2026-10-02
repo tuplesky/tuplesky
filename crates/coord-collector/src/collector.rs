@@ -63,7 +63,7 @@ use crate::wire::{SubmitV1, submit_frame};
 
 /// The largest result a client can actually be handed: an API-class
 /// frame, less room for the response's own fields and the frame header.
-const MAX_DELIVERABLE_RESULT_BYTES: usize =
+pub(crate) const MAX_DELIVERABLE_RESULT_BYTES: usize =
     (coord_types::wire_v1::KindRange::Api.max_frame_length() as usize) - 64 * 1024;
 
 /// What a submission envelope may carry beyond its request's own bytes.
@@ -708,6 +708,24 @@ impl Collector {
         now: MonotonicMillis,
         admitted: &AdmittedRequest,
     ) -> Result<Submitted, SubmitRefusal> {
+        self.submit_since(now, now, admitted)
+    }
+
+    /// Whether `key` is bound to a command here: one being collected, or
+    /// one whose result is retained.
+    pub fn is_bound(&self, key: &RetryKey) -> bool {
+        self.bindings.contains_key(key)
+    }
+
+    /// Submit at `now` a request admitted at `since`, its client deadline
+    /// measured from `since`: a read that waited on its leader first
+    /// (task-d50) keeps the deadline it was admitted with.
+    pub fn submit_since(
+        &mut self,
+        now: MonotonicMillis,
+        since: MonotonicMillis,
+        admitted: &AdmittedRequest,
+    ) -> Result<Submitted, SubmitRefusal> {
         let request = match decode_stream(&admitted.frame).as_deref() {
             Ok([MessageV1::Request(r)]) => r.clone(),
             _ => return Err(SubmitRefusal::Malformed),
@@ -735,7 +753,7 @@ impl Collector {
             if let Some(entry) = self.pending.get_mut(&command) {
                 entry.attached = true;
                 entry.timed_out = false;
-                entry.deadline = deadline(now, request.deadline_ms);
+                entry.deadline = deadline(since, request.deadline_ms);
                 self.trace.push(CollectorEvent::Attached {
                     command: command_hex(&command),
                     sequence,
@@ -790,7 +808,7 @@ impl Collector {
                 votes: VoteSet::new(self.config.quorum.clone(), command),
                 released: None,
                 attached: true,
-                deadline: deadline(now, request.deadline_ms),
+                deadline: deadline(since, request.deadline_ms),
                 timed_out: false,
                 frame: Arc::clone(&frame),
                 solicit_at: now.plus(SOLICIT_AFTER_MILLIS),

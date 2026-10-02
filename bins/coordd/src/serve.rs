@@ -20,7 +20,8 @@ use coord_checkpoint::local::LocalLimits;
 use coord_checkpoint::{LocalBaseline, LocalCheckpointStore};
 use coord_collector::ingress::is_collector;
 use coord_collector::wire::{
-    KIND_EVIDENCE, KIND_RELEASE, KIND_SUBMIT, decode_evidence, decode_release,
+    KIND_EVIDENCE, KIND_READ, KIND_READ_ANSWER, KIND_RELEASE, KIND_SUBMIT, decode_evidence,
+    decode_read_answer, decode_release,
 };
 use coord_collector::{
     Admission, AdmissionLimits, Collector, CollectorConfig, Dispatcher, MonotonicMillis,
@@ -266,8 +267,21 @@ impl Frontend {
                 max_admitted_per_second: Some(config.limits.max_admitted_per_second),
             },
         );
-        let dispatcher =
+        let mut dispatcher =
             Dispatcher::new(admission, collector, config.limits.max_live_subscriptions);
+        // A frontend with a voter beside it follows that voter's ballot,
+        // so it knows who leads; one without does not, and orders every
+        // read (task-d50).
+        dispatcher.set_leader_reads(
+            local.is_some() && config.reads.path == coord_daemon::ReadPath::Leader,
+        );
+        if cfg!(feature = "skip-read-confirmation") {
+            eprintln!(
+                "coordd: built with skip-read-confirmation, the register check's negative \
+                 control: a leader serves reads without confirming its ballot, and they are \
+                 not linearizable"
+            );
+        }
         let frontend = BoundFrontend::new(
             dispatcher,
             BindingConfig {
@@ -829,6 +843,15 @@ pub async fn first_leaf_expired(
         .unwrap_or(Principal::Node)
 }
 
+/// Resolves when `materialized` is notified; never, without one
+/// (task-d52).
+async fn notified(materialized: Option<&tokio::sync::Notify>) {
+    match materialized {
+        Some(notify) => notify.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// A renewal attempt that ended, and which of `renewals` it was; or
 /// nothing for ever while none is out -- a `select!` arm that resolved at
 /// once would spin the loop.
@@ -936,6 +959,8 @@ pub struct Domain<P: Persistence> {
     /// Peer events taken since the last caller's event, so the peer
     /// plane's priority cannot become the caller plane's starvation.
     peer_streak: u32,
+    /// Events taken since the voter last flushed (task-d47).
+    since_flush: u32,
     budgets: Budgets,
     /// This run's stage accounting (task-61), shared with the voter's
     /// node so the journal and materialization points record into the
@@ -944,6 +969,13 @@ pub struct Domain<P: Persistence> {
     /// How long this loop has waited, and when it next prints a
     /// snapshot (task-d45).
     pacing: Pacing,
+    /// Notified by the voter's materializer thread each time a projection
+    /// commit finishes (task-d52), so the loop takes it back and releases
+    /// what waited on it. `None` where commits run on this thread.
+    materialized: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// What reads the leader read barrier did not serve came to, waiting
+    /// for a turn that can send it (task-d50).
+    read_orders: Vec<coord_collector::Action>,
     /// Dials out after the first ones, one task each (task-d03). A dial is
     /// mostly waiting -- an absent voter costs a whole handshake timeout
     /// -- so it runs beside the loop rather than inside it, and ends with
@@ -1291,6 +1323,14 @@ const OFFERS_PER_TURN: usize = 16;
 /// loop read it (task-d33).
 const PEER_BEFORE_API: u32 = 8;
 
+/// Queued batches at which the loop lowers before it takes another event
+/// (task-d47): a full journal group (`GroupLimits::DEFAULT`).
+const FLUSH_QUEUED: usize = 64;
+
+/// Events the loop takes before it flushes what they left owed, however
+/// many more are ready (task-d47).
+const FLUSH_EVENTS: u32 = 64;
+
 /// Whether the caller's plane is polled before the peer plane this
 /// turn, given how many peer events have been taken since the last
 /// caller's event.
@@ -1423,10 +1463,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             floor_said: coord_daemon::floor::FloorCounts::default(),
             fenced_stop: None,
             peer_streak: 0,
+            since_flush: 0,
             budgets,
             recorder,
             pacing: Pacing::default(),
+            materialized: None,
+            read_orders: Vec::new(),
         }
+    }
+
+    /// Wake when `materialized` is notified, and take back what the
+    /// voter's materializer committed (task-d52).
+    #[must_use]
+    pub fn wake_on_materialized(
+        mut self,
+        materialized: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.materialized = Some(materialized);
+        self
     }
 
     /// Print a snapshot every `every` while serving, for `roles`
@@ -1474,6 +1528,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
+            resends: resends(&voter.resend_counts()),
+            established_fast: voter.node().established.fast,
+            established_slow: voter.node().established.slow,
+            reads: reads(&voter.read_counts()),
         })
     }
 
@@ -1668,6 +1726,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 say_fenced_stop(&what);
                 return;
             }
+            // A full journal group's worth queued is lowered now, whatever
+            // else is ready, and so is whatever a run of events left owed:
+            // events that queue nothing -- votes the leader counts, a
+            // busy follower's acknowledgements -- would otherwise keep a
+            // command that is ready from executing for as long as they
+            // kept arriving (task-d47).
+            let owed = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            if (self.queued() >= FLUSH_QUEUED || (owed && self.since_flush >= FLUSH_EVENTS))
+                && self.stops_on_flush(transport)
+            {
+                return;
+            }
             let progressed = match self.turn(transport).await {
                 Ok(p) => p,
                 Err(coord_daemon::DriveError::Fenced(what)) => {
@@ -1777,6 +1847,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // share without giving up the ordering that makes the
             // domain progress.
             let api_first = poll_api_first(self.peer_streak);
+            let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            let materialized = self.materialized.clone();
             // Waiting from here: the select below returns at once when
             // there is work, and otherwise this is the loop's idle time.
             self.pacing.wait();
@@ -1789,9 +1861,29 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     // voter that cannot progress waits rather than
                     // spins.
                     () = std::future::ready(()), if progressed => continue,
+                    // A projection commit has finished: what waited on it
+                    // -- a group's results and watch events -- goes out,
+                    // and the materializer gets the next (task-d52).
+                    () = notified(materialized.as_deref()) => {
+                        self.pacing.woke();
+                        if self.stops_on_settle(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     event = transport.next_event() => event.map(Arrived::Api),
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
+                    // No event is ready: what the events so far queued is
+                    // lowered as one group before the loop waits (task-d47).
+                    () = std::future::ready(()), if owes_flush => {
+                        // Work, not waiting: it is counted as busy.
+                        self.pacing.woke();
+                        if self.stops_on_flush(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
                         self.dialled(done);
                         continue;
@@ -1810,9 +1902,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 tokio::select! {
                     biased;
                     () = std::future::ready(()), if progressed => continue,
+                    // A projection commit has finished: what waited on it
+                    // -- a group's results and watch events -- goes out,
+                    // and the materializer gets the next (task-d52).
+                    () = notified(materialized.as_deref()) => {
+                        self.pacing.woke();
+                        if self.stops_on_settle(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                     event = transport.next_event() => event.map(Arrived::Api),
+                    () = std::future::ready(()), if owes_flush => {
+                        // Work, not waiting: it is counted as busy.
+                        self.pacing.woke();
+                        if self.stops_on_flush(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     Some(done) = self.dials.join_next_with_id(), if !self.dials.is_empty() => {
                         self.dialled(done);
                         continue;
@@ -1832,10 +1942,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             match arrived {
                 Some(Arrived::Api(event)) => {
                     self.peer_streak = 0;
+                    self.since_flush = self.since_flush.saturating_add(1);
                     self.on_transport(transport, event, &clock).await;
                 }
                 Some(Arrived::Peer(event)) => {
                     self.peer_streak = self.peer_streak.saturating_add(1);
+                    self.since_flush = self.since_flush.saturating_add(1);
                     self.on_peer_plane(transport, event);
                 }
                 None => return,
@@ -2279,8 +2391,17 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // A snapshot is due on its interval, and an idle domain is the
         // one whose counters an operator is asking about (task-d45).
         let report = self.pacing.due.filter(|_| self.pacing.every.is_some());
+        // A read whose leader has not answered is ordered at its deadline
+        // (task-d50), and nothing arrives to say the deadline has passed.
+        let read = self
+            .frontend
+            .frontend
+            .dispatcher()
+            .next_read_deadline()
+            .map(|at| self.started + std::time::Duration::from_millis(at.get()));
         [
             expiry, parked, reoffer, redial, renewal, election, resend, catch_up, pages, report,
+            read,
         ]
         .into_iter()
         .flatten()
@@ -2295,6 +2416,76 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .map_or((0, 0, 0), |e| (e.done.0, e.done.1, e.armed()))
     }
 
+    /// Batches the voter's rounds left queued for a flush (task-d47).
+    fn queued(&self) -> usize {
+        match &self.backing {
+            Backing::Voting(voter) => voter.queued(),
+            Backing::Serving(_) => 0,
+        }
+    }
+
+    /// Lower what the voter's rounds left queued as one group and send
+    /// what that released (task-d47). Returns whether the voter must
+    /// stop: it cannot make its transitions durable, or it is fenced.
+    fn stops_on_flush(&mut self, api: &Transport) -> bool {
+        self.since_flush = 0;
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        // What the journal append released goes out before the execution
+        // group's projection commit, and the group's results after it.
+        let journaled = voter.flush();
+        if self.stops_on(api, journaled) {
+            return true;
+        }
+        let Backing::Voting(voter) = &mut self.backing else {
+            unreachable!("checked above");
+        };
+        let finished = voter.finish();
+        self.stops_on(api, finished)
+    }
+
+    /// Take back what the voter's materializer committed and send what
+    /// that released (task-d52). Returns whether the voter must stop.
+    fn stops_on_settle(&mut self, api: &Transport) -> bool {
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        let settled = voter.settle();
+        self.stops_on(api, settled)
+    }
+
+    /// Send one step of a flush's output, or report why the voter stops.
+    fn stops_on(
+        &mut self,
+        api: &Transport,
+        step: Result<coord_daemon::Outbound, DriveError>,
+    ) -> bool {
+        let now = self.now_millis();
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        match step {
+            Ok(mut out) => {
+                // A flush or a materialization may be what a held read
+                // waited for (task-d50).
+                out.absorb(voter.pump_reads(now));
+                let provenance = voter.provenance();
+                self.frontend.follow(voter.node().machine().active());
+                self.carry(api, out, provenance);
+                false
+            }
+            Err(DriveError::Fenced(what)) => {
+                say_fenced_stop(&what);
+                true
+            }
+            Err(e) => {
+                eprintln!("this voter cannot make its transitions durable: {e}");
+                true
+            }
+        }
+    }
+
     /// Give the voter its turn: the local submissions it is owed, then
     /// whatever applying those produced.
     ///
@@ -2302,6 +2493,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// to come back rather than wait.
     async fn turn(&mut self, api: &Transport) -> Result<bool, DriveError> {
         self.maintain();
+        // Reads whose leader did not answer in time are ordered instead
+        // (task-d50), on a serving node as on a voting one.
+        let now = self.now_millis();
+        let expired = self.frontend.frontend.dispatcher_mut().expire_reads(now);
+        self.read_orders.extend(expired);
+        self.send_read_orders(api);
         let Backing::Voting(voter) = &mut self.backing else {
             return Ok(false);
         };
@@ -2348,7 +2545,11 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             }
         }
         out.absorb(voter.follow_machine()?);
-        out.absorb(voter.execute()?);
+        // Lowering in groups, commands are applied when the loop flushes,
+        // with whatever else became executable by then (task-d47).
+        if !voter.node().lowers_in_groups() {
+            out.absorb(voter.execute()?);
+        }
         // A command whose identity this replica learned from evidence
         // and whose content nobody sent it. Execution stops at it
         // rather than going past it, so what unblocks the domain is
@@ -2557,6 +2758,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 voter.node().machine().identity().epoch,
             )));
         }
+        // What this turn executed may be what a held read waited for.
+        out.absorb(voter.pump_reads(now));
         self.carry(api, out, provenance);
         // A submission is the only thing that can say where this voter's
         // evidence for a command belongs, so whatever was waiting for
@@ -2639,6 +2842,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// there is no local acknowledgement, and one co-located voter is
     /// one voter's worth of evidence.
     fn carry(&mut self, api: &Transport, out: coord_daemon::Outbound, provenance: PeerProvenance) {
+        // A read's answer goes to the collector that sent the read, and
+        // to no other (task-d50).
+        for (origin, bytes) in out.reads {
+            match origin {
+                coord_daemon::voter::Origin::Connection(id) => {
+                    self.return_to_collector(api, id, &bytes);
+                }
+                coord_daemon::voter::Origin::Local => match one_frame(&bytes) {
+                    Ok(frame) => self.on_frame_from_voter(provenance, &frame),
+                    Err(_) => self.frontend.counts.unserved += 1,
+                },
+            }
+        }
         for frame in out.frontend {
             self.hand_to_collector(api, provenance, &frame);
         }
@@ -2729,6 +2945,87 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         // its own report.
         self.frontend.counts.unserved +=
             (out.arm.len() + out.cancel.len() + out.views.len() + out.entropy.len()) as u64;
+        self.send_read_orders(api);
+    }
+
+    /// Send a read to the leader its collector follows (task-d50): to
+    /// the voter in this process when it leads, and otherwise over the
+    /// link to the leader, as a submission goes. A read that cannot be
+    /// sent is ordered at once rather than left to its deadline.
+    fn send_read(&mut self, api: &Transport, plan: coord_collector::ReadPlan) {
+        let now = self.now_millis();
+        if let Backing::Voting(voter) = &mut self.backing
+            && voter.provenance().from() == plan.leader
+        {
+            let out = match one_frame(&plan.frame) {
+                Ok(frame) => voter.on_read(&frame, coord_daemon::voter::Origin::Local, now),
+                Err(_) => coord_daemon::Outbound::default(),
+            };
+            let provenance = voter.provenance();
+            self.carry(api, out, provenance);
+            return;
+        }
+        let fan_out = coord_collector::FanOut {
+            command: plan.command,
+            retry_key: plan.retry_key,
+            targets: vec![plan.leader],
+            frame: plan.frame.into(),
+        };
+        let out = fanout::dispatch(&self.frontend.membership, api, None, &fan_out);
+        if out.queued.is_empty()
+            && let Some(action) = self
+                .frontend
+                .frontend
+                .dispatcher_mut()
+                .order_read(now, &plan.retry_key)
+        {
+            self.read_orders.push(action);
+            self.send_read_orders(api);
+        }
+    }
+
+    /// Carry out what ordering a read the barrier did not serve asked for
+    /// (task-d50): a submission to fan out, or an answer.
+    fn send_read_orders(&mut self, api: &Transport) {
+        for action in std::mem::take(&mut self.read_orders) {
+            match action {
+                coord_collector::Action::FanOut(plan) => {
+                    let command = plan.command;
+                    let out = fanout::dispatch(
+                        &self.frontend.membership,
+                        api,
+                        self.frontend
+                            .local
+                            .as_ref()
+                            .map(|l| l as &dyn fanout::LocalIngress),
+                        &plan,
+                    );
+                    self.record_offer(command, &out);
+                }
+                coord_collector::Action::Respond(delivery) => self.answer(delivery),
+                // Attached to an ordering already under way: its release
+                // finds the stream.
+                _ => {}
+            }
+        }
+    }
+
+    /// A current read a collector in another process sent this voter as
+    /// the leader it follows (task-d50).
+    fn on_remote_read(
+        &mut self,
+        api: &Transport,
+        frame: &Frame,
+        from: coord_transport::ConnectionId,
+    ) {
+        let now = self.now_millis();
+        let Backing::Voting(voter) = &mut self.backing else {
+            self.frontend.counts.unserved += 1;
+            return;
+        };
+        let out = voter.on_read(frame, coord_daemon::voter::Origin::Connection(from.0), now);
+        let provenance = voter.provenance();
+        self.carry(api, out, provenance);
     }
 
     /// One frame a voter addressed to the trusted collector: to
@@ -3091,6 +3388,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     Err(_) => None,
                 }
             }),
+            KIND_READ_ANSWER => {
+                let now = self.now_millis();
+                let resolved = decode_read_answer(frame).ok().and_then(|answer| {
+                    self.frontend.frontend.dispatcher_mut().on_read_answer(
+                        now,
+                        provenance.from(),
+                        answer,
+                    )
+                });
+                match resolved {
+                    Some(coord_collector::ReadResolution::Answer(delivery)) => Some(delivery),
+                    // Ordered instead: sent on the next pass that holds
+                    // the transport.
+                    Some(coord_collector::ReadResolution::Ordered(action)) => {
+                        self.read_orders.push(action);
+                        None
+                    }
+                    None => None,
+                }
+            }
             _ => {
                 self.frontend.counts.unserved += 1;
                 return;
@@ -3218,6 +3535,13 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     drop(responder);
                     return;
                 }
+                // A collector's read for this voter as the leader it
+                // follows (task-d50): answered on the link, like evidence.
+                if frame.kind == KIND_READ && is_collector(identity.role) {
+                    self.on_remote_read(transport, &frame, connection);
+                    drop(responder);
+                    return;
+                }
                 let health = ClockHealth::healthy(clock(), CLOCK_UNCERTAINTY_SECONDS);
                 let retry_key = invocation_of(&frame);
                 // A request this domain has already executed is answered
@@ -3297,7 +3621,10 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             TransportEvent::ApiDelivery {
                 provenance, frame, ..
             } => match provenance {
-                Some(provenance) => self.on_frame_from_voter(provenance, &frame),
+                Some(provenance) => {
+                    self.on_frame_from_voter(provenance, &frame);
+                    self.send_read_orders(transport);
+                }
                 // A peer holding no replica identity is not a voter, so
                 // what it delivered is not evidence of anything.
                 None => self.frontend.counts.unserved += 1,
@@ -3335,8 +3662,14 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 // around it is the transport's, and the transport has
                 // already refused any kind or version that is not this
                 // build's peer evidence.
+                let now = MonotonicMillis::new(
+                    u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
                 match voter.on_peer(provenance, payload) {
-                    Ok(out) => {
+                    Ok(mut out) => {
+                        // A confirmation, or what the frame executed, may
+                        // be what a held read waited for (task-d50).
+                        out.absorb(voter.pump_reads(now));
                         let provenance = voter.provenance();
                         // Before the frame's output reaches the collector
                         // beside this voter: evidence the step that
@@ -3458,6 +3791,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     &plan,
                 );
                 self.record_offer(command, &out);
+            }
+            Step::Read(plan) => {
+                // Held before the read goes out, as a submission is: the
+                // leader beside this collector answers within this call.
+                if let Some(displaced) =
+                    self.frontend
+                        .pending
+                        .hold(connection.0, plan.retry_key, responder)
+                {
+                    drop(displaced);
+                }
+                self.send_read(transport, *plan);
             }
             Step::Watch {
                 watch_id,
@@ -3951,6 +4296,33 @@ fn say_fenced_stop(what: &str) {
          which is at a promise above this voter's ballot. \
          A restart resumes at the promised ballot, as a follower that campaigns"
     );
+}
+
+/// The snapshot's reading of a leader's re-send counts (task-d49).
+fn resends(counts: &coord_consensus::ResendCounts) -> coord_daemon::metrics::Resends {
+    coord_daemon::metrics::Resends {
+        deferred: counts.deferred,
+        decided: counts.decided,
+        acknowledged: counts.acknowledged,
+        unanswered: counts.unanswered,
+        lost: counts.lost(),
+        late: counts.late,
+        handed_off: counts.handed_off,
+        duplicate_votes: counts.duplicate_votes,
+    }
+}
+
+/// The snapshot's reading of the read barrier's counts (task-d50).
+fn reads(counts: &coord_daemon::reads::ReadCounts) -> coord_daemon::metrics::Reads {
+    coord_daemon::metrics::Reads {
+        served: counts.served,
+        refused: counts.refused,
+        rounds: counts.rounds,
+        confirmed: counts.confirmed,
+        waited_confirm_ms: counts.waited_confirm_ms,
+        waited_index_ms: counts.waited_index_ms,
+        waited_ms: counts.waited_ms,
+    }
 }
 
 fn hex4(replica: &coord_types::ids::ReplicaId) -> String {

@@ -35,6 +35,8 @@ impl From<EngineError> for ViewError {
 #[derive(Debug, Default)]
 pub struct Frontier {
     completed: AtomicU64,
+    /// The stamp of a projection commit that is running, or zero.
+    committing: AtomicU64,
     quarantined: std::sync::atomic::AtomicBool,
 }
 
@@ -42,6 +44,28 @@ impl Frontier {
     pub(crate) fn set_completed(&self, seq: StoreSeq) {
         self.completed
             .store(seq.journal_seq().get(), Ordering::Release);
+    }
+
+    /// A projection commit stamped `seq` is about to run (task-d52).
+    ///
+    /// Its rows can become visible to a snapshot an instant before the
+    /// commit returns and [`Frontier::set_completed`] moves the gate. A
+    /// reader that pins one in that instant waits for the commit to end
+    /// rather than being refused: once the materializer commits on its
+    /// own thread, that instant is no longer one no reader can see.
+    pub(crate) fn begin_commit(&self, seq: StoreSeq) {
+        self.committing
+            .store(seq.journal_seq().get(), Ordering::Release);
+    }
+
+    /// The running commit has ended, whatever its outcome; the gate has
+    /// moved already if it returned.
+    pub(crate) fn end_commit(&self) {
+        self.committing.store(0, Ordering::Release);
+    }
+
+    fn committing(&self) -> u64 {
+        self.committing.load(Ordering::Acquire)
     }
 
     pub(crate) fn quarantine(&self) {
@@ -107,8 +131,20 @@ impl<R: SnapshotSource> GatedReader<R> {
         }
         let view = self.reader.snapshot()?;
         let meta = DurableMeta::read(&view)?;
-        let completed = self.frontier.completed();
-        if meta.stamp.store_seq().journal_seq().get() > completed {
+        let stamp = meta.stamp.store_seq().journal_seq().get();
+        let mut completed = self.frontier.completed();
+        // A snapshot of a commit that is still returning: its rows are
+        // visible and its gate is about to move. The commit is waited
+        // out, not refused; the moment is the commit's own return, and a
+        // commit that fails leaves `committing` without moving the gate.
+        while stamp > completed && self.frontier.committing() == stamp {
+            std::thread::yield_now();
+            completed = self.frontier.completed();
+        }
+        // `end_commit` follows `set_completed`, so a commit that ended
+        // between the two loads above has moved the gate by now.
+        completed = self.frontier.completed();
+        if stamp > completed {
             return Err(ViewError::AheadOfCompletion {
                 snapshot: meta.stamp.store_seq(),
                 completed: StoreSeq::from_journal(
@@ -117,5 +153,100 @@ impl<R: SnapshotSource> GatedReader<R> {
             });
         }
         Ok(GatedView::new(view, meta))
+    }
+}
+
+#[cfg(test)]
+mod committing {
+    //! The moment between a projection commit making its rows visible and
+    //! the gate moving (task-d52). Once the materializer commits on a
+    //! thread of its own, a reader on the domain thread can land in it.
+
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use coord_store_api::engine::{LocalEngine, WriteTxn};
+    use coord_store_api::envelope::AppliedStamp;
+    use coord_store_api::seq::StoreSeq;
+    use coord_store_testkit::model::ModelEngine;
+    use coord_types::identity::Digest32;
+    use coord_types::ids::LocalJournalSeq;
+
+    use super::{Frontier, GatedReader, ViewError};
+    use crate::lowering::{DurableMeta, ExecutionFrontier};
+
+    fn stamp(n: u64) -> StoreSeq {
+        StoreSeq::from_journal(LocalJournalSeq::new(n).unwrap())
+    }
+
+    /// A projection whose committed stamp is `n`, as the materializer's
+    /// commit would have left it.
+    fn committed_at(n: u64) -> ModelEngine {
+        let mut engine = ModelEngine::new();
+        let mut tx = engine.begin_write().unwrap();
+        DurableMeta {
+            stamp: AppliedStamp::new(stamp(n), Digest32([n as u8; 32])),
+            frontier: ExecutionFrontier::INITIAL,
+        }
+        .write(&mut tx)
+        .unwrap();
+        tx.commit_durable().unwrap();
+        engine
+    }
+
+    #[test]
+    fn a_snapshot_of_a_commit_still_returning_waits_for_the_gate() {
+        let engine = committed_at(5);
+        let frontier = Arc::new(Frontier::default());
+        frontier.set_completed(stamp(4));
+        frontier.begin_commit(stamp(5));
+        let reader = GatedReader::new(engine.reader(), frontier.clone());
+        let started = Instant::now();
+        let materializer = std::thread::spawn({
+            let frontier = frontier.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                frontier.set_completed(stamp(5));
+                frontier.end_commit();
+            }
+        });
+        let view = reader.snapshot().expect("waited for the commit to return");
+        assert_eq!(view.store_seq(), stamp(5));
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        materializer.join().unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_of_a_commit_that_failed_is_refused() {
+        let engine = committed_at(5);
+        let frontier = Arc::new(Frontier::default());
+        frontier.set_completed(stamp(4));
+        frontier.begin_commit(stamp(5));
+        let reader = GatedReader::new(engine.reader(), frontier.clone());
+        let materializer = std::thread::spawn({
+            let frontier = frontier.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(20));
+                // An indeterminate commit: the gate does not move.
+                frontier.end_commit();
+            }
+        });
+        assert!(matches!(
+            reader.snapshot(),
+            Err(ViewError::AheadOfCompletion { .. })
+        ));
+        materializer.join().unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_ahead_of_the_gate_with_no_commit_running_is_refused_at_once() {
+        let engine = committed_at(5);
+        let frontier = Arc::new(Frontier::default());
+        frontier.set_completed(stamp(4));
+        let reader = GatedReader::new(engine.reader(), frontier);
+        assert!(matches!(
+            reader.snapshot(),
+            Err(ViewError::AheadOfCompletion { .. })
+        ));
     }
 }

@@ -11,6 +11,12 @@ publish.workspace = true
 [package.metadata.tuplesky]
 role = "production"
 
+[features]
+# The register check's negative control (task-d50): a leader serves a
+# read without the confirmation round. Unsafe by construction; built
+# only by `scripts/bench/register-faults.sh` to show the check fails.
+skip-read-confirmation = []
+
 [dependencies]
 coord-types.workspace = true
 coord-transport.workspace = true
@@ -22,6 +28,8 @@ coord-core.workspace = true
 coord-session.workspace = true
 coord-storage.workspace = true
 coord-checkpoint.workspace = true
+coord-state.workspace = true
+postcard.workspace = true
 rustix.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
@@ -30,9 +38,7 @@ toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-postcard.workspace = true
 coord-journal-api.workspace = true
-coord-state.workspace = true
 rcgen.workspace = true
 coord-storage-redb.workspace = true
 coord-store-testkit.workspace = true

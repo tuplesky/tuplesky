@@ -20,6 +20,7 @@
 //! is only journaled is evidence a recovery summary must include, not a
 //! learned or established outcome, and the overlay is never written back.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, VecDeque};
 
 use coord_core::effect::{CollectionId, StoreUpdate};
@@ -51,6 +52,13 @@ impl CutOverlay {
                 (update.collection, update.key.clone()),
                 update.value.clone(),
             );
+        }
+    }
+
+    /// Lay `later`'s rows over these, a key `later` holds winning.
+    pub fn absorb(&mut self, later: &CutOverlay) {
+        for (key, value) in &later.rows {
+            self.rows.insert(key.clone(), value.clone());
         }
     }
 
@@ -87,20 +95,21 @@ impl CutOverlay {
 
 /// A gated snapshot plus the journal suffix that is durable but not yet
 /// materialized: the authoritative cut a recovery summary is built from.
-pub struct RecoveryCut<V> {
+///
+/// The overlay is held as `O`, so a reader that keeps one overlay across
+/// many reads -- an applier planning a group of commands over the writes
+/// the group has not materialized yet (task-d47) -- shares it rather than
+/// copying it for each.
+pub struct RecoveryCut<V, O = CutOverlay> {
     snapshot: GatedView<V>,
-    overlay: CutOverlay,
+    overlay: O,
     durable: LocalJournalSeq,
 }
 
-impl<V: OrderedRead> RecoveryCut<V> {
+impl<V: OrderedRead, O: Borrow<CutOverlay>> RecoveryCut<V, O> {
     /// Bind a snapshot to the overlay of the records durable through
     /// `durable` but not represented by the snapshot's stamp.
-    pub const fn new(
-        snapshot: GatedView<V>,
-        overlay: CutOverlay,
-        durable: LocalJournalSeq,
-    ) -> Self {
+    pub const fn new(snapshot: GatedView<V>, overlay: O, durable: LocalJournalSeq) -> Self {
         RecoveryCut {
             snapshot,
             overlay,
@@ -119,8 +128,8 @@ impl<V: OrderedRead> RecoveryCut<V> {
     }
 
     /// The overlay the cut adds over the snapshot.
-    pub const fn overlay(&self) -> &CutOverlay {
-        &self.overlay
+    pub fn overlay(&self) -> &CutOverlay {
+        self.overlay.borrow()
     }
 }
 
@@ -133,9 +142,12 @@ enum Side {
     Both,
 }
 
-impl<V: OrderedRead> OrderedRead for RecoveryCut<V> {
+impl<V: OrderedRead, O: Borrow<CutOverlay>> OrderedRead for RecoveryCut<V, O> {
     fn get(&self, collection: CollectionId, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
-        match self.overlay.rows.get(&(collection, key.to_vec())) {
+        if self.overlay().is_empty() {
+            return self.snapshot.view().get(collection, key);
+        }
+        match self.overlay().rows.get(&(collection, key.to_vec())) {
             Some(value) => Ok(value.clone()),
             None => self.snapshot.view().get(collection, key),
         }
@@ -146,7 +158,10 @@ impl<V: OrderedRead> OrderedRead for RecoveryCut<V> {
         collection: CollectionId,
         request: &ScanRequest,
     ) -> Result<RowPage, EngineError> {
-        let mut overlay = self.overlay.in_scan_order(collection, request);
+        if self.overlay().is_empty() {
+            return self.snapshot.view().scan_page(collection, request);
+        }
+        let mut overlay = self.overlay().in_scan_order(collection, request);
         let mut base: VecDeque<Row> = VecDeque::new();
         let mut base_cursor = request.resume_after.clone();
         let mut base_exhausted = false;

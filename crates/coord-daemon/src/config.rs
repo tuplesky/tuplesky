@@ -146,6 +146,29 @@ pub struct MetricsConfig {
     pub interval_seconds: u64,
 }
 
+/// How this node's frontend serves a current read (task-d50; design
+/// Section 6.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadsConfig {
+    /// Which path a current read takes.
+    #[serde(default)]
+    pub path: ReadPath,
+}
+
+/// The path a current read takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadPath {
+    /// The leader read barrier, falling back to an ordered command. A
+    /// frontend with no voter beside it orders every read: it follows no
+    /// ballot, so it does not know who leads.
+    #[default]
+    Leader,
+    /// Every read is an ordered command, as before task-d50.
+    Ordered,
+}
+
 /// The interval a configuration that names none gets: often enough that
 /// a killed daemon's last line is recent, rarely enough that the log is
 /// not the snapshot.
@@ -638,6 +661,9 @@ pub struct Config {
     /// Printing this node's metrics while it serves (task-d45).
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// How current reads are served (task-d50).
+    #[serde(default)]
+    pub reads: ReadsConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).
