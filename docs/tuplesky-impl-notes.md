@@ -9092,21 +9092,37 @@ seconds), two runs of each binary:
   and the first page is a round trip away. The bound is that round trip
   plus one turn of the voter's loop; the re-send interval does not enter
   it, since catch-up and not the re-send carries what it missed.
-- In this task's runs the leader re-sent 1,252 and 1,312 decided
-  proposals in all and handed 1,043 and 1,087 of them off to catch-up. It
-  refused at least 9,216 frames to the paused voter. Most of those were
-  refused while it was stopped, and they were fresh proposals and
+- In the first cut's runs, which stopped re-sending a decided proposal
+  at the hand-off, the leader re-sent 1,252 and 1,312 decided proposals
+  in all, and handed 1,043 and 1,087 of them off to catch-up. It refused
+  at least 9,216 frames to the paused voter. Most of those were refused
+  while it was stopped, and they were fresh proposals and
   acknowledgements at the full command rate, not re-sends.
-- **The lane does not drain, with either binary, while the load
-  lasts.** The leader's refusals to the voter rose again 6 to 11 s after
-  it was continued. When the bench ended the voter was still 5,000 to
-  9,000 commands behind: catching up from history it executed about
-  560 commands a second while the domain executed 800. The plan's
-  acceptance asks for a bound on the lane draining. **These runs do not
-  meet it, and this task's re-sends are not what keeps it full.** A
-  voter that is behind needs the fresh traffic to it held back while it
-  catches up, or a catch-up path faster than the domain. That is
-  outside the re-send window.
+- **The lane drained in some runs and not in others, with either
+  binary.** In the first session neither binary drained it while the load
+  lasted. The leader's refusals to the voter rose again 6 to 11 s after
+  it was continued, and when the bench ended the voter was still 5,000
+  to 9,000 commands behind: catching up from history, it executed about
+  560 commands a second while the domain executed 800. In a later
+  session, with the trickle, the old binary and the new one alternated
+  twice each, and every run caught up while the load lasted:
+
+  | binary | caught up after continue (s) | refusals last rose after continue (s) | refused to the voter, at least |
+  | --- | --- | --- | --- |
+  | stop at the hand-off | 4.26, 6.06 | 19.02, 16.35 | 8,960, 8,960 |
+  | trickle | 7.83, 5.68 | 8.13, 6.34 | 9,344, 9,344 |
+
+  Two earlier runs with the trickle caught up after 7.25 and 4.11 s,
+  and their refusals last rose 15.65 and 6.91 s after continue. They
+  re-sent 1,434 and 1,497 decided proposals and handed off 49 and 50.
+  The trickle counts a proposal handed off only when it is first
+  trickled, so it is not comparable to the first cut's count.
+  What differs between the two sessions is not explained, and two runs
+  a side do not separate the binaries. **The plan's acceptance, a
+  bound on the lane draining, is not shown.** A voter that is behind
+  needs the fresh traffic to it held back while it catches up, or a
+  catch-up path faster than the domain. That is outside the re-send
+  window.
 - `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`:
   see the PR.
 
