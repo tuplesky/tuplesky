@@ -8849,3 +8849,118 @@ repeats per caller count each, medians of nine:
 On tmpfs the readings are inside the `command cost` gate's margins
 (1,051 to 1,240 completed a second at ten callers, 0.71 to 0.82 busy ms
 a command); a sync costs nothing there, so the change does not show.
+
+## The projection's commit off the domain thread
+
+task-d52. After task-d47 and task-d48 a group still cost the domain
+thread its journal sync, then its projection commit and that commit's
+sync, then the next group's execution, in series. The projection's
+commit now runs on a thread of its own, the materializer. The domain
+thread journals a group and goes on executing while the group commits.
+
+- **The hand-off** (`JournaledStore::hand_off`). A domain's engine is
+  lent to the materializer with the durable records one commit takes,
+  and taken back with the outcome. The commit is the same transaction
+  with the same guards as before. Each domain has at most one commit
+  out, so its commits keep the journal's order. What the domain
+  journals meanwhile waits behind the commit that is out, and goes out
+  as the next one when that commit is back.
+- **Facts and results wait for the outcome.**
+  - `Materialized` is reported only once the outcome is taken back.
+  - A group's results, sends and watch events are held in the node
+    (`Node::settle`) until the projection has committed through the
+    group's last position. The rule is the one task-d47 kept for a
+    group materialized on the domain thread.
+  - The materializer's waker wakes `coordd`'s loop to take an outcome
+    back.
+- **Planning over a group in flight.** The next group is planned over
+  the projection's snapshot with the rows of every group still in
+  flight laid over it, oldest first. This is task-d47's group overlay,
+  extended across groups. A snapshot that already holds some of those
+  groups reads the same, because their rows are the ones it holds and
+  every later write is laid over them again. The base the store checks
+  is still its queued frontier.
+- **The read gate.**
+  - The materializer moves a domain's gate as its commit returns.
+  - A commit's rows are visible a moment before that. A reader that
+    pins a snapshot in that moment waits for the commit to return
+    rather than being refused (`Frontier::begin_commit`).
+  - A commit that fails leaves the gate where it was, and the reader is
+    refused as before.
+- **The bound.** Past 256 durable records owed to the projection, the
+  domain thread waits for the commit out (`PIPELINE_RECORDS`). The
+  learner is held there, not dropped.
+- **What stays on the domain thread.**
+  - Execution itself: planning, admission and the retry layer. Only
+    the commit moved. It was the part with the syncs, and in the
+    profile after task-d46 it was the largest share of the CPU. Moving
+    execution as well would need the machines' `applied` to come back
+    from another thread, and the plan's review boundary allows it, but
+    it is not done here.
+  - Checkpoint publication, a floor boundary and a full queue take the
+    commit out back and commit on the domain thread, as before.
+
+**Recovery.** A boot that ends with a commit out recovers like any
+other, from the journal and the projection's own stamp. That holds
+whether the commit had not started or had returned without its outcome
+being taken back. `into_parts` takes every lent engine back without
+looking at its outcome, as a crash would.
+
+**Tests.**
+- `coord-storage`, `tests/pipelined.rs`, with a manual materializer:
+  - a hand-off reports `Materialized` only once taken back, and lends
+    the records journaled behind it next;
+  - a commit refused definitely gives its records back ahead of those
+    behind it;
+  - an indeterminate commit settles from the stamp, and only the
+    records it took;
+  - checkpoint publication takes the commit out back first;
+  - a boot that ends with a commit handed over and not started, after
+    a commit and before its outcome is taken back, and with records
+    journaled behind a commit out, recovers the journal's rows.
+- `view.rs`: a snapshot of a commit still returning waits for the
+  gate, and one of a commit that failed is refused.
+- `coord-daemon`, `tests/node.rs`:
+  - a group's results wait for its commit while the next group
+    executes over it;
+  - a pipelined node sends the collector the same frames, records the
+    same results and reaches the same revision as one that commits on
+    its own thread;
+  - a boot that ends with a commit handed over, in the middle of a
+    group, or before a commit is taken back answers every journaled
+    command's retry key from the recovered projection.
+- **Negative control.** Releasing a group's results when it is handed
+  off rather than when its commit is back fails
+  `pipelined_a_groups_results_wait_for_its_projection_commit_while_execution_goes_on`.
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, task-d48's
+binary and this task's alternated twice, three repeats per caller count
+each, medians of six:
+
+| callers | completed/s, task-d48 → task-d52 | leader busy ms/cmd | leader journal appends/cmd |
+| --- | --- | --- | --- |
+| 10 | 543.3 → 529.1 | 1.81 → 1.79 | 0.63 → 0.84 |
+| 50 | 861.3 → 948.2 (+10%) | 1.18 → 1.04 (−11%) | 0.22 → 0.24 |
+
+- **At ten callers nothing moved**, within this disk's noise (task-d52's
+  six runs read 507 to 582). The commits left the domain thread, but
+  the thread then flushed smaller groups: 0.84 journal appends a
+  command where it made 0.63. Each append is a sync on the domain
+  thread, and with the projection syncing on the same disk beside it
+  an append took about 1.4 ms. The plan's acceptance was that busy
+  time per command at ten callers falls by at least the projection's
+  share. **This run does not meet it.**
+- **At fifty callers** the groups are large enough that the extra
+  appends cost little, and taking the commit off the thread shows:
+  throughput up 10%, and the leader's busy time per command down 11%.
+- **The domain thread is not what bounds throughput here.** In every
+  run each voter's domain thread is busy 40 to 60% of the time. During
+  a fifty-caller run the container's four cores were 75 to 78% busy:
+  three voters, their network threads, the materializers and fifty
+  callers. What is left is latency: the round trips a command waits
+  through (task-d49's re-sends, task-d50's slow path) and the journal
+  sync that is still on the domain thread.
+- **Not measured here:** the Jepsen runner. That is where the plan's
+  comparison with etcd is made.
