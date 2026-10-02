@@ -1510,6 +1510,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             busy,
             uptime: now.saturating_duration_since(self.started),
             recent,
+            resends: resends(&voter.resend_counts()),
         })
     }
 
@@ -4111,6 +4112,20 @@ fn say_fenced_stop(what: &str) {
          which is at a promise above this voter's ballot. \
          A restart resumes at the promised ballot, as a follower that campaigns"
     );
+}
+
+/// The snapshot's reading of a leader's re-send counts (task-d49).
+fn resends(counts: &coord_consensus::ResendCounts) -> coord_daemon::metrics::Resends {
+    coord_daemon::metrics::Resends {
+        deferred: counts.deferred,
+        decided: counts.decided,
+        acknowledged: counts.acknowledged,
+        unanswered: counts.unanswered,
+        lost: counts.lost(),
+        late: counts.late,
+        handed_off: counts.handed_off,
+        duplicate_votes: counts.duplicate_votes,
+    }
 }
 
 fn hex4(replica: &coord_types::ids::ReplicaId) -> String {

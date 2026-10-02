@@ -102,6 +102,22 @@ def per_command(node: str, snapshot: dict) -> dict:
         "projection_commits_per_command": cost["projection_commits"] / executed,
         "busy_ms_per_command": busy * 1000 / executed,
         "busy_fraction": busy / uptime if uptime > 0 else None,
+        **resends_of(cost, executed),
+    }
+
+
+def resends_of(cost: dict, executed: int) -> dict:
+    """A voter's re-sends and refused duplicate votes per command
+    (task-d49): what it re-sent while it led, by reason, and the votes it
+    refused as duplicates. Empty for a binary older than the counts."""
+    resends = cost.get("resends")
+    if not isinstance(resends, dict):
+        return {}
+    resent = resends["decided"] + resends["acknowledged"] + resends["unanswered"]
+    return {
+        "resends": resends,
+        "resent_per_command": resent / executed,
+        "duplicate_votes_per_command": resends["duplicate_votes"] / executed,
     }
 
 
@@ -244,8 +260,9 @@ def table(result: dict) -> str:
     lines = [
         "| callers | completed/s | node | executed | lowerings/cmd | syncs/cmd "
         "| appends/cmd | commits/cmd | busy ms/cmd | first three quarters "
-        "| last quarter | ratio | busy |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| last quarter | ratio | busy | re-sends/cmd | duplicate votes/cmd |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
+        "| --- | --- |",
     ]
     for run in result["runs"]:
         rate = run.get("completed_per_second")
@@ -261,9 +278,18 @@ def table(result: dict) -> str:
                 f"| {v['journal_appends_per_command']:.2f} "
                 f"| {v['projection_commits_per_command']:.2f} "
                 f"| {v['busy_ms_per_command']:.2f} | {head} "
-                f"| {v['tail_busy_ms_per_command']:.2f} | {ratio} | {busy} |"
+                f"| {v['tail_busy_ms_per_command']:.2f} | {ratio} | {busy} "
+                f"| {per_command_or_dash(v, 'resent_per_command')} "
+                f"| {per_command_or_dash(v, 'duplicate_votes_per_command')} |"
             )
     return "\n".join(lines)
+
+
+def per_command_or_dash(voter: dict, field: str) -> str:
+    """A per-command reading to three places, or `--` when the binary
+    did not report it."""
+    value = voter.get(field)
+    return "--" if value is None else f"{value:.3f}"
 
 
 def main(argv: list[str]) -> int:

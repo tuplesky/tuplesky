@@ -136,6 +136,15 @@ impl Machine {
         }
     }
 
+    /// What the leader's re-sends did since the last call (task-d49);
+    /// nothing for a follower, which re-sends nothing.
+    pub fn take_resend_counts(&mut self) -> coord_consensus::ResendCounts {
+        match self {
+            Machine::Leader(m) => m.take_resend_counts(),
+            Machine::Follower(_) => coord_consensus::ResendCounts::default(),
+        }
+    }
+
     /// Send the voters, again, the proposals they have not voted on
     /// (task-d07), and the commit frontier (task-d09). Only a leader has
     /// proposals to send or a frontier to announce.
@@ -510,6 +519,9 @@ pub struct Node<P: Persistence> {
     /// projection has committed through its position (task-d52), oldest
     /// first.
     releases: VecDeque<(ExecutionPosition, Vec<Effect>)>,
+    /// What this replica's re-sends did, over every ballot it led since
+    /// boot (task-d49).
+    resends: coord_consensus::ResendCounts,
 }
 
 /// Most commands one execution group applies before it is lowered
@@ -556,6 +568,7 @@ impl<P: Persistence> Node<P> {
             flushing: false,
             staged: Vec::new(),
             releases: VecDeque::new(),
+            resends: coord_consensus::ResendCounts::default(),
         }
     }
 
@@ -826,6 +839,8 @@ impl<P: Persistence> Node<P> {
         if !change {
             return Ok(None);
         }
+        let counts = self.machine_mut().take_resend_counts();
+        self.resends.add(&counts);
         let machine = self.machine.take().expect("a node always holds a machine");
         let (machine, effects) = match machine {
             Machine::Follower(f) => {
@@ -865,6 +880,8 @@ impl<P: Persistence> Node<P> {
         if !matches!(self.machine(), Machine::Leader(_)) {
             return Ok(Outbound::default());
         }
+        let counts = self.machine_mut().take_resend_counts();
+        self.resends.add(&counts);
         let Some(Machine::Leader(l)) = self.machine.take() else {
             unreachable!("checked above")
         };
@@ -879,6 +896,15 @@ impl<P: Persistence> Node<P> {
     /// for a leader of the genesis ballot, which nobody campaigned for.
     pub const fn won(&self) -> Option<&SyncDecision> {
         self.won.as_ref()
+    }
+
+    /// What this replica's re-sends did since boot (task-d49).
+    pub fn resend_counts(&self) -> coord_consensus::ResendCounts {
+        let mut counts = self.resends;
+        if let Machine::Leader(m) = self.machine() {
+            counts.add(&m.resend_counts());
+        }
+        counts
     }
 
     /// Take what the machine refused since the last call, rendered.

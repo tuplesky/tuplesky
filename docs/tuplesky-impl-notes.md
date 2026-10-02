@@ -8964,3 +8964,174 @@ each, medians of six:
   sync that is still on the domain thread.
 - **Not measured here:** the Jepsen runner. That is where the plan's
   comparison with etcd is made.
+
+## Re-sending a proposal once its answer is due
+
+task-d49. With one caller a leader refused at least 8,192 duplicate
+votes in 100 s for about 4,000 commands. Each duplicate was an
+adoption the voter had already sent, answered again because the leader
+had re-sent the proposal while the first answer was on its way: the
+re-send went out on the first call of the 250 ms timer after the
+proposal, however recent, to every voter whose adoption had not
+arrived. Each one was another step on a domain thread that was already
+the bottleneck.
+
+- **Age.** `Leader::resend_unvoted` re-sends a proposal to a voter only
+  once an interval of calls has passed since its last send, the first
+  send included: the call count is stamped on the proposal when its
+  batch is durable and its first send released (`Proposal::sent`). A
+  re-proposal held back from a new leader's first batch has no first
+  send; it goes out on the next call, counted as `deferred`, unless its
+  batch is refused and presented again first, which sends it to every
+  voter and so publishes it (#141).
+- **The interval is the voter's.** It is the 99th percentile of the
+  calls the voter's latest 128 adoptions took to arrive, between one
+  call and `RESEND_INTERVAL_CAP` (four, one second, as task-d33's
+  back-off cap and for its reason). An adoption that arrived before
+  the next call took none, so a voter that answers within a call keeps
+  today's floor: re-sent on the second call after a send at the
+  earliest, a quarter to half a second. An adoption of a proposal that
+  was re-sent may answer either send, so it is not a sample until a
+  second copy arrives and shows the first was late (Karn's rule).
+  Without those, a voter slower than its interval would be re-sent to
+  every time and its interval would never learn it is slow.
+- **The window is what is due.** It was the voter's first sixteen
+  proposals not adopted, and one waiting out its back-off kept its
+  place. Sixteen proposals whose answers were on their way, or lost
+  behind a full lane, kept a lost proposal after them from ever being
+  sent again. The window is now the voter's first sixteen proposals
+  that are due.
+- **A decided proposal is mostly left to catch-up once it is old.** A
+  proposal the leader decided needs no vote; it is re-sent for the
+  voter, which holds everything ordered after a proposal it lacks. It
+  is re-sent at its back-off only until `RESEND_HANDOFF_CALLS` (eight,
+  two seconds) after its first send: at the floor interval, one, two
+  and four calls after it. By then a voter that still lacks it and holds
+  work behind it has had its frontier still for twice
+  `catch_up::STILL_FOR` and has asked a peer for executed history,
+  which carries the command (task-d08). After that it is handed off:
+  re-sent only as a trickle, one handed-off proposal a voter a call,
+  each one eight calls apart, so a voter that is far behind is sent at
+  most four of them a second. The trickle is for a voter catch-up does
+  not reach: one that missed both the submission and the proposal
+  through an outage holds no work behind the command, and on a quiet
+  domain nothing arrives after it to make it ask (#141; the first cut
+  stopped re-sending outright, and such a voter never got the command).
+  A proposal that is not decided is never handed off: its vote may be
+  the one the leader still needs (task-d15).
+- **A duplicate costs its lookup.** A refused vote returns before the
+  learner runs, on the leader and the follower: nothing was counted,
+  so nothing new can be learned.
+- **Counted by reason.** Each re-send is classified when it goes out:
+  decided, acknowledged on the fast path, or unanswered. Answers that
+  came back twice after a re-send are `late`, the other answers to a
+  re-send `lost`, and every refused duplicate vote is counted exactly.
+  They are in the metrics snapshot's `cost.resends`, over every ballot
+  the voter led, and `scripts/ci/command_cost.py` reports re-sends and
+  duplicate votes per command.
+
+**Not as planned.** The plan asked to re-send only what the voter has
+not acknowledged "on the fast path or the slow". A fast acknowledgement
+goes out when the payload arrives, proposal or not (task-d07), and
+`a_fast_acknowledgement_does_not_stand_for_the_proposal` is the case
+where crediting it leaves a voter without a proposal for good. So a
+fast acknowledgement still does not take a proposal out of the window.
+What keeps such a re-send from being a duplicate is its age: in a
+fault-free run nothing is due. Re-sends counted as acknowledged or
+decided are what the snapshot shows if that stops holding.
+
+The plan's negative control, counting only slow adoptions, does not
+apply as stated for the same reason. The ones run here, each by hand
+and reverted:
+
+- re-sending on the first call regardless of age fails
+  `a_proposal_is_not_resent_before_its_answer_is_due`;
+- taking the window before asking what is due fails
+  `a_lost_proposal_is_resent_with_a_full_window_ahead_of_it`;
+- holding the interval at the floor fails
+  `a_slow_voter_is_given_its_own_interval`;
+- stopping re-sends at the hand-off fails
+  `a_voter_that_missed_a_command_through_a_long_outage_gets_it_on_a_quiet_domain`
+  and `a_decided_proposal_is_trickled_once_old`;
+- not publishing a re-proposal presented again fails
+  `a_held_back_reproposal_presented_again_is_not_sent_again_at_once`
+  ("sent again on the next call, as a first send").
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, task-d52's
+binary and this task's alternated twice, three repeats per caller count
+each, medians of six. The duplicate votes for task-d52 are a lower
+bound: its voters log a refusal only at powers of two, and the bound
+adds each voter's largest. This task's are exact, from the snapshot.
+
+| callers | completed/s, task-d52 → task-d49 | leader busy ms/cmd | duplicate votes per command |
+| --- | --- | --- | --- |
+| 1 | 187.8 → 189.0 | 3.16 → 3.12 | ≥ 0.049 → 0 |
+| 10 | 532.2 → 532.5 | 1.77 → 1.76 | ≥ 0.196 → 0 |
+| 50 | 896.8 → 876.1 | 1.10 → 1.11 | ≥ 0.193 → 0 |
+
+- **No duplicate vote at all**, in any of the 18 runs, against at least
+  5% to 20% of commands before. Every run re-sent two proposals, both
+  counted unanswered and answered as lost: the domain's first
+  proposals, which go out before the followers are linked (task-d07's
+  case). None was counted acknowledged or decided.
+- **Throughput and busy time did not move**, within this disk's noise.
+  A refused duplicate was already cheap, and the domain thread is not
+  what bounds these runs (task-d52's notes).
+- **On tmpfs** the command-cost gate passes, with no duplicate vote at
+  1, 10 or 50 callers.
+
+**A paused voter** (`scripts/bench/pause-voter.sh`, ten callers, 20,000
+operations on tmpfs, the third voter stopped five seconds in for five
+seconds), two runs of each binary:
+
+- The paused voter **executes again within 0.03 to 0.06 s** of being
+  continued, with either binary: its frontier has been still for longer
+  than `STILL_FOR`, so it asks for executed history on its first turn,
+  and the first page is a round trip away. The bound is that round trip
+  plus one turn of the voter's loop; the re-send interval does not enter
+  it, since catch-up and not the re-send carries what it missed.
+- In the first cut's runs, which stopped re-sending a decided proposal
+  at the hand-off, the leader re-sent 1,252 and 1,312 decided proposals
+  in all, and handed 1,043 and 1,087 of them off to catch-up. It refused
+  at least 9,216 frames to the paused voter. Most of those were refused
+  while it was stopped, and they were fresh proposals and
+  acknowledgements at the full command rate, not re-sends.
+- **The lane drained in some runs and not in others, with either
+  binary.** In the first session neither binary drained it while the load
+  lasted. The leader's refusals to the voter rose again 6 to 11 s after
+  it was continued, and when the bench ended the voter was still 5,000
+  to 9,000 commands behind: catching up from history, it executed about
+  560 commands a second while the domain executed 800. In a later
+  session, with the trickle, the old binary and the new one alternated
+  twice each, and every run caught up while the load lasted:
+
+  | binary | caught up after continue (s) | refusals last rose after continue (s) | refused to the voter, at least |
+  | --- | --- | --- | --- |
+  | stop at the hand-off | 4.26, 6.06 | 19.02, 16.35 | 8,960, 8,960 |
+  | trickle | 7.83, 5.68 | 8.13, 6.34 | 9,344, 9,344 |
+
+  Two earlier runs with the trickle caught up after 7.25 and 4.11 s,
+  and their refusals last rose 15.65 and 6.91 s after continue. They
+  re-sent 1,434 and 1,497 decided proposals and handed off 49 and 50.
+  The trickle counts a proposal handed off only when it is first
+  trickled, so it is not comparable to the first cut's count.
+  What differs between the two sessions is not explained, and two runs
+  a side do not separate the binaries. **The plan's acceptance, a
+  bound on the lane draining, is not shown.** A voter that is behind
+  needs the fresh traffic to it held back while it catches up, or a
+  catch-up path faster than the domain. That is outside the re-send
+  window.
+- `a_replica_that_falls_behind_catches_up_without_starving_its_own_catch_up`:
+  see the PR.
+
+### Not done here
+
+- **Submissions presented again.** Followers still refuse a submission
+  the collector offers again as `Duplicate(command)`: 64 to 128 of
+  2,651 commands at fifty callers. That is the collector's re-offering
+  (task-c02, task-64), not a vote.
+- **The lane counters.** `coordd` reports its lanes' frames and
+  refusals as `NotInstrumented`; the pause script reads refusals from
+  the log's powers of two.

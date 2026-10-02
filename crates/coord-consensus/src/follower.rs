@@ -4698,7 +4698,10 @@ impl Follower {
             .entry(command)
             .or_insert_with(|| VoteSet::new(self.config.quorum.clone(), command));
         if let Err(e) = set.add(vote) {
+            // Nothing was counted, so there is nothing new to learn: a
+            // refusal costs the lookup that found it (task-d49).
             self.rejections.push(FollowerRejection::Vote(e));
+            return Vec::new();
         }
         self.learn();
         Vec::new()
