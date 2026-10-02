@@ -93,7 +93,7 @@ use coord_journal_api::failure::{JournalError, JournalFailure};
 use coord_journal_api::frontier::{
     AppliedFrontier, CheckpointPointerV1, FrontierError, Frontiers, select_recovery_pointer,
 };
-use coord_journal_api::group::{GroupEntry, GroupError, GroupLimits, GroupWrite};
+use coord_journal_api::group::{GroupEntry, GroupError, GroupLimits, GroupReceipt, GroupWrite};
 use coord_journal_api::head::{HeadError, HeadState, Reconciled, StreamHead, WrittenBytes};
 use coord_journal_api::record::{
     JOURNAL_RECORD_FORMAT_V1, JournalRecordV1, LifecycleRecordV1, MAX_RECORD_BYTES,
@@ -295,6 +295,9 @@ pub enum JournaledError {
     Frontier(FrontierError),
     /// The composition disagrees with itself; the domain is quarantined.
     Quarantined(&'static str),
+    /// The journal is lent to the [`Appender`] and this borrow cannot
+    /// wait for it to come back (task-d54).
+    JournalLent,
 }
 
 impl fmt::Display for JournaledError {
@@ -312,6 +315,7 @@ impl fmt::Display for JournaledError {
             JournaledError::Head(e) => write!(f, "head: {e}"),
             JournaledError::Frontier(e) => write!(f, "frontier: {e}"),
             JournaledError::Quarantined(what) => write!(f, "quarantined: {what}"),
+            JournaledError::JournalLent => f.write_str("the journal is lent to the appender"),
         }
     }
 }
@@ -539,7 +543,8 @@ impl<E: LocalEngine> Domain<E> {
 /// The journal-first coordinator of one node: one shared journal and one
 /// durable projection per attached domain.
 pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
-    journal: J,
+    /// `None` while an append has it on the [`Appender`] (task-d54).
+    journal: Option<J>,
     allocator: StreamAllocator,
     cluster: ClusterId,
     replica: ReplicaId,
@@ -556,12 +561,33 @@ pub struct JournaledStore<J: JournalEngine, E: LocalEngine> {
     /// error alone discarded those completions, so a caller waiting on
     /// the barrier waited for something that had already happened.
     deferred_events: Vec<StorageEvent>,
+    /// Whether an append whose outcome is unknown was taken back where its
+    /// report could not go to the caller (task-d54): the next report that
+    /// carries the deferred events says so, and its caller reconciles.
+    deferred_uncertain: bool,
     /// What lowering has cost since the store opened (task-d45).
     cost: LoweringCost,
     /// Where projection commits run when they leave the caller's thread
     /// (task-d52); `None` commits them in [`JournaledStore::materialize`].
     materializer: Option<Box<dyn Materializer<E>>>,
+    /// Where journal appends run when they leave the caller's thread
+    /// (task-d54); `None` appends them in [`JournaledStore::append`].
+    appender: Option<Box<dyn Appender<J>>>,
+    /// The entries of the group the appender has out, as sealed: what its
+    /// outcome completes, fails or leaves uncertain when it is taken back.
+    appending: Option<Vec<Sealed>>,
+    /// The journal's synced writes as of the last time this store held
+    /// it, reported while it is lent.
+    syncs: Option<u64>,
 }
+
+/// One stream's entry in a sealed group: the domain, the barrier the
+/// entry is reserved under, and its records in order.
+type Sealed = (DomainId, BarrierId, Vec<Durable>);
+
+/// Said where the journal is used after [`JournaledStore::await_append`]
+/// has taken it back.
+const HELD: &str = "the journal is held once no append is out";
 
 /// What a store's lowering has cost since it opened (task-d45).
 ///
@@ -608,8 +634,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         let allocator = StreamAllocator::restore(high_water, mappings)?;
         Ok(JournaledStore {
             deferred_events: Vec::new(),
+            deferred_uncertain: false,
             cost: LoweringCost::default(),
-            journal,
+            syncs: journal.syncs(),
+            journal: Some(journal),
+            appender: None,
+            appending: None,
             allocator,
             cluster,
             replica,
@@ -632,14 +662,35 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     }
 
     /// The shared journal (diagnostics and maintenance).
-    pub const fn journal(&self) -> &J {
-        &self.journal
+    ///
+    /// # Panics
+    ///
+    /// While an append has it on the [`Appender`]
+    /// ([`JournaledStore::appending`]); [`JournaledStore::journal_mut`]
+    /// waits for it instead.
+    pub fn journal(&self) -> &J {
+        self.journal
+            .as_ref()
+            .expect("the journal is not lent to the appender")
     }
 
     /// The shared journal for maintenance the pipeline does not drive
     /// itself (engine statistics, purge suggestions) and for harnesses.
-    pub const fn journal_mut(&mut self) -> &mut J {
-        &mut self.journal
+    ///
+    /// An append the [`Appender`] has out is waited for and taken back
+    /// first; what it completed goes out with the next report.
+    pub fn journal_mut(&mut self) -> Result<&mut J, JournaledError> {
+        self.await_append()?;
+        Ok(self.journal.as_mut().expect(HELD))
+    }
+
+    /// Synced writes the journal has issued since it opened
+    /// ([`JournalEngine::syncs`]). While an append is out, the count as of
+    /// when it left: the append's own sync is counted once it is back.
+    pub fn journal_syncs(&self) -> Option<u64> {
+        self.journal
+            .as_ref()
+            .map_or(self.syncs, JournalEngine::syncs)
     }
 
     /// A domain's projection engine (diagnostics and harnesses that crash
@@ -657,8 +708,15 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// An engine lent to a [`Materializer`] is taken back first, whether
     /// or not its commit ran, and its outcome is not taken: the boot ends
     /// there, as a crash would end it, and the next one recovers from the
-    /// journal and the projection's own stamp.
+    /// journal and the projection's own stamp. A journal lent to an
+    /// [`Appender`] is taken back the same way, its append's outcome
+    /// unseen; the next boot reads the stream's actual durable head.
     pub fn into_parts(mut self) -> (J, Vec<(DomainId, E)>) {
+        if let Some(mut appender) = self.appender.take()
+            && let Some(journal) = appender.reclaim()
+        {
+            self.journal = Some(journal);
+        }
         if let Some(mut materializer) = self.materializer.take() {
             for (domain, engine) in materializer.reclaim() {
                 if let Some(state) = self.domains.get_mut(&domain) {
@@ -678,7 +736,11 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 )
             })
             .collect();
-        (self.journal, domains)
+        (
+            self.journal
+                .expect("a lent journal is reclaimed before the parts are given back"),
+            domains,
+        )
     }
 
     /// Attach a domain's durable projection to the shared journal.
@@ -734,6 +796,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         if self.domains.contains_key(&domain) {
             return Err(JournaledError::AlreadyAttached);
         }
+        self.await_append()?;
         // The journal is the projection's redo log from here on, the
         // replay below included (task-d48).
         engine.commit_under_journal();
@@ -761,7 +824,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             incarnation: self.incarnation,
             stream,
         };
-        let durable = self.journal.durable_head(stream)?;
+        let durable = self.journal.as_ref().expect(HELD).durable_head(stream)?;
         let reader = engine.reader();
         let meta = DurableMeta::read(&reader.snapshot()?)?;
         let applied = AppliedFrontier::from_stamp(&meta.stamp);
@@ -793,7 +856,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             status: DomainStatus::Ready,
             fence: None,
         };
-        Self::replay(&self.journal, &mut state, self.limits)?;
+        Self::replay(self.journal.as_ref().expect(HELD), &mut state, self.limits)?;
         // Replay moved the projection forward, so the application
         // frontiers have to describe the recovered history rather than
         // the projection as it was found. Leaving them at the pre-replay
@@ -871,7 +934,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     }
 
     fn persist_mapping(&mut self, mapping: &StreamMappingV1) -> Result<(), JournaledError> {
+        self.await_append()?;
         self.journal
+            .as_mut()
+            .expect(HELD)
             .persist_mapping(self.allocator.high_water(), mapping)?;
         Ok(())
     }
@@ -955,6 +1021,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// records): a stream that has never been written gets its genesis
     /// record in the same entry.
     fn record_boot(&mut self, domain: DomainId) -> Result<(), JournaledError> {
+        self.await_append()?;
         let state = self
             .domains
             .get_mut(&domain)
@@ -996,7 +1063,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         state
             .head
             .reserve(barrier, NonZeroU32::new(count).expect("non-zero"))?;
-        match self.journal.append_group(&group) {
+        match self.journal.as_mut().expect(HELD).append_group(&group) {
             Ok(_) => {
                 let state = self.domains.get_mut(&domain).expect("attached");
                 state.head.complete_durable(barrier)?;
@@ -1069,10 +1136,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         pointer: &CheckpointPointerV1,
     ) -> Result<Published, JournaledError> {
         // The publication record is materialized here, on this thread, so
-        // a commit a materializer has out is taken back first; what it
-        // completed goes out with the next report.
+        // a commit a materializer has out is taken back first, and so is
+        // an append the appender has out; what they completed goes out
+        // with the next report.
         let drained = self.drain()?;
         self.deferred_events.extend(drained.events);
+        self.deferred_uncertain |= drained.indeterminate;
         let barrier = BarrierId {
             node_generation: self.incarnation,
             boot_id: self.boot,
@@ -1114,7 +1183,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         state
             .head
             .reserve(barrier, NonZeroU32::new(1).expect("non-zero"))?;
-        match self.journal.append_group(&group) {
+        match self.journal.as_mut().expect(HELD).append_group(&group) {
             Ok(_) => {
                 let state = self.domains.get_mut(&domain).expect("attached");
                 state.head.complete_durable(barrier)?;
@@ -1160,7 +1229,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         }
         // Only now, and never as a condition of the publication.
         let stream = self.domains.get(&domain).expect("attached").origin.stream;
-        match self.journal.retire_prefix(stream, pointer) {
+        match self
+            .journal
+            .as_mut()
+            .expect(HELD)
+            .retire_prefix(stream, pointer)
+        {
             Ok(()) => Ok(Published {
                 published: pointer.represented,
                 retired: true,
@@ -1211,9 +1285,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // Where the retained suffix begins, not zero: a prefix this
         // stream already reclaimed is gone, and asking for it is a read
         // the engine refuses rather than answers with a gap.
-        let mut after = self.journal.retained_from(stream)?;
+        let journal = self.journal.as_ref().ok_or(JournaledError::JournalLent)?;
+        let mut after = journal.retained_from(stream)?;
         loop {
-            let page = self.journal.read_suffix(stream, after, self.limits.read)?;
+            let page = journal.read_suffix(stream, after, self.limits.read)?;
             let Some(last) = page.records.last() else {
                 break;
             };
@@ -1391,11 +1466,23 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     ///
     /// Other domains are untouched. There is no cross-domain election
     /// barrier, no global packet drain and no wait for peers.
+    ///
+    /// An append the [`Appender`] has out is taken back first (task-d54),
+    /// and what it completed goes out with the next report. Its group was
+    /// sealed out of the queue and is in neither the journaled frontier
+    /// nor the in-flight records until it is taken back, so a fence that
+    /// ran before would test what is queued behind it against the
+    /// frontier before it and refuse it, and would move the queued
+    /// frontier back past the group.
     pub fn fence(
         &mut self,
         domain: DomainId,
         promised: Ballot,
     ) -> Result<Vec<StorageEvent>, JournaledError> {
+        if !self.domains.contains_key(&domain) {
+            return Err(JournaledError::UnknownDomain);
+        }
+        self.await_append()?;
         let state = self
             .domains
             .get_mut(&domain)
@@ -1469,10 +1556,50 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// the first transition's barrier, and each record still reports its
     /// own `JournalDurable`. Nothing is split: what does not fit stays
     /// queued for the next group (task-d47).
+    ///
+    /// On this thread, and before it returns, whether or not the store
+    /// has an [`Appender`]: an append the appender has out is taken back
+    /// first, and what it completed is reported with the rest.
     pub fn append_pending(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
+        match self.append_pending_into(&mut report) {
+            Ok(()) => Ok(report),
+            Err(e) => {
+                self.hold_back(report);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`JournaledStore::append_pending`] into `report`, uncharged.
+    fn append_pending_into(&mut self, report: &mut FlushReport) -> Result<(), JournaledError> {
+        self.await_append_into(report)?;
+        let Some((group, sealed)) = self.seal_group()? else {
+            return Ok(());
+        };
+        let result = self.journal.as_mut().expect(HELD).append_group(&group);
+        report.absorb(self.complete_group(sealed, result)?);
+        Ok(())
+    }
+
+    /// Hand what `report` took back to the next report, charged, when the
+    /// call that gathered it fails after: an append taken back was synced
+    /// whatever came after it, and its barriers completed or failed then.
+    /// Dropped with the error, the sends waiting on them would never be
+    /// released.
+    fn hold_back(&mut self, report: FlushReport) {
+        self.cost.charge(&report);
+        self.deferred_events.extend(report.events);
+        self.deferred_uncertain |= report.indeterminate;
+    }
+
+    /// Seal every queued transition of each ready stream that fits one
+    /// group, reserve each stream's entry and take the transitions out of
+    /// the queue; `None` when nothing is ready. The group is not written:
+    /// [`JournaledStore::complete_group`] takes its outcome.
+    fn seal_group(&mut self) -> Result<Option<(GroupWrite, Vec<Sealed>)>, JournaledError> {
         let mut group = GroupWrite::new(self.limits.group);
-        let mut sealed: Vec<(DomainId, BarrierId, Vec<Durable>)> = Vec::new();
+        let mut sealed: Vec<Sealed> = Vec::new();
         let mut full = false;
         for (id, state) in &mut self.domains {
             if full {
@@ -1553,10 +1680,23 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             sealed.push((*id, entry_barrier, records));
         }
         if sealed.is_empty() {
-            return Ok(report);
+            return Ok(None);
         }
-        report.appends = 1;
-        match self.journal.append_group(&group) {
+        Ok(Some((group, sealed)))
+    }
+
+    /// Complete, fail or leave uncertain each sealed entry of a group by
+    /// the outcome of its append, and report it.
+    fn complete_group(
+        &mut self,
+        sealed: Vec<Sealed>,
+        result: Result<GroupReceipt, JournalFailure>,
+    ) -> Result<FlushReport, JournaledError> {
+        let mut report = FlushReport {
+            appends: 1,
+            ..FlushReport::default()
+        };
+        match result {
             Ok(receipt) => {
                 report.written = Some(receipt.written);
                 for (id, entry_barrier, records) in sealed {
@@ -1629,8 +1769,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     pub fn materialize(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         report.events.append(&mut self.deferred_events);
+        report.indeterminate |= std::mem::take(&mut self.deferred_uncertain);
         if let Err(e) = self.drain_into(&mut report) {
             self.deferred_events.append(&mut report.events);
+            self.deferred_uncertain |= report.indeterminate;
             return Err(e);
         }
         for state in self.domains.values_mut() {
@@ -1649,6 +1791,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     // The domains that did materialize completed their
                     // barriers; one domain's failure does not undo that.
                     self.deferred_events.append(&mut report.events);
+                    self.deferred_uncertain |= report.indeterminate;
                     return Err(e);
                 }
             }
@@ -1675,6 +1818,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 // that back. They are handed to the next report rather
                 // than dropped with the error.
                 self.deferred_events.append(&mut report.events);
+                self.deferred_uncertain |= report.indeterminate;
                 Err(e)
             }
         }
@@ -1686,10 +1830,25 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// domain's pending records for the next [`JournaledStore::flush`] or
     /// [`JournaledStore::materialize`], and a recovery cut includes it
     /// meanwhile.
+    ///
+    /// A store with an [`Appender`] does not wait for the sync (task-d54):
+    /// it takes back the append the appender has finished, if one is out,
+    /// and lends the journal for the next group of what is queued. While
+    /// an append is out nothing else goes: what is queued meanwhile waits
+    /// for the next group, so the appender has one group at a time and
+    /// streams are written in the order their entries were sealed. The
+    /// report carries what the appends taken back made durable; nothing
+    /// lent now is reported until its outcome is taken.
     pub fn append(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         report.events.append(&mut self.deferred_events);
-        match self.append_pending() {
+        report.indeterminate |= std::mem::take(&mut self.deferred_uncertain);
+        let appended = if self.appender.is_some() {
+            self.lend_append()
+        } else {
+            self.append_pending()
+        };
+        match appended {
             Ok(appended) => {
                 report.absorb(appended);
                 self.cost.charge(&report);
@@ -1697,9 +1856,174 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
             Err(e) => {
                 self.deferred_events.append(&mut report.events);
+                self.deferred_uncertain |= report.indeterminate;
                 Err(e)
             }
         }
+    }
+
+    /// Take back the append the [`Appender`] has finished, if one is out,
+    /// without waiting and without lending the next group (task-d54).
+    ///
+    /// What it made durable is reported as [`JournaledStore::append`]
+    /// reports it. What is queued stays queued for the next
+    /// [`JournaledStore::append`]: a caller woken by the appender takes
+    /// the outcome at once, and leaves the next group to the point where
+    /// it would lower anyway, so that the group holds everything that
+    /// arrived during the sync rather than what had been read when the
+    /// wake came.
+    pub fn take_back_append(&mut self) -> Result<FlushReport, JournaledError> {
+        self.take_back_with(false)
+    }
+
+    /// Wait for the append the [`Appender`] has out, if one is, and take
+    /// it back, without lending the next group (task-d54). What it made
+    /// durable is reported as [`JournaledStore::take_back_append`]
+    /// reports it.
+    ///
+    /// For a caller about to act on what the journal holds, such as a
+    /// fence: the group out is in no frontier until it is taken back.
+    pub fn finish_append(&mut self) -> Result<FlushReport, JournaledError> {
+        self.take_back_with(true)
+    }
+
+    fn take_back_with(&mut self, wait: bool) -> Result<FlushReport, JournaledError> {
+        let mut report = FlushReport::default();
+        report.events.append(&mut self.deferred_events);
+        report.indeterminate |= std::mem::take(&mut self.deferred_uncertain);
+        let taken = match self.appender.as_mut() {
+            Some(appender) if self.appending.is_some() => {
+                let done = if wait {
+                    Some(appender.take().expect("an append is out"))
+                } else {
+                    appender.try_take()
+                };
+                match done {
+                    Some(done) => self.take_append(done),
+                    None => Ok(FlushReport::default()),
+                }
+            }
+            _ => Ok(FlushReport::default()),
+        };
+        match taken {
+            Ok(taken) => {
+                report.absorb(taken);
+                self.cost.charge(&report);
+                Ok(report)
+            }
+            Err(e) => {
+                self.cost.charge(&report);
+                self.deferred_events.append(&mut report.events);
+                self.deferred_uncertain |= report.indeterminate;
+                Err(e)
+            }
+        }
+    }
+
+    /// [`JournaledStore::append`] with an appender: take back a finished
+    /// append, and lend the journal for the next group if none is out.
+    fn lend_append(&mut self) -> Result<FlushReport, JournaledError> {
+        let mut report = FlushReport::default();
+        if self.appending.is_some() {
+            let appender = self.appender.as_mut().expect("an appender has the append");
+            let Some(done) = appender.try_take() else {
+                return Ok(report);
+            };
+            report.absorb(self.take_append(done)?);
+        }
+        let sealed = match self.seal_group() {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                self.hold_back(report);
+                return Err(e);
+            }
+        };
+        let Some((group, sealed)) = sealed else {
+            return Ok(report);
+        };
+        let journal = self.journal.take().expect(HELD);
+        self.syncs = journal.syncs();
+        self.appending = Some(sealed);
+        self.appender
+            .as_mut()
+            .expect("checked by the caller")
+            .submit(AppendJob { journal, group });
+        Ok(report)
+    }
+
+    /// The journal back from the appender, and the outcome of its append
+    /// taken: each entry of the group completed, failed or left uncertain
+    /// exactly as an append on this thread would leave it.
+    fn take_append(&mut self, done: AppendDone<J>) -> Result<FlushReport, JournaledError> {
+        let AppendDone { journal, result } = done;
+        self.syncs = journal.syncs();
+        self.journal = Some(journal);
+        let sealed = self.appending.take().expect("an append taken back was out");
+        self.complete_group(sealed, result)
+    }
+
+    /// Wait for the append the appender has out, if any, and take it back
+    /// into `report`, uncharged.
+    fn await_append_into(&mut self, report: &mut FlushReport) -> Result<(), JournaledError> {
+        if self.appending.is_none() {
+            return Ok(());
+        }
+        let done = self
+            .appender
+            .as_mut()
+            .expect("an appender has the append")
+            .take()
+            .expect("an append is out");
+        report.absorb(self.take_append(done)?);
+        Ok(())
+    }
+
+    /// Wait for the append the appender has out, if any, and take it back;
+    /// what it completed goes out with the next report.
+    fn await_append(&mut self) -> Result<(), JournaledError> {
+        let mut report = FlushReport::default();
+        let awaited = self.await_append_into(&mut report);
+        self.cost.charge(&report);
+        self.deferred_events.append(&mut report.events);
+        self.deferred_uncertain |= report.indeterminate;
+        awaited
+    }
+
+    /// Write journal groups off the caller's thread from now on
+    /// (task-d54): [`JournaledStore::append`] lends the journal to
+    /// `appender` for one synced group append and takes it back with the
+    /// outcome, so the caller's thread does not wait for the sync.
+    ///
+    /// An append this store already had out is waited for first, and what
+    /// it completed is reported.
+    pub fn pipeline_journal(
+        &mut self,
+        appender: Box<dyn Appender<J>>,
+    ) -> Result<FlushReport, JournaledError> {
+        let mut report = FlushReport::default();
+        report.events.append(&mut self.deferred_events);
+        report.indeterminate |= std::mem::take(&mut self.deferred_uncertain);
+        let awaited = self.await_append_into(&mut report);
+        self.cost.charge(&report);
+        if let Err(e) = awaited {
+            self.deferred_events.append(&mut report.events);
+            self.deferred_uncertain |= report.indeterminate;
+            return Err(e);
+        }
+        self.appender = Some(appender);
+        Ok(report)
+    }
+
+    /// Whether the journal is lent to the [`Appender`] now: an append is
+    /// out and its outcome has not been taken (task-d54).
+    pub fn appending(&self) -> bool {
+        self.appending.is_some()
+    }
+
+    /// Whether journal appends leave the caller's thread
+    /// ([`JournaledStore::pipeline_journal`]).
+    pub fn journal_pipelined(&self) -> bool {
+        self.appender.is_some()
     }
 
     /// Terminal events held back by a failed stage, for a caller that
@@ -1711,9 +2035,47 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// Resolve an ambiguous outcome from semantic records: the journal's
     /// actual durable head for an uncertain append, the projection's own
     /// stamp for an uncertain commit. Nothing is blind-retried.
+    ///
+    /// The durable head is read from the journal, so an append the
+    /// [`Appender`] has out is taken back first, and what it completed is
+    /// reported here with the rest; so are events a failed stage held
+    /// back. On an error they are held back again, never dropped.
     pub fn reconcile(&mut self, domain: DomainId) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
-        let journal = &self.journal;
+        report.events.append(&mut self.deferred_events);
+        // Uncertainty taken back before this reconcile, here or where it
+        // could not be reported, is settled by it for this domain; it
+        // stays reported only while another stream is still in doubt.
+        let mut taken_uncertain = std::mem::take(&mut self.deferred_uncertain);
+        let mut reconciled = self.await_append_into(&mut report);
+        taken_uncertain |= std::mem::take(&mut report.indeterminate);
+        if reconciled.is_ok() {
+            reconciled = self.reconcile_into(domain, &mut report);
+        }
+        report.indeterminate |= taken_uncertain
+            && self
+                .domains
+                .values()
+                .any(|d| d.status == DomainStatus::JournalUncertain);
+        self.cost.charge(&report);
+        match reconciled {
+            Ok(()) => Ok(report),
+            Err(e) => {
+                self.deferred_events.append(&mut report.events);
+                self.deferred_uncertain |= report.indeterminate || taken_uncertain;
+                Err(e)
+            }
+        }
+    }
+
+    /// [`JournaledStore::reconcile`] into `report`, uncharged, with no
+    /// append out.
+    fn reconcile_into(
+        &mut self,
+        domain: DomainId,
+        report: &mut FlushReport,
+    ) -> Result<(), JournaledError> {
+        let journal = self.journal.as_ref().expect(HELD);
         let state = self
             .domains
             .get_mut(&domain)
@@ -1811,8 +2173,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             }
             other => return Err(JournaledError::NotReady(other)),
         }
-        self.cost.charge(&report);
-        Ok(report)
+        Ok(())
     }
 
     /// What lowering has cost since this store opened (task-d45).
@@ -1861,9 +2222,14 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 })?,
                 predecessor: snapshot.meta().stamp.last_batch_digest(),
             };
+            // A journal lent to the appender cannot be read here; a cut
+            // that needs the suffix is refused until it is back.
+            let journal = self
+                .journal
+                .as_ref()
+                .ok_or(CutError::Journal(JournaledError::JournalLent))?;
             while seq < durable {
-                let page = self
-                    .journal
+                let page = journal
                     .read_suffix(state.origin.stream, seq, self.limits.read)
                     .map_err(|e| CutError::Journal(e.into()))?;
                 if page.records.is_empty() {
@@ -2018,6 +2384,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         }
         let mut report = FlushReport::default();
         report.events.append(&mut self.deferred_events);
+        report.indeterminate |= std::mem::take(&mut self.deferred_uncertain);
         let materializer = self.materializer.as_mut().expect("checked above");
         // Domains whose commit this call took back refused: not lent again
         // until the next call. The materializer's waker runs this as soon
@@ -2042,6 +2409,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 Err(e) => {
                     self.cost.charge(&report);
                     self.deferred_events.append(&mut report.events);
+                    self.deferred_uncertain |= report.indeterminate;
                     return Err(e);
                 }
             }
@@ -2077,7 +2445,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
 
     /// Wait for every commit the materializer has out and take each back
     /// (task-d52). Afterwards no engine is lent, and what was journaled
-    /// meanwhile is still pending.
+    /// meanwhile is still pending. An append the [`Appender`] has out is
+    /// waited for and taken back first (task-d54), so what it made durable
+    /// is pending too.
     pub fn drain(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         let drained = self.drain_into(&mut report);
@@ -2086,6 +2456,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             Ok(()) => Ok(report),
             Err(e) => {
                 self.deferred_events.append(&mut report.events);
+                self.deferred_uncertain |= report.indeterminate;
                 Err(e)
             }
         }
@@ -2094,6 +2465,9 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// [`JournaledStore::drain`] into `report`, uncharged. On an error
     /// what was taken back before it is in `report`.
     fn drain_into(&mut self, report: &mut FlushReport) -> Result<(), JournaledError> {
+        // An append out is taken back first: what it made durable is
+        // pending once it is, and owed to the projection with the rest.
+        self.await_append_into(report)?;
         let Some(materializer) = self.materializer.as_mut() else {
             return Ok(());
         };
@@ -2280,6 +2654,78 @@ pub trait Materializer<E: LocalEngine>: Send {
     /// may be given back without running, and one that has is waited for.
     /// This store's boot is ending ([`JournaledStore::into_parts`]).
     fn reclaim(&mut self) -> Vec<(DomainId, E)>;
+}
+
+/// Where a store's journal appends run when they leave the caller's
+/// thread (task-d54).
+///
+/// [`JournaledStore::append`] lends the shared journal out with one sealed
+/// group ([`AppendJob`]); the appender runs the synced append, on whatever
+/// thread it likes, and gives the journal back with the outcome
+/// ([`AppendDone`]). A store has at most one append out, so groups are
+/// written in the order they were sealed.
+pub trait Appender<J: JournalEngine>: Send {
+    /// Take a job.
+    fn submit(&mut self, job: AppendJob<J>);
+
+    /// The finished job, without waiting; `None` when it has not finished
+    /// or none is out.
+    fn try_take(&mut self) -> Option<AppendDone<J>>;
+
+    /// The job out, waiting for it to finish; `None` only when none is
+    /// out.
+    fn take(&mut self) -> Option<AppendDone<J>>;
+
+    /// The journal, if it is lent, outcome unseen: a job that has not
+    /// started may give it back without running, and one that has is
+    /// waited for. This store's boot is ending
+    /// ([`JournaledStore::into_parts`]).
+    fn reclaim(&mut self) -> Option<J>;
+}
+
+/// One synced group append lent to an [`Appender`] (task-d54): the shared
+/// journal and the sealed group it writes.
+pub struct AppendJob<J: JournalEngine> {
+    journal: J,
+    group: GroupWrite,
+}
+
+impl<J: JournalEngine> AppendJob<J> {
+    /// Records the group carries.
+    pub fn records(&self) -> usize {
+        self.group.record_count()
+    }
+
+    /// Append the group with sync before success, exactly as
+    /// [`JournaledStore::append_pending`] appends it.
+    pub fn run(self) -> AppendDone<J> {
+        let AppendJob { mut journal, group } = self;
+        let result = journal.append_group(&group);
+        AppendDone { journal, result }
+    }
+
+    /// The journal back, the append never run.
+    pub fn abandon(self) -> J {
+        self.journal
+    }
+}
+
+/// An [`AppendJob`] that ran: the journal and the append's outcome.
+pub struct AppendDone<J: JournalEngine> {
+    journal: J,
+    result: Result<GroupReceipt, JournalFailure>,
+}
+
+impl<J: JournalEngine> AppendDone<J> {
+    /// Whether the append succeeded.
+    pub fn appended(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    /// The journal back, outcome unseen.
+    pub fn into_journal(self) -> J {
+        self.journal
+    }
 }
 
 /// One projection commit lent to a [`Materializer`] (task-d52): a

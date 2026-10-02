@@ -620,6 +620,7 @@ fn a_vote_whose_append_ended_uncertain_is_reconciled_and_released() {
         .store_mut()
         .store_mut()
         .journal_mut()
+        .unwrap()
         .script_append(coord_store_testkit::journal::AppendScript::Indeterminate { applied: true });
 
     let out = follower
@@ -1240,4 +1241,222 @@ fn pipelined_a_boot_that_ends_in_the_middle_of_a_group_answers_every_journaled_c
 #[test]
 fn pipelined_a_boot_that_ends_before_a_commit_is_taken_back_answers_every_journaled_command() {
     pipelined_boot_ends(EndsAt::CommittedNotTaken);
+}
+
+/// Lend `node`'s journal appends to a manual appender (task-d54),
+/// returning the handle that runs them. The projection commits are lent
+/// too: the runtime pipelines both.
+fn lend_journal(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+) -> (
+    coord_storage::ManualHandle<ModelEngine>,
+    coord_storage::ManualAppendHandle<ModelJournal>,
+) {
+    let commits = pipeline(node);
+    let (appender, appends) = coord_storage::ManualAppender::new();
+    node.applier_mut()
+        .store_mut()
+        .store_mut()
+        .pipeline_journal(Box::new(appender))
+        .expect("nothing out yet");
+    (commits, appends)
+}
+
+/// Run whatever the appender and the materializer have waiting, settling
+/// after each as the runtime does when it is woken, until neither has
+/// anything; the frames the settles sent the collector.
+fn pump(
+    node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+    commits: &coord_storage::ManualHandle<ModelEngine>,
+    appends: &coord_storage::ManualAppendHandle<ModelJournal>,
+) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    loop {
+        let ran = appends.run() | commits.run();
+        if !ran {
+            return frames;
+        }
+        frames.extend(node.settle(&ballot()).expect("settled").frontend);
+    }
+}
+
+/// With the journal lent (task-d54), the leader's proposal waits for the
+/// append that makes its record durable to come back, not for the flush
+/// that lent it: the flush returns with the sync still out, and the
+/// settle that takes it back sends the proposal.
+#[test]
+fn lending_the_journal_a_proposal_is_held_until_its_append_is_taken_back() {
+    let boot = BootId([16; 16]);
+    let applier = journaled_applier(boot, r(0));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    let (commits, appends) = lend_journal(&mut node);
+    // The boot's own record went out on the domain thread before the
+    // journal was lent; nothing is out yet.
+    assert!(!appends.waiting());
+
+    let out = node
+        .on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("admitted");
+    assert!(out.peer.is_empty());
+    let out = node.flush(&ballot()).expect("flushed");
+    assert!(
+        out.peer.is_empty(),
+        "a proposal went out while its append was still out"
+    );
+    assert!(node.applier().store().appending());
+    assert!(appends.waiting());
+    assert_eq!(node.applier().store().queued(), 0, "sealed and lent");
+
+    // Synced but not taken back: still held.
+    assert!(appends.run());
+    let out = node.flush(&ballot()).expect("flushed");
+    let mut to: Vec<ReplicaId> = out.peer.iter().map(|(p, _)| p.replica).collect();
+    // A flush takes it back too, as a settle does; either is the domain
+    // thread taking the outcome, never the appender's thread.
+    if to.is_empty() {
+        let out = node.settle(&ballot()).expect("settled");
+        to = out.peer.iter().map(|(p, _)| p.replica).collect();
+    }
+    assert!(
+        to.contains(&r(1)) && to.contains(&r(2)),
+        "the proposal did not reach the voters once durable: {to:?}"
+    );
+    // Whatever the machine journaled in answer is the next append; the
+    // proposal itself is no longer held.
+    assert_eq!(node.held(), 0);
+    drop(commits);
+}
+
+/// A journaled flush (task-d54) returns with nothing out: the append the
+/// flush lent is waited for and taken back on the domain thread, and the
+/// proposal its record released goes out with it. A fence runs after one,
+/// so it never tests what is queued against a frontier a group out is
+/// not yet in.
+#[test]
+fn a_journaled_flush_waits_for_the_append_out_and_sends_what_it_released() {
+    let boot = BootId([18; 16]);
+    let applier = journaled_applier(boot, r(0));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    let (commits, appends) = lend_journal(&mut node);
+
+    node.on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("admitted");
+    let out = node.flush_journaled(&ballot()).expect("flushed");
+    assert!(
+        !node.applier().store().appending(),
+        "an append is still out"
+    );
+    assert!(!appends.waiting());
+    assert_eq!(node.applier().store().queued(), 0);
+    let to: Vec<ReplicaId> = out.peer.iter().map(|(p, _)| p.replica).collect();
+    assert!(
+        to.contains(&r(1)) && to.contains(&r(2)),
+        "the proposal did not reach the voters: {to:?}"
+    );
+    assert_eq!(node.held(), 0);
+    drop(commits);
+}
+
+/// With the journal lent (task-d54), the same commands give the same
+/// results, the same frames to the collector and the same projection as
+/// on a node that appends on its own thread.
+#[test]
+fn lending_the_journal_results_are_those_of_a_node_that_appends_on_its_own_thread() {
+    let run = |lending: bool| {
+        let mut node = grouped_lone_leader(BootId([17; 16]));
+        let handles = lending.then(|| lend_journal(&mut node));
+        let mut frames = Vec::new();
+        let settle = |node: &mut Node<JournaledDomain<ModelJournal, ModelEngine>>,
+                      frames: &mut Vec<Vec<u8>>| {
+            if let Some((commits, appends)) = &handles {
+                frames.extend(pump(node, commits, appends));
+            }
+        };
+        for round in 0..4u64 {
+            for sequence in round * 4 + 1..=round * 4 + 4 {
+                let out = node
+                    .on_event(
+                        Event::Admitted(admitted_putting(sequence, vec![sequence as u8; 8])),
+                        &ballot(),
+                    )
+                    .expect("admitted");
+                frames.extend(out.frontend);
+                frames.extend(node.flush(&ballot()).expect("flushed").frontend);
+                settle(&mut node, &mut frames);
+            }
+            let mut out = node.stage(&ballot()).expect("staged");
+            out.absorb(node.flush(&ballot()).expect("flushed"));
+            frames.extend(out.frontend);
+            settle(&mut node, &mut frames);
+            frames.extend(node.finish(&ballot()).expect("finished").frontend);
+            settle(&mut node, &mut frames);
+        }
+        frames.extend(node.drain(&ballot()).expect("drained").frontend);
+        assert_eq!(node.executed, 16);
+        assert_eq!(node.awaiting_materialization(), 0);
+        assert!(!node.applier().store().appending());
+        let rows = {
+            let gated = node.applier().store().reader().snapshot().unwrap();
+            let mut rows = Vec::new();
+            for sequence in 1..=16 {
+                rows.push(
+                    coord_storage::retry::lookup(gated.view(), &retry_key_of(sequence))
+                        .unwrap()
+                        .expect("every command's result is recorded"),
+                );
+            }
+            rows
+        };
+        frames.sort();
+        (frames, rows, node.applier().kv_revision().unwrap())
+    };
+    let (frames, rows, revision) = run(false);
+    let (lent_frames, lent_rows, lent_revision) = run(true);
+    assert_eq!(lent_revision, revision);
+    assert_eq!(lent_rows, rows);
+    assert_eq!(lent_frames, frames);
 }

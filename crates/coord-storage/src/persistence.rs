@@ -176,6 +176,36 @@ pub trait Persistence {
         false
     }
 
+    /// Whether a journal append is out on another thread now, its outcome
+    /// not yet taken (task-d54). A [`Persistence::journal`] takes it back
+    /// once it has finished and moves nothing before: what is queued
+    /// meanwhile waits for the next group.
+    fn appending(&self) -> bool {
+        false
+    }
+
+    /// Take back a journal append that has finished on another thread,
+    /// without waiting and without starting the next (task-d54); what it
+    /// made durable is reported. Nothing is out where nothing is
+    /// pipelined.
+    fn take_back(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
+    /// Whether journal appends go to another thread (task-d54): whether
+    /// [`Persistence::journal`] lends the next group rather than waiting
+    /// for its sync.
+    fn journal_pipelined(&self) -> bool {
+        false
+    }
+
+    /// Wait for a journal append out on another thread, if one is, and
+    /// take it back without starting the next (task-d54); what it made
+    /// durable is reported. Nothing is out where nothing is pipelined.
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
     /// Take back the projection commits that have finished, without
     /// waiting, and hand what is journaled and not materialized to the
     /// next one (task-d52). The facts of the commits taken back are
@@ -517,12 +547,34 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
     fn cost(&self) -> Option<StorageCost> {
         Some(StorageCost {
             lowering: self.store.cost(),
-            journal_syncs: self.store.journal().syncs(),
+            journal_syncs: self.store.journal_syncs(),
         })
     }
 
     fn pipelined(&self) -> bool {
         self.store.pipelined()
+    }
+
+    fn appending(&self) -> bool {
+        self.store.appending()
+    }
+
+    fn take_back(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .take_back_append()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn journal_pipelined(&self) -> bool {
+        self.store.journal_pipelined()
+    }
+
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .finish_append()
+            .map(lowered_from_journal)
+            .map_err(engine)
     }
 
     fn hand_off(&mut self) -> Result<Lowered, EngineError> {

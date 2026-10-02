@@ -411,6 +411,7 @@ fn an_ambiguous_append_is_reconciled_from_the_actual_durable_head_and_never_blin
         world
             .store
             .journal_mut()
+            .unwrap()
             .script_append(AppendScript::Indeterminate { applied });
         let report = world.store.append_pending().unwrap();
         assert!(report.indeterminate);
@@ -586,6 +587,7 @@ fn a_late_old_ballot_completion_updates_bookkeeping_but_never_authorizes_a_new_v
     world
         .store
         .journal_mut()
+        .unwrap()
         .script_append(AppendScript::Indeterminate { applied: true });
     let report = world.store.append_pending().unwrap();
     assert!(report.indeterminate);
@@ -1815,6 +1817,7 @@ fn an_uncertain_entry_of_several_records_reconciles_all_or_none() {
         world
             .store
             .journal_mut()
+            .unwrap()
             .script_append(AppendScript::Indeterminate { applied });
         assert!(world.store.append_pending().unwrap().indeterminate);
         assert_eq!(world.store.status(A), Some(DomainStatus::JournalUncertain));

@@ -494,6 +494,49 @@ pub struct Cost {
     /// (task-d50). Zero for a voter that never led.
     #[serde(default)]
     pub reads: Reads,
+    /// CPU time used since the process started (task-d54), or why there
+    /// is no reading. Beside [`Cost::busy`], which counts the syncs the
+    /// loop waits for, it says what the work itself cost.
+    #[serde(default = "not_instrumented")]
+    pub cpu: Measure<Cpu>,
+    /// How often, and how long, the domain loop blocked on its pipeline
+    /// threads (task-d54), cumulative, or why there is no reading. Part
+    /// of [`Cost::busy`] that is not [`Cpu::domain`]: the loop waiting
+    /// for a journal append or a projection commit to come back.
+    #[serde(default = "not_instrumented")]
+    pub waits: Measure<PipelineWaits>,
+}
+
+/// The domain loop's blocking takes from its pipeline threads (task-d54).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineWaits {
+    /// Waits for a journal append on the appender's thread.
+    pub appender: Wait,
+    /// Waits for a projection commit on the materializer's thread.
+    pub materializer: Wait,
+}
+
+/// Blocking takes and their total time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wait {
+    /// Takes that found the job still running.
+    pub count: u64,
+    /// The time those takes blocked.
+    pub time: Duration,
+}
+
+/// CPU time a voter's process has used (task-d54), cumulative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cpu {
+    /// The domain loop's own thread.
+    pub domain: Duration,
+    /// Every thread of the process: the loop, the appender and the
+    /// materializer, the transport's workers.
+    pub process: Duration,
+}
+
+fn not_instrumented<T>() -> Measure<T> {
+    Measure::Unavailable(Unavailable::NotInstrumented)
 }
 
 /// What a leader's read barrier did (task-d50), cumulative.
@@ -568,6 +611,9 @@ pub struct Interval {
     pub busy: Duration,
     /// Commands applied in it.
     pub executed: u64,
+    /// CPU time the domain loop's thread used in it (task-d54).
+    #[serde(default = "not_instrumented")]
+    pub domain_cpu: Measure<Duration>,
 }
 
 impl MetricsSnapshot {
