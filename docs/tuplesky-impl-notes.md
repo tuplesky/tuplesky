@@ -9287,3 +9287,96 @@ since reads are no longer commands.
   point reads were measured.
 - **The Jepsen client's runs** are the external evidence (by the owner
   of #98).
+
+## The journal's appends off the domain thread
+
+task-d54. After task-d50 the Jepsen runs put the leader's domain loop at
+82 to 88% busy at six nodes on the runner's disk, about 2.7 ms a
+command, and about 1.2 ms of that in the journal's `fdatasync` on the
+loop's own thread. The loop could take in nothing while it synced, so a
+group held only what had arrived during the previous sync, about 1.6
+commands. Section 17.3.3 already draws the append on a shared journal
+worker; task-j03 ran it inline.
+
+The domain thread now seals a group, reserves each stream's entry and
+lends the journal with the group to an appender thread
+(`JournaledStore::pipeline_journal`, `ThreadAppender`). The appender
+runs the synced append and wakes the loop on the materializer's
+`Notify`. The loop takes the journal back with the outcome and
+completes, fails or leaves uncertain each entry exactly as an inline
+append does. That code is the same `complete_group` both paths call.
+
+- **One group out at a time.** What queues meanwhile is the next group,
+  so groups are written in the order they were sealed and a stream's
+  records chain as before. A stream with its entry out is not idle and
+  could not seal another anyway.
+- **The outcome is the loop's.** `JournalDurable` is reported only from
+  a take-back on the loop's thread. A proposal is the leader's vote, and
+  it still leaves only after its rows are durable.
+- **Who waits.** Anything that reads or writes the journal on the loop's
+  thread waits for an append that is out and takes it back first:
+  reconcile, checkpoint publication, drain, flush, attach,
+  `journal_mut`.
+  - `recovery_cut` and `recovery_baseline` take `&self` and cannot wait.
+    While the journal is lent they refuse with `JournalLent`. Both run
+    only at start-up, before it is lent.
+  - An indeterminate outcome taken back where its report cannot reach
+    the caller, as in a checkpoint publication, marks the next report
+    indeterminate, so that caller reconciles.
+- **The next group is lent from the flush, not the wake.** The first
+  version had `Node::settle` take the append back and lend the next
+  group at once.
+  - The wake is a high-priority branch of the loop, ahead of the events
+    that arrived during the sync. Lent there, a group held what had been
+    read when the wake came. On the container's disk at fifty callers
+    the leader then appended 0.58 groups a command, against 0.48 inline.
+  - Settle now only takes the append back. The runtime's flush is the
+    loop's lowest-priority branch, taken once no event is ready, and it
+    lends the next group. That is the batching an inline sync gave, when
+    everything that arrived during it went to the flush after it.
+- **Nothing is owed while an append is out.** `Voter::owes_flush` does
+  not count batches queued behind one, since a flush then moves nothing.
+  `Node::lower_queued` stops when a lowering moves nothing.
+- **The applier.** A group's append may now come back after the group
+  was handed off, so the applier checks the barriers of every group in
+  flight for a lost batch. `Applier::drain` journals a group that was
+  handed off while an append was out.
+
+### Measured
+
+`scripts/bench/command-cost.sh` on the container's disk, three voters,
+2,500 operations a run. task-d50's binary (1ada606) alternated with this
+task's, three repeats per caller count each time. The baseline ran four
+times (12 runs), the first version twice and the final one twice (6
+runs each). Medians:
+
+| callers | | completed/s | leader busy ms/cmd | leader appends/cmd | leader commits/cmd | follower busy ms/cmd | leader domain CPU ms/cmd |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | task-d50 | 1,090 (884–1,171) | 1.94 | 1.51 | 0.88 | 1.73 | -- |
+| 10 | lent at the wake | 1,062 (998–1,140) | 1.26 | 1.30 | 1.10 | 0.86 | 0.75 |
+| 10 | task-d54 | 1,071 (1,020–1,149) | 1.23 (−37%) | 1.06 (−30%) | 1.00 | 0.82 (−53%) | 0.74 |
+| 50 | task-d50 | 1,862 (1,602–1,995) | 1.22 | 0.48 | 0.27 | 1.09 | -- |
+| 50 | lent at the wake | 1,784 (1,599–1,930) | 1.12 | 0.58 | 0.45 | 0.84 | 0.75 |
+| 50 | task-d54 | 1,809 (1,690–1,960) | 1.10 (−10%) | 0.36 (−25%) | 0.35 | 0.81 (−26%) | 0.76 |
+
+- **The loop's time per command falls, and the groups grow.** On the
+  leader, busy time falls 37% at ten callers. Followers fall 53%, since
+  their loops did little but sync. Journal appends per command fall by
+  a quarter to a third.
+- **Throughput does not move on this container.** The spread of the
+  runs is wider than any difference. The domain loops were not what
+  bounded it: at task-d50 the leader's loop was 28 to 36% busy. What
+  bounds a command here is the chain of syncs it waits through: the
+  leader's proposal, the followers' votes, the execution group's
+  journal append and the projection's commit. task-d54 takes those syncs
+  off the loop and leaves them on the command's path. The plan's
+  acceptance is on the Jepsen runner, where the leader's loop was what
+  saturated: busy time per command at six nodes on disk down by the
+  journal's share, and journal syncs below 0.2 a command.
+- **CPU beside busy.** On the leader, the domain thread's CPU is about
+  0.75 ms a command of its 1.1 to 1.2 ms busy. The rest is time the loop
+  spends working without being on a CPU: page faults, reads of the
+  projection, the materializer's drain. The process as a whole uses
+  2.0 ms a command at ten callers and 1.5 ms at fifty.
+- **The command-cost gate** (tmpfs, one and ten callers, three repeats)
+  is within the baseline's margins.
