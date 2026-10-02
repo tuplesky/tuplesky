@@ -237,14 +237,30 @@ impl Caller {
     /// being measured is wall time on this side, not the client's notion
     /// of it.
     pub async fn ask(&mut self, request: &LogicalRequest, deadline: Duration) -> Answer {
+        match self.call(request, deadline).await {
+            Ok(coord_sdk::Outcome::Established { .. }) => Answer::Established,
+            Ok(coord_sdk::Outcome::Unknown) => Answer::Unknown,
+            Ok(other) => Answer::Refused(refusal(&other)),
+            Err(answer) => answer,
+        }
+    }
+
+    /// Submit one request and return the SDK's outcome for it, result
+    /// bytes included, or what this side made of it when the SDK never
+    /// reached one (never `Established`).
+    pub async fn call(
+        &mut self,
+        request: &LogicalRequest,
+        deadline: Duration,
+    ) -> Result<coord_sdk::Outcome, Answer> {
         self.ticks += 1;
         let now = self.ticks;
         let Ok(id) = self.client.submit(now, request, 0) else {
-            return Answer::Refused("not-submitted".into());
+            return Err(Answer::Refused("not-submitted".into()));
         };
         let actions = self.client.take_actions();
         let [coord_sdk::SdkAction::Send { frame, .. }] = actions.as_slice() else {
-            return Answer::Refused("not-sent".into());
+            return Err(Answer::Refused("not-sent".into()));
         };
         let Ok(answer) = self
             .transport
@@ -258,13 +274,13 @@ impl Caller {
             // full of refusals that came from this process. The run
             // reports the unknown and lets the invocation go.
             self.client.forget(id);
-            return Answer::Unknown;
+            return Err(Answer::Unknown);
         };
         let Ok(bytes) =
             coord_types::wire_v1::encode_frame(answer.kind, answer.version, &answer.payload)
         else {
             self.client.forget(id);
-            return Answer::Refused("unframeable".into());
+            return Err(Answer::Refused("unframeable".into()));
         };
         if self
             .client
@@ -272,12 +288,12 @@ impl Caller {
             .is_err()
         {
             self.client.forget(id);
-            return Answer::Refused("undecodable".into());
+            return Err(Answer::Refused("undecodable".into()));
         }
         let completions = self.client.take_completions();
         let Some(completion) = completions.iter().find(|c| c.request == id) else {
             self.client.forget(id);
-            return Answer::Unknown;
+            return Err(Answer::Unknown);
         };
         // Release the invocation. The SDK retains a completed request so
         // that a caller which never saw the answer can still resolve it
@@ -286,11 +302,7 @@ impl Caller {
         // domain.
         let outcome = completion.outcome.clone();
         self.client.forget(id);
-        match &outcome {
-            coord_sdk::Outcome::Established { .. } => Answer::Established,
-            coord_sdk::Outcome::Unknown => Answer::Unknown,
-            other => Answer::Refused(refusal(other)),
-        }
+        Ok(outcome)
     }
 }
 
