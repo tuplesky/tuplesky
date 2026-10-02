@@ -2397,6 +2397,17 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     }
                     state.pending_meta = None;
                     state.status = DomainStatus::Ready;
+                    // Whether the commit reconciled here was durable or a
+                    // working one is not known (task-j06). Under the
+                    // strict profile every commit is durable; under the
+                    // replay-backed one the projection is made durable
+                    // now, so neither the cadence's bound nor
+                    // `projection_durable` is lost to an uncertain
+                    // outcome.
+                    match self.profile {
+                        ProjectionProfile::Strict => state.committed(true, taken),
+                        ProjectionProfile::Replay(_) => state.sync_projection()?,
+                    }
                 } else if observed == state.meta {
                     // The commit is absent. The records are authoritative
                     // in the journal, so they are applied again as a

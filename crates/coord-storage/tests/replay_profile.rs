@@ -23,7 +23,7 @@ use coord_storage::journaled::{
 };
 use coord_store_api::engine::LocalEngine;
 use coord_store_testkit::journal::ModelJournal;
-use coord_store_testkit::model::{ModelEngine, ModelReader, ModelWrite};
+use coord_store_testkit::model::{CommitScript, ModelEngine, ModelReader, ModelWrite};
 use coord_types::identity::Digest32;
 use coord_types::ids::*;
 
@@ -454,4 +454,31 @@ fn a_projection_at_the_journals_head_is_validated_by_the_record_at_its_stamp() {
         next.validate_projection(A, &foreign, LocalJournalSeq::ZERO),
         Err(JournaledError::ProjectionInvalid(_))
     ));
+}
+
+/// A projection commit whose outcome was uncertain and that reconciles as
+/// applied may have been a working commit or a durable one: the
+/// projection is made durable then, so the cadence's bound and the
+/// durable frontier survive the uncertainty.
+#[test]
+fn a_reconciled_commit_leaves_the_projection_durable() {
+    let mut world = World::new(ProjectionProfile::Replay(never()));
+    world.commit_each(2);
+    assert!(world.projection_durable() < world.materialized());
+    world
+        .engine()
+        .script_commit(CommitScript::Indeterminate { applied: true });
+    world.queue(1);
+    world.store.append().unwrap();
+    let report = world.store.materialize().unwrap();
+    assert!(report.indeterminate);
+    assert_eq!(
+        world.store.status(A),
+        Some(DomainStatus::MaterializationUncertain)
+    );
+    world.store.reconcile(A).unwrap();
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+    assert_eq!(world.projection_durable(), world.materialized());
+    assert_eq!(world.engine().working_commits(), 0);
+    assert_eq!(kv_only(world.engine().durable_rows()), reference_kv(3));
 }
