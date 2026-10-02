@@ -9135,3 +9135,155 @@ seconds), two runs of each binary:
 - **The lane counters.** `coordd` reports its lanes' frames and
   refusals as `NotInstrumented`; the pause script reads refusals from
   the log's powers of two.
+
+## Reads off the slow path
+
+task-d50. A Range was a command: ordered, journaled and synced twice,
+and executed like a write. At ten callers on this container's disk its
+operation took 16 ms at the median, as long as a put. The amendment
+(design Section 6.3) serves it from the leader instead, behind a
+confirmation of its ballot.
+
+- **The barrier.** A frontend with a voter beside it sends a Range
+  without an explicit revision to the leader of the ballot it follows
+  (`ReadV1`). The leader takes its highest proposed sequence number as
+  the read index, starts a confirmation round after the read arrived
+  (`ReadConfirm`), and serves the read once a slow quorum including
+  itself has confirmed that round, everything it proposed below the
+  index has executed, and its snapshot has materialized that far. It
+  plans the Range with the ordered path's own admission check, view and
+  planner, so the answer carries the bytes the ordered path would have
+  recorded at that state (`ReadAnswerV1`). A refusal, an answer from
+  anyone but that leader, or no answer within 1.5 s orders the read.
+- **Why it is linearizable.** A write that completed before the read
+  arrived was learned, so a leader proposed it. If that was this leader
+  in this ballot, it is below the index. If it was an earlier ballot,
+  this ballot's first proposal follows it in the total chain. A higher
+  ballot that could have ordered a later write needed a quorum of
+  promises, and every quorum meets the one that confirmed this ballot
+  after the read arrived: a voter confirms only the ballot it promised,
+  so the round could not have confirmed if a higher one had been
+  promised by a quorum first.
+- **A session's window.** A read served this way records nothing, so it
+  retires nothing; only an ordered command moves its client's floor, by
+  at most 64 sequences. A session that read through the leader alone
+  walked out of its 1024-wide window and was then refused everything,
+  ordered requests included (the first register run: a quarter of the
+  reads were `RetryOutOfWindow`). Past half the window from the floor
+  the leader now leaves the read to the ordered path, which retires
+  behind it: about one read in 64 of a read-only session is ordered.
+  `a_session_that_only_reads_is_served_past_its_window` reads 2,600
+  times on one session; without the guard it is refused at read 1,089.
+- **The fast path stays as it is** (the amendment's decision). With
+  reads off the chain the leader's fast-path share at ten callers rose
+  from 6% to 28%; at one caller it is 99%.
+
+### Linearizability under leader faults
+
+`coord-register` (crates/coord-wan-bench) drives four registers through
+every frontend, two callers each, about a third of the operations
+writes of a value no other write puts, and checks the history
+(`register::check`): writes in revision order agree with real time, and
+every read saw a value some write put, at its revision, invoked before
+the read completed, no older than any write or read that completed
+before the read was invoked, and older than any write invoked after it
+completed. An operation whose outcome the caller never learned may or
+may not have happened. Twelve unit tests on constructed histories,
+each rule broken once.
+
+`scripts/bench/register-faults.sh` stands up a three-voter domain and
+faults its leader while the workload runs:
+
+| Scenario | Runs | Violations | Reads | Writes | Leader after |
+|---|---|---|---|---|---|
+| partition 45 s | 2 | 0, 0 | 28,225, 28,993 | 12,109, 12,423 | n2 (elected) |
+| pause 5 s, then 40 s | 2 | 0, 0 | 42,694, 36,539 | 18,875, 16,194 | n2 (elected) |
+| kill and restart, twice | 2 | 0, 0 | 19,870, 19,621 | 8,243, 8,122 | n1 (ballots 1, 2) |
+| partition 45 s, `skip-read-confirmation` | 1 | **260** | 30,994 | 13,096 | n2 |
+
+- **Partition.** The leader's daemon sockets are cut off from the other
+  voters' with iptables; its own callers still reach it, and only read,
+  five times a second. The other frontends' callers do nothing for two
+  seconds either side of the cut, so the leader holds no proposal it
+  cannot commit. The others notice at the transport's 30 s idle timeout
+  and elect a leader. With the round the cut-off leader serves nothing
+  during the cut (its frontend completed 170 and 188 reads in the
+  run); without it, it answers from the state it had, and the check
+  finds 260 stale reads, all at its frontend (rule 4: "a read ... saw
+  revision 3702; revision 5450 had completed before it").
+- **The negative control needs the quiet.** In the first cut of the
+  scenario the writing frontends kept going; the cut-off leader then
+  always held an ordered read or a write it could not commit, its index
+  never executed, and even without the round it served nothing stale.
+  That is the index doing its part, not the round.
+- **Pause.** A 5 s pause is shorter than the idle timeout: nobody else
+  campaigns, and the reads wait it out. The 40 s pause is longer: the
+  others elect n2 and the stopped voter comes back still believing it
+  leads.
+- **Kill.** The killed leader, started again five seconds later,
+  campaigned and won the next ballot before the others noticed it was
+  gone, both times. A voter taking over from a killed leader is the
+  pause run's case.
+- Unknown outcomes: up to 1,677 reads in a pause run (each a caller
+  waiting out its 5 s deadline on the stopped leader's frontend), up to
+  33 writes in a kill run. The register caller gives an unknown outcome
+  up (`Client::abandon`); forgetting it would hold its session's
+  acknowledged prefix, and the session would be refused a window later.
+
+### Measured
+
+This container's disk, the default mix without scans (55% gets),
+2,500 operations, d49b and d50 alternated, two rounds of three repeats;
+medians of the six:
+
+| Callers | Build | Get service p50 | Get whole p50 | Put service p50 | Completed/s |
+|---|---|---|---|---|---|
+| 1 | d49b | 4.09 ms | 13.19 ms | 4.78 ms | 213 |
+| 1 | d50 | 0.83 ms | 6.23 ms | 4.68 ms | 376 |
+| 10 | d49b | 16.21 ms | 34.20 ms | 16.49 ms | 591 |
+| 10 | d50 | 10.81 ms | 23.32 ms | 12.73 ms | 835 |
+
+Per run, the get service p50 at ten callers was 15.7 to 17.6 ms on
+d49b and 10.4 to 11.5 ms on d50; at one caller 4.0 to 4.3 and 0.8 to
+0.9 ms.
+
+Where a served read's time goes, from `cost.reads` on the leader in one
+instrumented run at ten callers (1,492 served, none refused): 2.4 ms on
+average until its confirmation round was seen confirmed, 5.2 ms until
+everything below its index had also executed, 7.8 ms until it was
+answered, the last 2.6 ms the snapshot materializing that far. At one
+caller all three are 0.4 ms. The rest of the 10.8 ms service time is
+the hop from the two frontends that are not the leader's.
+
+**The acceptance at ten callers is not met.** A read there is not one
+round trip plus the leader's queue: it waits for the writes in flight
+when it arrived to execute, and for their projection. Either is a
+follow-up:
+
+- **A lower index.** Every proposal below the index is waited for,
+  committed or not, because a command the collector learned on the fast
+  path may have completed without the leader knowing it was committed.
+  A read needs only the writes that may have completed before it
+  arrived. Bounding those without the leader learning the fast path's
+  outcomes is a protocol change.
+- **The executed state rather than the projection.** The read is
+  planned over the materialized snapshot, which the applier commits off
+  the domain thread (task-d52). Planning it over what has executed but
+  not yet materialized needs a view of the applier's pending batch.
+
+The command-cost gate (tmpfs, three repeats) is within the baseline's
+margins: busy time per executed command 1.15 to 1.19 ms at one caller
+and 1.04 to 1.11 ms at ten on the leader, against a baseline of 1.32
+and 1.46. Executed commands per run fell from about 2,600 to 1,110,
+since reads are no longer commands.
+
+### Not done here
+
+- **A frontend without a voter** still orders every read: it follows no
+  ballot, so it does not know whom to ask. `[reads] path = "ordered"`
+  turns the barrier off everywhere.
+- **Reads at an explicit revision, and transactions,** are ordered as
+  before. Every Range without one is served, scans included; only
+  point reads were measured.
+- **The Jepsen client's runs** are the external evidence (by the owner
+  of #98).

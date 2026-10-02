@@ -137,6 +137,17 @@ pub const KIND_COLLECTOR_SUBMIT: u16 = 0x0103;
 /// understands.
 pub const COLLECTOR_SUBMIT_VERSION: u16 = 1;
 
+/// A trusted collector's current read, sent to the leader it follows
+/// only (`spec/wire-v1.md`, "Collector frames"; task-d50, design Section
+/// 6.3). A raw kind of the API range like [`KIND_COLLECTOR_SUBMIT`], and
+/// admitted on a request stream on the same terms: from a role that
+/// [`PeerRole::may_submit_for_clients`]. Its payload is
+/// `coord_collector::wire::ReadV1`.
+pub const KIND_COLLECTOR_READ: u16 = 0x0107;
+
+/// The only schema version of a collector read this build understands.
+pub const COLLECTOR_READ_VERSION: u16 = 1;
+
 /// Registered message kinds with frozen discriminants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]

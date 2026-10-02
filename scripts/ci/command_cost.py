@@ -103,7 +103,39 @@ def per_command(node: str, snapshot: dict) -> dict:
         "busy_ms_per_command": busy * 1000 / executed,
         "busy_fraction": busy / uptime if uptime > 0 else None,
         **resends_of(cost, executed),
+        **paths_of(cost),
+        **reads_of(cost),
     }
+
+
+def reads_of(cost: dict) -> dict:
+    """What a voter's read barrier served and refused, and how long a
+    served read waited on average: for its confirmation round, for its
+    index to execute (round included), and in all (task-d50). Empty for
+    a binary older than the counts, or a voter that served none."""
+    reads = cost.get("reads")
+    if not isinstance(reads, dict) or reads["served"] + reads["refused"] == 0:
+        return {}
+    served = reads["served"]
+    mean = lambda total: total / served if served else None
+    return {
+        "reads": {
+            "served": served,
+            "refused": reads["refused"],
+            "mean_confirm_ms": mean(reads["waited_confirm_ms"]),
+            "mean_index_ms": mean(reads["waited_index_ms"]),
+            "mean_served_ms": mean(reads["waited_ms"]),
+        }
+    }
+
+
+def paths_of(cost: dict) -> dict:
+    """The share of the commands a voter established that the fast path
+    decided (task-d50). Empty for a binary older than the counts."""
+    fast, slow = cost.get("established_fast"), cost.get("established_slow")
+    if fast is None or slow is None or fast + slow == 0:
+        return {}
+    return {"fast_path_share": fast / (fast + slow)}
 
 
 def resends_of(cost: dict, executed: int) -> dict:

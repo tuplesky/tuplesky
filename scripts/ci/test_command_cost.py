@@ -85,6 +85,26 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reading["duplicate_votes_per_command"], 0.04)
         self.assertNotIn("resent_per_command", cost.per_command("n1", snapshot()))
 
+    def test_the_fast_path_share_is_read_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["established_fast"] = 25
+        snap["cost"]["Observed"]["established_slow"] = 75
+        self.assertAlmostEqual(cost.per_command("n1", snap)["fast_path_share"], 0.25)
+        self.assertNotIn("fast_path_share", cost.per_command("n1", snapshot()))
+
+    def test_the_read_barrier_waits_are_read_as_means_when_reported(self):
+        snap = snapshot()
+        snap["cost"]["Observed"]["reads"] = {
+            "served": 200, "refused": 3, "rounds": 90, "confirmed": 88,
+            "waited_confirm_ms": 100, "waited_index_ms": 600, "waited_ms": 800,
+        }
+        reads = cost.per_command("n1", snap)["reads"]
+        self.assertEqual((reads["served"], reads["refused"]), (200, 3))
+        self.assertAlmostEqual(reads["mean_confirm_ms"], 0.5)
+        self.assertAlmostEqual(reads["mean_index_ms"], 3.0)
+        self.assertAlmostEqual(reads["mean_served_ms"], 4.0)
+        self.assertNotIn("reads", cost.per_command("n1", snapshot()))
+
     def test_an_absent_reading_is_absent_not_zero(self):
         with self.assertRaises(cost.Absent):
             cost.per_command("n1", snapshot(syncs_observed=False))

@@ -325,6 +325,28 @@ pub enum ProtocolMessage {
         /// The encoded readiness.
         readiness: Vec<u8>,
     },
+    /// A leader asks whether its ballot is still every voter's promise
+    /// (task-d50; design Section 6.3). One round answers every read that
+    /// reached the leader before the round was started, so a leader
+    /// starts one after a read arrives and never answers a read from a
+    /// round started earlier.
+    ReadConfirm {
+        /// The ballot the leader leads.
+        ballot: Ballot,
+        /// The leader's round number, echoed in the answer.
+        round: u64,
+    },
+    /// A voter's answer to [`ProtocolMessage::ReadConfirm`]: its promise
+    /// is `ballot`, with no higher one in flight. A voter that has
+    /// promised anything else does not answer.
+    ReadConfirmed {
+        /// The ballot confirmed.
+        ballot: Ballot,
+        /// The round answered.
+        round: u64,
+        /// The voter answering.
+        replica: ReplicaId,
+    },
 }
 
 /// Why a voter refused a submission (task-d22).
@@ -380,6 +402,8 @@ impl ProtocolMessage {
             | ProtocolMessage::CatchUpRequest { .. }
             | ProtocolMessage::CatchUpPage { .. }
             | ProtocolMessage::FloorReadiness { .. }
+            | ProtocolMessage::ReadConfirm { .. }
+            | ProtocolMessage::ReadConfirmed { .. }
             | ProtocolMessage::Sync(_) => None,
         }
     }

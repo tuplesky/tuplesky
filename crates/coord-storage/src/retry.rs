@@ -204,6 +204,26 @@ pub fn floor<V: OrderedRead>(
     }
 }
 
+/// The floor of `key`'s client instance, with its window width taken
+/// from the session record when no floor row exists yet; `None` when the
+/// session is unknown. What [`admit`] measures a request's window from,
+/// before the request's own acknowledgement moves it.
+pub fn session_floor<V: OrderedRead>(
+    view: &V,
+    key: &RetryKey,
+) -> Result<Option<RetryFloorV1>, EngineError> {
+    let Some(session) = session_state(view, &key.session_id)? else {
+        return Ok(None);
+    };
+    floor(
+        view,
+        &key.session_id,
+        &key.client_instance_id,
+        session.window,
+    )
+    .map(Some)
+}
+
 /// Retained record for a retry key.
 pub fn lookup<V: OrderedRead>(
     view: &V,
