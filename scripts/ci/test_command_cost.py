@@ -105,6 +105,19 @@ class ReduceTests(unittest.TestCase):
         self.assertAlmostEqual(reads["mean_served_ms"], 4.0)
         self.assertNotIn("reads", cost.per_command("n1", snapshot()))
 
+    def test_cpu_is_read_per_command_when_reported(self):
+        snap = snapshot(executed=200)
+        snap["cost"]["Observed"]["cpu"] = {
+            "Observed": {"domain": duration(0.3), "process": duration(0.9)},
+        }
+        reading = cost.per_command("n1", snap)
+        self.assertAlmostEqual(reading["domain_cpu_ms_per_command"], 1.5)
+        self.assertAlmostEqual(reading["process_cpu_ms_per_command"], 4.5)
+        unavailable = snapshot()
+        unavailable["cost"]["Observed"]["cpu"] = {"Unavailable": "NotInstrumented"}
+        self.assertNotIn("domain_cpu_ms_per_command", cost.per_command("n1", unavailable))
+        self.assertNotIn("domain_cpu_ms_per_command", cost.per_command("n1", snapshot()))
+
     def test_an_absent_reading_is_absent_not_zero(self):
         with self.assertRaises(cost.Absent):
             cost.per_command("n1", snapshot(syncs_observed=False))

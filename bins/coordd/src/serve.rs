@@ -1138,9 +1138,15 @@ struct Pacing {
     every: Option<(std::time::Duration, coord_daemon::role::RoleSet)>,
     /// When the next snapshot is due.
     due: Option<std::time::Instant>,
-    /// The last printed snapshot's instant, busy time and executed
-    /// count: where the current interval began.
-    last: Option<(std::time::Instant, std::time::Duration, u64)>,
+    /// The last printed snapshot's instant, busy time, executed count
+    /// and the domain thread's CPU time: where the current interval
+    /// began.
+    last: Option<(
+        std::time::Instant,
+        std::time::Duration,
+        u64,
+        Option<std::time::Duration>,
+    )>,
 }
 
 impl Pacing {
@@ -1495,7 +1501,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// What this voter's work has cost since the loop started, with the
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
-        use coord_daemon::metrics::{Cost, Interval, Measure, Unavailable};
+        use coord_daemon::metrics::{Cost, Cpu, Interval, Measure, Unavailable};
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
             // cost this reports is a voter's: per command it executed in
@@ -1508,13 +1514,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let now = std::time::Instant::now();
         let executed = voter.node().executed;
         let busy = self.pacing.busy(self.started, now);
+        // This runs on the domain loop's thread, so the calling thread's
+        // CPU time is the loop's.
+        let domain_cpu = crate::cpu::this_thread();
         let recent = match self.pacing.last {
-            Some((at, busy_then, executed_then)) => Measure::Observed(Interval {
+            Some((at, busy_then, executed_then, cpu_then)) => Measure::Observed(Interval {
                 span: now.saturating_duration_since(at),
                 busy: busy.saturating_sub(busy_then),
                 executed: executed.saturating_sub(executed_then),
+                domain_cpu: match (domain_cpu, cpu_then) {
+                    (Some(cpu), Some(then)) => Measure::Observed(cpu.saturating_sub(then)),
+                    _ => Measure::Unavailable(Unavailable::NotInstrumented),
+                },
             }),
             None => Measure::Unavailable(Unavailable::NoSamples),
+        };
+        let cpu = match (domain_cpu, crate::cpu::process()) {
+            (Some(domain), Some(process)) => Measure::Observed(Cpu { domain, process }),
+            _ => Measure::Unavailable(Unavailable::NotInstrumented),
         };
         Measure::Observed(Cost {
             executed,
@@ -1532,6 +1549,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             established_fast: voter.node().established.fast,
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
+            cpu,
         })
     }
 
@@ -1553,7 +1571,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             Backing::Voting(voter) => voter.node().executed,
             Backing::Serving(_) => 0,
         };
-        self.pacing.last = Some((now, self.pacing.busy(self.started, now), executed));
+        self.pacing.last = Some((
+            now,
+            self.pacing.busy(self.started, now),
+            executed,
+            crate::cpu::this_thread(),
+        ));
         self.pacing.due = Some(now + every);
     }
 
