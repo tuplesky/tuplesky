@@ -1531,6 +1531,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             resends: resends(&voter.resend_counts()),
             established_fast: voter.node().established.fast,
             established_slow: voter.node().established.slow,
+            reads: reads(&voter.read_counts()),
         })
     }
 
@@ -4308,6 +4309,19 @@ fn resends(counts: &coord_consensus::ResendCounts) -> coord_daemon::metrics::Res
         late: counts.late,
         handed_off: counts.handed_off,
         duplicate_votes: counts.duplicate_votes,
+    }
+}
+
+/// The snapshot's reading of the read barrier's counts (task-d50).
+fn reads(counts: &coord_daemon::reads::ReadCounts) -> coord_daemon::metrics::Reads {
+    coord_daemon::metrics::Reads {
+        served: counts.served,
+        refused: counts.refused,
+        rounds: counts.rounds,
+        confirmed: counts.confirmed,
+        waited_confirm_ms: counts.waited_confirm_ms,
+        waited_index_ms: counts.waited_index_ms,
+        waited_ms: counts.waited_ms,
     }
 }
 

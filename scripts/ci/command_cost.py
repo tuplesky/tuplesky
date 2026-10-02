@@ -104,6 +104,28 @@ def per_command(node: str, snapshot: dict) -> dict:
         "busy_fraction": busy / uptime if uptime > 0 else None,
         **resends_of(cost, executed),
         **paths_of(cost),
+        **reads_of(cost),
+    }
+
+
+def reads_of(cost: dict) -> dict:
+    """What a voter's read barrier served and refused, and how long a
+    served read waited on average: for its confirmation round, for its
+    index to execute (round included), and in all (task-d50). Empty for
+    a binary older than the counts, or a voter that served none."""
+    reads = cost.get("reads")
+    if not isinstance(reads, dict) or reads["served"] + reads["refused"] == 0:
+        return {}
+    served = reads["served"]
+    mean = lambda total: total / served if served else None
+    return {
+        "reads": {
+            "served": served,
+            "refused": reads["refused"],
+            "mean_confirm_ms": mean(reads["waited_confirm_ms"]),
+            "mean_index_ms": mean(reads["waited_index_ms"]),
+            "mean_served_ms": mean(reads["waited_ms"]),
+        }
     }
 
 

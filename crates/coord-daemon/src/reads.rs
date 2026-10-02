@@ -65,6 +65,10 @@ pub struct Held {
     after_round: u64,
     /// When it arrived.
     arrived: MonotonicMillis,
+    /// When a round started after it arrived was first seen confirmed.
+    confirmed_at: Option<MonotonicMillis>,
+    /// When everything below its index had also executed.
+    due_at: Option<MonotonicMillis>,
     /// The position the snapshot it is planned over must reach, once
     /// everything below its index has executed.
     pub required: Option<ExecutionPosition>,
@@ -89,6 +93,15 @@ pub struct ReadCounts {
     pub rounds: u64,
     /// Confirmation rounds that confirmed.
     pub confirmed: u64,
+    /// Over the reads served: milliseconds from arrival until a round
+    /// started after it was seen confirmed, summed.
+    pub waited_confirm_ms: u64,
+    /// Over the reads served: milliseconds from arrival until, confirmed,
+    /// everything below its index had executed, summed.
+    pub waited_index_ms: u64,
+    /// Over the reads served: milliseconds from arrival until served,
+    /// summed.
+    pub waited_ms: u64,
 }
 
 /// The reads a leader holds, and the rounds that confirm them.
@@ -152,6 +165,8 @@ impl ReadBarrier {
             index,
             after_round: self.next_round,
             arrived: now,
+            confirmed_at: None,
+            due_at: None,
             required: None,
         });
         Ok(())
@@ -265,9 +280,13 @@ impl ReadBarrier {
                 ));
                 continue;
             }
-            if held.required.is_none() && self.covered(&held, ballot) && executed_below(held.index)
+            if held.confirmed_at.is_none() && self.covered(&held, ballot) {
+                held.confirmed_at = Some(now);
+            }
+            if held.required.is_none() && held.confirmed_at.is_some() && executed_below(held.index)
             {
                 held.required = Some(executed_through);
+                held.due_at = Some(now);
             }
             if held.required.is_some() {
                 due.push(held);
@@ -289,9 +308,15 @@ impl ReadBarrier {
         self.held.push_front(held);
     }
 
-    /// Count `held` served.
-    pub fn served(&mut self) {
+    /// Count `held` served at `now`, and how long it waited.
+    pub fn served(&mut self, held: &Held, now: MonotonicMillis) {
+        let since = |at: Option<MonotonicMillis>| {
+            at.map_or(0, |at| at.get().saturating_sub(held.arrived.get()))
+        };
         self.counts.served += 1;
+        self.counts.waited_confirm_ms += since(held.confirmed_at);
+        self.counts.waited_index_ms += since(held.due_at);
+        self.counts.waited_ms += since(Some(now));
     }
 
     /// Count a read refused after it was due.
@@ -605,6 +630,29 @@ mod tests {
         barrier.hold_again(due.into_iter().next().unwrap());
         let (due, _) = barrier.take_due(leading(b, 9), T0, |_| true, at(12));
         assert_eq!(due[0].required, Some(at(8)));
+    }
+
+    /// A served read's waits are counted from its arrival: until its
+    /// round confirmed, until its index executed, and until it was served.
+    #[test]
+    fn a_served_read_counts_what_it_waited_for() {
+        let b = ballot(1);
+        let ms = |n: u64| T0.plus(n);
+        let mut barrier = ReadBarrier::new();
+        barrier
+            .admit(Origin::Local, read(1, b, range()), leading(b, 7), T0)
+            .unwrap();
+        let round = barrier.round_to_start(b, 2, T0).unwrap();
+        barrier.on_confirmed(ReplicaId([2; 16]), b, round, 2);
+        let (due, _) = barrier.take_due(leading(b, 9), ms(2), |index| index <= 6, at(5));
+        assert!(due.is_empty());
+        let (due, _) = barrier.take_due(leading(b, 9), ms(7), |_| true, at(8));
+        barrier.served(&due[0], ms(9));
+        let counts = barrier.counts;
+        assert_eq!(counts.served, 1);
+        assert_eq!(counts.waited_confirm_ms, 2);
+        assert_eq!(counts.waited_index_ms, 7);
+        assert_eq!(counts.waited_ms, 9);
     }
 
     #[test]

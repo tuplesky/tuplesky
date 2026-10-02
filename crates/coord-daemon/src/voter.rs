@@ -674,7 +674,7 @@ impl<P: Persistence> Voter<P> {
             let ballot = held.read.ballot;
             match evaluate(self.node.applier().store(), &held) {
                 Evaluated::Served(response) => {
-                    self.reads.served();
+                    self.reads.served(&held, now);
                     push_answer(
                         &mut out,
                         held.origin,

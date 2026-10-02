@@ -490,6 +490,34 @@ pub struct Cost {
     pub established_fast: u64,
     /// Commands this voter established on the slow path (task-d50).
     pub established_slow: u64,
+    /// What this voter's read barrier did, over every ballot it led
+    /// (task-d50). Zero for a voter that never led.
+    #[serde(default)]
+    pub reads: Reads,
+}
+
+/// What a leader's read barrier did (task-d50), cumulative.
+///
+/// The waits are summed over the reads served, so a reader divides them
+/// by [`Reads::served`] for the mean: how long a read waited for its
+/// confirmation round, for everything below its index to execute (which
+/// includes the round), and in all before it was answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reads {
+    /// Reads answered by the barrier.
+    pub served: u64,
+    /// Reads refused, ordered by their frontends instead.
+    pub refused: u64,
+    /// Confirmation rounds started.
+    pub rounds: u64,
+    /// Confirmation rounds that confirmed.
+    pub confirmed: u64,
+    /// Milliseconds from arrival to confirmation, summed.
+    pub waited_confirm_ms: u64,
+    /// Milliseconds from arrival to the index executed, summed.
+    pub waited_index_ms: u64,
+    /// Milliseconds from arrival to the answer, summed.
+    pub waited_ms: u64,
 }
 
 /// What a leader's re-sends of proposals did (task-d49), cumulative.
