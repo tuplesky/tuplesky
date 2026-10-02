@@ -194,6 +194,9 @@ pub struct RedbEngine {
     /// nothing is served or accepted until a later reopen succeeds. The
     /// placeholder database installed during reopen is never exposed.
     quarantined: bool,
+    /// Commit in one phase, the torn commit detected by redb's checksums
+    /// (task-d48): set once a journal is underneath. Two-phase otherwise.
+    one_phase: bool,
 }
 
 impl RedbEngine {
@@ -208,12 +211,19 @@ impl RedbEngine {
             source: Source::File { path, cache_bytes },
             writer_open: false,
             quarantined: false,
+            one_phase: false,
         }
     }
 
     /// Whether a failed reopen left the engine unavailable.
     pub fn is_quarantined(&self) -> bool {
         self.quarantined
+    }
+
+    /// Whether commits are one-phase (task-d48): the journal is
+    /// underneath, see [`LocalEngine::commit_under_journal`].
+    pub fn commits_in_one_phase(&self) -> bool {
+        self.one_phase
     }
 
     fn quarantine_error() -> EngineError {
@@ -250,6 +260,7 @@ impl RedbEngine {
             source: Source::Backend,
             writer_open: false,
             quarantined: false,
+            one_phase: false,
         })
     }
 
@@ -290,6 +301,7 @@ impl RedbEngine {
             source: Source::Backend,
             writer_open: false,
             quarantined: false,
+            one_phase: false,
         })
     }
 
@@ -529,16 +541,24 @@ impl LocalEngine for RedbEngine {
             redb::TransactionError::Storage(s) => storage_error(s),
             other => EngineError::new(ErrorClass::Busy, redact(&other)),
         })?;
-        // Strict profile: Immediate durability plus two-phase commit; quick
-        // repair stays off (Section 17.3.4).
+        // Strict profile: Immediate durability, every commit synced; quick
+        // repair stays off (Section 17.3.4). Two-phase commit, unless a
+        // journal is underneath (task-d48): then one phase, one sync, and
+        // a commit a crash tore fails redb's checksums at the next open
+        // and rolls back to the one before it, which the journal replay
+        // carries forward again.
         txn.set_durability(redb::Durability::Immediate)
             .map_err(|e| EngineError::new(ErrorClass::Unsupported, redact(&e)))?;
-        txn.set_two_phase_commit(true);
+        txn.set_two_phase_commit(!self.one_phase);
         txn.set_quick_repair(false);
         self.writer_open = true;
         Ok(RedbWrite {
             engine: self,
             txn: Some(txn),
         })
+    }
+
+    fn commit_under_journal(&mut self) {
+        self.one_phase = true;
     }
 }
