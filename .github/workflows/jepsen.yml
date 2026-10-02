@@ -198,10 +198,12 @@ jobs:
         working-directory: jepsen/tuplesky
         run: lein test
       - name: Stand the cluster up
-        # With store tmpfs, each voter's binary and store live on a tmpfs.
+        # With store tmpfs, /opt, which holds each voter's binary and store
+        # (/opt/tuplesky), is a tmpfs. Not /opt/tuplesky itself: the test
+        # removes that at setup, and a mount point cannot be removed.
         run: |
           tmpfs=()
-          if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt/tuplesky); fi
+          if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt); fi
           jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
             ${tmpfs[@]+"${tmpfs[@]}"}
       - name: Deploy a domain on it and put a write through every voter
@@ -504,10 +506,11 @@ jobs:
           grep -n 'tn/' etcd-test/src/jepsen/etcd/nemesis.clj
           grep -n 'wan' etcd-test/src/jepsen/etcd.clj || true
       - name: Stand the cluster up
-        # With store tmpfs, etcd's binary and data directory live on a tmpfs.
+        # With store tmpfs, /opt, which holds etcd's binary and data
+        # directory (/opt/etcd), is a tmpfs.
         run: |
           tmpfs=()
-          if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt/etcd); fi
+          if [ "$STORE" = tmpfs ]; then tmpfs=(--tmpfs /opt); fi
           jepsen/tuplesky/docker/up.sh --nodes "$NODES" --dir "$RUNNER_TEMP/cluster" \
             ${tmpfs[@]+"${tmpfs[@]}"}
       - name: Run the etcd test

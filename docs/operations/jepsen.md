@@ -165,10 +165,11 @@ as `2n`, `5n` as `6n`) and its summaries' titles say so.
 
 The `store` input is `disk` (the default) or `tmpfs`. With `tmpfs`, the
 cluster is stood up with `docker/up.sh --tmpfs` (from tuplesky/jepsen's
-`claude/docker-tmpfs-mounts` until it merges), which puts `/opt/tuplesky`
-in each TupleSky node, and `/opt/etcd` in each etcd node, on a tmpfs.
-That is where each voter's binary and store live, and etcd's binary and
-data directory. Their fsyncs then cost next to nothing, so a `tmpfs` run
+`claude/docker-tmpfs-mounts` until it merges), which puts each node's
+`/opt` on a tmpfs. That holds each voter's binary and store
+(`/opt/tuplesky`), and etcd's binary and data directory (`/opt/etcd`); the
+tmpfs is the parent because each test removes its own directory at setup,
+and a mount point cannot be removed. Their fsyncs then cost next to nothing, so a `tmpfs` run
 beside a `disk` run shows how much of a result is the store's synchronous
 writes. SwiftPaxos keeps nothing durable, so its job ignores the input.
 The summaries' titles end in "stores on tmpfs".
