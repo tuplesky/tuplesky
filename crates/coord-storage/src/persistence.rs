@@ -192,6 +192,20 @@ pub trait Persistence {
         Ok(Lowered::default())
     }
 
+    /// Whether journal appends go to another thread (task-d54): whether
+    /// [`Persistence::journal`] lends the next group rather than waiting
+    /// for its sync.
+    fn journal_pipelined(&self) -> bool {
+        false
+    }
+
+    /// Wait for a journal append out on another thread, if one is, and
+    /// take it back without starting the next (task-d54); what it made
+    /// durable is reported. Nothing is out where nothing is pipelined.
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
     /// Take back the projection commits that have finished, without
     /// waiting, and hand what is journaled and not materialized to the
     /// next one (task-d52). The facts of the commits taken back are
@@ -548,6 +562,17 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
     fn take_back(&mut self) -> Result<Lowered, EngineError> {
         self.store
             .take_back_append()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn journal_pipelined(&self) -> bool {
+        self.store.journal_pipelined()
+    }
+
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .finish_append()
             .map(lowered_from_journal)
             .map_err(engine)
     }

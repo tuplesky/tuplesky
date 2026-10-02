@@ -9334,6 +9334,24 @@ append does. That code is the same `complete_group` both paths call.
     loop's lowest-priority branch, taken once no event is ready, and it
     lends the next group. That is the batching an inline sync gave, when
     everything that arrived during it went to the flush after it.
+- **A fence waits for the append out.** A group out is in no frontier
+  until it is taken back: `seal_group` takes it out of the queue, and
+  only `complete_group` advances the journaled frontier. A fence that
+  ran while it was out tested what was queued behind it against the
+  frontier before it, refused an application of the current ballot as
+  not extending, and moved the queued frontier back past the group, so
+  the next application was planned on a base the projection refuses.
+  `Voter::fence` therefore journals what is queued with
+  `Node::flush_journaled`, which waits for each append out on the loop's
+  thread, as a flush that appended inline did, and `JournaledStore::fence`
+  takes any append out back before it reads a frontier. A fence is rare;
+  the wait is the one an inline flush made anyway.
+- **Under back-pressure the next group is still lent.** `Node::make_room`
+  waits for the append out and lends the next group rather than
+  appending inline, so the loop waits for one sync, not two.
+- **A take-back is never dropped.** When sealing the next group fails
+  after an append was taken back, what the append made durable goes to
+  the next report, as any other stage's failure leaves it.
 - **Nothing is owed while an append is out.** `Voter::owes_flush` does
   not count batches queued behind one, since a flush then moves nothing.
   `Node::lower_queued` stops when a lowering moves nothing.

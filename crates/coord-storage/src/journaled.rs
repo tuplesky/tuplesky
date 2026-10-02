@@ -1466,11 +1466,23 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     ///
     /// Other domains are untouched. There is no cross-domain election
     /// barrier, no global packet drain and no wait for peers.
+    ///
+    /// An append the [`Appender`] has out is taken back first (task-d54),
+    /// and what it completed goes out with the next report. Its group was
+    /// sealed out of the queue and is in neither the journaled frontier
+    /// nor the in-flight records until it is taken back, so a fence that
+    /// ran before would test what is queued behind it against the
+    /// frontier before it and refuse it, and would move the queued
+    /// frontier back past the group.
     pub fn fence(
         &mut self,
         domain: DomainId,
         promised: Ballot,
     ) -> Result<Vec<StorageEvent>, JournaledError> {
+        if !self.domains.contains_key(&domain) {
+            return Err(JournaledError::UnknownDomain);
+        }
+        self.await_append()?;
         let state = self
             .domains
             .get_mut(&domain)
@@ -1550,13 +1562,35 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// first, and what it completed is reported with the rest.
     pub fn append_pending(&mut self) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
-        self.await_append_into(&mut report)?;
+        match self.append_pending_into(&mut report) {
+            Ok(()) => Ok(report),
+            Err(e) => {
+                self.hold_back(report);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`JournaledStore::append_pending`] into `report`, uncharged.
+    fn append_pending_into(&mut self, report: &mut FlushReport) -> Result<(), JournaledError> {
+        self.await_append_into(report)?;
         let Some((group, sealed)) = self.seal_group()? else {
-            return Ok(report);
+            return Ok(());
         };
         let result = self.journal.as_mut().expect(HELD).append_group(&group);
         report.absorb(self.complete_group(sealed, result)?);
-        Ok(report)
+        Ok(())
+    }
+
+    /// Hand what `report` took back to the next report, charged, when the
+    /// call that gathered it fails after: an append taken back was synced
+    /// whatever came after it, and its barriers completed or failed then.
+    /// Dropped with the error, the sends waiting on them would never be
+    /// released.
+    fn hold_back(&mut self, report: FlushReport) {
+        self.cost.charge(&report);
+        self.deferred_events.extend(report.events);
+        self.deferred_uncertain |= report.indeterminate;
     }
 
     /// Seal every queued transition of each ready stream that fits one
@@ -1839,14 +1873,36 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
     /// arrived during the sync rather than what had been read when the
     /// wake came.
     pub fn take_back_append(&mut self) -> Result<FlushReport, JournaledError> {
+        self.take_back_with(false)
+    }
+
+    /// Wait for the append the [`Appender`] has out, if one is, and take
+    /// it back, without lending the next group (task-d54). What it made
+    /// durable is reported as [`JournaledStore::take_back_append`]
+    /// reports it.
+    ///
+    /// For a caller about to act on what the journal holds, such as a
+    /// fence: the group out is in no frontier until it is taken back.
+    pub fn finish_append(&mut self) -> Result<FlushReport, JournaledError> {
+        self.take_back_with(true)
+    }
+
+    fn take_back_with(&mut self, wait: bool) -> Result<FlushReport, JournaledError> {
         let mut report = FlushReport::default();
         report.events.append(&mut self.deferred_events);
         report.indeterminate |= std::mem::take(&mut self.deferred_uncertain);
         let taken = match self.appender.as_mut() {
-            Some(appender) if self.appending.is_some() => match appender.try_take() {
-                Some(done) => self.take_append(done),
-                None => Ok(FlushReport::default()),
-            },
+            Some(appender) if self.appending.is_some() => {
+                let done = if wait {
+                    Some(appender.take().expect("an append is out"))
+                } else {
+                    appender.try_take()
+                };
+                match done {
+                    Some(done) => self.take_append(done),
+                    None => Ok(FlushReport::default()),
+                }
+            }
             _ => Ok(FlushReport::default()),
         };
         match taken {
@@ -1875,7 +1931,14 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             };
             report.absorb(self.take_append(done)?);
         }
-        let Some((group, sealed)) = self.seal_group()? else {
+        let sealed = match self.seal_group() {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                self.hold_back(report);
+                return Err(e);
+            }
+        };
+        let Some((group, sealed)) = sealed else {
             return Ok(report);
         };
         let journal = self.journal.take().expect(HELD);
