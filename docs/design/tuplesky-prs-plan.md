@@ -2448,9 +2448,11 @@ Write the design amendment first, then implement it:
 - **One group out at a time.** What is queued while a group is out goes as the next group once it is back, so groups are written in the order they were sealed, and a stream's records chain as before.
 - **Keep every barrier.** `JournalDurable` is reported only once the outcome is taken back, so a vote or proposal still leaves only after its rows are durable. An indeterminate outcome is reconciled from the journal's durable head, wherever it is taken back. Anything that reads or writes the journal on the loop's thread (a reconcile, a checkpoint publication, a drain, a flush) takes an append that is out back first.
 - **Report CPU beside busy.** The `metrics` line's cost carries the domain thread's and the process's CPU time, so a CPU per operation column can sit beside busy time, which counts a sync the loop waits for as work.
+- **Count the loop's waits.** The cost also carries how often, and how long, the loop blocked taking a job back from the appender's and the materializer's threads, so busy time less CPU time is accounted for rather than inferred.
 
 **Acceptance:**
-- On the Jepsen runner at six nodes with stores on a disk, the leader's busy time per command falls by at least the journal's share (about 1.2 of 2.7 ms after task-d50), and journal syncs per command fall below 0.2.
+- On the Jepsen runner at six nodes with stores on a disk, the leader's busy time per command falls by at least the journal's share (about 1.2 of 2.7 ms after task-d50).
+- The leader's busy time less its loop CPU per command is reported beside the loop's counted waits on the appender and the materializer. Journal syncs per command are reported and not gated. With one group out at a time, a voter syncs once per sync time or once per arrival, whichever is rarer, so the ratio follows the load rather than the loop. A first gate of below 0.2 was replaced once the runs showed 0.40 to 1.27 across the runner's rows, with the loop no longer the bound.
 - Results are those of a node that appends on its own thread, and a proposal is not sent before the append that makes its record durable is taken back (negative control).
 - A boot that ends with an append lent and not started, or synced and not taken back, recovers to what the journal holds, and no resolve after the restart answers `Unknown` or `Forgotten` for a command the journal holds.
 

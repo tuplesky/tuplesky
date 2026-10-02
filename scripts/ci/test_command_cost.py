@@ -118,6 +118,19 @@ class ReduceTests(unittest.TestCase):
         self.assertNotIn("domain_cpu_ms_per_command", cost.per_command("n1", unavailable))
         self.assertNotIn("domain_cpu_ms_per_command", cost.per_command("n1", snapshot()))
 
+    def test_pipeline_waits_are_read_per_command_when_reported(self):
+        snap = snapshot(executed=200)
+        snap["cost"]["Observed"]["waits"] = {
+            "Observed": {
+                "appender": {"count": 30, "time": duration(0.1)},
+                "materializer": {"count": 4, "time": duration(0.02)},
+            },
+        }
+        reading = cost.per_command("n1", snap)
+        self.assertAlmostEqual(reading["appender_wait_ms_per_command"], 0.5)
+        self.assertAlmostEqual(reading["materializer_wait_ms_per_command"], 0.1)
+        self.assertNotIn("appender_wait_ms_per_command", cost.per_command("n1", snapshot()))
+
     def test_an_absent_reading_is_absent_not_zero(self):
         with self.assertRaises(cost.Absent):
             cost.per_command("n1", snapshot(syncs_observed=False))

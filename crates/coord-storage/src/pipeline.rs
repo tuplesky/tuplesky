@@ -18,9 +18,11 @@
 //! [`JournaledStore::append`]: crate::journaled::JournaledStore::append
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use coord_journal_api::engine::JournalEngine;
 use coord_store_api::engine::LocalEngine;
@@ -34,6 +36,51 @@ use crate::journaled::{
 /// finishes, so the domain thread wakes and takes it back.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// How often, and for how long, the domain thread blocked taking a job
+/// back from a pipeline thread (task-d54): a take that found the job
+/// still running, and the time until it finished. A take that found it
+/// done is not a wait.
+///
+/// Cumulative and shared, so the runtime reads it while the store owns
+/// the pipeline thread. Only the threaded pipelines count; the manual
+/// ones a test drives do not wait.
+#[derive(Debug, Default)]
+pub struct Waits {
+    count: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl Waits {
+    /// The waits so far, and their total time.
+    pub fn read(&self) -> (u64, Duration) {
+        (
+            self.count.load(Ordering::Relaxed),
+            Duration::from_nanos(self.nanos.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn record(&self, waited: Duration) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
+/// Take the next job back from `done`, blocking if it is still running,
+/// and record the block in `waits`.
+fn take_counting<T>(done: &Receiver<T>, waits: &Waits) -> Result<T, TryRecvError> {
+    match done.try_recv() {
+        Ok(done) => Ok(done),
+        Err(TryRecvError::Empty) => {
+            let started = Instant::now();
+            let taken = done.recv().map_err(|_| TryRecvError::Disconnected);
+            waits.record(started.elapsed());
+            taken
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Projection commits on a thread of their own (task-d52).
 ///
 /// The thread runs the jobs in the order they were submitted, one at a
@@ -45,6 +92,7 @@ pub struct ThreadMaterializer<E: LocalEngine> {
     done: Receiver<MaterializeDone<E>>,
     out: usize,
     thread: Option<JoinHandle<()>>,
+    waits: Arc<Waits>,
 }
 
 impl<E: LocalEngine> ThreadMaterializer<E> {
@@ -67,7 +115,13 @@ impl<E: LocalEngine> ThreadMaterializer<E> {
             done,
             out: 0,
             thread: Some(thread),
+            waits: Arc::default(),
         })
+    }
+
+    /// Where the domain thread's waits for a commit are counted.
+    pub fn waits(&self) -> Arc<Waits> {
+        Arc::clone(&self.waits)
     }
 }
 
@@ -100,9 +154,7 @@ impl<E: LocalEngine> Materializer<E> for ThreadMaterializer<E> {
         if self.out == 0 {
             return None;
         }
-        let done = self
-            .done
-            .recv()
+        let done = take_counting(&self.done, &self.waits)
             .expect("the materializer thread ended with a commit out");
         self.out -= 1;
         Some(done)
@@ -250,6 +302,7 @@ pub struct ThreadAppender<J: JournalEngine + Send + 'static> {
     done: Receiver<AppendDone<J>>,
     out: usize,
     thread: Option<JoinHandle<()>>,
+    waits: Arc<Waits>,
 }
 
 impl<J: JournalEngine + Send + 'static> ThreadAppender<J> {
@@ -272,7 +325,13 @@ impl<J: JournalEngine + Send + 'static> ThreadAppender<J> {
             done,
             out: 0,
             thread: Some(thread),
+            waits: Arc::default(),
         })
+    }
+
+    /// Where the domain thread's waits for an append are counted.
+    pub fn waits(&self) -> Arc<Waits> {
+        Arc::clone(&self.waits)
     }
 }
 
@@ -305,9 +364,7 @@ impl<J: JournalEngine + Send + 'static> Appender<J> for ThreadAppender<J> {
         if self.out == 0 {
             return None;
         }
-        let done = self
-            .done
-            .recv()
+        let done = take_counting(&self.done, &self.waits)
             .expect("the appender thread ended with an append out");
         self.out -= 1;
         Some(done)
@@ -418,5 +475,33 @@ impl<J: JournalEngine + Send> Appender<J> for ManualAppender<J> {
             return Some(done.into_journal());
         }
         shared.waiting.take().map(AppendJob::abandon)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_take_that_blocks_is_counted_and_one_that_finds_the_job_done_is_not() {
+        let waits = Waits::default();
+        let (outbox, done) = channel::<u8>();
+        outbox.send(1).unwrap();
+        assert_eq!(take_counting(&done, &waits), Ok(1));
+        assert_eq!(waits.read(), (0, Duration::ZERO));
+
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            outbox.send(2).unwrap();
+        });
+        assert_eq!(take_counting(&done, &waits), Ok(2));
+        let (count, time) = waits.read();
+        assert_eq!(count, 1);
+        assert!(time >= Duration::from_millis(15), "waited {time:?}");
+        late.join().unwrap();
+        assert_eq!(
+            take_counting(&done, &waits),
+            Err(TryRecvError::Disconnected)
+        );
     }
 }

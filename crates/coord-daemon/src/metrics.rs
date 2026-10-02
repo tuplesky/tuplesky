@@ -499,6 +499,30 @@ pub struct Cost {
     /// loop waits for, it says what the work itself cost.
     #[serde(default = "not_instrumented")]
     pub cpu: Measure<Cpu>,
+    /// How often, and how long, the domain loop blocked on its pipeline
+    /// threads (task-d54), cumulative, or why there is no reading. Part
+    /// of [`Cost::busy`] that is not [`Cpu::domain`]: the loop waiting
+    /// for a journal append or a projection commit to come back.
+    #[serde(default = "not_instrumented")]
+    pub waits: Measure<PipelineWaits>,
+}
+
+/// The domain loop's blocking takes from its pipeline threads (task-d54).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineWaits {
+    /// Waits for a journal append on the appender's thread.
+    pub appender: Wait,
+    /// Waits for a projection commit on the materializer's thread.
+    pub materializer: Wait,
+}
+
+/// Blocking takes and their total time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wait {
+    /// Takes that found the job still running.
+    pub count: u64,
+    /// The time those takes blocked.
+    pub time: Duration,
 }
 
 /// CPU time a voter's process has used (task-d54), cumulative.

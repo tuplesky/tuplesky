@@ -106,6 +106,7 @@ def per_command(node: str, snapshot: dict) -> dict:
         **paths_of(cost),
         **reads_of(cost),
         **cpu_of(cost, executed),
+        **waits_of(cost, executed),
     }
 
 
@@ -121,6 +122,21 @@ def cpu_of(cost: dict, executed: int) -> dict:
     return {
         "domain_cpu_ms_per_command": seconds(cpu["domain"]) * 1000 / executed,
         "process_cpu_ms_per_command": seconds(cpu["process"]) * 1000 / executed,
+    }
+
+
+def waits_of(cost: dict, executed: int) -> dict:
+    """Milliseconds per command the domain loop blocked on its appender
+    and its materializer threads (task-d54): part of its busy time that
+    is not its CPU time. Empty for a binary older than the reading."""
+    waits = cost.get("waits")
+    if not isinstance(waits, dict) or "Observed" not in waits:
+        return {}
+    waits = waits["Observed"]
+    return {
+        "appender_wait_ms_per_command": seconds(waits["appender"]["time"]) * 1000 / executed,
+        "materializer_wait_ms_per_command": seconds(waits["materializer"]["time"]) * 1000
+        / executed,
     }
 
 
@@ -309,9 +325,10 @@ def table(result: dict) -> str:
         "| callers | completed/s | node | executed | lowerings/cmd | syncs/cmd "
         "| appends/cmd | commits/cmd | busy ms/cmd | first three quarters "
         "| last quarter | ratio | busy | domain CPU ms/cmd | process CPU ms/cmd "
+        "| appender wait ms/cmd | materializer wait ms/cmd "
         "| re-sends/cmd | duplicate votes/cmd |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- "
-        "| --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for run in result["runs"]:
         rate = run.get("completed_per_second")
@@ -330,6 +347,8 @@ def table(result: dict) -> str:
                 f"| {v['tail_busy_ms_per_command']:.2f} | {ratio} | {busy} "
                 f"| {per_command_or_dash(v, 'domain_cpu_ms_per_command')} "
                 f"| {per_command_or_dash(v, 'process_cpu_ms_per_command')} "
+                f"| {per_command_or_dash(v, 'appender_wait_ms_per_command')} "
+                f"| {per_command_or_dash(v, 'materializer_wait_ms_per_command')} "
                 f"| {per_command_or_dash(v, 'resent_per_command')} "
                 f"| {per_command_or_dash(v, 'duplicate_votes_per_command')} |"
             )

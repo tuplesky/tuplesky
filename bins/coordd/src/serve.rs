@@ -973,6 +973,13 @@ pub struct Domain<P: Persistence> {
     /// commit finishes (task-d52), so the loop takes it back and releases
     /// what waited on it. `None` where commits run on this thread.
     materialized: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Where the loop's blocking takes from the appender's and the
+    /// materializer's threads are counted (task-d54), in that order.
+    /// `None` where neither thread runs.
+    pipeline_waits: Option<(
+        std::sync::Arc<coord_storage::Waits>,
+        std::sync::Arc<coord_storage::Waits>,
+    )>,
     /// What reads the leader read barrier did not serve came to, waiting
     /// for a turn that can send it (task-d50).
     read_orders: Vec<coord_collector::Action>,
@@ -1486,6 +1493,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             recorder,
             pacing: Pacing::default(),
             materialized: None,
+            pipeline_waits: None,
             read_orders: Vec::new(),
         }
     }
@@ -1501,6 +1509,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self
     }
 
+    /// Report the loop's blocking takes from the voter's appender and
+    /// materializer threads in its cost (task-d54).
+    #[must_use]
+    pub fn count_pipeline_waits(
+        mut self,
+        appender: std::sync::Arc<coord_storage::Waits>,
+        materializer: std::sync::Arc<coord_storage::Waits>,
+    ) -> Self {
+        self.pipeline_waits = Some((appender, materializer));
+        self
+    }
+
     /// Print a snapshot every `every` while serving, for `roles`
     /// (task-d45). Without it the only snapshots are the ones at start
     /// and at a clean end, and a killed daemon's log has neither.
@@ -1513,7 +1533,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// What this voter's work has cost since the loop started, with the
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
-        use coord_daemon::metrics::{Cost, Cpu, Interval, Measure, Unavailable};
+        use coord_daemon::metrics::{
+            Cost, Cpu, Interval, Measure, PipelineWaits, Unavailable, Wait,
+        };
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
             // cost this reports is a voter's: per command it executed in
@@ -1562,6 +1584,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
             cpu,
+            waits: self.pipeline_waits.as_ref().map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                |(appender, materializer)| {
+                    let wait = |waits: &coord_storage::Waits| {
+                        let (count, time) = waits.read();
+                        Wait { count, time }
+                    };
+                    Measure::Observed(PipelineWaits {
+                        appender: wait(appender),
+                        materializer: wait(materializer),
+                    })
+                },
+            ),
         })
     }
 

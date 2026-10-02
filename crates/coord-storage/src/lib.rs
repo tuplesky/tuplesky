@@ -132,7 +132,7 @@ pub use materialize::{
 pub use persistence::{JournaledDomain, Lowered, Persistence, Refused, StorageCost};
 pub use pipeline::{
     ManualAppendHandle, ManualAppender, ManualHandle, ManualMaterializer, ThreadAppender,
-    ThreadMaterializer, Waker,
+    ThreadMaterializer, Waits, Waker,
 };
 pub use retry::{Admission, Resolution, RetryBinding};
 pub use speculate::{Overlay, SpeculationLimits, SpeculationRefused, speculable, speculate};

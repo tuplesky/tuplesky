@@ -9352,6 +9352,13 @@ append does. That code is the same `complete_group` both paths call.
 - **A take-back is never dropped.** When sealing the next group fails
   after an append was taken back, what the append made durable goes to
   the next report, as any other stage's failure leaves it.
+- **The loop's waits are counted.** `ThreadAppender` and
+  `ThreadMaterializer` count a take that found the job still running,
+  and the time it blocked, in a shared `Waits`. The `metrics` line's
+  `cost.waits` reports both, so busy time less the loop's CPU time is
+  read as waits on the pipeline threads and whatever else blocked the
+  loop, rather than assumed to be syncs. The manual pipelines the tests
+  drive never block, and the store itself reads no clock.
 - **Nothing is owed while an append is out.** `Voter::owes_flush` does
   not count batches queued behind one, since a flush then moves nothing.
   `Node::lower_queued` stops when a lowering moves nothing.

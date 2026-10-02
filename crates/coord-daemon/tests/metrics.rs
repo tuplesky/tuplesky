@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use coord_daemon::metrics::{
     Cost, Cpu, Durability, Frontiers, Headroom, Interval, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Reads, Recorder, Resends, ShardIndex,
-    ShardReading, Stage, StageReading, Unavailable,
+    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder, Resends,
+    ShardIndex, ShardReading, Stage, StageReading, Unavailable, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -365,6 +365,16 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             cpu: Measure::Observed(Cpu {
                 domain: Duration::from_secs(25),
                 process: Duration::from_secs(70),
+            }),
+            waits: Measure::Observed(PipelineWaits {
+                appender: Wait {
+                    count: 9,
+                    time: Duration::from_millis(40),
+                },
+                materializer: Wait {
+                    count: 3,
+                    time: Duration::from_millis(12),
+                },
             }),
         }),
     };
