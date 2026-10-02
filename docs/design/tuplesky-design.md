@@ -102,7 +102,7 @@ Initially every replicated command in a domain conflicts with every other comman
 
 Revision allocation is part of deterministic application of the established command, not a separate WAN round trip. Moving it into Kine would merely move the ordering problem. Optimize single-command conditional operations, pipelining, bounded batching and later certified read barriers against the conservative implementation. Any finer conflict predicate needs a separate correctness review.
 
-A future revision-free native profile could expose per-object versions and dependency-aware cursors, but it would have a different contract. Do not claim transparent mapping into one Kine revision history without additional ordering. Measure fast-path rate for concurrent disjoint-key writers as well as hot keys. QUIC stream independence removes transport ordering constraints, not semantic dependencies.
+A future revision-free native profile could expose per-object versions and dependency-aware cursors, but it would have a different contract. Do not claim transparent mapping into one Kine revision history without additional ordering. Measure fast-path rate for concurrent disjoint-key writers as well as hot keys. Measured at the leader before task-d50, the share of commands learned on the fast path was 56% with one caller, 6% with ten and 2% with fifty. Under the conservative key a follower's path is its own arrival order, and concurrent collectors make the orders differ. The conservative key stays. The fast path pays at low concurrency, and a finer conflict predicate is the separate review above, not a throughput task. Reads served by the leader read barrier leave the chain, which leaves fewer commands in it to conflict. QUIC stream independence removes transport ordering constraints, not semantic dependencies.
 
 <a id="s2-3"></a>
 ### 2.3 Identities and counters
@@ -298,6 +298,8 @@ Membership epoch is an evidence/envelope context, not a reason to change the log
 ### 4.5 Speculation and side effects
 
 Tentative execution uses a copy-on-write overlay over committed state and may calculate responses, candidate revisions and authorization. It cannot publish events, sign usable sessions, issue node credentials, invoke external services or modify committed materialization. Discard superseded overlays. Established outcomes must be reproducible from recovered durable history.
+
+`coordd` does not drive speculation (task-d50). A speculative release still waits until the command and its whole prefix are learned. It would save only the execution after learning, not the journal sync or the round trips before it. Reads take the leader read barrier instead (Section 6.3).
 
 Large speculative results may use the ordinary finalized-execution path; label its latency. An established speculative response can precede materialization only when the complete learning predicate determines command, predecessor order, authorization and exact result durably. No extra volatile COMMIT broadcast is assumed to have reached a quorum.
 
@@ -572,7 +574,25 @@ Lease administration, reads and policy/session updates advance execution without
 <a id="s6-3"></a>
 ### 6.3 Reads and pagination
 
-Initially a complete current read is an ordered command. Local leader belief, heartbeat success and application leases are not current-read authority. The later ReadFence path in Section 6.9 establishes a request-bound execution point and checks applied state and authorization.
+A complete current read is served by the leader read barrier, or as an ordered command. The ordered command stays available, and it is the fallback for every case the barrier does not serve. Local leader belief, heartbeat success and application leases are not current-read authority. A confirmation round started after the read arrived is (task-d50). The later ReadFence path in Section 6.9 establishes a request-bound execution point for an observer, and checks applied state and authorization.
+
+The leader read barrier serves a Range without an explicit revision:
+
+1. **Routing.** The frontend sends the read to the leader of the ballot it follows (`ReadV1`, below). A frontend that follows no voter's ballot sends it as an ordered command.
+2. **Read index.** When the read arrives, the leader records its read index: the next sequence number of its ballot. A leader that has proposed nothing in its ballot, or is not leading, refuses.
+3. **Confirmation.** The leader asks every voter whether its promise is still the leader's ballot. The round is started after the read arrived, and one round answers every read that arrived before it started. The round confirms once a slow quorum, the leader included, answers yes. A voter answers yes only while its promise is that ballot with no higher promise in flight.
+4. **Execution point.** The leader waits until every proposal of its ballot below the read index is executed, and until its projection has materialized through the position it had executed when that held.
+5. **Evaluation.** The leader plans the read with the ordinary planner over one gated snapshot at or past that position. It answers with the same response bytes the ordered path would record. The frontend's output gate authorizes them as it authorizes any read output.
+
+A leader that is deposed, a round that does not confirm in time, a deadline, or a view the planner refuses each return the request to the ordered path. The answer is never a weaker one.
+
+Why the barrier is linearizable. Let W be a command whose response completed before the read R reached the leader, and let b be the leader's ballot. R must read a state in which W is executed.
+
+- **W was learned in ballot b.** Every command of b is proposed by its leader: a slow decision needs the leader's sequence number, and a fast one needs a fast quorum on the leader's path. W was proposed before it completed, so its sequence number is below R's read index, and R waits for it to execute.
+- **W was learned in an earlier ballot.** The dependency chain is total (task-d06), and recovery puts every command learned earlier ahead of the ballot's first proposal. A read index above zero makes R wait for at least one proposal of b, and so for W.
+- **W was learned in a higher ballot b'.** A quorum promised b' before W completed, so before R arrived. R's round started after that, and its quorum intersects that one in a voter whose promise is already b', which never answers yes for b.
+
+R reads only executed, and so learned, state. A command concurrent with R may or may not be in it, as in any linearizable read. This is the argument Section 6.9.1 asked of a ReadIndex adaptation. Its evidence is task-d50's: a linearizability check of a register history under faults, and the Jepsen client's.
 
 Historical pages hold one logical revision across pages. A future revision is a defined error or bounded wait; missing compacted history returns Compacted. Pagination does not pin a physical snapshot forever. A weaker stale-data read must be explicit and still requires fresh authorization under the strict profile. Stale data never authorizes stale policy decisions.
 
@@ -679,7 +699,7 @@ Use bounded fan-out regional relays, loop-free source choices, health/backoff an
 | Operation | Initial route | Qualified extension |
 |---|---|---|
 | Mutations, CAS, compaction, native renewal | Trusted collector to voters | Same authority with safe pipelining/batching |
-| Current read/CurrentRevision | Authoritative ordered command | Request-bound ReadFence plus observer snapshot |
+| Current read/CurrentRevision | Leader read barrier (Section 6.3), falling back to an authoritative ordered command | Request-bound ReadFence plus observer snapshot |
 | Historical Get/List/Count | Capable observer with required permission/history | Load-aware source selection |
 | Watch/event following | Regional observer/relay with voter-backed fallback | Bounded relay trees and source failover |
 | Kine TTL expiry | Conditional authoritative command | Never local unconditional delete |
@@ -717,7 +737,7 @@ Neither inspected Backend read signature carries the etcd Serializable flag dire
 
 Historical reads require the observer to have the necessary established execution frontier and retained MVCC, and to return a consistent snapshot including Count, range limits, pagination and keys-only behavior. Its local latest value is not proof of freshness.
 
-For later current-read offload, submit a real ordered ReadFence after invocation, not an unproved SwiftPaxos adaptation of Raft ReadIndex. Bind origin/domain, execution position, KV revision, invocation, range/options/scope, authorization decision and schema. Wait for that execution frontier, then read the certified snapshot revision. Pin needed history for a bounded request or fail/reissue an authoritative fence if compacted. Do not return newer data with an older header. Policy state is ordered by execution even when KV revision did not advance.
+For later current-read offload to an observer, submit a real ordered ReadFence after invocation. The leader read barrier of Section 6.3 is the SwiftPaxos adaptation of Raft ReadIndex, with its argument there and its own evidence (task-d50). It serves at the leader only, and it is no observer's authority. Bind origin/domain, execution position, KV revision, invocation, range/options/scope, authorization decision and schema. Wait for that execution frontier, then read the certified snapshot revision. Pin needed history for a bounded request or fail/reissue an authoritative fence if compacted. Do not return newer data with an older header. Policy state is ordered by execution even when KV revision did not advance.
 
 This retains WAN freshness coordination while moving bulk scan/data serving regionally. Future fence batching needs a precise temporal cut; an old fence cannot serve a later invocation. The initial full ordered-read path remains available.
 
