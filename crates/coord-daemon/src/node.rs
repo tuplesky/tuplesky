@@ -29,6 +29,8 @@
 //! the trusted collector, timers and entropy to the runtime that owns
 //! real time and real randomness.
 
+use std::collections::VecDeque;
+
 use coord_collector::frontend_frame;
 use coord_consensus::{AppliedOutcome, Follower, Leader, PayloadRecordV1, SyncDecision};
 use coord_core::effect::{Effect, PeerId, PersistBatch, TimerId};
@@ -38,7 +40,7 @@ use coord_core::outbox::{Outbox, PendingSend};
 use coord_storage::journaled::TransitionKind;
 use coord_storage::{Applier, Persistence, Refused};
 use coord_types::CommandId;
-use coord_types::ids::Ballot;
+use coord_types::ids::{Ballot, ExecutionPosition};
 
 use crate::metrics::{Recorder, Stage};
 
@@ -504,6 +506,10 @@ pub struct Node<P: Persistence> {
     /// What the commands of a staged execution group led to, carried out
     /// once [`Node::finish`] has materialized the group (task-d47).
     staged: Vec<Effect>,
+    /// What groups handed to a pipelined store led to, each held until the
+    /// projection has committed through its position (task-d52), oldest
+    /// first.
+    releases: VecDeque<(ExecutionPosition, Vec<Effect>)>,
 }
 
 /// Most commands one execution group applies before it is lowered
@@ -515,6 +521,12 @@ const GROUP_COMMANDS: usize = 32;
 /// applies more (task-d47): half of `JournalLimits`' default 256 per
 /// domain.
 const GROUP_QUEUE_ROOM: usize = 128;
+
+/// Durable records a pipelined store may owe its projection before
+/// execution waits for the materializer (task-d52): four journal groups.
+/// Past it the learner is held, not dropped: the domain thread drains the
+/// commit out, and the next group is planned over what it committed.
+const PIPELINE_RECORDS: usize = 256;
 
 impl<P: Persistence> Node<P> {
     /// A node over `machine` and `applier`, publishing to `frontend`.
@@ -543,6 +555,7 @@ impl<P: Persistence> Node<P> {
             grouped: false,
             flushing: false,
             staged: Vec::new(),
+            releases: VecDeque::new(),
         }
     }
 
@@ -606,6 +619,15 @@ impl<P: Persistence> Node<P> {
         // to carry out.
         self.unreleased = true;
         let mut out = self.carry_out(next, ballot)?;
+        if self.applier.pipelined() {
+            // The projection follows the journal from the materializer's
+            // thread: what this flush journaled is handed to it, and what
+            // it has committed is released (task-d52).
+            if !self.applier.in_group() {
+                out.absorb(self.settle(ballot)?);
+            }
+            return Ok(out);
+        }
         if self.grouped
             && !self.applier.in_group()
             && self.applier.store().unmaterialized() > 0
@@ -992,6 +1014,12 @@ impl<P: Persistence> Node<P> {
             .encode(),
         ));
         out
+    }
+
+    /// Give the applier back; this node's boot ends where it stands
+    /// (harnesses that end a boot at a chosen point and reopen its store).
+    pub fn into_applier(self) -> Applier<P> {
+        self.applier
     }
 
     /// The applier (watch hub, reader, store).
@@ -1482,7 +1510,7 @@ impl<P: Persistence> Node<P> {
             if grouping {
                 held.extend(effects);
                 if boundary {
-                    out.absorb(self.close_group(&mut held, ballot)?);
+                    out.absorb(self.close_group_waiting(&mut held, ballot)?);
                 }
             } else {
                 out.absorb(self.carry_out(effects, ballot)?);
@@ -1494,9 +1522,126 @@ impl<P: Persistence> Node<P> {
         Ok(out)
     }
 
-    /// Lower the open execution group until it has materialized, then
-    /// carry out what its commands led to (task-d47).
+    /// Close the open execution group and carry out what its commands led
+    /// to once it has materialized (task-d47).
+    ///
+    /// On a pipelined store (task-d52) the group is journaled and its
+    /// projection commit handed to the materializer, and what it led to is
+    /// held until the projection has committed through it
+    /// ([`Node::settle`]). Execution goes on meanwhile, planning over the
+    /// groups in flight. Past `PIPELINE_RECORDS` owed it waits for them.
     fn close_group(
+        &mut self,
+        held: &mut Vec<Effect>,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        if !self.applier.pipelined() {
+            return self.close_group_waiting(held, ballot);
+        }
+        let applier = &mut self.applier;
+        let position = Self::measured(self.recorder.as_deref(), Stage::Journal, || {
+            applier.hand_off_group()
+        })
+        .map_err(Self::group_error)?;
+        let effects = core::mem::take(held);
+        let mut out = match position {
+            Some(position) => {
+                self.releases.push_back((position, effects));
+                Outbound::default()
+            }
+            None if self.releases.is_empty() => self.carry_out(effects, ballot)?,
+            // Nothing of its own in flight, but what it led to still comes
+            // after what the groups before it led to.
+            None => {
+                let last = self.releases.back_mut().expect("checked above");
+                last.1.extend(effects);
+                Outbound::default()
+            }
+        };
+        out.absorb(self.release_through_settled(ballot)?);
+        if self.applier.store().unmaterialized() > PIPELINE_RECORDS {
+            out.absorb(self.drain(ballot)?);
+        }
+        Ok(out)
+    }
+
+    /// Take back what a pipelined store's materializer has committed and
+    /// carry out what the groups it completed led to (task-d52).
+    ///
+    /// The runtime calls this when the materializer says a commit has
+    /// finished, and a flush calls it too. A result, a send or a watch
+    /// event of a group goes out here and never before the projection has
+    /// committed the group: the same rule as a group materialized on this
+    /// thread, kept across the hand-off.
+    pub fn settle(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        if !self.applier.pipelined() {
+            return Ok(Outbound::default());
+        }
+        self.release_through_settled(ballot)
+    }
+
+    /// Wait for every group handed off to materialize, and carry out what
+    /// they led to (task-d52).
+    pub fn drain(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        if !self.applier.pipelined() {
+            return Ok(Outbound::default());
+        }
+        let applier = &mut self.applier;
+        let through = Self::measured(self.recorder.as_deref(), Stage::Materialization, || {
+            applier.drain()
+        })
+        .map_err(Self::group_error)?;
+        self.release_through(through, ballot)
+    }
+
+    /// Groups handed off whose results are still held (task-d52).
+    pub fn awaiting_materialization(&self) -> usize {
+        self.releases.len()
+    }
+
+    fn release_through_settled(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let through = self.applier.settle().map_err(Self::group_error)?;
+        self.release_through(through, ballot)
+    }
+
+    /// Carry out what the groups handed off through `through` led to, in
+    /// the order they were handed off.
+    fn release_through(
+        &mut self,
+        through: ExecutionPosition,
+        ballot: &Ballot,
+    ) -> Result<Outbound, DriveError> {
+        let mut effects = Vec::new();
+        while self
+            .releases
+            .front()
+            .is_some_and(|(position, _)| *position <= through)
+        {
+            let (_, released) = self.releases.pop_front().expect("checked above");
+            effects.extend(released);
+        }
+        // Run even with nothing released: the materializer's facts about
+        // the protocol's batches are this node's to deliver.
+        self.carry_out(effects, ballot)
+    }
+
+    fn group_error(e: coord_storage::ApplyError) -> DriveError {
+        match e {
+            // Its commands were reported applied and their results are
+            // held here, unreleased. The journal is the record, so the
+            // replica restarts from it rather than plan them again.
+            coord_storage::ApplyError::GroupLost => {
+                DriveError::Engine("an execution group was definitely not journaled".into())
+            }
+            other => DriveError::Engine(format!("{other:?}")),
+        }
+    }
+
+    /// Lower the open execution group until it has materialized, then
+    /// carry out what its commands led to (task-d47). On a pipelined
+    /// store what the groups in flight before it led to is carried out
+    /// first.
+    fn close_group_waiting(
         &mut self,
         held: &mut Vec<Effect>,
         ballot: &Ballot,
@@ -1505,17 +1650,15 @@ impl<P: Persistence> Node<P> {
         Self::measured(self.recorder.as_deref(), Stage::Journal, || {
             applier.finish_group()
         })
-        .map_err(|e| match e {
-            // Its commands were reported applied and their results are
-            // held here, unreleased. The journal is the record, so the
-            // replica restarts from it rather than plan them again.
-            coord_storage::ApplyError::GroupLost => {
-                DriveError::Engine("an execution group was definitely not journaled".into())
-            }
-            other => DriveError::Engine(format!("{other:?}")),
-        })?;
+        .map_err(Self::group_error)?;
+        let mut out = Outbound::default();
+        if !self.releases.is_empty() {
+            let through = self.applier.drain().map_err(Self::group_error)?;
+            out.absorb(self.release_through(through, ballot)?);
+        }
         let effects = core::mem::take(held);
-        self.carry_out(effects, ballot)
+        out.absorb(self.carry_out(effects, ballot)?);
+        Ok(out)
     }
 
     /// The driver's account of an apply that failed.

@@ -675,6 +675,13 @@ impl<P: Persistence> Voter<P> {
         self.node.finish(&self.ballot)
     }
 
+    /// Take back what a pipelined store's materializer has committed and
+    /// hand out what it released (task-d52, [`Node::settle`]). The runtime
+    /// calls this when the materializer's waker fires.
+    pub fn settle(&mut self) -> Result<Outbound, DriveError> {
+        self.node.settle(&self.ballot)
+    }
+
     /// Whether [`Voter::flush`] has anything to do: batches queued, or a
     /// command to apply.
     pub fn owes_flush(&self) -> bool {

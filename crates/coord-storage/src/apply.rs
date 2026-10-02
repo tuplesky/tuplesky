@@ -25,7 +25,7 @@ use coord_types::ids::{KvRevision, NamespaceId};
 use coord_types::logical_v1::{CanonicalOperation, LogicalRequest};
 use coord_types::{CommandId, RetryKey};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use coord_core::effect::BarrierId;
@@ -161,6 +161,20 @@ pub struct Applier<P: Persistence> {
     /// The commands applied since [`Applier::begin_group`] whose batches
     /// have not materialized yet (task-d47).
     group: Option<Group>,
+    /// Groups handed to a pipelined store and not yet known to have
+    /// materialized (task-d52), oldest first.
+    inflight: VecDeque<InFlight>,
+}
+
+/// A group handed off to a pipelined store's materializer (task-d52).
+struct InFlight {
+    /// The position of the group's last command: the group has
+    /// materialized once the projection has committed through it.
+    position: coord_types::ids::ExecutionPosition,
+    /// The rows the group's own batches write.
+    own: Arc<CutOverlay>,
+    /// Watch publications owed once it has materialized, in order.
+    publications: Vec<Publication>,
 }
 
 /// Commands applied as one group: planned one after another, each over
@@ -168,8 +182,13 @@ pub struct Applier<P: Persistence> {
 #[derive(Default)]
 struct Group {
     /// Every row the group's batches write, in order, a later write of a
-    /// key winning: what a command planned after them reads through.
+    /// key winning: what a command planned after them reads through. On
+    /// a pipelined store it starts from the rows of the groups still in
+    /// flight (task-d52).
     overlay: Arc<CutOverlay>,
+    /// The rows the group's own batches write, without those of the
+    /// groups in flight before it (task-d52).
+    own: Arc<CutOverlay>,
     /// Barriers of the group's batches.
     barriers: BTreeSet<BarrierId>,
     /// The application the group's last batch completes. The journal
@@ -237,6 +256,7 @@ impl<P: Persistence> Applier<P> {
             foreign: Vec::new(),
             sharing: false,
             group: None,
+            inflight: VecDeque::new(),
         })
     }
 
@@ -300,7 +320,20 @@ impl<P: Persistence> Applier<P> {
     /// Returns whether commands are now being grouped.
     pub fn begin_group(&mut self) -> bool {
         if self.group.is_none() && self.store.chains_applications() {
-            self.group = Some(Group::default());
+            let mut group = Group::default();
+            // The projection may not hold the groups still in flight yet,
+            // so a command planned now reads through their rows as well,
+            // oldest first. A snapshot that already holds some of them
+            // reads the same: those rows are the ones it holds, and every
+            // later write is laid over them again.
+            if !self.inflight.is_empty() {
+                let mut overlay = CutOverlay::new();
+                for flight in &self.inflight {
+                    overlay.absorb(&flight.own);
+                }
+                group.overlay = Arc::new(overlay);
+            }
+            self.group = Some(group);
         }
         self.group.is_some()
     }
@@ -369,6 +402,14 @@ impl<P: Persistence> Applier<P> {
                 )));
             }
         }
+        // Groups handed off before this one have materialized with it
+        // (a pipelined store's lowering takes its commits back first), and
+        // their revisions go out before this group's (task-d52).
+        if !self.inflight.is_empty() {
+            let drained = self.store.drain()?;
+            self.take_lowered(drained, &group.barriers)?;
+            self.publish_materialized()?;
+        }
         for publication in group.publications {
             match publication {
                 Publication::Events {
@@ -377,6 +418,174 @@ impl<P: Persistence> Applier<P> {
                     events,
                 } => self.publish(namespace, revision, &events)?,
                 Publication::Through(revision) => self.publish_through(revision)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the store's projection commits leave this thread
+    /// (task-d52, [`Persistence::pipelined`]).
+    pub fn pipelined(&self) -> bool {
+        self.store.pipelined()
+    }
+
+    /// Groups handed off and not yet known to have materialized.
+    pub fn in_flight(&self) -> usize {
+        self.inflight.len()
+    }
+
+    /// Journal the open group and hand its projection commit to the
+    /// pipelined store's materializer, without waiting for it (task-d52).
+    ///
+    /// Returns the execution position the projection must commit before
+    /// what the group's commands led to may be disclosed: the group's
+    /// last command, or, for a group that submitted nothing, the last of
+    /// the groups still in flight. `None` when nothing is owed. Its watch
+    /// publications are held to the same position, and go out from
+    /// [`Applier::settle`].
+    ///
+    /// A store that is not pipelined materializes the group here, as
+    /// [`Applier::finish_group`] does, and returns `None`.
+    pub fn hand_off_group(
+        &mut self,
+    ) -> Result<Option<coord_types::ids::ExecutionPosition>, ApplyError> {
+        if !self.store.pipelined() {
+            self.finish_group()?;
+            return Ok(None);
+        }
+        let Some(group) = self.group.take() else {
+            return Ok(None);
+        };
+        let Some(last) = group.last else {
+            // Nothing of its own to materialize; what it publishes may
+            // still name a revision a group in flight wrote.
+            if let Some(flight) = self.inflight.back_mut() {
+                flight.publications.extend(group.publications);
+                return Ok(Some(flight.position));
+            }
+            self.publish_now(group.publications)?;
+            return Ok(None);
+        };
+        // A flush journals a staged group with the protocol's batches;
+        // a group closed between flushes is journaled here. One append
+        // takes what fits a journal group, so this goes on until the
+        // queue is empty or an append moves nothing.
+        let mut attempts = self.store.queued() + 1;
+        while self.store.queued() > 0 && attempts > 0 {
+            let before = self.store.queued();
+            let journaled = self.store.journal()?;
+            self.take_lowered(journaled, &group.barriers)?;
+            if self.store.queued() >= before {
+                break;
+            }
+            attempts -= 1;
+        }
+        self.inflight.push_back(InFlight {
+            position: last.position,
+            own: group.own,
+            publications: group.publications,
+        });
+        let handed = self.store.hand_off()?;
+        self.take_lowered(handed, &group.barriers)?;
+        self.publish_materialized()?;
+        Ok(Some(last.position))
+    }
+
+    /// Take back the projection commits a pipelined store's materializer
+    /// has finished, without waiting, hand it the next, and publish the
+    /// revisions of every group that has now materialized (task-d52).
+    ///
+    /// Returns the execution position the projection has committed:
+    /// whatever was held to a position at or below it may go out.
+    pub fn settle(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        if self.store.pipelined() {
+            let handed = self.store.hand_off()?;
+            self.take_lowered(handed, &BTreeSet::new())?;
+        }
+        self.publish_materialized()
+    }
+
+    /// Wait until every group handed off has materialized (task-d52):
+    /// the projection commit out is waited for, and what was journaled
+    /// meanwhile is committed after it.
+    pub fn drain(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        if self.store.pipelined() {
+            for _ in 0..GROUP_LOWERINGS {
+                let drained = self.store.drain()?;
+                self.take_lowered(drained, &BTreeSet::new())?;
+                if self.store.unmaterialized() == 0 {
+                    break;
+                }
+                let handed = self.store.hand_off()?;
+                self.take_lowered(handed, &BTreeSet::new())?;
+            }
+        }
+        let through = self.publish_materialized()?;
+        if let Some(flight) = self.inflight.front() {
+            return Err(ApplyError::Engine(EngineError::new(
+                coord_store_api::engine::ErrorClass::Busy,
+                format!(
+                    "a group handed off at position {:?} did not materialize while draining",
+                    flight.position
+                ),
+            )));
+        }
+        Ok(through)
+    }
+
+    /// Publish the revisions of the groups in flight that the projection
+    /// has now committed, oldest first, and forget those groups. Returns
+    /// the position it has committed through.
+    fn publish_materialized(&mut self) -> Result<coord_types::ids::ExecutionPosition, ApplyError> {
+        let through = self.store.materialized_through()?;
+        while self
+            .inflight
+            .front()
+            .is_some_and(|flight| flight.position <= through)
+        {
+            let flight = self.inflight.pop_front().expect("checked above");
+            self.publish_now(flight.publications)?;
+        }
+        Ok(through)
+    }
+
+    /// Hand the facts a lowering produced for other batches on, settle an
+    /// outcome in doubt, and refuse one that lost a batch of `barriers`.
+    fn take_lowered(
+        &mut self,
+        lowered: crate::persistence::Lowered,
+        barriers: &BTreeSet<BarrierId>,
+    ) -> Result<(), ApplyError> {
+        let group_lost = lowered.events.iter().any(|e| lost(e, barriers));
+        if self.sharing {
+            self.foreign.extend(lowered.events);
+        }
+        if group_lost {
+            return Err(ApplyError::GroupLost);
+        }
+        if lowered.indeterminate {
+            let settled = self.store.reconcile()?;
+            let group_lost = settled.events.iter().any(|e| lost(e, barriers));
+            if self.sharing {
+                self.foreign.extend(settled.events);
+            }
+            if group_lost {
+                return Err(ApplyError::GroupLost);
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish revisions that have materialized, in order.
+    fn publish_now(&mut self, publications: Vec<Publication>) -> Result<(), ApplyError> {
+        for publication in publications {
+            match publication {
+                Publication::Events {
+                    namespace,
+                    revision,
+                    events,
+                } => self.publish_to_hub(namespace, revision, &events)?,
+                Publication::Through(revision) => self.publish_stored_through(revision)?,
             }
         }
         Ok(())
@@ -470,6 +679,7 @@ impl<P: Persistence> Applier<P> {
             Submitted::Accepted => {
                 let group = self.group.as_mut().expect("checked above");
                 Arc::make_mut(&mut group.overlay).extend(&updates);
+                Arc::make_mut(&mut group.own).extend(&updates);
                 group.barriers.insert(barrier);
                 group.last = Some(pending);
                 Ok(ApplyOutcome::Applied(Vec::new()))
@@ -487,14 +697,30 @@ impl<P: Persistence> Applier<P> {
         revision: KvRevision,
         events: &[KvEvent],
     ) -> Result<(), ApplyError> {
+        let publication = Publication::Events {
+            namespace,
+            revision,
+            events: events.to_vec(),
+        };
         if let Some(group) = self.group.as_mut() {
-            group.publications.push(Publication::Events {
-                namespace,
-                revision,
-                events: events.to_vec(),
-            });
+            group.publications.push(publication);
             return Ok(());
         }
+        // Behind a group in flight, whose revisions come first (task-d52).
+        if let Some(flight) = self.inflight.back_mut() {
+            flight.publications.push(publication);
+            return Ok(());
+        }
+        self.publish_to_hub(namespace, revision, events)
+    }
+
+    /// Announce a materialized revision to watches now.
+    fn publish_to_hub(
+        &mut self,
+        namespace: NamespaceId,
+        revision: KvRevision,
+        events: &[KvEvent],
+    ) -> Result<(), ApplyError> {
         match self.hub.publish(namespace, revision, events) {
             Ok(()) => Ok(()),
             // The hub is behind, because an earlier revision was
@@ -502,7 +728,7 @@ impl<P: Persistence> Applier<P> {
             // Replay the durable events of everything it missed; a gap is
             // never left behind, since every later publication would be
             // refused.
-            Err(PublishError::Gap { .. }) => self.publish_through(revision),
+            Err(PublishError::Gap { .. }) => self.publish_stored_through(revision),
             Err(e) => Err(ApplyError::Publish(e)),
         }
     }
@@ -543,6 +769,11 @@ impl<P: Persistence> Applier<P> {
         command: CommandId,
         payload: &PayloadRecordV1,
     ) -> Result<AppliedOutcome, ApplyError> {
+        // Outside a group a command is planned over the projection alone,
+        // so whatever a pipelined store still has in flight lands first.
+        if self.group.is_none() && !self.inflight.is_empty() {
+            self.drain()?;
+        }
         let request: LogicalRequest =
             postcard::from_bytes(&payload.logical).map_err(|_| ApplyError::MalformedPayload)?;
         let actual = CommandId::derive(&payload.retry_key, &request)
@@ -989,6 +1220,15 @@ impl<P: Persistence> Applier<P> {
             group.publications.push(Publication::Through(through));
             return Ok(());
         }
+        if let Some(flight) = self.inflight.back_mut() {
+            flight.publications.push(Publication::Through(through));
+            return Ok(());
+        }
+        self.publish_stored_through(through)
+    }
+
+    /// [`Applier::publish_through`] now, from what storage holds.
+    fn publish_stored_through(&mut self, through: KvRevision) -> Result<(), ApplyError> {
         loop {
             let published = self.hub.published();
             if published >= through {

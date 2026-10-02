@@ -829,6 +829,15 @@ pub async fn first_leaf_expired(
         .unwrap_or(Principal::Node)
 }
 
+/// Resolves when `materialized` is notified; never, without one
+/// (task-d52).
+async fn notified(materialized: Option<&tokio::sync::Notify>) {
+    match materialized {
+        Some(notify) => notify.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// A renewal attempt that ended, and which of `renewals` it was; or
 /// nothing for ever while none is out -- a `select!` arm that resolved at
 /// once would spin the loop.
@@ -946,6 +955,10 @@ pub struct Domain<P: Persistence> {
     /// How long this loop has waited, and when it next prints a
     /// snapshot (task-d45).
     pacing: Pacing,
+    /// Notified by the voter's materializer thread each time a projection
+    /// commit finishes (task-d52), so the loop takes it back and releases
+    /// what waited on it. `None` where commits run on this thread.
+    materialized: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// Dials out after the first ones, one task each (task-d03). A dial is
     /// mostly waiting -- an absent voter costs a whole handshake timeout
     /// -- so it runs beside the loop rather than inside it, and ends with
@@ -1437,7 +1450,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             budgets,
             recorder,
             pacing: Pacing::default(),
+            materialized: None,
         }
+    }
+
+    /// Wake when `materialized` is notified, and take back what the
+    /// voter's materializer committed (task-d52).
+    #[must_use]
+    pub fn wake_on_materialized(
+        mut self,
+        materialized: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.materialized = Some(materialized);
+        self
     }
 
     /// Print a snapshot every `every` while serving, for `roles`
@@ -1801,6 +1826,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // domain progress.
             let api_first = poll_api_first(self.peer_streak);
             let owes_flush = matches!(&self.backing, Backing::Voting(v) if v.owes_flush());
+            let materialized = self.materialized.clone();
             // Waiting from here: the select below returns at once when
             // there is work, and otherwise this is the loop's idle time.
             self.pacing.wait();
@@ -1813,6 +1839,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     // voter that cannot progress waits rather than
                     // spins.
                     () = std::future::ready(()), if progressed => continue,
+                    // A projection commit has finished: what waited on it
+                    // -- a group's results and watch events -- goes out,
+                    // and the materializer gets the next (task-d52).
+                    () = notified(materialized.as_deref()) => {
+                        self.pacing.woke();
+                        if self.stops_on_settle(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     event = transport.next_event() => event.map(Arrived::Api),
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
@@ -1844,6 +1880,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 tokio::select! {
                     biased;
                     () = std::future::ready(()), if progressed => continue,
+                    // A projection commit has finished: what waited on it
+                    // -- a group's results and watch events -- goes out,
+                    // and the materializer gets the next (task-d52).
+                    () = notified(materialized.as_deref()) => {
+                        self.pacing.woke();
+                        if self.stops_on_settle(transport) {
+                            return;
+                        }
+                        continue;
+                    }
                     () = tokio::time::sleep(PAYLOAD_RETRY), if waiting_for_content => continue,
                     peer = next_peer_event(self.plane.as_mut()) => peer.map(Arrived::Peer),
                     event = transport.next_event() => event.map(Arrived::Api),
@@ -2366,6 +2412,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         };
         let finished = voter.finish();
         self.stops_on(api, finished)
+    }
+
+    /// Take back what the voter's materializer committed and send what
+    /// that released (task-d52). Returns whether the voter must stop.
+    fn stops_on_settle(&mut self, api: &Transport) -> bool {
+        let Backing::Voting(voter) = &mut self.backing else {
+            return false;
+        };
+        let settled = voter.settle();
+        self.stops_on(api, settled)
     }
 
     /// Send one step of a flush's output, or report why the voter stops.

@@ -105,6 +105,7 @@ pub mod journaled;
 pub mod lowering;
 pub mod materialize;
 pub mod persistence;
+pub mod pipeline;
 pub mod policy;
 pub mod protocol;
 pub mod retry;
@@ -120,7 +121,8 @@ pub use compaction::{GcBudget, GcPlan, HoldGuard, RetentionHolds, plan_gc};
 pub use cut::{CutOverlay, RecoveryCut};
 pub use journaled::{
     CutError, DomainStatus, FlushReport, JournalLimits, JournaledError, JournaledStore,
-    LoweringCost, Published, Submission, SubmitRefused, TransitionKind,
+    LoweringCost, MaterializeDone, MaterializeJob, Materializer, Published, Submission,
+    SubmitRefused, TransitionKind,
 };
 pub use lowering::{GroupDigest, batch_digest};
 pub use materialize::{
@@ -128,6 +130,7 @@ pub use materialize::{
     prepare, submit,
 };
 pub use persistence::{JournaledDomain, Lowered, Persistence, Refused, StorageCost};
+pub use pipeline::{ManualHandle, ManualMaterializer, ThreadMaterializer, Waker};
 pub use retry::{Admission, Resolution, RetryBinding};
 pub use speculate::{Overlay, SpeculationLimits, SpeculationRefused, speculable, speculate};
 pub use view::{GatedReader, GatedView, ViewError};
