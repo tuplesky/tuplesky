@@ -522,6 +522,19 @@ pub struct Node<P: Persistence> {
     /// What this replica's re-sends did, over every ballot it led since
     /// boot (task-d49).
     resends: coord_consensus::ResendCounts,
+    /// Commands this replica established, by the path that decided them
+    /// (task-d50).
+    pub established: Established,
+}
+
+/// Commands a replica established since boot, by the learning path that
+/// decided them (task-d50).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Established {
+    /// Decided by a fast quorum's matching dependency paths.
+    pub fast: u64,
+    /// Decided by a majority of adoptions.
+    pub slow: u64,
 }
 
 /// Most commands one execution group applies before it is lowered
@@ -569,6 +582,7 @@ impl<P: Persistence> Node<P> {
             staged: Vec::new(),
             releases: VecDeque::new(),
             resends: coord_consensus::ResendCounts::default(),
+            established: Established::default(),
         }
     }
 
@@ -1226,7 +1240,13 @@ impl<P: Persistence> Node<P> {
                 // the release, which carries the response; publishing the
                 // establishment too would disclose an outcome before the
                 // release rule had admitted it.
-                Effect::Established(_) => {}
+                Effect::Established(result) => {
+                    if result.fast_path() {
+                        self.established.fast += 1;
+                    } else {
+                        self.established.slow += 1;
+                    }
+                }
                 Effect::Released(_) => unreachable!("routed to the collector above"),
                 #[expect(
                     unreachable_patterns,

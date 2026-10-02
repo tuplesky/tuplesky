@@ -1511,6 +1511,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             uptime: now.saturating_duration_since(self.started),
             recent,
             resends: resends(&voter.resend_counts()),
+            established_fast: voter.node().established.fast,
+            established_slow: voter.node().established.slow,
         })
     }
 

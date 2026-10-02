@@ -486,6 +486,10 @@ pub struct Cost {
     /// What this voter's re-sends of proposals did, over every ballot it
     /// led (task-d49). Zero for a voter that never led.
     pub resends: Resends,
+    /// Commands this voter established on the fast path (task-d50).
+    pub established_fast: u64,
+    /// Commands this voter established on the slow path (task-d50).
+    pub established_slow: u64,
 }
 
 /// What a leader's re-sends of proposals did (task-d49), cumulative.

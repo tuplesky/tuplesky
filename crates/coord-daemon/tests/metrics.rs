@@ -350,6 +350,8 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
                 duplicate_votes: 1,
                 ..Resends::default()
             },
+            established_fast: 40,
+            established_slow: 1160,
         }),
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");

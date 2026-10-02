@@ -103,7 +103,17 @@ def per_command(node: str, snapshot: dict) -> dict:
         "busy_ms_per_command": busy * 1000 / executed,
         "busy_fraction": busy / uptime if uptime > 0 else None,
         **resends_of(cost, executed),
+        **paths_of(cost),
     }
+
+
+def paths_of(cost: dict) -> dict:
+    """The share of the commands a voter established that the fast path
+    decided (task-d50). Empty for a binary older than the counts."""
+    fast, slow = cost.get("established_fast"), cost.get("established_slow")
+    if fast is None or slow is None or fast + slow == 0:
+        return {}
+    return {"fast_path_share": fast / (fast + slow)}
 
 
 def resends_of(cost: dict, executed: int) -> dict:
