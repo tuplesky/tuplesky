@@ -418,7 +418,10 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   commands it established that it established on the fast path
   (task-d50's counters). A leader's loop near
   100% is the limit on throughput; well below it, the limit is elsewhere,
-  such as the runner's CPU. When a voter's read barrier answered or
+  such as the runner's CPU. When voters report CPU time (task-d54), two
+  more columns give the CPU per executed command of the loop's own thread
+  and of the whole process; busy less the loop's CPU is mostly the loop
+  waiting on syncs. When a voter's read barrier answered or
   refused reads as leader (task-d50), three more columns give the reads
   served, refused, and a served read's mean wait to its answer.
 

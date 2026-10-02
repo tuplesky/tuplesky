@@ -142,6 +142,9 @@ class Cost:
     # (task-d50); both zero before it.
     fast: int = 0
     slow: int = 0
+    # CPU seconds the domain loop's thread and the whole process used
+    # (task-d54); None before it, or where coordd could not read them.
+    cpu: tuple[float, float] | None = None
 
 
 def seconds(d) -> float:
@@ -157,6 +160,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
         return None
     recent = (cost.get("recent") or {}).get("Observed")
     reads = cost.get("reads") or {}
+    cpu = (cost.get("cpu") or {}).get("Observed")
     return Cost(
         executed=cost.get("executed", 0),
         busy=seconds(cost.get("busy")),
@@ -167,6 +171,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
         waited_ms=reads.get("waited_ms", 0),
         fast=cost.get("established_fast", 0),
         slow=cost.get("established_slow", 0),
+        cpu=(seconds(cpu.get("domain")), seconds(cpu.get("process"))) if isinstance(cpu, dict) else None,
     )
 
 
@@ -562,25 +567,34 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
         costs = [(node, v.cost) for node, v in voters.items() if v.cost]
         if costs:
             reads = any(c.served or c.refused for _, c in costs)
+            cpu = any(c.cpu for _, c in costs)
             out.append(
                 "**Domain loop** (each voter's last boot, from the same `metrics` line; busy is time the loop "
                 "spent working rather than waiting for an event, store syncs included; fast path is the share of the "
                 "commands this voter established that it established on the fast path"
+                + ("; CPU is what the loop's own thread and the whole process used, so busy less the loop's CPU is "
+                   "mostly time spent waiting on syncs" if cpu else "")
                 + ("; reads are those its read barrier answered or refused as leader" if reads else "")
                 + ")"
             )
             out.append("")
             head = "| Node | Executed | Busy (s) | Up (s) | Busy | Busy, last interval | Busy per command (ms) | Fast path |"
+            if cpu:
+                head += " Loop CPU per command (ms) | Process CPU per command (ms) |"
             if reads:
                 head += " Reads served | Reads refused | Mean read wait (ms) |"
             out.append(head)
-            out.append("| --- " * (8 + (3 if reads else 0)) + "|")
+            out.append("| --- " * (8 + (2 if cpu else 0) + (3 if reads else 0)) + "|")
             for node, c in costs:
                 share = f"{c.busy / c.uptime:.0%}" if c.uptime > 0 else "-"
                 last = f"{c.recent[0] / c.recent[1]:.0%}" if c.recent and c.recent[1] > 0 else "-"
                 per = f"{c.busy * 1000 / c.executed:.2f}" if c.executed else "-"
                 fast = f"{c.fast / (c.fast + c.slow):.0%} of {c.fast + c.slow}" if c.fast + c.slow else "-"
                 row = f"| {node} | {c.executed} | {c.busy:.1f} | {c.uptime:.1f} | {share} | {last} | {per} | {fast} |"
+                if cpu:
+                    row += "".join(
+                        f" {t * 1000 / c.executed:.2f} |" if c.cpu and c.executed else " - |" for t in (c.cpu or (0, 0))
+                    )
                 if reads:
                     wait = f"{c.waited_ms / c.served:.1f}" if c.served else "-"
                     row += f" {c.served} | {c.refused} | {wait} |"
