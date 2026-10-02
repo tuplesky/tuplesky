@@ -402,7 +402,15 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   a voter Jepsen stopped with `SIGKILL` still shows its counters as of its
   last interval. The counts run from that boot. A `Journal` write is one
   synchronous store write; the raft-engine journal's own sync count
-  (`WriteStats`) is not in that line.
+  (`WriteStats`) is not in that line;
+* and, from the same line, each voter's domain loop: commands executed,
+  the time the loop was busy (working rather than waiting for an event,
+  store syncs included) and up, busy as a share of its uptime and of the
+  last interval, and busy per executed command. A leader's loop near
+  100% is the limit on throughput; well below it, the limit is elsewhere,
+  such as the runner's CPU. When a voter's read barrier answered or
+  refused reads as leader (task-d50), three more columns give the reads
+  served, refused, and a served read's mean wait to its answer.
 
 The last 400 lines of each voter's log follow in the TupleSky job's log.
 

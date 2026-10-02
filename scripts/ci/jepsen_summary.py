@@ -18,7 +18,10 @@ directory (`store/latest`) and writes what a reader looks for first:
   mark the failures seen so far;
 * and the stages each voter timed in its last boot (journal writes,
   materialization, admission), from the last `metrics` line it printed:
-  it prints one on an interval and when it stops cleanly.
+  it prints one on an interval and when it stops cleanly;
+* and, from the same line, how busy each voter's domain loop was: over
+  its boot and over the last interval, per executed command, and what
+  its read barrier served (task-d50).
 
     scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
 
@@ -118,6 +121,47 @@ class Voter:
     # A voter prints it when it stops cleanly, so it covers the boot that
     # ran to the end, and a killed boot has none.
     stages: dict = field(default_factory=dict)
+    # The `cost` reading of the same line (task-d45), or None without one.
+    cost: Cost | None = None
+
+
+@dataclass
+class Cost:
+    executed: int
+    busy: float
+    uptime: float
+    # The last interval's busy and span, in seconds; None in a first
+    # snapshot, which has no interval behind it.
+    recent: tuple[float, float] | None
+    # What the read barrier did (task-d50): served, refused and the
+    # milliseconds served reads waited in all.
+    served: int
+    refused: int
+    waited_ms: int
+
+
+def seconds(d) -> float:
+    return d.get("secs", 0) + d.get("nanos", 0) / 1e9 if isinstance(d, dict) else 0.0
+
+
+def parse_cost(snapshot: dict) -> Cost | None:
+    """The observed `cost` of a coordd metrics snapshot (task-d45), or None
+    when it is absent or `Unavailable`. Its durations are serde's
+    `{"secs", "nanos"}` and `recent` is itself observed or unavailable."""
+    cost = (snapshot.get("cost") or {}).get("Observed")
+    if not isinstance(cost, dict):
+        return None
+    recent = (cost.get("recent") or {}).get("Observed")
+    reads = cost.get("reads") or {}
+    return Cost(
+        executed=cost.get("executed", 0),
+        busy=seconds(cost.get("busy")),
+        uptime=seconds(cost.get("uptime")),
+        recent=(seconds(recent.get("busy")), seconds(recent.get("span"))) if isinstance(recent, dict) else None,
+        served=reads.get("served", 0),
+        refused=reads.get("refused", 0),
+        waited_ms=reads.get("waited_ms", 0),
+    )
 
 
 def parse_stages(snapshot: dict) -> dict:
@@ -125,9 +169,6 @@ def parse_stages(snapshot: dict) -> dict:
     `stages` are `{"stage": name, "metrics": {"Observed": {...}}}` or an
     `Unavailable` reason, and each latency's durations are serde's
     `{"secs", "nanos"}`."""
-
-    def seconds(d) -> float:
-        return d.get("secs", 0) + d.get("nanos", 0) / 1e9 if isinstance(d, dict) else 0.0
 
     out = {}
     for reading in snapshot.get("stages") or []:
@@ -213,7 +254,9 @@ def parse_voter(lines) -> Voter:
     for line in lines:
         if line.startswith("metrics "):
             try:
-                v.stages = parse_stages(json.loads(line[len("metrics "):]))
+                snapshot = json.loads(line[len("metrics "):])
+                v.stages = parse_stages(snapshot)
+                v.cost = parse_cost(snapshot)
             except (ValueError, AttributeError):
                 pass
             continue
@@ -509,6 +552,31 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
                 mean = f"{total / samples * 1000:.2f}" if samples else "-"
                 peak_ms = f"{peak * 1000:.1f}" if samples else "-"
                 out.append(f"| {node} | {name} | {completed} | {refused} | {mean} | {peak_ms} | {total:.1f} |")
+            out.append("")
+        costs = [(node, v.cost) for node, v in voters.items() if v.cost]
+        if costs:
+            reads = any(c.served or c.refused for _, c in costs)
+            out.append(
+                "**Domain loop** (each voter's last boot, from the same `metrics` line; busy is time the loop "
+                "spent working rather than waiting for an event, store syncs included"
+                + ("; reads are those its read barrier answered or refused as leader" if reads else "")
+                + ")"
+            )
+            out.append("")
+            head = "| Node | Executed | Busy (s) | Up (s) | Busy | Busy, last interval | Busy per command (ms) |"
+            if reads:
+                head += " Reads served | Reads refused | Mean read wait (ms) |"
+            out.append(head)
+            out.append("| --- " * (7 + (3 if reads else 0)) + "|")
+            for node, c in costs:
+                share = f"{c.busy / c.uptime:.0%}" if c.uptime > 0 else "-"
+                last = f"{c.recent[0] / c.recent[1]:.0%}" if c.recent and c.recent[1] > 0 else "-"
+                per = f"{c.busy * 1000 / c.executed:.2f}" if c.executed else "-"
+                row = f"| {node} | {c.executed} | {c.busy:.1f} | {c.uptime:.1f} | {share} | {last} | {per} |"
+                if reads:
+                    wait = f"{c.waited_ms / c.served:.1f}" if c.served else "-"
+                    row += f" {c.served} | {c.refused} | {wait} |"
+                out.append(row)
             out.append("")
     return "\n".join(out) + "\n"
 
