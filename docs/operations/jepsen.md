@@ -198,6 +198,10 @@ voters ran the other profile says so above everything else. Under
 `replay` the voters table gains each voter's projection durable frontier
 against what it had applied, from its last `metrics` line, and the Stages
 caption says that a `Materialization` entry is then a working commit.
+"Executed at end" is read from each voter's store after Jepsen killed it,
+so under `replay` it is the projection's last durable commit and can trail
+what the voter executed by up to one cadence; the projection durable
+column is the figure to read.
 etcd's and SwiftPaxos's jobs ignore the input.
 
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
@@ -443,7 +447,10 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   voters report CPU time (task-d54), two more columns give the CPU per
   executed command of the loop's own thread and of the whole process;
   busy less the loop's CPU is time the loop was blocked rather than
-  computing. When a voter's read barrier answered or
+  computing. Where the line counts them (`cost.waits`, task-d54), two more
+  give the time per command the loop blocked taking back a journal append
+  or a projection commit that was still running. When a voter's read
+  barrier answered or
   refused reads as leader (task-d50), three more columns give the reads
   served, refused, and a served read's mean wait to its answer.
 

@@ -159,6 +159,10 @@ class Cost:
     # Synced writes the journal counted (its groups, mapping updates and
     # compactions), or None where it does not count its own.
     syncs: int | None = None
+    # Seconds the loop blocked taking back a journal append and a
+    # projection commit that were still running (task-d54's waits); None
+    # where the line does not count them.
+    waits: tuple[float, float] | None = None
 
 
 def seconds(d) -> float:
@@ -176,6 +180,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
     reads = cost.get("reads") or {}
     cpu = (cost.get("cpu") or {}).get("Observed")
     syncs = (cost.get("journal_syncs") or {}).get("Observed")
+    waits = (cost.get("waits") or {}).get("Observed")
     return Cost(
         executed=cost.get("executed", 0),
         busy=seconds(cost.get("busy")),
@@ -188,6 +193,11 @@ def parse_cost(snapshot: dict) -> Cost | None:
         slow=cost.get("established_slow", 0),
         cpu=(seconds(cpu.get("domain")), seconds(cpu.get("process"))) if isinstance(cpu, dict) else None,
         syncs=syncs if isinstance(syncs, int) else None,
+        waits=(
+            (seconds((waits.get("appender") or {}).get("time")), seconds((waits.get("materializer") or {}).get("time")))
+            if isinstance(waits, dict)
+            else None
+        ),
     )
 
 
@@ -577,7 +587,9 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             "**Voters** (from each `coordd.log`; a refusal counts the highest \"so far\" in each boot"
             + (
                 "; projection durable is, from the voter's last `metrics` line, how far its projection was durable "
-                "against what it had applied: what a crash then would have left it to replay from its journal"
+                "against what it had applied: what a crash then would have left it to replay from its journal; "
+                "executed at end is read from the store after the voter was killed, so under this profile it is the "
+                "projection's last durable commit and can trail the voter by up to one cadence"
                 if replay
                 else ""
             )
@@ -628,6 +640,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             reads = any(c.served or c.refused for _, c in costs)
             cpu = any(c.cpu for _, c in costs)
             syncs = any(c.syncs is not None for _, c in costs)
+            waits = any(c.waits for _, c in costs)
             out.append(
                 "**Domain loop** (each voter's last boot, from the same `metrics` line; busy is time the loop "
                 "spent working rather than waiting for an event, store syncs included; fast path is the share of the "
@@ -635,6 +648,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 + ("; journal syncs are the synced writes the journal counted, per executed command" if syncs else "")
                 + ("; CPU is what the loop's own thread and the whole process used, so busy less the loop's CPU is "
                    "time the loop was blocked rather than computing" if cpu else "")
+                + ("; waits are the time the loop blocked taking back a journal append or a projection commit "
+                   "that was still running" if waits else "")
                 + ("; reads are those its read barrier answered or refused as leader" if reads else "")
                 + ")"
             )
@@ -644,10 +659,12 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 head += " Journal syncs per command |"
             if cpu:
                 head += " Loop CPU per command (ms) | Process CPU per command (ms) |"
+            if waits:
+                head += " Appender wait per command (ms) | Materializer wait per command (ms) |"
             if reads:
                 head += " Reads served | Reads refused | Mean read wait (ms) |"
             out.append(head)
-            out.append("| --- " * (8 + (1 if syncs else 0) + (2 if cpu else 0) + (3 if reads else 0)) + "|")
+            out.append("| --- " * (8 + (1 if syncs else 0) + (2 if cpu else 0) + (2 if waits else 0) + (3 if reads else 0)) + "|")
             for node, c in costs:
                 share = f"{c.busy / c.uptime:.0%}" if c.uptime > 0 else "-"
                 last = f"{c.recent[0] / c.recent[1]:.0%}" if c.recent and c.recent[1] > 0 else "-"
@@ -659,6 +676,10 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 if cpu:
                     row += "".join(
                         f" {t * 1000 / c.executed:.2f} |" if c.cpu and c.executed else " - |" for t in (c.cpu or (0, 0))
+                    )
+                if waits:
+                    row += "".join(
+                        f" {t * 1000 / c.executed:.2f} |" if c.waits and c.executed else " - |" for t in (c.waits or (0, 0))
                     )
                 if reads:
                     wait = f"{c.waited_ms / c.served:.1f}" if c.served else "-"

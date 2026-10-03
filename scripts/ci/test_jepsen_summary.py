@@ -55,7 +55,7 @@ this voter's machine refused: Backpressure (1 so far)
 this voter's machine refused: Promise(CandidateBehind { candidate: ExecutionPosition(1), own: ExecutionPosition(9) }) (1 so far)
 cannot reach a voter on the peer plane: voter 02 Control: 127.0.0.1:7002: Rejected(Transport("connection lost")) (3 so far)
 cannot reach a voter to submit to it: voter 02: 127.0.0.1:7102: Rejected(Timeout) (1 so far)
-metrics {"stages":[{"stage":"Admission","metrics":{"Observed":{"entered":40,"completed":38,"refused":2,"latency":{"count":38,"total":{"secs":0,"nanos":19000000},"max":{"secs":0,"nanos":2000000}}}}},{"stage":"ClientTransit","metrics":{"Unavailable":"NotInstrumented"}},{"stage":"Journal","metrics":{"Observed":{"entered":120,"completed":120,"refused":0,"latency":{"count":120,"total":{"secs":1,"nanos":200000000},"max":{"secs":0,"nanos":45500000}}}}},{"stage":"Materialization","metrics":{"Observed":{"entered":0,"completed":0,"refused":0,"latency":{"count":0,"total":{"secs":0,"nanos":0},"max":{"secs":0,"nanos":0}}}}}],"durability":{"Unavailable":"NotInstrumented"},"cost":{"Observed":{"executed":400,"busy":{"secs":6,"nanos":500000000},"uptime":{"secs":10,"nanos":0},"recent":{"Observed":{"span":{"secs":1,"nanos":0},"busy":{"secs":0,"nanos":900000000},"executed":40}},"established_fast":30,"established_slow":90,"reads":{"served":300,"refused":2,"rounds":290,"confirmed":290,"waited_confirm_ms":600,"waited_index_ms":1500,"waited_ms":2340},"journal_syncs":{"Observed":100},"cpu":{"Observed":{"domain":{"secs":3,"nanos":0},"process":{"secs":8,"nanos":0}}}}}}
+metrics {"stages":[{"stage":"Admission","metrics":{"Observed":{"entered":40,"completed":38,"refused":2,"latency":{"count":38,"total":{"secs":0,"nanos":19000000},"max":{"secs":0,"nanos":2000000}}}}},{"stage":"ClientTransit","metrics":{"Unavailable":"NotInstrumented"}},{"stage":"Journal","metrics":{"Observed":{"entered":120,"completed":120,"refused":0,"latency":{"count":120,"total":{"secs":1,"nanos":200000000},"max":{"secs":0,"nanos":45500000}}}}},{"stage":"Materialization","metrics":{"Observed":{"entered":0,"completed":0,"refused":0,"latency":{"count":0,"total":{"secs":0,"nanos":0},"max":{"secs":0,"nanos":0}}}}}],"durability":{"Unavailable":"NotInstrumented"},"cost":{"Observed":{"executed":400,"busy":{"secs":6,"nanos":500000000},"uptime":{"secs":10,"nanos":0},"recent":{"Observed":{"span":{"secs":1,"nanos":0},"busy":{"secs":0,"nanos":900000000},"executed":40}},"established_fast":30,"established_slow":90,"reads":{"served":300,"refused":2,"rounds":290,"confirmed":290,"waited_confirm_ms":600,"waited_index_ms":1500,"waited_ms":2340},"journal_syncs":{"Observed":100},"waits":{"Observed":{"appender":{"count":20,"time":{"secs":0,"nanos":200000000}},"materializer":{"count":4,"time":{"secs":0,"nanos":40000000}}}},"cpu":{"Observed":{"domain":{"secs":3,"nanos":0},"process":{"secs":8,"nanos":0}}}}}}
 """
 
 
@@ -99,7 +99,7 @@ class ParseTests(unittest.TestCase):
 
     def test_cost_from_the_last_metrics_line(self):
         v = js.parse_voter(VOTER.splitlines(keepends=True))
-        self.assertEqual(v.cost, js.Cost(400, 6.5, 10.0, (0.9, 1.0), 300, 2, 2340, 30, 90, (3.0, 8.0), 100))
+        self.assertEqual(v.cost, js.Cost(400, 6.5, 10.0, (0.9, 1.0), 300, 2, 2340, 30, 90, (3.0, 8.0), 100, (0.2, 0.04)))
         # A first snapshot has no interval, a voter before task-d50 no
         # reads, one before task-d54 no CPU, and an unavailable cost no
         # reading at all.
@@ -197,7 +197,10 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("Reads served | Reads refused | Mean read wait (ms) |", self.text)
         self.assertIn("Loop CPU per command (ms) | Process CPU per command (ms) |", self.text)
         self.assertIn("Journal syncs per command | Loop CPU per command (ms)", self.text)
-        self.assertIn("| n1 | 400 | 6.5 | 10.0 | 65% | 90% | 16.25 | 25% of 120 | 0.25 | 7.50 | 20.00 | 300 | 2 | 7.8 |", self.text)
+        self.assertIn("Process CPU per command (ms) | Appender wait per command (ms) | Materializer wait per command (ms) |", self.text)
+        self.assertIn(
+            "| n1 | 400 | 6.5 | 10.0 | 65% | 90% | 16.25 | 25% of 120 | 0.25 | 7.50 | 20.00 | 0.50 | 0.10 | 300 | 2 | 7.8 |", self.text
+        )
 
     def test_executed_at_end_without_a_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -282,6 +285,7 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("| Executed at end | Projection durable | Last role |", text)
         self.assertIn("| n1 | 1 | 0 | - | 64 of 118 | - |", text)
         self.assertIn("a `Materialization` entry is a working projection commit", text)
+        self.assertIn("so under this profile it is the projection's last durable commit", text)
         self.assertIn("| n1 | Materialization | 5 | 0 | 10.00 | 20.0 | 0.1 |", text)
 
     def test_a_strict_run_has_no_projection_column_or_caption(self):
@@ -289,6 +293,7 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn("dispatched as", text)
         self.assertNotIn("Projection durable", text)
         self.assertNotIn("working projection commit", text)
+        self.assertNotIn("last durable commit", text)
 
     def test_a_run_whose_voters_ran_another_profile_says_so_first(self):
         text = self.summarize(STRICT_VOTER, "replay")
