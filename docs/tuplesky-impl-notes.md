@@ -9488,3 +9488,12 @@ until task-j05's composed matrix.
   task-j05's. SIGKILL under the Jepsen kill nemesis, the boot replay
   time and the 6-node disk rows with the profile on are the #98 owner's
   runs, after #143's fence fix.
+
+## What a publication, a restart and the loop's thread are measured as
+
+task-j06's Jepsen runs at six nodes left three readings missing, and task-d55 adds them.
+
+- **A publication's steps.** Each `checkpoint` line carries `took_ms` and the time of each step in task-j04's order: `export_ms` (pinning the snapshot and producing the image), `write_ms` (the image file and its directory, synced), `drain_ms` (taking back a lent append or projection commit), `sync_ms` (the replay profile's forced durable commit; zero under strict), `append_ms` (the pointer, synced), `retire_ms` (the journal's compaction) and `reclaim_ms`. Under the replay profile the publications took twice the strict profile's time on the domain thread, 818 ms at the longest, and these say which step that was. The `Checkpoint` stage takes each publication as one sample, and a failed one as a refusal. A publication with nothing new to represent is neither.
+- **A restart's replay.** `owed=0` on the `storage` line says the replay was complete, not what it cost. The attach records where the projection was found and the journal's durable head, and the time between them. `coordd` prints `replayed records= from= through= took_ms= attach_ms=` after `storage`. `attach_ms` includes a reinstall from the baseline's image, which `took_ms` does not. The `Recovery` stage takes the replay as its one sample a start, on the startup snapshot and on the serving loop's.
+- **The domain thread's scheduling.** The leader's busy time less its loop CPU was 1.41 ms a command under replay, with no pipeline wait counted. `cost.cpu.domain_scheduling` carries the thread's run-queue time (`schedstat`'s second field) and its voluntary and involuntary context switches (`status`), cumulative like the rest of the cost. Run-queue time is the host's cores; a voluntary switch is a blocking call on the loop's own thread.
+- **The interval a run needs.** `coord-harness provision --checkpoint-after-records N` (or `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`) sets every voter's interval, so one Jepsen run can say how much of the replay profile's tail is the publication before task-d51 moves it.

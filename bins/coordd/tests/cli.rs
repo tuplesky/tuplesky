@@ -3559,6 +3559,25 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
             "the daemon never published a recovery checkpoint\n{}",
             daemon.said()
         );
+        // And it says how long each of its steps took, so a run whose
+        // publications grow shows which step grew (task-d55).
+        let said = daemon.said();
+        let line = said
+            .lines()
+            .find(|line| line.starts_with("checkpoint ") && line.contains("retired=true"))
+            .expect("the publication's line");
+        for phase in [
+            " took_ms=",
+            " export_ms=",
+            " write_ms=",
+            " drain_ms=",
+            " sync_ms=",
+            " append_ms=",
+            " retire_ms=",
+            " reclaim_ms=",
+        ] {
+            assert!(line.contains(phase), "no{phase} in {line}");
+        }
         response_of(&answer)
     };
 
@@ -4557,12 +4576,33 @@ async fn a_node_reports_bounded_secret_free_metrics() {
             .unwrap_or_else(|| panic!("no {name} reading:\n{rendered}"))["metrics"]
             .clone()
     };
-    for recorded in ["Admission", "Journal", "Materialization"] {
+    for recorded in [
+        "Admission",
+        "Journal",
+        "Materialization",
+        "Checkpoint",
+        "Recovery",
+    ] {
         assert!(
             reading(recorded).get("Observed").is_some(),
             "{recorded} is recorded by this daemon but was not observed:\n{rendered}"
         );
     }
+    // The restart replayed its journal before the report, and the report
+    // has that replay as its one recovery sample (task-d55).
+    assert_eq!(
+        reading("Recovery").pointer("/Observed/completed"),
+        Some(&serde_json::json!(1)),
+        "the boot's replay is not the recovery stage's sample:\n{rendered}"
+    );
+    let replay = said
+        .lines()
+        .find(|line| line.starts_with("replayed records="))
+        .unwrap_or_else(|| panic!("the daemon never said what it replayed:\n{said}"));
+    assert!(
+        replay.contains(" took_ms=") && replay.contains(" attach_ms="),
+        "{replay}"
+    );
     for unrecorded in ["FanOut", "ClientTransit", "EvidenceLearning"] {
         assert_eq!(
             reading(unrecorded)

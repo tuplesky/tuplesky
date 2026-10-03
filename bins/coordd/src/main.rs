@@ -487,6 +487,14 @@ fn report_metrics(
     storage: &store::Storage,
     domain: coord_types::ids::DomainId,
 ) {
+    let recorder = serve::recorder(roles.votes());
+    // The boot's replay has happened by now, so the first snapshot has
+    // its one recovery sample (task-d55).
+    if let Some(replayed) = storage.domain.store().replayed(domain) {
+        use coord_daemon::metrics::Stage;
+        recorder.entered(Stage::Recovery);
+        recorder.completed(Stage::Recovery, replayed.took);
+    }
     use coord_daemon::metrics::{
         Frontiers, Lane, LaneReading, Measure, MetricsSnapshot, ShardIndex, ShardReading,
         Unavailable,
@@ -535,7 +543,7 @@ fn report_metrics(
         // Nothing has been recorded before the first turn, but which
         // stages this daemon records is already known, and the ones it
         // does not are stated as such rather than as zeroes.
-        stages: serve::recorder(roles.votes()).snapshot_stages(roles),
+        stages: recorder.snapshot_stages(roles),
         lanes,
         shards,
         durability: Measure::Unavailable(Unavailable::NotInstrumented),
@@ -989,6 +997,7 @@ fn main() -> ExitCode {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
+    let attaching = std::time::Instant::now();
     let storage = match opened.attach() {
         Ok(s) => s,
         Err(e) => {
@@ -1017,6 +1026,22 @@ fn main() -> ExitCode {
         // image was opened above, before the domain was attached.
         storage.baseline.as_ref().map_or(0, |p| p.represented.get()),
     );
+    // How long the restart's replay took, and over how much (task-d55).
+    // `owed=0` above says the replay is complete, not what it cost, and
+    // under the replay profile it is the price of every working commit a
+    // crash lost. The attach's own time is beside it: a reinstall from
+    // the baseline's image is in it and not in the replay.
+    let replayed = storage.domain.store().replayed(placed.membership.domain());
+    if let Some(replayed) = &replayed {
+        println!(
+            "replayed records={} from={} through={} took_ms={:.1} attach_ms={:.1}",
+            replayed.records(),
+            replayed.from.get(),
+            replayed.through.get(),
+            replayed.took.as_secs_f64() * 1000.0,
+            attaching.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
     // The bounded snapshot (task-61), on the startup report where an
     // operator already looks. Rendered whole: every field is a number
     // or a frozen enum, so there is nothing in it to redact, and every
@@ -1136,6 +1161,9 @@ fn main() -> ExitCode {
     };
     let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default())
         .wake_on_materialized(materialized);
+    if let Some(replayed) = replayed {
+        domain = domain.recovered_in(replayed.took);
+    }
     if let Some((appender, materializer)) = waits {
         domain = domain.count_pipeline_waits(appender, materializer);
     }

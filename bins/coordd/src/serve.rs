@@ -1042,11 +1042,16 @@ struct Dialled {
 /// Admission is recorded where the frontend decides a caller's frame;
 /// the journal and materialization are recorded by the voter's node,
 /// around the flush of a round's protocol transitions and around the
-/// application of each executable command. Every other stage has no
-/// point in this build and is reported as not instrumented rather than
-/// as a zero: a count nobody took is not a count of nothing.
-pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 3] = [
+/// application of each executable command. A checkpoint is recorded
+/// around each local publication, and recovery is the boot's replay of
+/// the journal into the projection, one sample a start (task-d55). Every
+/// other stage has no point in this build and is reported as not
+/// instrumented rather than as a zero: a count nobody took is not a
+/// count of nothing.
+pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 5] = [
     coord_daemon::metrics::Stage::Admission,
+    coord_daemon::metrics::Stage::Checkpoint,
+    coord_daemon::metrics::Stage::Recovery,
     coord_daemon::metrics::Stage::Journal,
     coord_daemon::metrics::Stage::Materialization,
 ];
@@ -1058,12 +1063,13 @@ pub const INSTRUMENTED: [coord_daemon::metrics::Stage; 3] = [
 /// journal and materialization points are the voter's node's, so a
 /// process with no voter (`voting` false) records neither, and reports
 /// both as not instrumented rather than as observed zeroes -- which they
-/// would be the day its serving applier materializes something.
+/// would be the day its serving applier materializes something. Every
+/// process attaches its storage and keeps its own checkpoints.
 pub fn recorder(voting: bool) -> coord_daemon::metrics::Recorder {
     if voting {
         coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED)
     } else {
-        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED[..1])
+        coord_daemon::metrics::Recorder::instrumenting(&INSTRUMENTED[..3])
     }
 }
 
@@ -1539,7 +1545,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
         use coord_daemon::metrics::{
-            Cost, Cpu, Interval, Measure, PipelineWaits, Unavailable, Wait,
+            Cost, Cpu, Interval, Measure, PipelineWaits, Scheduling, Unavailable, Wait,
         };
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
@@ -1569,7 +1575,20 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             None => Measure::Unavailable(Unavailable::NoSamples),
         };
         let cpu = match (domain_cpu, crate::cpu::process()) {
-            (Some(domain), Some(process)) => Measure::Observed(Cpu { domain, process }),
+            (Some(domain), Some(process)) => Measure::Observed(Cpu {
+                domain,
+                process,
+                domain_scheduling: crate::cpu::this_thread_scheduling().map_or(
+                    Measure::Unavailable(Unavailable::NotInstrumented),
+                    |s| {
+                        Measure::Observed(Scheduling {
+                            run_queue: s.run_queue,
+                            voluntary: s.voluntary,
+                            involuntary: s.involuntary,
+                        })
+                    },
+                ),
+            }),
             _ => Measure::Unavailable(Unavailable::NotInstrumented),
         };
         Measure::Observed(Cost {
@@ -1719,6 +1738,16 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             limits: LocalLimits::default(),
             done: (0, 0),
         });
+        self
+    }
+
+    /// Record the boot's replay of the journal into the projection, which
+    /// ran before this domain existed, as its recovery stage (task-d55).
+    #[must_use]
+    pub fn recovered_in(self, took: std::time::Duration) -> Self {
+        use coord_daemon::metrics::Stage;
+        self.recorder.entered(Stage::Recovery);
+        self.recorder.completed(Stage::Recovery, took);
         self
     }
 
@@ -2937,7 +2966,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let images = housekeeping.images.clone();
         // The export runs on this thread until task-d51 moves it off, and
         // the domain takes no event meanwhile: its duration is in the line
-        // so that a run whose voter stalls here shows why.
+        // so that a run whose voter stalls here shows why, and so are its
+        // steps', so that it shows which of them grew (task-d55).
+        use coord_daemon::metrics::Stage;
         let started = std::time::Instant::now();
         let outcome = self
             .backing
@@ -2948,14 +2979,27 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         let housekeeping = self.housekeeping.as_mut().expect("just borrowed");
         match outcome {
             Ok(Some(published)) => {
+                self.recorder.entered(Stage::Checkpoint);
+                self.recorder.completed(Stage::Checkpoint, took);
                 housekeeping.done.0 += 1;
                 housekeeping.floor = after;
+                let phases = &published.phases;
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
                 eprintln!(
-                    "checkpoint represented={} retired={} reclaimed={} took_ms={}",
+                    "checkpoint represented={} retired={} reclaimed={} took_ms={} \
+                     export_ms={:.1} write_ms={:.1} drain_ms={:.1} sync_ms={:.1} \
+                     append_ms={:.1} retire_ms={:.1} reclaim_ms={:.1}",
                     published.represented.get(),
                     published.retired,
                     published.reclaimed,
-                    took.as_millis()
+                    took.as_millis(),
+                    ms(phases.export),
+                    ms(phases.write),
+                    ms(phases.journal.drain),
+                    ms(phases.journal.sync),
+                    ms(phases.journal.append),
+                    ms(phases.journal.retire),
+                    ms(phases.reclaim),
                 );
             }
             // Nothing new to represent: the projection has materialized
@@ -2964,6 +3008,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             // worth a line.
             Ok(None) => housekeeping.floor = after,
             Err(e) => {
+                self.recorder.entered(Stage::Checkpoint);
+                self.recorder.refused(Stage::Checkpoint);
                 housekeeping.done.1 += 1;
                 housekeeping.floor = gap.saturating_add(after);
                 eprintln!(
