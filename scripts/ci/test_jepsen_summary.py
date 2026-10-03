@@ -345,9 +345,8 @@ class RunQueueTests(unittest.TestCase):
         self.assertNotIn("run queue", text.lower())
 
 
-def booted(at: str, executed: int, replayed: str | None = None, durable: int | None = None) -> str:
-    """One start of a replay voter: Jepsen's line, coordd's, and a last
-    interval `metrics` line when `durable` is given."""
+def booted(at: str, executed: int, replayed: str | None = None) -> str:
+    """One start of a replay voter: Jepsen's line and coordd's."""
     lines = [
         f"{at} Jepsen starting  /opt/tuplesky/coordd --config coordd.toml",
         "coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true",
@@ -357,20 +356,14 @@ def booted(at: str, executed: int, replayed: str | None = None, durable: int | N
     ]
     if replayed:
         lines.append(replayed)
-    if durable is not None:
-        lines.append(
-            'metrics {"stages":[],"frontiers":{"Observed":{"journal":300,"materialized":290,"checkpoint":0,'
-            f'"projection_durable":{durable}}}}}}}'
-        )
     return "\n".join(lines) + "\n"
 
 
 class BootTests(unittest.TestCase):
-    """task-d55: every start of every voter, with what the boot before it
-    had durable when it last reported and what the attach replayed."""
+    """task-d55: every start of every voter, with what its attach replayed."""
 
     LOG = (
-        booted("2026-10-03 01:41:25", 0, "replayed records=0 from=0 through=0 took_ms=0.0 attach_ms=3.1", durable=200)
+        booted("2026-10-03 01:41:25", 0, "replayed records=0 from=0 through=0 took_ms=0.0 attach_ms=3.1")
         + booted("2026-10-03 01:43:05", 95, "replayed records=90 from=200 through=290 took_ms=41.5 attach_ms=52.0")
         # A build before task-d55 prints no `replayed` line.
         + booted("2026-10-03 01:44:00", 95)
@@ -379,10 +372,6 @@ class BootTests(unittest.TestCase):
     def test_each_boot_is_parsed(self):
         boots = js.parse_voter(self.LOG.splitlines(keepends=True)).boot_rows
         self.assertEqual([b.started for b in boots], ["2026-10-03 01:41:25", "2026-10-03 01:43:05", "2026-10-03 01:44:00"])
-        self.assertIsNone(boots[0].before)
-        self.assertEqual(boots[1].before["projection_durable"], 200)
-        # The second boot printed no metrics line before it was killed.
-        self.assertIsNone(boots[2].before)
         self.assertEqual(boots[1].replayed, (90, 200, 290, 41.5, 52.0))
         self.assertIsNone(boots[2].replayed)
         self.assertEqual([b.executed for b in boots], ["0", "95", "95"])
@@ -397,9 +386,9 @@ class BootTests(unittest.TestCase):
     def test_the_table_has_a_row_a_boot(self):
         text = self.summarize(self.LOG)
         self.assertIn("**Boots** (every start of each voter", text)
-        self.assertIn("| n1 | 1 | 2026-10-03 01:41:25 | - | 0 | 0 | 0 | 0.0 | 3.1 | 0 |", text)
-        self.assertIn("| n1 | 2 | 2026-10-03 01:43:05 | 200 of 290 | 90 | 200 | 290 | 41.5 | 52.0 | 95 |", text)
-        self.assertIn("| n1 | 3 | 2026-10-03 01:44:00 | - | - | - | - | - | - | 95 |", text)
+        self.assertIn("| n1 | 1 | 2026-10-03 01:41:25 | 0 | 0 | 0 | 0.0 | 3.1 | 0 |", text)
+        self.assertIn("| n1 | 2 | 2026-10-03 01:43:05 | 90 | 200 | 290 | 41.5 | 52.0 | 95 |", text)
+        self.assertIn("| n1 | 3 | 2026-10-03 01:44:00 | - | - | - | - | - | 95 |", text)
 
     def test_voters_that_report_no_replay_have_no_table(self):
         self.assertNotIn("**Boots**", self.summarize(REPLAY_VOTER))

@@ -28,9 +28,8 @@ directory (`store/latest`) and writes what a reader looks for first:
   top, and under the replay profile each voter's row carries how far its
   projection was durable against what it had applied;
 * and, where the voters report what their start replayed (task-d55),
-  every boot of every voter: how far the boot before it had its
-  projection durable when it last reported, what the attach replayed
-  and how long it and the attach took.
+  every boot of every voter: what the attach replayed, from where it
+  found the projection, and how long the replay and the attach took.
 
     scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
         [--profile strict|replay]
@@ -122,9 +121,6 @@ class Boot:
 
     # The time on the "Jepsen starting" line before it, or None.
     started: str | None = None
-    # The previous boot's last `metrics` frontiers, or None without one:
-    # how far the projection was durable when that boot last reported.
-    before: dict | None = None
     executed: str = "-"
     # (records, from, through, took_ms, attach_ms), or None without the line.
     replayed: tuple | None = None
@@ -311,8 +307,7 @@ def parse_voter(lines) -> Voter:
     # The current boot's counts when the last "Jepsen starting" was seen,
     # or None before it.
     base: dict | None = None
-    # The current boot's last `metrics` frontiers, and the last start's time.
-    reported: dict | None = None
+    # The time on the last "Jepsen starting" line, until a boot takes it.
     started: str | None = None
 
     def since_start():
@@ -329,7 +324,6 @@ def parse_voter(lines) -> Voter:
                 observed = (snapshot.get("frontiers") or {}).get("Observed")
                 if isinstance(observed, dict):
                     v.frontiers = observed
-                    reported = observed
                     v.replay |= "projection_durable" in observed
             except (ValueError, AttributeError):
                 pass
@@ -341,8 +335,7 @@ def parse_voter(lines) -> Voter:
             continue
         if line.startswith("coordd domain="):
             v.boots += 1
-            v.boot_rows.append(Boot(started=started, before=reported if v.boot_rows else None))
-            reported = None
+            v.boot_rows.append(Boot(started=started))
             started = None
             for k, n in boot.items():
                 v.counts[k] = v.counts.get(k, 0) + n
@@ -455,11 +448,7 @@ def clip(s: str, n: int = 90) -> str:
 def projection_durable(v: Voter) -> str:
     """The projection's durable frontier against what the voter had applied,
     from its last `metrics` line: "-" where that line has none."""
-    return durable_of(v.frontiers)
-
-
-def durable_of(frontiers: dict | None) -> str:
-    f = frontiers or {}
+    f = v.frontiers or {}
     if "projection_durable" not in f:
         return "-"
     return f"{f['projection_durable']} of {f.get('materialized', '?')}"
@@ -661,27 +650,25 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
         out.append("")
         if any(b.replayed for v in voters.values() for b in v.boot_rows):
             out.append(
-                "**Boots** (every start of each voter, from its `coordd.log`; projection durable before is the last "
-                "`metrics` line of the boot before it, how far that boot's projection was durable against what it had "
-                "applied when it last reported, so a kill after that line can only have left it further on; replayed is "
-                "what the attach replayed from the journal into the projection, from where it found the projection to "
-                "the journal's durable head, and attach includes a reinstall, which replay does not)"
+                "**Boots** (every start of each voter, from its `coordd.log`; replayed is what the attach replayed "
+                "from the journal into the projection, from where it found the projection, which after a kill is how "
+                "far the projection was durable when the voter died, to the journal's durable head; attach is the whole "
+                "attach, a reinstall included, which replay is not)"
             )
             out.append("")
             out.append(
-                "| Node | Boot | Started | Projection durable before | Replayed records | From | Through "
+                "| Node | Boot | Started | Replayed records | From | Through "
                 "| Replay (ms) | Attach (ms) | Executed at recovery |"
             )
-            out.append("| --- " * 10 + "|")
+            out.append("| --- " * 9 + "|")
             for node, v in voters.items():
                 for i, b in enumerate(v.boot_rows, 1):
-                    before = durable_of(b.before) if i > 1 else "-"
                     if b.replayed:
                         records, start, through, took, attach = b.replayed
                         replayed = f"{records} | {start} | {through} | {took:.1f} | {attach:.1f}"
                     else:
                         replayed = "- | - | - | - | -"
-                    out.append(f"| {node} | {i} | {b.started or '-'} | {before} | {replayed} | {b.executed} |")
+                    out.append(f"| {node} | {i} | {b.started or '-'} | {replayed} | {b.executed} |")
             out.append("")
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
         if timed:
