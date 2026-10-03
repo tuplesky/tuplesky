@@ -133,7 +133,9 @@ pub enum Stage {
     Checkpoint = 0x000a,
     /// Bulk traffic's interference with everything else.
     BulkInterference = 0x000b,
-    /// Recovery.
+    /// Recovery. `coordd` samples the boot's replay of the journal into
+    /// the projection here, one a start (task-d55), so it is every
+    /// storage-holding role's, as the journal is.
     Recovery = 0x000c,
 }
 
@@ -186,14 +188,11 @@ impl Stage {
         let has = |role: Role| roles.roles().contains(&role);
         match self {
             // Every role journals and materializes its own storage.
-            Stage::Journal | Stage::Materialization | Stage::Checkpoint => {
+            Stage::Journal | Stage::Materialization | Stage::Checkpoint | Stage::Recovery => {
                 has(Role::Voter) || has(Role::Observer)
             }
             // Consensus stages belong to a voter.
-            Stage::FanOut
-            | Stage::DependencyClosure
-            | Stage::EvidenceLearning
-            | Stage::Recovery => has(Role::Voter),
+            Stage::FanOut | Stage::DependencyClosure | Stage::EvidenceLearning => has(Role::Voter),
             // The caller-facing stages belong to whatever serves callers.
             Stage::Admission | Stage::ClientTransit | Stage::Watches => {
                 has(Role::Frontend) || has(Role::Observer)
@@ -535,13 +534,34 @@ pub struct Wait {
 }
 
 /// CPU time a voter's process has used (task-d54), cumulative.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cpu {
     /// The domain loop's own thread.
     pub domain: Duration,
     /// Every thread of the process: the loop, the appender and the
     /// materializer, the transport's workers.
     pub process: Duration,
+    /// How the domain loop's thread was scheduled (task-d55), or why
+    /// there is no reading.
+    #[serde(default = "not_instrumented")]
+    pub domain_scheduling: Measure<Scheduling>,
+}
+
+/// How a thread was scheduled (task-d55), cumulative.
+///
+/// The domain loop's busy time less its CPU time, less the waits on its
+/// pipeline threads, is time it was neither computing nor counted as
+/// waiting. Runnable and not running is [`Scheduling::run_queue`]: a
+/// host with more runnable threads than cores. Otherwise it is a blocking
+/// call on the loop's own thread, which [`Scheduling::voluntary`] counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scheduling {
+    /// Time runnable and waiting for a CPU.
+    pub run_queue: Duration,
+    /// Times the thread gave up the CPU itself.
+    pub voluntary: u64,
+    /// Times the scheduler took the CPU from it.
+    pub involuntary: u64,
 }
 
 fn not_instrumented<T>() -> Measure<T> {

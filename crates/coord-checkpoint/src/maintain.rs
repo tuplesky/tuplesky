@@ -32,11 +32,12 @@
 //! [`JournaledStore`]: coord_storage::journaled::JournaledStore
 
 use core::fmt;
+use std::time::{Duration, Instant};
 
 use coord_journal_api::JournalEngine;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_storage::JournaledDomain;
-use coord_storage::journaled::JournaledError;
+use coord_storage::journaled::{JournaledError, PublishPhases};
 use coord_storage::view::ViewError;
 use coord_store_api::engine::LocalEngine;
 use coord_types::ids::LocalJournalSeq;
@@ -59,6 +60,28 @@ pub struct Publication {
     pub retired: bool,
     /// Images the publication superseded and removed.
     pub reclaimed: usize,
+    /// How long each step took.
+    pub phases: Phases,
+}
+
+/// How long each step of a publication took, in the order they run.
+///
+/// The image is written from a snapshot and the pointer appended to the
+/// journal, and the two grow for different reasons: the export with the
+/// projection it copies, the journal's part with what was lent out and
+/// with the profile. Reported apart so that a run whose publications
+/// grow says which.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Phases {
+    /// Steps 1 and 2's read: pinning the snapshot and producing the image
+    /// from it.
+    pub export: Duration,
+    /// Step 2's write: the image file, synced, and its directory.
+    pub write: Duration,
+    /// Steps 3 and 4, the journal's.
+    pub journal: PublishPhases,
+    /// Step 5.
+    pub reclaim: Duration,
 }
 
 /// Why a publication did not complete.
@@ -191,23 +214,36 @@ impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E> {
         // `&mut` owns both, so it covers at least `represented`. Being
         // ahead of it is harmless -- the pointer retires through what
         // it claims, never through what the image happens to contain.
+        let started = Instant::now();
         let gated = store
             .reader(domain)
             .ok_or(BaselineError::Unattached)?
             .snapshot()?;
         let checkpoint = export_local(gated.view(), origin, represented, limits)?;
+        drop(gated);
+        let export = started.elapsed();
+        let started = Instant::now();
         let pointer = images.write(&checkpoint)?;
+        let write = started.elapsed();
         // Step 3 and step 4, in that order and inside the journal.
         let published = self.store_mut().publish_checkpoint(domain, &pointer)?;
         // Step 5, last: an image is removed only once a newer one is
         // durably selected, so a crash anywhere above leaves a baseline
         // that still loads.
+        let started = Instant::now();
         let reclaimed = images.reclaim(&pointer)?;
+        let reclaim = started.elapsed();
         Ok(Some(Publication {
             pointer,
             represented: published.published,
             retired: published.retired,
             reclaimed,
+            phases: Phases {
+                export,
+                write,
+                journal: published.phases,
+                reclaim,
+            },
         }))
     }
 }

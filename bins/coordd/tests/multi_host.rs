@@ -473,3 +473,35 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// task-d55: a checkpoint interval the harness provisions is the one the
+/// daemon reads, and the rest of the `[limits]` it has to write beside it
+/// are the daemon's own defaults, so setting the one does not quietly set
+/// the others.
+#[test]
+fn a_provisioned_checkpoint_interval_leaves_every_other_limit_at_its_default() {
+    let dir = workspace("checkpoint-interval");
+    for interval in [None, Some(0), Some(65_536)] {
+        let run = dir.join(format!("{interval:?}"));
+        let provisioned = provision(&Plan {
+            checkpoint_after_records: interval,
+            ..Plan::loopback(run.clone(), 3, 0)
+        })
+        .expect("provisioned");
+        for node in &provisioned.voters {
+            let config = coord_daemon::config::Config::parse(
+                &std::fs::read_to_string(&node.config).expect("the voter's configuration"),
+            )
+            .expect("a configuration the daemon accepts");
+            let defaults = coord_daemon::config::Limits::default();
+            assert_eq!(
+                config.limits,
+                coord_daemon::config::Limits {
+                    checkpoint_after_records: interval.unwrap_or(defaults.checkpoint_after_records),
+                    ..defaults
+                }
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

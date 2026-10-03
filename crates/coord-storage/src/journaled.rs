@@ -85,6 +85,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use coord_core::effect::{ApplyBase, BarrierId, BootId, PersistBatch};
 use coord_core::event::{StorageError, StorageEvent};
@@ -507,6 +508,31 @@ pub struct Published {
     /// retired on a later attempt. It is reported rather than retried
     /// here so the caller decides when to spend the I/O.
     pub retired: bool,
+    /// How long each of its steps took.
+    pub phases: PublishPhases,
+}
+
+/// How long the steps of [`JournaledStore::publish_checkpoint`] took,
+/// in its order.
+///
+/// A publication runs on the domain thread, which takes no event
+/// meanwhile, so its duration is a stall every caller in flight waits
+/// out. Its parts are reported apart because they grow for different
+/// reasons: taking back a lent append or commit is the pipeline's, the
+/// forced sync is the replay profile's (task-j06), the pointer is one
+/// synced journal append, and the retirement is the journal's
+/// compaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PublishPhases {
+    /// Taking back an append or a projection commit that was out.
+    pub drain: Duration,
+    /// Making the projection durable first, under the replay profile.
+    /// Zero under the strict profile, which has nothing to make durable.
+    pub sync: Duration,
+    /// Appending the pointer, synced, and materializing it.
+    pub append: Duration,
+    /// Retiring the prefix the pointer represents.
+    pub retire: Duration,
 }
 
 fn alloc_one(record: JournalRecordV1) -> Vec<JournalRecordV1> {
@@ -565,6 +591,28 @@ struct Domain<E: LocalEngine> {
     projection_durable: LocalJournalSeq,
     /// Working commits since the last durable one.
     working: Working,
+    /// What the attach replayed into the projection.
+    replayed: Replayed,
+}
+
+/// What an attach replayed from the journal into a domain's projection,
+/// and how long it took: the part of a restart that grows with the
+/// suffix the projection was behind by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replayed {
+    /// Where the projection was found (its applied stamp).
+    pub from: LocalJournalSeq,
+    /// The journal's durable head, where the replay ended.
+    pub through: LocalJournalSeq,
+    /// How long the replay took.
+    pub took: Duration,
+}
+
+impl Replayed {
+    /// Records replayed.
+    pub fn records(&self) -> u64 {
+        self.through.get().saturating_sub(self.from.get())
+    }
 }
 
 impl<E: LocalEngine> Domain<E> {
@@ -988,13 +1036,21 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             // What a crash left is durable, whichever profile wrote it.
             projection_durable: applied.materialized,
             working: Working::default(),
+            replayed: Replayed {
+                from: applied.materialized,
+                through: applied.materialized,
+                took: Duration::ZERO,
+            },
         };
+        let started = Instant::now();
         Self::replay(
             self.journal.as_ref().expect(HELD),
             &mut state,
             self.limits,
             self.profile,
         )?;
+        state.replayed.through = state.frontiers.materialized();
+        state.replayed.took = started.elapsed();
         // Replay moved the projection forward, so the application
         // frontiers have to describe the recovered history rather than
         // the projection as it was found. Leaving them at the pre-replay
@@ -1292,9 +1348,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // a commit a materializer has out is taken back first, and so is
         // an append the appender has out; what they completed goes out
         // with the next report.
+        let mut phases = PublishPhases::default();
+        let started = Instant::now();
         let drained = self.drain()?;
         self.deferred_events.extend(drained.events);
         self.deferred_uncertain |= drained.indeterminate;
+        phases.drain = started.elapsed();
         let barrier = BarrierId {
             node_generation: self.incarnation,
             boot_id: self.boot,
@@ -1321,8 +1380,10 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // replay at the next attach would start below a retired prefix.
         // The engine is held: the drain above took back a lent one.
         if matches!(self.profile, ProjectionProfile::Replay(_)) {
+            let started = Instant::now();
             state.sync_projection()?;
             debug_assert!(state.projection_durable >= state.frontiers.materialized());
+            phases.sync = started.elapsed();
         }
         // `C <= M` is what makes the image loadable: an image claiming
         // records the projection has not applied represents obligations
@@ -1333,6 +1394,7 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         proposed
             .publish_checkpoint(pointer.represented)
             .map_err(JournaledError::Frontier)?;
+        let started = Instant::now();
         let seq = state.head.next_seq()?;
         let record = JournalRecordV1::seal(RecordDraft {
             origin: state.origin,
@@ -1390,23 +1452,22 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                 return Err(JournaledError::Journal(failure));
             }
         }
+        phases.append = started.elapsed();
         // Only now, and never as a condition of the publication.
         let stream = self.domains.get(&domain).expect("attached").origin.stream;
-        match self
+        let started = Instant::now();
+        let retired = self
             .journal
             .as_mut()
             .expect(HELD)
             .retire_prefix(stream, pointer)
-        {
-            Ok(()) => Ok(Published {
-                published: pointer.represented,
-                retired: true,
-            }),
-            Err(_) => Ok(Published {
-                published: pointer.represented,
-                retired: false,
-            }),
-        }
+            .is_ok();
+        phases.retire = started.elapsed();
+        Ok(Published {
+            published: pointer.represented,
+            retired,
+            phases,
+        })
     }
 
     /// Whether `engine`, the projection a boot found, continues `domain`'s
@@ -2681,6 +2742,12 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             state.sync_projection()?;
         }
         Ok(())
+    }
+
+    /// What the attach replayed into `domain`'s projection, or `None`
+    /// for a domain not attached.
+    pub fn replayed(&self, domain: DomainId) -> Option<Replayed> {
+        self.domains.get(&domain).map(|d| d.replayed)
     }
 
     /// Whether a domain's projection holds working commits a crash would

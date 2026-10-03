@@ -204,6 +204,10 @@ pub struct Provisioned {
     /// was; one without it was strict.
     #[serde(default, skip_serializing_if = "JournalProfile::is_strict")]
     pub journal_profile: JournalProfile,
+    /// `checkpoint_after_records` every voter was provisioned with, where
+    /// not the daemon's default (task-d55). Written only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_after_records: Option<u64>,
 }
 
 impl Provisioned {
@@ -248,6 +252,27 @@ pub struct Plan {
     pub issuer_listen: Option<Address>,
     /// The journal profile every voter runs (task-j06).
     pub journal: JournalPlan,
+    /// `[limits] checkpoint_after_records` for every voter, where not
+    /// the daemon's default (task-d55): how far the journal runs past the
+    /// last local checkpoint before the next is published. Zero never
+    /// publishes.
+    pub checkpoint_after_records: Option<u64>,
+}
+
+/// The `[limits]` a voter's configuration carries when the plan sets one
+/// of them; empty otherwise, so the configuration is byte for byte what
+/// this harness has always written. The section's other fields are
+/// required, so they are written at the daemon's defaults, which
+/// `coordd`'s tests check against its own.
+fn limits_section(checkpoint_after_records: Option<u64>) -> String {
+    match checkpoint_after_records {
+        None => String::new(),
+        Some(n) => format!(
+            "\n[limits]\nmax_request_bytes = 2097152\nmax_response_bytes = 8388608\n\
+             max_outstanding_per_session = 256\nmax_live_subscriptions = 4096\n\
+             checkpoint_after_records = {n}\n"
+        ),
+    }
 }
 
 /// The journal profile a provisioned domain's voters run, written into
@@ -340,6 +365,7 @@ impl Plan {
             edge_host: None,
             issuer_listen: None,
             journal: JournalPlan::default(),
+            checkpoint_after_records: None,
         }
     }
 }
@@ -761,7 +787,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
                 &hex(&principal),
                 &hex(&namespace),
                 &hex(&trust_rule),
-                &plan.journal,
+                plan,
             ),
         )?;
         voters_out.push(Node {
@@ -820,6 +846,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         issuer,
         edge,
         journal_profile: plan.journal.profile,
+        checkpoint_after_records: plan.checkpoint_after_records,
     };
     std::fs::write(
         dir.join("harness.json"),
@@ -949,7 +976,7 @@ fn node_config(
     principal: &str,
     namespace: &str,
     trust_rule: &str,
-    journal: &JournalPlan,
+    plan: &Plan,
 ) -> String {
     format!(
         r#"# Written by `coord-harness provision`. A strict configuration: the
@@ -994,9 +1021,10 @@ trust_rule = "{trust_rule}"
 [[grant]]
 principal = "{principal}"
 namespace = "{namespace}"
-"#,
+{limits}"#,
         preamble = layout.preamble(),
-        journal = journal.lines(),
+        journal = plan.journal.lines(),
+        limits = limits_section(plan.checkpoint_after_records),
         manifest = layout.shared("genesis.json"),
         admin_key = layout.shared(ADMIN_KEY),
         endpoints = layout.shared("endpoints.bin"),

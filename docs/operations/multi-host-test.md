@@ -113,9 +113,17 @@ What `--hosts` changes, and nothing else does:
   profile is off by default and is not a supported production profile until
   task-j05; `harness.json` records it as `journal_profile` when it is not
   strict.
+* **The checkpoint interval** (`--checkpoint-after-records N`, task-d55)
+  writes a `[limits]` section into every voter with
+  `checkpoint_after_records = N`: how far the journal runs past the last
+  local checkpoint before the next is published. Zero never publishes. The
+  section's other fields are written at the daemon's defaults. Without the
+  flag the harness reads `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, and
+  refuses a value that does not parse. `harness.json` records it as
+  `checkpoint_after_records` when set.
 
-Without `--hosts`, `--issuer-listen`, `--edge-host` and a journal profile,
-provisioning writes exactly what it always has;
+Without `--hosts`, `--issuer-listen`, `--edge-host`, a journal profile and a
+checkpoint interval, provisioning writes exactly what it always has;
 `crates/coord-harness/tests/provision.rs` pins that.
 
 A genesis commits its voters by key. Re-provisioning makes a new domain with
