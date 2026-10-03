@@ -3,7 +3,7 @@
 **Status:** Review proposal, consolidated v1.5.  
 **Date:** 2026-09-24.  
 **Companion:** [TupleSky implementation design](tuplesky-design.md).  
-**Scope:** 152 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d57` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
+**Scope:** 156 implementation tasks with stable `task-*` identifiers. The `task-01` through `task-66`, `task-s01` through `task-s04`, `task-j01` through `task-j10`, `task-o01` through `task-o06`, `task-m01` through `task-m05`, `task-c01`, `task-c02`, `task-c03`, `task-d01` through `task-d61` and `task-q01` suffixes and prerequisites are preserved. v1.5 adds `task-d01` through `task-d04` from review of the open implementation PRs and of multi-host readiness, `task-d05` through `task-d17` from the Jepsen client's runs, `task-d18` through `task-d33` from a review against an external SwiftPaxos correctness checklist ([review record](tuplesky-checklist-review.md)), `task-d34` from what the protocol simulator of task-d30 found, `task-d35` through `task-d44` from a review of recovery time and storage integrity (an execution chain, a scrub, and voter replacement through a prepared transition, a staged learner, terminal recovery after the seal, serving across a transition and a running membership install), `task-d45` through `task-d50` from measuring the throughput of the Jepsen client's first unthrottled runs, `task-d51` from task-d46's long runs, `task-d52` and `task-d53` from a profile of the domain thread after task-d46, `task-d54` from the Jepsen runs of task-d50, `task-d55` through `task-d57` from the Jepsen runs of task-j06, `task-d58` through `task-d61` from a profile of five voters' CPU per operation, and moves committed key replacement from `task-58` to `task-m03`; the changes are listed under [Gate checklist and deferred work](#gate-checklist-and-deferred-work). Task IDs are not GitHub pull-request or issue numbers. One implementation PR corresponds to one task; its GitHub-assigned number is recorded separately. No baseline, supplement or separate amendment is needed.
 
 ## How to use this plan
 
@@ -35,6 +35,7 @@ Reference single-store and fixed-membership compositions are early increments, n
 | task-d01 through task-d44 | Daemon runtime wiring (election, leaf renewal, reconnection and why a dial failed), one execution order on every replica, recovery bounded by execution, a Sync that leaves no stale acceptance, a new leader that chains after what it executed, a diverged node that stays stopped and says what it compared, a decision that names its admission facts, every proposal and decision reaching every voter, every vote reaching the leader, catch-up, multi-host test provisioning, and the correctness-checklist remediation (a promise a Sync cannot lower, slow decisions recovery keeps, a Sync that fits its row, collector obligations that end, client outcomes, table room for recovery, a resource contract, forgetting wired into `coordd` and a learner reinstall behind its floor, the failure and obligation contract, the real machines under simulation, and the recovery bugs that simulation found), an execution chain every voter compares, a scrub of the replicated state, a prepared transition, a staged learner, a configuration installed into a running daemon, and voter replacement through the sealed handoff | Required before task-64/task-65 qualification and task-66 |
 | task-d45 through task-d54 | Throughput: a command's cost measured on every node and gated in CI, per-turn work independent of history, durable group writes, the projection's durability under the journal, re-sends only once an answer is due, reads and the fast path off the slow path, the local checkpoint off the domain thread, execution and materialization on a pipelined applier, an execution established without walking what already executed, and the journal's syncs off the domain thread | task-d45 through task-d49 and task-d51 through task-d53 required before task-64, task-q01 and task-62's remaining rows, task-d54 before task-62's remaining rows; task-d50 after its design amendment |
 | task-d55 through task-d57 | From the Jepsen runs of task-j06: a publication's steps, a restart's replay and the domain thread's scheduling measured; a restarted voter that neither fills the leader's control lane nor takes the ballot from a live leader; a read's index bounded by what the voters confirming it had voted | task-d55 before task-d51's acceptance run; task-d56 before task-64; task-d57 after its design amendment |
+| task-d58 through task-d61 | From a profile of five voters' CPU per operation: held reads served from one snapshot; the leader's re-send without a sort of every proposal; allocation on the domain thread; a turn's frames to one peer sent together | After task-d51, in that order; each measured against the five-voter profile |
 | task-q01 | Combined durable WAN/Kine qualification | Required before task-66 |
 
 ```mermaid
@@ -208,13 +209,17 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-d48](#task-d48) | Commit the projection in one phase under the journal | task-53, task-59, task-j04, task-j05, task-d47 |
 | [task-d49](#task-d49) | Re-send a proposal only once its answer is due | task-d07, task-d08, task-d15, task-d45 |
 | [task-d50](#task-d50) | Serve reads and the fast path without waiting on the slow path | task-28, task-29, task-d46, task-d47, task-d49 |
-| [task-d51](#task-d51) | Export the local checkpoint off the domain thread, and bound it | task-j04, task-d37, task-d55 |
+| [task-d51](#task-d51) | Export the local checkpoint off the domain thread, and bound it | task-j04, task-d55 |
 | [task-d52](#task-d52) | Execute and materialize on a pipelined applier | task-j03, task-j08, task-d47, task-d48 |
 | [task-d53](#task-d53) | Establish an execution without walking what already executed | task-21, task-24, task-d46 |
 | [task-d54](#task-d54) | Append the journal's groups on a journal worker | task-j03, task-d47, task-d52 |
 | [task-d55](#task-d55) | Measure a publication's steps, a restart's replay and the domain thread's scheduling | task-j04, task-j06, task-d45, task-d54 |
 | [task-d56](#task-d56) | Keep a restarted voter from stalling the domain | task-31, task-d01, task-d08, task-d10 |
 | [task-d57](#task-d57) | Bound a read's index by what the confirming voters had voted | task-d50 |
+| [task-d58](#task-d58) | Serve a turn's held reads from one snapshot | task-11, task-d50 |
+| [task-d59](#task-d59) | Re-send without sorting every proposal on every flush | task-d49 |
+| [task-d60](#task-d60) | Allocate less on the domain thread | task-d45 |
+| [task-d61](#task-d61) | Send a turn's frames to one peer together | task-31, task-d45 |
 | [task-q01](#task-q01) | Produce the combined durable WAN/Kine qualification report | task-j07, task-j08, task-o06, task-m05, task-63, task-64, task-d45, task-d46, task-d47, task-d48, task-d49, task-d51, task-d52, task-d53 |
 
 ## Task specifications
@@ -2398,16 +2403,16 @@ Write the design amendment first, then implement it:
 <a id="task-d51"></a>
 ### task-d51: Export the local checkpoint off the domain thread, and bound it
 
-**Prerequisites:** task-j04, task-d37, task-d55.  
+**Prerequisites:** task-j04, task-d55.  
 **Design:** Sections 17.16.1–17.16.6.
 
 **Implement:** task-d46's long runs left one cost that grows with the state on each node's domain thread: task-j04's local checkpoint. `Domain::maintain` publishes one each time the journal runs `limits.checkpoint_after_records` (4,096 by default) past the last, and `export_local` traverses the whole projection in one read transaction on the domain thread to write it. The projection grows with every executed command, so each export costs more than the last: 1.1 to 1.3 s of the domain thread on average over a 150,000-operation run at ten clients, about 2.5 s at 365,000 projection records, during which the voter takes no event. Over 280 s a follower's busy time per command grew 2.0- to 2.3-fold with exports on and stayed within 20% with them off, and a voter fell 9,000 commands behind.
 
 **Promoted to next, from task-j06's Jepsen runs.** At six nodes on the runner's disk, the leader spent 2.0% of a 120 s run inside publications under the strict profile (20 of them, the longest 195 ms) and 4.3% under the replay profile (21, the longest 818 ms), growing near-linearly with `represented`. Nothing is proposed, voted or read while one runs, so every operation in flight waits out the rest of it. Under replay that is most of the tail: read p95 80 → 166 ms and p99 132 → 299 ms against strict. In a closed loop the tail sets the throughput, so replay's lower median (read 45 → 27 ms) bought no throughput (318 against 310 `ok`/s). Before any code, one run settles how much of the tail this is: the six-node replay row with `checkpoint_after_records = 65536` (task-d55's harness knob). The prediction is p99 at or below strict's 132 ms, and `ok`/s up by the tail's share of the mean. task-d55's per-step timings say which step replay doubled.
 
-- **Export from task-d37's snapshot.** Open the read snapshot at the represented position on the domain thread, as task-d37's root does, and write the image from it on a background thread under a CPU and I/O budget. The domain thread keeps the steps that order the publication: it selects the image (the pointer) only once the image and its directory are durable, then retires the prefix and reclaims the superseded images, in task-j04's order. Those steps take microseconds to a sync, not the projection's size.
+- **Export from a pinned snapshot.** Open the read snapshot at the represented position on the domain thread, as task-d37's root will, and write the image from it on a background thread. task-d37 is not built yet, so the snapshot is the gated reader's (task-11), which is the same pin, and task-d37 is no longer a prerequisite. One thread, one export at a time, is the budget. The domain thread keeps the steps that order the publication: it selects the image (the pointer) only once the image and its directory are durable, then retires the prefix and reclaims the superseded images, in task-j04's order. Those steps take microseconds to a sync, not the projection's size.
 - **Bounded, not only moved.** An image is a copy of the whole projection, so publishing every 4,096 records costs a run time quadratic in its length, whichever thread pays it. Under the replay profile the journal is the record and a restart replays from the projection's last durable commit, so the cadence is by time (every 30 s by default) and by records (65,536 by default), whichever comes later, and a restart's replay is bounded by it. task-d55's boot line measures that replay, and the faults run is its evidence. Under the strict profile the cadence stays by records, with the same default raised to 65,536 once the replay time at that interval is measured on the runner.
-- **The pin's cost** is task-d37's: redb cannot reuse pages freed while the snapshot is open, so the file grows by about the write volume during the export, and the bound is stated and measured the same way. An export that exceeds its bound is abandoned and reported, never queued behind the next, and the previous baseline stays selected.
+- **The pin's cost** is task-d37's: redb cannot reuse pages freed while the snapshot is open, so the file grows by about the write volume during the export. The bound is a deadline of 60 s from the pin: a read past it fails the export, which is abandoned and reported, never queued behind the next, and the previous baseline stays selected.
 
 **Acceptance:**
 - In task-d46's long runs with local checkpoints at their default, a follower's busy time per command at 280 s is within 20% of its value at 20 s, at one client and at ten, and no voter is more than 5,000 commands behind the leader's executed count at any 30 s snapshot. With checkpoints off those runs stayed within about 3,200, snapshot skew included; with the inline export a voter ended more than 9,000 behind.
@@ -2544,6 +2549,63 @@ Write the design amendment first, then implement it:
 
 **Review boundary:** What the confirmation round carries and how the read's index is taken from it. No change to execution order, to when a round confirms, or to what a read may observe.
 
+<a id="task-d58"></a>
+### task-d58: Serve a turn's held reads from one snapshot
+
+**Prerequisites:** task-11, task-d50.  
+**Design:** Sections 4.5, 17.4.
+
+**Implement:** A profile of five voters on one host ([notes](../tuplesky-impl-notes.md#a-voters-cpu-per-operation-at-five-voters)) put 25% of the leader's domain thread in `Voter::pump_reads`: about 0.14 ms of every operation, 0.27 ms of every read. Each held read that comes due pins its own snapshot (a redb read transaction and the durable metadata read that proves its stamp, 16% of the thread), and every point read on a snapshot opens its table again (`open_table` is 11% of the thread on its own).
+
+- Evaluate every read that comes due in one pump from one snapshot. Each is due because its index has executed, and one snapshot taken after that covers all of them.
+- Keep a snapshot's opened tables for its life, so a second read of a table does not walk the table tree again.
+
+**Acceptance:**
+- In the five-voter profile, the leader's domain thread spends at least half less in `pump_reads` per read, and one snapshot is pinned per pump that serves any.
+- `coord-register` under task-d50's leader faults finds no violation, and task-d50's tests pass unchanged.
+
+**Review boundary:** How many snapshots a pump takes and how a snapshot reads its tables. No change to when a read is due or what it may return.
+
+<a id="task-d59"></a>
+### task-d59: Re-send without sorting every proposal on every flush
+
+**Prerequisites:** task-d49.  
+**Design:** Section 6.2.
+
+**Implement:** `Leader::resend_unvoted` runs on every flush, collects every durable proposal, sorts them and scans them once per voter: 8.7% of the leader's domain thread in the five-voter profile, three quarters of it in the function itself. Keep what each voter last voted and when each proposal's answer comes due, so that a flush looks only at the proposals that came due since the last.
+
+**Acceptance:**
+- The work a flush does to re-send is independent of how many proposals are in flight: a unit test with thousands outstanding and none due does no per-proposal work.
+- task-d49's tests and its duplicate-vote reading are unchanged.
+
+**Review boundary:** How the leader finds what is due. No change to what is re-sent or when.
+
+<a id="task-d60"></a>
+### task-d60: Allocate less on the domain thread
+
+**Prerequisites:** task-d45.  
+**Design:** None.
+
+**Implement:** The allocator is 25% of the leader's domain thread and 32% of a follower's, counted inclusively, in the five-voter profile, and no one caller owns it: encoding into vectors that grow as they are written (journal records, store envelopes, protocol frames), and the outbox's release. First an allocator measured against the system one on task-d45's gate and the five-voter profile, kept only if it gains; then encoders sized before they write.
+
+**Acceptance:** task-d45's busy time per command, and the five voters' CPU per operation in the profile, fall by what the profile attributes to the allocator, or the change is not kept.
+
+**Review boundary:** Memory allocation only. No change to any format.
+
+<a id="task-d61"></a>
+### task-d61: Send a turn's frames to one peer together
+
+**Prerequisites:** task-31, task-d45.  
+**Design:** Section 17.5.
+
+**Implement:** Each voter's transport threads cost 0.26 to 0.34 ms of CPU per operation in the five-voter profile, a third of a voter's CPU. Little of it is cryptography (3 to 5%): it is QUIC's per-packet work (22 to 24%), a `sendmsg` per packet (13 to 15%) and parking and waking (19 to 26%). That cost is per frame, not per byte. Count the frames and packets a command costs each voter, then send what one turn has for one peer as one write on its lane, rather than one write per frame.
+
+**Acceptance:**
+- Frames and packets per command are reported in `metrics`.
+- The transport threads' CPU per operation in the five-voter profile falls, and task-d45's gate and the Jepsen client's runs are unchanged in what they check.
+
+**Review boundary:** How frames to a peer are written. No change to a frame's format, to the lanes or to their bounds.
+
 ## Gate checklist and deferred work
 
 task-s01, task-s02 feed the strict storage reference through task-07. Optional task-s03, task-s04 need not merge to release redb; retired task-s05 through task-s08 are not replaced by migration or mixed-engine support gates. Same-engine crash/restore, common/local checkpoints, safe replacement and schema lifecycle remain requirements.
@@ -2562,8 +2624,9 @@ G3 requires task-43/transitive prerequisites, G4 task-48, G5 checkpoint/replacem
 - **After task-d46, a profile of the domain thread** (`perf`, ten clients, stores on tmpfs; [notes](../tuplesky-impl-notes.md#where-a-commands-time-goes-after-task-d46)) put about 1.15 ms of CPU on each command: 34% in the projection's redb transaction (its commit alone 24%), 25% in `Learner::established` walking every live executed predecessor to build a closure that only a duplicate check reads, 11% in the rest of consensus and 6% in the journal. With the stores on a disk, the journal's and the projection's syncs add about 4.8 ms a command, all on the same thread. Two tasks follow. task-d52 moves execution and materialization onto a pipelined applier, so that the domain thread pays the journal and consensus and the projection's commit and sync overlap the next group: after task-d47 and task-d48 a group still costs the domain thread two syncs in series, which bounds a voter near etcd's rate on the Jepsen runner's disk with nothing to spare. task-d53 establishes an execution from its direct dependencies, which the guard already requires executed, instead of walking every executed predecessor still in the table.
 - **After task-d50, the Jepsen runs** put the leader's domain loop near saturation on the runner's disk with about 1.2 of its 2.7 ms a command waiting in the journal's sync on that thread, so a group held about 1.6 commands. task-d54 runs the journal's appends on the journal worker Section 17.3.3 already describes, so that a group holds what arrives during a sync. A proposal split into a tentative frame and a later durable vote, which would take one of the three serial syncs off a command's path, is a wire and evidence change with a second frame per command; it is deferred, not refused, to be sized as a Section 4/6 amendment with its own bounded model once task-d54's numbers are in.
 - **After task-j06, the Jepsen runs** showed the replay profile taking a third of the CPU per operation and 18 ms off every median at six nodes, and no throughput. Each publication of the local checkpoint stalls the domain thread for a time that grows with the projection, so the closed loop's mean is set by the tail. task-d51 is promoted to next and bounded as well as moved, after one run with the publication interval raised. task-d55 measures a publication's steps, a restart's replay and the domain thread's scheduling, which that run and task-d51's acceptance read. task-d56 keeps one restarted follower from stalling the domain, which the replay faults run found and the strict ones show the start of. task-d57 bounds a read's index by what the followers confirming its round had voted, which is the largest lever left on the median: neither the leader's commit frontier nor the read's keys bound it safely. The proposal split stays deferred behind all four.
+- **After task-d55, a profile of five voters** on one four-core host ([notes](../tuplesky-impl-notes.md#a-voters-cpu-per-operation-at-five-voters)) measured the voters at 4.3 ms of CPU per operation, the Jepsen runner's 4.1, and the load generator at 0.2. On the Jepsen runner the harness takes about 2.0. So the harness is most of what the runner's arithmetic leaves outside the voters, and the voters alone are near twice etcd with its client. Of the voters' 4.3 ms: 43% on the domain threads, 32% on the transport threads, 17% on the materializers, 7% on the appenders. Four tasks follow, after task-d51. task-d58 serves a turn's held reads from one snapshot, a quarter of the leader's domain thread. task-d59 re-sends without sorting every proposal on every flush. task-d60 allocates less on the domain thread, a quarter to a third of it. task-d61 sends a turn's frames to one peer together, since the transport's cost is per frame. None of them is a gate. Each is measured against the same profile.
 - **Gating.** task-d45 through task-d49 and task-d51 through task-d53 are prerequisites of task-64 and task-q01, so that the qualification and the combined report measure the protocol rather than these costs. task-d56 is a prerequisite of task-64, as liveness under faults. task-62's remaining rows, and any reference result it publishes again, wait on them and on task-d54 for the same reason. This is stated in task-62 rather than as a prerequisite, since task-62's first runs produced task-c01 and task-c02, which the throughput tasks build on. task-d50, reads and the fast path off the slow path, changes protocol behaviour and waits on its own design amendment.
-- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 do not change the design. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
+- **Design changes.** task-d45 through task-d47, task-d49, task-d51 through task-d56 and task-d58 through task-d61 do not change the design. task-d48 amends Section 17.3.4's projection hardening; task-d50 amends Sections 4.5, 6.3 and 17.4; task-d57 amends Sections 2.2, 4.5 and 6.3.
 
 task-j06 is optional and cannot silently relax durable materialization. ReadFence is its own capability gate. Observers do not improve quorum fault tolerance or acquire voting rights by catching up. Interface drift in Kine is resolved at one explicit pin, not mixed across examples. Strict per-output authorization remains authoritative even for regional observers.
 

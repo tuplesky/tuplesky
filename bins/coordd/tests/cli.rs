@@ -3568,6 +3568,8 @@ async fn a_node_publishes_its_own_baseline_and_comes_back_on_it() {
             .expect("the publication's line");
         for phase in [
             " took_ms=",
+            " loop_ms=",
+            " pin_ms=",
             " export_ms=",
             " write_ms=",
             " drain_ms=",

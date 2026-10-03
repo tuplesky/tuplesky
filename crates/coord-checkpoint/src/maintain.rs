@@ -14,6 +14,13 @@
 //! 4. retire the journal prefix it represents;
 //! 5. reclaim the images it supersedes.
 //!
+//! Steps 1 and 2 are split so that they need not run on the thread that
+//! owns the store (task-d51). [`LocalBaseline::pin_local`] pins the
+//! snapshot there, [`Pinned::write`] produces and writes the image
+//! anywhere, and [`LocalBaseline::finish_local`] runs steps 3 to 5 back
+//! on the owning thread. An image is a copy of the whole projection, so
+//! its export grows with it; the pin and the pointer do not.
+//!
 //! *When* is not decided here either. The caller asks how far the
 //! journal has run past the last baseline and spends the I/O when it
 //! judges the prefix worth reclaiming, because that is a local
@@ -31,15 +38,20 @@
 //! [`local`]: crate::local
 //! [`JournaledStore`]: coord_storage::journaled::JournaledStore
 
+use core::cell::Cell;
 use core::fmt;
 use std::time::{Duration, Instant};
 
 use coord_journal_api::JournalEngine;
+use coord_journal_api::RecordOrigin;
 use coord_journal_api::frontier::CheckpointPointerV1;
 use coord_storage::JournaledDomain;
 use coord_storage::journaled::{JournaledError, PublishPhases};
-use coord_storage::view::ViewError;
-use coord_store_api::engine::LocalEngine;
+use coord_storage::view::{GatedView, ViewError};
+use coord_store_api::engine::{
+    CollectionId, EngineError, ErrorClass, LocalEngine, OrderedRead, RowPage, ScanRequest,
+    SnapshotSource,
+};
 use coord_types::ids::LocalJournalSeq;
 
 use crate::local::{LocalError, LocalLimits, export_local};
@@ -73,8 +85,9 @@ pub struct Publication {
 /// grow says which.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Phases {
-    /// Steps 1 and 2's read: pinning the snapshot and producing the image
-    /// from it.
+    /// Step 1: pinning the snapshot, on the thread that owns the store.
+    pub pin: Duration,
+    /// Step 2's read: producing the image from the snapshot.
     pub export: Duration,
     /// Step 2's write: the image file, synced, and its directory.
     pub write: Duration,
@@ -98,6 +111,13 @@ pub enum BaselineError {
     Image(StoreError),
     /// The pointer could not be made durable.
     Journal(JournaledError),
+    /// The export ran past its deadline and was given up. The snapshot
+    /// is released and nothing was written.
+    Abandoned,
+    /// The domain was reattached under another origin while the image
+    /// was written, so the image describes storage this node no longer
+    /// has. Nothing was published.
+    Superseded,
 }
 
 impl fmt::Display for BaselineError {
@@ -108,6 +128,10 @@ impl fmt::Display for BaselineError {
             BaselineError::Export(e) => write!(f, "the image could not be produced: {e}"),
             BaselineError::Image(e) => write!(f, "{e}"),
             BaselineError::Journal(e) => write!(f, "the pointer was refused: {e}"),
+            BaselineError::Abandoned => write!(f, "the export ran past its deadline"),
+            BaselineError::Superseded => {
+                write!(f, "the domain was reattached while its image was written")
+            }
         }
     }
 }
@@ -138,6 +162,118 @@ impl From<JournaledError> for BaselineError {
     }
 }
 
+/// A publication whose snapshot is pinned and whose image is still to
+/// be produced (task-d51).
+///
+/// Holding it holds the snapshot, and the engine cannot reuse pages
+/// freed while a snapshot is open: the file grows by about what is
+/// written meanwhile. [`Pinned::write`] releases it as soon as the image
+/// is produced, and a deadline bounds how long that may take.
+pub struct Pinned<V> {
+    view: GatedView<V>,
+    origin: RecordOrigin,
+    represented: LocalJournalSeq,
+    pin: Duration,
+}
+
+impl<V: OrderedRead> Pinned<V> {
+    /// The sequence the image will represent (`C` once published).
+    pub fn represented(&self) -> LocalJournalSeq {
+        self.represented
+    }
+
+    /// Step 2: produce the image from the snapshot and write it as a
+    /// complete inactive image.
+    ///
+    /// Touches neither the store's writer nor the journal, so it runs on
+    /// any thread while the owner goes on committing. A read after
+    /// `deadline` fails the export as [`BaselineError::Abandoned`]; the
+    /// write, once the image is produced, is not interrupted.
+    pub fn write(
+        self,
+        images: &LocalCheckpointStore,
+        limits: &LocalLimits,
+        deadline: Option<Instant>,
+    ) -> Result<Written, BaselineError> {
+        let started = Instant::now();
+        let bounded = Bounded {
+            view: self.view.view(),
+            deadline,
+            exceeded: Cell::new(false),
+        };
+        let checkpoint = match export_local(&bounded, self.origin, self.represented, limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) if bounded.exceeded.get() => return Err(BaselineError::Abandoned),
+            Err(e) => return Err(e.into()),
+        };
+        drop(self.view);
+        let export = started.elapsed();
+        let started = Instant::now();
+        let pointer = images.write(&checkpoint)?;
+        Ok(Written {
+            pointer,
+            pin: self.pin,
+            export,
+            write: started.elapsed(),
+        })
+    }
+}
+
+/// An image written and not yet selected: what [`Pinned::write`] hands
+/// back to the thread that owns the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Written {
+    /// The pointer that would select it.
+    pub pointer: CheckpointPointerV1,
+    /// How long the pin took.
+    pub pin: Duration,
+    /// How long producing the image took.
+    pub export: Duration,
+    /// How long writing it took.
+    pub write: Duration,
+}
+
+/// A snapshot whose reads fail once a deadline has passed.
+///
+/// `export_local` reads a page at a time, so a read that refuses ends
+/// the export within a page of the deadline.
+struct Bounded<'a, V> {
+    view: &'a V,
+    deadline: Option<Instant>,
+    exceeded: Cell<bool>,
+}
+
+impl<V> Bounded<'_, V> {
+    fn check(&self) -> Result<(), EngineError> {
+        match self.deadline {
+            Some(deadline) if Instant::now() > deadline => {
+                self.exceeded.set(true);
+                Err(EngineError::new(
+                    ErrorClass::Limit,
+                    "the checkpoint export ran past its deadline",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<V: OrderedRead> OrderedRead for Bounded<'_, V> {
+    fn get(&self, collection: CollectionId, key: &[u8]) -> Result<Option<Vec<u8>>, EngineError> {
+        self.check()?;
+        self.view.get(collection, key)
+    }
+
+    fn scan_page(
+        &self,
+        collection: CollectionId,
+        request: &ScanRequest,
+    ) -> Result<RowPage, EngineError> {
+        self.check()?;
+        self.view.scan_page(collection, request)
+    }
+}
+
 /// Storage that keeps a local recovery baseline of its own.
 ///
 /// A narrow seam rather than a method on the coordinator: publishing
@@ -145,6 +281,10 @@ impl From<JournaledError> for BaselineError {
 /// deliberately ignorant of both. A caller holds the store the images
 /// live in and asks for the cycle to be run against it.
 pub trait LocalBaseline {
+    /// The snapshot an image is produced from. It is sent to the thread
+    /// that writes the image.
+    type View: OrderedRead + Send + 'static;
+
     /// Journal records this node holds that the current baseline does
     /// not represent: `J - C`.
     ///
@@ -163,19 +303,45 @@ pub trait LocalBaseline {
     /// position" would hide both.
     fn frontiers(&self) -> Option<(u64, u64, u64)>;
 
-    /// Run the publication cycle once.
+    /// Step 1: pin a snapshot covering everything the projection has
+    /// materialized.
     ///
     /// `Ok(None)` when there is nothing new to represent: the baseline
     /// already covers everything the projection has materialized, and
     /// an image of it would select the same state and retire nothing.
+    fn pin_local(&mut self) -> Result<Option<Pinned<Self::View>>, BaselineError>;
+
+    /// Steps 3 to 5 for an image [`Pinned::write`] wrote: append the
+    /// pointer, retire the prefix, reclaim what it supersedes.
+    fn finish_local(
+        &mut self,
+        images: &LocalCheckpointStore,
+        written: Written,
+    ) -> Result<Publication, BaselineError>;
+
+    /// Run the publication cycle once, every step on this thread.
+    ///
+    /// `Ok(None)` when there is nothing new to represent, as for
+    /// [`LocalBaseline::pin_local`].
     fn publish_local(
         &mut self,
         images: &LocalCheckpointStore,
         limits: &LocalLimits,
-    ) -> Result<Option<Publication>, BaselineError>;
+    ) -> Result<Option<Publication>, BaselineError> {
+        let Some(pinned) = self.pin_local()? else {
+            return Ok(None);
+        };
+        let written = pinned.write(images, limits, None)?;
+        self.finish_local(images, written).map(Some)
+    }
 }
 
-impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E> {
+impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E>
+where
+    <E::Reader as SnapshotSource>::View: Send + 'static,
+{
+    type View = <E::Reader as SnapshotSource>::View;
+
     fn unreclaimed(&self) -> u64 {
         self.store().frontiers(self.domain()).map_or(0, |f| {
             f.durable().get().saturating_sub(f.checkpoint().get())
@@ -192,11 +358,7 @@ impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E> {
         })
     }
 
-    fn publish_local(
-        &mut self,
-        images: &LocalCheckpointStore,
-        limits: &LocalLimits,
-    ) -> Result<Option<Publication>, BaselineError> {
+    fn pin_local(&mut self) -> Result<Option<Pinned<Self::View>>, BaselineError> {
         let domain = self.domain();
         let store = self.store();
         let frontiers = store.frontiers(domain).ok_or(BaselineError::Unattached)?;
@@ -214,17 +376,36 @@ impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E> {
         // `&mut` owns both, so it covers at least `represented`. Being
         // ahead of it is harmless -- the pointer retires through what
         // it claims, never through what the image happens to contain.
+        // What is committed after the pin is not in the snapshot, so the
+        // image may be produced on another thread while it is.
         let started = Instant::now();
-        let gated = store
+        let view = store
             .reader(domain)
             .ok_or(BaselineError::Unattached)?
             .snapshot()?;
-        let checkpoint = export_local(gated.view(), origin, represented, limits)?;
-        drop(gated);
-        let export = started.elapsed();
-        let started = Instant::now();
-        let pointer = images.write(&checkpoint)?;
-        let write = started.elapsed();
+        Ok(Some(Pinned {
+            view,
+            origin,
+            represented,
+            pin: started.elapsed(),
+        }))
+    }
+
+    fn finish_local(
+        &mut self,
+        images: &LocalCheckpointStore,
+        written: Written,
+    ) -> Result<Publication, BaselineError> {
+        let domain = self.domain();
+        // The image was produced from the storage the pin saw. A domain
+        // reattached since then, from a peer's baseline, has another
+        // origin, and the image describes storage it no longer has.
+        // It is left unselected, and the next publication's reclaim
+        // removes it.
+        if self.store().origin(domain) != Some(written.pointer.origin) {
+            return Err(BaselineError::Superseded);
+        }
+        let pointer = written.pointer;
         // Step 3 and step 4, in that order and inside the journal.
         let published = self.store_mut().publish_checkpoint(domain, &pointer)?;
         // Step 5, last: an image is removed only once a newer one is
@@ -233,17 +414,18 @@ impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E> {
         let started = Instant::now();
         let reclaimed = images.reclaim(&pointer)?;
         let reclaim = started.elapsed();
-        Ok(Some(Publication {
+        Ok(Publication {
             pointer,
             represented: published.published,
             retired: published.retired,
             reclaimed,
             phases: Phases {
-                export,
-                write,
+                pin: written.pin,
+                export: written.export,
+                write: written.write,
                 journal: published.phases,
                 reclaim,
             },
-        }))
+        })
     }
 }

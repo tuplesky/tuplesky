@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use coord_authn::ClockHealth;
 use coord_checkpoint::local::LocalLimits;
-use coord_checkpoint::{LocalBaseline, LocalCheckpointStore};
+use coord_checkpoint::{BaselineError, LocalBaseline, LocalCheckpointStore, Written};
 use coord_collector::ingress::is_collector;
 use coord_collector::wire::{
     KIND_EVIDENCE, KIND_READ, KIND_READ_ANSWER, KIND_RELEASE, KIND_SUBMIT, decode_evidence,
@@ -1447,10 +1447,38 @@ struct Housekeeping {
     /// housekeeping that can make an incident worse. Raised, it retries
     /// as the journal grows instead.
     floor: u64,
+    /// The least time between two publications, beside `after`: under
+    /// the replay profile both have to have passed (task-d51). An image
+    /// copies the whole projection, so a cadence by records alone costs
+    /// a run time quadratic in its length; by time as well, a busy
+    /// domain publishes once an interval and a restart replays at most
+    /// an interval's records.
+    every: Option<std::time::Duration>,
+    /// When the last publication completed, or this domain was composed.
+    last: std::time::Instant,
     limits: LocalLimits,
+    /// The image being produced off the domain thread, at most one.
+    export: Option<Export>,
     /// Publications and failures so far (diagnostic).
     done: (u64, u64),
 }
+
+/// An image being produced and written on its own thread (task-d51).
+struct Export {
+    /// When the snapshot was pinned.
+    started: std::time::Instant,
+    /// What the pin cost the domain thread.
+    pinned: std::time::Duration,
+    worker: std::thread::JoinHandle<Result<Written, BaselineError>>,
+}
+
+/// How long an image may take to produce before it is abandoned
+/// (task-d51). The snapshot is held while it is produced, and the
+/// engine cannot reuse pages freed meanwhile, so the file grows with
+/// what is written for as long as it takes; an export that has not
+/// finished in this long is given up rather than left to grow it. The
+/// longest seen on the Jepsen runner was 2.5 s, at 365,000 records.
+const EXPORT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl<P: Persistence + LocalBaseline> Domain<P> {
     /// Compose `frontend` over `backing`.
@@ -1730,12 +1758,22 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
 
     /// Publish this node's recovery baseline into `images` once the
     /// journal has run `after` records past the last one.
-    pub fn with_checkpoints(mut self, images: LocalCheckpointStore, after: u64) -> Self {
+    /// Under the replay profile, `every` is the least time between two
+    /// (task-d51).
+    pub fn with_checkpoints(
+        mut self,
+        images: LocalCheckpointStore,
+        after: u64,
+        every: Option<std::time::Duration>,
+    ) -> Self {
         self.housekeeping = Some(Housekeeping {
             images,
             after,
             floor: after,
+            every,
+            last: std::time::Instant::now(),
             limits: LocalLimits::default(),
+            export: None,
             done: (0, 0),
         });
         self
@@ -2952,69 +2990,138 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 store.request_durable_projection();
             }
         }
-        let Some(housekeeping) = &self.housekeeping else {
+        let Some(mut housekeeping) = self.housekeeping.take() else {
             return;
         };
+        self.publish(&mut housekeeping);
+        self.housekeeping = Some(housekeeping);
+    }
+
+    /// The local checkpoint's turn (task-j04, task-d51): collect an image
+    /// that has been written, or start one that is due.
+    ///
+    /// The image is produced and written on a thread of its own from a
+    /// snapshot pinned here, and the domain goes on serving meanwhile.
+    /// This thread keeps the steps that order the publication: the pin,
+    /// then once the image and its directory are durable the pointer, the
+    /// retirement and the reclaim, in task-j04's order. A publication
+    /// costs it a pin and a pointer's sync, not the projection's size.
+    fn publish(&mut self, housekeeping: &mut Housekeeping) {
+        use coord_daemon::metrics::Stage;
         if housekeeping.after == 0 {
             return;
         }
-        let (after, floor, limits) = (housekeeping.after, housekeeping.floor, housekeeping.limits);
-        let gap = self.backing.applier().store().unreclaimed();
-        if gap < floor {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        if let Some(export) = &housekeeping.export {
+            if !export.worker.is_finished() {
+                return;
+            }
+            let export = housekeeping.export.take().expect("just seen");
+            let written = export.worker.join().unwrap_or_else(|_| {
+                eprintln!("the checkpoint writer panicked");
+                Err(BaselineError::Abandoned)
+            });
+            let started = std::time::Instant::now();
+            let outcome = written.and_then(|written| {
+                self.backing
+                    .applier_mut()
+                    .store_mut()
+                    .finish_local(&housekeeping.images, written)
+            });
+            let on_loop = export.pinned + started.elapsed();
+            let took = export.started.elapsed();
+            match outcome {
+                Ok(published) => {
+                    // The stage samples what the publication held this
+                    // thread for; `took_ms` is the whole of it.
+                    self.recorder.completed(Stage::Checkpoint, on_loop);
+                    housekeeping.done.0 += 1;
+                    housekeeping.floor = housekeeping.after;
+                    housekeeping.last = std::time::Instant::now();
+                    let phases = &published.phases;
+                    eprintln!(
+                        "checkpoint represented={} retired={} reclaimed={} took_ms={} \
+                         loop_ms={:.1} pin_ms={:.1} export_ms={:.1} write_ms={:.1} \
+                         drain_ms={:.1} sync_ms={:.1} append_ms={:.1} retire_ms={:.1} \
+                         reclaim_ms={:.1}",
+                        published.represented.get(),
+                        published.retired,
+                        published.reclaimed,
+                        took.as_millis(),
+                        ms(on_loop),
+                        ms(phases.pin),
+                        ms(phases.export),
+                        ms(phases.write),
+                        ms(phases.journal.drain),
+                        ms(phases.journal.sync),
+                        ms(phases.journal.append),
+                        ms(phases.journal.retire),
+                        ms(phases.reclaim),
+                    );
+                }
+                Err(e) => {
+                    self.recorder.refused(Stage::Checkpoint);
+                    housekeeping.done.1 += 1;
+                    let gap = self.backing.applier().store().unreclaimed();
+                    housekeeping.floor = gap.saturating_add(housekeeping.after);
+                    eprintln!(
+                        "this node could not publish a recovery checkpoint after {} ms: {e}",
+                        took.as_millis()
+                    );
+                }
+            }
             return;
         }
-        let images = housekeeping.images.clone();
-        // The export runs on this thread until task-d51 moves it off, and
-        // the domain takes no event meanwhile: its duration is in the line
-        // so that a run whose voter stalls here shows why, and so are its
-        // steps', so that it shows which of them grew (task-d55).
-        use coord_daemon::metrics::Stage;
+        let gap = self.backing.applier().store().unreclaimed();
+        if gap < housekeeping.floor {
+            return;
+        }
+        if housekeeping
+            .every
+            .is_some_and(|every| housekeeping.last.elapsed() < every)
+        {
+            return;
+        }
         let started = std::time::Instant::now();
-        let outcome = self
-            .backing
-            .applier_mut()
-            .store_mut()
-            .publish_local(&images, &limits);
-        let took = started.elapsed();
-        let housekeeping = self.housekeeping.as_mut().expect("just borrowed");
-        match outcome {
-            Ok(Some(published)) => {
+        let pinned = self.backing.applier_mut().store_mut().pin_local();
+        match pinned {
+            Ok(Some(pinned)) => {
                 self.recorder.entered(Stage::Checkpoint);
-                self.recorder.completed(Stage::Checkpoint, took);
-                housekeeping.done.0 += 1;
-                housekeeping.floor = after;
-                let phases = &published.phases;
-                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-                eprintln!(
-                    "checkpoint represented={} retired={} reclaimed={} took_ms={} \
-                     export_ms={:.1} write_ms={:.1} drain_ms={:.1} sync_ms={:.1} \
-                     append_ms={:.1} retire_ms={:.1} reclaim_ms={:.1}",
-                    published.represented.get(),
-                    published.retired,
-                    published.reclaimed,
-                    took.as_millis(),
-                    ms(phases.export),
-                    ms(phases.write),
-                    ms(phases.journal.drain),
-                    ms(phases.journal.sync),
-                    ms(phases.journal.append),
-                    ms(phases.journal.retire),
-                    ms(phases.reclaim),
-                );
+                let pin = started.elapsed();
+                let (images, limits) = (housekeeping.images.clone(), housekeeping.limits);
+                let deadline = started + EXPORT_DEADLINE;
+                let worker = std::thread::Builder::new()
+                    .name("checkpoint".into())
+                    .spawn(move || pinned.write(&images, &limits, Some(deadline)));
+                match worker {
+                    Ok(worker) => {
+                        housekeeping.export = Some(Export {
+                            started,
+                            pinned: pin,
+                            worker,
+                        });
+                    }
+                    Err(e) => {
+                        self.recorder.refused(Stage::Checkpoint);
+                        housekeeping.done.1 += 1;
+                        housekeeping.floor = gap.saturating_add(housekeeping.after);
+                        eprintln!("this node could not start a recovery checkpoint: {e}");
+                    }
+                }
             }
             // Nothing new to represent: the projection has materialized
             // nothing since the last baseline, so an image would select
             // the same state and retire nothing. Not a failure, and not
             // worth a line.
-            Ok(None) => housekeeping.floor = after,
+            Ok(None) => housekeeping.floor = housekeeping.after,
             Err(e) => {
                 self.recorder.entered(Stage::Checkpoint);
                 self.recorder.refused(Stage::Checkpoint);
                 housekeeping.done.1 += 1;
-                housekeeping.floor = gap.saturating_add(after);
+                housekeeping.floor = gap.saturating_add(housekeeping.after);
                 eprintln!(
                     "this node could not publish a recovery checkpoint after {} ms: {e}",
-                    took.as_millis()
+                    started.elapsed().as_millis()
                 );
             }
         }

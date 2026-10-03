@@ -497,7 +497,7 @@ fn a_provisioned_checkpoint_interval_leaves_every_other_limit_at_its_default() {
             assert_eq!(
                 config.limits,
                 coord_daemon::config::Limits {
-                    checkpoint_after_records: interval.unwrap_or(defaults.checkpoint_after_records),
+                    checkpoint_after_records: interval,
                     ..defaults
                 }
             );

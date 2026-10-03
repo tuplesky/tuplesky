@@ -9497,3 +9497,135 @@ task-j06's Jepsen runs at six nodes left three readings missing, and task-d55 ad
 - **A restart's replay.** `owed=0` on the `storage` line says the replay was complete, not what it cost. The attach records where the projection was found and the journal's durable head, and the time between them. `coordd` prints `replayed records= from= through= took_ms= attach_ms=` after `storage`. `attach_ms` includes a reinstall from the baseline's image, which `took_ms` does not. The `Recovery` stage takes the replay as its one sample a start, on the startup snapshot and on the serving loop's.
 - **The domain thread's scheduling.** The leader's busy time less its loop CPU was 1.41 ms a command under replay, with no pipeline wait counted. `cost.cpu.domain_scheduling` carries the thread's run-queue time (`schedstat`'s second field) and its voluntary and involuntary context switches (`status`), cumulative like the rest of the cost. Run-queue time is the host's cores; a voluntary switch is a blocking call on the loop's own thread.
 - **The interval a run needs.** `coord-harness provision --checkpoint-after-records N` (or `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`) sets every voter's interval, so one Jepsen run can say how much of the replay profile's tail is the publication before task-d51 moves it.
+
+## A voter's CPU per operation at five voters
+
+The review of task-d55's Jepsen runs on #98 found the runner saturated:
+its 4 cores divided by about 6.1 ms of CPU an operation, of which the
+five voters' `cost.cpu.process` was 4.09 ms and everything else, by
+subtraction, about 2.0 ms. etcd and its client cost at most 2.2 to
+2.3 ms on the same runner. This profile asked how the voters' part
+splits, and what the load generator costs when it is one process.
+
+**The run.** #145's head (570fc01), release build. Five voters from
+`coord-harness` on one four-core container, stores on its disk, the
+replay profile with `checkpoint_after_records = 65536`.
+`coord-wan-bench` drives it with 30 callers over five frontends,
+closed loop, put 30, get 50, contended 20, for 40,000 operations after
+500 of warm-up. Two runs: one clean, and one with
+`perf record -F 199 --call-graph dwarf` on every voter for 20 s of the
+middle. Each process's and each thread's user and system time is read
+from `/proc` at the start and the end.
+
+**Throughput and the host.** 676 operations a second clean, 602 under
+the profiler. The host was 3.10 cores busy, 0.36 in I/O wait and 0.46
+idle, so the voters here are not short of cores the way the runner's
+are.
+
+**Where the CPU goes, clean run, per operation:**
+
+| | leader | each follower | five voters |
+| --- | --- | --- | --- |
+| domain thread | 0.55 ms | 0.32 ms | 1.83 ms (43%) |
+| transport threads (`tokio-rt-worker`) | 0.34 ms | 0.26 ms | 1.38 ms (32%) |
+| materializer | 0.16 ms | 0.15 ms | 0.74 ms (17%) |
+| appender | 0.06 ms | 0.06 ms | 0.31 ms (7%) |
+| process | 1.10 ms | 0.79 ms | 4.26 ms |
+
+- **The voters cost the same here as on the runner:** 4.26 ms an
+  operation here, 4.09 there. So this host measures the daemon's part
+  of the runner's arithmetic.
+- **The load generator cost 0.20 ms an operation**, 8.1 s of CPU over
+  the profiled run: one process, one QUIC endpoint, 30 sessions. On the
+  runner the harness's share is about 2.0 ms, ten times as much, which
+  is the case for #98's one shim process.
+- **The voters alone are near twice etcd with its client.** That is the
+  daemon's part of the gap.
+
+**The leader's domain thread** (1,454 samples, counted inclusively):
+
+| what | share | about, per operation |
+| --- | --- | --- |
+| `Voter::pump_reads`: held reads served | 25.0% | 0.14 ms |
+| of which pinning a snapshot (`GatedReader::snapshot`) | 16.4% | |
+| of which point reads (`RedbView::get`) | 13.7% | |
+| `Leader::step` | 18.7% | 0.10 ms |
+| of which `resend_unvoted` | 8.7% | 0.05 ms |
+| `run_executions` (the apply's bound) | 10.1% | 0.06 ms |
+| the journal's group | 5.0% | 0.03 ms |
+| the allocator (`malloc`, `realloc`, `free`) | 25.2% | |
+| the scheduler and futexes | 6.7% | |
+
+- **A held read pins its own snapshot.** A read that comes due under
+  task-d50 is evaluated from a fresh redb read transaction, and the
+  gate reads the durable metadata to prove its stamp (11.8% of the
+  thread). Then every point read opens its table again: `open_table`
+  is 11.0% of the thread on its own. One snapshot per pump, and a
+  snapshot that keeps its tables, is task-d58.
+- **The re-send sorts every proposal on every flush.**
+  `resend_unvoted` collects the durable proposals, sorts them and scans
+  them once per voter, and three quarters of its time is its own.
+  task-d59.
+- **Allocation has no single owner.** `malloc` and `realloc` are
+  reached from encoding into vectors that grow as they are written
+  (journal records, store envelopes, postcard frames), from the
+  outbox's release and from the read path's tables. task-d60 measures
+  an allocator first, then sizes the encoders.
+
+**A follower's domain thread** (866 samples): `Follower::step` 23.8%,
+`run_executions` 16.5% (`apply_bound` 12.9%), the journal 10.5% (its
+record's encoding 5.3%), `Outbox::release` 7.3%, and the allocator
+32.4%, inclusive. Nothing in it waits on a read, which is why a
+follower's thread costs 0.32 ms to the leader's 0.55.
+
+**The transport threads** cost a voter a third of its CPU. On the
+leader (882 samples): QUIC's per-packet work (`quinn_proto`) 23.8%,
+`sendmsg` 15.0%, parking and waking 19.4%, frame encoding 6.2%,
+`rustls` 5.3%, the cipher itself 4.8%, `recvmsg` 2.2%. A follower's
+are the same shape: 22.1%, 13.4%, 26.4%, 4.9%, 3.9%, 3.4%, 3.4%, with
+the allocator 11.1%. The cost is per frame and per packet, not per
+byte, and the cipher is not it. task-d61 counts frames per command and
+sends what one turn has for one peer as one write.
+
+**The materializer** is 54 to 60% in redb's commit (its `fsync` 12 to
+13%, its freed-page bookkeeping 8 to 10%) and 39% applying the rows.
+**The appender** is 39% in `fsync`, 51% in the write and 33% encoding.
+Neither is on the domain thread any more (task-d52, task-d54).
+
+**What follows.** task-d58 through task-d61, after task-d51. The
+leader's domain thread is the one that sets the domain's rate, and
+task-d58 and task-d59 together are a third of it.
+
+## The local checkpoint off the domain thread
+
+task-d51. task-j06's Jepsen runs measured each publication of the
+local checkpoint at 170 to 250 ms of the domain thread at 65,536
+records, almost all of it the export and the image write (task-d55),
+and the closed loop's tail was those stalls.
+
+- **The split.** `LocalBaseline::pin_local` pins the snapshot on the
+  domain thread. It is the gated reader's (task-11), the same pin
+  task-d37's scrub will take, and what is committed after it is not in
+  it. `Pinned::write` produces the image from it and writes it, on a
+  thread named `checkpoint`. It touches neither the projection's writer
+  nor the journal. `LocalBaseline::finish_local` runs back on the domain
+  thread once the image and its directory are durable: the pointer, the
+  retirement and the reclaim, in task-j04's order. `publish_local` is
+  still the three in a row, for a caller with no thread to spare.
+- **What the domain thread waits for.** Nothing. It checks the writer
+  each turn, publishes once it has finished, and starts the next only
+  after that: at most one image is in flight.
+- **The bound.** A read of the snapshot after 60 s fails the export as
+  abandoned. The snapshot is released and nothing is written. An image
+  of a domain reattached under another origin meanwhile is not
+  published (`BaselineError::Superseded`); the next publication's
+  reclaim removes it.
+- **The cadence.** Unset, `checkpoint_after_records` is 4,096 under the
+  strict profile and 65,536 under the replay profile, and the new
+  `checkpoint_after_seconds` is none under strict and 30 under replay.
+  Where both apply, both have to have passed. A configuration that
+  names either keeps it.
+- **The line.** `checkpoint` gains `loop_ms`, what the publication held
+  the domain thread for (the pin and the finish), and `pin_ms`.
+  `took_ms` is now from the pin to the finish, most of it off the
+  thread. The `Checkpoint` stage samples `loop_ms`.
