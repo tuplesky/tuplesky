@@ -80,6 +80,9 @@ fn executed(tag: u8, position: u64) -> StoreUpdate {
     }
 }
 
+/// Every row of a projection, as (collection, key, value).
+type Rows = Vec<(u16, Vec<u8>, Vec<u8>)>;
+
 /// Every row of every registered collection, in collection and key order.
 fn rows<E: coord_store_api::engine::LocalEngine>(
     store: &JournaledStore<RaftEngineJournal, E>,
@@ -349,7 +352,17 @@ fn copy_tree(from: &Path, to: &Path) {
 /// outcomes, one flush each, until the first failure.
 fn materialize_steps(store: &mut JournaledStore<RaftEngineJournal, RedbEngine>, steps: u64) {
     let mut barriers = BarrierAllocator::new(inc(), FIRST_BOOT);
-    for step in 1..=steps {
+    materialize_range(store, &mut barriers, 1..=steps);
+}
+
+/// [`materialize_steps`] for the steps in `range`, with `barriers`;
+/// whether every one was materialized.
+fn materialize_range(
+    store: &mut JournaledStore<RaftEngineJournal, RedbEngine>,
+    barriers: &mut BarrierAllocator,
+    range: std::ops::RangeInclusive<u64>,
+) -> bool {
+    for step in range {
         let protocol = store.submit(Submission {
             domain: A,
             ballot: ballot(step),
@@ -365,7 +378,7 @@ fn materialize_steps(store: &mut JournaledStore<RaftEngineJournal, RedbEngine>, 
             },
         });
         let Some(base) = store.application_base(A) else {
-            return;
+            return false;
         };
         let application = store.submit(Submission {
             domain: A,
@@ -390,9 +403,10 @@ fn materialize_steps(store: &mut JournaledStore<RaftEngineJournal, RedbEngine>, 
             },
         });
         if protocol.is_err() || application.is_err() || store.flush().is_err() {
-            return;
+            return false;
         }
     }
+    true
 }
 
 /// task-d48: the projection commits in one phase under the journal, and a
@@ -551,6 +565,26 @@ fn crash_matrix(replay: Option<DurableCadence>) {
 /// the next boot replays nothing.
 #[test]
 fn sync_projections_makes_redbs_working_commits_durable() {
+    redbs_working_commits_made_durable_by(|store| {
+        store.sync_projections().unwrap();
+    });
+}
+
+/// task-j06 review: so does the idle sync, once a request for a durable
+/// commit has met no commit -- the time bound on a domain that went idle.
+#[test]
+fn an_idle_sync_makes_redbs_working_commits_durable() {
+    redbs_working_commits_made_durable_by(|store| {
+        store.request_durable_projection();
+        store.sync_idle_projections().unwrap();
+    });
+}
+
+/// Materialize working commits on redb, show a crash would lose some of
+/// them, `sync`, and show a crash then loses none.
+fn redbs_working_commits_made_durable_by(
+    sync: impl FnOnce(&mut JournaledStore<RaftEngineJournal, RedbEngine>),
+) {
     const STEPS: u64 = 3;
     let dir = tempfile::tempdir().unwrap();
     let journal = RaftEngineJournal::create(
@@ -583,7 +617,7 @@ fn sync_projections_makes_redbs_working_commits_durable() {
     let (backend, _) = FaultBackend::new(shared.crash_image(Tail::None), FaultPlan::default());
     assert!(kv_rows(&RedbEngine::from_backend(backend, CACHE).unwrap()) < STEPS as usize);
 
-    store.sync_projections().unwrap();
+    sync(&mut store);
     assert_eq!(
         store.projection_durable(A).unwrap(),
         frontiers.materialized()
@@ -592,5 +626,168 @@ fn sync_projections_makes_redbs_working_commits_durable() {
     assert_eq!(
         kv_rows(&RedbEngine::from_backend(backend, CACHE).unwrap()),
         STEPS as usize
+    );
+}
+
+/// task-j06 over redb, the publication's own matrix: under the
+/// replay-backed profile with no cadence at all, so the only durable
+/// projection commits are the ones a checkpoint publication forces, a
+/// crash at every write and sync of the projection -- before, inside and
+/// after the publication, with nothing, everything or a seeded subset of
+/// the unsynced writes surviving -- leaves a projection that continues
+/// the journal from the baseline the journal selects (`C <= M_durable`),
+/// and the next boot recovers exactly the rows a run without a crash had
+/// at the same journal head. Without the forced sync, every crash after
+/// the pointer is durable leaves the projection below the retired prefix.
+#[test]
+fn a_crash_anywhere_around_a_publication_under_the_replay_profile_continues_the_journal() {
+    use coord_journal_api::CheckpointPointerV1;
+    use std::collections::BTreeMap;
+    let never = DurableCadence {
+        commits: NonZeroU32::new(u32::MAX).unwrap(),
+        records: NonZeroU32::new(u32::MAX).unwrap(),
+    };
+    // The rows to compare, less the stamp: its digest is of a record of
+    // this journal's own stream, which another journal does not share,
+    // and `validate_projection` has already checked it against the
+    // journal it belongs to.
+    let unstamped = |mut rows: Rows| {
+        rows.retain(|(c, key, _)| {
+            !(*c == Collection::MetaV1.id().0
+                && key.as_slice() == coord_store_api::registry::meta_fields::APPLIED_STAMP)
+        });
+        rows
+    };
+    // The workload, and what the projection held at each journal head it
+    // passed through.
+    let workload = |store: &mut JournaledStore<RaftEngineJournal, RedbEngine>,
+                    seen: &mut BTreeMap<u64, Rows>| {
+        let mut barriers = BarrierAllocator::new(inc(), FIRST_BOOT);
+        let mut note = |store: &JournaledStore<RaftEngineJournal, RedbEngine>| {
+            let materialized = store.frontiers(A).unwrap().materialized().get();
+            seen.insert(materialized, unstamped(rows(store, A)));
+        };
+        for step in 1..=2 {
+            if !materialize_range(store, &mut barriers, step..=step) {
+                return;
+            }
+            note(store);
+        }
+        let pointer = CheckpointPointerV1 {
+            origin: store.origin(A).unwrap(),
+            represented: store.frontiers(A).unwrap().materialized(),
+            format: 1,
+            manifest_digest: Digest32([0x5a; 32]),
+            checkpoint_id: Digest32([0x5b; 32]),
+        };
+        if store.publish_checkpoint(A, &pointer).is_err() {
+            return;
+        }
+        note(store);
+        for step in 3..=4 {
+            if !materialize_range(store, &mut barriers, step..=step) {
+                return;
+            }
+            note(store);
+        }
+    };
+    let measure = |dir: &Path, plan: Option<(u64, Tail)>| {
+        let journal =
+            RaftEngineJournal::create(dir, identity(), &JournalOptions::default()).unwrap();
+        let (backend, shared) = FaultBackend::new(Vec::new(), FaultPlan::default());
+        let engine = RedbEngine::create_on_backend(backend, CACHE).unwrap();
+        let mut store = JournaledStore::open(
+            journal,
+            CLUSTER,
+            REPLICA,
+            inc(),
+            FIRST_BOOT,
+            JournalLimits::default(),
+        )
+        .unwrap();
+        store.replay_projection(never).unwrap();
+        store.attach(A, shard(), engine).unwrap();
+        let setup = shared.ops();
+        if let Some((k, tail)) = plan {
+            shared.set_plan(FaultPlan {
+                crash_after: Some(setup + k),
+                tail,
+                ..FaultPlan::default()
+            });
+        }
+        let mut seen = BTreeMap::new();
+        workload(&mut store, &mut seen);
+        drop(store);
+        (setup, shared, seen)
+    };
+    let probe_dir = tempfile::tempdir().unwrap();
+    let (setup, probe, reference) = measure(&probe_dir.path().join("journal"), None);
+    let workload_ops = probe.ops() - setup;
+    assert_eq!(reference.len(), 5, "four steps and a publication");
+
+    let mut published = 0;
+    for k in 1..=workload_ops {
+        for tail in [Tail::None, Tail::All, Tail::Seeded(k)] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal_dir = dir.path().join("journal");
+            let (_, shared, crashed_seen) = measure(&journal_dir, Some((k, tail)));
+            assert!(shared.is_frozen(), "k={k}: the crash happened");
+            let image = shared.crash_image(tail);
+            let journal = RaftEngineJournal::open_existing(
+                &journal_dir,
+                identity(),
+                &JournalOptions::default(),
+            )
+            .unwrap();
+            let engine = if image.is_empty() {
+                let (backend, _) = FaultBackend::new(Vec::new(), FaultPlan::default());
+                RedbEngine::create_on_backend(backend, CACHE).unwrap()
+            } else {
+                let (backend, _) = FaultBackend::new(image, FaultPlan::default());
+                RedbEngine::from_backend(backend, CACHE).expect("the projection reopens")
+            };
+            let mut next = JournaledStore::open(
+                journal,
+                CLUSTER,
+                REPLICA,
+                inc(),
+                NEXT_BOOT,
+                JournalLimits::default(),
+            )
+            .unwrap();
+            next.replay_projection(never).unwrap();
+            let baseline = next
+                .recovery_baseline(A)
+                .unwrap()
+                .map_or(LocalJournalSeq::ZERO, |p| p.represented);
+            if baseline > LocalJournalSeq::ZERO {
+                published += 1;
+            }
+            next.validate_projection(A, &engine, baseline)
+                .unwrap_or_else(|e| {
+                    panic!("k={k} tail={tail:?}: the projection does not continue the journal from {baseline:?}: {e}")
+                });
+            next.attach_with_baseline(A, shard(), engine, baseline)
+                .unwrap_or_else(|e| panic!("k={k} tail={tail:?}: {e:?}"));
+            let recovered = next.frontiers(A).unwrap();
+            assert_eq!(recovered.materialized(), recovered.durable());
+            assert_eq!(next.status(A), Some(DomainStatus::Ready));
+            // This boot's own lifecycle record is the head; the workload's
+            // last record is the one before it.
+            let head = recovered.durable().get() - 1;
+            assert!(
+                crashed_seen.keys().all(|seen| *seen <= head),
+                "k={k} tail={tail:?}: the journal lost a record the crashed run materialized"
+            );
+            assert_eq!(
+                Some(&unstamped(rows(&next, A))),
+                reference.get(&head),
+                "k={k} tail={tail:?}: the recovered projection is the journal's state at {head}"
+            );
+        }
+    }
+    assert!(
+        published > 0,
+        "some crashes came after the pointer was durable"
     );
 }

@@ -482,3 +482,74 @@ fn a_reconciled_commit_leaves_the_projection_durable() {
     assert_eq!(world.engine().working_commits(), 0);
     assert_eq!(kv_only(world.engine().durable_rows()), reference_kv(3));
 }
+
+/// task-j06 review: a domain that goes idle on working commits has no next
+/// commit to take a request for a durable one. Once a request has met no
+/// commit, `sync_idle_projections` makes them durable, so the time bound
+/// holds on an idle domain too and a crash after it replays nothing; a
+/// request a commit took is spent there, and leaves nothing to sync.
+#[test]
+fn an_idle_domain_is_synced_once_its_request_meets_no_commit() {
+    let profile = ProjectionProfile::Replay(never());
+    let mut world = World::new(profile);
+    world.commit_each(3);
+    assert!(world.store.projection_volatile(A));
+    // Nothing asked for: nothing synced.
+    let working = world.engine().working_commits();
+    world.store.sync_idle_projections().unwrap();
+    assert_eq!(world.engine().working_commits(), working);
+    // A request the next commit takes is spent there.
+    world.store.request_durable_projection();
+    world.commit_each(1);
+    assert_eq!(world.engine().working_commits(), 0);
+    world.commit_each(2);
+    world.store.sync_idle_projections().unwrap();
+    assert_eq!(world.engine().working_commits(), 2);
+    // A request no commit takes: the domain is idle, and is synced.
+    world.store.request_durable_projection();
+    world.store.sync_idle_projections().unwrap();
+    assert_eq!(world.engine().working_commits(), 0);
+    assert!(!world.store.projection_volatile(A));
+    assert_eq!(world.projection_durable(), world.materialized());
+    assert_eq!(kv_only(world.engine().durable_rows()), reference_kv(6));
+    let next = crash_and_attach(world, profile, LocalJournalSeq::ZERO).unwrap();
+    assert_recovered(&next, 6);
+}
+
+/// The idle sync leaves a domain whose engine the materializer has: the
+/// commit out there carries the request, and is made durable by it.
+#[test]
+fn an_idle_sync_leaves_a_lent_engine_to_the_commit_it_has_out() {
+    let mut world = World::new(ProjectionProfile::Replay(never()));
+    world.store.sync_projections().unwrap();
+    let (materializer, handle) = ManualMaterializer::new();
+    world.store.pipeline(Box::new(materializer)).unwrap();
+    world.queue(1);
+    world.store.append().unwrap();
+    world.store.hand_off().unwrap();
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert_eq!(world.engine().working_commits(), 1);
+    world.store.request_durable_projection();
+    world.queue(1);
+    world.store.append().unwrap();
+    world.store.hand_off().unwrap();
+    assert!(world.store.lent(A));
+    world.store.sync_idle_projections().unwrap();
+    assert!(handle.run());
+    world.store.hand_off().unwrap();
+    assert!(!world.store.lent(A));
+    assert_eq!(world.engine().working_commits(), 0);
+    assert_eq!(world.projection_durable(), world.materialized());
+}
+
+/// The strict profile has nothing volatile and nothing to sync.
+#[test]
+fn the_strict_profile_has_no_volatile_projection() {
+    let mut world = World::new(ProjectionProfile::Strict);
+    world.commit_each(2);
+    assert!(!world.store.projection_volatile(A));
+    world.store.request_durable_projection();
+    world.store.sync_idle_projections().unwrap();
+    assert_eq!(world.projection_durable(), world.materialized());
+}

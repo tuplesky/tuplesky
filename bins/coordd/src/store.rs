@@ -1115,7 +1115,11 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
     /// published: the first boot's projection is put back after the
     /// second boot's checkpoint retired the prefix it would replay.
     /// Returns the journal head the second boot reached and the baseline.
-    fn a_projection_behind_its_baseline(config: &Config, dir: &Path) -> (u64, u64) {
+    /// A node initialized at incarnation 1 and served at `at` -- an
+    /// adoption when `at` is later -- whose projection is put back behind
+    /// the baseline a later boot published. Returns the journal's durable
+    /// head and the baseline's represented sequence.
+    fn a_projection_behind_its_baseline(config: &Config, dir: &Path, at: u64) -> (u64, u64) {
         use coord_checkpoint::LocalBaseline;
         let opened = open_storage(
             config,
@@ -1129,11 +1133,16 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
         let mut storage = opened.attach().expect("attach");
         crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
         drop(storage);
+        if at > 1 {
+            let opened = serve(config, at).expect("serve");
+            assert!(opened.adoption.is_some(), "no adoption was pending");
+            drop(opened.attach().expect("the adoption"));
+        }
         copy_tree(&dir.join("state"), &dir.join("state-before"));
 
-        // The second boot appends its lifecycle record, materializes it
+        // The next boot appends its lifecycle record, materializes it
         // and publishes a baseline that represents it.
-        let mut storage = serve(config, 1).expect("serve").attach().expect("attach");
+        let mut storage = serve(config, at).expect("serve").attach().expect("attach");
         let published = storage
             .domain
             .publish_local(
@@ -1165,7 +1174,7 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
     fn a_projection_behind_its_baseline_is_reinstalled_only_under_the_replay_profile() {
         let dir = workspace("reinstall");
         let mut config = config(&dir);
-        let (durable, represented) = a_projection_behind_its_baseline(&config, &dir);
+        let (durable, represented) = a_projection_behind_its_baseline(&config, &dir, 1);
         assert!(represented > 0);
 
         let refused = serve(&config, 1).expect("serve").attach();
@@ -1195,6 +1204,91 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             .expect("serve")
             .attach()
             .expect("the reinstalled generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// task-j06, on a node that has been through an adoption (task-58):
+    /// the manifest moved to the new incarnation and the projection, and
+    /// every image published from it, kept the one it was created under.
+    /// The reinstall stages a generation under the manifest's and installs
+    /// the image's record into it, which a selected generation may hold.
+    #[test]
+    fn a_projection_behind_its_baseline_is_reinstalled_after_an_adoption() {
+        let dir = workspace("reinstall-adopted");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let (durable, represented) = a_projection_behind_its_baseline(&config, &dir, 2);
+        assert!(represented > 0);
+
+        let storage = serve(&config, 2)
+            .expect("serve")
+            .attach()
+            .expect("an adopted node reinstalls its baseline");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        assert_eq!(frontiers.checkpoint().get(), represented);
+        assert!(frontiers.durable().get() > durable);
+        drop(storage);
+        assert_eq!(
+            coord_storage_redb::lifecycle::selected_manifest(
+                &config.state.root_path(&config.state_directory)
+            )
+            .expect("manifest")
+            .incarnation,
+            incarnation(2)
+        );
+        serve(&config, 2)
+            .expect("serve")
+            .attach()
+            .expect("the reinstalled generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// task-j06: a reinstall stopped after its generation is activated
+    /// and before the attach has replayed anything onto it. The next
+    /// start finds the image's projection at the baseline, which
+    /// continues the journal, so it keeps it -- no second reinstall --
+    /// and replays `(C, J]` onto it as any boot does.
+    #[test]
+    fn a_reinstall_stopped_before_its_replay_is_finished_by_the_next_start() {
+        let dir = workspace("reinstall-stopped");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let (durable, represented) = a_projection_behind_its_baseline(&config, &dir, 1);
+
+        let reinstalled = {
+            let opened = serve(&config, 1).expect("serve");
+            let checkpoints = coord_checkpoint::LocalCheckpointStore::open(&opened.checkpoint_root)
+                .expect("checkpoints");
+            let baseline = opened
+                .store
+                .recovery_baseline(opened.domain_id)
+                .expect("baseline")
+                .expect("a published baseline");
+            let image = checkpoints.load(&baseline).expect("image");
+            let generation = reinstall_if_invalid(
+                &opened.store,
+                opened.domain_id,
+                opened.generation,
+                Some((&baseline, &image)),
+                baseline.represented,
+                opened.options,
+            )
+            .expect("reinstalled");
+            // The process stops here: the reinstalled generation is
+            // selected, and nothing has been replayed onto it.
+            generation.directory().to_path_buf()
+        };
+
+        let storage = serve(&config, 1)
+            .expect("serve")
+            .attach()
+            .expect("the next start replays onto the reinstalled generation");
+        assert_eq!(storage.generation, reinstalled, "reinstalled a second time");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        assert_eq!(frontiers.checkpoint().get(), represented);
+        assert!(frontiers.durable().get() > durable);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

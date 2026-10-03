@@ -2499,9 +2499,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .dispatcher()
             .next_read_deadline()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()));
+        // A working projection commit is made durable within its bound
+        // on an idle domain too, and nothing arrives to say it is due
+        // (task-j06).
+        let durable_projection = self
+            .durable_projection
+            .filter(|_| self.backing.applier().store().projection_volatile())
+            .map(|(every, last)| last + every / 2);
         [
-            expiry, parked, reoffer, redial, renewal, election, resend, catch_up, pages, report,
+            expiry,
+            parked,
+            reoffer,
+            redial,
+            renewal,
+            election,
+            resend,
+            catch_up,
+            pages,
+            report,
             read,
+            durable_projection,
         ]
         .into_iter()
         .flatten()
@@ -2884,16 +2901,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// node whose checkpoints have been failing for a week is a node
     /// whose disk is filling, and that is an operator's to see.
     fn maintain(&mut self) {
-        // Asking costs nothing: the next projection commit is the durable
-        // one, whichever thread makes it.
+        // The time bound on a working projection commit (task-j06), in
+        // two halves. Every half interval the next projection commit is
+        // asked to be durable, which costs nothing: whichever thread
+        // makes it, a busy domain makes it soon. A request still waiting
+        // at the next half has met no commit at all, so the domain is
+        // idle, and the projection is made durable here -- one empty
+        // durable commit on a thread with nothing else to do. Either way
+        // a working commit is durable within the interval.
         if let Some((every, last)) = &mut self.durable_projection {
             let now = std::time::Instant::now();
-            if now.duration_since(*last) >= *every {
+            if now.duration_since(*last) >= *every / 2 {
                 *last = now;
-                self.backing
-                    .applier_mut()
-                    .store_mut()
-                    .request_durable_projection();
+                let store = self.backing.applier_mut().store_mut();
+                // A failure is said and left, as at the stop: the journal
+                // holds every record, and the next commit says whether
+                // the engine can still commit at all.
+                if let Err(e) = store.sync_idle_projections() {
+                    eprintln!("the idle projection could not be made durable: {e}");
+                }
+                store.request_durable_projection();
             }
         }
         let Some(housekeeping) = &self.housekeeping else {

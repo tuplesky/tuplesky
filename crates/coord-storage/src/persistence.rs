@@ -230,6 +230,20 @@ pub trait Persistence {
     /// there is nothing to ask for there.
     fn request_durable_projection(&mut self) {}
 
+    /// Make durable now the working projection commits a request has
+    /// been waiting on with no commit to take it (task-j06): the half of
+    /// the time bound an idle domain needs, since it has no next commit.
+    /// Nothing under the strict profile.
+    fn sync_idle_projections(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Whether the projection holds working commits a crash would lose
+    /// (task-j06). Never under the strict profile.
+    fn projection_volatile(&self) -> bool {
+        false
+    }
+
     /// Make every working projection commit durable now (task-j06), for
     /// a clean stop: a commit or an append out on another thread is
     /// waited for and taken back first, and what it completed reported.
@@ -620,6 +634,14 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
             .sync_projections()
             .map(lowered_from_journal)
             .map_err(engine)
+    }
+
+    fn sync_idle_projections(&mut self) -> Result<(), EngineError> {
+        self.store.sync_idle_projections().map_err(engine)
+    }
+
+    fn projection_volatile(&self) -> bool {
+        self.store.projection_volatile(self.domain)
     }
 
     fn projection_durable(&self) -> Option<LocalJournalSeq> {

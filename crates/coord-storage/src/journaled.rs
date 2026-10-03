@@ -2400,13 +2400,18 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
                     // Whether the commit reconciled here was durable or a
                     // working one is not known (task-j06). Under the
                     // strict profile every commit is durable; under the
-                    // replay-backed one the projection is made durable
-                    // now, so neither the cadence's bound nor
+                    // replay-backed one it is counted as working, the
+                    // weaker of the two, and the projection is then made
+                    // durable, so neither the cadence's bound nor
                     // `projection_durable` is lost to an uncertain
-                    // outcome.
+                    // outcome -- and if that sync fails, the cadence has
+                    // still counted the commit.
                     match self.profile {
                         ProjectionProfile::Strict => state.committed(true, taken),
-                        ProjectionProfile::Replay(_) => state.sync_projection()?,
+                        ProjectionProfile::Replay(_) => {
+                            state.committed(false, taken);
+                            state.sync_projection()?;
+                        }
                     }
                 } else if observed == state.meta {
                     // The commit is absent. The records are authoritative
@@ -2650,6 +2655,43 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
             if state.projection_durable < state.frontiers.materialized() {
                 state.working.requested = true;
             }
+        }
+    }
+
+    /// Make durable now the working commits of every domain whose request
+    /// ([`JournaledStore::request_durable_projection`]) no commit has
+    /// taken since (task-j06): a domain that has gone idle, so there is
+    /// no next commit for the request to make durable, and its working
+    /// commits would otherwise stay volatile until the next command, the
+    /// next checkpoint or the stop. A domain whose engine is lent is
+    /// left: the commit out there, or the one after it, takes the
+    /// request. One empty durable commit per such domain, on the
+    /// caller's thread.
+    pub fn sync_idle_projections(&mut self) -> Result<(), JournaledError> {
+        if matches!(self.profile, ProjectionProfile::Strict) {
+            return Ok(());
+        }
+        for state in self.domains.values_mut() {
+            if state.status == DomainStatus::Quarantined
+                || !state.working.requested
+                || state.engine.is_none()
+            {
+                continue;
+            }
+            state.sync_projection()?;
+        }
+        Ok(())
+    }
+
+    /// Whether a domain's projection holds working commits a crash would
+    /// lose (task-j06). Never under the strict profile.
+    pub fn projection_volatile(&self, domain: DomainId) -> bool {
+        match self.profile {
+            ProjectionProfile::Strict => false,
+            ProjectionProfile::Replay(_) => self
+                .domains
+                .get(&domain)
+                .is_some_and(|d| d.projection_durable < d.frontiers.materialized()),
         }
     }
 

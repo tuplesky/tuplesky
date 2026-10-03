@@ -356,7 +356,9 @@ pub struct JournalConfig {
     #[serde(default = "projection_durable_records")]
     pub projection_durable_records: u32,
     /// Under [`JOURNAL_REPLAY_PROFILE`], milliseconds at most a working
-    /// commit waits for a durable one while the node is busy.
+    /// commit waits for a durable one, busy or idle: half way the next
+    /// commit is asked to be durable, and a domain that has made none by
+    /// the end is synced by its own loop.
     #[serde(default = "projection_durable_ms")]
     pub projection_durable_ms: u64,
 }
@@ -975,26 +977,25 @@ impl Config {
         if !self.journal.replays_projection() {
             engine_named("journal.profile", &self.journal.profile, JOURNAL_PROFILE)?;
         }
-        for (field, value) in [
+        for (field, value, max) in [
             (
                 "journal.projection_durable_commits",
                 u64::from(self.journal.projection_durable_commits),
+                u64::from(u32::MAX),
             ),
             (
                 "journal.projection_durable_records",
                 u64::from(self.journal.projection_durable_records),
+                u64::from(u32::MAX),
             ),
             (
                 "journal.projection_durable_ms",
                 self.journal.projection_durable_ms,
+                u64::MAX,
             ),
         ] {
             if value == 0 {
-                return Err(ConfigError::OutOfRange {
-                    field,
-                    min: 1,
-                    max: u64::from(u32::MAX),
-                });
+                return Err(ConfigError::OutOfRange { field, min: 1, max });
             }
         }
         // A node that journals nothing has no authoritative transition to

@@ -9432,8 +9432,16 @@ until task-j05's composed matrix.
   database is a durable commit, so a node stopped cleanly loses nothing.
 - **When a commit is durable.** `DurableCadence` makes the next commit
   durable after `commits` working commits or `records` records applied
-  (64 and 4096 by default), and `coordd` asks for one every
-  `projection_durable_ms` (100). A checkpoint publication makes the
+  (64 and 4096 by default). `coordd` bounds the time too, at
+  `projection_durable_ms` (100), in two halves: every half interval it
+  asks for the next commit to be durable, and a request still waiting at
+  the next half has met no commit, so the domain is idle and its loop
+  makes the projection durable itself (`sync_idle_projections`, one
+  empty durable commit). The loop has a deadline for it while anything
+  is volatile, so an idle domain wakes for it. Without that half the
+  bound held only while commands kept coming, and a domain that went
+  quiet kept its working commits volatile until the next command, the
+  next checkpoint or the stop. A checkpoint publication makes the
   projection durable before it appends the pointer and retires the
   prefix: the pointer retires the journal through `C`, and a crash
   afterwards takes the projection back to its last durable commit,
@@ -9454,8 +9462,16 @@ until task-j05's composed matrix.
   record's own digest at the head. If it fails, the generation is
   restaged (`Generation::stage_reinstall`, which carries obligations
   because the image is this node's own) and the baseline's image is
-  installed (`install_local`, which now admits a staging's identity rows
-  when the image holds the same ones). The attach then replays `(C, J]`.
+  installed (`install_local`, which now admits a staging's six identity
+  rows when the image holds the same ones, and nothing else). The
+  incarnation may differ, by the rule a selected generation is opened
+  under: an adoption (task-58) advances the manifest alone, so the
+  projection and every image published from it keep the incarnation
+  they were created under, at or below the one the reinstall stages
+  with, and the install writes the image's back. A reinstall stopped
+  after activation and before the replay leaves a projection at `C`
+  that continues the journal, so the next start keeps it and replays.
+  The attach then replays `(C, J]`.
   Without a baseline the node refuses to serve: the genesis rows were
   written before the journal existed, so a replay into an empty
   projection could not rebuild them. The attach refuses the same
@@ -9465,8 +9481,10 @@ until task-j05's composed matrix.
   anywhere durable, and the attach replays the journal above the stamp
   under either profile. A node started strict after a replay run
   replays what its last run left working.
-- **What is not shown here.** The faultkit matrix crashes the projection
-  at each of its writes and syncs; it does not crash the journal, which
-  is task-j05's. SIGKILL under the Jepsen kill nemesis, the boot replay
+- **What is not shown here.** The faultkit matrices crash the projection
+  at each of its writes and syncs, one of them around a checkpoint
+  publication with no cadence at all, so that only the publication's
+  forced sync is durable; they do not crash the journal, which is
+  task-j05's. SIGKILL under the Jepsen kill nemesis, the boot replay
   time and the 6-node disk rows with the profile on are the #98 owner's
   runs, after #143's fence fix.

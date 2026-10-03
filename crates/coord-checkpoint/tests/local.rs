@@ -441,57 +441,88 @@ fn an_image_is_never_merged_and_never_inherited() {
 /// admitted, and one that differs from the image is a target that is not
 /// fresh.
 #[test]
-fn a_target_may_hold_only_metadata_the_image_holds_as_it_is() {
-    let source = engine();
-    let checkpoint = exported(&source);
+fn a_target_may_hold_only_identity_the_image_holds_as_it_is() {
+    use coord_checkpoint::local::InstallLocalError;
     let meta = Collection::MetaV1.id();
-    let row = checkpoint
-        .chunks
-        .iter()
-        .flat_map(|chunk| chunk.rows.iter())
-        .find(|row| row.collection == meta.0)
-        .expect("the image carries metadata")
-        .clone();
-
-    let mut staged = ModelEngine::new();
-    let mut tx = staged.begin_write().unwrap();
-    tx.put(meta, &row.key, &row.value).unwrap();
+    let incarnation = |n: u64| ReplicaIncarnation::new(n).unwrap().to_be_bytes().to_vec();
+    // An image of a projection created under incarnation 5, as every
+    // image is after an adoption: the record keeps the generation the
+    // database was created under (task-58).
+    let mut source = engine();
+    let mut tx = source.begin_write().unwrap();
+    tx.put(meta, meta_fields::CLUSTER_ID, b"cluster").unwrap();
+    tx.put(meta, meta_fields::INCARNATION, &incarnation(5))
+        .unwrap();
     tx.commit_durable().unwrap();
-    install_local(
-        &mut staged,
-        &checkpoint,
-        &origin(3),
-        &InstallLocalLimits::default(),
-    )
-    .expect("the same row is admitted");
+    let checkpoint = exported(&source);
+    let stamp = source
+        .reader()
+        .snapshot()
+        .unwrap()
+        .get(meta, meta_fields::APPLIED_STAMP)
+        .unwrap()
+        .expect("the image is stamped");
 
-    let mut differs = ModelEngine::new();
-    let mut tx = differs.begin_write().unwrap();
-    tx.put(meta, &row.key, b"another value").unwrap();
-    tx.commit_durable().unwrap();
-    assert!(matches!(
+    let staged = |rows: &[(&[u8], &[u8])]| {
+        let mut engine = ModelEngine::new();
+        let mut tx = engine.begin_write().unwrap();
+        for (key, value) in rows {
+            tx.put(meta, key, value).unwrap();
+        }
+        tx.commit_durable().unwrap();
+        engine
+    };
+    let install = |engine: &mut ModelEngine| {
         install_local(
-            &mut differs,
+            engine,
             &checkpoint,
             &origin(3),
-            &InstallLocalLimits::default()
-        ),
-        Err(coord_checkpoint::local::InstallLocalError::NotEmpty { collection }) if collection == meta.0
-    ));
+            &InstallLocalLimits::default(),
+        )
+    };
+    let refused = |result: Result<u64, InstallLocalError>| matches!(result, Err(InstallLocalError::NotEmpty { collection }) if collection == meta.0);
 
-    let mut unknown = ModelEngine::new();
-    let mut tx = unknown.begin_write().unwrap();
-    tx.put(meta, b"not-in-the-image", b"row").unwrap();
-    tx.commit_durable().unwrap();
-    assert!(matches!(
-        install_local(
-            &mut unknown,
-            &checkpoint,
-            &origin(3),
-            &InstallLocalLimits::default()
-        ),
-        Err(coord_checkpoint::local::InstallLocalError::NotEmpty { .. })
-    ));
+    // The same identity, and one staged at a later incarnation: the
+    // reinstall of a node that has adopted since the image was cut.
+    for at in [5, 7] {
+        let mut target = staged(&[
+            (meta_fields::CLUSTER_ID, b"cluster"),
+            (meta_fields::INCARNATION, &incarnation(at)),
+        ]);
+        install(&mut target).unwrap_or_else(|e| panic!("staged at {at}: {e:?}"));
+        assert_eq!(
+            target
+                .reader()
+                .snapshot()
+                .unwrap()
+                .get(meta, meta_fields::INCARNATION)
+                .unwrap(),
+            Some(incarnation(5)),
+            "the image's record comes back, as a selected generation may hold it"
+        );
+    }
+
+    // An image *ahead* of the staging is not this generation's.
+    assert!(refused(install(&mut staged(&[(
+        meta_fields::INCARNATION,
+        &incarnation(4)
+    )]))));
+    // Any other identity row must be the image's own.
+    assert!(refused(install(&mut staged(&[(
+        meta_fields::CLUSTER_ID,
+        b"another cluster"
+    )]))));
+    // A row the image holds identically, but that is not identity: a
+    // stamp is a target that is not empty, whatever its value.
+    assert!(refused(install(&mut staged(&[(
+        meta_fields::APPLIED_STAMP,
+        &stamp
+    )]))));
+    // A row the image does not hold at all.
+    assert!(refused(install(&mut staged(&[(
+        b"not-in-the-image".as_slice(),
+        b"row".as_slice()
+    )]))));
 }
 
 fn image_dir(root: &Path, id: &Digest32) -> std::path::PathBuf {

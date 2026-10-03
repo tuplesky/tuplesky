@@ -118,7 +118,10 @@ pub enum Stage {
     DependencyClosure = 0x0004,
     /// The durable journal.
     Journal = 0x0005,
-    /// Materialization into the projection.
+    /// Materialization into the projection. Under the replay-backed
+    /// profile (task-j06) most of these commits are working ones, so the
+    /// stage's time is not a durable commit's; what a crash would leave
+    /// is `frontiers.projection_durable`.
     Materialization = 0x0006,
     /// Learning from evidence.
     EvidenceLearning = 0x0007,
