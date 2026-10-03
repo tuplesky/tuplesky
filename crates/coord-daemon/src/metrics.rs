@@ -133,7 +133,9 @@ pub enum Stage {
     Checkpoint = 0x000a,
     /// Bulk traffic's interference with everything else.
     BulkInterference = 0x000b,
-    /// Recovery.
+    /// Recovery. `coordd` samples the boot's replay of the journal into
+    /// the projection here, one a start (task-d55), so it is every
+    /// storage-holding role's, as the journal is.
     Recovery = 0x000c,
 }
 
@@ -186,14 +188,11 @@ impl Stage {
         let has = |role: Role| roles.roles().contains(&role);
         match self {
             // Every role journals and materializes its own storage.
-            Stage::Journal | Stage::Materialization | Stage::Checkpoint => {
+            Stage::Journal | Stage::Materialization | Stage::Checkpoint | Stage::Recovery => {
                 has(Role::Voter) || has(Role::Observer)
             }
             // Consensus stages belong to a voter.
-            Stage::FanOut
-            | Stage::DependencyClosure
-            | Stage::EvidenceLearning
-            | Stage::Recovery => has(Role::Voter),
+            Stage::FanOut | Stage::DependencyClosure | Stage::EvidenceLearning => has(Role::Voter),
             // The caller-facing stages belong to whatever serves callers.
             Stage::Admission | Stage::ClientTransit | Stage::Watches => {
                 has(Role::Frontend) || has(Role::Observer)
