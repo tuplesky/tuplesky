@@ -950,6 +950,7 @@ fn the_binary_takes_the_profile_from_its_flag_or_its_environment() {
             "COORD_HARNESS_PROJECTION_DURABLE_COMMITS",
             "COORD_HARNESS_PROJECTION_DURABLE_RECORDS",
             "COORD_HARNESS_PROJECTION_DURABLE_MS",
+            "COORD_HARNESS_CHECKPOINT_AFTER_RECORDS",
         ] {
             command.env_remove(name);
         }
@@ -996,5 +997,121 @@ fn the_binary_takes_the_profile_from_its_flag_or_its_environment() {
     assert!(config.is_none());
     let (ok, config) = run(&[], &[("COORD_HARNESS_JOURNAL_PROFILE", "fast")]);
     assert!(!ok, "a profile that names nothing was accepted");
+    assert!(config.is_none());
+    // Nor is one that is not text at all read as strict.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("a run directory");
+        let output = std::process::Command::new(binary)
+            .arg("provision")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--voters")
+            .arg("3")
+            .env(
+                "COORD_HARNESS_JOURNAL_PROFILE",
+                std::ffi::OsStr::from_bytes(b"repl\xffay"),
+            )
+            .output()
+            .expect("ran");
+        assert!(
+            !output.status.success(),
+            "a profile that is not text was accepted"
+        );
+        assert!(!dir.path().join("n1/coordd.toml").exists());
+    }
+}
+
+/// task-d55: how far each voter's journal runs past its last local
+/// checkpoint is part of what is provisioned. Without it nothing is
+/// written and the daemon's default stands; with it every voter gets a
+/// `[limits]` carrying it, and the description records it. The binary
+/// takes it from `--checkpoint-after-records` or, as Jepsen's control
+/// node passes it, from `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, and
+/// refuses a variable that does not parse.
+#[test]
+fn the_checkpoint_interval_is_written_into_every_voter_and_recorded() {
+    let dir = tempfile::tempdir().expect("a run directory");
+    let out = provision(&Plan::loopback(dir.path().to_path_buf(), 3, 0)).expect("provisioned");
+    assert_eq!(out.checkpoint_after_records, None);
+    for node in &out.voters {
+        let config = std::fs::read_to_string(&node.config).expect("config");
+        assert!(!config.contains("[limits]"), "{config}");
+    }
+    let description: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("harness.json")).expect("read"))
+            .expect("json");
+    assert!(description.get("checkpoint_after_records").is_none());
+
+    for n in [0, 65_536] {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let out = provision(&Plan {
+            checkpoint_after_records: Some(n),
+            ..Plan::loopback(dir.path().to_path_buf(), 3, 0)
+        })
+        .expect("provisioned");
+        for node in &out.voters {
+            let config = std::fs::read_to_string(&node.config).expect("config");
+            let limits = &config[config.find("\n[limits]\n").expect("a limits section")..];
+            assert!(
+                limits.contains(&format!("\ncheckpoint_after_records = {n}\n")),
+                "{limits}"
+            );
+        }
+        assert_eq!(
+            Provisioned::read(dir.path())
+                .expect("the description")
+                .checkpoint_after_records,
+            Some(n)
+        );
+    }
+
+    let binary = env!("CARGO_BIN_EXE_coord-harness");
+    let run = |args: &[&str], env: &[(&str, &str)]| {
+        let dir = tempfile::tempdir().expect("a run directory");
+        let output = std::process::Command::new(binary)
+            .arg("provision")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--voters")
+            .arg("3")
+            .args(args)
+            .env_remove("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS")
+            .envs(env.iter().copied())
+            .output()
+            .expect("ran");
+        let config = std::fs::read_to_string(dir.path().join("n1/coordd.toml")).ok();
+        (output.status.success(), config)
+    };
+    let (ok, config) = run(&["--checkpoint-after-records", "65536"], &[]);
+    assert!(ok);
+    assert!(
+        config
+            .expect("config")
+            .contains("checkpoint_after_records = 65536\n")
+    );
+    let (ok, config) = run(&[], &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "0")]);
+    assert!(ok);
+    assert!(
+        config
+            .expect("config")
+            .contains("checkpoint_after_records = 0\n")
+    );
+    let (ok, config) = run(
+        &["--checkpoint-after-records", "8192"],
+        &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "0")],
+    );
+    assert!(ok);
+    assert!(
+        config
+            .expect("config")
+            .contains("checkpoint_after_records = 8192\n")
+    );
+    let (ok, config) = run(&[], &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "")]);
+    assert!(ok);
+    assert!(!config.expect("config").contains("[limits]"));
+    let (ok, config) = run(&[], &[("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS", "often")]);
+    assert!(!ok, "an interval that does not parse was accepted");
     assert!(config.is_none());
 }

@@ -95,7 +95,7 @@ pub use handoff::{
     activate_successor, publish_certificate, publish_handoff_activation, published_certificate,
     read_installs, record_install, record_local_install, select_certificate,
 };
-pub use maintain::{BaselineError, LocalBaseline, Publication};
+pub use maintain::{BaselineError, LocalBaseline, Phases, Publication};
 pub use store::{LocalCheckpointStore, SharedImageStore, StoreError};
 
 pub use install::{

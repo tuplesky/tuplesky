@@ -290,6 +290,28 @@ async fn a_voter_killed_under_the_replay_profile_comes_back_and_serves() {
     .await;
 }
 
+/// The value a read of one key came back with: `None` for a read that
+/// was not established or found nothing.
+async fn read_value(caller: &mut Caller, provisioned: &Provisioned, key: &[u8]) -> Option<Vec<u8>> {
+    match caller
+        .call(&get(provisioned, key), Duration::from_secs(30))
+        .await
+    {
+        Ok(coord_sdk::Outcome::Established { result, .. }) => {
+            match postcard::from_bytes::<coord_state::Response>(&result)
+                .ok()?
+                .outcome
+            {
+                coord_state::Outcome::Range { items, .. } => {
+                    items.first().map(|item| item.entry.value.clone())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The startup metrics lines of what a voter said, in order.
 fn startup_metrics(said: &str) -> Vec<serde_json::Value> {
     said.lines()
@@ -440,14 +462,46 @@ async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
         voters[1].said(),
         voters[2].said()
     );
-    // And the write from before the kill is read through it.
+    // And the write from before the kill is read through it, value and
+    // all: a replay that restored nothing would still establish a read
+    // of a missing key.
     assert_eq!(
-        returned
-            .ask(&get(&provisioned, b"before"), Duration::from_secs(30))
-            .await,
-        Answer::Established,
-        "the returned voter did not serve a read of the write before its kill:\n{}",
+        read_value(&mut returned, &provisioned, b"before").await,
+        Some(b"placed".to_vec()),
+        "the returned voter did not read back the write from before its kill:\n{}",
         voters[2].said()
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// task-d55: a checkpoint interval the harness provisions is the one the
+/// daemon reads, and the rest of the `[limits]` it has to write beside it
+/// are the daemon's own defaults, so setting the one does not quietly set
+/// the others.
+#[test]
+fn a_provisioned_checkpoint_interval_leaves_every_other_limit_at_its_default() {
+    let dir = workspace("checkpoint-interval");
+    for interval in [None, Some(0), Some(65_536)] {
+        let run = dir.join(format!("{interval:?}"));
+        let provisioned = provision(&Plan {
+            checkpoint_after_records: interval,
+            ..Plan::loopback(run.clone(), 3, 0)
+        })
+        .expect("provisioned");
+        for node in &provisioned.voters {
+            let config = coord_daemon::config::Config::parse(
+                &std::fs::read_to_string(&node.config).expect("the voter's configuration"),
+            )
+            .expect("a configuration the daemon accepts");
+            let defaults = coord_daemon::config::Limits::default();
+            assert_eq!(
+                config.limits,
+                coord_daemon::config::Limits {
+                    checkpoint_after_records: interval.unwrap_or(defaults.checkpoint_after_records),
+                    ..defaults
+                }
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -84,6 +84,26 @@ struct Provisioning {
     /// commit waits for a durable one (`COORD_HARNESS_PROJECTION_DURABLE_MS`).
     #[arg(long)]
     projection_durable_ms: Option<u64>,
+    /// Journal records each voter holds past its last local checkpoint
+    /// before it publishes the next, where not the daemon's 4096; zero
+    /// never publishes (`COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`).
+    #[arg(long)]
+    checkpoint_after_records: Option<u64>,
+}
+
+/// A `COORD_HARNESS_*` variable: `None` when unset or empty, refused
+/// when it does not parse, since a run would otherwise be labelled by a
+/// setting it did not run.
+fn from_env<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+    match std::env::var(name) {
+        Ok(text) if text.is_empty() => Ok(None),
+        Ok(text) => text
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{name}=`{text}` does not parse")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
 }
 
 impl Provisioning {
@@ -92,23 +112,14 @@ impl Provisioning {
     /// that does not parse is refused rather than ignored, since a run
     /// would otherwise be labelled by a profile it did not run.
     fn journal(&self) -> Result<JournalPlan, String> {
-        fn from_env<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
-            match std::env::var(name) {
-                Ok(text) if text.is_empty() => Ok(None),
-                Ok(text) => text
-                    .parse()
-                    .map(Some)
-                    .map_err(|_| format!("{name}=`{text}` does not parse")),
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(e) => Err(format!("{name}: {e}")),
-            }
-        }
         let profile = match self.journal_profile {
             Some(profile) => profile,
             None => match std::env::var("COORD_HARNESS_JOURNAL_PROFILE") {
-                Ok(text) if !text.is_empty() => JournalProfile::parse(&text)
+                Ok(text) if text.is_empty() => JournalProfile::Strict,
+                Ok(text) => JournalProfile::parse(&text)
                     .map_err(|e| format!("COORD_HARNESS_JOURNAL_PROFILE: {e}"))?,
-                _ => JournalProfile::Strict,
+                Err(std::env::VarError::NotPresent) => JournalProfile::Strict,
+                Err(e) => return Err(format!("COORD_HARNESS_JOURNAL_PROFILE: {e}")),
             },
         };
         Ok(JournalPlan {
@@ -126,6 +137,14 @@ impl Provisioning {
                 None => from_env("COORD_HARNESS_PROJECTION_DURABLE_MS")?,
             },
         })
+    }
+
+    /// `checkpoint_after_records` from its flag, or from its variable.
+    fn checkpoint_after_records(&self) -> Result<Option<u64>, String> {
+        match self.checkpoint_after_records {
+            Some(n) => Ok(Some(n)),
+            None => from_env("COORD_HARNESS_CHECKPOINT_AFTER_RECORDS"),
+        }
     }
 }
 
@@ -270,9 +289,11 @@ fn provision(
         .into());
     }
     let journal = provisioning.journal()?;
+    let checkpoint_after_records = provisioning.checkpoint_after_records()?;
     Ok(coord_harness::provision(&Plan {
         hosts,
         journal,
+        checkpoint_after_records,
         listen_any: provisioning.listen_any,
         edge_host: provisioning.edge_host,
         issuer_listen: provisioning.issuer_listen,

@@ -553,3 +553,40 @@ fn the_strict_profile_has_no_volatile_projection() {
     world.store.sync_idle_projections().unwrap();
     assert_eq!(world.projection_durable(), world.materialized());
 }
+
+/// task-d55: the attach says what it replayed -- from where the crash
+/// left the projection to the journal's head -- and a projection the
+/// crash left at the head replays nothing.
+#[test]
+fn the_attach_reports_what_it_replayed() {
+    let profile = ProjectionProfile::Replay(never());
+    let mut world = World::new(profile);
+    world.commit_each(6);
+    let left = world.projection_durable();
+    let head = world.store.frontiers(A).unwrap().durable();
+    assert!(left < head);
+    let next = crash_and_attach(world, profile, LocalJournalSeq::ZERO).unwrap();
+    let replayed = next.replayed(A).expect("attached");
+    assert_eq!((replayed.from, replayed.through), (left, head));
+    assert_eq!(replayed.records(), head.get() - left.get());
+
+    let mut world = World::new(profile);
+    world.commit_each(3);
+    world.store.sync_projections().unwrap();
+    let next = crash_and_attach(world, profile, LocalJournalSeq::ZERO).unwrap();
+    assert_eq!(next.replayed(A).expect("attached").records(), 0);
+    assert_eq!(next.replayed(DomainId([0xb2; 16])), None);
+}
+
+/// task-d55: a publication reports its steps apart, and under the strict
+/// profile it spends nothing making the projection durable, which every
+/// commit already was.
+#[test]
+fn a_strict_publication_spends_nothing_on_the_projections_sync() {
+    let mut world = World::new(ProjectionProfile::Strict);
+    world.commit_each(4);
+    let pointer = world.pointer();
+    let published = world.store.publish_checkpoint(A, &pointer).unwrap();
+    assert_eq!(published.phases.sync, std::time::Duration::ZERO);
+    assert!(published.retired);
+}
