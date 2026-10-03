@@ -21,6 +21,7 @@
 //! of that one, so nothing here infers intent: `coordd init` creates,
 //! `coordd` serves, and each refuses the other's situation.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use coord_core::effect::BootId;
@@ -30,7 +31,9 @@ use coord_journal_raft_engine::journal::{
     JournalIdentity, JournalOptions, OpenError as JournalOpenError, RaftEngineJournal,
 };
 use coord_storage::JournaledDomain;
-use coord_storage::journaled::{JournalLimits, JournaledStore};
+use coord_storage::journaled::{
+    DurableCadence, JournalLimits, JournaledError, JournaledStore, ProjectionProfile,
+};
 use coord_storage_redb::RedbEngine;
 use coord_storage_redb::lifecycle::{
     Generation, InactiveGeneration, OpenError, OpenOptions, StoreIdentity,
@@ -280,6 +283,9 @@ pub struct Opened {
     checkpoint_root: PathBuf,
     /// An authorized replacement's adoption, still to be made durable.
     adoption: Option<Adoption>,
+    /// How the projection's generation is opened, for a reinstall
+    /// (task-j06).
+    options: OpenOptions,
 }
 
 /// An authorized replacement this start comes back on (task-58), found
@@ -445,6 +451,23 @@ pub fn open_storage_with(
         root: show(&journal_root),
         reason: format!("{e:?}"),
     })?;
+    let mut store = store;
+    // The replay-backed profile is set before the domain is attached, so
+    // the attach's own replay already commits under it (task-j06).
+    if config.journal.replays_projection() {
+        let cadence = DurableCadence {
+            commits: NonZeroU32::new(config.journal.projection_durable_commits)
+                .expect("validated at parse"),
+            records: NonZeroU32::new(config.journal.projection_durable_records)
+                .expect("validated at parse"),
+        };
+        store
+            .replay_projection(cadence)
+            .map_err(|e| StoreError::Refused {
+                root: show(&journal_root),
+                reason: format!("{e}"),
+            })?;
+    }
 
     let checkpoint_root = root_path(&config.state_directory, &config.state.checkpoints);
     let adoption = pending.map(|previous| Adoption {
@@ -469,6 +492,9 @@ pub fn open_storage_with(
         boot,
         checkpoint_root,
         adoption,
+        options: OpenOptions {
+            cache_bytes: config.state.cache_bytes,
+        },
     })
 }
 
@@ -500,6 +526,7 @@ impl Opened {
             boot,
             checkpoint_root,
             adoption,
+            options,
         } = self;
         let mut generation = generation;
         // The rollback guard (task-60). A build started against a cluster
@@ -538,9 +565,6 @@ impl Opened {
                 between,
             )?,
         };
-        let directory = generation.directory().to_path_buf();
-        let (engine, _lock, _manifest) = generation.into_parts();
-
         // The local checkpoint directory, and what the journal says the
         // baseline is. Both are read before the domain is attached: the
         // baseline is a fact of the stream, not of the projection, and an
@@ -559,12 +583,28 @@ impl Opened {
                 root: show(&journal_root),
                 reason: format!("the local recovery baseline could not be read: {e}"),
             })?;
-        if let Some(pointer) = &baseline {
-            checkpoints.load(pointer).map_err(|e| StoreError::Refused {
+        let image = match &baseline {
+            Some(pointer) => Some(checkpoints.load(pointer).map_err(|e| StoreError::Refused {
                 root: show(&checkpoint_root),
                 reason: format!("{e}"),
-            })?;
-        }
+            })?),
+            None => None,
+        };
+        let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
+        let generation = if store.projection_profile() == ProjectionProfile::Strict {
+            generation
+        } else {
+            reinstall_if_invalid(
+                &store,
+                domain_id,
+                generation,
+                baseline.as_ref().zip(image.as_ref()),
+                represented,
+                options,
+            )?
+        };
+        let directory = generation.directory().to_path_buf();
+        let (engine, _lock, _manifest) = generation.into_parts();
 
         // Shard 0 for the single-domain preview; task-j07 is where a node
         // spreads domains over a shard set.
@@ -573,7 +613,6 @@ impl Opened {
         // would count the whole retained stream as unreclaimed, and the
         // housekeeping that watches that number would publish a full image
         // on every restart of a node that had once crossed its threshold.
-        let represented = baseline.map_or(LocalJournalSeq::ZERO, |pointer| pointer.represented);
         store
             .attach_with_baseline(domain_id, shard, engine, represented)
             .map_err(|e| StoreError::Refused {
@@ -602,6 +641,82 @@ impl Opened {
             boot,
         })
     }
+}
+
+/// Under the replay-backed profile (task-j06, Section 17.16.4), keep the
+/// projection a boot found if it continues the journal, and otherwise
+/// discard it and install the selected baseline's image in its place.
+///
+/// A crash rolls such a projection back to its last durable commit, and
+/// every forced durable commit -- before a checkpoint pointer retires a
+/// prefix -- is what keeps that commit at the baseline or past it, so the
+/// ordinary case is a projection behind the journal that the attach
+/// replays forward. One that is behind the baseline, or whose stamp is
+/// not the record the journal holds at it, cannot be: the image is this
+/// node's own state at the baseline, and the attach then replays
+/// `(C, J]` onto it. Without a baseline there is nothing to install, and
+/// the node refuses to serve rather than guess.
+fn reinstall_if_invalid(
+    store: &JournaledStore<RaftEngineJournal, RedbEngine>,
+    domain_id: DomainId,
+    mut generation: Generation,
+    baseline: Option<(
+        &coord_journal_api::CheckpointPointerV1,
+        &coord_checkpoint::LocalCheckpointV1,
+    )>,
+    represented: LocalJournalSeq,
+    options: OpenOptions,
+) -> Result<Generation, StoreError> {
+    let directory = generation.directory().to_path_buf();
+    let refused = |reason: String| StoreError::Refused {
+        root: show(&directory),
+        reason,
+    };
+    let why = match store.validate_projection(domain_id, generation.engine(), represented) {
+        Ok(()) => return Ok(generation),
+        Err(JournaledError::ProjectionInvalid(why)) => why,
+        Err(e) => {
+            return Err(refused(format!(
+                "the projection could not be checked against the journal: {e}"
+            )));
+        }
+    };
+    let Some((pointer, image)) = baseline else {
+        return Err(refused(format!(
+            "the projection does not continue the journal ({why}) and no local \
+             checkpoint was published to reinstall it from"
+        )));
+    };
+    eprintln!(
+        "the projection does not continue the journal ({why}); reinstalling the local \
+         checkpoint at {}",
+        pointer.represented.get()
+    );
+    let manifest = generation.manifest();
+    let identity = StoreIdentity {
+        cluster_id: manifest.cluster_id,
+        domain_id: manifest.domain_id,
+        replica_id: manifest.replica_id,
+        incarnation: manifest.incarnation,
+    };
+    let mut staged = generation
+        .stage_reinstall(identity, options)
+        .map_err(|e| refused(format!("a generation to reinstall into: {e}")))?;
+    coord_checkpoint::install_local(
+        staged.engine(),
+        image,
+        &pointer.origin,
+        &coord_checkpoint::local::InstallLocalLimits::default(),
+    )
+    .map_err(|e| {
+        refused(format!(
+            "the local checkpoint could not be installed: {e:?}"
+        ))
+    })?;
+    let generation = staged
+        .activate()
+        .map_err(|e| refused(format!("the reinstalled generation: {e}")))?;
+    Ok(generation)
 }
 
 /// Carry out an authorized replacement's adoption: the journal's stream
@@ -980,6 +1095,200 @@ namespace = "5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
             Ok(_) => {}
             Err(e) => panic!("the initialized node did not open: {e}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("copy target");
+        for entry in std::fs::read_dir(from).expect("copy source") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy");
+            }
+        }
+    }
+
+    /// End two boots with a projection behind the baseline the second
+    /// published: the first boot's projection is put back after the
+    /// second boot's checkpoint retired the prefix it would replay.
+    /// Returns the journal head the second boot reached and the baseline.
+    /// A node initialized at incarnation 1 and served at `at` -- an
+    /// adoption when `at` is later -- whose projection is put back behind
+    /// the baseline a later boot published. Returns the journal's durable
+    /// head and the baseline's represented sequence.
+    fn a_projection_behind_its_baseline(config: &Config, dir: &Path, at: u64) -> (u64, u64) {
+        use coord_checkpoint::LocalBaseline;
+        let opened = open_storage(
+            config,
+            Intent::Initialize,
+            CLUSTER,
+            DOMAIN,
+            REPLICA,
+            incarnation(1),
+        )
+        .expect("init");
+        let mut storage = opened.attach().expect("attach");
+        crate::write_genesis_policy(config, &mut storage, incarnation(1)).expect("policy");
+        drop(storage);
+        if at > 1 {
+            let opened = serve(config, at).expect("serve");
+            assert!(opened.adoption.is_some(), "no adoption was pending");
+            drop(opened.attach().expect("the adoption"));
+        }
+        copy_tree(&dir.join("state"), &dir.join("state-before"));
+
+        // The next boot appends its lifecycle record, materializes it
+        // and publishes a baseline that represents it.
+        let mut storage = serve(config, at).expect("serve").attach().expect("attach");
+        let published = storage
+            .domain
+            .publish_local(
+                &storage.checkpoints,
+                &coord_checkpoint::LocalLimits::default(),
+            )
+            .expect("publish")
+            .expect("something to represent");
+        let durable = storage
+            .domain
+            .store()
+            .frontiers(DOMAIN)
+            .expect("frontiers")
+            .durable()
+            .get();
+        drop(storage);
+        std::fs::remove_dir_all(dir.join("state")).expect("remove");
+        std::fs::rename(dir.join("state-before"), dir.join("state")).expect("put back");
+        (durable, published.represented.get())
+    }
+
+    /// task-j06: under the strict profile a projection behind the
+    /// published baseline stops the node -- nothing would have rolled it
+    /// back, so it is damage -- and under the replay-backed profile the
+    /// same projection is discarded and the baseline's image installed in
+    /// its place, after which the attach replays `(C, J]` and the node
+    /// serves at the journal's head.
+    #[test]
+    fn a_projection_behind_its_baseline_is_reinstalled_only_under_the_replay_profile() {
+        let dir = workspace("reinstall");
+        let mut config = config(&dir);
+        let (durable, represented) = a_projection_behind_its_baseline(&config, &dir, 1);
+        assert!(represented > 0);
+
+        let refused = serve(&config, 1).expect("serve").attach();
+        assert!(
+            matches!(&refused, Err(StoreError::Refused { reason, .. }) if reason.contains("ProjectionInvalid")),
+            "the strict profile attached a projection behind its baseline: {:?}",
+            refused.err().map(|e| e.to_string())
+        );
+
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let storage = serve(&config, 1)
+            .expect("serve")
+            .attach()
+            .expect("the replay profile reinstalls the baseline");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        assert_eq!(frontiers.checkpoint().get(), represented);
+        // This boot's lifecycle record is past the second boot's head.
+        assert!(frontiers.durable().get() > durable);
+        assert_eq!(
+            storage.baseline.map(|p| p.represented.get()),
+            Some(represented)
+        );
+        drop(storage);
+        // The reinstalled generation is the one selected now.
+        serve(&config, 1)
+            .expect("serve")
+            .attach()
+            .expect("the reinstalled generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// task-j06, on a node that has been through an adoption (task-58):
+    /// the manifest moved to the new incarnation and the projection, and
+    /// every image published from it, kept the one it was created under.
+    /// The reinstall stages a generation under the manifest's and installs
+    /// the image's record into it, which a selected generation may hold.
+    #[test]
+    fn a_projection_behind_its_baseline_is_reinstalled_after_an_adoption() {
+        let dir = workspace("reinstall-adopted");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let (durable, represented) = a_projection_behind_its_baseline(&config, &dir, 2);
+        assert!(represented > 0);
+
+        let storage = serve(&config, 2)
+            .expect("serve")
+            .attach()
+            .expect("an adopted node reinstalls its baseline");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        assert_eq!(frontiers.checkpoint().get(), represented);
+        assert!(frontiers.durable().get() > durable);
+        drop(storage);
+        assert_eq!(
+            coord_storage_redb::lifecycle::selected_manifest(
+                &config.state.root_path(&config.state_directory)
+            )
+            .expect("manifest")
+            .incarnation,
+            incarnation(2)
+        );
+        serve(&config, 2)
+            .expect("serve")
+            .attach()
+            .expect("the reinstalled generation serves again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// task-j06: a reinstall stopped after its generation is activated
+    /// and before the attach has replayed anything onto it. The next
+    /// start finds the image's projection at the baseline, which
+    /// continues the journal, so it keeps it -- no second reinstall --
+    /// and replays `(C, J]` onto it as any boot does.
+    #[test]
+    fn a_reinstall_stopped_before_its_replay_is_finished_by_the_next_start() {
+        let dir = workspace("reinstall-stopped");
+        let mut config = config(&dir);
+        config.journal.profile = coord_daemon::config::JOURNAL_REPLAY_PROFILE.to_owned();
+        let (durable, represented) = a_projection_behind_its_baseline(&config, &dir, 1);
+
+        let reinstalled = {
+            let opened = serve(&config, 1).expect("serve");
+            let checkpoints = coord_checkpoint::LocalCheckpointStore::open(&opened.checkpoint_root)
+                .expect("checkpoints");
+            let baseline = opened
+                .store
+                .recovery_baseline(opened.domain_id)
+                .expect("baseline")
+                .expect("a published baseline");
+            let image = checkpoints.load(&baseline).expect("image");
+            let generation = reinstall_if_invalid(
+                &opened.store,
+                opened.domain_id,
+                opened.generation,
+                Some((&baseline, &image)),
+                baseline.represented,
+                opened.options,
+            )
+            .expect("reinstalled");
+            // The process stops here: the reinstalled generation is
+            // selected, and nothing has been replayed onto it.
+            generation.directory().to_path_buf()
+        };
+
+        let storage = serve(&config, 1)
+            .expect("serve")
+            .attach()
+            .expect("the next start replays onto the reinstalled generation");
+        assert_eq!(storage.generation, reinstalled, "reinstalled a second time");
+        let frontiers = storage.domain.store().frontiers(DOMAIN).expect("frontiers");
+        assert_eq!(frontiers.materialized(), frontiers.durable());
+        assert_eq!(frontiers.checkpoint().get(), represented);
+        assert!(frontiers.durable().get() > durable);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

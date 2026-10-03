@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use coord_harness::domain::{Address, Plan, Provisioned};
+use coord_harness::domain::{Address, JournalPlan, JournalProfile, Plan, Provisioned};
 
 #[derive(Parser)]
 #[command(
@@ -64,6 +64,71 @@ struct Provisioning {
     /// other off-loopback address.
     #[arg(long, value_parser = Address::parse)]
     issuer_listen: Option<Address>,
+    /// The journal profile every voter runs: `strict` (the default) or
+    /// `replay`, the replay-backed projection of task-j06. Without the
+    /// flag, `COORD_HARNESS_JOURNAL_PROFILE` is read, so a driver that
+    /// runs this harness from its own environment (Jepsen's control
+    /// node) can select it without passing anything through.
+    #[arg(long, value_parser = JournalProfile::parse)]
+    journal_profile: Option<JournalProfile>,
+    /// Under `--journal-profile replay`, working projection commits at
+    /// most between durable ones (`COORD_HARNESS_PROJECTION_DURABLE_COMMITS`).
+    #[arg(long)]
+    projection_durable_commits: Option<u32>,
+    /// Under `--journal-profile replay`, records at most applied by
+    /// working commits between durable ones
+    /// (`COORD_HARNESS_PROJECTION_DURABLE_RECORDS`).
+    #[arg(long)]
+    projection_durable_records: Option<u32>,
+    /// Under `--journal-profile replay`, milliseconds at most a working
+    /// commit waits for a durable one (`COORD_HARNESS_PROJECTION_DURABLE_MS`).
+    #[arg(long)]
+    projection_durable_ms: Option<u64>,
+}
+
+impl Provisioning {
+    /// The journal plan the flags name, each one absent falling back to
+    /// its `COORD_HARNESS_*` variable. An empty variable is unset; one
+    /// that does not parse is refused rather than ignored, since a run
+    /// would otherwise be labelled by a profile it did not run.
+    fn journal(&self) -> Result<JournalPlan, String> {
+        fn from_env<T: std::str::FromStr>(name: &str) -> Result<Option<T>, String> {
+            match std::env::var(name) {
+                Ok(text) if text.is_empty() => Ok(None),
+                Ok(text) => text
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| format!("{name}=`{text}` does not parse")),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(e) => Err(format!("{name}: {e}")),
+            }
+        }
+        let profile = match self.journal_profile {
+            Some(profile) => profile,
+            None => match std::env::var("COORD_HARNESS_JOURNAL_PROFILE") {
+                Ok(text) if text.is_empty() => JournalProfile::Strict,
+                Ok(text) => JournalProfile::parse(&text)
+                    .map_err(|e| format!("COORD_HARNESS_JOURNAL_PROFILE: {e}"))?,
+                Err(std::env::VarError::NotPresent) => JournalProfile::Strict,
+                Err(e) => return Err(format!("COORD_HARNESS_JOURNAL_PROFILE: {e}")),
+            },
+        };
+        Ok(JournalPlan {
+            profile,
+            projection_durable_commits: match self.projection_durable_commits {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_DURABLE_COMMITS")?,
+            },
+            projection_durable_records: match self.projection_durable_records {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_DURABLE_RECORDS")?,
+            },
+            projection_durable_ms: match self.projection_durable_ms {
+                Some(n) => Some(n),
+                None => from_env("COORD_HARNESS_PROJECTION_DURABLE_MS")?,
+            },
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -206,8 +271,10 @@ fn provision(
         )
         .into());
     }
+    let journal = provisioning.journal()?;
     Ok(coord_harness::provision(&Plan {
         hosts,
+        journal,
         listen_any: provisioning.listen_any,
         edge_host: provisioning.edge_host,
         issuer_listen: provisioning.issuer_listen,

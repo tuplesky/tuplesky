@@ -1108,3 +1108,39 @@ fn a_sync_past_its_row_refuses_the_campaign_by_name() {
         other => panic!("{other:?}"),
     }
 }
+
+/// task-j06: the replay-backed projection profile is named, never a
+/// default, and its durable-commit cadence has no zero bound.
+#[test]
+fn the_replay_profile_is_opt_in_and_its_cadence_is_bounded() {
+    use coord_daemon::config::{JOURNAL_PROFILE, JOURNAL_REPLAY_PROFILE};
+
+    let strict = Config::parse(&base_config("")).unwrap();
+    assert_eq!(strict.journal.profile, JOURNAL_PROFILE);
+    assert!(!strict.journal.replays_projection());
+
+    let named = base_config("").replace(
+        "[journal]\nroot",
+        &format!("[journal]\nprofile = \"{JOURNAL_REPLAY_PROFILE}\"\nroot"),
+    );
+    let replay = Config::parse(&named).unwrap();
+    assert!(replay.journal.replays_projection());
+    assert_eq!(replay.journal.projection_durable_commits, 64);
+    assert_eq!(replay.journal.projection_durable_records, 4096);
+    assert_eq!(replay.journal.projection_durable_ms, 100);
+
+    for field in [
+        "projection_durable_commits",
+        "projection_durable_records",
+        "projection_durable_ms",
+    ] {
+        let zero = named.replace("[journal]\n", &format!("[journal]\n{field} = 0\n"));
+        assert!(
+            matches!(
+                Config::parse(&zero),
+                Err(ConfigError::OutOfRange { field: f, .. }) if f.ends_with(field)
+            ),
+            "{field} = 0 was accepted"
+        );
+    }
+}

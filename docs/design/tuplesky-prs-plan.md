@@ -138,7 +138,7 @@ This is a workstream overview; the individual prerequisites are authoritative. O
 | [task-j03](#task-j03) | Integrate journal-first shared storage and atomic materialization | task-j02, task-08, task-11 |
 | [task-j04](#task-j04) | Publish local recovery checkpoints and reclaim journal prefixes | task-j03, task-09 |
 | [task-j05](#task-j05) | Qualify the real journal and composed persistence boundary | task-j02, task-j03, task-j04, task-j08, task-09 |
-| [task-j06](#task-j06) | Enable replay-backed working-state materialization, optional | task-j04, task-j05 |
+| [task-j06](#task-j06) | Replay-backed working-state materialization, promoted, off by default | task-j04; task-j05 before it may be a default |
 | [task-j07](#task-j07) | Validate multi-group batching and resource isolation | task-j03, task-j05, task-31 |
 | [task-j08](#task-j08) | Compose journal-backed application and serving storage | task-j03, task-43 |
 | [task-j09](#task-j09) | Establish a caller's session as a replicated command | task-18, task-37, task-j08 |
@@ -1218,16 +1218,29 @@ On the serving path: a running daemon publishes its own baseline, retires the pr
 **Review boundary:** Clean close or process kill alone does not prove power-loss behavior.
 
 <a id="task-j06"></a>
-### task-j06: Enable replay-backed working-state materialization, optional
+### task-j06: Replay-backed working-state materialization, promoted, off by default
 
-**Prerequisites:** task-j04, task-j05.  
+**Prerequisites:** task-j04. task-j05 before the profile may be a default or part of a supported production profile.  
 **Design:** Sections 17.3.4, 17.16.
 
-**Implement:** Separate internal atomic-working-state capability without per-transaction projection sync, preserving durable journal and local checkpoint publication. Reconstruct new working generation from selected source/suffix; fail closed on missing authority. Retain strict supported/default profile until reviewed enablement.
+**Trigger for the promotion.** This row was optional. task-d48's row routed a non-durable projection here, to be promoted if task-d45's numbers showed the remaining projection sync still bounded throughput. #143's runs on the Jepsen runner did: after task-d54 the leader's loop was 48% busy at the same throughput, and the disk rows' p50 sat about 26 ms above tmpfs at six nodes. Every write's chain holds three syncs, the leader's journal, the follower's journal and the projection's; this profile takes the third off it. The review on #98 (5962787328) chose this path over doing task-j05 first: the profile is built and tested with the crash evidence that exists today, measured with the profile on and labelled so, and the default stays strict until task-j05 lands.
 
-**Acceptance:** Entire composed fault matrix succeeds when unsynced live projection is discarded/invalid. No weaker success masquerades as commit_durable. Measure durable end-to-end, checkpoint maintenance and recovery. Enable only after complete evidence and measured benefit, and include profile in task-q01's applicable matrix.
+**Implement:**
+- A separate engine capability, `WriteTxn::commit_working` (redb `Durability::None`), with `LocalEngine::WORKING_STATE` and `LocalEngine::sync_working`. `commit_durable` and `commit_under_journal` keep their contracts, and an engine without the capability is refused the profile rather than given a weaker success.
+- A named profile, `journal.profile = "journaled-replay-v1"`; strict stays the default, and there is no switch that weakens durability under another name.
+- A durable-commit cadence bounded by working commits, records applied, and time, plus a forced durable commit before every checkpoint publication (so `C <= M_durable <= J` holds when a pointer retires a prefix) and at a clean stop. Journal reclaim happens only through that publication, so it is keyed on the projection's durable stamp. redb frees pages and releases its write cache only at a durable commit, so the cadence also bounds file growth and memory.
+- At start, the projection's applied stamp is validated against the journal before anything is attached: at or past the selected baseline, and naming the record the journal holds there (the next record's predecessor digest, or the record's own digest at the head). A projection that validates is replayed forward from its stamp. One that does not is discarded and the selected baseline's image installed in a new generation, after which `(C, J]` is replayed (17.16.4). Without a baseline there is nothing to install and the node refuses to serve. The live database is never the only source.
+- `Materialized` means applied and visible. The projection's durable frontier is separate (`projection_durable`, on the metrics line), and checkpoint publication and reclaim use it. Replay runs before the node answers, so a resolve answered from the projection still sees every journaled command.
 
-**Review boundary:** No generic unsafe operator switch, dual authority, old-directory fallback, durability downgrade or headline omitting maintenance.
+**Acceptance:**
+- The redb faultkit crash matrix in both profiles: a crash at every write and sync of the projection, with nothing, everything or a seeded subset of what was unsynced surviving, recovers the journal's state.
+- A unit test that crashes after N unsynced commits and replays them; the cadence, a requested durable commit, a checkpoint publication and a stop each make the working commits durable; an invalid projection is refused at attach and reinstalled at start.
+- SIGKILL under the Jepsen kill nemesis with the profile on: every journaled command answered after the restart.
+- Boot replay time bounded by the cadence.
+- The 6-node disk rows run with the profile on, labelled as such, after #143's fence fix so the faults scenario runs on the same carry.
+- Before it may be a default: the entire composed fault matrix of task-j05 succeeds when the unsynced live projection is discarded or invalid, and the profile is in task-q01's applicable matrix.
+
+**Review boundary:** No generic unsafe operator switch, dual authority, old-directory fallback, durability downgrade or headline omitting maintenance. No default other than strict until task-j05's evidence.
 
 <a id="task-j07"></a>
 ### task-j07: Validate multi-group batching and resource isolation

@@ -118,7 +118,10 @@ pub enum Stage {
     DependencyClosure = 0x0004,
     /// The durable journal.
     Journal = 0x0005,
-    /// Materialization into the projection.
+    /// Materialization into the projection. Under the replay-backed
+    /// profile (task-j06) most of these commits are working ones, so the
+    /// stage's time is not a durable commit's; what a crash would leave
+    /// is `frontiers.projection_durable`.
     Materialization = 0x0006,
     /// Learning from evidence.
     EvidenceLearning = 0x0007,
@@ -376,6 +379,12 @@ pub struct Frontiers {
     pub materialized: u64,
     /// `C`: the published local checkpoint boundary.
     pub checkpoint: u64,
+    /// The projection's last durable commit, under the replay-backed
+    /// profile (task-j06): what a crash leaves of `M`, and where the
+    /// next start replays from. Absent under the strict profile, where
+    /// it is `M`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_durable: Option<u64>,
 }
 
 impl Frontiers {

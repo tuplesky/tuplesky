@@ -22,7 +22,9 @@ use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use coord_harness::domain::{Plan, Provisioned, parse_hosts, provision};
+use coord_harness::domain::{
+    JournalPlan, JournalProfile, Plan, Provisioned, parse_hosts, provision,
+};
 use coord_wan_bench::{Answer, Caller};
 
 const HOSTS: [&str; 3] = ["127.0.0.2", "127.0.0.3", "127.0.0.4"];
@@ -263,13 +265,70 @@ async fn a_voter_started_after_the_first_write_serves_reads() {
 /// voter 3's own frontend, so it is the returned voter that serves it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_voter() {
+    takes_back_a_restarted_voter("placed", JournalPlan::default()).await;
+}
+
+/// The same under the replay-backed profile (task-j06), as
+/// `coord-harness provision --journal-profile replay` writes it, with a
+/// cadence that makes nothing durable on its own: voter 3 is killed with
+/// its projection's commits since its start still working ones, comes
+/// back by replaying them from its journal, and serves a read of the
+/// write it had applied before the kill. Its startup metrics carry the
+/// projection's durable frontier, which only the replay profile reports,
+/// so the run is the profile it was provisioned as.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voter_killed_under_the_replay_profile_comes_back_and_serves() {
+    takes_back_a_restarted_voter(
+        "placed-replay",
+        JournalPlan {
+            profile: JournalProfile::Replay,
+            projection_durable_commits: Some(u32::MAX),
+            projection_durable_records: Some(u32::MAX),
+            projection_durable_ms: Some(3_600_000),
+        },
+    )
+    .await;
+}
+
+/// The value a read of one key came back with: `None` for a read that
+/// was not established or found nothing.
+async fn read_value(caller: &mut Caller, provisioned: &Provisioned, key: &[u8]) -> Option<Vec<u8>> {
+    match caller
+        .call(&get(provisioned, key), Duration::from_secs(30))
+        .await
+    {
+        Ok(coord_sdk::Outcome::Established { result, .. }) => {
+            match postcard::from_bytes::<coord_state::Response>(&result)
+                .ok()?
+                .outcome
+            {
+                coord_state::Outcome::Range { items, .. } => {
+                    items.first().map(|item| item.entry.value.clone())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The startup metrics lines of what a voter said, in order.
+fn startup_metrics(said: &str) -> Vec<serde_json::Value> {
+    said.lines()
+        .filter_map(|line| line.strip_prefix("metrics "))
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect()
+}
+
+async fn takes_back_a_restarted_voter(name: &str, journal: JournalPlan) {
     // 127.0.0.2 and up are loopback on Linux and not assigned by default
     // elsewhere (macOS): there is nothing to place a voter at.
     if HOSTS.iter().any(|h| UdpSocket::bind((*h, 0)).is_err()) {
         eprintln!("skipped: {HOSTS:?} are not all assigned on this machine");
         return;
     }
-    let dir = workspace("placed");
+    let replay = journal.profile == JournalProfile::Replay;
+    let dir = workspace(name);
     let api = free_everywhere(&[]);
     let peer = free_everywhere(&[api]);
     let spec = HOSTS
@@ -281,10 +340,18 @@ async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_vo
     let run = dir.join("run");
     let provisioned = provision(&Plan {
         hosts: parse_hosts(&spec).expect("a host list"),
+        journal: journal.clone(),
         ..Plan::loopback(run.clone(), 3, 0)
     })
     .expect("provisioned");
+    assert_eq!(provisioned.journal_profile, journal.profile);
     for (i, node) in provisioned.voters.iter().enumerate() {
+        // What the daemon will read is the profile the plan named.
+        let config = coord_daemon::config::Config::parse(
+            &std::fs::read_to_string(&node.config).expect("the voter's configuration"),
+        )
+        .expect("a configuration the daemon accepts");
+        assert_eq!(config.journal.replays_projection(), replay);
         assert_eq!(node.api, format!("{}:{api}", HOSTS[i]));
         assert_eq!(node.peer, format!("{}:{peer}", HOSTS[i]));
     }
@@ -325,6 +392,22 @@ async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_vo
         "the placed domain did not establish a request"
     );
 
+    // Voter 3 has applied the write before it goes: under the replay
+    // profile, a working commit its kill loses.
+    if replay {
+        let mut at_three = Caller::connect(&run, &provisioned, &minter, 2, 2)
+            .await
+            .expect("a caller bound at voter 3");
+        assert_eq!(
+            at_three
+                .ask(&get(&provisioned, b"before"), Duration::from_secs(30))
+                .await,
+            Answer::Established,
+            "voter 3 did not serve the write before it was killed:\n{}",
+            voters[2].said()
+        );
+    }
+
     // Voter 3 goes, without closing anything.
     voters[2].daemon = None;
     for (i, voter) in voters.iter().take(2).enumerate() {
@@ -338,6 +421,25 @@ async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_vo
     }
     let since: Vec<usize> = voters.iter().map(|v| v.said().len()).collect();
     voters[2].start(3, false);
+    // The restarted voter reports the projection's durable frontier
+    // apart from what it has applied exactly when it runs the replay
+    // profile.
+    let restarted = startup_metrics(voters[2].said().get(since[2]..).unwrap_or_default());
+    let frontiers = restarted
+        .first()
+        .and_then(|m| m.pointer("/frontiers/Observed"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no startup metrics after the restart:\n{}",
+                voters[2].said()
+            )
+        })
+        .clone();
+    assert_eq!(
+        frontiers.get("projection_durable").is_some(),
+        replay,
+        "{frontiers}"
+    );
     for (i, voter) in voters.iter().enumerate() {
         assert!(
             voter.waits_until(60, since[i], meshed),
@@ -358,6 +460,15 @@ async fn a_domain_placed_on_three_addresses_serves_and_takes_back_a_restarted_vo
         "the returned voter's frontend did not establish a request:\n-- 1 --\n{}\n-- 2 --\n{}\n-- 3 --\n{}",
         voters[0].said(),
         voters[1].said(),
+        voters[2].said()
+    );
+    // And the write from before the kill is read through it, value and
+    // all: a replay that restored nothing would still establish a read
+    // of a missing key.
+    assert_eq!(
+        read_value(&mut returned, &provisioned, b"before").await,
+        Some(b"placed".to_vec()),
+        "the returned voter did not read back the write from before its kill:\n{}",
         voters[2].said()
     );
     let _ = std::fs::remove_dir_all(&dir);

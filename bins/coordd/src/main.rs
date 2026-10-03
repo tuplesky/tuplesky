@@ -497,6 +497,8 @@ fn report_metrics(
             journal: held.durable().get(),
             materialized: held.materialized().get(),
             checkpoint: held.checkpoint().get(),
+            projection_durable: coord_storage::Persistence::projection_durable(&storage.domain)
+                .map(|seq| seq.get()),
         }),
         // A domain whose projection is not attached has no frontiers to
         // report, and saying so is the point: three zeroes would read
@@ -1137,11 +1139,20 @@ fn main() -> ExitCode {
     if let Some((appender, materializer)) = waits {
         domain = domain.count_pipeline_waits(appender, materializer);
     }
-    let mut domain = domain
+    let domain = domain
         // Where this node keeps its own recovery images, and how much
         // unrepresented journal it tolerates before making one. Local
         // to this node: no replicated result depends on the answer.
         .with_checkpoints(checkpoints, config.limits.checkpoint_after_records);
+    // Under the replay-backed profile, the time bound on a working
+    // projection commit (task-j06); the store keeps the other two.
+    let mut domain = if config.journal.replays_projection() {
+        domain.with_durable_projection_every(std::time::Duration::from_millis(
+            config.journal.projection_durable_ms,
+        ))
+    } else {
+        domain
+    };
     println!(
         "frontend ready waiting={} voting={}",
         domain.waiting(),
@@ -1289,6 +1300,9 @@ fn main() -> ExitCode {
         if let Some(principal) = raced {
             domain.leaf_expired_while_serving(principal);
         }
+        // A clean stop leaves the projection durable where it stands, so
+        // the next start replays nothing it had applied (task-j06).
+        domain.sync_projections();
         eprintln!(
             "peers connected={} submittable={}",
             domain.reachable(),
