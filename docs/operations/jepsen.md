@@ -464,7 +464,18 @@ of lines. `scripts/ci/jepsen_summary.py` reads the test's store
   or a projection commit that was still running. When a voter's read
   barrier answered or
   refused reads as leader (task-d50), three more columns give the reads
-  served, refused, and a served read's mean wait to its answer.
+  served, refused, and a served read's mean wait to its answer;
+* and, where voters print what their start replayed (task-d55), a Boots
+  table with a row for every start of every voter: when Jepsen started
+  it; the projection durable frontier on the last `metrics` line of the
+  boot before it, against what that boot had applied, which a kill after
+  that line can only have left further on; the `replayed` line's records,
+  from and through (where the attach found the projection, and the
+  journal's durable head) and how long the replay and the whole attach
+  took; and the executed frontier it recovered at. A boot killed before
+  its first interval has no `metrics` line, so the boot after it shows
+  none. The 400-line excerpt below can miss a voter's early starts; this
+  table reads its whole log.
 
 The last 400 lines of each voter's log follow in the TupleSky job's log,
 without its `metrics` lines, and then each voter's last `metrics` line

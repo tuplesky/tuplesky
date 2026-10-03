@@ -26,7 +26,11 @@ directory (`store/latest`) and writes what a reader looks for first:
   only the replay profile reports a projection durable frontier, so a run
   dispatched under one profile whose voters ran the other says so at the
   top, and under the replay profile each voter's row carries how far its
-  projection was durable against what it had applied.
+  projection was durable against what it had applied;
+* and, where the voters report what their start replayed (task-d55),
+  every boot of every voter: how far the boot before it had its
+  projection durable when it last reported, what the attach replayed
+  and how long it and the attach took.
 
     scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
         [--profile strict|replay]
@@ -90,6 +94,10 @@ BALLOT = re.compile(r"ballot (\d+)")
 # `[:no-client "throw+: {:type :ns/kind, ... :error \"why\"}"]`
 SLINGSHOT = re.compile(r':type :[\w.-]+/([\w-]+).*?:error \\?"([^"\\]*)')
 RECOVERED = re.compile(r"^recovered .*\bexecuted=(\d+)")
+# What the attach replayed from the journal into the projection (task-d55).
+REPLAYED = re.compile(
+    r"^replayed records=(\d+) from=(\d+) through=(\d+) took_ms=([\d.]+) attach_ms=([\d.]+)"
+)
 # Written into the log by Jepsen's start-daemon!, one per :start of the node.
 STARTING = "Jepsen starting "
 # jepsen.tuplesky.wan's setup: "WAN round trip n1 -> n2 : 66.2 ms, profile 66 ms".
@@ -106,6 +114,20 @@ class Op:
     f: str
     value: str
     error: str
+
+
+@dataclass
+class Boot:
+    """One start of a voter, from its own log."""
+
+    # The time on the "Jepsen starting" line before it, or None.
+    started: str | None = None
+    # The previous boot's last `metrics` frontiers, or None without one:
+    # how far the projection was durable when that boot last reported.
+    before: dict | None = None
+    executed: str = "-"
+    # (records, from, through, took_ms, attach_ms), or None without the line.
+    replayed: tuple | None = None
 
 
 @dataclass
@@ -134,6 +156,8 @@ class Voter:
     # Whether any `metrics` line this voter printed reports a projection
     # durable frontier, which only the replay profile does (task-j06).
     replay: bool = False
+    # Every start, in order.
+    boot_rows: list = field(default_factory=list)
 
 
 @dataclass
@@ -287,6 +311,9 @@ def parse_voter(lines) -> Voter:
     # The current boot's counts when the last "Jepsen starting" was seen,
     # or None before it.
     base: dict | None = None
+    # The current boot's last `metrics` frontiers, and the last start's time.
+    reported: dict | None = None
+    started: str | None = None
 
     def since_start():
         for k, n in boot.items():
@@ -302,6 +329,7 @@ def parse_voter(lines) -> Voter:
                 observed = (snapshot.get("frontiers") or {}).get("Observed")
                 if isinstance(observed, dict):
                     v.frontiers = observed
+                    reported = observed
                     v.replay |= "projection_durable" in observed
             except (ValueError, AttributeError):
                 pass
@@ -309,9 +337,13 @@ def parse_voter(lines) -> Voter:
         if STARTING in line:
             v.after_start = {}
             base = dict(boot)
+            started = line[: line.index(STARTING)].strip() or None
             continue
         if line.startswith("coordd domain="):
             v.boots += 1
+            v.boot_rows.append(Boot(started=started, before=reported if v.boot_rows else None))
+            reported = None
+            started = None
             for k, n in boot.items():
                 v.counts[k] = v.counts.get(k, 0) + n
             if base is not None:
@@ -322,6 +354,11 @@ def parse_voter(lines) -> Voter:
         m = RECOVERED.match(line)
         if m:
             v.executed = m[1]
+            if v.boot_rows:
+                v.boot_rows[-1].executed = m[1]
+        m = REPLAYED.match(line)
+        if m and v.boot_rows:
+            v.boot_rows[-1].replayed = (int(m[1]), int(m[2]), int(m[3]), float(m[4]), float(m[5]))
         m = ROLE.search(line)
         if m:
             v.role = m[1]
@@ -418,7 +455,11 @@ def clip(s: str, n: int = 90) -> str:
 def projection_durable(v: Voter) -> str:
     """The projection's durable frontier against what the voter had applied,
     from its last `metrics` line: "-" where that line has none."""
-    f = v.frontiers or {}
+    return durable_of(v.frontiers)
+
+
+def durable_of(frontiers: dict | None) -> str:
+    f = frontiers or {}
     if "projection_durable" not in f:
         return "-"
     return f"{f['projection_durable']} of {f.get('materialized', '?')}"
@@ -618,6 +659,30 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} |{durable} {v.role} | {ballot} | {counts} | {after} |"
             )
         out.append("")
+        if any(b.replayed for v in voters.values() for b in v.boot_rows):
+            out.append(
+                "**Boots** (every start of each voter, from its `coordd.log`; projection durable before is the last "
+                "`metrics` line of the boot before it, how far that boot's projection was durable against what it had "
+                "applied when it last reported, so a kill after that line can only have left it further on; replayed is "
+                "what the attach replayed from the journal into the projection, from where it found the projection to "
+                "the journal's durable head, and attach includes a reinstall, which replay does not)"
+            )
+            out.append("")
+            out.append(
+                "| Node | Boot | Started | Projection durable before | Replayed records | From | Through "
+                "| Replay (ms) | Attach (ms) | Executed at recovery |"
+            )
+            out.append("| --- " * 10 + "|")
+            for node, v in voters.items():
+                for i, b in enumerate(v.boot_rows, 1):
+                    before = durable_of(b.before) if i > 1 else "-"
+                    if b.replayed:
+                        records, start, through, took, attach = b.replayed
+                        replayed = f"{records} | {start} | {through} | {took:.1f} | {attach:.1f}"
+                    else:
+                        replayed = "- | - | - | - | -"
+                    out.append(f"| {node} | {i} | {b.started or '-'} | {before} | {replayed} | {b.executed} |")
+            out.append("")
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
         if timed:
             out.append(
