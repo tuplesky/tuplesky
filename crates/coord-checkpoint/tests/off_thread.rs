@@ -165,9 +165,8 @@ fn an_image_written_off_the_thread_is_the_one_written_on_it() {
     assert_eq!(written.pointer, expected, "the same image, named the same");
     assert_eq!(files(off_dir.path()), files(on_dir.path()), "byte for byte");
 
-    let published = domain
-        .finish_local(&off_thread, written)
-        .expect("published");
+    let mut published = domain.finish_local(written).expect("published");
+    coord_checkpoint::reclaim_local(&off_thread, &mut published).expect("reclaimed");
     assert_eq!(published.represented, expected.represented);
     assert!(published.retired);
     assert_eq!(
@@ -300,7 +299,7 @@ fn an_image_of_another_origin_is_not_published() {
     // What an image produced before a reattachment names: the storage
     // of an incarnation this node no longer serves.
     written.pointer.origin.incarnation = ReplicaIncarnation::new(2).unwrap();
-    let outcome = domain.finish_local(&images, written);
+    let outcome = domain.finish_local(written);
     assert!(
         matches!(outcome, Err(BaselineError::Superseded)),
         "{outcome:?}"

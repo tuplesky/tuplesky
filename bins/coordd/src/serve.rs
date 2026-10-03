@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use coord_authn::ClockHealth;
 use coord_checkpoint::local::LocalLimits;
-use coord_checkpoint::{BaselineError, LocalBaseline, LocalCheckpointStore, Written};
+use coord_checkpoint::{BaselineError, LocalBaseline, LocalCheckpointStore, Publication, Written};
 use coord_collector::ingress::is_collector;
 use coord_collector::wire::{
     KIND_EVIDENCE, KIND_READ, KIND_READ_ANSWER, KIND_RELEASE, KIND_SUBMIT, decode_evidence,
@@ -1463,13 +1463,46 @@ struct Housekeeping {
     done: (u64, u64),
 }
 
-/// An image being produced and written on its own thread (task-d51).
+/// A publication in progress off the domain thread (task-d51).
 struct Export {
     /// When the snapshot was pinned.
     started: std::time::Instant,
-    /// What the pin cost the domain thread.
-    pinned: std::time::Duration,
-    worker: std::thread::JoinHandle<Result<Written, BaselineError>>,
+    /// What it has cost the domain thread so far: the pin, then the
+    /// pointer and the retirement.
+    on_loop: std::time::Duration,
+    job: Job,
+}
+
+/// The step of a publication that is running on its own thread.
+enum Job {
+    /// Steps 1 and 2: producing the image and writing it.
+    Write(std::thread::JoinHandle<Result<Written, BaselineError>>),
+    /// Step 5, once the pointer is durable: removing what it supersedes.
+    Reclaim(std::thread::JoinHandle<(Publication, Result<(), BaselineError>)>),
+}
+
+impl Job {
+    fn is_finished(&self) -> bool {
+        match self {
+            Job::Write(worker) => worker.is_finished(),
+            Job::Reclaim(worker) => worker.is_finished(),
+        }
+    }
+}
+
+/// Run step 5 on a thread of its own: removing an image is a directory
+/// tree's worth of unlinks and a sync, tens of milliseconds at 65,536
+/// records, and nothing on the domain thread waits for it.
+fn spawn_reclaim(
+    images: LocalCheckpointStore,
+    mut publication: Publication,
+) -> std::io::Result<std::thread::JoinHandle<(Publication, Result<(), BaselineError>)>> {
+    std::thread::Builder::new()
+        .name("checkpoint".into())
+        .spawn(move || {
+            let reclaimed = coord_checkpoint::reclaim_local(&images, &mut publication);
+            (publication, reclaimed)
+        })
 }
 
 /// How long an image may take to produce before it is abandoned
@@ -3011,64 +3044,71 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         if housekeeping.after == 0 {
             return;
         }
-        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         if let Some(export) = &housekeeping.export {
-            if !export.worker.is_finished() {
+            if !export.job.is_finished() {
                 return;
             }
-            let export = housekeeping.export.take().expect("just seen");
-            let written = export.worker.join().unwrap_or_else(|_| {
-                eprintln!("the checkpoint writer panicked");
-                Err(BaselineError::Abandoned)
-            });
-            let started = std::time::Instant::now();
-            let outcome = written.and_then(|written| {
-                self.backing
-                    .applier_mut()
-                    .store_mut()
-                    .finish_local(&housekeeping.images, written)
-            });
-            let on_loop = export.pinned + started.elapsed();
-            let took = export.started.elapsed();
-            match outcome {
-                Ok(published) => {
-                    // The stage samples what the publication held this
-                    // thread for; `took_ms` is the whole of it.
-                    self.recorder.completed(Stage::Checkpoint, on_loop);
-                    housekeeping.done.0 += 1;
-                    housekeeping.floor = housekeeping.after;
-                    housekeeping.last = std::time::Instant::now();
-                    let phases = &published.phases;
-                    eprintln!(
-                        "checkpoint represented={} retired={} reclaimed={} took_ms={} \
-                         loop_ms={:.1} pin_ms={:.1} export_ms={:.1} write_ms={:.1} \
-                         drain_ms={:.1} sync_ms={:.1} append_ms={:.1} retire_ms={:.1} \
-                         reclaim_ms={:.1}",
-                        published.represented.get(),
-                        published.retired,
-                        published.reclaimed,
-                        took.as_millis(),
-                        ms(on_loop),
-                        ms(phases.pin),
-                        ms(phases.export),
-                        ms(phases.write),
-                        ms(phases.journal.drain),
-                        ms(phases.journal.sync),
-                        ms(phases.journal.append),
-                        ms(phases.journal.retire),
-                        ms(phases.reclaim),
-                    );
+            let Export {
+                started,
+                mut on_loop,
+                job,
+            } = housekeeping.export.take().expect("just seen");
+            match job {
+                // The image is durable: the pointer and the retirement,
+                // here, then the reclaim off the thread again.
+                Job::Write(worker) => {
+                    let written = worker.join().unwrap_or_else(|_| {
+                        eprintln!("the checkpoint writer panicked");
+                        Err(BaselineError::Abandoned)
+                    });
+                    let finishing = std::time::Instant::now();
+                    let outcome = written.and_then(|written| {
+                        self.backing.applier_mut().store_mut().finish_local(written)
+                    });
+                    on_loop += finishing.elapsed();
+                    match outcome {
+                        Ok(publication) => {
+                            match spawn_reclaim(housekeeping.images.clone(), publication.clone()) {
+                                Ok(worker) => {
+                                    housekeeping.export = Some(Export {
+                                        started,
+                                        on_loop,
+                                        job: Job::Reclaim(worker),
+                                    });
+                                }
+                                // No thread to spare: the images stay
+                                // until the next publication reclaims
+                                // them, which is the safe direction.
+                                Err(e) => {
+                                    eprintln!("the superseded images were not reclaimed: {e}");
+                                    self.published(housekeeping, publication, started, on_loop);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.recorder.refused(Stage::Checkpoint);
+                            housekeeping.done.1 += 1;
+                            let gap = self.backing.applier().store().unreclaimed();
+                            housekeeping.floor = gap.saturating_add(housekeeping.after);
+                            eprintln!(
+                                "this node could not publish a recovery checkpoint after {} ms: {e}",
+                                started.elapsed().as_millis()
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.recorder.refused(Stage::Checkpoint);
-                    housekeeping.done.1 += 1;
-                    let gap = self.backing.applier().store().unreclaimed();
-                    housekeeping.floor = gap.saturating_add(housekeeping.after);
-                    eprintln!(
-                        "this node could not publish a recovery checkpoint after {} ms: {e}",
-                        took.as_millis()
-                    );
-                }
+                Job::Reclaim(worker) => match worker.join() {
+                    Ok((publication, reclaimed)) => {
+                        // The pointer is durable whatever the reclaim did:
+                        // a failure leaves images on disk for the next
+                        // publication to remove, not a failed publication.
+                        if let Err(e) = reclaimed {
+                            eprintln!("the superseded images were not reclaimed: {e}");
+                        }
+                        self.published(housekeeping, publication, started, on_loop);
+                    }
+                    Err(_) => eprintln!("the checkpoint reclaimer panicked"),
+                },
             }
             return;
         }
@@ -3097,8 +3137,8 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                     Ok(worker) => {
                         housekeeping.export = Some(Export {
                             started,
-                            pinned: pin,
-                            worker,
+                            on_loop: pin,
+                            job: Job::Write(worker),
                         });
                     }
                     Err(e) => {
@@ -3125,6 +3165,44 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 );
             }
         }
+    }
+
+    /// Account a completed publication and say what it cost.
+    fn published(
+        &self,
+        housekeeping: &mut Housekeeping,
+        published: Publication,
+        started: std::time::Instant,
+        on_loop: std::time::Duration,
+    ) {
+        use coord_daemon::metrics::Stage;
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        // The stage samples what the publication held this thread for;
+        // `took_ms` is the whole of it, most of it on other threads.
+        self.recorder.completed(Stage::Checkpoint, on_loop);
+        housekeeping.done.0 += 1;
+        housekeeping.floor = housekeeping.after;
+        housekeeping.last = std::time::Instant::now();
+        let phases = &published.phases;
+        eprintln!(
+            "checkpoint represented={} retired={} reclaimed={} took_ms={} \
+             loop_ms={:.1} pin_ms={:.1} export_ms={:.1} write_ms={:.1} \
+             drain_ms={:.1} sync_ms={:.1} append_ms={:.1} retire_ms={:.1} \
+             reclaim_ms={:.1}",
+            published.represented.get(),
+            published.retired,
+            published.reclaimed,
+            started.elapsed().as_millis(),
+            ms(on_loop),
+            ms(phases.pin),
+            ms(phases.export),
+            ms(phases.write),
+            ms(phases.journal.drain),
+            ms(phases.journal.sync),
+            ms(phases.journal.append),
+            ms(phases.journal.retire),
+            ms(phases.reclaim),
+        );
     }
 
     /// Carry out what a voter's round asked for.

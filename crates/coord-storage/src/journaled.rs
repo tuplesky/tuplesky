@@ -1378,11 +1378,17 @@ impl<J: JournalEngine, E: LocalEngine> JournaledStore<J, E> {
         // and a crash afterwards rolls the projection back to its last
         // durable commit; that commit has to be at `C` or past it, or the
         // replay at the next attach would start below a retired prefix.
-        // The engine is held: the drain above took back a lent one.
-        if matches!(self.profile, ProjectionProfile::Replay(_)) {
+        // The engine is held: the drain above took back a lent one. A
+        // projection already durable at `C` needs nothing: an image
+        // produced off this thread (task-d51) represents what was
+        // materialized when it was pinned, which the replay profile's own
+        // cadence has usually made durable since.
+        if matches!(self.profile, ProjectionProfile::Replay(_))
+            && state.projection_durable < pointer.represented
+        {
             let started = Instant::now();
             state.sync_projection()?;
-            debug_assert!(state.projection_durable >= state.frontiers.materialized());
+            debug_assert!(state.projection_durable >= pointer.represented);
             phases.sync = started.elapsed();
         }
         // `C <= M` is what makes the image loadable: an image claiming

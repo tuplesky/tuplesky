@@ -17,9 +17,11 @@
 //! Steps 1 and 2 are split so that they need not run on the thread that
 //! owns the store (task-d51). [`LocalBaseline::pin_local`] pins the
 //! snapshot there, [`Pinned::write`] produces and writes the image
-//! anywhere, and [`LocalBaseline::finish_local`] runs steps 3 to 5 back
-//! on the owning thread. An image is a copy of the whole projection, so
-//! its export grows with it; the pin and the pointer do not.
+//! anywhere, [`LocalBaseline::finish_local`] runs steps 3 and 4 back on
+//! the owning thread, and [`reclaim_local`] runs step 5 anywhere again.
+//! An image is a copy of the whole projection, so its export grows with
+//! it, and so does removing the one it supersedes; the pin and the
+//! pointer do not.
 //!
 //! *When* is not decided here either. The caller asks how far the
 //! journal has run past the last baseline and spends the I/O when it
@@ -311,13 +313,10 @@ pub trait LocalBaseline {
     /// an image of it would select the same state and retire nothing.
     fn pin_local(&mut self) -> Result<Option<Pinned<Self::View>>, BaselineError>;
 
-    /// Steps 3 to 5 for an image [`Pinned::write`] wrote: append the
-    /// pointer, retire the prefix, reclaim what it supersedes.
-    fn finish_local(
-        &mut self,
-        images: &LocalCheckpointStore,
-        written: Written,
-    ) -> Result<Publication, BaselineError>;
+    /// Steps 3 and 4 for an image [`Pinned::write`] wrote: append the
+    /// pointer and retire the prefix. Step 5 is [`reclaim_local`]'s, and
+    /// until it runs the publication says it reclaimed nothing.
+    fn finish_local(&mut self, written: Written) -> Result<Publication, BaselineError>;
 
     /// Run the publication cycle once, every step on this thread.
     ///
@@ -332,8 +331,28 @@ pub trait LocalBaseline {
             return Ok(None);
         };
         let written = pinned.write(images, limits, None)?;
-        self.finish_local(images, written).map(Some)
+        let mut publication = self.finish_local(written)?;
+        reclaim_local(images, &mut publication)?;
+        Ok(Some(publication))
     }
+}
+
+/// Step 5: remove the images `publication` supersedes, and record what
+/// it removed and how long that took.
+///
+/// Last, and on any thread: an image is removed only once a newer one
+/// is durably selected, so a crash anywhere before it leaves a baseline
+/// that still loads, and nothing but this removes an image. A failure
+/// leaves the publication standing and the images on disk for the next
+/// one to remove.
+pub fn reclaim_local(
+    images: &LocalCheckpointStore,
+    publication: &mut Publication,
+) -> Result<(), BaselineError> {
+    let started = Instant::now();
+    publication.reclaimed = images.reclaim(&publication.pointer)?;
+    publication.phases.reclaim = started.elapsed();
+    Ok(())
 }
 
 impl<J: JournalEngine, E: LocalEngine> LocalBaseline for JournaledDomain<J, E>
@@ -391,11 +410,7 @@ where
         }))
     }
 
-    fn finish_local(
-        &mut self,
-        images: &LocalCheckpointStore,
-        written: Written,
-    ) -> Result<Publication, BaselineError> {
+    fn finish_local(&mut self, written: Written) -> Result<Publication, BaselineError> {
         let domain = self.domain();
         // The image was produced from the storage the pin saw. A domain
         // reattached since then, from a peer's baseline, has another
@@ -408,23 +423,17 @@ where
         let pointer = written.pointer;
         // Step 3 and step 4, in that order and inside the journal.
         let published = self.store_mut().publish_checkpoint(domain, &pointer)?;
-        // Step 5, last: an image is removed only once a newer one is
-        // durably selected, so a crash anywhere above leaves a baseline
-        // that still loads.
-        let started = Instant::now();
-        let reclaimed = images.reclaim(&pointer)?;
-        let reclaim = started.elapsed();
         Ok(Publication {
             pointer,
             represented: published.published,
             retired: published.retired,
-            reclaimed,
+            reclaimed: 0,
             phases: Phases {
                 pin: written.pin,
                 export: written.export,
                 write: written.write,
                 journal: published.phases,
-                reclaim,
+                reclaim: Duration::ZERO,
             },
         })
     }

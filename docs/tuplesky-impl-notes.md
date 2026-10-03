@@ -9609,9 +9609,16 @@ and the closed loop's tail was those stalls.
   it. `Pinned::write` produces the image from it and writes it, on a
   thread named `checkpoint`. It touches neither the projection's writer
   nor the journal. `LocalBaseline::finish_local` runs back on the domain
-  thread once the image and its directory are durable: the pointer, the
-  retirement and the reclaim, in task-j04's order. `publish_local` is
-  still the three in a row, for a caller with no thread to spare.
+  thread once the image and its directory are durable: the pointer and
+  the retirement. `reclaim_local`, step 5, runs on the `checkpoint`
+  thread again once the pointer is durable: removing the superseded
+  image is a directory of unlinks and a sync, 28 to 64 ms at 50,000
+  records here. task-j04's order is kept. `publish_local` is still all
+  of it in a row, for a caller with no thread to spare.
+- **The forced projection sync** under the replay profile is skipped
+  when the projection is already durable at the represented position,
+  which the profile's own cadence has usually made it by the time an
+  image produced off the thread is published.
 - **What the domain thread waits for.** Nothing. It checks the writer
   each turn, publishes once it has finished, and starts the next only
   after that: at most one image is in flight.
@@ -9626,6 +9633,7 @@ and the closed loop's tail was those stalls.
   Where both apply, both have to have passed. A configuration that
   names either keeps it.
 - **The line.** `checkpoint` gains `loop_ms`, what the publication held
-  the domain thread for (the pin and the finish), and `pin_ms`.
+  the domain thread for (the pin, the pointer and the retirement), and
+  `pin_ms`.
   `took_ms` is now from the pin to the finish, most of it off the
   thread. The `Checkpoint` stage samples `loop_ms`.
