@@ -182,6 +182,24 @@ beside a `disk` run shows how much of a result is the store's synchronous
 writes. SwiftPaxos keeps nothing durable, so its job ignores the input.
 The summaries' titles end in "stores on tmpfs".
 
+The `profile` input is TupleSky's journal profile: `strict` (the default)
+or `replay`, the replay-backed projection of task-j06, whose projection
+commits are working commits made durable on a cadence and replayed from the
+journal after a crash. It is not a default and not a supported production
+profile until task-j05. The scenario step exports it as
+`COORD_HARNESS_JOURNAL_PROFILE`, which `coord-harness provision` reads on
+the control node when jepsen.tuplesky.db runs it, so it needs no change to
+tuplesky/jepsen; it needs a carry with the harness of #144 (`d998539` or
+later), and a carry without it provisions strict. The TupleSky summary's
+title ends in ", strict" or ", replay", and the summary checks that against
+the voters themselves: only the replay profile reports
+`frontiers.projection_durable` on a voter's `metrics` lines, so a run whose
+voters ran the other profile says so above everything else. Under
+`replay` the voters table gains each voter's projection durable frontier
+against what it had applied, from its last `metrics` line, and the Stages
+caption says that a `Materialization` entry is then a working commit.
+etcd's and SwiftPaxos's jobs ignore the input.
+
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |
 | `faults` (default, weekly, pull requests) | append | kill, pause, partition (pause, partition) | 20/s, 2 clients a node | the runner's bridge | 300 s |

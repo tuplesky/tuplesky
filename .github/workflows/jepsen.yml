@@ -64,6 +64,11 @@ on:
         type: choice
         options: [disk, tmpfs]
         default: disk
+      profile:
+        description: "TupleSky's journal profile: strict, or replay (task-j06: projection commits made durable on a cadence and replayed after a crash; not a default)"
+        type: choice
+        options: [strict, replay]
+        default: strict
       swiftpaxos:
         description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
         default: ""
@@ -102,6 +107,7 @@ env:
   IN_CONCURRENCY: ${{ inputs.concurrency }}
   IN_SWIFTPAXOS: ${{ inputs.swiftpaxos }}
   IN_STORE: ${{ inputs.store }}
+  IN_PROFILE: ${{ inputs.profile }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
@@ -259,7 +265,8 @@ jobs:
         run: |
           if [ -d jepsen/tuplesky/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
-              --nodes-file "$RUNNER_TEMP/cluster/nodes" --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX"
+              --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
+              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi

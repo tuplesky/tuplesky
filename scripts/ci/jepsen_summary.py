@@ -21,9 +21,15 @@ directory (`store/latest`) and writes what a reader looks for first:
   it prints one on an interval and when it stops cleanly;
 * and, from the same line, how busy each voter's domain loop was: over
   its boot and over the last interval, per executed command, and what
-  its read barrier served (task-d50).
+  its read barrier served (task-d50);
+* and the journal profile the voters ran (task-j06), from the same lines:
+  only the replay profile reports a projection durable frontier, so a run
+  dispatched under one profile whose voters ran the other says so at the
+  top, and under the replay profile each voter's row carries how far its
+  projection was durable against what it had applied.
 
     scripts/ci/jepsen_summary.py STORE_DIR [--nodes-file FILE] [--title T]
+        [--profile strict|replay]
 
 The Markdown goes to `$GITHUB_STEP_SUMMARY` when it is set, and to standard
 output either way (in a folded group on a runner). It reads only `jepsen.log`, `results.edn` and
@@ -123,6 +129,11 @@ class Voter:
     stages: dict = field(default_factory=dict)
     # The `cost` reading of the same line (task-d45), or None without one.
     cost: Cost | None = None
+    # The observed frontiers of the same line, or None without them.
+    frontiers: dict | None = None
+    # Whether any `metrics` line this voter printed reports a projection
+    # durable frontier, which only the replay profile does (task-j06).
+    replay: bool = False
 
 
 @dataclass
@@ -273,6 +284,10 @@ def parse_voter(lines) -> Voter:
                 snapshot = json.loads(line[len("metrics "):])
                 v.stages = parse_stages(snapshot)
                 v.cost = parse_cost(snapshot)
+                observed = (snapshot.get("frontiers") or {}).get("Observed")
+                if isinstance(observed, dict):
+                    v.frontiers = observed
+                    v.replay |= "projection_durable" in observed
             except (ValueError, AttributeError):
                 pass
             continue
@@ -385,7 +400,16 @@ def clip(s: str, n: int = 90) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def summarize(store: str, nodes: list[str], title: str) -> str:
+def projection_durable(v: Voter) -> str:
+    """The projection's durable frontier against what the voter had applied,
+    from its last `metrics` line: "-" where that line has none."""
+    f = v.frontiers or {}
+    if "projection_durable" not in f:
+        return "-"
+    return f"{f['projection_durable']} of {f.get('materialized', '?')}"
+
+
+def summarize(store: str, nodes: list[str], title: str, profile: str | None = None) -> str:
     out = [f"## {title}", ""]
     log_path = os.path.join(store, "jepsen.log")
     ops = []
@@ -537,22 +561,44 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
             with open(path, encoding="utf-8", errors="replace") as f:
                 voters[node] = parse_voter(f)
             voters[node].executed_at_end = read_executed_at_end(os.path.join(store, node))
+    replay = any(v.replay for v in voters.values())
+    reported = any(v.frontiers is not None for v in voters.values())
+    if profile and reported:
+        ran = "replay" if replay else "strict"
+        if ran != profile:
+            out[2:2] = [
+                f"**The voters ran the {ran} journal profile; this run was dispatched as {profile}.** "
+                "Read it as a run of the profile the voters report.",
+                "",
+            ]
     if voters:
         keys = [k for k, _ in MARKERS]
-        out.append("**Voters** (from each `coordd.log`; a refusal counts the highest \"so far\" in each boot)")
+        out.append(
+            "**Voters** (from each `coordd.log`; a refusal counts the highest \"so far\" in each boot"
+            + (
+                "; projection durable is, from the voter's last `metrics` line, how far its projection was durable "
+                "against what it had applied: what a crash then would have left it to replay from its journal"
+                if replay
+                else ""
+            )
+            + ")"
+        )
         out.append("")
         out.append(
-            "| Node | Boots | Executed at last boot | Executed at end | Last role | Highest ballot | "
+            "| Node | Boots | Executed at last boot | Executed at end | "
+            + ("Projection durable | " if replay else "")
+            + "Last role | Highest ballot | "
             + " | ".join(keys)
             + " | ProposalRepublished after the final start |"
         )
-        out.append("| --- " * (7 + len(keys)) + "|")
+        out.append("| --- " * (7 + (1 if replay else 0) + len(keys)) + "|")
         for node, v in voters.items():
             counts = " | ".join(str(v.counts.get(k, 0)) for k in keys)
             ballot = "-" if v.ballot is None else str(v.ballot)
             after = v.after_start.get("ProposalRepublished", 0)
+            durable = f" {projection_durable(v)} |" if replay else ""
             out.append(
-                f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} | {v.role} | {ballot} | {counts} | {after} |"
+                f"| {node} | {v.boots} | {v.executed} | {v.executed_at_end} |{durable} {v.role} | {ballot} | {counts} | {after} |"
             )
         out.append("")
         timed = [(node, name, r) for node, v in voters.items() for name, r in v.stages.items() if r[1] or r[2]]
@@ -560,7 +606,14 @@ def summarize(store: str, nodes: list[str], title: str) -> str:
             out.append(
                 "**Stages** (each voter's last boot, from the last `metrics` line it printed, on its interval or at a clean stop; "
                 "a `Journal` entry is one lowering step on the domain loop's thread, which includes a store sync only where "
-                "the journal's append still runs inline)"
+                "the journal's append still runs inline"
+                + (
+                    "; under the replay profile a `Materialization` entry is a working projection commit, made durable "
+                    "only on its cadence, so its time is not a durable commit's"
+                    if replay
+                    else ""
+                )
+                + ")"
             )
             out.append("")
             out.append("| Node | Stage | Completed | Refused | Mean (ms) | Max (ms) | Total (s) |")
@@ -620,6 +673,11 @@ def main() -> int:
     p.add_argument("store", help="the test's store directory, e.g. store/latest")
     p.add_argument("--nodes-file", help="one node per line, in Jepsen's order")
     p.add_argument("--title", default="Jepsen")
+    p.add_argument(
+        "--profile",
+        choices=["strict", "replay"],
+        help="the journal profile the run was dispatched with; checked against what the voters report",
+    )
     a = p.parse_args()
     if not os.path.isdir(a.store):
         print(f"no store directory at {a.store}", file=sys.stderr)
@@ -637,7 +695,7 @@ def main() -> int:
             if os.path.isdir(os.path.join(a.store, d))
             and any(n.endswith(".log") for n in os.listdir(os.path.join(a.store, d)))
         )
-    text = summarize(a.store, nodes, a.title)
+    text = summarize(a.store, nodes, a.title, a.profile)
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if target:
         with open(target, "a", encoding="utf-8") as f:

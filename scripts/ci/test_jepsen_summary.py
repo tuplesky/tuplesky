@@ -253,5 +253,57 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn("Voters", text)
 
 
+STRICT_VOTER = """coordd domain=tuplesky-harness roles=[Voter] phase=starting votes=true
+recovered promise=None records=0 payloads=0 executed=0 history=0 frontier=0 position=0
+metrics {"stages":[{"stage":"Materialization","metrics":{"Observed":{"entered":5,"completed":5,"refused":0,"latency":{"count":5,"total":{"secs":0,"nanos":50000000},"max":{"secs":0,"nanos":20000000}}}}}],"frontiers":{"Observed":{"journal":120,"materialized":120,"checkpoint":0}}}
+"""
+
+# Killed after its last interval line: what it had applied, and how much of
+# that its projection held durably.
+REPLAY_VOTER = STRICT_VOTER.replace(
+    '"materialized":120,"checkpoint":0}', '"materialized":118,"checkpoint":0,"projection_durable":64}'
+)
+
+
+class ProfileTests(unittest.TestCase):
+    """task-j06: the journal profile the voters ran, from their own metrics."""
+
+    def summarize(self, voter, profile=None):
+        with tempfile.TemporaryDirectory() as store:
+            for node in ["n1", "n2"]:
+                os.mkdir(os.path.join(store, node))
+                with open(os.path.join(store, node, "coordd.log"), "w") as f:
+                    f.write(voter)
+            return js.summarize(store, ["n1", "n2"], "TupleSky", profile)
+
+    def test_a_replay_run_shows_each_voters_projection_durable(self):
+        text = self.summarize(REPLAY_VOTER, "replay")
+        self.assertNotIn("dispatched as", text)
+        self.assertIn("| Executed at end | Projection durable | Last role |", text)
+        self.assertIn("| n1 | 1 | 0 | - | 64 of 118 | - |", text)
+        self.assertIn("a `Materialization` entry is a working projection commit", text)
+        self.assertIn("| n1 | Materialization | 5 | 0 | 10.00 | 20.0 | 0.1 |", text)
+
+    def test_a_strict_run_has_no_projection_column_or_caption(self):
+        text = self.summarize(STRICT_VOTER, "strict")
+        self.assertNotIn("dispatched as", text)
+        self.assertNotIn("Projection durable", text)
+        self.assertNotIn("working projection commit", text)
+
+    def test_a_run_whose_voters_ran_another_profile_says_so_first(self):
+        text = self.summarize(STRICT_VOTER, "replay")
+        self.assertTrue(
+            text.startswith(
+                "## TupleSky\n\n**The voters ran the strict journal profile; this run was dispatched as replay.**"
+            ),
+            text[:200],
+        )
+        self.assertIn("dispatched as strict", self.summarize(REPLAY_VOTER, "strict"))
+
+    def test_voters_that_report_no_frontiers_are_not_judged(self):
+        # A build from before task-61's frontiers, or no metrics line at all.
+        self.assertNotIn("dispatched as", self.summarize(VOTER, "replay"))
+
+
 if __name__ == "__main__":
     unittest.main()

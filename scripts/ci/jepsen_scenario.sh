@@ -15,6 +15,11 @@
 #                  empty for the scenario's
 #   IN_STORE       disk (default) or tmpfs: where TupleSky's voters and
 #                  etcd keep their stores (SwiftPaxos writes none)
+#   IN_PROFILE     strict (default) or replay: the journal profile
+#                  TupleSky's voters run (task-j06). It reaches them as
+#                  COORD_HARNESS_JOURNAL_PROFILE, which `coord-harness
+#                  provision` reads on the control node, and it is named in
+#                  the TupleSky title either way
 #
 # faults:          append; kill, pause, partition (SwiftPaxos: pause,
 #                  partition); 20 operations a second from 2 clients a node,
@@ -102,6 +107,12 @@ case $store in
   *) echo "store must be disk or tmpfs, not $store" >&2; exit 2 ;;
 esac
 
+profile=${IN_PROFILE:-strict}
+case $profile in
+  strict | replay) ;;
+  *) echo "profile must be strict or replay, not $profile" >&2; exit 2 ;;
+esac
+
 out=${GITHUB_ENV:-/dev/stdout}
 {
   echo "SCENARIO=$scenario"
@@ -117,4 +128,7 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "TITLE_SUFFIX=$suffix"
   echo "STORE=$store"
   echo "STORE_SUFFIX=$store_suffix"
+  echo "PROFILE=$profile"
+  echo "PROFILE_SUFFIX=, $profile"
+  echo "COORD_HARNESS_JOURNAL_PROFILE=$profile"
 } >> "$out"
