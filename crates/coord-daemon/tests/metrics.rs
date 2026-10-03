@@ -130,6 +130,21 @@ fn an_unavailable_metric_is_never_reported_as_zero() {
             consensus.name()
         );
     }
+    // An observer holds storage and replays its journal at every start,
+    // so recovery is its stage, as the journal is, while the consensus
+    // stages are still not (task-d55).
+    let observer = recorder.snapshot_stages(&roles("observer"));
+    let why = |stage: Stage| {
+        observer
+            .iter()
+            .find(|r| r.stage == stage)
+            .expect("every stage is reported")
+            .metrics
+            .why()
+    };
+    assert_ne!(why(Stage::Recovery), Some(Unavailable::NotThisRole));
+    assert_ne!(why(Stage::Journal), Some(Unavailable::NotThisRole));
+    assert_eq!(why(Stage::FanOut), Some(Unavailable::NotThisRole));
     // And the stages it does have are present, with honest zeroes for
     // the counts: "nothing has happened here" is a different statement
     // from "this does not exist here", and both are said.
