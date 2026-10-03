@@ -7,8 +7,9 @@
 use std::time::Duration;
 
 use coord_daemon::metrics::{
-    Durability, Frontiers, Headroom, Lane, LaneReading, Latency, MAX_REPORTED_SHARDS, Measure,
-    MetricsSnapshot, Recorder, ShardIndex, ShardReading, Stage, StageReading, Unavailable,
+    Cost, Cpu, Durability, Frontiers, Headroom, Interval, Lane, LaneReading, Latency,
+    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder, Resends,
+    Scheduling, ShardIndex, ShardReading, Stage, StageReading, Unavailable, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -129,6 +130,21 @@ fn an_unavailable_metric_is_never_reported_as_zero() {
             consensus.name()
         );
     }
+    // An observer holds storage and replays its journal at every start,
+    // so recovery is its stage, as the journal is, while the consensus
+    // stages are still not (task-d55).
+    let observer = recorder.snapshot_stages(&roles("observer"));
+    let why = |stage: Stage| {
+        observer
+            .iter()
+            .find(|r| r.stage == stage)
+            .expect("every stage is reported")
+            .metrics
+            .why()
+    };
+    assert_ne!(why(Stage::Recovery), Some(Unavailable::NotThisRole));
+    assert_ne!(why(Stage::Journal), Some(Unavailable::NotThisRole));
+    assert_eq!(why(Stage::FanOut), Some(Unavailable::NotThisRole));
     // And the stages it does have are present, with honest zeroes for
     // the counts: "nothing has happened here" is a different statement
     // from "this does not exist here", and both are said.
@@ -233,6 +249,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 1000,
         materialized: 940,
         checkpoint: 500,
+        projection_durable: None,
     };
     assert_eq!(frontiers.unmaterialized(), 60, "the node is behind its log");
     assert_eq!(frontiers.unreclaimed(), 440, "what a reclaim would replay");
@@ -244,6 +261,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 10,
         materialized: 10,
         checkpoint: 10,
+        projection_durable: None,
     };
     assert_eq!(level.unmaterialized(), 0);
     assert_eq!(level.unreclaimed(), 0);
@@ -251,6 +269,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 5,
         materialized: 9,
         checkpoint: 20,
+        projection_durable: None,
     };
     assert_eq!(impossible.unmaterialized(), 0);
     assert_eq!(impossible.unreclaimed(), 0);
@@ -326,9 +345,62 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             journal: 90,
             materialized: 88,
             checkpoint: 40,
+            projection_durable: Some(70),
         }),
         view_age: Measure::Observed(Duration::from_millis(12)),
         engine_pressure: Measure::Observed(Headroom { used: 3, bound: 10 }),
+        cost: Measure::Observed(Cost {
+            executed: 1200,
+            lowerings: 6100,
+            journal_appends: 6000,
+            journal_syncs: Measure::Observed(6020),
+            projection_commits: 6100,
+            busy: Duration::from_secs(41),
+            uptime: Duration::from_secs(60),
+            recent: Measure::Observed(Interval {
+                span: Duration::from_secs(10),
+                busy: Duration::from_secs(7),
+                executed: 210,
+                domain_cpu: Measure::Observed(Duration::from_secs(4)),
+            }),
+            resends: Resends {
+                unanswered: 3,
+                lost: 2,
+                late: 1,
+                duplicate_votes: 1,
+                ..Resends::default()
+            },
+            established_fast: 40,
+            established_slow: 1160,
+            reads: Reads {
+                served: 900,
+                refused: 4,
+                rounds: 310,
+                confirmed: 305,
+                waited_confirm_ms: 450,
+                waited_index_ms: 2700,
+                waited_ms: 2800,
+            },
+            cpu: Measure::Observed(Cpu {
+                domain: Duration::from_secs(25),
+                process: Duration::from_secs(70),
+                domain_scheduling: Measure::Observed(Scheduling {
+                    run_queue: Duration::from_secs(3),
+                    voluntary: 5200,
+                    involuntary: 410,
+                }),
+            }),
+            waits: Measure::Observed(PipelineWaits {
+                appender: Wait {
+                    count: 9,
+                    time: Duration::from_millis(40),
+                },
+                materializer: Wait {
+                    count: 3,
+                    time: Duration::from_millis(12),
+                },
+            }),
+        }),
     };
     let rendered = serde_json::to_string(&snapshot).expect("a snapshot renders");
 
@@ -476,4 +548,18 @@ fn every_stage_is_accounted_for_under_every_role() {
             );
         }
     }
+}
+
+/// A `cpu` reading written before the thread's scheduling was reported
+/// (task-d55) still reads, and says it has no scheduling rather than
+/// zero run-queue time.
+#[test]
+fn a_cpu_reading_without_scheduling_reads_as_not_instrumented() {
+    let older = r#"{"domain":{"secs":25,"nanos":0},"process":{"secs":70,"nanos":0}}"#;
+    let cpu: Cpu = serde_json::from_str(older).expect("an older reading parses");
+    assert_eq!(cpu.domain, Duration::from_secs(25));
+    assert_eq!(
+        cpu.domain_scheduling,
+        Measure::Unavailable(Unavailable::NotInstrumented)
+    );
 }

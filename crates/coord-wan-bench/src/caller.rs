@@ -79,6 +79,9 @@ pub struct Caller {
     connection: coord_transport::ConnectionId,
     client: coord_sdk::Client<coord_sdk::StaticProvider>,
     ticks: u64,
+    /// Give up on an unknown outcome for good rather than keep its
+    /// identity resolvable ([`Caller::abandon_unknown_outcomes`]).
+    abandon_unknown: bool,
     /// The session this caller's credential named.
     pub session: SessionId,
     /// The frontend it reached.
@@ -225,6 +228,7 @@ impl Caller {
             connection,
             client,
             ticks: 0,
+            abandon_unknown: false,
             session: ack.session,
             frontend: node.api.clone(),
         })
@@ -237,14 +241,49 @@ impl Caller {
     /// being measured is wall time on this side, not the client's notion
     /// of it.
     pub async fn ask(&mut self, request: &LogicalRequest, deadline: Duration) -> Answer {
+        match self.call(request, deadline).await {
+            Ok(coord_sdk::Outcome::Established { .. }) => Answer::Established,
+            Ok(coord_sdk::Outcome::Unknown) => Answer::Unknown,
+            Ok(other) => Answer::Refused(refusal(&other)),
+            Err(answer) => answer,
+        }
+    }
+
+    /// From now on, give up on a request whose outcome this caller never
+    /// learned (`Client::abandon`) instead of keeping its identity
+    /// resolvable (`Client::forget`). A forgotten unknown holds the
+    /// session's acknowledged prefix where it is, so a session that met
+    /// one is refused a window later; a run that keeps a session going
+    /// through faults, and counts an unknown as an operation that may or
+    /// may not have happened, gives it up instead.
+    pub fn abandon_unknown_outcomes(&mut self) {
+        self.abandon_unknown = true;
+    }
+
+    fn release(&mut self, id: coord_sdk::RequestId) {
+        if self.abandon_unknown {
+            self.client.abandon(id);
+        } else {
+            self.client.forget(id);
+        }
+    }
+
+    /// Submit one request and return the SDK's outcome for it, result
+    /// bytes included, or what this side made of it when the SDK never
+    /// reached one (never `Established`).
+    pub async fn call(
+        &mut self,
+        request: &LogicalRequest,
+        deadline: Duration,
+    ) -> Result<coord_sdk::Outcome, Answer> {
         self.ticks += 1;
         let now = self.ticks;
         let Ok(id) = self.client.submit(now, request, 0) else {
-            return Answer::Refused("not-submitted".into());
+            return Err(Answer::Refused("not-submitted".into()));
         };
         let actions = self.client.take_actions();
         let [coord_sdk::SdkAction::Send { frame, .. }] = actions.as_slice() else {
-            return Answer::Refused("not-sent".into());
+            return Err(Answer::Refused("not-sent".into()));
         };
         let Ok(answer) = self
             .transport
@@ -257,27 +296,27 @@ impl Caller {
             // the client's own bound and turn one deadline into a run
             // full of refusals that came from this process. The run
             // reports the unknown and lets the invocation go.
-            self.client.forget(id);
-            return Answer::Unknown;
+            self.release(id);
+            return Err(Answer::Unknown);
         };
         let Ok(bytes) =
             coord_types::wire_v1::encode_frame(answer.kind, answer.version, &answer.payload)
         else {
-            self.client.forget(id);
-            return Answer::Refused("unframeable".into());
+            self.release(id);
+            return Err(Answer::Refused("unframeable".into()));
         };
         if self
             .client
             .on_frame(now, coord_sdk::ConnectionId(self.connection.0), &bytes)
             .is_err()
         {
-            self.client.forget(id);
-            return Answer::Refused("undecodable".into());
+            self.release(id);
+            return Err(Answer::Refused("undecodable".into()));
         }
         let completions = self.client.take_completions();
         let Some(completion) = completions.iter().find(|c| c.request == id) else {
-            self.client.forget(id);
-            return Answer::Unknown;
+            self.release(id);
+            return Err(Answer::Unknown);
         };
         // Release the invocation. The SDK retains a completed request so
         // that a caller which never saw the answer can still resolve it
@@ -285,21 +324,23 @@ impl Caller {
         // invocation of the run and stop being a measurement of the
         // domain.
         let outcome = completion.outcome.clone();
-        self.client.forget(id);
-        match &outcome {
-            coord_sdk::Outcome::Established { .. } => Answer::Established,
-            coord_sdk::Outcome::Unknown => Answer::Unknown,
-            other => Answer::Refused(refusal(other)),
+        if matches!(outcome, coord_sdk::Outcome::Unknown) {
+            self.release(id);
+        } else {
+            self.client.forget(id);
         }
+        Ok(outcome)
     }
 }
 
 /// A bounded name for a refusal. Never the detail bytes: a report is
 /// published and a detail is not a label.
-fn refusal(outcome: &coord_sdk::Outcome) -> String {
+pub fn refusal(outcome: &coord_sdk::Outcome) -> String {
     match outcome {
         coord_sdk::Outcome::Established { .. } => "established".into(),
         coord_sdk::Outcome::Unknown => "unknown".into(),
+        coord_sdk::Outcome::Withheld => "withheld".into(),
+        coord_sdk::Outcome::Retired => "retired".into(),
         coord_sdk::Outcome::Failed(error) => format!("{error:?}")
             .split(['(', ' ', '{'])
             .next()

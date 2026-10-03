@@ -7,8 +7,8 @@ use coord_types::CommandId;
 use coord_types::wire_v1::{BoundedBytes, OutcomeV1, ResponseV1};
 
 pub use coord_types::wire_v1::codes::{
-    BACKPRESSURE, MALFORMED_REQUEST, NOT_ADMITTED, REQUEST_IDENTITY_CONFLICT, REQUEST_TOO_LARGE,
-    RESULT_TOO_LARGE,
+    BACKPRESSURE, MALFORMED_REQUEST, NOT_ADMITTED, OUTPUT_WITHHELD, REQUEST_IDENTITY_CONFLICT,
+    REQUEST_TOO_LARGE, RESULT_RETIRED, RESULT_TOO_LARGE,
 };
 
 /// A response whose outcome is not established yet (`ResolveRequest`

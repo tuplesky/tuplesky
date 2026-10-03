@@ -192,14 +192,18 @@ impl Budget {
 /// is decide a replicated outcome, so nothing here is charged to the
 /// view budget. The range itself is bounded by the replicated retention
 /// floor, which is the same on every replica.
+///
+/// Each row is handed to `each` as its page is read, and no page is kept
+/// past it (task-d26): collected, every obsolete version still on disk in
+/// the range was held at once, however few the request reads.
 fn scan_history<V: OrderedRead>(
     view: &V,
     lower: Vec<u8>,
     upper: Bound<Vec<u8>>,
-) -> Result<RawRows, ViewBuildError> {
+    mut each: impl FnMut(Vec<u8>, Vec<u8>) -> Result<(), ViewBuildError>,
+) -> Result<(), ViewBuildError> {
     /// One page of history rows. Large enough for any schema-valid row.
     const PAGE_BYTES: u32 = 16 * 1024 * 1024;
-    let mut out = Vec::new();
     let mut request = ScanRequest {
         lower: Bound::Included(lower),
         upper,
@@ -211,9 +215,11 @@ fn scan_history<V: OrderedRead>(
     loop {
         let page = view.scan_page(Collection::KvHistoryV1.id(), &request)?;
         let last = page.rows.last().map(|r| r.key.clone());
-        out.extend(page.rows.into_iter().map(|r| (r.key, r.value)));
+        for row in page.rows {
+            each(row.key, row.value)?;
+        }
         if page.exhausted {
-            return Ok(out);
+            return Ok(());
         }
         match last {
             Some(key) => request.resume_after = Some(key),
@@ -615,7 +621,26 @@ pub fn build_read_view<V: OrderedRead>(
         if r > kv_revision || r < compact_floor {
             continue;
         }
-        let mut chosen: BTreeMap<Vec<u8>, Option<KvEntry>> = BTreeMap::new();
+        let mut entries: BTreeMap<Vec<u8>, KvEntry> = BTreeMap::new();
+        // A key's version at R, once the scan has moved past the key: the
+        // one the request reads, charged as it is kept (task-d26). Rows
+        // arrive in (key, revision) order, so the last version at or below
+        // R for a key wins, and a key is final when the next one starts.
+        // A key two ranges share is kept and charged once, as the same
+        // version, so the charge is the same on every replica whatever
+        // each has collected.
+        let mut settle = |entries: &mut BTreeMap<Vec<u8>, KvEntry>,
+                          key: Vec<u8>,
+                          entry: Option<KvEntry>|
+         -> Result<(), ViewBuildError> {
+            if let Some(entry) = entry
+                && !entries.contains_key(&key)
+            {
+                budget.charge(1, key.len() + entry.value.len())?;
+                entries.insert(key, entry);
+            }
+            Ok(())
+        };
         for touch in historical_touches(&request.operation, r) {
             let (lower, upper) = history_bounds(&namespace, &touch);
             // Physical versions are not charged to the replicated budget.
@@ -628,26 +653,28 @@ pub fn build_read_view<V: OrderedRead>(
             // same chosen command, one executing it and one recording a
             // rejection. The selection below is charged instead, and it
             // is the same everywhere.
-            for (row_key, value) in scan_history(view, lower, upper)? {
+            let mut current: Option<(Vec<u8>, Option<KvEntry>)> = None;
+            scan_history(view, lower, upper, |row_key, value| {
                 let decoded = ordered_key::decode_history(&row_key)
                     .map_err(|_| EngineError::new(ErrorClass::Corrupt, "kv_history key"))?;
                 let version = decoded.revision.expect("history key carries a revision");
                 if decoded.namespace != namespace || version > r {
-                    continue;
+                    return Ok(());
                 }
-                // Rows arrive in (key, revision) order, so the last version
-                // at or below R for a key wins.
-                chosen.insert(decoded.key, codecs::decode_history(&value)?.entry);
+                let entry = codecs::decode_history(&value)?.entry;
+                match &mut current {
+                    Some((key, chosen)) if *key == decoded.key => *chosen = entry,
+                    _ => {
+                        if let Some((key, chosen)) = current.replace((decoded.key, entry)) {
+                            settle(&mut entries, key, chosen)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            if let Some((key, chosen)) = current {
+                settle(&mut entries, key, chosen)?;
             }
-        }
-        let entries: BTreeMap<Vec<u8>, KvEntry> = chosen
-            .into_iter()
-            .filter_map(|(k, e)| e.map(|e| (k, e)))
-            .collect();
-        // What the request actually reads: one version per key, the same
-        // on every replica whatever each has collected.
-        for (key, entry) in &entries {
-            budget.charge(1, key.len() + entry.value.len())?;
         }
         read_view.historical.push(HistoricalView {
             revision: r,

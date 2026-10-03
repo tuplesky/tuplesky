@@ -286,6 +286,46 @@ fn wrong_configuration_identity_never_votes() {
     }
 }
 
+/// A ballot refused as behind fences every ballot at or below it here
+/// (task-d10). The refused candidate promised itself that ballot and hears
+/// nothing below it; a lower ballot promised here could win without it,
+/// and it could then never follow the leader it has to catch up from.
+#[test]
+fn a_ballot_refused_as_behind_fences_the_ballots_below_it() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let refused = ballot(1, 5, 0);
+    let behind = ExecutionPosition::new(10).unwrap();
+    let own = ExecutionPosition::new(100).unwrap();
+    assert_eq!(
+        state.refuses_behind(r(0), refused, behind, own, 64),
+        Some(PromiseRejection::CandidateBehind {
+            candidate: behind,
+            own
+        })
+    );
+    assert_eq!(state.outranked(), Some(refused));
+    assert_eq!(state.in_flight(), None, "nothing was promised");
+    // Within a table, nobody is refused.
+    assert_eq!(
+        state.refuses_behind(r(2), ballot(1, 6, 2), own, own, 64),
+        None
+    );
+    // Another voter's lower ballot, which it campaigned for without
+    // seeing the refused one, is not promised.
+    assert_eq!(
+        state.on_new_leader(peer(2), ballot(1, 1, 2), b, &mut a, &[]),
+        Err(PromiseRejection::NotHigher { promised: refused })
+    );
+    // One above it is.
+    assert!(
+        state
+            .on_new_leader(peer(2), ballot(1, 6, 2), b, &mut a, &[])
+            .is_ok()
+    );
+}
+
 #[test]
 fn a_same_boot_election_fences_obsolete_vote_callbacks() {
     let b = boot(1);
@@ -394,6 +434,12 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
         Err(InitError::PayloadConflict)
     );
     assert_eq!(table.record(&c1).unwrap().deps, vec![c2]);
+    // Rebinding the facts is for a record nothing was decided over: at
+    // PRE-ACCEPT (task-d09) and at ACCEPT (task-d14) it replaces them, and
+    // at COMMIT or beyond nothing changes.
+    assert!(table.rebind(&c1, Digest32([8; 32])));
+    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([8; 32])));
+    assert!(table.rebind(&c1, Digest32([1; 32])));
     // Dependency-phase prerequisites: c1 cannot be accepted with dep c2
     // until c2 is accepted; nor committed until c2 is committed.
     assert_eq!(
@@ -402,12 +448,17 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
     );
     table.accept(c2, vec![]).unwrap();
     table.accept(c1, vec![c2]).unwrap();
+    assert!(table.rebind(&c1, Digest32([8; 32])));
+    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([8; 32])));
+    assert!(table.rebind(&c1, Digest32([1; 32])));
     assert_eq!(
         table.commit(c1),
         Err(GuardViolation::DependencyNotCommitted { dep: c2 })
     );
     table.commit(c2).unwrap();
     table.commit(c1).unwrap();
+    assert!(!table.rebind(&c1, Digest32([8; 32])));
+    assert_eq!(table.record(&c1).unwrap().payload, Some(Digest32([1; 32])));
     assert_eq!(
         table.execute(c1),
         Err(GuardViolation::DependencyNotExecuted { dep: c2 })
@@ -444,6 +495,30 @@ fn initialization_publishes_atomically_and_placeholders_are_invisible() {
         base: None,
         updates: vec![],
     };
+}
+
+/// A promise is repeated for a leader that asks again only while no
+/// higher promise is in flight (task-d33, #130 review): that promise
+/// voids the lower one, and repeating it would tell the lower leader this
+/// replica still follows it.
+#[test]
+fn a_promise_is_not_repeated_below_one_in_flight() {
+    let b = boot(1);
+    let mut a = alloc(b);
+    let mut state = voter();
+    let low = ballot(1, 5, 2);
+    let e5 = state.on_new_leader(peer(2), low, b, &mut a, &[]).unwrap();
+    let barrier = match &e5.persist {
+        Effect::Persist(batch) => batch.barrier,
+        other => panic!("{other:?}"),
+    };
+    state.on_storage(&durable(barrier, 1));
+    assert_eq!(state.promised(), low);
+    assert!(state.promise_again(peer(2), low, b).is_some());
+    state
+        .on_new_leader(peer(0), ballot(1, 10, 0), b, &mut a, &[])
+        .unwrap();
+    assert!(state.promise_again(peer(2), low, b).is_none());
 }
 
 #[test]

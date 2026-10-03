@@ -34,7 +34,10 @@
 //! pre-counted acknowledgement, which is what keeps one co-located voter
 //! from looking like a quorum.
 
-use coord_collector::{IngressError, admitted_from_submit};
+use coord_collector::{
+    IngressError, MonotonicMillis, ReadAnswerV1, ReadOutcomeV1, ReadRefusal, admitted_from_submit,
+    decode_read, read_answer_frame,
+};
 use coord_core::effect::{BootId, PeerId};
 use coord_core::event::{AuthenticatedPeerMessage, Event, PeerProvenance};
 use coord_membership::membership::Membership;
@@ -44,7 +47,8 @@ use coord_types::ids::{Ballot, ClusterId, DomainId, ReplicaId, ReplicaIncarnatio
 use coord_types::wire_v1::{FrameReader, WireError};
 
 use crate::mailbox::Ingress;
-use crate::node::{DriveError, Node, Outbound};
+use crate::node::{DriveError, Machine, Node, Outbound};
+use crate::reads::{Evaluated, Leading, ReadBarrier, evaluate};
 
 /// The replica identity reserved for a domain's trusted collector.
 ///
@@ -130,6 +134,8 @@ pub struct Voter<P: Persistence> {
     /// own store. Compared within an epoch only (`highest`): a fence
     /// from another epoch is not a bound on this one's ballots.
     fenced_at: Option<Ballot>,
+    /// The reads this voter holds as a leader (task-d50).
+    reads: ReadBarrier,
 }
 
 impl<P: Persistence> Voter<P> {
@@ -163,6 +169,7 @@ impl<P: Persistence> Voter<P> {
             refused: 0,
             fenced: 0,
             fenced_at: None,
+            reads: ReadBarrier::new(),
         }
     }
 
@@ -236,6 +243,14 @@ impl<P: Persistence> Voter<P> {
         // under that fence (a candidate with a higher replica id at the
         // same number), which its own store refuses every time.
         let held = highest(self.ballot, self.node.machine().promised());
+        // Above any ballot this voter refused as behind (task-d10): that
+        // candidate promised itself the ballot and hears nothing below
+        // it, and it has to follow this campaign's leader to catch up.
+        let held = self
+            .node
+            .machine()
+            .outranked()
+            .map_or(held, |refused| highest(held, refused));
         let highest = self.fenced_at.map_or(held, |fence| highest(held, fence));
         let Ok(ballot) = highest.successor(self.ingress.replica()) else {
             return Ok(None);
@@ -296,6 +311,7 @@ impl<P: Persistence> Voter<P> {
                 to,
                 coord_consensus::ProtocolMessage::NewLeader {
                     ballot: self.ballot,
+                    executed: self.node.machine().executed_through(),
                 }
                 .encode(),
             ));
@@ -339,6 +355,28 @@ impl<P: Persistence> Voter<P> {
         if let Some(changed) = self.node.change_role(&self.ballot)? {
             out.absorb(changed);
         }
+        // A leader that refused a higher ballot as behind leads again above
+        // it, at once (task-d10). The refused voter promised itself that
+        // ballot and hears nothing below it, so under this leader's ballot
+        // it would sit deaf, one voter short, until an election came
+        // along -- and a restarted voter's timer firing before it hears
+        // the leader is exactly how the refused campaign starts. Stepping
+        // down and campaigning through [`Voter::campaign`] goes above the
+        // refused ballot; the refused voter promises and follows. It costs
+        // an election per refused campaign, bounded because the refused
+        // voter does not campaign again until it has caught up.
+        if self.leads()
+            && self
+                .node
+                .machine()
+                .outranked()
+                .is_some_and(|refused| higher(&refused, &self.ballot))
+        {
+            out.absorb(self.node.step_down(&self.ballot)?);
+            if let Some((_, campaigned)) = self.campaign()? {
+                out.absorb(campaigned);
+            }
+        }
         Ok(out)
     }
 
@@ -346,6 +384,14 @@ impl<P: Persistence> Voter<P> {
     /// transitions it refused, so no barrier waits for ever on work the
     /// old ballot can no longer make durable.
     fn fence(&mut self) -> Result<Outbound, DriveError> {
+        // What is queued is lowered first, under the ballot it was made
+        // under, as a node lowering each round would have (task-d47):
+        // the fence refuses only the work of a ballot left behind, and
+        // work this voter made before it promised was not. It is
+        // journaled before the fence, not lent: the fence tests what is
+        // still queued against the frontier the journal has reached, and
+        // a group out on the appender's thread is in none (task-d54).
+        let mut out = self.node.flush_journaled(&self.ballot)?;
         let refused = self
             .node
             .applier_mut()
@@ -356,7 +402,6 @@ impl<P: Persistence> Voter<P> {
             self.fenced_at
                 .map_or(self.ballot, |fence| highest(fence, self.ballot)),
         );
-        let mut out = Outbound::default();
         for event in refused {
             self.fenced += 1;
             out.absorb(self.node.on_storage(event, &self.ballot)?);
@@ -406,7 +451,7 @@ impl<P: Persistence> Voter<P> {
     ) -> Result<Outbound, DriveError> {
         let before = self.ballot;
         let message = coord_consensus::ProtocolMessage::decode(&frame).ok();
-        if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot }) = &message
+        if let Some(coord_consensus::ProtocolMessage::NewLeader { ballot, .. }) = &message
             && higher(ballot, &self.ballot)
         {
             self.set_ballot(*ballot);
@@ -433,6 +478,57 @@ impl<P: Persistence> Voter<P> {
                 },
                 coord_consensus::ProtocolMessage::Sync(decision.clone()).encode(),
             ));
+        }
+        // A lagging voter's ask for this node's executed history is
+        // answered from its durable rows, which the machine does not
+        // hold (task-d08).
+        if let Some(coord_consensus::ProtocolMessage::CatchUpRequest { ballot, after }) = &message {
+            out.absorb(self.node.serve_catch_up(provenance.from(), *ballot, *after));
+        }
+        // A leader asking whether its ballot is still this voter's promise
+        // is answered from the promise this voter holds, not by the
+        // machine (task-d50). Only a promise of exactly that ballot, with
+        // nothing higher in flight, is a yes; anything else is silence.
+        if let Some(coord_consensus::ProtocolMessage::ReadConfirm { ballot, round }) = &message
+            && provenance.from() == ballot.leader
+            && let Machine::Follower(f) = self.node.machine()
+            && f.ballots().promised() == *ballot
+            && f.ballots().in_flight().is_none()
+            && f.quorum().ballot() == *ballot
+        {
+            out.peer.push((
+                PeerId {
+                    replica: ballot.leader,
+                    incarnation: ReplicaIncarnation::ZERO,
+                },
+                coord_consensus::ProtocolMessage::ReadConfirmed {
+                    ballot: *ballot,
+                    round: *round,
+                    replica: self.provenance.from(),
+                }
+                .encode(),
+            ));
+        }
+        if let Some(coord_consensus::ProtocolMessage::ReadConfirmed {
+            ballot,
+            round,
+            replica,
+        }) = &message
+            && *replica == provenance.from()
+            && let Some(leading) = self.leading()
+            && let Machine::Leader(leader) = self.node.machine()
+            && leader.config_quorum().is_voter(replica)
+        {
+            self.reads
+                .on_confirmed(*replica, *ballot, *round, leading.slow_size);
+        }
+        // A peer's promise about a floor boundary is recorded from its own
+        // link: the runtime's, like the checkpoint it names (task-d27).
+        if let Some(coord_consensus::ProtocolMessage::FloorReadiness { readiness }) = &message {
+            out.absorb(
+                self.node
+                    .hear_floor(provenance.from(), readiness, &self.ballot)?,
+            );
         }
         out.absorb(self.node.on_event(
             Event::Peer(AuthenticatedPeerMessage::new(provenance, frame)),
@@ -477,6 +573,141 @@ impl<P: Persistence> Voter<P> {
         self.node
             .on_event(Event::Admitted(admitted), &self.ballot)
             .map(Ok)
+    }
+
+    /// What this voter leads, for the read barrier: `None` unless its
+    /// machine is a leader that is leading (task-d50).
+    fn leading(&self) -> Option<Leading> {
+        match self.node.machine() {
+            Machine::Leader(l) if l.is_leading() => {
+                let quorum = l.config_quorum();
+                Some(Leading {
+                    ballot: quorum.ballot(),
+                    index: l.read_index(),
+                    slow_size: quorum.slow_size(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// A current read a collector sent this voter as the leader it
+    /// follows, from `origin` (task-d50; design Section 6.3).
+    ///
+    /// Held, or refused at once; either way the answer goes back in
+    /// [`Outbound::reads`]. A frame that does not decode as a read is
+    /// dropped: the collector that sent it orders the read when its
+    /// deadline passes.
+    pub fn on_read(
+        &mut self,
+        frame: &coord_types::wire_v1::Frame,
+        origin: Origin,
+        now: MonotonicMillis,
+    ) -> Outbound {
+        let mut out = Outbound::default();
+        let Ok(read) = decode_read(frame) else {
+            return out;
+        };
+        let leading = self.leading();
+        if let Err(refused) = self.reads.admit(origin, read, leading, now) {
+            let (origin, answer) = *refused;
+            push_answer(&mut out, origin, &answer);
+            return out;
+        }
+        out.absorb(self.pump_reads(now));
+        out
+    }
+
+    /// Move the reads this voter holds along (task-d50): start the
+    /// confirmation round a newly arrived read needs, answer every read
+    /// whose round confirmed, whose index executed and whose snapshot
+    /// reached it, and refuse what can no longer be served.
+    ///
+    /// Called after anything that can move one of those: a read, a
+    /// confirmation, an execution, a materialization, a turn.
+    pub fn pump_reads(&mut self, now: MonotonicMillis) -> Outbound {
+        let mut out = Outbound::default();
+        if self.reads.held() == 0 {
+            return out;
+        }
+        let leading = self.leading();
+        if let Some(l) = leading
+            && let Some(round) = self.reads.round_to_start(l.ballot, l.slow_size, now)
+        {
+            let frame = coord_consensus::ProtocolMessage::ReadConfirm {
+                ballot: l.ballot,
+                round,
+            }
+            .encode();
+            if let Machine::Leader(leader) = self.node.machine() {
+                for voter in leader.config_quorum().voters() {
+                    if *voter == l.ballot.leader {
+                        continue;
+                    }
+                    out.peer.push((
+                        PeerId {
+                            replica: *voter,
+                            incarnation: ReplicaIncarnation::ZERO,
+                        },
+                        frame.clone(),
+                    ));
+                }
+            }
+        }
+        let (due, refused) = match self.node.machine() {
+            Machine::Leader(leader) => self.reads.take_due(
+                leading,
+                now,
+                |index| leader.executed_below(index),
+                leader.executed_through(),
+            ),
+            Machine::Follower(_) => self.reads.take_due(
+                None,
+                now,
+                |_| false,
+                coord_types::ids::ExecutionPosition::ZERO,
+            ),
+        };
+        for (origin, answer) in refused {
+            push_answer(&mut out, origin, &answer);
+        }
+        let mut again = Vec::new();
+        for held in due {
+            let retry_key = held.read.request.retry_key;
+            let ballot = held.read.ballot;
+            match evaluate(self.node.applier().store(), &held) {
+                Evaluated::Served(response) => {
+                    self.reads.served(&held, now);
+                    push_answer(
+                        &mut out,
+                        held.origin,
+                        &ReadAnswerV1 {
+                            retry_key,
+                            ballot,
+                            outcome: ReadOutcomeV1::Served { response },
+                        },
+                    );
+                }
+                Evaluated::NotYet => again.push(held),
+                Evaluated::NotServable => {
+                    self.reads.refused();
+                    push_answer(
+                        &mut out,
+                        held.origin,
+                        &crate::reads::refusal(retry_key, ballot, ReadRefusal::NotServable),
+                    );
+                }
+            }
+        }
+        for held in again.into_iter().rev() {
+            self.reads.hold_again(held);
+        }
+        out
+    }
+
+    /// What the read barrier has done since boot (task-d50).
+    pub fn read_counts(&self) -> crate::reads::ReadCounts {
+        self.reads.counts
     }
 
     /// Where this command's evidence is owed, if this voter admitted it.
@@ -554,10 +785,50 @@ impl<P: Persistence> Voter<P> {
         self.node.payloads_answered()
     }
 
+    /// What this voter's re-sends did since boot (task-d49).
+    pub fn resend_counts(&self) -> coord_consensus::ResendCounts {
+        self.node.resend_counts()
+    }
+
+    /// Send this ballot's voters, again, the proposals they have not voted
+    /// on. Only a leader sends anything (task-d07).
+    pub fn resend_proposals(&mut self) -> Result<Outbound, DriveError> {
+        self.node.resend_proposals(&self.ballot)
+    }
+
     /// Ask this ballot's leader for the payloads this replica lacks.
     pub fn request_payloads(&mut self) -> Result<Outbound, DriveError> {
         let leader = self.ballot.leader;
         self.node.request_payloads(leader, &self.ballot)
+    }
+
+    /// Ask the voters that promised this voter's campaign for the report
+    /// pages that have not arrived (task-d28).
+    pub fn request_report_pages(&mut self) -> Result<Outbound, DriveError> {
+        self.node.request_report_pages(&self.ballot)
+    }
+
+    /// Ask a peer for the commands it executed after this voter's
+    /// frontier, when `pacer` says it is time (task-d08): the leader
+    /// first, then the other voters in turn.
+    pub fn catch_up(
+        &mut self,
+        pacer: &mut crate::catch_up::Pacer,
+        now: std::time::Instant,
+    ) -> Result<Outbound, DriveError> {
+        let machine = self.node.machine();
+        let standing = crate::catch_up::Standing {
+            executed: machine.executed_through(),
+            holds: machine.holds_unexecuted(),
+            busy: machine.catching_up(),
+            leads: machine.leads(),
+        };
+        let voters: Vec<ReplicaId> = machine.identity().voters.iter().copied().collect();
+        let me = self.ingress.replica();
+        match pacer.due(now, standing, me, self.ballot.leader, &voters) {
+            Some(donor) => self.node.request_catch_up(donor, &self.ballot),
+            None => Ok(Outbound::default()),
+        }
     }
 
     /// The command execution is waiting for a payload for, if any.
@@ -568,6 +839,57 @@ impl<P: Persistence> Voter<P> {
     /// Whether this replica currently leads its ballot.
     pub fn leads(&self) -> bool {
         self.node.machine().leads()
+    }
+
+    /// Apply every command whose turn has come as a staged group, journal
+    /// it with what this voter's rounds left queued, and hand out what
+    /// that released (task-d47, [`Node::stage`], [`Node::flush`]). A
+    /// runtime lowering in groups calls this, then [`Voter::finish`],
+    /// rather than [`Voter::execute`], once it has no more events ready.
+    pub fn flush(&mut self) -> Result<Outbound, DriveError> {
+        // The ready commands are staged first, so their batches and the
+        // protocol's share one journal append; what that releases is
+        // handed out here, before the group's projection commit, and the
+        // group's results by [`Voter::finish`] after it.
+        let mut out = self.node.stage(&self.ballot)?;
+        out.absorb(self.node.flush(&self.ballot)?);
+        Ok(out)
+    }
+
+    /// Materialize the execution group a [`Voter::flush`] staged and hand
+    /// out its results (task-d47).
+    pub fn finish(&mut self) -> Result<Outbound, DriveError> {
+        self.node.finish(&self.ballot)
+    }
+
+    /// Take back what a pipelined store's materializer has committed and
+    /// hand out what it released (task-d52, [`Node::settle`]). The runtime
+    /// calls this when the materializer's waker fires.
+    pub fn settle(&mut self) -> Result<Outbound, DriveError> {
+        self.node.settle(&self.ballot)
+    }
+
+    /// Whether [`Voter::flush`] has anything to do: batches queued, or a
+    /// command to apply.
+    ///
+    /// Batches queued behind a journal append that is out are not owed a
+    /// flush (task-d54): nothing can be journaled until the append is
+    /// back, and the appender's wake ([`Voter::settle`]) journals them
+    /// then. Owed one, the runtime would flush in a loop that moves
+    /// nothing.
+    pub fn owes_flush(&self) -> bool {
+        (self.queued() > 0 && !self.appending()) || self.node.can_execute()
+    }
+
+    /// Whether a journal append is out on the appender's thread, its
+    /// outcome not yet taken back (task-d54).
+    pub fn appending(&self) -> bool {
+        self.node.applier().store().appending()
+    }
+
+    /// Batches this voter submitted and has not lowered yet.
+    pub fn queued(&self) -> usize {
+        self.node.applier().store().queued()
     }
 
     /// Apply every command whose turn has come.
@@ -659,4 +981,11 @@ fn higher(a: &Ballot, b: &Ballot) -> bool {
 /// comparable.
 fn highest(a: Ballot, b: Ballot) -> Ballot {
     if higher(&b, &a) { b } else { a }
+}
+
+/// Queue `answer` for `origin`'s collector.
+fn push_answer(out: &mut Outbound, origin: Origin, answer: &ReadAnswerV1) {
+    if let Ok(frame) = read_answer_frame(answer) {
+        out.reads.push((origin, frame));
+    }
 }

@@ -1081,3 +1081,79 @@ fn shared_checkpoint_fixture_is_frozen() {
         "shared checkpoint fixture drifted; the canonical traversal and root are frozen"
     );
 }
+
+/// What an inline export costs as common state grows: the floor runs
+/// [`export_shared`] and [`SharedImageStore::keep`] on the serving loop,
+/// so their time is time the domain does not serve. Run by hand:
+///
+/// `FLOOR_MEASURE_MIB=16,64,256 cargo test --release -p coord-checkpoint
+/// --test export -- --ignored --nocapture measure_the_inline_boundary`
+///
+/// Each size writes a redb store and an image of about that many MiB.
+#[test]
+#[ignore = "a measurement, run by hand"]
+fn measure_the_inline_boundary() {
+    use coord_checkpoint::store::SharedImageStore;
+    use std::time::Instant;
+
+    let sizes: Vec<usize> = std::env::var("FLOOR_MEASURE_MIB")
+        .unwrap_or_else(|_| "16,64".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    // coordd's default `[state] cache_bytes`.
+    let cache: usize = std::env::var("FLOOR_MEASURE_CACHE_MIB")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(64);
+    let value = codecs::encode_current(&entry(&[b'x'; 1000], 3, 3, 1)).unwrap();
+    for mib in sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let mut generation = Generation::create(
+            &dir.path().join("store"),
+            StoreIdentity {
+                cluster_id: CLUSTER,
+                domain_id: DOMAIN,
+                replica_id: ReplicaId([3; 16]),
+                incarnation: ReplicaIncarnation::new(1).unwrap(),
+            },
+            OpenOptions {
+                cache_bytes: cache * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        seed(generation.engine(), Profile::default());
+        let rows = mib * 1024 * 1024 / (value.len() + 24);
+        for batch in (0..rows).collect::<Vec<_>>().chunks(4096) {
+            let mut tx = generation.engine().begin_write().unwrap();
+            for i in batch {
+                tx.put(
+                    Collection::KvCurrentV1.id(),
+                    &codecs::current_key(&NS, format!("bulk-{i:010}").as_bytes()),
+                    &value,
+                )
+                .unwrap();
+            }
+            tx.commit_durable().unwrap();
+        }
+        let engine = generation.engine();
+        let started = Instant::now();
+        let view = engine.reader().snapshot().unwrap();
+        let checkpoint = export_shared(&view, origin(), &ExportLimits::default()).unwrap();
+        let exported = started.elapsed();
+        let images = SharedImageStore::open(&dir.path().join("images")).unwrap();
+        let started = Instant::now();
+        let bytes = images.keep(&checkpoint).unwrap();
+        let kept = started.elapsed();
+        let manifest = checkpoint.manifest.encode().unwrap().len();
+        println!(
+            "state {mib} MiB cache {cache} MiB: rows {} chunks {} manifest {manifest} B image {bytes} B \
+             export {:.3}s keep {:.3}s total {:.3}s ({:.1} ms/MiB)",
+            checkpoint.manifest.rows(),
+            checkpoint.chunks.len(),
+            exported.as_secs_f64(),
+            kept.as_secs_f64(),
+            (exported + kept).as_secs_f64(),
+            (exported + kept).as_secs_f64() * 1000.0 / mib as f64,
+        );
+    }
+}

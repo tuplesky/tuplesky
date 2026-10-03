@@ -7,8 +7,9 @@
 use std::collections::BTreeSet;
 
 use coord_consensus::{
-    ClosureProgress, CommandTable, GuardViolation, InitError, Phase, RetireError, chain,
-    decode_dependency, dependency_key, dependency_update, empty_path,
+    ClosureProgress, CommandRecord, CommandTable, GuardViolation, InitError, Phase, RetireError,
+    anchored_path, chain, decode_dependency, dependency_key, dependency_update, empty_path,
+    reordered_path,
 };
 use coord_store_api::registry::Collection;
 use coord_types::identity::Digest32;
@@ -121,6 +122,112 @@ fn leader_synchronization_aligns_follower_paths() {
     assert_eq!(fd.paths, ld.paths);
 }
 
+/// A command pre-accepted ahead of one the leader then ordered first is
+/// left behind it in the log, pre-accepted without it (task-d34, F7).
+///
+/// The follower saw x, then y; the leader ordered y, then x. Aligned to y
+/// alone, the follower's log reads y then x, which is the leader's order,
+/// while its record of x still does not depend on y. A fast
+/// acknowledgement of a next command z with that head would claim a
+/// history the follower's records do not hold, and with the leader
+/// absent recovery could not rebuild z's ancestors from them. Until x is
+/// synchronized itself, the head is on no leader path.
+#[test]
+fn a_command_left_behind_a_synchronization_keeps_the_head_off_the_leaders() {
+    let (x, y, z) = (cmd(1), cmd(2), cmd(3));
+    let mut leader = CommandTable::new();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let lx = leader.initialize(x, payload(1), k("key")).unwrap();
+    assert_eq!(lx.deps, vec![y]);
+    let mut follower = CommandTable::new();
+    let fx = follower.initialize(x, payload(1), k("key")).unwrap();
+    assert!(!fx.deps.contains(&y));
+    follower.initialize(y, payload(2), k("key")).unwrap();
+
+    follower.record_leader_path(y, 0, &ly.paths);
+    let log = follower.log(b"key").unwrap();
+    assert_eq!(log.pending(), &[x]);
+    assert_eq!(log.reordered(), &BTreeSet::from([x]));
+    // Without the rule this is chain(y's anchor, x): the leader's head.
+    assert_eq!(
+        follower.path_head(b"key"),
+        chain(&reordered_path(&ly.paths[0].1), &x)
+    );
+    assert_ne!(follower.path_head(b"key"), leader.path_head(b"key"));
+    let lz = leader.initialize(z, payload(3), k("key")).unwrap();
+    let mut early = follower.clone();
+    let fz = early.initialize(z, payload(3), k("key")).unwrap();
+    assert_ne!(fz.path, lz.path, "no fast evidence over x's stale record");
+
+    // Synchronized itself, x takes the leader's order, and the head is the
+    // leader's again.
+    follower.record_leader_path(x, 1, &lx.paths);
+    assert!(follower.log(b"key").unwrap().reordered().is_empty());
+    assert_eq!(follower.path_head(b"key"), lx.paths[0].1);
+    let fz = follower.initialize(z, payload(3), k("key")).unwrap();
+    assert_eq!(fz.path, lz.path);
+
+    // A synchronization that arrived before its command was appended here
+    // leaves all of the suffix behind it too.
+    let mut late = CommandTable::new();
+    late.record_leader_path(y, 0, &ly.paths);
+    late.initialize(x, payload(1), k("key")).unwrap();
+    late.initialize(y, payload(2), k("key")).unwrap();
+    assert_eq!(late.log(b"key").unwrap().reordered(), &BTreeSet::from([x]));
+    assert_ne!(late.path_head(b"key"), leader.path_head(b"key"));
+
+    // Executed and retired without a synchronization of its own, x holds a
+    // decided order, and it no longer keeps the head off.
+    early.accept(y, vec![]).unwrap();
+    early.accept(x, vec![y]).unwrap();
+    early.commit(y).unwrap();
+    early.commit(x).unwrap();
+    early.execute(y).unwrap();
+    early.execute(x).unwrap();
+    early.retire(&x).unwrap();
+    assert!(early.log(b"key").unwrap().reordered().is_empty());
+}
+
+/// A new leader's first fresh proposal follows the recovered tails, and
+/// so does its path (task-d34, F7).
+///
+/// The leader's own appends never passed through t, which it installed
+/// from a Sync and anchors after. A follower whose appends were the same,
+/// and which has not installed t, derives x from b alone. Hashed through
+/// the leader's appends, x's path was the same on both while its
+/// dependencies were not, and the fast acknowledgement of the command
+/// after x, with equal dependencies and an equal path, was a fast decision
+/// over two histories (protocol_sim row 10, three voters, seed 52).
+#[test]
+fn a_leaders_path_follows_the_tails_it_anchors_after() {
+    let (b, t, x, y) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let mut leader = CommandTable::new();
+    let mut follower = CommandTable::new();
+    let lb = leader.initialize(b, payload(1), k("key")).unwrap();
+    follower.initialize(b, payload(1), k("key")).unwrap();
+    follower.record_leader_path(b, 0, &lb.paths);
+    assert_eq!(leader.path_head(b"key"), follower.path_head(b"key"));
+
+    leader.anchor_all(b"key", &[t, b]);
+    assert_eq!(leader.path_head(b"key"), anchored_path(&[b, t]));
+    let lx = leader.initialize(x, payload(3), k("key")).unwrap();
+    let fx = follower.initialize(x, payload(3), k("key")).unwrap();
+    assert_eq!(lx.deps, vec![t, b]);
+    assert_eq!(fx.deps, vec![b]);
+    assert_ne!(lx.path, fx.path);
+    let ly = leader.initialize(y, payload(4), k("key")).unwrap();
+    let mut behind = follower.clone();
+    let fy = behind.initialize(y, payload(4), k("key")).unwrap();
+    assert_eq!(ly.deps, fy.deps);
+    assert_ne!(ly.path, fy.path, "equal dependencies over another history");
+
+    // Synchronized to the leader's order for x, the follower's paths are
+    // the leader's again.
+    follower.record_leader_path(x, 1, &lx.paths);
+    let fy = follower.initialize(y, payload(4), k("key")).unwrap();
+    assert_eq!(fy.path, ly.path);
+}
+
 #[test]
 fn duplicate_and_reordered_messages_converge() {
     let (a, b) = (cmd(1), cmd(2));
@@ -207,6 +314,63 @@ fn closure_traversal_is_exact_and_incremental() {
         u.closure_start(cmd(0)),
         Err(GuardViolation::DependencyUnknown { dep: cmd(0) })
     );
+}
+
+/// An execution's evidence stops at what already executed: an executed
+/// command's predecessors were established when it ran, so walking
+/// through them again proves nothing, and the full walk visits every
+/// executed record the table holds on every execution (task-d53).
+#[test]
+fn an_executions_closure_stops_at_what_already_executed() {
+    for executed in [10u8, 200] {
+        let mut t = CommandTable::new();
+        for i in 0..=executed {
+            t.initialize(cmd(i), payload(i), k("chain")).unwrap();
+            let deps = t.record(&cmd(i)).unwrap().deps.clone();
+            t.accept(cmd(i), deps).unwrap();
+            t.commit(cmd(i)).unwrap();
+            if i < executed {
+                t.execute(cmd(i)).unwrap();
+            }
+        }
+        let last = cmd(executed);
+        let ClosureProgress::Complete(full) = t
+            .closure_step(t.closure_start(last).unwrap(), usize::MAX)
+            .unwrap()
+        else {
+            panic!("an unbounded step completes");
+        };
+        assert_eq!(
+            full.visits,
+            usize::from(executed),
+            "the full walk visits every one"
+        );
+        let ClosureProgress::Complete(needed) = t
+            .unexecuted_closure_step(t.closure_start(last).unwrap(), usize::MAX)
+            .unwrap()
+        else {
+            panic!("an unbounded step completes");
+        };
+        assert_eq!(needed.members, BTreeSet::from([cmd(executed - 1)]));
+        assert_eq!(needed.visits, 1, "however many executed before it");
+    }
+    // An unexecuted predecessor is walked through, down to what executed.
+    let mut t = CommandTable::new();
+    for i in 0..4u8 {
+        t.initialize(cmd(i), payload(i), k("chain")).unwrap();
+        let deps = t.record(&cmd(i)).unwrap().deps.clone();
+        t.accept(cmd(i), deps).unwrap();
+        t.commit(cmd(i)).unwrap();
+    }
+    t.execute(cmd(0)).unwrap();
+    let ClosureProgress::Complete(needed) = t
+        .unexecuted_closure_step(t.closure_start(cmd(3)).unwrap(), usize::MAX)
+        .unwrap()
+    else {
+        panic!("an unbounded step completes");
+    };
+    assert_eq!(needed.members, BTreeSet::from([cmd(0), cmd(1), cmd(2)]));
+    assert_eq!(needed.visits, 3);
 }
 
 #[test]
@@ -387,9 +551,13 @@ fn a_hot_key_keeps_working_after_its_executed_predecessor_is_retired() {
     assert!(!t.tombstones().contains(&cmd(0)));
     assert!(t.tombstones().contains(&cmd(1)));
     assert!(t.tombstones().contains(&cmd(2)));
-    // The key's next command depends on nothing: the index was cleared.
+    // The key's next command still depends on the latest one, retired
+    // as it is (task-d06): a replica that has not executed c2 yet must not
+    // execute c3 first, and one that has reads c2's tombstone as EXECUTED.
     let i3 = t.initialize(cmd(3), payload(3), k("hot")).unwrap();
-    assert_eq!(i3.deps, vec![]);
+    assert_eq!(i3.deps, vec![cmd(2)]);
+    t.accept(cmd(3), i3.deps)
+        .expect("the tombstone answers for c2");
 }
 
 /// A command retired before the evidence that names it arrives is still
@@ -511,4 +679,367 @@ fn a_full_table_reclaims_what_it_executed_and_nothing_else() {
     roomy.initialize(cmd(1), payload(1), k("key")).unwrap();
     assert_eq!(roomy.phase_of(&cmd(0)), Some(Phase::Executed));
     assert_eq!(roomy.len(), 2);
+}
+
+/// Run `command` through to EXECUTED under its own dependencies.
+fn run_through(
+    t: &mut CommandTable,
+    command: CommandId,
+    i: u8,
+    keys: Vec<Vec<u8>>,
+) -> Vec<CommandId> {
+    let deps = t.initialize(command, payload(i), keys).unwrap().deps;
+    t.accept(command, deps.clone()).unwrap();
+    t.commit(command).unwrap();
+    t.execute(command).unwrap();
+    deps
+}
+
+/// The command after a reclaim still depends on the key's latest command,
+/// retired or not (task-d06).
+///
+/// The table reclaims exactly when it is full, and before it computes the
+/// next command's dependencies. Retirement used to clear the key's latest,
+/// so the first command a full leader proposed named no dependency at all;
+/// a follower still behind the command it should have named found it
+/// ready and executed it first. On the leader nothing looked wrong: what
+/// it retired had executed there.
+#[test]
+fn the_command_after_a_reclaim_still_depends_on_the_last_one() {
+    let capacity = 4u8;
+    let mut t = CommandTable::with_capacity(usize::from(capacity));
+    let mut previous = None;
+    for i in 1..=capacity {
+        let deps = run_through(&mut t, cmd(i), i, k("conservative"));
+        assert_eq!(deps, previous.into_iter().collect::<Vec<_>>());
+        previous = Some(cmd(i));
+    }
+    // Full, so this reclaims every executed record first.
+    let next = t
+        .initialize(cmd(100), payload(100), k("conservative"))
+        .unwrap();
+    assert_eq!(
+        next.deps,
+        vec![cmd(capacity)],
+        "the chain broke at the reclaim"
+    );
+    assert!(t.record(&cmd(capacity)).is_none(), "it was retired");
+    assert_eq!(t.phase_of(&cmd(capacity)), Some(Phase::Executed));
+    assert_eq!(t.conflicts(&k("conservative")), vec![cmd(100)]);
+}
+
+/// A key's latest command keeps its tombstone however many retirements
+/// follow on other keys, because the next command on that key will name
+/// it and the guards must answer for it (task-d06). Every other tombstone
+/// still goes by age.
+#[test]
+fn a_keys_latest_tombstone_outlives_the_bound() {
+    let capacity = 2u8;
+    let mut t = CommandTable::with_capacity(usize::from(capacity));
+    run_through(&mut t, cmd(1), 1, k("quiet"));
+    t.retire(&cmd(1)).unwrap();
+    for i in 2..=8u8 {
+        run_through(&mut t, cmd(i), i, k("busy"));
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        t.tombstones().contains(&cmd(1)),
+        "the quiet key's latest lost its tombstone"
+    );
+    assert!(!t.tombstones().contains(&cmd(2)), "an old tombstone stayed");
+    let next = t.initialize(cmd(50), payload(50), k("quiet")).unwrap();
+    assert_eq!(next.deps, vec![cmd(1)]);
+    t.accept(cmd(50), next.deps)
+        .expect("the guard answers for it");
+    // Superseded, it goes in its turn.
+    t.commit(cmd(50)).unwrap();
+    t.execute(cmd(50)).unwrap();
+    t.retire(&cmd(50)).unwrap();
+    for i in 9..=12u8 {
+        run_through(&mut t, cmd(i), i, k("busy"));
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        !t.tombstones().contains(&cmd(1)),
+        "a superseded tombstone stayed"
+    );
+    assert!(
+        t.tombstones().contains(&cmd(50)),
+        "the quiet key's new latest"
+    );
+}
+
+/// A command this replica executed is answered for as executed however
+/// long ago it was retired, and the tombstones stay bounded (task-d05).
+///
+/// The tombstones are a recency window: what this replica still keeps
+/// about a command. Recovery asks a different question of commands far
+/// older than that window -- did this replica execute it at all -- and a
+/// replica that answered "unknown" for its own history treated it as work
+/// to do: a placeholder, a payload to fetch, a table filling with it.
+#[test]
+fn an_executed_command_is_answered_for_long_after_its_tombstone_went() {
+    let capacity = 2u8;
+    let mut t = CommandTable::with_capacity(usize::from(capacity));
+    for i in 1..=40u8 {
+        run_through(&mut t, cmd(i), i, k("conservative"));
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        t.tombstones().len() <= usize::from(capacity) + 1,
+        "the tombstones grew with the history: {}",
+        t.tombstones().len()
+    );
+    assert!(!t.tombstones().contains(&cmd(1)));
+    for i in 1..=40u8 {
+        assert_eq!(t.phase_of(&cmd(i)), Some(Phase::Executed), "command {i}");
+    }
+    // A command never seen is still unknown.
+    assert_eq!(t.phase_of(&cmd(99)), None);
+    // Restored from an executed identity whose rows are gone, a command is
+    // remembered as executed too.
+    let mut restored = CommandTable::with_capacity(usize::from(capacity));
+    restored.restore_executed(&cmd(7));
+    assert_eq!(restored.phase_of(&cmd(7)), Some(Phase::Executed));
+    assert!(restored.record(&cmd(7)).is_none());
+}
+
+/// What a report still names is the last `capacity` retirements, however
+/// many keys there are (task-d05).
+///
+/// The tombstones keep every key's latest command for the guards, and
+/// with commands on ever new keys every one of them is some key's latest:
+/// a report bounded by the tombstones grew with the keys. The domain uses
+/// one conservative key today, so this is the table's contract rather
+/// than a case `coordd` meets.
+#[test]
+fn history_on_distinct_keys_is_forgotten_past_the_window() {
+    let capacity = 4usize;
+    let mut t = CommandTable::with_capacity(capacity);
+    for i in 1..=40u8 {
+        let key = alloc_key(i);
+        run_through(&mut t, cmd(i), i, vec![key]);
+        t.retire(&cmd(i)).unwrap();
+    }
+    // Each command is its key's latest, so each keeps its tombstone.
+    assert_eq!(t.tombstones().len(), 40);
+    let remembered: Vec<u8> = (1..=40u8).filter(|i| !t.forgotten(&cmd(*i))).collect();
+    assert_eq!(remembered, vec![37, 38, 39, 40]);
+    for i in 1..=40u8 {
+        assert_eq!(t.phase_of(&cmd(i)), Some(Phase::Executed), "command {i}");
+    }
+}
+
+/// A reclaim retires what executed in the order it executed (task-d33,
+/// protocol_sim row 3, three voters, seed 22).
+///
+/// A table past its capacity -- commands let in beyond it, a recovery's
+/// reserve -- reclaims more executed records at once than the window a
+/// report names. Retired in identity order, a command executed a moment
+/// before could go into the window first and out of it within the same
+/// reclaim: the deposed leader's report left it out, the candidate still
+/// held it pre-accepted and re-proposed it, and the voters executed two
+/// decisions of it. The window has to be the last `capacity` commands
+/// executed, which is what a replica's refusal of a candidate behind it
+/// counts.
+#[test]
+fn a_reclaim_retires_in_the_order_commands_executed() {
+    let capacity = 4usize;
+    let mut t = CommandTable::with_capacity(capacity);
+    for i in 1..=12u8 {
+        let deps = t
+            .initialize_beyond_capacity(cmd(i), payload(i), vec![alloc_key(i)])
+            .unwrap()
+            .deps;
+        t.accept(cmd(i), deps).unwrap();
+        t.commit(cmd(i)).unwrap();
+        t.execute(cmd(i)).unwrap();
+    }
+    assert_eq!(t.reclaim(), 12);
+    let remembered: Vec<u8> = (1..=12u8).filter(|i| !t.forgotten(&cmd(*i))).collect();
+    assert_eq!(remembered, vec![9, 10, 11, 12]);
+}
+
+fn alloc_key(i: u8) -> Vec<u8> {
+    vec![b'k', i]
+}
+
+/// The closure of a record stops at any command this replica executed and
+/// retired, however long ago, not only at one still in the tombstone
+/// window (task-d05).
+///
+/// A restart retires every executed record at once, and the tombstones
+/// then keep only the last `capacity` of them. A record still live after
+/// the restart -- committed, not yet executed -- whose dependencies reach
+/// further back met a command the guards answer EXECUTED for and the
+/// closure called unknown. Executing it failed as `DependencyUnknown` on
+/// every restart: the `--fault leader` stop on #98.
+#[test]
+fn a_closure_stops_at_history_older_than_the_tombstones() {
+    let record = |phase: Phase, deps: &[u8]| coord_consensus::CommandRecord {
+        phase,
+        deps: deps.iter().copied().map(cmd).collect(),
+        keys: k("conservative"),
+        payload: Some(payload(0)),
+        paths: Vec::new(),
+        synced_seq: None,
+        path: empty_path(),
+    };
+    // Six commands executed in a chain, and a seventh, committed and not
+    // executed, that depends on the first.
+    let mut rows: Vec<_> = (1..=6u8)
+        .map(|i| {
+            let deps: Vec<u8> = if i == 1 { Vec::new() } else { vec![i - 1] };
+            (cmd(i), record(Phase::Accept, &deps))
+        })
+        .collect();
+    rows.push((cmd(7), record(Phase::Commit, &[1])));
+    let mut t = CommandTable::restore(Some(2), rows);
+    for i in 1..=6u8 {
+        t.restore_executed(&cmd(i));
+    }
+    for i in 1..=6u8 {
+        t.retire(&cmd(i)).unwrap();
+    }
+    assert!(
+        !t.tombstones().contains(&cmd(1)),
+        "command 1 left the window"
+    );
+    assert_eq!(t.phase_of(&cmd(1)), Some(Phase::Executed));
+    let cursor = t.closure_start(cmd(7)).unwrap();
+    let ClosureProgress::Complete(closure) = t
+        .closure_step(cursor, usize::MAX)
+        .expect("the closure stops at an executed command")
+    else {
+        panic!("an unbounded step completes");
+    };
+    assert_eq!(closure.members, BTreeSet::from([cmd(1)]));
+}
+
+/// A table restored with a commit missing between two committed commands
+/// has two committed tails, and nothing in it says which one is last. The
+/// next command anchored at them depends on both, so it follows the real
+/// tail whichever it is (task-d12).
+///
+/// A live table cannot get there -- a commit waits for its dependencies'
+/// -- but a restart can: a command installed from a Sync comes back at
+/// COMMIT from its row, while one committed from votes left its row at
+/// ACCEPT.
+#[test]
+fn a_command_anchored_at_every_committed_tail_follows_the_last_one() {
+    // The earlier of the two committed commands takes the larger
+    // identity, so a choice by identity picks the wrong one.
+    let (one, two) = (cmd(1), cmd(2));
+    let (early, late) = (one.max(two), one.min(two));
+    let between = cmd(3);
+    let mut live = CommandTable::new();
+    for (i, c) in [early, between, late].into_iter().enumerate() {
+        live.initialize(c, payload(i as u8), k("key")).unwrap();
+    }
+    live.accept(early, vec![]).unwrap();
+    live.accept(between, vec![early]).unwrap();
+    live.accept(late, vec![between]).unwrap();
+    // As the rows say after the restart: `between` at ACCEPT.
+    let rows: Vec<(CommandId, CommandRecord)> = [
+        (early, Phase::Commit),
+        (between, Phase::Accept),
+        (late, Phase::Commit),
+    ]
+    .into_iter()
+    .map(|(c, phase)| {
+        let mut record = live.record(&c).unwrap().clone();
+        record.phase = phase;
+        (c, record)
+    })
+    .collect();
+    let mut table = CommandTable::restore(Some(32), rows);
+    let tails = table.committed_tails(b"key");
+    assert_eq!(tails.len(), 2, "{tails:?}");
+    assert!(tails.contains(&early) && tails.contains(&late));
+    table.anchor_all(b"key", &tails);
+    let next = table.initialize(cmd(4), payload(4), k("key")).unwrap();
+    assert!(
+        next.deps.contains(&late),
+        "the next command does not follow the last committed command: {:?}",
+        next.deps
+    );
+    // Once, not for ever: the command after it follows it alone.
+    let after = table.initialize(cmd(5), payload(5), k("key")).unwrap();
+    assert_eq!(after.deps, vec![cmd(4)]);
+}
+
+/// task-d24: releasing an undecided record repairs the conflict index: a
+/// key whose latest command it was takes the released command's own
+/// dependencies, so the next command on the key follows what the released
+/// one followed; a decided record is never released.
+#[test]
+fn releasing_the_latest_command_hands_the_key_back_to_its_predecessor() {
+    let id = |n: u8| CommandId(Digest32([n; 32]));
+    let key = vec![b"*".to_vec()];
+    let mut t = CommandTable::with_capacity(16);
+    let a = t.initialize(id(1), Digest32([1; 32]), key.clone()).unwrap();
+    assert!(a.deps.is_empty());
+    let b = t.initialize(id(2), Digest32([2; 32]), key.clone()).unwrap();
+    assert_eq!(b.deps, vec![id(1)]);
+    assert!(t.release(&id(2)));
+    assert_eq!(t.phase_of(&id(2)), None);
+    let c = t.initialize(id(3), Digest32([3; 32]), key.clone()).unwrap();
+    assert_eq!(
+        c.deps,
+        vec![id(1)],
+        "the next command follows the released one's predecessor"
+    );
+    t.accept(id(1), vec![]).unwrap();
+    t.commit(id(1)).unwrap();
+    assert!(!t.release(&id(1)), "a decided record stays");
+}
+
+/// A released command leaves the key's path log (task-d24): the next
+/// command's path is the one a replica that never held it computes, so
+/// its fast-path evidence agrees with theirs.
+#[test]
+fn a_released_command_leaves_the_path_log() {
+    let id = |n: u8| CommandId(Digest32([n; 32]));
+    let key = vec![b"*".to_vec()];
+    let mut released = CommandTable::with_capacity(16);
+    released
+        .initialize(id(1), Digest32([1; 32]), key.clone())
+        .unwrap();
+    released
+        .initialize(id(2), Digest32([2; 32]), key.clone())
+        .unwrap();
+    assert!(released.release(&id(2)));
+    let after_release = released
+        .initialize(id(3), Digest32([3; 32]), key.clone())
+        .unwrap();
+    let mut never = CommandTable::with_capacity(16);
+    never
+        .initialize(id(1), Digest32([1; 32]), key.clone())
+        .unwrap();
+    let without = never
+        .initialize(id(3), Digest32([3; 32]), key.clone())
+        .unwrap();
+    assert_eq!(after_release.paths, without.paths);
+    assert_eq!(after_release.path, without.path);
+}
+
+/// A released command that was reordered behind a synchronization no
+/// longer holds the head off the leader's paths (task-d24 with task-d34):
+/// released, it stands for no history at all.
+#[test]
+fn a_released_reordered_command_frees_the_head() {
+    let (x, y) = (cmd(1), cmd(2));
+    let mut leader = CommandTable::new();
+    let ly = leader.initialize(y, payload(2), k("key")).unwrap();
+    let mut follower = CommandTable::new();
+    follower.initialize(x, payload(1), k("key")).unwrap();
+    follower.initialize(y, payload(2), k("key")).unwrap();
+    follower.record_leader_path(y, 0, &ly.paths);
+    assert_eq!(
+        follower.log(b"key").unwrap().reordered(),
+        &BTreeSet::from([x])
+    );
+    assert!(follower.release(&x));
+    assert!(follower.log(b"key").unwrap().reordered().is_empty());
+    assert_eq!(follower.path_head(b"key"), leader.path_head(b"key"));
 }

@@ -161,12 +161,27 @@ impl Outbox {
                 self.dropped.push((send, ReleaseError::ObsoleteBallot));
                 continue;
             }
-            if let Some(err) = send.requires.iter().find_map(|b| self.failed.get(b)) {
-                let err = *err;
+            // A send can require every batch submitted before its own (a
+            // leader's acknowledgement does), so a new leader re-proposing
+            // a selection of thousands holds sends requiring thousands of
+            // barriers, and this runs at every completion. Nothing failed
+            // is the usual case, checked once; and the newest barrier, the
+            // one least likely durable yet, is checked first, so a send
+            // still waiting costs one lookup rather than a walk over the
+            // durable prefix of its list.
+            let failed = if self.failed.is_empty() {
+                None
+            } else {
+                send.requires
+                    .iter()
+                    .find_map(|b| self.failed.get(b))
+                    .copied()
+            };
+            if let Some(err) = failed {
                 self.dropped.push((send, ReleaseError::BarrierFailed(err)));
                 continue;
             }
-            let barriers_durable = send.requires.iter().all(|b| self.durable.contains(b));
+            let barriers_durable = send.requires.iter().rev().all(|b| self.durable.contains(b));
             let cut_durable = send.context.required_journal_seq <= self.durable_through;
             if barriers_durable && cut_durable {
                 released.push(Effect::SendWhenDurable {
@@ -194,16 +209,40 @@ impl Outbox {
     }
 }
 
+/// The first sequence of the application's barriers.
+///
+/// A replica's protocol machine and its applier each allocate barriers
+/// for the same boot and hand them to the same store, and a barrier is
+/// told apart from another only by its sequence. Both counting from one
+/// made them the same barrier: the applier took a protocol batch's
+/// `Materialized` as its own command's, and reported the command applied
+/// while its own batch was still queued. So the sequences are split in
+/// two, and the upper half is the applier's.
+pub const APPLICATION_BARRIERS: u64 = 1 << 63;
+
+/// The first sequence of the runtime's own barriers: batches a replica's
+/// runtime persists for itself, beside its protocol machine and its
+/// applier, such as a forgetting floor's readiness (task-d27). Below
+/// [`APPLICATION_BARRIERS`], so the applier hands their facts on.
+pub const RUNTIME_BARRIERS: u64 = 1 << 62;
+
+/// Whether `barrier` was allocated by an applier ([`BarrierAllocator::for_application`]).
+pub const fn is_application(barrier: &BarrierId) -> bool {
+    barrier.sequence >= APPLICATION_BARRIERS
+}
+
 /// Allocator of per-boot barrier sequences.
 #[derive(Debug)]
 pub struct BarrierAllocator {
     node_generation: coord_types::ids::ReplicaIncarnation,
     boot_id: BootId,
     next: u64,
+    /// The first sequence this allocator may not issue.
+    end: u64,
 }
 
 impl BarrierAllocator {
-    /// New allocator for this boot.
+    /// New allocator for this boot, below [`RUNTIME_BARRIERS`].
     pub const fn new(
         node_generation: coord_types::ids::ReplicaIncarnation,
         boot_id: BootId,
@@ -212,12 +251,36 @@ impl BarrierAllocator {
             node_generation,
             boot_id,
             next: 1,
+            end: RUNTIME_BARRIERS,
         }
+    }
+
+    /// The same allocator moved to the runtime's own sequences, between
+    /// the protocol's and the application's.
+    #[must_use]
+    pub const fn for_runtime(mut self) -> Self {
+        if self.next < RUNTIME_BARRIERS {
+            self.next = RUNTIME_BARRIERS;
+        }
+        self.end = APPLICATION_BARRIERS;
+        self
+    }
+
+    /// The same allocator moved to the application's half of the
+    /// sequences, which no protocol allocator of the boot reaches.
+    #[must_use]
+    pub const fn for_application(mut self) -> Self {
+        if self.next < APPLICATION_BARRIERS {
+            self.next = APPLICATION_BARRIERS;
+        }
+        self.end = u64::MAX;
+        self
     }
 
     /// Next barrier; sequences never repeat within a boot.
     pub fn allocate(&mut self) -> BarrierId {
         let sequence = self.next;
+        assert!(sequence < self.end, "barrier sequence exhausted");
         self.next = self
             .next
             .checked_add(1)

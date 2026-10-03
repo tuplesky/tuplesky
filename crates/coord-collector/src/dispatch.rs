@@ -28,12 +28,18 @@ use coord_types::wire_v1::{
 };
 use coord_types::{CommandId, RetryKey};
 
+use coord_core::event::AdmittedRequest;
+use coord_types::ids::{Ballot, ReplicaId};
+use coord_types::logical_v1::{CanonicalOperation, LogicalRequest};
+use coord_types::wire_v1::{OutcomeV1, RequestV1, ResponseV1};
+
 use crate::admission::{Admission, AdmissionRefusal, Caller};
 use crate::clock::MonotonicMillis;
 use crate::codes;
 use crate::collector::{
     Collector, EvidenceError, Progress, Release, Resolution, SubmitRefusal, Submitted,
 };
+use crate::wire::{ReadAnswerV1, ReadOutcomeV1, ReadV1, read_frame};
 
 /// A response for a connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,11 +52,76 @@ pub struct Delivery {
     pub frame: Vec<u8>,
 }
 
+/// How long a frontend waits for the leader's answer to a read before it
+/// orders the read instead, in milliseconds (task-d50). Longer than the
+/// leader holds one (`coord_daemon::reads::READ_WAIT_MILLIS`), so a
+/// leader that is still answering is heard first.
+pub const READ_FALLBACK_MILLIS: u64 = 1_500;
+
+/// Whether the leader read barrier serves `request` (task-d50; design
+/// Section 6.3): a range with no explicit revision. A historical read is
+/// not current, and every other operation changes state.
+pub fn servable(request: &LogicalRequest) -> bool {
+    matches!(&request.operation, CanonicalOperation::Range(r) if r.revision.is_none())
+}
+
+/// A read for the leader the collector follows (task-d50).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadPlan {
+    /// The command the request derives to.
+    pub command: CommandId,
+    /// The invocation.
+    pub retry_key: RetryKey,
+    /// The leader it goes to.
+    pub leader: ReplicaId,
+    /// The encoded `ReadV1` frame.
+    pub frame: Vec<u8>,
+}
+
+/// A read waiting on its leader's answer.
+#[derive(Clone, Debug)]
+struct PendingRead {
+    connection: u64,
+    command: CommandId,
+    leader: ReplicaId,
+    admitted: AdmittedRequest,
+    reserved: bool,
+    /// When it was presented: a fallback's client deadline is measured
+    /// from here, not from the fallback.
+    since: MonotonicMillis,
+    /// When the leader's answer stops being waited for.
+    fallback_at: MonotonicMillis,
+    /// The client's own deadline, if it named one.
+    client_deadline: Option<MonotonicMillis>,
+}
+
+impl PendingRead {
+    /// The earlier of the fallback and the client's deadline.
+    fn deadline(&self) -> MonotonicMillis {
+        self.client_deadline
+            .map_or(self.fallback_at, |d| d.min(self.fallback_at))
+    }
+}
+
+/// What a leader's answer to a read, or its absence, came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadResolution {
+    /// Served: the response for the caller, still to be gated.
+    Answer(Delivery),
+    /// Not served by the barrier: the read is ordered instead, and this
+    /// is what ordering it asks the runtime to do.
+    Ordered(Action),
+}
+
 /// What the runtime does next.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Fan the submission out to every target in parallel.
     FanOut(crate::collector::FanOut),
+    /// Send a current read to the leader the collector follows; the
+    /// stream stays open until its answer, or until it is ordered
+    /// instead (task-d50).
+    Read(ReadPlan),
     /// Write this frame back on the request's stream.
     Respond(Delivery),
     /// The request is pending; the stream stays open until a delivery.
@@ -87,6 +158,10 @@ pub struct Dispatcher {
     by_connection: BTreeMap<u64, BTreeSet<RetryKey>>,
     watches: BTreeMap<(u64, u64), WatchId>,
     watch_queue: usize,
+    /// Whether current reads go to the leader read barrier (task-d50).
+    leader_reads: bool,
+    /// Reads waiting on their leader's answer.
+    reads: BTreeMap<RetryKey, PendingRead>,
 }
 
 impl Dispatcher {
@@ -99,7 +174,21 @@ impl Dispatcher {
             by_connection: BTreeMap::new(),
             watches: BTreeMap::new(),
             watch_queue,
+            leader_reads: false,
+            reads: BTreeMap::new(),
         }
+    }
+
+    /// Send current reads to the leader read barrier, or order them
+    /// (task-d50). Off until the runtime turns it on: a frontend that
+    /// follows no voter's ballot does not know who leads.
+    pub fn set_leader_reads(&mut self, on: bool) {
+        self.leader_reads = on;
+    }
+
+    /// Reads waiting on their leader's answer.
+    pub fn reads_waiting(&self) -> usize {
+        self.reads.len()
     }
 
     /// The collector.
@@ -181,13 +270,16 @@ impl Dispatcher {
         match message {
             MessageV1::Request(request) => {
                 let key = request.retry_key;
-                let admitted = match self.admission.admit(now_ticks, caller, &request) {
+                let admitted = match self.admission.admit_at(now_ticks, now, caller, &request) {
                     Ok(a) => a,
                     Err(refusal) => {
                         let (code, detail) = match refusal {
                             AdmissionRefusal::Malformed => (codes::MALFORMED_REQUEST, "malformed"),
                             AdmissionRefusal::SessionBusy { .. } => {
                                 (codes::BACKPRESSURE, "session busy")
+                            }
+                            AdmissionRefusal::RateLimited { .. } => {
+                                (codes::BACKPRESSURE, "admission rate")
                             }
                             AdmissionRefusal::RequestTooLarge { .. } => {
                                 (codes::REQUEST_TOO_LARGE, "request too large")
@@ -214,44 +306,29 @@ impl Dispatcher {
                     }
                 };
                 let reserved = admitted.reserved;
-                match self.collector.submit(now, &admitted.request) {
-                    Ok(Submitted::FanOut(fan_out)) => {
-                        self.attach(connection, key);
-                        Action::FanOut(fan_out)
-                    }
-                    Ok(Submitted::Attached { command }) => {
-                        self.attach(connection, key);
-                        Action::Pending { command }
-                    }
-                    Ok(Submitted::Resolved(response)) => {
-                        // Resolved: the invocation is finished, so its
-                        // slot frees whoever presented it.
-                        self.admission.settled(&key);
-                        Action::Respond(Delivery {
-                            connection,
-                            retry_key: key,
-                            frame: MessageV1::Response(response).encode().expect("bounded"),
-                        })
-                    }
-                    Err(refusal) => {
-                        // Only if this presentation took the slot. A
-                        // conflicting payload under a pending retry key
-                        // is refused while the original request is still
-                        // outstanding and still holds its reservation.
+                // A retry key whose read is waiting on its leader is bound
+                // to that read: another payload under it is a conflict,
+                // as it would be under an ordered command.
+                if let Some(waiting) = self.reads.get(&key) {
+                    let command = request
+                        .logical()
+                        .ok()
+                        .and_then(|logical| CommandId::derive(&key, &logical).ok());
+                    if command != Some(waiting.command) {
                         self.admission.settled_reservation(&key, reserved);
-                        let (code, detail) = match refusal {
-                            SubmitRefusal::Malformed => (codes::MALFORMED_REQUEST, "malformed"),
-                            SubmitRefusal::RequestIdentityConflict { .. } => (
-                                codes::REQUEST_IDENTITY_CONFLICT,
-                                "retry key bound to another payload",
-                            ),
-                            SubmitRefusal::Backpressure { .. } => {
-                                (codes::BACKPRESSURE, "domain at its collection bound")
-                            }
-                        };
-                        self.respond(connection, key, command_of(&key), code, detail)
+                        return self.respond(
+                            connection,
+                            key,
+                            command.unwrap_or_else(|| command_of(&key)),
+                            codes::REQUEST_IDENTITY_CONFLICT,
+                            "retry key bound to another payload",
+                        );
                     }
                 }
+                if let Some(read) = self.read_for(&request) {
+                    return self.send_read(now, connection, read, admitted.request, reserved);
+                }
+                self.order(now, now, connection, key, &admitted.request, reserved)
             }
             MessageV1::ResolveRequest(resolve) => {
                 if caller.role != coord_types::wire_v1::PeerRole::Client
@@ -454,6 +531,23 @@ impl Dispatcher {
         self.collector.due_offers(now, budget)
     }
 
+    /// Commands that have held neither half of a release long enough,
+    /// submitted to every voter again (task-d22); see
+    /// [`crate::Collector::due_solicits`].
+    pub fn due_solicits(
+        &mut self,
+        now: MonotonicMillis,
+        budget: usize,
+    ) -> Vec<crate::collector::FanOut> {
+        self.collector.due_solicits(now, budget)
+    }
+
+    /// When the next of those falls due; see
+    /// [`crate::Collector::next_solicit`].
+    pub fn next_solicit(&self) -> Option<MonotonicMillis> {
+        self.collector.next_solicit()
+    }
+
     /// A destination's link has come back; its re-offers fall due now
     /// (see [`crate::collector::Collector::reachable_again`]).
     pub fn reachable_again(
@@ -497,7 +591,8 @@ impl Dispatcher {
     }
 
     /// Pending commands the collector holds half of a release for
-    /// (task-c02): the ones a durable record is consulted for.
+    /// (task-c02), and those the record may settle alone (task-d22): the
+    /// ones a durable record is consulted for.
     pub fn half_established(&self) -> Vec<(CommandId, RetryKey)> {
         self.collector.half_established()
     }
@@ -508,12 +603,29 @@ impl Dispatcher {
         &mut self,
         command: CommandId,
         result_digest: coord_types::identity::Digest32,
+        position: coord_types::ids::ExecutionPosition,
         revision: Option<coord_types::ids::KvRevision>,
         response: &[u8],
     ) -> Result<Option<Delivery>, crate::collector::SettleError> {
-        let progress =
-            self.collector
-                .settle_from_record(command, result_digest, revision, response)?;
+        let progress = self.collector.settle_from_record(
+            command,
+            result_digest,
+            position,
+            revision,
+            response,
+        )?;
+        Ok(self.deliver(progress))
+    }
+
+    /// [`crate::Collector::settle_conflict_from_record`], then account the
+    /// release as any other: the session slot is freed and the attached
+    /// caller answered.
+    pub fn settle_conflict_from_record(
+        &mut self,
+        command: CommandId,
+        bound: CommandId,
+    ) -> Result<Option<Delivery>, crate::collector::SettleError> {
+        let progress = self.collector.settle_conflict_from_record(command, bound)?;
         Ok(self.deliver(progress))
     }
 
@@ -573,6 +685,17 @@ impl Dispatcher {
     /// collecting and stay resolvable), its watches are cancelled.
     pub fn on_connection_closed(&mut self, connection: u64, hub: &WatchHub) -> Vec<CommandId> {
         let mut cancelled = Vec::new();
+        // A read nobody waits for is not ordered: it changes nothing.
+        let reads: Vec<RetryKey> = self
+            .reads
+            .iter()
+            .filter(|(_, r)| r.connection == connection)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in reads {
+            self.reads.remove(&key);
+            self.admission.settled(&key);
+        }
         for key in self.by_connection.remove(&connection).unwrap_or_default() {
             self.owner.remove(&key);
             if let Some(command) = self.collector.cancel(&key) {
@@ -591,6 +714,232 @@ impl Dispatcher {
             }
         }
         cancelled
+    }
+
+    /// Submit an admitted request for ordering: the path every request
+    /// that is not a leader read takes, and the one a refused read takes
+    /// after.
+    ///
+    /// `since` is when the request was presented, which its client
+    /// deadline is measured from.
+    fn order(
+        &mut self,
+        now: MonotonicMillis,
+        since: MonotonicMillis,
+        connection: u64,
+        key: RetryKey,
+        admitted: &AdmittedRequest,
+        reserved: bool,
+    ) -> Action {
+        match self.collector.submit_since(now, since, admitted) {
+            Ok(Submitted::FanOut(fan_out)) => {
+                self.attach(connection, key);
+                Action::FanOut(fan_out)
+            }
+            Ok(Submitted::Attached { command }) => {
+                self.attach(connection, key);
+                Action::Pending { command }
+            }
+            Ok(Submitted::Resolved(response)) => {
+                // Resolved: the invocation is finished, so its slot
+                // frees whoever presented it.
+                self.admission.settled(&key);
+                Action::Respond(Delivery {
+                    connection,
+                    retry_key: key,
+                    frame: MessageV1::Response(response).encode().expect("bounded"),
+                })
+            }
+            Err(refusal) => {
+                // Only if this presentation took the slot. A conflicting
+                // payload under a pending retry key is refused while the
+                // original request is still outstanding and still holds
+                // its reservation.
+                self.admission.settled_reservation(&key, reserved);
+                let (code, detail) = match refusal {
+                    SubmitRefusal::Malformed => (codes::MALFORMED_REQUEST, "malformed"),
+                    SubmitRefusal::RequestIdentityConflict { .. } => (
+                        codes::REQUEST_IDENTITY_CONFLICT,
+                        "retry key bound to another payload",
+                    ),
+                    SubmitRefusal::Backpressure { .. } => {
+                        (codes::BACKPRESSURE, "domain at its collection bound")
+                    }
+                };
+                self.respond(connection, key, command_of(&key), code, detail)
+            }
+        }
+    }
+
+    /// The leader and the request of a read the barrier would serve, if
+    /// `request` is one and this collector is sending reads there.
+    ///
+    /// Not an invocation the collector has bound, being collected or
+    /// retained: a retry of a read that went the ordered way waits for
+    /// that answer, or is given it, since the command may already have
+    /// executed -- whether or not a caller is still attached to it.
+    fn read_for(&self, request: &RequestV1) -> Option<(Ballot, CommandId, RequestV1)> {
+        if !self.leader_reads
+            || self.owner.contains_key(&request.retry_key)
+            || self.collector.is_bound(&request.retry_key)
+        {
+            return None;
+        }
+        let logical = request.logical().ok().filter(servable)?;
+        let command = CommandId::derive(&request.retry_key, &logical).ok()?;
+        Some((self.collector.quorum().ballot(), command, request.clone()))
+    }
+
+    /// Send `read` to the leader of `ballot`, holding what ordering it
+    /// would need until the answer.
+    fn send_read(
+        &mut self,
+        now: MonotonicMillis,
+        connection: u64,
+        (ballot, command, request): (Ballot, CommandId, RequestV1),
+        admitted: AdmittedRequest,
+        reserved: bool,
+    ) -> Action {
+        let key = request.retry_key;
+        let client_deadline =
+            (request.deadline_ms > 0).then(|| now.plus(u64::from(request.deadline_ms)));
+        // The same read presented again before its answer (its payload
+        // checked by the caller): this caller waits for that one, under
+        // the deadline it presented, as an attach to an ordered command
+        // does.
+        if let Some(waiting) = self.reads.get_mut(&key) {
+            debug_assert_eq!(waiting.command, command);
+            waiting.connection = connection;
+            waiting.since = now;
+            waiting.client_deadline = client_deadline;
+            return Action::Pending { command };
+        }
+        let Ok(frame) = read_frame(&ReadV1 { ballot, request }) else {
+            return self.order(now, now, connection, key, &admitted, reserved);
+        };
+        self.reads.insert(
+            key,
+            PendingRead {
+                connection,
+                command,
+                leader: ballot.leader,
+                admitted,
+                reserved,
+                since: now,
+                fallback_at: now.plus(READ_FALLBACK_MILLIS),
+                client_deadline,
+            },
+        );
+        Action::Read(ReadPlan {
+            command,
+            retry_key: key,
+            leader: ballot.leader,
+            frame,
+        })
+    }
+
+    /// The leader `from`'s answer to a read (task-d50).
+    ///
+    /// Only the voter the read was sent to answers it. A served result is
+    /// the caller's, still to pass the frontend's output gate; a refusal
+    /// orders the read instead.
+    pub fn on_read_answer(
+        &mut self,
+        now: MonotonicMillis,
+        from: ReplicaId,
+        answer: ReadAnswerV1,
+    ) -> Option<ReadResolution> {
+        let key = answer.retry_key;
+        if self.reads.get(&key)?.leader != from {
+            return None;
+        }
+        let waiting = self.reads.remove(&key)?;
+        if let ReadOutcomeV1::Served { response } = answer.outcome
+            && response.len() <= crate::collector::MAX_DELIVERABLE_RESULT_BYTES
+            && let Ok(result) = BoundedBytes::new(response)
+        {
+            self.admission.settled(&key);
+            return Some(ReadResolution::Answer(Delivery {
+                connection: waiting.connection,
+                retry_key: key,
+                frame: MessageV1::Response(ResponseV1 {
+                    command_id: waiting.command,
+                    outcome: OutcomeV1::Ok {
+                        revision: None,
+                        result,
+                    },
+                })
+                .encode()
+                .expect("bounded"),
+            }));
+        }
+        Some(ReadResolution::Ordered(self.order(
+            now,
+            waiting.since,
+            waiting.connection,
+            key,
+            &waiting.admitted,
+            waiting.reserved,
+        )))
+    }
+
+    /// Reads whose leader has not answered by their deadline (task-d50).
+    ///
+    /// One whose client deadline passed is answered as an ordered
+    /// command is at its deadline: pending, resolvable by identity. A
+    /// read never ordered changed nothing, and resolving it finds
+    /// nothing. Any other is ordered instead, under the deadline it was
+    /// presented with.
+    pub fn expire_reads(&mut self, now: MonotonicMillis) -> Vec<Action> {
+        let due: Vec<RetryKey> = self
+            .reads
+            .iter()
+            .filter(|(_, r)| r.deadline() <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut out = Vec::new();
+        for key in due {
+            let waiting = self.reads.remove(&key).expect("listed");
+            if waiting.client_deadline.is_some_and(|d| d <= now) {
+                self.admission.settled(&key);
+                out.push(Action::Respond(Delivery {
+                    connection: waiting.connection,
+                    retry_key: key,
+                    frame: MessageV1::Response(codes::pending_response(waiting.command))
+                        .encode()
+                        .expect("bounded"),
+                }));
+                continue;
+            }
+            out.push(self.order(
+                now,
+                waiting.since,
+                waiting.connection,
+                key,
+                &waiting.admitted,
+                waiting.reserved,
+            ));
+        }
+        out
+    }
+
+    /// Order the read `key` now, without waiting for its deadline: its
+    /// leader could not be reached at all (task-d50).
+    pub fn order_read(&mut self, now: MonotonicMillis, key: &RetryKey) -> Option<Action> {
+        let waiting = self.reads.remove(key)?;
+        Some(self.order(
+            now,
+            waiting.since,
+            waiting.connection,
+            *key,
+            &waiting.admitted,
+            waiting.reserved,
+        ))
+    }
+
+    /// The earliest deadline of a read waiting on its leader.
+    pub fn next_read_deadline(&self) -> Option<MonotonicMillis> {
+        self.reads.values().map(PendingRead::deadline).min()
     }
 
     fn attach(&mut self, connection: u64, key: RetryKey) {

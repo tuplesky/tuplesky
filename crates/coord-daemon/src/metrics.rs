@@ -118,7 +118,10 @@ pub enum Stage {
     DependencyClosure = 0x0004,
     /// The durable journal.
     Journal = 0x0005,
-    /// Materialization into the projection.
+    /// Materialization into the projection. Under the replay-backed
+    /// profile (task-j06) most of these commits are working ones, so the
+    /// stage's time is not a durable commit's; what a crash would leave
+    /// is `frontiers.projection_durable`.
     Materialization = 0x0006,
     /// Learning from evidence.
     EvidenceLearning = 0x0007,
@@ -130,7 +133,9 @@ pub enum Stage {
     Checkpoint = 0x000a,
     /// Bulk traffic's interference with everything else.
     BulkInterference = 0x000b,
-    /// Recovery.
+    /// Recovery. `coordd` samples the boot's replay of the journal into
+    /// the projection here, one a start (task-d55), so it is every
+    /// storage-holding role's, as the journal is.
     Recovery = 0x000c,
 }
 
@@ -183,14 +188,11 @@ impl Stage {
         let has = |role: Role| roles.roles().contains(&role);
         match self {
             // Every role journals and materializes its own storage.
-            Stage::Journal | Stage::Materialization | Stage::Checkpoint => {
+            Stage::Journal | Stage::Materialization | Stage::Checkpoint | Stage::Recovery => {
                 has(Role::Voter) || has(Role::Observer)
             }
             // Consensus stages belong to a voter.
-            Stage::FanOut
-            | Stage::DependencyClosure
-            | Stage::EvidenceLearning
-            | Stage::Recovery => has(Role::Voter),
+            Stage::FanOut | Stage::DependencyClosure | Stage::EvidenceLearning => has(Role::Voter),
             // The caller-facing stages belong to whatever serves callers.
             Stage::Admission | Stage::ClientTransit | Stage::Watches => {
                 has(Role::Frontend) || has(Role::Observer)
@@ -376,6 +378,12 @@ pub struct Frontiers {
     pub materialized: u64,
     /// `C`: the published local checkpoint boundary.
     pub checkpoint: u64,
+    /// The projection's last durable commit, under the replay-backed
+    /// profile (task-j06): what a crash leaves of `M`, and where the
+    /// next start replays from. Absent under the strict profile, where
+    /// it is `M`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_durable: Option<u64>,
 }
 
 impl Frontiers {
@@ -445,6 +453,196 @@ pub struct MetricsSnapshot {
     pub view_age: Measure<Duration>,
     /// Engine pressure as the storage engine reports it.
     pub engine_pressure: Measure<Headroom>,
+    /// What this node's work has cost since it started, or why it has
+    /// no such reading (task-d45).
+    pub cost: Measure<Cost>,
+}
+
+/// What a voter's work has cost since it started (task-d45).
+///
+/// Every count is cumulative, so a reader divides one snapshot's
+/// difference from an earlier one by the commands executed between them
+/// and gets a per-command cost that does not depend on when the process
+/// started. The one windowed reading is [`Cost::recent`], the domain
+/// loop's busy time over the last reporting interval, because that is
+/// the reading a log of a killed daemon is read for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cost {
+    /// Commands this replica applied.
+    pub executed: u64,
+    /// Lowerings that wrote something: a journal group, a projection
+    /// commit or both, wherever they ran -- the voter's own flush, the
+    /// applier's when it applied a command, and every reconcile.
+    pub lowerings: u64,
+    /// Journal groups appended.
+    pub journal_appends: u64,
+    /// Synced writes as the journal counts them: its groups, mapping
+    /// updates and compactions. Unavailable when the journal does not
+    /// count its own.
+    pub journal_syncs: Measure<u64>,
+    /// Projection transactions committed.
+    pub projection_commits: u64,
+    /// Time the domain loop spent working rather than waiting for an
+    /// event, since it started. A lowering's syncs are inside it, since
+    /// the loop waits for them.
+    pub busy: Duration,
+    /// How long the domain loop has been running.
+    pub uptime: Duration,
+    /// The last reporting interval alone, or why there is none: the first
+    /// snapshot of a run has no interval behind it.
+    pub recent: Measure<Interval>,
+    /// What this voter's re-sends of proposals did, over every ballot it
+    /// led (task-d49). Zero for a voter that never led.
+    pub resends: Resends,
+    /// Commands this voter established on the fast path (task-d50).
+    pub established_fast: u64,
+    /// Commands this voter established on the slow path (task-d50).
+    pub established_slow: u64,
+    /// What this voter's read barrier did, over every ballot it led
+    /// (task-d50). Zero for a voter that never led.
+    #[serde(default)]
+    pub reads: Reads,
+    /// CPU time used since the process started (task-d54), or why there
+    /// is no reading. Beside [`Cost::busy`], which counts the syncs the
+    /// loop waits for, it says what the work itself cost.
+    #[serde(default = "not_instrumented")]
+    pub cpu: Measure<Cpu>,
+    /// How often, and how long, the domain loop blocked on its pipeline
+    /// threads (task-d54), cumulative, or why there is no reading. Part
+    /// of [`Cost::busy`] that is not [`Cpu::domain`]: the loop waiting
+    /// for a journal append or a projection commit to come back.
+    #[serde(default = "not_instrumented")]
+    pub waits: Measure<PipelineWaits>,
+}
+
+/// The domain loop's blocking takes from its pipeline threads (task-d54).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineWaits {
+    /// Waits for a journal append on the appender's thread.
+    pub appender: Wait,
+    /// Waits for a projection commit on the materializer's thread.
+    pub materializer: Wait,
+}
+
+/// Blocking takes and their total time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wait {
+    /// Takes that found the job still running.
+    pub count: u64,
+    /// The time those takes blocked.
+    pub time: Duration,
+}
+
+/// CPU time a voter's process has used (task-d54), cumulative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cpu {
+    /// The domain loop's own thread.
+    pub domain: Duration,
+    /// Every thread of the process: the loop, the appender and the
+    /// materializer, the transport's workers.
+    pub process: Duration,
+    /// How the domain loop's thread was scheduled (task-d55), or why
+    /// there is no reading.
+    #[serde(default = "not_instrumented")]
+    pub domain_scheduling: Measure<Scheduling>,
+}
+
+/// How a thread was scheduled (task-d55), cumulative.
+///
+/// The domain loop's busy time less its CPU time, less the waits on its
+/// pipeline threads, is time it was neither computing nor counted as
+/// waiting. Runnable and not running is [`Scheduling::run_queue`]: a
+/// host with more runnable threads than cores. Otherwise it is a blocking
+/// call on the loop's own thread, which [`Scheduling::voluntary`] counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scheduling {
+    /// Time runnable and waiting for a CPU.
+    pub run_queue: Duration,
+    /// Times the thread gave up the CPU itself.
+    pub voluntary: u64,
+    /// Times the scheduler took the CPU from it.
+    pub involuntary: u64,
+}
+
+fn not_instrumented<T>() -> Measure<T> {
+    Measure::Unavailable(Unavailable::NotInstrumented)
+}
+
+/// What a leader's read barrier did (task-d50), cumulative.
+///
+/// The waits are summed over the reads served, so a reader divides them
+/// by [`Reads::served`] for the mean: how long a read waited for its
+/// confirmation round, for everything below its index to execute (which
+/// includes the round), and in all before it was answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reads {
+    /// Reads answered by the barrier.
+    pub served: u64,
+    /// Reads refused, ordered by their frontends instead.
+    pub refused: u64,
+    /// Confirmation rounds started.
+    pub rounds: u64,
+    /// Confirmation rounds that confirmed.
+    pub confirmed: u64,
+    /// Milliseconds from arrival to confirmation, summed.
+    pub waited_confirm_ms: u64,
+    /// Milliseconds from arrival to the index executed, summed.
+    pub waited_index_ms: u64,
+    /// Milliseconds from arrival to the answer, summed.
+    pub waited_ms: u64,
+}
+
+/// What a leader's re-sends of proposals did (task-d49), cumulative.
+///
+/// A re-send is classified when it goes out: [`Resends::decided`],
+/// [`Resends::acknowledged`] and [`Resends::unanswered`] add up to every
+/// re-send. Whether an unanswered one was lost or late shows afterwards:
+/// [`Resends::late`] counts adoptions that arrived again, as duplicates,
+/// after a re-send, and [`Resends::lost`] the answers to a re-send that
+/// were not late.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resends {
+    /// First sends of re-proposals held back from a new leader's first
+    /// batch; not re-sends.
+    pub deferred: u64,
+    /// Re-sends of a proposal already decided.
+    pub decided: u64,
+    /// Re-sends to a voter that had acknowledged the proposal on the
+    /// fast path.
+    pub acknowledged: u64,
+    /// Re-sends to a voter that had not answered the proposal.
+    pub unanswered: u64,
+    /// Answers to a re-send that were not late: the voter lacked the
+    /// proposal, or its first answer was lost.
+    pub lost: u64,
+    /// Answers that had been on their way when the re-send went out.
+    pub late: u64,
+    /// Decided proposals the leader stopped re-sending to a voter and left
+    /// to catch-up.
+    pub handed_off: u64,
+    /// Votes refused as duplicates, fast or slow.
+    pub duplicate_votes: u64,
+}
+
+impl Resends {
+    /// Every re-send, whatever its reason.
+    pub const fn resent(&self) -> u64 {
+        self.decided + self.acknowledged + self.unanswered
+    }
+}
+
+/// One reporting interval of the domain loop (task-d45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interval {
+    /// How long the interval was.
+    pub span: Duration,
+    /// How much of it the loop was busy.
+    pub busy: Duration,
+    /// Commands applied in it.
+    pub executed: u64,
+    /// CPU time the domain loop's thread used in it (task-d54).
+    #[serde(default = "not_instrumented")]
+    pub domain_cpu: Measure<Duration>,
 }
 
 impl MetricsSnapshot {

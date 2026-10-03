@@ -47,10 +47,74 @@ pub struct Limits {
     /// makes a restart replay further.
     #[serde(default = "default_checkpoint_after")]
     pub checkpoint_after_records: u64,
+    /// Commands a voter's command table holds at once (task-d05): the
+    /// ones it still owes work on, and the executed ones it has not
+    /// retired yet.
+    ///
+    /// A local memory bound and an operational setting, not a safety
+    /// switch: no replicated result depends on it, and voters of one
+    /// domain may differ. It is also, until recovery is bounded by what
+    /// the voters executed, how much history an election can carry: a
+    /// candidate must hold the whole selection, so a domain whose history
+    /// is well past this many commands cannot elect a leader. Raising it
+    /// moves that cliff; it does not remove it.
+    #[serde(default = "default_command_table_capacity")]
+    pub command_table_capacity: usize,
+    /// New requests each frontend admits a second, with a second's worth
+    /// as a burst (task-d26). A retry of a request still outstanding is
+    /// not a new one.
+    ///
+    /// Bounded below the rate at which a voter catching up executes: a
+    /// page of up to 64 commands installed in one batch (task-d25). A
+    /// voter returning behind gains on the domain by the difference, so
+    /// the time it takes to close a gap is bounded by the gap; admitted
+    /// faster than it can execute, it never closes it. The bound is per
+    /// frontend: a domain served by several admits their sum.
+    #[serde(default = "default_max_admitted_per_second")]
+    pub max_admitted_per_second: u32,
 }
 
 const fn default_checkpoint_after() -> u64 {
     4096
+}
+
+/// The admission rate a configuration that names none gets (task-d26): a
+/// design target and a ceiling, not a proved bound. It is under a sixth
+/// of what catch-up would execute at one 64-command window per durable
+/// batch of 10 ms, which nothing has measured; task-d33's budget oracle
+/// is its check. At the 35 to 100 commands a second a domain sustains
+/// today it never binds. It gates client requests only: resolves,
+/// watches and held retries bypass it, and every session of a frontend
+/// shares one bucket.
+pub const DEFAULT_MAX_ADMITTED_PER_SECOND: u32 = 1000;
+
+const fn default_max_admitted_per_second() -> u32 {
+    DEFAULT_MAX_ADMITTED_PER_SECOND
+}
+
+/// The command table capacity a configuration that names none gets: the
+/// largest (task-d20).
+pub const DEFAULT_COMMAND_TABLE_CAPACITY: usize = MAX_COMMAND_TABLE_CAPACITY;
+/// The smallest command table capacity a voter is configured with. A
+/// table must hold a proposal's worth of in-flight commands and still
+/// reclaim, and the follower's held-proposal bound is a multiple of it.
+pub const MIN_COMMAND_TABLE_CAPACITY: usize = 32;
+/// The largest. A report carries at most twice the table (its live
+/// records and its retirement window, `coord_consensus::max_report_entries`;
+/// a larger one is set aside), and a Sync is capped to the same, 2,000
+/// commands at this capacity, except kept entries, which are never cut
+/// (task-d24). The Sync is written as one row and sent as one frame, and
+/// the row binds first. An entry with its admission digest, one
+/// dependency and the largest sequence number is 208 bytes, and each
+/// further dependency 32 more; 2,000 such entries are 416,000 bytes, a
+/// fifth of the row, so at the cap an entry has about 1,058 bytes, some
+/// 27 dependencies on average, before the Sync is refused by name rather
+/// than written (task-d20, measured by
+/// `the_largest_table_gives_a_sync_that_fits_a_row_and_a_frame`).
+pub const MAX_COMMAND_TABLE_CAPACITY: usize = coord_consensus::MAX_TABLE_CAPACITY;
+
+const fn default_command_table_capacity() -> usize {
+    DEFAULT_COMMAND_TABLE_CAPACITY
 }
 
 impl Default for Limits {
@@ -61,6 +125,111 @@ impl Default for Limits {
             max_outstanding_per_session: 256,
             max_live_subscriptions: 4096,
             checkpoint_after_records: default_checkpoint_after(),
+            command_table_capacity: default_command_table_capacity(),
+            max_admitted_per_second: default_max_admitted_per_second(),
+        }
+    }
+}
+
+/// Reporting this node's metrics while it serves (task-d45).
+///
+/// A snapshot printed only at start and at a clean end says nothing
+/// about a daemon that was killed, which is the daemon a fault run and
+/// a stuck one leave behind. One every interval leaves the last
+/// interval's counters in the log however the process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Seconds between the snapshots a serving node prints. Zero prints
+    /// only the ones at start and at the end.
+    #[serde(default = "default_metrics_interval")]
+    pub interval_seconds: u64,
+}
+
+/// How this node's frontend serves a current read (task-d50; design
+/// Section 6.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadsConfig {
+    /// Which path a current read takes.
+    #[serde(default)]
+    pub path: ReadPath,
+}
+
+/// The path a current read takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadPath {
+    /// The leader read barrier, falling back to an ordered command. A
+    /// frontend with no voter beside it orders every read: it follows no
+    /// ballot, so it does not know who leads.
+    #[default]
+    Leader,
+    /// Every read is an ordered command, as before task-d50.
+    Ordered,
+}
+
+/// The interval a configuration that names none gets: often enough that
+/// a killed daemon's last line is recent, rarely enough that the log is
+/// not the snapshot.
+pub const DEFAULT_METRICS_INTERVAL_SECONDS: u64 = 10;
+
+const fn default_metrics_interval() -> u64 {
+    DEFAULT_METRICS_INTERVAL_SECONDS
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            interval_seconds: default_metrics_interval(),
+        }
+    }
+}
+
+/// Agreeing a forgetting floor (task-d27; design Section 5.3).
+///
+/// A voter that takes part exports the shared checkpoint at every floor
+/// boundary ([`crate::floor::FLOOR_INTERVAL`] executed positions), keeps
+/// the image, and promises its peers it holds it. A majority promising
+/// one checkpoint activates the floor. Nothing is forgotten below it
+/// yet: this is the agreement, and trimming comes after it.
+///
+/// Off by default. The interval is the schema's rather than this file's,
+/// so voters that take part agree on the boundaries without having to
+/// agree on a setting; one that does not take part simply promises
+/// nothing, and a floor then needs a majority of the others.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloorConfig {
+    /// Whether this voter exports and promises at floor boundaries.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory the promised images are kept in, relative to
+    /// `state_directory` unless absolute. Not the local checkpoints'
+    /// directory: that one reclaims every image but the selected one.
+    #[serde(default = "floor_images")]
+    pub images: String,
+    /// Free bytes the images' filesystem must keep beyond the image an
+    /// export would add. Short of it, the boundary is refused and said
+    /// so, and no promise is made.
+    #[serde(default = "floor_headroom_bytes")]
+    pub headroom_bytes: u64,
+}
+
+fn floor_images() -> String {
+    "floor-images".to_owned()
+}
+
+const fn floor_headroom_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+impl Default for FloorConfig {
+    fn default() -> Self {
+        FloorConfig {
+            enabled: false,
+            images: floor_images(),
+            headroom_bytes: floor_headroom_bytes(),
         }
     }
 }
@@ -87,6 +256,16 @@ pub const STATE_PROFILE: &str = "strict-single-store-v1";
 pub const JOURNAL_ENGINE: &str = "raft-engine";
 /// Profile of [`JOURNAL_ENGINE`].
 pub const JOURNAL_PROFILE: &str = "journaled-strict-v1";
+/// The replay-backed profile (task-j06, Section 17.3.4): projection
+/// commits are working commits, made durable on
+/// [`JournalConfig::projection_durable_commits`],
+/// [`JournalConfig::projection_durable_records`] and
+/// [`JournalConfig::projection_durable_ms`], before every checkpoint
+/// publication and at a clean stop, and a crash's loss is replayed from
+/// the journal before the node answers. Named, never defaulted: the
+/// strict profile stays the default until task-j05 qualifies the journal
+/// this one leans on for more.
+pub const JOURNAL_REPLAY_PROFILE: &str = "journaled-replay-v1";
 /// An engine that is built and tested but carries no production support:
 /// it reports its own platforms, and task-s03's review boundary keeps it
 /// out of a production graph. Named here so configuring it is refused for
@@ -167,6 +346,40 @@ pub struct JournalConfig {
     /// Shards this node writes.
     #[serde(default = "one_shard")]
     pub shards: u16,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], working projection commits at
+    /// most between durable ones. Ignored under the strict profile.
+    #[serde(default = "projection_durable_commits")]
+    pub projection_durable_commits: u32,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], journal records at most applied
+    /// by working commits between durable ones: what a crash makes the
+    /// next start replay.
+    #[serde(default = "projection_durable_records")]
+    pub projection_durable_records: u32,
+    /// Under [`JOURNAL_REPLAY_PROFILE`], milliseconds at most a working
+    /// commit waits for a durable one, busy or idle: half way the next
+    /// commit is asked to be durable, and a domain that has made none by
+    /// the end is synced by its own loop.
+    #[serde(default = "projection_durable_ms")]
+    pub projection_durable_ms: u64,
+}
+
+impl JournalConfig {
+    /// Whether the projection runs under [`JOURNAL_REPLAY_PROFILE`].
+    pub fn replays_projection(&self) -> bool {
+        self.profile == JOURNAL_REPLAY_PROFILE
+    }
+}
+
+fn projection_durable_commits() -> u32 {
+    64
+}
+
+fn projection_durable_records() -> u32 {
+    4096
+}
+
+fn projection_durable_ms() -> u64 {
+    100
 }
 
 fn journal_engine() -> String {
@@ -485,6 +698,16 @@ pub struct Config {
     /// Semantic limits.
     #[serde(default)]
     pub limits: Limits,
+    /// Agreeing a forgetting floor with the other voters (task-d27).
+    /// Absent, it is off.
+    #[serde(default)]
+    pub floor: FloorConfig,
+    /// Printing this node's metrics while it serves (task-d45).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+    /// How current reads are served (task-d50).
+    #[serde(default)]
+    pub reads: ReadsConfig,
     /// Local capability.
     pub capability: Capability,
     /// Whether application 0-RTT is disabled (must be true).
@@ -556,9 +779,27 @@ pub enum ConfigError {
     InsecureIssuer,
     /// A renewal that asks for no lifetime at all.
     ZeroLifetime,
+    /// A setting outside the range this build accepts.
+    OutOfRange {
+        /// Which setting.
+        field: &'static str,
+        /// The smallest value accepted.
+        min: u64,
+        /// The largest value accepted.
+        max: u64,
+    },
     /// A test-only switch set in a build without debug assertions. The
     /// field is named.
     TestOnlySwitch(&'static str),
+    /// Two stores that each reclaim what they do not keep given the same
+    /// directory, or one inside the other: each would take the other's
+    /// images for its own leftovers and remove them.
+    SharedDirectory {
+        /// The one setting.
+        first: &'static str,
+        /// The other.
+        second: &'static str,
+    },
 }
 
 /// Which build is validating: whether test-only switches may be set.
@@ -709,6 +950,22 @@ impl Config {
             return Err(ConfigError::InvalidListener("admin_http"));
         }
         capability_covers(&self.capability, &self.limits)?;
+        if !(MIN_COMMAND_TABLE_CAPACITY..=MAX_COMMAND_TABLE_CAPACITY)
+            .contains(&self.limits.command_table_capacity)
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.command_table_capacity",
+                min: MIN_COMMAND_TABLE_CAPACITY as u64,
+                max: MAX_COMMAND_TABLE_CAPACITY as u64,
+            });
+        }
+        if self.limits.max_admitted_per_second == 0 {
+            return Err(ConfigError::OutOfRange {
+                field: "limits.max_admitted_per_second",
+                min: 1,
+                max: u64::from(u32::MAX),
+            });
+        }
         // Durable state is opened under the name this build implements or
         // it is not opened at all. A name this build does not serve is a
         // different store, not a compatible one, and the manifest is what
@@ -717,7 +974,30 @@ impl Config {
         engine_named("state", &self.state.engine, STATE_ENGINE)?;
         engine_named("state.profile", &self.state.profile, STATE_PROFILE)?;
         engine_named("journal", &self.journal.engine, JOURNAL_ENGINE)?;
-        engine_named("journal.profile", &self.journal.profile, JOURNAL_PROFILE)?;
+        if !self.journal.replays_projection() {
+            engine_named("journal.profile", &self.journal.profile, JOURNAL_PROFILE)?;
+        }
+        for (field, value, max) in [
+            (
+                "journal.projection_durable_commits",
+                u64::from(self.journal.projection_durable_commits),
+                u64::from(u32::MAX),
+            ),
+            (
+                "journal.projection_durable_records",
+                u64::from(self.journal.projection_durable_records),
+                u64::from(u32::MAX),
+            ),
+            (
+                "journal.projection_durable_ms",
+                self.journal.projection_durable_ms,
+                u64::MAX,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::OutOfRange { field, min: 1, max });
+            }
+        }
         // A node that journals nothing has no authoritative transition to
         // apply from, so zero shards is a configuration that cannot serve.
         if self.journal.shards == 0 {
@@ -774,8 +1054,46 @@ impl Config {
                 return Err(ConfigError::EmptyPath(name));
             }
         }
+        // The floor's images and the local checkpoints are each reclaimed
+        // down to what their own store keeps, and both name an image by a
+        // 64-hex directory. Given one directory, or one inside the other,
+        // the local store would remove the images a floor promise names
+        // and the floor would remove the selected recovery checkpoint.
+        if self.floor.enabled {
+            if self.floor.images.trim().is_empty() {
+                return Err(ConfigError::EmptyPath("floor.images"));
+            }
+            let images = resolved(&self.state_directory, &self.floor.images);
+            let checkpoints = resolved(&self.state_directory, &self.state.checkpoints);
+            if images.starts_with(&checkpoints) || checkpoints.starts_with(&images) {
+                return Err(ConfigError::SharedDirectory {
+                    first: "floor.images",
+                    second: "state.checkpoints",
+                });
+            }
+        }
         Ok(())
     }
+}
+
+/// `path` under `state_directory` unless absolute, with `.` and `..`
+/// taken out lexically, so two spellings of one directory compare equal.
+/// Links are not followed here: the store compares the directories it
+/// opened as well (`coordd`'s `keep_floor`).
+pub fn resolved(state_directory: &str, path: &str) -> std::path::PathBuf {
+    use std::path::{Component, Path, PathBuf};
+    let joined = Path::new(state_directory).join(path);
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Refuse an engine or profile this build does not serve.
@@ -871,5 +1189,53 @@ allow_insecure_loopback = {allow}
         for build in [Build::Test, Build::Release] {
             assert_eq!(unset.validate_as(build), Err(ConfigError::InsecureIssuer));
         }
+    }
+
+    /// The floor is off unless a configuration turns it on, and turned on
+    /// it keeps its images apart from the local checkpoints (task-d27).
+    #[test]
+    fn the_forgetting_floor_is_off_unless_configured() {
+        use super::{FloorConfig, state_checkpoints};
+        assert_eq!(with_renewal(true).floor, FloorConfig::default());
+        assert!(!FloorConfig::default().enabled);
+        let on: FloorConfig = toml::from_str("enabled = true").expect("parses");
+        assert!(on.enabled);
+        assert_ne!(on.images, state_checkpoints());
+        assert!(toml::from_str::<FloorConfig>("interval = 8").is_err());
+    }
+
+    /// Turned on, the floor refuses a directory the local checkpoints
+    /// reclaim, however it is spelled: each store would remove the
+    /// other's images.
+    #[test]
+    fn the_floor_keeps_its_images_apart_from_the_local_checkpoints() {
+        let on = |images: &str, checkpoints: &str| {
+            let mut config = with_renewal(false);
+            config.renewal = None;
+            config.floor.enabled = true;
+            config.floor.images = images.to_owned();
+            config.state.checkpoints = checkpoints.to_owned();
+            config.validate_as(Build::Test)
+        };
+        let shared = Err(ConfigError::SharedDirectory {
+            first: "floor.images",
+            second: "state.checkpoints",
+        });
+        assert_eq!(on("floor-images", "checkpoints"), Ok(()));
+        assert_eq!(on("checkpoints", "checkpoints"), shared);
+        assert_eq!(on("./checkpoints/", "checkpoints"), shared);
+        assert_eq!(on("/var/lib/coord/a/checkpoints", "checkpoints"), shared);
+        assert_eq!(on("x/../checkpoints", "checkpoints"), shared);
+        assert_eq!(on("checkpoints/floor", "checkpoints"), shared);
+        assert_eq!(on(".", "checkpoints"), shared);
+        assert_eq!(
+            on("", "checkpoints"),
+            Err(ConfigError::EmptyPath("floor.images"))
+        );
+        // Off, the setting is not used and not checked.
+        let mut off = with_renewal(false);
+        off.renewal = None;
+        off.floor.images = "checkpoints".to_owned();
+        assert_eq!(off.validate_as(Build::Test), Ok(()));
     }
 }

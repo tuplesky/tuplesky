@@ -263,6 +263,9 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("r1-forged-proposal", fast(1, b, c1, &deps, 7, Some(3))),
             ("r2-slow", slow(2, b, c1)),
             ("r2-slow-redelivered", slow(2, b, c1)),
+            // The leader's proposal is not its adoption: its acceptance
+            // row is durable only once this arrives (task-d19).
+            ("leader-adoption", slow(0, b, c1)),
             ("leader-redelivered", fast(0, b, c1, &deps, 7, Some(0))),
             ("leader-without-seqnum", fast(0, b, c1, &deps, 7, None)),
         ],
@@ -339,7 +342,8 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
     assert!(!fast_path.rejected.contains_key("r1-slow-adoption"));
 
     // Differing dependency path: no fast learning; the leader order is
-    // adopted by r1 (equal deps) and r2 (slow ack) -> slow path.
+    // adopted by r2 and by the leader itself once its acceptance row is
+    // durable (task-d19) -> slow path.
     let slow_path = explore(
         "slow-path-path-disagreement",
         &cfg,
@@ -348,6 +352,7 @@ fn learning_is_order_independent_and_rejects_non_c2_evidence() {
             ("leader-proposal", fast(0, b, c1, &deps, 7, Some(0))),
             ("r1-fast-other-path", fast(1, b, c1, &deps, 8, None)),
             ("r2-slow", slow(2, b, c1)),
+            ("leader-adoption", slow(0, b, c1)),
         ],
     );
     assert_eq!(
@@ -445,6 +450,7 @@ fn entry(c: CommandId, phase: Phase, deps: &[CommandId]) -> ReportEntry {
         seqnum: 0,
         keys: vec![b"*".to_vec()],
         payload_present: true,
+        admission: None,
     }
 }
 
@@ -545,12 +551,16 @@ fn recovery_selection_is_source_defined_and_order_independent() {
                 entry(c3, Phase::PreAccept, &[]),
             ],
         ),
-        // A lower synchronized ballot: its COMMIT of c2 with different
-        // dependencies is stale state, never a candidate.
+        // A lower synchronized ballot: its acceptances are stale state,
+        // never candidates -- c3, which only the source pre-accepted, and
+        // c4, which the source does not hold.
         report(
             3,
             0,
-            vec![entry(c2, Phase::Commit, &[]), entry(c4, Phase::Accept, &[])],
+            vec![
+                entry(c3, Phase::Accept, &[c4]),
+                entry(c4, Phase::Accept, &[]),
+            ],
         ),
     ];
     let scenario = explore_recovery("legitimate-phase-differences", &cfg, &reports);
@@ -569,12 +579,29 @@ fn recovery_selection_is_source_defined_and_order_independent() {
     );
     assert_eq!(decision.reproposed, BTreeSet::from([c3, c4]));
     assert_eq!(scenario.outcome.as_ref().unwrap(), &summarize(&decision));
-    // The wrong rule would have committed c2 with the stale dependencies.
+    // The wrong rule would have adopted c3 with the stale dependencies.
     assert_eq!(
-        scenario.highest_phase_wins[&format!("{c2:?}")],
-        (Phase::Commit, vec![]),
+        scenario.highest_phase_wins[&format!("{c3:?}")],
+        (Phase::Accept, vec![c4]),
         "the recorded counterexample of highest-phase-wins"
     );
+
+    // A commit is final whatever ballot it was reached in (task-d12): a
+    // lower synchronized ballot's COMMIT is selected, and one under other
+    // dependencies than the source's acceptance is the alarm it should be.
+    let mut committed_below = reports.clone();
+    committed_below[2]
+        .entries
+        .push(entry(c1, Phase::Commit, &[]));
+    let decision_below = select(&cfg, &committed_below).unwrap();
+    assert_eq!(decision_below.entries[&c1].phase, Phase::Commit);
+    let mut disagreeing = reports.clone();
+    disagreeing[2].entries.push(entry(c2, Phase::Commit, &[]));
+    let below = explore_recovery("below-source-commit-disagrees", &cfg, &disagreeing);
+    assert!(matches!(
+        below.outcome,
+        Err(RecoveryError::IncompatibleAccepted { command, .. }) if command == c2
+    ));
 
     // Incompatible accepted candidates at the source ballot stop recovery
     // with the evidence whenever the conflicting report is among the
@@ -623,6 +650,7 @@ fn recovery_selection_is_source_defined_and_order_independent() {
             seqnum: 0,
             keys: vec![b"*".to_vec()],
             payload_present: false,
+            admission: None,
         }],
     });
     let half = explore_recovery("half-initialized-entry", &cfg, &half);
@@ -655,7 +683,7 @@ fn recovery_selection_is_source_defined_and_order_independent() {
         Err(RecoveryError::WrongBallot { replica: r(1) })
     );
 
-    fixture("recovery_scenarios.json", &vec![scenario, bad, half]);
+    fixture("recovery_scenarios.json", &vec![scenario, bad, half, below]);
 }
 
 #[test]
@@ -1031,4 +1059,900 @@ fn decoded_configurations_are_validated_like_constructed_ones() {
     let mut stranger = serde_json::to_value(&good).unwrap();
     stranger["fast_set"] = serde_json::to_value(BTreeSet::from([r(0), r(1), r(9)])).unwrap();
     assert!(serde_json::from_value::<BallotConfiguration>(stranger).is_err());
+}
+
+/// Checklist P5/P6 (task-d19): a fast-set member's fast acknowledgement
+/// does not count toward the slow majority, and a slow decision made of
+/// adoptions survives any recovering majority with its dependencies.
+///
+/// Five voters, fast set {r0, r1, r2}. Counting r1's fast acknowledgement
+/// as an adoption made x learned from r0, r1 and r3; then r2, recovering
+/// from r1, r2 and r4, held only r1's PRE-ACCEPT and re-proposed x with
+/// new dependencies, although the collector may already have released it.
+#[test]
+fn a_slow_decision_counting_a_fast_ack_survives_recovery() {
+    let src = BallotConfiguration::c2_default(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(0, 0),
+        (0..5).map(r).collect(),
+    )
+    .unwrap();
+    // Fast set of ballot 0 is {r0, r1, r2}.
+    let b0 = ballot(0, 0);
+    let (y, x) = (cmd(0), cmd(1));
+    let mut set = VoteSet::new(src.clone(), x);
+    set.add(fast(0, b0, x, &[y], 7, Some(1))).unwrap();
+    // r1, a fast-set member, pre-accepted x with the leader's dependencies
+    // but another path: no fast decision, and no adoption either.
+    set.add(fast(1, b0, x, &[y], 9, None)).unwrap();
+    set.add(slow(3, b0, x)).unwrap();
+    assert_eq!(
+        set.learned(),
+        None,
+        "a fast acknowledgement counted as an adoption"
+    );
+    assert_eq!(set.learned_slow(), None);
+    // r1 adopts, and r1 holds x at ACCEPT; with the leader's own adoption,
+    // its acceptance row durable, x is learned (task-d19).
+    set.add(slow(1, b0, x)).unwrap();
+    assert_eq!(set.learned(), None, "the leader's proposal counted");
+    set.add(slow(0, b0, x)).unwrap();
+    assert_eq!(set.learned(), Some(Learned::Slow { deps: vec![y] }));
+    // r0 and r3 are gone. r2 leads ballot 1 and hears r1, r2 and r4: the
+    // one member of the deciding quorum it hears is r1, at ACCEPT.
+    let cfg = BallotConfiguration::c2_default(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(1, 2),
+        (0..5).map(r).collect(),
+    )
+    .unwrap();
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![entry(y, Phase::Accept, &[]), entry(x, Phase::Accept, &[y])],
+        ),
+        report_for(2, ballot(1, 2), 0, vec![entry(y, Phase::Accept, &[])]),
+        report_for(4, ballot(1, 2), 0, vec![entry(y, Phase::Accept, &[])]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    let kept = decision.entries.get(&x);
+    assert!(
+        kept.is_some_and(|e| e.deps == vec![y]),
+        "x was learned with deps [y] but recovery selected {kept:?}, reproposed {:?}",
+        decision.reproposed
+    );
+}
+
+/// What one non-leader voter of the source ballot did with x.
+#[derive(Clone, Copy, Debug)]
+enum XState {
+    /// Nothing reached it.
+    None,
+    /// Pre-accepted x with the leader's dependencies (`true`) or others.
+    Pre(bool),
+    /// Adopted the leader's proposal, after a fast acknowledgement with
+    /// the leader's dependencies, with others, or none.
+    Adopted(Option<bool>),
+}
+
+const X_STATES: [XState; 6] = [
+    XState::None,
+    XState::Pre(true),
+    XState::Pre(false),
+    XState::Adopted(None),
+    XState::Adopted(Some(true)),
+    XState::Adopted(Some(false)),
+];
+
+/// task-d19's bounded model, joining learning with selection at three and
+/// five voters: every combination of what the non-leaders did with one
+/// command x, whose leader ordered it after y, and of whether the leader's
+/// own acceptance row became durable; for every combination whose vote
+/// set learns x, every majority of reports, under every new leader among
+/// them, selects x with the learned dependencies.
+///
+/// A leader whose acceptance row is not durable reports x at PRE-ACCEPT,
+/// as a restarted leader does when a crash lost that batch: its proposal
+/// row is all it holds. Counting the proposal toward the slow majority
+/// fails here (the Codex case on #116).
+#[test]
+fn every_learned_decision_is_selected_by_every_recovering_majority() {
+    let (y, x) = (cmd(0), cmd(1));
+    let leader_deps = vec![y];
+    let other_deps: Vec<CommandId> = Vec::new();
+    let mut checked = 0u32;
+    for n in [3u8, 5] {
+        let src = BallotConfiguration::c2_default(
+            ConfigurationEpoch::new(1).unwrap(),
+            ballot(0, 0),
+            (0..n).map(r).collect(),
+        )
+        .unwrap();
+        let others = usize::from(n - 1);
+        let combos = X_STATES.len().pow(others as u32);
+        for (code, leader_adopted) in
+            (0..combos).flat_map(|code| [false, true].map(|adopted| (code, adopted)))
+        {
+            let mut states = Vec::new();
+            let mut c = code;
+            for _ in 0..others {
+                states.push(X_STATES[c % X_STATES.len()]);
+                c /= X_STATES.len();
+            }
+            let b0 = ballot(0, 0);
+            let mut set = VoteSet::new(src.clone(), x);
+            set.add(fast(0, b0, x, &leader_deps, 7, Some(1))).unwrap();
+            if leader_adopted {
+                set.add(slow(0, b0, x)).unwrap();
+            }
+            for (i, s) in states.iter().enumerate() {
+                let replica = (i + 1) as u8;
+                let fast_eligible = src.fast_eligible(&r(replica));
+                let pre = match s {
+                    XState::Pre(same) | XState::Adopted(Some(same)) => Some(*same),
+                    _ => None,
+                };
+                if let (Some(same), true) = (pre, fast_eligible) {
+                    let (deps, path) = if same {
+                        (&leader_deps, 7)
+                    } else {
+                        (&other_deps, 9)
+                    };
+                    set.add(fast(replica, b0, x, deps, path, None)).unwrap();
+                }
+                if matches!(s, XState::Adopted(_)) {
+                    set.add(slow(replica, b0, x)).unwrap();
+                }
+            }
+            let Some(learned) = set.learned() else {
+                continue;
+            };
+            let entry_of = |replica: u8| -> Option<ReportEntry> {
+                if replica == 0 {
+                    let phase = if leader_adopted {
+                        Phase::Accept
+                    } else {
+                        Phase::PreAccept
+                    };
+                    return Some(entry(x, phase, &leader_deps));
+                }
+                match states[usize::from(replica) - 1] {
+                    XState::None => None,
+                    XState::Pre(true) => Some(entry(x, Phase::PreAccept, &leader_deps)),
+                    XState::Pre(false) => Some(entry(x, Phase::PreAccept, &other_deps)),
+                    XState::Adopted(_) => Some(entry(x, Phase::Accept, &leader_deps)),
+                }
+            };
+            for mask in 0u32..(1 << n) {
+                let members: Vec<u8> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
+                if members.len() < src.slow_size() {
+                    continue;
+                }
+                for &new_leader in &members {
+                    let cfg = BallotConfiguration::c2_default(
+                        ConfigurationEpoch::new(1).unwrap(),
+                        ballot(1, new_leader),
+                        (0..n).map(r).collect(),
+                    )
+                    .unwrap();
+                    let reports: Vec<RecoveryReport> = members
+                        .iter()
+                        .map(|&m| {
+                            let mut entries = vec![entry(y, Phase::Accept, &[])];
+                            entries.extend(entry_of(m));
+                            report_for(m, ballot(1, new_leader), 0, entries)
+                        })
+                        .collect();
+                    let decision = select(&cfg, &reports).unwrap_or_else(|e| {
+                        panic!(
+                            "n={n} leader_adopted={leader_adopted} states={states:?} \
+                             members={members:?}: {e:?}"
+                        )
+                    });
+                    let kept = decision.entries.get(&x);
+                    assert!(
+                        kept.is_some_and(|e| e.deps == learned.deps()),
+                        "n={n} leader_adopted={leader_adopted} states={states:?} learned \
+                         {learned:?}, members {members:?} under r{new_leader} selected {kept:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked}");
+}
+
+/// A pre-accept as a reporter holds it: `path` is set apart from `deps`,
+/// as a follower's may be once the leader's path was recorded for it.
+fn pre_accept_with(c: CommandId, deps: &[CommandId], path: u8) -> ReportEntry {
+    ReportEntry {
+        path: Digest32([path; 32]),
+        paths: vec![(b"*".to_vec(), Digest32([path; 32]))],
+        ..entry(c, Phase::PreAccept, deps)
+    }
+}
+
+/// task-d34 (found by the protocol simulator): a fast acknowledgement with
+/// the leader's path but other dependencies decides nothing fast.
+///
+/// A follower that received the leader's proposal before the payload has
+/// the leader's digests in its logs; when the payload arrives, its fast
+/// acknowledgement carries the leader's path and its own local
+/// dependencies. Counting the path alone learned the command fast with the
+/// leader's dependencies, which no member of the fast quorum recorded.
+#[test]
+fn a_fast_acknowledgement_with_the_leaders_path_and_other_dependencies_decides_nothing() {
+    let cfg = config(3, 0, &[0, 1], 0);
+    let b0 = ballot(0, 0);
+    let (x, y, z) = (cmd(1), cmd(2), cmd(3));
+    let mut set = VoteSet::new(cfg, x);
+    set.add(fast(0, b0, x, &[y], 7, Some(1))).unwrap();
+    set.add(fast(1, b0, x, &[z], 7, None)).unwrap();
+    assert_eq!(set.learned(), None);
+    // With the leader's dependencies too, it is a fast decision.
+    let mut set = VoteSet::new(config(3, 0, &[0, 1], 0), x);
+    set.add(fast(0, b0, x, &[y], 7, Some(1))).unwrap();
+    set.add(fast(1, b0, x, &[y], 7, None)).unwrap();
+    assert_eq!(set.learned(), Some(Learned::Fast { deps: vec![y] }));
+}
+
+/// task-d34 (found by the protocol simulator): the source leader's own
+/// report is one of the fast-set members' for the possible-fast rule.
+///
+/// The leader's reply to the frontend waits for its proposal batch, which
+/// records the command at PRE-ACCEPT; its own ACCEPT row is a later batch.
+/// A leader that crashed between the two reported the command at
+/// PRE-ACCEPT, and a selection that heard it skipped the possible-fast
+/// rule altogether, re-proposing a command the collector had learned fast.
+#[test]
+fn a_fast_decision_survives_a_leader_that_crashed_before_its_accept_row() {
+    let cfg = config(3, 1, &[1, 2], 1);
+    let x = cmd(1);
+    let reports = vec![
+        report_for(0, ballot(1, 1), 0, vec![pre_accept_with(x, &[], 7)]),
+        report_for(1, ballot(1, 1), 0, vec![pre_accept_with(x, &[], 7)]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| (e.phase, e.deps.clone())),
+        Some((Phase::Accept, vec![])),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+}
+
+/// task-d34 (found by the protocol simulator): fast-set members that agree
+/// on a path but not on the dependencies make no possible-fast candidate.
+#[test]
+fn members_agreeing_on_a_path_but_not_on_dependencies_decide_nothing_fast() {
+    let cfg = config(5, 3, &[3, 4, 0], 1);
+    let (x, y, z) = (cmd(1), cmd(2), cmd(3));
+    // Ballot 0's fast set is {r0, r1, r2}. r1 and r2 pre-accepted x with
+    // one path and different dependencies; nothing else distinguishes
+    // them. The rule used to take the first member's order.
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 3),
+            0,
+            vec![entry(y, Phase::Accept, &[]), pre_accept_with(x, &[y], 9)],
+        ),
+        report_for(2, ballot(1, 3), 0, vec![pre_accept_with(x, &[z], 9)]),
+        report_for(3, ballot(1, 3), 0, vec![entry(y, Phase::Accept, &[])]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(
+        !decision.entries.contains_key(&x),
+        "{:?}",
+        decision.entries.get(&x)
+    );
+    assert!(decision.reproposed.contains(&x));
+}
+
+/// task-d34 (found by the protocol simulator): a candidate is not kept
+/// when a conflicting command accepted at the source ballot, and not
+/// ordered after it, is absent from the member's records.
+///
+/// The member's order never placed that command, so its path for the
+/// candidate cannot be the leader's. The check used to look the command's
+/// keys up in the member's own records, found none, and let the candidate
+/// through with the member's dependencies, ahead of a decided command.
+#[test]
+fn a_candidate_its_member_ordered_without_an_accepted_command_is_not_kept() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (a, f, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        // r1, in ballot 0's fast set, pre-accepted x after a and never
+        // held f.
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![entry(a, Phase::Commit, &[]), pre_accept_with(x, &[a], 5)],
+        ),
+        // r2 committed f after a at the source ballot.
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(a, Phase::Commit, &[]), entry(f, Phase::Commit, &[a])],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(
+        !decision.entries.contains_key(&x),
+        "{:?}",
+        decision.entries.get(&x)
+    );
+    assert!(decision.reproposed.contains(&x));
+}
+
+/// Nor for a command accepted at the source ballot that its member
+/// executed and forgot, where its own order put that command before the
+/// candidate (task-d34, #118 item 5).
+///
+/// r1 executed a, then f, and retired both; x, pre-accepted after f,
+/// names f. Its records hold neither, but x's dependencies place f before
+/// x, and the selection decided a before f. Dropping x here would
+/// re-propose a command that may have been decided fast, which is the
+/// unsafe direction.
+#[test]
+fn a_candidate_whose_member_forgot_an_at_source_command_it_ordered_first_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (a, f, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        // r1, in ballot 0's fast set, executed and retired a and f.
+        report_for(1, ballot(1, 2), 0, vec![pre_accept_with(x, &[f], 5)]),
+        // r2 committed f after a at the source ballot.
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(a, Phase::Commit, &[]), entry(f, Phase::Commit, &[a])],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    // A command the member no longer holds is evidence only for what the
+    // selection decided before it: f after a says nothing of g.
+    let g = cmd(4);
+    let reports = vec![
+        report_for(1, ballot(1, 2), 0, vec![pre_accept_with(x, &[f], 5)]),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(a, Phase::Commit, &[]),
+                entry(f, Phase::Commit, &[a]),
+                entry(g, Phase::Commit, &[a]),
+            ],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+}
+
+/// A command adopted after a candidate that follows another candidate is
+/// ordered after both by the selection (#130 review). The selection's
+/// order was read through the adopted entries alone: a, adopted after y,
+/// was not seen to follow x through y, so x was judged against a as if
+/// the selection placed a before it, and dropped with y after it.
+///
+/// r1, in ballot 0's fast set, pre-accepted x after w and y after x; r2
+/// accepted a after y.
+#[test]
+fn a_command_adopted_after_a_candidate_follows_what_that_candidate_follows() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (w, x, y, a) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(w, Phase::Commit, &[]),
+                pre_accept_with(x, &[w], 5),
+                pre_accept_with(y, &[x], 6),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(w, Phase::Commit, &[]), entry(a, Phase::Accept, &[y])],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![w]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert_eq!(
+        decision.entries.get(&y).map(|e| e.deps.clone()),
+        Some(vec![x]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(decision.reproposed.is_empty(), "{:?}", decision.reproposed);
+}
+
+/// A member's order is read through what the selection decided, not
+/// through the member's stale record of it (task-d33, protocol_sim row 10,
+/// five voters, seed 67).
+///
+/// r1, in ballot 0's fast set, pre-accepted d after a, a after w, and c
+/// after d. r2 holds d committed after w, and a accepted after d. Read
+/// over r1's records, c's closure reached a through d, so a passed as
+/// ordered before c. But d executes after w, not after a: the selection
+/// kept c after d beside a after d, two commands of one key that neither
+/// orders, and the voters executed them in different orders.
+#[test]
+fn a_candidate_is_not_ordered_after_an_adopted_command_through_a_stale_record() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (w, d, a, c) = (cmd(1), cmd(2), cmd(3), cmd(4));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(w, Phase::Commit, &[]),
+                pre_accept_with(d, &[a], 5),
+                pre_accept_with(a, &[w], 6),
+                pre_accept_with(c, &[d], 7),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![
+                entry(w, Phase::Commit, &[]),
+                entry(d, Phase::Commit, &[w]),
+                entry(a, Phase::Accept, &[d]),
+            ],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    let after_d: Vec<CommandId> = decision
+        .entries
+        .values()
+        .filter(|e| e.deps == vec![d])
+        .map(|e| e.command)
+        .collect();
+    assert!(
+        after_d.len() <= 1,
+        "two commands follow d unordered: {after_d:?}, reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(
+        decision.reproposed.contains(&c),
+        "{:?}",
+        decision.entries.get(&c)
+    );
+}
+
+/// The same check does not drop a candidate for a decision of an earlier
+/// ballot its member executed and forgot (task-d34).
+#[test]
+fn a_candidate_whose_member_forgot_an_earlier_ballots_decision_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (b, a, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        // r1 synchronized ballot 1 (led by r0; fast set {r0, r1}), forgot
+        // b, committed a, and pre-accepted x after a.
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![entry(a, Phase::Commit, &[b]), pre_accept_with(x, &[a], 5)],
+        ),
+        // r2 is behind at ballot 0 and reports b committed there.
+        report_for(2, ballot(2, 2), 0, vec![entry(b, Phase::Commit, &[])]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![a]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+}
+
+/// Recovery reads the source ballot's fast set from its configuration
+/// where it is known (task-d31). Ballot 0 ran with the fast set {r0, r2},
+/// not the default {r0, r1}: r2's pre-acceptance may be a fast decision,
+/// which the default rule, looking at r1 instead, would re-propose.
+#[test]
+fn possible_fast_decisions_follow_the_source_ballots_own_fast_set() {
+    let cfg = config(3, 1, &[1, 0], 1);
+    let source = config(3, 0, &[0, 2], 0);
+    let c1 = cmd(1);
+    let reports = vec![
+        report_for(1, ballot(1, 1), 0, vec![]),
+        report_for(2, ballot(1, 1), 0, vec![entry(c1, Phase::PreAccept, &[])]),
+    ];
+    let known = coord_consensus::select_from(
+        &cfg,
+        &reports,
+        |_, _| false,
+        |b| (*b == source.ballot()).then(|| source.clone()),
+    )
+    .unwrap();
+    assert_eq!(
+        known.entries.get(&c1).map(|e| e.phase),
+        Some(Phase::Accept),
+        "a possible fast decision of the source ballot was not kept: {known:?}"
+    );
+    assert!(known.reproposed.is_empty());
+    // Under the default fast set r1 is the member heard, and it holds
+    // nothing: the command is re-proposed.
+    let default = select(&cfg, &reports).unwrap();
+    assert!(!default.entries.contains_key(&c1));
+    assert_eq!(default.reproposed, BTreeSet::from([c1]));
+    // A configuration of another ballot, epoch or voter set is not taken
+    // for the source's.
+    let other = config(3, 0, &[0, 2], 7);
+    let ignored =
+        coord_consensus::select_from(&cfg, &reports, |_, _| false, |_| Some(other.clone()))
+            .unwrap();
+    assert_eq!(ignored, default);
+}
+
+/// Under C1 a fast quorum is any `fast_size` voters with the leader, not a
+/// fixed set (task-d31, Codex review on #127). With five voters it is any
+/// four with r0. Reports from r0, r1 and r2 where r0 and r1 pre-accepted x
+/// alike and r2 holds nothing: {r0, r1, r3, r4} may have decided x fast,
+/// and r2 was simply outside that quorum. Requiring every reporting
+/// member to agree re-proposed a command that may have been learned.
+#[test]
+fn a_c1_candidate_needs_only_the_members_a_fast_quorum_could_not_miss() {
+    let cfg = config(5, 1, &[1, 0, 2], 1);
+    let source = BallotConfiguration::c1(
+        ConfigurationEpoch::new(1).unwrap(),
+        ballot(0, 0),
+        (0..5).map(r).collect(),
+    )
+    .unwrap();
+    let under_c1 = |reports: &[RecoveryReport]| {
+        coord_consensus::select_from(
+            &cfg,
+            reports,
+            |_, _| false,
+            |b| (*b == source.ballot()).then(|| source.clone()),
+        )
+        .unwrap()
+    };
+    let x = cmd(1);
+    let held = |replica| report_for(replica, ballot(1, 1), 0, vec![pre_accept_with(x, &[], 5)]);
+    let empty = |replica| report_for(replica, ballot(1, 1), 0, vec![]);
+
+    // Two of three reporters agree, one of them the leader: kept.
+    let decision = under_c1(&[held(0), held(1), empty(2)]);
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.phase),
+        Some(Phase::Accept),
+        "{decision:?}"
+    );
+    // Without the leader's report, two agreeing members still fit a fast
+    // quorum with the two that did not report.
+    let decision = under_c1(&[held(1), held(2), empty(3)]);
+    assert!(decision.entries.contains_key(&x), "{decision:?}");
+    // The leader is in every fast quorum: its report without x rules a
+    // fast decision out.
+    let decision = under_c1(&[empty(0), held(1), held(2)]);
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+    // One agreeing member of three reports cannot be a fast quorum's share.
+    let decision = under_c1(&[held(1), empty(2), empty(3)]);
+    assert!(!decision.entries.contains_key(&x));
+    assert!(decision.reproposed.contains(&x));
+}
+
+/// task-d33 (found by the protocol simulator's row 14): a member's own
+/// path for an ancestor is no evidence against its path for the
+/// candidate.
+///
+/// r1, in ballot 0's fast set, pre-accepted a with a path of its own; the
+/// leader ordered a otherwise and a was accepted slowly. A leader
+/// synchronization then re-based r1's log, so r1's pre-acceptance of x
+/// after a carried the leader's path, and r0 and r1 decided x fast. r1's
+/// record of a still holds the path it was pre-accepted with. Requiring
+/// it to equal the selected path re-proposed x, and the new ballot
+/// executed x after another dependency: two decisions of one command.
+#[test]
+fn a_candidate_is_kept_when_its_member_pre_accepted_an_ancestor_on_its_own_path() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (a, x) = (cmd(1), cmd(2));
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![
+                pre_accept_with(a, &[], 0x11),
+                pre_accept_with(x, &[a], 0x33),
+            ],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(a, Phase::Accept, &[]), pre_accept_with(x, &[a], 0x33)],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![a]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    // The order is still checked: a member that did not order a before x
+    // cannot have decided x fast with the leader, which ordered a.
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![pre_accept_with(a, &[], 0x11), pre_accept_with(x, &[], 0x33)],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(a, Phase::Accept, &[]), pre_accept_with(x, &[], 0x33)],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(decision.reproposed.contains(&x));
+}
+
+/// task-d33 (protocol_sim row 14, three voters, seed 79): a member's
+/// closure of a candidate stops at a command it executed and retired, so
+/// a conflicting command it still holds, which the selection orders
+/// before that one, is in neither the closure nor after the candidate. It
+/// was executed there before the retired command, so before the
+/// candidate: no evidence against the member's path.
+#[test]
+fn a_candidate_is_kept_when_a_held_command_precedes_one_its_member_retired() {
+    let cfg = config(3, 2, &[2, 0], 1);
+    let (y, f, x) = (cmd(1), cmd(2), cmd(3));
+    let reports = vec![
+        // r1, in ballot 0's fast set, executed y then f and retired f; it
+        // still holds y.
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![entry(y, Phase::Commit, &[]), pre_accept_with(x, &[f], 5)],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(y, Phase::Commit, &[]), entry(f, Phase::Commit, &[y])],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    // Held and ordered by nothing before x: still evidence against it.
+    let reports = vec![
+        report_for(
+            1,
+            ballot(1, 2),
+            0,
+            vec![entry(y, Phase::Commit, &[]), pre_accept_with(x, &[f], 5)],
+        ),
+        report_for(
+            2,
+            ballot(1, 2),
+            0,
+            vec![entry(y, Phase::Commit, &[]), entry(f, Phase::Commit, &[])],
+        ),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(decision.reproposed.contains(&x));
+}
+
+/// task-d33 (protocol_sim row 4, three voters, seed 85): the source
+/// leader re-proposed f, which no quorum accepted, and x was decided fast
+/// after it. The member holds f as its Sync demoted it; that is no
+/// evidence against x, which is kept with f as its dependency while f is
+/// re-proposed.
+#[test]
+fn a_candidate_is_kept_over_a_dependency_a_sync_demoted() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (f, x) = (cmd(1), cmd(2));
+    let demoted = ReportEntry {
+        path: coord_consensus::demoted_path(),
+        paths: vec![],
+        ..entry(f, Phase::PreAccept, &[])
+    };
+    let reports = vec![
+        // r1 synchronized ballot 1 (led by r0; fast set {r0, r1}).
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![demoted.clone(), pre_accept_with(x, &[f], 5)],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(decision.reproposed.contains(&f));
+    // So is a dependency the member holds with its own path, which no
+    // one decided (protocol_sim row 10, three voters, seed 31): the
+    // leader proposes x with the dependencies it knows, decided or not.
+    let undecided = ReportEntry {
+        payload_present: false,
+        ..pre_accept_with(f, &[], 9)
+    };
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![undecided, pre_accept_with(x, &[f], 5)],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f])
+    );
+    assert!(decision.reproposed.contains(&f));
+}
+
+/// task-d33 (protocol_sim row 10, three voters, seed 31): x was decided
+/// fast after d, which no ballot decided; the source leader accepted d
+/// after an adopted command a, but the member still holds its own
+/// pre-acceptance of d, which names nothing. Walked over the member's
+/// records, x's closure missed a, and x was dropped and re-proposed under
+/// other dependencies than the ones it was learned with. d is re-proposed
+/// after the recovered order, a among it, and x after d: x follows a
+/// whatever the member's stale record of d says.
+///
+/// d is a candidate too, and is dropped: its record says nothing orders it
+/// after a. Judged while d was still a candidate, x failed as well; the
+/// outcome must not depend on which of the two identities sorts first.
+#[test]
+fn a_candidate_after_an_undecided_command_is_kept_over_the_members_stale_record() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    for (a, d, x) in [(cmd(1), cmd(2), cmd(3)), (cmd(1), cmd(3), cmd(2))] {
+        let reports = vec![
+            // r1 synchronized ballot 1 (led by r0; fast set {r0, r1}).
+            report_for(
+                1,
+                ballot(2, 2),
+                1,
+                vec![
+                    entry(a, Phase::Commit, &[]),
+                    pre_accept_with(d, &[], 9),
+                    pre_accept_with(x, &[d], 5),
+                ],
+            ),
+            report_for(2, ballot(2, 2), 0, vec![entry(a, Phase::Commit, &[])]),
+        ];
+        let decision = select(&cfg, &reports).unwrap();
+        assert_eq!(
+            decision.entries.get(&x).map(|e| e.deps.clone()),
+            Some(vec![d]),
+            "reproposed {:?}",
+            decision.reproposed
+        );
+        assert!(decision.reproposed.contains(&d));
+        assert!(decision.entries.contains_key(&a));
+    }
+}
+
+/// task-d33 (protocol_sim row 2, three voters, seed 3): a candidate that
+/// follows a command the selection re-proposes is ordered after an
+/// adopted command only when that command follows no re-proposal itself.
+/// Here a, accepted at the source ballot, waits on d's re-proposal as x
+/// does: both go after d, and nothing orders one after the other. The
+/// member's own records do not put a before x either, so x is no fast
+/// decision and is re-proposed.
+#[test]
+fn a_candidate_is_not_ordered_after_an_adopted_command_that_waits_on_the_same_reproposal() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (a, d, x) = (cmd(1), cmd(2), cmd(3));
+    let undecided = ReportEntry {
+        payload_present: false,
+        ..pre_accept_with(d, &[], 9)
+    };
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Accept, &[d]),
+                undecided,
+                pre_accept_with(x, &[d], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(decision.entries.contains_key(&a));
+    assert!(
+        decision.reproposed.contains(&x),
+        "kept {:?}",
+        decision.entries.get(&x)
+    );
+    // Nor when the member's record of d names a (row 3, seed 70): that
+    // order runs through d, which is re-proposed under other
+    // dependencies, and says nothing of a against x.
+    let undecided = ReportEntry {
+        payload_present: false,
+        ..pre_accept_with(d, &[a], 9)
+    };
+    let reports = vec![
+        report_for(
+            1,
+            ballot(2, 2),
+            1,
+            vec![
+                entry(a, Phase::Accept, &[d]),
+                undecided,
+                pre_accept_with(x, &[d], 5),
+            ],
+        ),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert!(
+        decision.reproposed.contains(&x),
+        "kept {:?}",
+        decision.entries.get(&x)
+    );
+}
+
+/// task-d33 (protocol_sim row 12, three voters, seed 9): x was decided
+/// fast after f, which the member executed and retired past the window
+/// its report names, so no report holds f. A member at the source ballot
+/// releases nothing, and a pre-acceptance names only commands it held, so
+/// f is history there, before x. The rule that x's closure be decided
+/// dropped x and re-proposed it under other dependencies.
+#[test]
+fn a_candidate_after_a_command_its_member_retired_past_the_window_is_kept() {
+    let cfg = config(3, 2, &[2, 0], 2);
+    let (f, x) = (cmd(1), cmd(2));
+    let reports = vec![
+        report_for(1, ballot(2, 2), 1, vec![pre_accept_with(x, &[f], 5)]),
+        report_for(2, ballot(2, 2), 0, vec![]),
+    ];
+    let decision = select(&cfg, &reports).unwrap();
+    assert_eq!(
+        decision.entries.get(&x).map(|e| e.deps.clone()),
+        Some(vec![f]),
+        "reproposed {:?}",
+        decision.reproposed
+    );
+    assert!(!decision.reproposed.contains(&f));
 }

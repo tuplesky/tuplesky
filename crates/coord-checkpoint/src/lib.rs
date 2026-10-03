@@ -76,7 +76,7 @@ pub mod store;
 pub mod trim;
 pub mod verify;
 
-pub use export::{CheckpointOrigin, ExportError, ExportLimits, export_shared};
+pub use export::{CheckpointOrigin, ExportError, ExportLimits, common_state_bytes, export_shared};
 pub use local::{
     InstallLocalError, InstallLocalLimits, LocalCheckpointV1, LocalError, LocalLimits,
     LocalManifestV1, LocalPin, export_local, install_local, verify_local,
@@ -95,8 +95,8 @@ pub use handoff::{
     activate_successor, publish_certificate, publish_handoff_activation, published_certificate,
     read_installs, record_install, record_local_install, select_certificate,
 };
-pub use maintain::{BaselineError, LocalBaseline, Publication};
-pub use store::{LocalCheckpointStore, StoreError};
+pub use maintain::{BaselineError, LocalBaseline, Phases, Publication};
+pub use store::{LocalCheckpointStore, SharedImageStore, StoreError};
 
 pub use install::{
     ChunkSet, InstallError, InstallLimits, InstallRequirements, Installed, InstalledCheckpointV1,

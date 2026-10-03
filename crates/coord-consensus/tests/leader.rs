@@ -350,8 +350,34 @@ fn proposals_are_published_with_exact_durable_support_and_match_the_model() {
     assert_eq!(released.len(), 5);
     assert_eq!(leader.table().phase_of(&c1), Some(Phase::Accept));
     assert_eq!(leader.table().phase_of(&c2), Some(Phase::Accept));
-    assert_eq!(leader.pending_sends(), 0);
+    // The leader's own adoptions wait on the acceptance rows, to two
+    // voters and the frontend each (task-d19).
+    assert_eq!(leader.pending_sends(), 6);
     assert!(leader.take_rejections().is_empty());
+    let mut acks = Vec::new();
+    for (i, event) in durable(&released, 3).into_iter().enumerate() {
+        let out = leader.step(event);
+        trace.steps.push((
+            format!("acceptance {} durable", i + 1),
+            out.iter().map(summarize).collect(),
+        ));
+        acks.extend(out);
+    }
+    assert_eq!(leader.pending_sends(), 0);
+    let slow: Vec<_> = acks
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SendWhenDurable { frame, .. } => Some(ProtocolMessage::decode(frame).unwrap()),
+            _ => None,
+        })
+        .filter(|m| matches!(m, ProtocolMessage::SlowAck(a) if a.replica == r(0)))
+        .collect();
+    assert_eq!(
+        slow.len(),
+        6,
+        "c1 and c2 adopted by the leader, to all three"
+    );
+    assert!(leader.votes(&c1).unwrap().adopted_by(&r(0)));
     // The leader's own vote alone learns nothing.
     assert!(leader.votes(&c1).unwrap().learned_slow().is_none());
     assert_eq!(leader.next_executable(), None);
@@ -584,6 +610,7 @@ fn a_higher_promise_stops_proposing_and_fences_unreleased_proposals() {
         2,
         ProtocolMessage::NewLeader {
             ballot: ballot(1, 2),
+            executed: coord_types::ids::ExecutionPosition::ZERO,
         },
     ));
     assert_eq!(effects.len(), 1);
@@ -638,7 +665,7 @@ fn votes_are_collected_but_never_learned_here() {
     let mut leader = booted();
     let (e1, c1) = admitted(1, 1, 1);
     let effects = leader.step(e1);
-    leader.step(durable(&effects, 1).remove(0));
+    let acceptance = leader.step(durable(&effects, 1).remove(0));
     let path = leader.proposal(&c1).unwrap().path;
     let paths = leader.proposal(&c1).unwrap().paths.clone();
     let admitted_under = leader
@@ -693,6 +720,12 @@ fn votes_are_collected_but_never_learned_here() {
             Rejection::Vote(VoteError::NotAVoter)
         ]
     );
+    assert!(
+        leader.votes(&c1).unwrap().learned_slow().is_none(),
+        "r2's adoption and the leader's proposal: the leader's acceptance \
+         row is not durable yet (task-d19)"
+    );
+    leader.step(durable(&acceptance, 2).remove(0));
     let votes = leader.votes(&c1).unwrap();
     assert_eq!(votes.voted(), [r(0), r(1), r(2)].into());
     // The slow predicate holds: the command is committed (task-24), but

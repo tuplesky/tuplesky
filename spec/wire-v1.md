@@ -147,10 +147,10 @@ lane and direction.
 
 ## Collector frames (task-33)
 
-The trusted collector (`spec/collector-v1.md`) uses three raw kinds. Two
-are in the API range because they carry or answer a client request and
-take its class limit; the evidence frame is in the collector-evidence
-range. None is decodable by the typed decoder: they are dispatched by raw
+The trusted collector (`spec/collector-v1.md`) uses five raw kinds. Two
+are in the API range because they carry a client request and take its
+class limit; the answers and the evidence frame are in the
+collector-evidence range. None is decodable by the typed decoder: they are dispatched by raw
 kind at the collector boundary, like peer evidence.
 
 | Kind | Value | Direction | Payload |
@@ -158,6 +158,18 @@ kind at the collector boundary, like peer evidence.
 | Submit | `0x0103` | collector to every voter | `SubmitV1 { receipt: AdmissionFacts, request: RequestV1 }` (postcard); API class limit |
 | Release | `0x0701` | leader to collector | `ReleasedResult` (postcard); collector-evidence class limit |
 | Evidence | `0x0700` | voter to collector | Opaque `coord-consensus` protocol message (`LeaderReply`, `FastAck`, `SlowAck`); collector-evidence class limit |
+| Read | `0x0107` | frontend to the leader it follows | `ReadV1 { ballot, request: RequestV1 }` (postcard): a Range without an explicit revision, for the leader read barrier (task-d50); API class limit |
+| ReadAnswer | `0x0702` | leader to frontend | `ReadAnswerV1 { retry_key, ballot, outcome: Served { response } \| Refused { reason } }` (postcard), `reason` one of `NotLeading`, `NothingProposed`, `Expired`, `NotServable`, `Busy`; collector-evidence class limit |
+
+A read is served only by the leader of the ballot named in it, after a
+confirmation round of that ballot (`ProtocolMessage::ReadConfirm` /
+`ReadConfirmed`, appended at indices 20 and 21) started after the read
+arrived and after its executed and materialized state reached the read
+index; the served `response` is the encoded `Response` the ordered path
+would have recorded for a Range at that state. A refusal, or no answer
+by the frontend's deadline, sends the read down the ordered path
+(design Section 6.3). A voter admits `Read` under the same collector-role
+rule as `Submit`.
 
 `FastAck` and `SlowAck` carry the admission digest the sender accepted
 the command under. The command identity is the retry key and the
@@ -216,15 +228,30 @@ certificate binds one role and the role that may act for other
 principals is not the voter's. Frozen error codes of `ResponseV1::Err` are `wire_v1::codes` in
 `coord-types` (`0x0001` request identity conflict, `0x0002`
 backpressure, `0x0003` malformed request, `0x0004` not admitted, `0x0005`
-result too large, `0x0006` request too large; append-only); pending and
-unknown outcomes use the `Pending` and `Unknown` outcomes, not error
-codes. `0x0006` is a permanent refusal: what the request carries, as
+result too large, `0x0006` request too large, `0x0007` output withheld,
+`0x0008` result retired; append-only); pending and unknown outcomes use
+the `Pending` and `Unknown` outcomes, not error codes. `0x0006` is a permanent refusal: what the request carries, as
 the protocol counts it against its request limit (the bytes of its keys,
 values and range ends), exceeds the frontend's configured
 `max_request_bytes`. It is decided before
 anything is reserved, is answered under the invocation's own command
 identity, and is the same answer on every retry, so a client does not
 retry it.
+
+`0x0007` and `0x0008` answer for a command, not a refusal of it
+(task-d23). `0x0007`: the command executed, and its result is withheld
+from this caller, by the output gate under the current policy or because
+the session may no longer read it; `0x0004` never answers a command that
+executed. `0x0008`: the invocation's sequence is at or below its client
+instance's retirement floor and no result is kept, so whether it
+happened is not retrievable. Both are final; neither is retried. A
+retired sequence reaches a client as `0x0008` on a `Resolve`, and on a
+`Request` under a session that may no longer execute; on a `Request`
+under a live session, admission refuses it as `Rejected(RetryTooOld)`.
+`Unknown` means only that the endpoint, its memory and its durable
+record, holds nothing about the invocation; the client learns more by
+sending the identical `Request` again under the same retry key, which a
+domain that executed it answers from its record.
 
 ## API session binding (task-37)
 
