@@ -884,6 +884,10 @@ pub struct Domain<P: Persistence> {
     frontend: Frontend,
     /// This node's own recovery baseline, where it keeps one.
     housekeeping: Option<Housekeeping>,
+    /// How long a working projection commit may wait for a durable one
+    /// under the replay-backed profile, and when one was last asked for
+    /// (task-j06). `None` under the strict profile.
+    durable_projection: Option<(std::time::Duration, std::time::Instant)>,
     /// The other voters, where this process votes. `None` for a process
     /// that does not, and for a domain with nobody else in it.
     plane: Option<PeerPlane>,
@@ -973,6 +977,13 @@ pub struct Domain<P: Persistence> {
     /// commit finishes (task-d52), so the loop takes it back and releases
     /// what waited on it. `None` where commits run on this thread.
     materialized: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Where the loop's blocking takes from the appender's and the
+    /// materializer's threads are counted (task-d54), in that order.
+    /// `None` where neither thread runs.
+    pipeline_waits: Option<(
+        std::sync::Arc<coord_storage::Waits>,
+        std::sync::Arc<coord_storage::Waits>,
+    )>,
     /// What reads the leader read barrier did not serve came to, waiting
     /// for a turn that can send it (task-d50).
     read_orders: Vec<coord_collector::Action>,
@@ -1454,6 +1465,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             backing,
             frontend,
             housekeeping: None,
+            durable_projection: None,
             plane: None,
             links: CollectorLinks::new(Vec::new()),
             expiry: None,
@@ -1486,6 +1498,7 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             recorder,
             pacing: Pacing::default(),
             materialized: None,
+            pipeline_waits: None,
             read_orders: Vec::new(),
         }
     }
@@ -1501,6 +1514,18 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
         self
     }
 
+    /// Report the loop's blocking takes from the voter's appender and
+    /// materializer threads in its cost (task-d54).
+    #[must_use]
+    pub fn count_pipeline_waits(
+        mut self,
+        appender: std::sync::Arc<coord_storage::Waits>,
+        materializer: std::sync::Arc<coord_storage::Waits>,
+    ) -> Self {
+        self.pipeline_waits = Some((appender, materializer));
+        self
+    }
+
     /// Print a snapshot every `every` while serving, for `roles`
     /// (task-d45). Without it the only snapshots are the ones at start
     /// and at a clean end, and a killed daemon's log has neither.
@@ -1513,7 +1538,9 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// What this voter's work has cost since the loop started, with the
     /// interval since the last printed snapshot (task-d45).
     fn cost(&self) -> coord_daemon::metrics::Measure<coord_daemon::metrics::Cost> {
-        use coord_daemon::metrics::{Cost, Cpu, Interval, Measure, Unavailable};
+        use coord_daemon::metrics::{
+            Cost, Cpu, Interval, Measure, PipelineWaits, Unavailable, Wait,
+        };
         let Backing::Voting(voter) = &self.backing else {
             // A process without a voter applies what it serves, but the
             // cost this reports is a voter's: per command it executed in
@@ -1562,6 +1589,19 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             established_slow: voter.node().established.slow,
             reads: reads(&voter.read_counts()),
             cpu,
+            waits: self.pipeline_waits.as_ref().map_or(
+                Measure::Unavailable(Unavailable::NotInstrumented),
+                |(appender, materializer)| {
+                    let wait = |waits: &coord_storage::Waits| {
+                        let (count, time) = waits.read();
+                        Wait { count, time }
+                    };
+                    Measure::Observed(PipelineWaits {
+                        appender: wait(appender),
+                        materializer: wait(materializer),
+                    })
+                },
+            ),
         })
     }
 
@@ -1619,6 +1659,12 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
                 journal,
                 materialized,
                 checkpoint,
+                projection_durable: self
+                    .backing
+                    .applier()
+                    .store()
+                    .projection_durable()
+                    .map(|seq| seq.get()),
             }),
             None => Measure::Unavailable(Unavailable::Quarantined),
         };
@@ -1674,6 +1720,24 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             done: (0, 0),
         });
         self
+    }
+
+    /// Ask for a durable projection commit at least every `every` under
+    /// the replay-backed profile (task-j06): the time bound beside the
+    /// store's own count of commits and records.
+    pub fn with_durable_projection_every(mut self, every: std::time::Duration) -> Self {
+        self.durable_projection = Some((every, std::time::Instant::now()));
+        self
+    }
+
+    /// Make every working projection commit durable, for a clean stop
+    /// (task-j06): a start after it replays nothing the projection had
+    /// applied. A failure is said and left: the journal still holds every
+    /// record, and the next start replays them.
+    pub fn sync_projections(&mut self) {
+        if let Err(e) = self.backing.applier_mut().store_mut().sync_projections() {
+            eprintln!("the projection could not be made durable at the stop: {e}");
+        }
     }
 
     /// Baselines published, and cycles that failed.
@@ -2435,9 +2499,26 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
             .dispatcher()
             .next_read_deadline()
             .map(|at| self.started + std::time::Duration::from_millis(at.get()));
+        // A working projection commit is made durable within its bound
+        // on an idle domain too, and nothing arrives to say it is due
+        // (task-j06).
+        let durable_projection = self
+            .durable_projection
+            .filter(|_| self.backing.applier().store().projection_volatile())
+            .map(|(every, last)| last + every / 2);
         [
-            expiry, parked, reoffer, redial, renewal, election, resend, catch_up, pages, report,
+            expiry,
+            parked,
+            reoffer,
+            redial,
+            renewal,
+            election,
+            resend,
+            catch_up,
+            pages,
+            report,
             read,
+            durable_projection,
         ]
         .into_iter()
         .flatten()
@@ -2820,6 +2901,28 @@ impl<P: Persistence + LocalBaseline> Domain<P> {
     /// node whose checkpoints have been failing for a week is a node
     /// whose disk is filling, and that is an operator's to see.
     fn maintain(&mut self) {
+        // The time bound on a working projection commit (task-j06), in
+        // two halves. Every half interval the next projection commit is
+        // asked to be durable, which costs nothing: whichever thread
+        // makes it, a busy domain makes it soon. A request still waiting
+        // at the next half has met no commit at all, so the domain is
+        // idle, and the projection is made durable here -- one empty
+        // durable commit on a thread with nothing else to do. Either way
+        // a working commit is durable within the interval.
+        if let Some((every, last)) = &mut self.durable_projection {
+            let now = std::time::Instant::now();
+            if now.duration_since(*last) >= *every / 2 {
+                *last = now;
+                let store = self.backing.applier_mut().store_mut();
+                // A failure is said and left, as at the stop: the journal
+                // holds every record, and the next commit says whether
+                // the engine can still commit at all.
+                if let Err(e) = store.sync_idle_projections() {
+                    eprintln!("the idle projection could not be made durable: {e}");
+                }
+                store.request_durable_projection();
+            }
+        }
         let Some(housekeeping) = &self.housekeeping else {
             return;
         };

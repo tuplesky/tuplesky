@@ -116,6 +116,35 @@ impl World {
         barriers
     }
 
+    /// Queue an application at `position` under ballot `number`, planned
+    /// on the base the store hands out now.
+    fn apply(&mut self, number: u64, position: u64) -> BarrierId {
+        let barrier = self.barriers.allocate();
+        let base = self.store.application_base(A).unwrap();
+        self.store
+            .submit(Submission {
+                domain: A,
+                ballot: Ballot {
+                    epoch: base.configuration,
+                    number,
+                    leader: REPLICA,
+                },
+                kind: TransitionKind::Application {
+                    position: ExecutionPosition::new(position).unwrap(),
+                    revision: None,
+                    result_digest: coord_types::identity::Digest32([position as u8; 32]),
+                },
+                batch: PersistBatch {
+                    barrier,
+                    base: Some(base),
+                    updates: nth(self.next),
+                },
+            })
+            .unwrap();
+        self.next += 1;
+        barrier
+    }
+
     fn durable(&self) -> LocalJournalSeq {
         self.store.frontiers(A).unwrap().durable()
     }
@@ -444,4 +473,54 @@ fn a_thread_appender_syncs_off_the_callers_thread_and_wakes_it() {
     assert_eq!(seen, expected);
     world.store.flush().unwrap();
     assert_eq!(kv_rows(&world.store), reference_kv(10));
+}
+
+/// A fence takes an append out back before it tests what is queued: the
+/// group lent is in no frontier until it is taken back, so a fence before
+/// it would test an application queued behind it against the frontier
+/// before the group, refuse it, and move the queued frontier back past
+/// the group, which would leave the next application planned on a base
+/// the projection refuses.
+#[test]
+fn a_fence_takes_an_append_out_back_before_it_tests_what_is_queued() {
+    let (mut world, handle) = World::lending();
+    let first = world.apply(1, 1);
+    world.store.append().unwrap();
+    assert!(handle.waiting());
+    // The new leader's own application, planned behind the group out.
+    let second = world.apply(2, 2);
+    let base = world.store.application_base(A).unwrap();
+
+    let refused = world
+        .store
+        .fence(
+            A,
+            Ballot {
+                epoch: base.configuration,
+                number: 2,
+                leader: REPLICA,
+            },
+        )
+        .unwrap();
+    assert!(
+        refused.is_empty(),
+        "refused behind a group out: {refused:?}"
+    );
+    assert!(!world.store.appending(), "the fence took the append back");
+    assert_eq!(world.store.queued(A), 1);
+    assert_eq!(world.store.application_base(A).unwrap(), base);
+
+    // What the fence took back goes out with the next report, and the
+    // application behind it is lent with it.
+    let report = world.store.append().unwrap();
+    assert_eq!(durable(&report.events), vec![first]);
+    assert!(handle.run());
+    let report = world.store.append().unwrap();
+    assert_eq!(durable(&report.events), vec![second]);
+    assert_eq!(world.store.application_base(A).unwrap(), base);
+
+    // Both extend the projection: nothing is quarantined.
+    world.store.flush().unwrap();
+    assert_eq!(world.store.status(A), Some(DomainStatus::Ready));
+    assert_eq!(world.store.unmaterialized(A), 0);
 }

@@ -387,8 +387,11 @@ impl<P: Persistence> Voter<P> {
         // What is queued is lowered first, under the ballot it was made
         // under, as a node lowering each round would have (task-d47):
         // the fence refuses only the work of a ballot left behind, and
-        // work this voter made before it promised was not.
-        let mut out = self.node.flush(&self.ballot)?;
+        // work this voter made before it promised was not. It is
+        // journaled before the fence, not lent: the fence tests what is
+        // still queued against the frontier the journal has reached, and
+        // a group out on the appender's thread is in none (task-d54).
+        let mut out = self.node.flush_journaled(&self.ballot)?;
         let refused = self
             .node
             .applier_mut()

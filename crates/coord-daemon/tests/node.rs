@@ -1349,6 +1349,58 @@ fn lending_the_journal_a_proposal_is_held_until_its_append_is_taken_back() {
     drop(commits);
 }
 
+/// A journaled flush (task-d54) returns with nothing out: the append the
+/// flush lent is waited for and taken back on the domain thread, and the
+/// proposal its record released goes out with it. A fence runs after one,
+/// so it never tests what is queued against a frontier a group out is
+/// not yet in.
+#[test]
+fn a_journaled_flush_waits_for_the_append_out_and_sends_what_it_released() {
+    let boot = BootId([18; 16]);
+    let applier = journaled_applier(boot, r(0));
+    let bootstrapped = applier.store().application_base().execution_position;
+    let mut machine = Leader::new(
+        LeaderConfig {
+            identity: identity(0),
+            quorum: quorum(),
+            genesis: ballot(),
+            frontend: FRONTEND,
+            capacity: 64,
+        },
+        None,
+        bootstrapped,
+    );
+    machine.set_learning(LearningMode::Full);
+    let mut node = Node::new(Machine::Leader(Box::new(machine)), applier, FRONTEND);
+    node.on_event(
+        Event::Boot {
+            boot_id: boot,
+            incarnation: inc(),
+        },
+        &ballot(),
+    )
+    .expect("boot");
+    node.lower_in_groups();
+    let (commits, appends) = lend_journal(&mut node);
+
+    node.on_event(Event::Admitted(admitted(1)), &ballot())
+        .expect("admitted");
+    let out = node.flush_journaled(&ballot()).expect("flushed");
+    assert!(
+        !node.applier().store().appending(),
+        "an append is still out"
+    );
+    assert!(!appends.waiting());
+    assert_eq!(node.applier().store().queued(), 0);
+    let to: Vec<ReplicaId> = out.peer.iter().map(|(p, _)| p.replica).collect();
+    assert!(
+        to.contains(&r(1)) && to.contains(&r(2)),
+        "the proposal did not reach the voters: {to:?}"
+    );
+    assert_eq!(node.held(), 0);
+    drop(commits);
+}
+
 /// With the journal lent (task-d54), the same commands give the same
 /// results, the same frames to the collector and the same projection as
 /// on a node that appends on its own thread.

@@ -1330,6 +1330,7 @@ impl<P: Persistence> Node<P> {
                 Lowering::Lower => store.lower(),
                 Lowering::Journal => store.journal(),
                 Lowering::TakeBack => store.take_back(),
+                Lowering::Await => store.finish_append(),
             },
         )
         .map_err(|e| DriveError::Engine(format!("{e:?}")))?;
@@ -1422,7 +1423,18 @@ impl<P: Persistence> Node<P> {
             if before == 0 {
                 break;
             }
-            self.lower_once(next, Lowering::Lower)?;
+            // With the journal's appends on the appender's thread
+            // (task-d54), the room is made by lending the next group, as
+            // a flush would: this thread waits for the append out, if one
+            // is, and not for the next group's sync as well.
+            if self.applier.store().journal_pipelined() {
+                if self.applier.store().appending() {
+                    self.lower_once(next, Lowering::Await)?;
+                }
+                self.lower_once(next, Lowering::Journal)?;
+            } else {
+                self.lower_once(next, Lowering::Lower)?;
+            }
             if self.applier.store().queued() >= before {
                 break;
             }
@@ -1645,9 +1657,6 @@ impl<P: Persistence> Node<P> {
     /// have been taken in, so the group holds all of them -- as a sync on
     /// this thread left them all to the flush after it.
     pub fn settle(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
-        if !self.applier.pipelined() {
-            return Ok(Outbound::default());
-        }
         let mut out = Outbound::default();
         if self.applier.store().appending() {
             let mut next = Vec::new();
@@ -1655,7 +1664,32 @@ impl<P: Persistence> Node<P> {
             self.unreleased = true;
             out.absorb(self.carry_out(next, ballot)?);
         }
-        out.absorb(self.release_through_settled(ballot)?);
+        if self.applier.pipelined() {
+            out.absorb(self.release_through_settled(ballot)?);
+        }
+        Ok(out)
+    }
+
+    /// Flush, then wait on this thread until no journal append is out
+    /// (task-d54): each append out is taken back, what it made durable is
+    /// carried out, and what that queued is flushed in turn. What was
+    /// queued when this was called is journaled when it returns, as a
+    /// flush that appends on this thread leaves it, unless a lowering
+    /// moved nothing.
+    ///
+    /// For a caller about to act on what the journal holds rather than on
+    /// what it will: a fence tests what is queued against the frontier
+    /// the journal reaches, and a group out is in no frontier until it is
+    /// taken back.
+    pub fn flush_journaled(&mut self, ballot: &Ballot) -> Result<Outbound, DriveError> {
+        let mut out = self.flush(ballot)?;
+        while self.applier.store().appending() {
+            let mut next = Vec::new();
+            self.lower_once(&mut next, Lowering::Await)?;
+            self.unreleased = true;
+            out.absorb(self.carry_out(next, ballot)?);
+            out.absorb(self.flush(ballot)?);
+        }
         Ok(out)
     }
 
@@ -1836,4 +1870,7 @@ enum Lowering {
     /// Take back a journal append that has finished, and lend nothing
     /// ([`Persistence::take_back`], task-d54).
     TakeBack,
+    /// Wait for the journal append out, take it back, and lend nothing
+    /// ([`Persistence::finish_append`], task-d54).
+    Await,
 }

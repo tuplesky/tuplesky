@@ -198,6 +198,12 @@ pub struct Provisioned {
     pub issuer: Issuer,
     /// The Kubernetes storage edge.
     pub edge: Edge,
+    /// The journal profile every voter was provisioned with (task-j06),
+    /// so a run is labelled by what it ran. Written only when it is not
+    /// the strict default, so a strict description is what it always
+    /// was; one without it was strict.
+    #[serde(default, skip_serializing_if = "JournalProfile::is_strict")]
+    pub journal_profile: JournalProfile,
 }
 
 impl Provisioned {
@@ -240,6 +246,85 @@ pub struct Plan {
     /// Where the credential endpoint is reached, `host:port`, when that
     /// is not loopback. Its server certificate carries the host.
     pub issuer_listen: Option<Address>,
+    /// The journal profile every voter runs (task-j06).
+    pub journal: JournalPlan,
+}
+
+/// The journal profile a provisioned domain's voters run, written into
+/// each voter's `[journal]` (task-j06). The default is the strict
+/// profile, and writes nothing: the configuration is byte for byte what
+/// this harness has always written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalPlan {
+    /// The profile.
+    pub profile: JournalProfile,
+    /// `projection_durable_commits`, where not the daemon's default.
+    pub projection_durable_commits: Option<u32>,
+    /// `projection_durable_records`, where not the daemon's default.
+    pub projection_durable_records: Option<u32>,
+    /// `projection_durable_ms`, where not the daemon's default.
+    pub projection_durable_ms: Option<u64>,
+}
+
+/// A journal profile `coordd` serves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JournalProfile {
+    /// `journaled-strict-v1`: every projection commit is durable.
+    #[default]
+    Strict,
+    /// `journaled-replay-v1`: projection commits are working commits,
+    /// made durable on a cadence and replayed from the journal after a
+    /// crash. Not a default and not a supported production profile
+    /// until task-j05.
+    Replay,
+}
+
+impl JournalProfile {
+    /// The name `[journal] profile` takes.
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            JournalProfile::Strict => "journaled-strict-v1",
+            JournalProfile::Replay => "journaled-replay-v1",
+        }
+    }
+
+    /// Whether this is the strict default.
+    pub fn is_strict(&self) -> bool {
+        *self == JournalProfile::Strict
+    }
+
+    /// Parse `strict`, `replay`, or the profile's own name.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "strict" | "journaled-strict-v1" => Ok(JournalProfile::Strict),
+            "replay" | "journaled-replay-v1" => Ok(JournalProfile::Replay),
+            other => Err(format!(
+                "`{other}` is not a journal profile: strict or replay"
+            )),
+        }
+    }
+}
+
+impl JournalPlan {
+    /// The lines this plan adds under `[journal]`, each ending in a
+    /// newline; none for the strict default.
+    fn lines(&self) -> String {
+        let mut out = String::new();
+        if self.profile != JournalProfile::Strict {
+            out.push_str(&format!("profile = \"{}\"\n", self.profile.config_name()));
+        }
+        if let Some(n) = self.projection_durable_commits {
+            out.push_str(&format!("projection_durable_commits = {n}\n"));
+        }
+        if let Some(n) = self.projection_durable_records {
+            out.push_str(&format!("projection_durable_records = {n}\n"));
+        }
+        if let Some(n) = self.projection_durable_ms {
+            out.push_str(&format!("projection_durable_ms = {n}\n"));
+        }
+        out
+    }
 }
 
 impl Plan {
@@ -254,6 +339,7 @@ impl Plan {
             listen_any: false,
             edge_host: None,
             issuer_listen: None,
+            journal: JournalPlan::default(),
         }
     }
 }
@@ -449,6 +535,23 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
             plan.hosts.len(),
             plan.voters
         )));
+    }
+    // A cadence means nothing to the strict profile, and a run that set
+    // one and ran strict would be read as what it did not run. Zero is
+    // what the daemon refuses at start; it is refused here first.
+    let journal = &plan.journal;
+    let cadence = [
+        journal.projection_durable_commits.map(u64::from),
+        journal.projection_durable_records.map(u64::from),
+        journal.projection_durable_ms,
+    ];
+    if journal.profile == JournalProfile::Strict && cadence.iter().any(Option::is_some) {
+        return Err(invalid(
+            "a projection cadence is the replay profile's: name it as well".into(),
+        ));
+    }
+    if cadence.contains(&Some(0)) {
+        return Err(invalid("a projection cadence of zero".into()));
     }
     // What a certificate is reached at, settled before anything is
     // written: a host a certificate cannot name is refused here rather
@@ -658,6 +761,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
                 &hex(&principal),
                 &hex(&namespace),
                 &hex(&trust_rule),
+                &plan.journal,
             ),
         )?;
         voters_out.push(Node {
@@ -715,6 +819,7 @@ pub fn provision(plan: &Plan) -> std::io::Result<Provisioned> {
         authority_key,
         issuer,
         edge,
+        journal_profile: plan.journal.profile,
     };
     std::fs::write(
         dir.join("harness.json"),
@@ -844,6 +949,7 @@ fn node_config(
     principal: &str,
     namespace: &str,
     trust_rule: &str,
+    journal: &JournalPlan,
 ) -> String {
     format!(
         r#"# Written by `coord-harness provision`. A strict configuration: the
@@ -871,7 +977,7 @@ root = "state"
 [journal]
 root = "journal"
 shards = 1
-
+{journal}
 [identity]
 trust_bundle = "{roots}"
 node_certificate = "{node_certificate}"
@@ -890,6 +996,7 @@ principal = "{principal}"
 namespace = "{namespace}"
 "#,
         preamble = layout.preamble(),
+        journal = journal.lines(),
         manifest = layout.shared("genesis.json"),
         admin_key = layout.shared(ADMIN_KEY),
         endpoints = layout.shared("endpoints.bin"),

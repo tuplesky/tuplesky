@@ -102,9 +102,21 @@ What `--hosts` changes, and nothing else does:
   and an endpoint URL naming it. An API server verifies the edge against the
   host of the endpoint it is configured with unless told otherwise.
 
-Without `--hosts`, `--issuer-listen` and `--edge-host`, provisioning writes
-exactly what it always has; `crates/coord-harness/tests/provision.rs` pins
-that.
+* **The journal profile** (`--journal-profile replay`, task-j06) writes
+  `profile = "journaled-replay-v1"` into every voter's `[journal]`, with
+  `--projection-durable-commits`, `--projection-durable-records` and
+  `--projection-durable-ms` where given. Without the flag the harness reads
+  `COORD_HARNESS_JOURNAL_PROFILE` (and `COORD_HARNESS_PROJECTION_DURABLE_*`),
+  which is how a driver running it from its own environment, such as
+  Jepsen's control node, selects it. A cadence without the replay profile,
+  a cadence of zero, and a value that does not parse are refused. The
+  profile is off by default and is not a supported production profile until
+  task-j05; `harness.json` records it as `journal_profile` when it is not
+  strict.
+
+Without `--hosts`, `--issuer-listen`, `--edge-host` and a journal profile,
+provisioning writes exactly what it always has;
+`crates/coord-harness/tests/provision.rs` pins that.
 
 A genesis commits its voters by key. Re-provisioning makes a new domain with
 new keys, and every bundle has to be copied again; a node is never

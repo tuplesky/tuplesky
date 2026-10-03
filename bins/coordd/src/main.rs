@@ -497,6 +497,8 @@ fn report_metrics(
             journal: held.durable().get(),
             materialized: held.materialized().get(),
             checkpoint: held.checkpoint().get(),
+            projection_durable: coord_storage::Persistence::projection_durable(&storage.domain)
+                .map(|seq| seq.get()),
         }),
         // A domain whose projection is not attached has no frontiers to
         // report, and saying so is the point: three zeroes would read
@@ -1052,10 +1054,12 @@ fn main() -> ExitCode {
     // commit finishes (task-d52), and by its appender thread as each
     // journal append does (task-d54).
     let materialized = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Where the loop's waits on those two threads are counted.
+    let mut waits = None;
     let backing = if roles.votes() {
         match voter(&placed, applier, boot, config.limits.command_table_capacity)
             .and_then(|v| keep_floor(&placed, &config, v))
-            .and_then(|v| pipeline(v, &materialized))
+            .and_then(|v| pipeline(v, &materialized, &mut waits))
         {
             Ok(v) => serve::Backing::Voting(Box::new(v)),
             Err(e) => {
@@ -1131,11 +1135,24 @@ fn main() -> ExitCode {
         Vec::new()
     };
     let mut domain = serve::Domain::new(frontend, backing, serve::Budgets::default())
-        .wake_on_materialized(materialized)
+        .wake_on_materialized(materialized);
+    if let Some((appender, materializer)) = waits {
+        domain = domain.count_pipeline_waits(appender, materializer);
+    }
+    let domain = domain
         // Where this node keeps its own recovery images, and how much
         // unrepresented journal it tolerates before making one. Local
         // to this node: no replicated result depends on the answer.
         .with_checkpoints(checkpoints, config.limits.checkpoint_after_records);
+    // Under the replay-backed profile, the time bound on a working
+    // projection commit (task-j06); the store keeps the other two.
+    let mut domain = if config.journal.replays_projection() {
+        domain.with_durable_projection_every(std::time::Duration::from_millis(
+            config.journal.projection_durable_ms,
+        ))
+    } else {
+        domain
+    };
     println!(
         "frontend ready waiting={} voting={}",
         domain.waiting(),
@@ -1283,6 +1300,9 @@ fn main() -> ExitCode {
         if let Some(principal) = raced {
             domain.leaf_expired_while_serving(principal);
         }
+        // A clean stop leaves the projection durable where it stands, so
+        // the next start replays nothing it had applied (task-j06).
+        domain.sync_projections();
         eprintln!(
             "peers connected={} submittable={}",
             domain.reachable(),
@@ -1578,15 +1598,23 @@ fn voter(
 /// (task-d54): the domain thread seals a group and goes on, and what the
 /// group made durable is released once the appender has synced it and
 /// `materialized` has woken the loop to take it back.
+///
+/// The counters of the loop's waits on the two threads go to `waits`.
+#[allow(clippy::type_complexity)]
 fn pipeline(
     mut voter: coord_daemon::Voter<store::Persistence>,
     materialized: &std::sync::Arc<tokio::sync::Notify>,
+    waits: &mut Option<(
+        std::sync::Arc<coord_storage::Waits>,
+        std::sync::Arc<coord_storage::Waits>,
+    )>,
 ) -> Result<coord_daemon::Voter<store::Persistence>, String> {
     let notify = std::sync::Arc::clone(materialized);
     let materializer = coord_storage::ThreadMaterializer::new(std::sync::Arc::new(move || {
         notify.notify_one();
     }))
     .map_err(|e| format!("the materializer thread could not start: {e}"))?;
+    let materializer_waits = materializer.waits();
     voter
         .node_mut()
         .applier_mut()
@@ -1599,6 +1627,7 @@ fn pipeline(
         notify.notify_one();
     }))
     .map_err(|e| format!("the appender thread could not start: {e}"))?;
+    *waits = Some((appender.waits(), materializer_waits));
     voter
         .node_mut()
         .applier_mut()

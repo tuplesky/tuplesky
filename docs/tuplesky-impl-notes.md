@@ -9334,6 +9334,31 @@ append does. That code is the same `complete_group` both paths call.
     loop's lowest-priority branch, taken once no event is ready, and it
     lends the next group. That is the batching an inline sync gave, when
     everything that arrived during it went to the flush after it.
+- **A fence waits for the append out.** A group out is in no frontier
+  until it is taken back: `seal_group` takes it out of the queue, and
+  only `complete_group` advances the journaled frontier. A fence that
+  ran while it was out tested what was queued behind it against the
+  frontier before it, refused an application of the current ballot as
+  not extending, and moved the queued frontier back past the group, so
+  the next application was planned on a base the projection refuses.
+  `Voter::fence` therefore journals what is queued with
+  `Node::flush_journaled`, which waits for each append out on the loop's
+  thread, as a flush that appended inline did, and `JournaledStore::fence`
+  takes any append out back before it reads a frontier. A fence is rare;
+  the wait is the one an inline flush made anyway.
+- **Under back-pressure the next group is still lent.** `Node::make_room`
+  waits for the append out and lends the next group rather than
+  appending inline, so the loop waits for one sync, not two.
+- **A take-back is never dropped.** When sealing the next group fails
+  after an append was taken back, what the append made durable goes to
+  the next report, as any other stage's failure leaves it.
+- **The loop's waits are counted.** `ThreadAppender` and
+  `ThreadMaterializer` count a take that found the job still running,
+  and the time it blocked, in a shared `Waits`. The `metrics` line's
+  `cost.waits` reports both, so busy time less the loop's CPU time is
+  read as waits on the pipeline threads and whatever else blocked the
+  loop, rather than assumed to be syncs. The manual pipelines the tests
+  drive never block, and the store itself reads no clock.
 - **Nothing is owed while an append is out.** `Voter::owes_flush` does
   not count batches queued behind one, since a flush then moves nothing.
   `Node::lower_queued` stops when a lowering moves nothing.
@@ -9380,3 +9405,86 @@ runs each). Medians:
   2.0 ms a command at ten callers and 1.5 ms at fifty.
 - **The command-cost gate** (tmpfs, one and ten callers, three repeats)
   is within the baseline's margins.
+
+## The projection's working commits
+
+task-j06, promoted from optional on #98 (5962787328). After task-d54 the
+leader's loop at six nodes on the runner's disk was 48% busy at the same
+throughput, and the disk rows' p50 sat about 26 ms above tmpfs. A write
+waits through three syncs: the leader's journal, the follower's journal
+and the projection's commit. The replay-backed profile takes the third
+one off the write's path. It is named (`journal.profile =
+"journaled-replay-v1"`) and off by default; strict stays the default
+until task-j05's composed matrix.
+
+- **A capability, not a mode.** `WriteTxn::commit_working` sits beside
+  `commit_durable`, whose contract is unchanged; its default is
+  `commit_durable`, a stronger success. redb's is a `Durability::None`
+  commit. `LocalEngine::WORKING_STATE` says whether an engine has the
+  capability for real, and `JournaledStore::replay_projection` refuses
+  the profile over one that does not. fjall keeps the defaults.
+- **What redb does with a working commit.** It is visible to every
+  reader at once. Its pages stay in redb's write cache, so the file sees
+  no write until the next durable commit, and a crash loses whole
+  working commits and never part of one. The crash matrix shows it: a
+  crash image that keeps every write the process issued still lacks the
+  working commits after the last durable one. A clean close of the
+  database is a durable commit, so a node stopped cleanly loses nothing.
+- **When a commit is durable.** `DurableCadence` makes the next commit
+  durable after `commits` working commits or `records` records applied
+  (64 and 4096 by default). `coordd` bounds the time too, at
+  `projection_durable_ms` (100), in two halves: every half interval it
+  asks for the next commit to be durable, and a request still waiting at
+  the next half has met no commit, so the domain is idle and its loop
+  makes the projection durable itself (`sync_idle_projections`, one
+  empty durable commit). The loop has a deadline for it while anything
+  is volatile, so an idle domain wakes for it. Without that half the
+  bound held only while commands kept coming, and a domain that went
+  quiet kept its working commits volatile until the next command, the
+  next checkpoint or the stop. A checkpoint publication makes the
+  projection durable before it appends the pointer and retires the
+  prefix: the pointer retires the journal through `C`, and a crash
+  afterwards takes the projection back to its last durable commit,
+  which must not be below `C`. A clean stop calls `sync_projections`.
+  The materializer's jobs carry the same decision as the inline path, so
+  the cadence counts every commit wherever it runs.
+- **Two frontiers.** `M` and `Materialized` are what is applied and
+  visible: reads, the gate and resolves follow them. The projection's
+  durable commit is `projection_durable`, and the metrics line carries it
+  under the replay profile. A crash moves `M` back to it, and the attach
+  replays the journal above it before the domain serves. That keeps the
+  invariants task-d48 listed: a resolve is answered from a projection
+  that has replayed everything journaled.
+- **Validation at start.** `coordd` checks the projection a boot found
+  before attaching it (`JournaledStore::validate_projection`). Its stamp
+  must be at or past the selected baseline and must name the record the
+  journal holds there: the next record's predecessor digest, or the
+  record's own digest at the head. If it fails, the generation is
+  restaged (`Generation::stage_reinstall`, which carries obligations
+  because the image is this node's own) and the baseline's image is
+  installed (`install_local`, which now admits a staging's six identity
+  rows when the image holds the same ones, and nothing else). The
+  incarnation may differ, by the rule a selected generation is opened
+  under: an adoption (task-58) advances the manifest alone, so the
+  projection and every image published from it keep the incarnation
+  they were created under, at or below the one the reinstall stages
+  with, and the install writes the image's back. A reinstall stopped
+  after activation and before the replay leaves a projection at `C`
+  that continues the journal, so the next start keeps it and replays.
+  The attach then replays `(C, J]`.
+  Without a baseline the node refuses to serve: the genesis rows were
+  written before the journal existed, so a replay into an empty
+  projection could not rebuild them. The attach refuses the same
+  projections itself, as `ProjectionInvalid`, so a caller that skips
+  the check cannot serve one.
+- **Switching profiles** needs nothing. The profile is not recorded
+  anywhere durable, and the attach replays the journal above the stamp
+  under either profile. A node started strict after a replay run
+  replays what its last run left working.
+- **What is not shown here.** The faultkit matrices crash the projection
+  at each of its writes and syncs, one of them around a checkpoint
+  publication with no cadence at all, so that only the publication's
+  forced sync is durable; they do not crash the journal, which is
+  task-j05's. SIGKILL under the Jepsen kill nemesis, the boot replay
+  time and the 6-node disk rows with the profile on are the #98 owner's
+  runs, after #143's fence fix.

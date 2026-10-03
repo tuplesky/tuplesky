@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use coord_daemon::metrics::{
     Cost, Cpu, Durability, Frontiers, Headroom, Interval, Lane, LaneReading, Latency,
-    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, Reads, Recorder, Resends, ShardIndex,
-    ShardReading, Stage, StageReading, Unavailable,
+    MAX_REPORTED_SHARDS, Measure, MetricsSnapshot, PipelineWaits, Reads, Recorder, Resends,
+    ShardIndex, ShardReading, Stage, StageReading, Unavailable, Wait,
 };
 use coord_daemon::role::RoleSet;
 
@@ -234,6 +234,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 1000,
         materialized: 940,
         checkpoint: 500,
+        projection_durable: None,
     };
     assert_eq!(frontiers.unmaterialized(), 60, "the node is behind its log");
     assert_eq!(frontiers.unreclaimed(), 440, "what a reclaim would replay");
@@ -245,6 +246,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 10,
         materialized: 10,
         checkpoint: 10,
+        projection_durable: None,
     };
     assert_eq!(level.unmaterialized(), 0);
     assert_eq!(level.unreclaimed(), 0);
@@ -252,6 +254,7 @@ fn the_journal_and_the_projection_are_reported_separately() {
         journal: 5,
         materialized: 9,
         checkpoint: 20,
+        projection_durable: None,
     };
     assert_eq!(impossible.unmaterialized(), 0);
     assert_eq!(impossible.unreclaimed(), 0);
@@ -327,6 +330,7 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             journal: 90,
             materialized: 88,
             checkpoint: 40,
+            projection_durable: Some(70),
         }),
         view_age: Measure::Observed(Duration::from_millis(12)),
         engine_pressure: Measure::Observed(Headroom { used: 3, bound: 10 }),
@@ -365,6 +369,16 @@ fn a_rendered_snapshot_carries_no_secret_or_key_shaped_text() {
             cpu: Measure::Observed(Cpu {
                 domain: Duration::from_secs(25),
                 process: Duration::from_secs(70),
+            }),
+            waits: Measure::Observed(PipelineWaits {
+                appender: Wait {
+                    count: 9,
+                    time: Duration::from_millis(40),
+                },
+                materializer: Wait {
+                    count: 3,
+                    time: Duration::from_millis(12),
+                },
             }),
         }),
     };

@@ -579,6 +579,37 @@ impl Default for InstallLocalLimits {
     }
 }
 
+/// Whether a target's metadata row `key = staged` may stand before an
+/// install of an image whose row under `key` is `image`: an identity row
+/// the image holds as it is, or an incarnation the image's is at or
+/// below.
+fn identity_row_admitted(key: &[u8], staged: &[u8], image: Option<&[u8]>) -> bool {
+    use coord_store_api::registry::meta_fields;
+    use coord_types::ReplicaIncarnation;
+    const IDENTITY: [&[u8]; 6] = [
+        meta_fields::CLUSTER_ID,
+        meta_fields::DOMAIN_ID,
+        meta_fields::REPLICA_ID,
+        meta_fields::INCARNATION,
+        meta_fields::ENGINE,
+        meta_fields::PROFILE,
+    ];
+    let Some(image) = image else { return false };
+    if !IDENTITY.contains(&key) {
+        return false;
+    }
+    if key != meta_fields::INCARNATION {
+        return image == staged;
+    }
+    match (
+        ReplicaIncarnation::from_be_slice(image),
+        ReplicaIncarnation::from_be_slice(staged),
+    ) {
+        (Ok(image), Ok(staged)) => image <= staged,
+        _ => false,
+    }
+}
+
 /// Write a verified local image into an empty generation, restoring this
 /// incarnation's storage as it was at the represented sequence.
 ///
@@ -608,6 +639,9 @@ pub fn install_local<E: coord_store_api::engine::LocalEngine>(
     {
         let view = engine.reader().snapshot()?;
         for collection in Collection::ALL {
+            if collection == Collection::MetaV1 {
+                continue;
+            }
             // One row, and room for it: a byte budget too small to
             // return the first row would report every collection empty
             // and make this check say nothing at all.
@@ -616,6 +650,48 @@ pub fn install_local<E: coord_store_api::engine::LocalEngine>(
                 return Err(InstallLocalError::NotEmpty {
                     collection: collection.id().0,
                 });
+            }
+        }
+        // A staged generation carries its own identity record (task-j06
+        // reinstalls into one). Those six rows, and only those, are
+        // admitted where the image holds the same: any other metadata --
+        // a stamp above all -- is a target that is not empty. The
+        // incarnation is the one row that may differ, by the rule a
+        // selected generation is opened under: an adoption (task-58)
+        // advances the manifest alone, so this node's projection, and
+        // every image published from it since, records the incarnation
+        // it was created under, at or below the one a reinstall stages
+        // with. The install writes the image's row back, which that
+        // same rule admits.
+        let meta = Collection::MetaV1.id();
+        let image: std::collections::BTreeMap<&[u8], &[u8]> = checkpoint
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.rows.iter())
+            .filter(|row| row.collection == meta.0)
+            .map(|row| (row.key.as_slice(), row.value.as_slice()))
+            .collect();
+        let mut resume_after = None;
+        loop {
+            let page = view.scan_page(
+                meta,
+                &ScanRequest {
+                    resume_after: resume_after.clone(),
+                    ..ScanRequest::all(64, 1 << 20)
+                },
+            )?;
+            for row in &page.rows {
+                if !identity_row_admitted(
+                    row.key.as_slice(),
+                    &row.value,
+                    image.get(row.key.as_slice()).copied(),
+                ) {
+                    return Err(InstallLocalError::NotEmpty { collection: meta.0 });
+                }
+            }
+            match page.rows.last() {
+                Some(last) if !page.exhausted => resume_after = Some(last.key.clone()),
+                _ => break,
             }
         }
     }

@@ -24,6 +24,7 @@
 use coord_core::effect::{ApplyBase, BootId, PersistBatch};
 use coord_core::event::StorageEvent;
 use coord_store_api::engine::EngineError;
+use coord_types::ids::LocalJournalSeq;
 
 use crate::journaled::TransitionKind;
 use crate::view::GatedReader;
@@ -192,6 +193,20 @@ pub trait Persistence {
         Ok(Lowered::default())
     }
 
+    /// Whether journal appends go to another thread (task-d54): whether
+    /// [`Persistence::journal`] lends the next group rather than waiting
+    /// for its sync.
+    fn journal_pipelined(&self) -> bool {
+        false
+    }
+
+    /// Wait for a journal append out on another thread, if one is, and
+    /// take it back without starting the next (task-d54); what it made
+    /// durable is reported. Nothing is out where nothing is pipelined.
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        Ok(Lowered::default())
+    }
+
     /// Take back the projection commits that have finished, without
     /// waiting, and hand what is journaled and not materialized to the
     /// next one (task-d52). The facts of the commits taken back are
@@ -206,6 +221,42 @@ pub trait Persistence {
     /// Nothing is out where nothing is pipelined.
     fn drain(&mut self) -> Result<Lowered, EngineError> {
         Ok(Lowered::default())
+    }
+
+    /// Make the next projection commit a durable one, whatever the
+    /// replay-backed profile's cadence says (task-j06). For a caller that
+    /// bounds the time a working commit stays volatile; it waits for
+    /// nothing. Every commit is durable under the strict profile, so
+    /// there is nothing to ask for there.
+    fn request_durable_projection(&mut self) {}
+
+    /// Make durable now the working projection commits a request has
+    /// been waiting on with no commit to take it (task-j06): the half of
+    /// the time bound an idle domain needs, since it has no next commit.
+    /// Nothing under the strict profile.
+    fn sync_idle_projections(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Whether the projection holds working commits a crash would lose
+    /// (task-j06). Never under the strict profile.
+    fn projection_volatile(&self) -> bool {
+        false
+    }
+
+    /// Make every working projection commit durable now (task-j06), for
+    /// a clean stop: a commit or an append out on another thread is
+    /// waited for and taken back first, and what it completed reported.
+    /// Under the strict profile this is [`Persistence::drain`].
+    fn sync_projections(&mut self) -> Result<Lowered, EngineError> {
+        self.drain()
+    }
+
+    /// The journal sequence of the projection's last durable commit, if
+    /// this persistence has one apart from what it has materialized
+    /// (task-j06): what a crash would leave of the projection.
+    fn projection_durable(&self) -> Option<LocalJournalSeq> {
+        None
     }
 
     /// The execution position the projection has committed, as far as
@@ -552,6 +603,17 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
             .map_err(engine)
     }
 
+    fn journal_pipelined(&self) -> bool {
+        self.store.journal_pipelined()
+    }
+
+    fn finish_append(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .finish_append()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
     fn hand_off(&mut self) -> Result<Lowered, EngineError> {
         self.store
             .hand_off()
@@ -561,6 +623,34 @@ impl<J: coord_journal_api::JournalEngine, E: coord_store_api::engine::LocalEngin
 
     fn drain(&mut self) -> Result<Lowered, EngineError> {
         self.store.drain().map(lowered_from_journal).map_err(engine)
+    }
+
+    fn request_durable_projection(&mut self) {
+        self.store.request_durable_projection();
+    }
+
+    fn sync_projections(&mut self) -> Result<Lowered, EngineError> {
+        self.store
+            .sync_projections()
+            .map(lowered_from_journal)
+            .map_err(engine)
+    }
+
+    fn sync_idle_projections(&mut self) -> Result<(), EngineError> {
+        self.store.sync_idle_projections().map_err(engine)
+    }
+
+    fn projection_volatile(&self) -> bool {
+        self.store.projection_volatile(self.domain)
+    }
+
+    fn projection_durable(&self) -> Option<LocalJournalSeq> {
+        match self.store.projection_profile() {
+            crate::journaled::ProjectionProfile::Strict => None,
+            crate::journaled::ProjectionProfile::Replay(_) => {
+                self.store.projection_durable(self.domain)
+            }
+        }
     }
 
     fn materialized_through(&self) -> Result<coord_types::ids::ExecutionPosition, EngineError> {
