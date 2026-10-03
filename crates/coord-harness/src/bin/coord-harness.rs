@@ -106,9 +106,11 @@ impl Provisioning {
         let profile = match self.journal_profile {
             Some(profile) => profile,
             None => match std::env::var("COORD_HARNESS_JOURNAL_PROFILE") {
-                Ok(text) if !text.is_empty() => JournalProfile::parse(&text)
+                Ok(text) if text.is_empty() => JournalProfile::Strict,
+                Ok(text) => JournalProfile::parse(&text)
                     .map_err(|e| format!("COORD_HARNESS_JOURNAL_PROFILE: {e}"))?,
-                _ => JournalProfile::Strict,
+                Err(std::env::VarError::NotPresent) => JournalProfile::Strict,
+                Err(e) => return Err(format!("COORD_HARNESS_JOURNAL_PROFILE: {e}")),
             },
         };
         Ok(JournalPlan {

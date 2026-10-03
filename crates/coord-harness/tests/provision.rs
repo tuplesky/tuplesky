@@ -997,4 +997,27 @@ fn the_binary_takes_the_profile_from_its_flag_or_its_environment() {
     let (ok, config) = run(&[], &[("COORD_HARNESS_JOURNAL_PROFILE", "fast")]);
     assert!(!ok, "a profile that names nothing was accepted");
     assert!(config.is_none());
+    // Nor is one that is not text at all read as strict.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("a run directory");
+        let output = std::process::Command::new(binary)
+            .arg("provision")
+            .arg("--dir")
+            .arg(dir.path())
+            .arg("--voters")
+            .arg("3")
+            .env(
+                "COORD_HARNESS_JOURNAL_PROFILE",
+                std::ffi::OsStr::from_bytes(b"repl\xffay"),
+            )
+            .output()
+            .expect("ran");
+        assert!(
+            !output.status.success(),
+            "a profile that is not text was accepted"
+        );
+        assert!(!dir.path().join("n1/coordd.toml").exists());
+    }
 }
