@@ -163,6 +163,9 @@ class Cost:
     # projection commit that were still running (task-d54's waits); None
     # where the line does not count them.
     waits: tuple[float, float] | None = None
+    # Seconds the domain loop's thread was runnable and waiting for a CPU
+    # (task-d55); None before it, or where coordd could not read it.
+    run_queue: float | None = None
 
 
 def seconds(d) -> float:
@@ -181,6 +184,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
     cpu = (cost.get("cpu") or {}).get("Observed")
     syncs = (cost.get("journal_syncs") or {}).get("Observed")
     waits = (cost.get("waits") or {}).get("Observed")
+    scheduling = (cpu.get("domain_scheduling") or {}).get("Observed") if isinstance(cpu, dict) else None
     return Cost(
         executed=cost.get("executed", 0),
         busy=seconds(cost.get("busy")),
@@ -198,6 +202,7 @@ def parse_cost(snapshot: dict) -> Cost | None:
             if isinstance(waits, dict)
             else None
         ),
+        run_queue=seconds(scheduling.get("run_queue")) if isinstance(scheduling, dict) else None,
     )
 
 
@@ -641,6 +646,7 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
             cpu = any(c.cpu for _, c in costs)
             syncs = any(c.syncs is not None for _, c in costs)
             waits = any(c.waits for _, c in costs)
+            queue = any(c.run_queue is not None for _, c in costs)
             out.append(
                 "**Domain loop** (each voter's last boot, from the same `metrics` line; busy is time the loop "
                 "spent working rather than waiting for an event, store syncs included; fast path is the share of the "
@@ -650,6 +656,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                    "time the loop was blocked rather than computing" if cpu else "")
                 + ("; waits are the time the loop blocked taking back a journal append or a projection commit "
                    "that was still running" if waits else "")
+                + ("; run queue is the time the loop's thread was ready to run and waiting for a CPU, so busy less "
+                   "loop CPU, waits and run queue is the loop blocked in a call on its own thread" if queue else "")
                 + ("; reads are those its read barrier answered or refused as leader" if reads else "")
                 + ")"
             )
@@ -661,10 +669,16 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                 head += " Loop CPU per command (ms) | Process CPU per command (ms) |"
             if waits:
                 head += " Appender wait per command (ms) | Materializer wait per command (ms) |"
+            if queue:
+                head += " Loop run queue per command (ms) |"
             if reads:
                 head += " Reads served | Reads refused | Mean read wait (ms) |"
             out.append(head)
-            out.append("| --- " * (8 + (1 if syncs else 0) + (2 if cpu else 0) + (2 if waits else 0) + (3 if reads else 0)) + "|")
+            out.append(
+                "| --- "
+                * (8 + (1 if syncs else 0) + (2 if cpu else 0) + (2 if waits else 0) + (1 if queue else 0) + (3 if reads else 0))
+                + "|"
+            )
             for node, c in costs:
                 share = f"{c.busy / c.uptime:.0%}" if c.uptime > 0 else "-"
                 last = f"{c.recent[0] / c.recent[1]:.0%}" if c.recent and c.recent[1] > 0 else "-"
@@ -681,6 +695,8 @@ def summarize(store: str, nodes: list[str], title: str, profile: str | None = No
                     row += "".join(
                         f" {t * 1000 / c.executed:.2f} |" if c.waits and c.executed else " - |" for t in (c.waits or (0, 0))
                     )
+                if queue:
+                    row += f" {c.run_queue * 1000 / c.executed:.2f} |" if c.run_queue is not None and c.executed else " - |"
                 if reads:
                     wait = f"{c.waited_ms / c.served:.1f}" if c.served else "-"
                     row += f" {c.served} | {c.refused} | {wait} |"

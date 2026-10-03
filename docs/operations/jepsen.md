@@ -204,6 +204,18 @@ what the voter executed by up to one cadence; the projection durable
 column is the figure to read.
 etcd's and SwiftPaxos's jobs ignore the input.
 
+The `checkpoint-after-records` input sets how far each TupleSky voter's
+journal runs past its last local checkpoint before it publishes the next
+(task-d55): empty keeps the daemon's 4,096, and 0 never publishes. The
+scenario step exports it as `COORD_HARNESS_CHECKPOINT_AFTER_RECORDS`, which
+`coord-harness provision` reads the same way as the profile; it needs a
+carry with the harness of task-d55, and a carry without it keeps the
+default. The TupleSky summary's title then ends in ", checkpoint every N"
+(", no checkpoints" for 0).
+Each publication's `checkpoint` line in `coordd.log` says how long it held
+the domain thread and how long each of its steps took, and each restart's
+`replayed` line how many records it replayed and how long that took.
+
 | Scenario | Workload | Faults (SwiftPaxos) | Load | Network | Time |
 | --- | --- | --- | --- | --- | --- |
 | `faults` (default, weekly, pull requests) | append | kill, pause, partition (pause, partition) | 20/s, 2 clients a node | the runner's bridge | 300 s |

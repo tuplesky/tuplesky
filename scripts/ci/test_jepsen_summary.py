@@ -312,3 +312,38 @@ class ProfileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunQueueTests(unittest.TestCase):
+    """task-d55: the domain loop's run-queue time, where the voters report
+    it, is a column of its own; a run whose voters do not report it has
+    none."""
+
+    def summary(self, voter: str) -> str:
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "jepsen.log"), "w") as f:
+                f.write(LOG)
+            with open(os.path.join(store, "results.edn"), "w") as f:
+                f.write(RESULTS)
+            os.mkdir(os.path.join(store, "n1"))
+            with open(os.path.join(store, "n1", "coordd.log"), "w") as f:
+                f.write(voter)
+            return js.summarize(store, ["n1"], "Jepsen")
+
+    def test_a_voter_that_reports_its_run_queue_has_the_column(self):
+        voter = VOTER.replace(
+            '"process":{"secs":8,"nanos":0}}',
+            '"process":{"secs":8,"nanos":0},"domain_scheduling":{"Observed":'
+            '{"run_queue":{"secs":0,"nanos":600000000},"voluntary":900,"involuntary":40}}}',
+        )
+        self.assertNotEqual(voter, VOTER)
+        self.assertEqual(js.parse_voter(voter.splitlines(keepends=True)).cost.run_queue, 0.6)
+        text = self.summary(voter)
+        self.assertIn("Materializer wait per command (ms) | Loop run queue per command (ms) |", text)
+        self.assertIn("| 0.50 | 0.10 | 1.50 | 300 |", text)
+        self.assertIn("run queue is the time", text)
+
+    def test_a_voter_that_does_not_has_no_column(self):
+        self.assertIsNone(js.parse_voter(VOTER.splitlines(keepends=True)).cost.run_queue)
+        text = self.summary(VOTER)
+        self.assertNotIn("run queue", text.lower())

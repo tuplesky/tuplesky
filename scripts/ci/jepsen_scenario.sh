@@ -20,6 +20,12 @@
 #                  COORD_HARNESS_JOURNAL_PROFILE, which `coord-harness
 #                  provision` reads on the control node, and it is named in
 #                  the TupleSky title either way
+#   IN_CHECKPOINT_AFTER_RECORDS
+#                  journal records each TupleSky voter holds past its last
+#                  local checkpoint before publishing the next (task-d55);
+#                  0 never publishes; empty for the daemon's default. It
+#                  reaches the voters as COORD_HARNESS_CHECKPOINT_AFTER_RECORDS
+#                  and is named in the TupleSky title when set
 #
 # faults:          append; kill, pause, partition (SwiftPaxos: pause,
 #                  partition); 20 operations a second from 2 clients a node,
@@ -113,6 +119,14 @@ case $profile in
   *) echo "profile must be strict or replay, not $profile" >&2; exit 2 ;;
 esac
 
+checkpoint=${IN_CHECKPOINT_AFTER_RECORDS:-}
+case $checkpoint in
+  "") checkpoint_suffix="" ;;
+  0) checkpoint_suffix=", no checkpoints" ;;
+  *[!0-9]*) echo "checkpoint-after-records must be a number, not $checkpoint" >&2; exit 2 ;;
+  *) checkpoint_suffix=", checkpoint every $checkpoint" ;;
+esac
+
 out=${GITHUB_ENV:-/dev/stdout}
 {
   echo "SCENARIO=$scenario"
@@ -131,4 +145,6 @@ out=${GITHUB_ENV:-/dev/stdout}
   echo "PROFILE=$profile"
   echo "PROFILE_SUFFIX=, $profile"
   echo "COORD_HARNESS_JOURNAL_PROFILE=$profile"
+  echo "COORD_HARNESS_CHECKPOINT_AFTER_RECORDS=$checkpoint"
+  echo "CHECKPOINT_SUFFIX=$checkpoint_suffix"
 } >> "$out"

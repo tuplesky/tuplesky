@@ -69,6 +69,9 @@ on:
         type: choice
         options: [strict, replay]
         default: strict
+      checkpoint-after-records:
+        description: "Journal records each TupleSky voter holds past its last local checkpoint before publishing the next (task-d55); 0 never publishes; empty for the daemon's 4096"
+        default: ""
       swiftpaxos:
         description: "Faults for the SwiftPaxos baseline (pause, partition, packet; kill ends its cluster), none, or skip to not run it; empty for the scenario's"
         default: ""
@@ -108,6 +111,7 @@ env:
   IN_SWIFTPAXOS: ${{ inputs.swiftpaxos }}
   IN_STORE: ${{ inputs.store }}
   IN_PROFILE: ${{ inputs.profile }}
+  IN_CHECKPOINT_AFTER_RECORDS: ${{ inputs.checkpoint-after-records }}
   NODES: ${{ inputs.nodes || '5' }}
   ETCD_VERSION: ${{ inputs.etcd-version || 'latest' }}
   # jepsen-io/etcd, pinned; its head when the baseline was added.
@@ -266,7 +270,7 @@ jobs:
           if [ -d jepsen/tuplesky/store/latest ]; then
             python3 tuplesky/scripts/ci/jepsen_summary.py jepsen/tuplesky/store/latest \
               --nodes-file "$RUNNER_TEMP/cluster/nodes" --profile "$PROFILE" \
-              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX"
+              --title "TupleSky: $WORKLOAD, $NEMESIS$TITLE_SUFFIX$STORE_SUFFIX$PROFILE_SUFFIX$CHECKPOINT_SUFFIX"
           else
             echo "No Jepsen store: the test did not start." >> "$GITHUB_STEP_SUMMARY"
           fi
