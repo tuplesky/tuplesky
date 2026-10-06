@@ -172,8 +172,8 @@ so a register run's count goes up to the next multiple of `2n` (`1n` runs
 as `2n`, `5n` as `6n`) and its summaries' titles say so.
 
 The `store` input is `disk` (the default) or `tmpfs`. With `tmpfs`, the
-cluster is stood up with `docker/up.sh --tmpfs` (from tuplesky/jepsen's
-`claude/docker-tmpfs-mounts` until it merges), which puts each node's
+cluster is stood up with `docker/up.sh --tmpfs` (on tuplesky/jepsen's
+`main` since tuplesky/jepsen#6), which puts each node's
 `/opt` on a tmpfs. That holds each voter's binary and store
 (`/opt/tuplesky`), and etcd's binary and data directory (`/opt/etcd`); the
 tmpfs is the parent because each test removes its own directory at setup,
